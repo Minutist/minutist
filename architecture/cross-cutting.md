@@ -98,16 +98,50 @@ caller until upstream issue ggml-org/llama.cpp#20914 lands (multi-phase
 streaming work; not in v1's timeframe).
 
 The orchestrator must shape VAD chunks to ≥25 s before invoking
-`AsrBackend::transcribe_chunk`. The default strategy in
-Phase 2 is **batched-VAD**: collect VAD segments into a buffer until
-the buffer reaches 25-30 s of audio or a configurable maximum latency
-window has elapsed, then dispatch. The latency window default is the
-FR-7 budget (10 s post-utterance), which on long-utterance audio
-gracefully degrades to "transcribe-on-stop."
+`AsrBackend::transcribe_chunk`. The default strategy in Phase 2 is
+**batched-VAD**: collect VAD segments into a buffer until the buffer
+reaches 25-30 s of audio or a configurable maximum latency window has
+elapsed, then dispatch. The latency window default is the FR-7 budget
+(10 s post-utterance), which on long-utterance audio gracefully degrades
+to "transcribe-on-stop."
+
+**Preserve original-timeline silences.** Phase 0 Spike 3 found that
+concatenating VAD-trimmed utterances back-to-back into the batched
+buffer causes Qwen3-ASR to enter a greedy-decode loop after the first
+few words. Reconstructing the inter-utterance silences via zero-padding
+between segments restored correct output. Qwen3-ASR appears to use
+internal silences as sentence-boundary anchors. The orchestrator MUST
+keep original-timeline gaps between VAD segments (cap individual gaps
+at ~3 s to bound the 30 s buffer); do not "compact" VAD-bounded audio
+before dispatching to mtmd.
+
+**Early-stop on `</asr_text>`.** Qwen3-ASR's output schema wraps the
+transcript as `language English<asr_text>...</asr_text>`. The model
+does not always emit `<|im_end|>` (EOG) when the audio is shorter than
+the 30 s window; it instead generates hallucinated continuation past
+the real transcript end. `asr-runtime` MUST stop generation on
+`</asr_text>` in addition to EOG.
 
 Alternative strategies (pad-to-30s-per-call, post-filter hallucinated
 tail) are documented in Spike 1's README as fallbacks if batched-VAD's
 latency profile is unacceptable.
+
+## llama.cpp prefill batching
+
+Phase 0 Spike 2 found that `cparams.n_batch` is a **per-decode hard
+limit**, not just an allocation hint. Feeding a prompt longer than
+`n_batch` tokens in a single `LlamaBatch` trips
+`GGML_ASSERT(n_tokens_all <= cparams.n_batch)` and aborts. The fix is
+to chunk the prompt into `n_batch`-sized batches and call `decode` once
+per chunk; only the last token of the last chunk needs `logits = true`.
+
+Binding on `summariser`: long transcript + notes prompts will exceed
+`n_batch` regularly (default is 512 tokens; a 30-minute transcript can
+easily reach 8000+ tokens). The summariser MUST implement
+chunked-prefill.
+
+`asr-runtime` is not affected: `mtmd_helper_eval_chunks` performs the
+chunking internally for audio-bearing prompts.
 
 ## Model lifecycle
 

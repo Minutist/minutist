@@ -109,11 +109,15 @@ region, hallucinating words that weren't in the audio. The `AsrBackend`
 trait itself is unaffected — implementations handle the constraint.
 
 `orchestrator` is responsible for shaping its calls to this trait
-correctly: VAD chunks shorter than the window must either be (a) batched
-together up to ≥25 s before invoking the backend, (b) padded to 30 s and
-accept the full encode cost per call, or (c) the hallucinated tail must
-be post-filtered. The choice is a Phase-2 design decision — see
-the specification §10 Phase 2.
+correctly. The Phase 2 default is the batched-VAD strategy with
+silence-preservation (see `cross-cutting.md`, "ASR chunking
+constraint"): collect VAD segments into a ≥25 s buffer, **keep the
+original inter-utterance silences (zero-padded, capped at ~3 s each)**,
+and only then dispatch.
+
+**Output schema.** `asr-runtime` MUST stop generation on `</asr_text>`
+in addition to EOG — Qwen3-ASR doesn't always emit EOG for sub-window
+audio. See `cross-cutting.md` — ASR chunking constraint.
 
 ### `diarizer`
 **Crate:** `crates/diarizer`
@@ -126,6 +130,18 @@ the specification §10 Phase 2.
 Post-hoc only. Not in the live pipeline; runs after the recording stops
 or as a user-triggered re-diarize.
 
+**Binding pin (confirmed by Phase 0 Spike 4).** `sherpa-rs = 0.6.8`
+(Thewh1teagle, MIT) with the `download-binaries` feature for dev and
+`static` for Phase 7 bundling. The `sherpa_rs::diarize::Diarize` surface
+covers everything needed; no `bindgen` direct-C wrapper required. The
+k2-fsa-owned alternative crate `sherpa-onnx = 1.13.x` (Apache-2.0)
+should be re-evaluated against `sherpa-rs` before Phase 6 ships.
+
+Cluster IDs returned by the binding are arbitrary `i32`; the impl must
+normalise to first-seen-order labels (`A`, `B`, …) before populating
+`Segment::speaker_id`. The binding's `eyre::Result` is mapped to
+`common::AppError::Inference` at the trait boundary.
+
 ### `summariser`
 **Crate:** `crates/summariser`
 **Owns:** llama-cpp-2 text-LLM lifecycle, summarisation prompts, the
@@ -134,6 +150,23 @@ optional external-LLM dispatcher (Ollama / LM Studio).
 **Implements:** `Summariser` from `common`.
 **Inputs:** transcript + notes (read via `persistence`).
 **Outputs:** a markdown summary written via `persistence`.
+
+**Chat-template handling (confirmed by Phase 0 Spike 2).** Use
+`LlamaModel::chat_template(None::<&str>)` to read the GGUF's baked-in
+template, then `LlamaModel::apply_chat_template(template, messages,
+add_ass=true)` to render the prompt. Do NOT pull in `tokenizers` —
+llama-cpp-2 covers this cleanly. If the template is missing or the
+model isn't Qwen-shaped, fail the request explicitly rather than
+falling back to a hand-built ChatML scaffold (the manual scaffold only
+matches Qwen's template).
+
+**Prefill must chunk by `n_batch`** — see `cross-cutting.md`, "llama.cpp
+prefill batching". Long transcripts exceed `n_batch` (default 512) and
+will assert otherwise.
+
+**Use `AddBos::Never` after templating** (the template embeds the BOS
+itself). Stop generation on `model.is_eog_token(token)`, which covers
+both EOS and `<|im_end|>` for Qwen.
 
 ### `model-registry`
 **Crate:** `crates/model-registry`

@@ -83,6 +83,32 @@ Conventions:
 If a phase has only one work-stream, dispatch on the main checkout — no
 worktree needed.
 
+### Path discipline (load-bearing for isolation)
+
+The Agent tool's `isolation: "worktree"` provides a separate working
+directory, but the agent's file-editing tools (Read, Edit, Write,
+Bash) operate on **absolute paths**. If the agent constructs absolute
+paths like `/home/anl/meeting-app/spikes/foo/...`, those resolve to
+**main's working tree**, not the worktree — and isolation breaks
+silently.
+
+Phase 0 Spike 3 hit this: the agent's prompt referenced many absolute
+paths to `/home/anl/Handy/`, `/home/anl/transcribe-rs/`, and
+`/mnt/c/...` as read-only context, and the agent pattern-matched by
+constructing `/home/anl/meeting-app/spikes/vad-loop/...` for its own
+edits. The work landed in main while the worktree branch stayed empty.
+
+To prevent the silent break:
+
+- Every dispatch prompt that uses `isolation: "worktree"` MUST include
+  the worktree path explicitly:
+  > "Your worktree root is **/home/anl/meeting-app/.claude/worktrees/<id>/**. Use this as the prefix for all absolute paths into the repo, or use paths relative to the worktree root. Do NOT use `/home/anl/meeting-app/...` for editable files — that points to main."
+- The main session verifies after the agent returns: `git status` in
+  main should be clean; the worktree's branch should be ahead of main
+  with the expected diff. If main is dirty and the worktree is clean,
+  isolation broke and recovery is manual (commit the wayward diff in
+  main; drop the empty worktree branch).
+
 ## Branch and merge convention
 
 **Linear history only. No merge commits. Always rebase, fast-forward

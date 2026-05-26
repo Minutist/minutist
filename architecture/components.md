@@ -106,6 +106,14 @@ The Silero VAD ONNX file is **vendored** under `resources/silero/`, not
 managed by `model-registry`. See
 [`cross-cutting.md`](cross-cutting.md) — Model lifecycle.
 
+**Implementation note (Phase 2).** Smoother defaults: threshold 0.5,
+onset 3 frames (90 ms), hangover 24 frames (720 ms), prefill 5 frames
+(150 ms pre-roll). `process_samples` accumulates a partial-frame buffer
+and only feeds the VAD complete 480-sample frames (Silero v4 panics on
+any other size). The bundled ONNX is resolved at build time via
+`option_env!("MEETING_APP_SILERO_PATH")` falling back to
+`{CARGO_MANIFEST_DIR}/../../resources/silero/silero_vad_v4.onnx`.
+
 ### `asr-runtime`
 **Crate:** `crates/asr-runtime`
 **Owns:** llama-cpp-2 mtmd binding, the Qwen3-ASR model, the prompt /

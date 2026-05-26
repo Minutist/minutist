@@ -217,6 +217,13 @@ Parallel agents working on capture / VAD / ASR cannot independently
 change the orchestrator's wiring — that's an orchestration-owner
 decision and needs an architecture-doc update.
 
+**Phase 1 surface (broadcast policy).** `AppEvent` fan-out uses
+`broadcast::channel(256)` (~8 s of meter at 30 Hz). Slow subscribers
+receive `RecvError::Lagged` from tokio and must warn at their call site;
+the orchestrator does not pre-emptively drop subscribers. Meeting
+titles use the placeholder convention `"Recording {ISO-8601 start
+timestamp}"` until Phase 3/4 rename support lands.
+
 ### `settings`
 **Crate:** `crates/settings`
 **Owns:** the settings schema, validation, change notifications.

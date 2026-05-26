@@ -5,14 +5,27 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Phase 1 Stream D skeleton. The systems-engineer fills this in. The live
-# pipeline (VAD → ASR → events) lands in Phase 2 — do NOT preempt that.
+# Phase 1 Stream D: minimal state machine (start/stop/pause, audio meter forwarding).
+# The live pipeline (VAD → ASR → events) lands in Phase 2 — do NOT preempt that.
+
+[features]
+# Enables the test-support module and the start_with_streams constructor.
+# Used by integration tests that need deterministic audio without a real device.
+test-source = ["audio-capture/test-source"]
 
 [dependencies]
 meeting-app-common = { path = "../common" }
 audio-capture = { path = "../audio-capture" }
 persistence = { path = "../persistence" }
 settings = { path = "../settings" }
+chrono = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
+tracing-subscriber = { workspace = true }
+audio-capture = { path = "../audio-capture", features = ["test-source"] }

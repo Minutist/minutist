@@ -1520,12 +1520,17 @@ name = "orchestrator"
 version = "0.0.0"
 dependencies = [
  "audio-capture",
+ "chrono",
  "meeting-app-common",
  "persistence",
  "serde",
+ "serde_json",
  "settings",
+ "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

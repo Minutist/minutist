@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+#
+# pre-commit — architecture drift guard
+#
+# Fails the commit if source under crates/, src-tauri/, or ui/src/ is staged
+# without a matching change under architecture/. The intent is to
+# keep the live architecture docs honest: a structural change is incomplete
+# until the C4 docs reflect it.
+#
+# Install once per clone:
+#     git config core.hooksPath .githooks
+#
+# Override (rarely justified):
+#     SKIP_ARCH_CHECK=1 git commit ...
+
+set -euo pipefail
+
+if [ "${SKIP_ARCH_CHECK:-0}" = "1" ]; then
+    echo "[pre-commit] SKIP_ARCH_CHECK=1 — architecture drift check bypassed" >&2
+    exit 0
+fi
+
+# Staged-paths-only; we do not look at unstaged or untracked changes.
+staged="$(git diff --cached --name-only --diff-filter=ACMRTD)"
+
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+# Code paths whose changes require an architecture-doc touch.
+# Tests under crates/*/tests/ and fixtures are excluded — they don't affect
+# architectural shape.
+code_changed=0
+while IFS= read -r path; do
+    case "$path" in
+        crates/*/tests/*) ;;
+        tests/fixtures/*) ;;
+        crates/*|src-tauri/*|ui/src/*)
+            code_changed=1
+            ;;
+    esac
+done <<< "$staged"
+
+if [ "$code_changed" = "0" ]; then
+    exit 0
+fi
+
+# Did the commit also touch the architecture docs?
+arch_changed=0
+while IFS= read -r path; do
+    case "$path" in
+        architecture/*)
+            arch_changed=1
+            ;;
+    esac
+done <<< "$staged"
+
+if [ "$arch_changed" = "1" ]; then
+    exit 0
+fi
+
+cat >&2 <<EOF
+[pre-commit] architecture drift check FAILED
+
+  This commit touches source under crates/, src-tauri/, or ui/src/ but
+  no file under architecture/ is staged.
+
+  The architecture docs are LIVE — they describe the code as it is in the
+  current commit. If your change affects component boundaries, interfaces,
+  dependencies, or cross-cutting concerns, update the relevant file:
+
+    architecture/system-context.md
+    architecture/containers.md
+    architecture/components.md
+    architecture/cross-cutting.md
+    architecture/domain-ownership.md
+    architecture/workspace.dsl   (then re-run scripts/render-architecture.sh)
+
+  If your change is purely internal to one component (no boundary effect,
+  no public-surface change), say so explicitly by updating components.md
+  with a no-op edit such as a clarification, or set SKIP_ARCH_CHECK=1 on
+  this commit and explain in the commit message.
+
+  Bypass:  SKIP_ARCH_CHECK=1 git commit ...
+EOF
+exit 1

@@ -16,25 +16,42 @@ unit of agent ownership (see [`domain-ownership.md`](domain-ownership.md)).
 crossing a boundary either flows through trait objects defined in
 `common`, or via the orchestrator wiring everything together.
 
-The explicit cross-component dependencies are:
+The explicit cross-component dependencies and the phase each crate first
+appears in:
 
-| Crate | May depend on |
-|---|---|
-| `common` | (nothing in this workspace) |
-| `audio-capture` | `common` |
-| `vad-chunker` | `common` |
-| `asr-runtime` | `common`, `model-registry`, `settings` |
-| `diarizer` | `common`, `model-registry` |
-| `summariser` | `common`, `model-registry`, `settings`, `persistence` |
-| `persistence` | `common` |
-| `model-registry` | `common`, `settings` |
-| `settings` | `common` |
-| `orchestrator` | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `diarizer`, `persistence`, `settings` |
-| `ipc-bridge` | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
-| `app-main` (bin) | `common`, `orchestrator`, `ipc-bridge`, `settings` |
+| Crate | First phase | May depend on |
+|---|---|---|
+| `common` | 1 | (nothing in this workspace) |
+| `audio-capture` | 1 | `common` |
+| `vad-chunker` | 2 | `common` |
+| `asr-runtime` | 2 | `common`, `model-registry`, `settings` |
+| `diarizer` | 6 | `common`, `model-registry` |
+| `summariser` | 5 | `common`, `model-registry`, `settings`, `persistence` |
+| `persistence` | 1 (minimal) → 4 (full) | `common` |
+| `model-registry` | 2 | `common`, `settings` |
+| `settings` | 1 | `common` |
+| `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `diarizer`, `persistence`, `settings` |
+| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `settings` |
 
 Any PR adding an edge not in this table requires an architecture-doc
 update in the same commit.
+
+### Crates that grow across phases
+
+- **`persistence`** appears in Phase 1 as a minimal writer of
+  `audio.opus` + `metadata.json` to a per-meeting folder. The libsql
+  index, transcript/notes/summary storage, and meeting-list queries
+  arrive in Phase 4.
+- **`orchestrator`** appears in Phase 1 as a tiny state machine for
+  start / stop / pause with the audio meter and capture lifecycle. The
+  full live pipeline (VAD → ASR → transcript events → diarizer trigger)
+  arrives in Phase 2.
+- **`ipc-bridge`** appears in Phase 1 with start/stop/pause commands,
+  device-list query, audio-meter and state-change events. Grows each
+  phase as new domain surface is added.
+- **`asr-runtime`** and **`vad-chunker`** both first appear in Phase 2 —
+  they're a unit. Phase 1 captures audio but does not transcribe.
 
 ## Rust core components
 
@@ -66,6 +83,10 @@ wrapper, silence-detection heuristics.
 **Outputs:** an async `Stream<Item = AudioChunk>` where each chunk is
 bounded by detected silence ≥ the configured threshold and carries
 `{start_ms, end_ms, samples}`.
+
+The Silero VAD ONNX file is **vendored** under `resources/silero/`, not
+managed by `model-registry`. See
+[`cross-cutting.md`](cross-cutting.md) — Model lifecycle.
 
 ### `asr-runtime`
 **Crate:** `crates/asr-runtime`

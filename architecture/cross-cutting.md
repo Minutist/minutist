@@ -1,7 +1,13 @@
 # Cross-cutting concerns
 
 Concerns that touch every component. Decisions here are binding on all
-crates; deviation requires an architecture-doc update.
+**production** crates; deviation requires an architecture-doc update.
+
+The `spikes/` crates are exempt — they're throwaway code that proves
+upstream APIs work, and don't ship. Spikes may use `anyhow`, `println!`,
+unbounded channels, etc. without review findings. Any spike code that
+graduates into a production crate is held to these rules at migration
+time, not before.
 
 ## Async runtime
 
@@ -99,14 +105,25 @@ Owned by `model-registry`. The contract:
   responsible for tearing down its loaded model and reloading. The
   orchestrator coordinates this — there is no recording during a swap.
 
+**Exception: Silero VAD.** The Silero VAD ONNX file (~1.5 MB) is
+**vendored as a bundled resource** under `resources/silero/` in the
+installer, not managed by `model-registry`. `vad-chunker` loads it from
+its bundled location. The rationale: Silero is small enough that
+downloading it on first run adds friction without value; it never
+changes per-user; and a single-file vendored asset avoids forcing every
+phase that uses VAD to also pull in `model-registry`. This is the only
+model file that bypasses the registry.
+
 ## Configuration
 
 Single source: `settings` crate, backed by `tauri-plugin-store`. Other
 crates take a `&Settings` or call into `settings::get_*()` functions.
 No component reads the underlying TOML / JSON store directly.
 
-Settings changes broadcast a `SettingsChanged` event via the
-orchestrator. Components that care subscribe.
+Settings changes broadcast a `SettingsChanged` event directly from the
+`settings` crate via a tokio `broadcast` (or `watch`) channel.
+Components that care subscribe. The orchestrator is not a config bus —
+it consumes settings the same way every other component does.
 
 ## Filesystem layout
 
@@ -150,6 +167,12 @@ architecture-doc update and an explicit recorded product decision.
 Test fixtures (sample WAV files, expected transcripts) live under
 `tests/fixtures/` at the repo root and are git-lfs'd if they exceed
 ~1 MB.
+
+## Auto-update
+
+Owned by `app-main` (it's process-lifetime work). Uses
+`tauri-plugin-updater` against a static HTTPS endpoint serving signed
+artefacts. Introduced in Phase 7; no other crate touches updater logic.
 
 ## What's not decided here
 

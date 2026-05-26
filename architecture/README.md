@@ -64,3 +64,8 @@ Any change that:
 …must update the relevant files here in the same commit. The pre-commit
 hook checks the cheap part of this (architecture path touched); the
 reviewer checks the substantive part.
+
+The crate-introduction phases in `components.md` are themselves part of
+the architecture: each phase brings specific crates into existence (or
+grows them). Phase planning agents read this table to know which crates
+are in scope for the phase they're planning.

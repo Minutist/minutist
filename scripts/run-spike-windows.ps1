@@ -111,21 +111,32 @@ switch ($Spike) {
             --threads 8
     }
     'llm' {
-        Write-Host "==> Running spike-llm with cached Qwen2.5-3B (if present)"
-        $qwen = Get-ChildItem 'C:\Users\anl\.cache\huggingface\hub' -Recurse -Filter '*Qwen2.5-3B-Instruct*Q4_K_M*.gguf' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $qwen) { throw "Qwen2.5-3B-Instruct-Q4_K_M.gguf not found in HF cache. Run spike-llm manually with a different model path." }
-        & $bin --model $qwen.FullName --threads 8
+        $qwen = 'C:\Users\anl\llm-gguf\Qwen2.5-3B-Instruct-Q4_K_M.gguf'
+        if (-not (Test-Path $qwen)) {
+            $cached = Get-ChildItem 'C:\Users\anl\.cache\huggingface\hub' -Recurse -Filter '*Qwen2.5-3B-Instruct*Q4_K_M*.gguf' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cached) { $qwen = $cached.FullName }
+            else { throw "Qwen2.5-3B-Instruct-Q4_K_M.gguf not found. Stage it at $qwen or in the HF cache." }
+        }
+        Write-Host "==> Running spike-llm with model=$qwen"
+        & $bin --model $qwen --threads 8
     }
     'vad-loop' {
         Write-Host "==> Running spike-vad-loop on librispeech_30s.wav"
         & $bin `
-            --vad        '\\wsl.localhost\Ubuntu\home\anl\Handy\src-tauri\resources\models\silero_vad_v4.onnx' `
+            --vad        'C:\Users\anl\vad-models\silero_vad_v4.onnx' `
             --asr-model  'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B-Q8_0-ggml-org.gguf' `
             --mmproj     'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B.mmproj-Q8_0.gguf' `
             --wav        'C:\Users\anl\transcribe-rs-test\fixtures\librispeech_30s.wav'
     }
     'diarize' {
-        Write-Host "==> spike-diarize run flow not pre-configured (needs sherpa-onnx model + fixture cache on Windows). Skipping."
+        $seg = 'C:\Users\anl\sherpa-onnx-cache\diarization\sherpa-onnx-pyannote-segmentation-3-0\model.onnx'
+        $emb = 'C:\Users\anl\sherpa-onnx-cache\diarization\nemo_en_titanet_small.onnx'
+        $wav = 'C:\Users\anl\sherpa-onnx-cache\fixtures\2-two-speakers-en.wav'
+        foreach ($p in @($seg, $emb, $wav)) {
+            if (-not (Test-Path $p)) { throw "Missing: $p (copy from ~/.cache/sherpa-onnx/ on the WSL side)" }
+        }
+        Write-Host "==> Running spike-diarize"
+        & $bin --segmentation $seg --embedding $emb --wav $wav
     }
 }
 

@@ -10,7 +10,6 @@ members = [
     "crates/asr-runtime",
     "crates/orchestrator",
     "crates/ipc-bridge",
-    "crates/vad-chunker",
     "src-tauri",
     "spikes/asr",
     "spikes/llm",

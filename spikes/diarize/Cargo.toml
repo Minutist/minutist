@@ -13,6 +13,22 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 hound = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 meeting-app-common = { path = "../../crates/common" }
+
+# Pin sherpa-rs exactly. This is the Thewh1teagle binding called out in
+# Phase 0 Spike 4 — see README for the maturity verdict.
+#
+# 0.6.8 is the latest stable on crates.io as of 2026-05 and exposes the
+# offline speaker diarization surface used here (Diarize::new + .compute).
+#
+# `download-binaries` (default) fetches the matching sherpa-onnx pre-built
+# C-API shared library + ONNX Runtime from
+# https://github.com/k2-fsa/sherpa-onnx/releases (currently pinned by
+# `sherpa-rs-sys-0.6.8/dist.json` to sherpa-onnx v1.12.9). `tts` is
+# disabled — we don't link the TTS surface for the diarization spike.
+sherpa-rs = { version = "=0.6.8", default-features = false, features = ["download-binaries"] }
+
+sha2 = "0.10"

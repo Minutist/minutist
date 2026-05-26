@@ -59,8 +59,9 @@ update in the same commit.
 **Crate:** `crates/common`
 **Owns:** shared types (`MeetingId`, `ModelId`, `AudioChunk`, `Segment`,
 `WordTimestamp`, `MeetingMeta`, `ModelDescriptor`, `RecordingState`,
-`AppEvent`), trait definitions (`AsrBackend`, `Diarizer`, `Summariser`),
-the shared `AppError` enum + `AppResult<T>` alias.
+`AppEvent`, `AudioDevice`, `AudioMeterFrame`, `AudioFormat`), trait
+definitions (`AsrBackend`, `Diarizer`, `Summariser`), the shared
+`AppError` enum + `AppResult<T>` alias.
 
 **Stable surface — locked.** The trait signatures and event variants in
 this crate are the architectural contract that sub-agents implement
@@ -77,7 +78,9 @@ buffer, device enumeration for the settings UI.
 **Inputs:** start/stop commands (from orchestrator); device id (from
 settings).
 **Outputs:** an async `Stream<Item = AudioFrame>` of f32 samples at the
-internal sample rate (16 kHz mono).
+internal sample rate (**16 kHz mono — mandated; this matches mtmd's
+encoder input rate per Spike 1's Q-P0-1**, so downstream consumers do
+not resample).
 
 ### `vad-chunker`
 **Crate:** `crates/vad-chunker`

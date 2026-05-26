@@ -1,0 +1,18 @@
+[package]
+name = "ipc-bridge"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Phase 1 Stream E skeleton. The systems-engineer fills this in.
+# This is the ONLY non-app-main crate allowed to import `tauri::*`.
+
+[dependencies]
+meeting-app-common = { path = "../common" }
+orchestrator = { path = "../orchestrator" }
+persistence = { path = "../persistence" }
+settings = { path = "../settings" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

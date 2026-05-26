@@ -74,6 +74,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "audio-capture"
+version = "0.0.0"
+dependencies = [
+ "meeting-app-common",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -785,6 +795,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc-bridge"
+version = "0.0.0"
+dependencies = [
+ "meeting-app-common",
+ "orchestrator",
+ "persistence",
+ "serde",
+ "settings",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1128,6 +1151,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
+name = "orchestrator"
+version = "0.0.0"
+dependencies = [
+ "audio-capture",
+ "meeting-app-common",
+ "persistence",
+ "serde",
+ "settings",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "ort"
 version = "2.0.0-rc.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1165,6 +1201,17 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "persistence"
+version = "0.0.0"
+dependencies = [
+ "meeting-app-common",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+]
 
 [[package]]
 name = "pin-project-lite"
@@ -1475,6 +1522,16 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "settings"
+version = "0.0.0"
+dependencies = [
+ "meeting-app-common",
+ "serde",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

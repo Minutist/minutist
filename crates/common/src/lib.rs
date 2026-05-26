@@ -92,6 +92,43 @@ pub struct WordTimestamp {
     pub text: String,
 }
 
+/// One audio-input device exposed to the device-picker UI.
+///
+/// `id` is a stable, opaque string the IPC layer round-trips back to
+/// `audio-capture` to select the device. Format is implementation-defined
+/// (cpal device-name plus host index on the Rust side). `name` is the
+/// display label; `is_default` reflects the OS's default-input choice at
+/// query time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// One audio-meter sample emitted at ~30 Hz while recording.
+///
+/// `peak` is the maximum absolute sample magnitude in [0.0, 1.0] over the
+/// most-recent meter window (~33 ms of audio). `rms` is the root-mean-square
+/// over the same window. Consumers may render either; both are cheap to
+/// compute alongside capture.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AudioMeterFrame {
+    pub peak: f32,
+    pub rms: f32,
+}
+
+/// Audio-file format descriptor captured at write time. Phase 1 writes
+/// Opus 16 kHz mono; downstream phases re-decode using these fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioFormat {
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // Meeting metadata
 // ---------------------------------------------------------------------------
@@ -108,6 +145,7 @@ pub struct MeetingMeta {
     pub ended_at: Option<String>,
     pub duration_ms: u64,
     pub speaker_count: u32,
+    pub audio_format: AudioFormat,
     pub asr_model: Option<ModelDescriptor>,
     pub llm_model: Option<ModelDescriptor>,
     pub diarizer: Option<ModelDescriptor>,
@@ -155,8 +193,13 @@ pub enum RecordingState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AppEvent {
-    /// Audio meter level in [0.0, 1.0]. Emitted at ~30 Hz while recording.
-    AudioMeter { level: f32 },
+    /// Audio meter sample emitted at ~30 Hz while recording. Carries both
+    /// peak and RMS so the UI can pick the rendering it wants without an
+    /// extra round-trip.
+    AudioMeter { frame: AudioMeterFrame },
+    /// The available audio-input device list changed (hotplug or default
+    /// device switch). The webview should re-query `list_devices`.
+    DevicesChanged,
     /// Recording state changed.
     StateChanged { state: RecordingState },
     /// A new transcript segment was produced.
@@ -343,5 +386,78 @@ mod tests {
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"kind\":\"recording\""));
+    }
+
+    #[test]
+    fn audio_device_round_trips() {
+        let d = AudioDevice {
+            id: "hw:1,0".to_string(),
+            name: "Built-in Microphone".to_string(),
+            is_default: true,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: AudioDevice = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    #[test]
+    fn audio_meter_frame_round_trips() {
+        let f = AudioMeterFrame {
+            peak: 0.75,
+            rms: 0.42,
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let back: AudioMeterFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(f.peak, back.peak);
+        assert_eq!(f.rms, back.rms);
+    }
+
+    #[test]
+    fn app_event_audio_meter_uses_frame() {
+        let e = AppEvent::AudioMeter {
+            frame: AudioMeterFrame {
+                peak: 0.5,
+                rms: 0.3,
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"audio_meter\""));
+        assert!(json.contains("\"frame\""));
+        assert!(json.contains("\"peak\":0.5"));
+    }
+
+    #[test]
+    fn app_event_devices_changed_serialises_unit() {
+        let e = AppEvent::DevicesChanged;
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"devices_changed\""));
+    }
+
+    #[test]
+    fn meeting_meta_carries_audio_format() {
+        let m = MeetingMeta {
+            uuid: MeetingId::new(),
+            title: "Sample".to_string(),
+            started_at: "2026-05-27T10:00:00Z".to_string(),
+            ended_at: None,
+            duration_ms: 0,
+            speaker_count: 0,
+            audio_format: AudioFormat {
+                codec: "opus".to_string(),
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate_kbps: Some(32),
+            },
+            asr_model: None,
+            llm_model: None,
+            diarizer: None,
+            app_version: "0.0.0".to_string(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: MeetingMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.audio_format.codec, "opus");
+        assert_eq!(back.audio_format.sample_rate, 16_000);
+        assert_eq!(back.audio_format.channels, 1);
+        assert_eq!(back.audio_format.bitrate_kbps, Some(32));
     }
 }

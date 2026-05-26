@@ -1,0 +1,18 @@
+[package]
+name = "orchestrator"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Phase 1 Stream D skeleton. The systems-engineer fills this in. The live
+# pipeline (VAD → ASR → events) lands in Phase 2 — do NOT preempt that.
+
+[dependencies]
+meeting-app-common = { path = "../common" }
+audio-capture = { path = "../audio-capture" }
+persistence = { path = "../persistence" }
+settings = { path = "../settings" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

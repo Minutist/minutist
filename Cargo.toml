@@ -2,6 +2,11 @@
 resolver = "2"
 members = [
     "crates/common",
+    "crates/audio-capture",
+    "crates/settings",
+    "crates/persistence",
+    "crates/orchestrator",
+    "crates/ipc-bridge",
     "spikes/asr",
     "spikes/llm",
     "spikes/vad-loop",
@@ -15,6 +20,7 @@ license = "proprietary"
 authors = ["Andrew Leech <andrew@alelec.net>"]
 
 [workspace.dependencies]
+# Existing
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 hound = "3.5"
@@ -24,3 +30,26 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+
+# Phase 1 additions
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+cpal = "0.16"
+rubato = "0.16"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "time", "io-util"] }
+tracing-appender = "0.2"
+
+# Opus encoder (Phase 1 persistence). audiopus = bindings to libopus.
+audiopus = "0.3"
+ogg = "0.9"
+
+# Tauri 2.x — pinned to Handy's verified versions.
+tauri = { version = "2.10", features = [] }
+tauri-build = "2.4"
+tauri-plugin-fs = "2.4"
+tauri-plugin-store = "2.4"
+
+# tauri-specta — pinned to Handy's working set; bumping these is a coordinated
+# architecture-owner change because they gate the IPC contract for every phase.
+specta = "=2.0.0-rc.22"
+specta-typescript = "0.0.9"
+tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }

@@ -1,0 +1,17 @@
+[package]
+name = "persistence"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Phase 1 Stream C skeleton. The data-engineer fills this in. libsql
+# index, transcript/notes/summary storage land in Phase 4 — do NOT
+# preempt that work here.
+
+[dependencies]
+meeting-app-common = { path = "../common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

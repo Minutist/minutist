@@ -3,8 +3,11 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/audio-capture",
+    "crates/vad-chunker",
     "crates/settings",
     "crates/persistence",
+    "crates/model-registry",
+    "crates/asr-runtime",
     "crates/orchestrator",
     "crates/ipc-bridge",
     "src-tauri",

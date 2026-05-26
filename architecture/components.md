@@ -224,6 +224,13 @@ the orchestrator does not pre-emptively drop subscribers. Meeting
 titles use the placeholder convention `"Recording {ISO-8601 start
 timestamp}"` until Phase 3/4 rename support lands.
 
+**Integration tests** live in `crates/orchestrator/tests/` (per
+`cross-cutting.md` — Testing). Phase 1 integration tests:
+`start_record_stop` (full lifecycle + pause/resume decoded-duration
+accuracy + invalid transitions) and `back_pressure` (slow subscriber
+lag and subscriber-gone survivability). Run with
+`cargo test -p orchestrator --features test-source`.
+
 ### `settings`
 **Crate:** `crates/settings`
 **Owns:** the settings schema, validation, change notifications.

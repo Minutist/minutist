@@ -2875,8 +2875,10 @@ name = "orchestrator"
 version = "0.0.0"
 dependencies = [
  "audio-capture",
+ "audiopus",
  "chrono",
  "meeting-app-common",
+ "ogg",
  "persistence",
  "serde",
  "serde_json",

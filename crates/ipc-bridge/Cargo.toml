@@ -5,14 +5,25 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Phase 1 Stream E skeleton. The systems-engineer fills this in.
-# This is the ONLY non-app-main crate allowed to import `tauri::*`.
+# The ONLY non-app-main crate allowed to import `tauri::*`.
+# See architecture/domain-ownership.md — `ipc-bridge` / `systems-engineer` role.
 
 [dependencies]
 meeting-app-common = { path = "../common" }
+audio-capture = { path = "../audio-capture" }
 orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }
 settings = { path = "../settings" }
 serde = { workspace = true }
+serde_json = { workspace = true }
+specta = { workspace = true }
+tauri = { workspace = true }
+tauri-specta = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }  # for MeetingIdType's From impl
+
+[dev-dependencies]
+specta-typescript = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -246,6 +246,24 @@ TypeScript types consumed by the webview.
 free of Tauri imports — this is what makes the core testable without a
 running Tauri app.
 
+**Phase 1 command surface (8 commands, all `async fn` returning `Result<T, IpcError>`):**
+`list_devices`, `start_recording`, `pause_recording`, `resume_recording`,
+`stop_recording`, `get_recording_state`, `get_settings`, `update_settings`.
+
+**Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
+to the orchestrator broadcast and emits `AppEventPayload` (event name
+`"app-event-payload"`) to all windows.
+
+**tauri-specta pin verified (Q-P1-2):** `tauri-specta = "=2.0.0-rc.21"`,
+`specta = "=2.0.0-rc.22"`, `specta-typescript = "0.0.9"` compile cleanly with
+`tauri = "2.10"`. No version conflict.
+
+**Type mirror pattern:** `common` and `settings` types do not derive
+`specta::Type` (those crates have no `specta` dependency). Mirror types in
+`crates/ipc-bridge/src/specta_types.rs` carry identical serde shapes and the
+required derives. An architecture-owner commit adding `specta::Type` to
+`common` / `settings` can remove the mirror layer.
+
 ### `app-main` (bin)
 **Crate:** `src-tauri/` (Tauri convention)
 **Owns:** the Tauri main binary, tray icon, window management, process

@@ -76,11 +76,79 @@ Conventions:
   dependency additions are coordinated by the main session before
   fan-out.
 - When all streams complete, the main session reviews each worktree
-  diff, then merges them into `main` sequentially. The orchestrator
-  integration step is the last serial step.
+  diff, then integrates them into `main` sequentially per the
+  branch-and-merge convention below. The orchestrator integration step
+  is the last serial step.
 
 If a phase has only one work-stream, dispatch on the main checkout — no
 worktree needed.
+
+## Branch and merge convention
+
+**Linear history only. No merge commits. Always rebase, fast-forward
+merge only.** This applies to every branch in the repo — worktree
+streams, feature branches, anything.
+
+Why: parallel sub-agent work produces multiple branches that need to
+land on `main` in a defined order. Merge commits make the history a
+graph that's hard to bisect, hard to read, and hard to revert cleanly.
+Linear history keeps every Phase N commit a contiguous run on `main`,
+which the principal-code-reviewer and bisect tooling rely on.
+
+Mechanically:
+
+```bash
+# In the worktree (the agent's branch):
+git fetch origin main           # if there's a remote; not yet
+git rebase main                 # replay the branch onto current main
+cargo test --workspace          # confirm green after rebase
+
+# Back in the main session, on main:
+git merge --ff-only <branch>    # refuses if not a fast-forward
+```
+
+Per-clone setup (in addition to the architecture hook install):
+
+```bash
+git config pull.rebase true     # never merge-pull
+git config merge.ff only        # any merge that would create a merge
+                                # commit will fail by default
+```
+
+Interactions with the architecture pre-commit hook:
+
+- The hook runs on every replayed commit during a rebase. **Each commit
+  must independently satisfy the hook** — if a commit touches
+  `crates/foo/`, it must also touch `architecture/` in the same commit,
+  not in a sibling commit. Agents that produce multi-commit branches
+  must pair each code-touching commit with an architecture-touching
+  edit in that same commit.
+- `SKIP_ARCH_CHECK=1` is not allowed during rebase. If a rebase fails
+  on the hook, the underlying commit was malformed; fix the commit
+  (squash or amend it to include the architecture touch) and re-rebase.
+
+Rebase-conflict policy:
+
+- A conflict in `Cargo.lock` is expected when streams add crates
+  concurrently. Resolve by deleting `Cargo.lock` and running
+  `cargo generate-lockfile`, then `cargo build --workspace` to confirm
+  the lockfile is consistent.
+- A conflict in `architecture/components.md` likely indicates two
+  streams modified the same dependency-table row or the same crate
+  description. This is an architecture-owner resolution, not an
+  in-stream fix.
+- Any conflict outside the agent's owned scope is a sign the stream
+  reached beyond its domain — investigate before resolving.
+
+What this rules out:
+
+- `git merge` without `--ff-only` (creates a merge commit).
+- `git pull` without `--rebase` (can create a merge commit when local
+  is ahead).
+- `git rebase -p` (preserves merges; defeats the linear-history goal).
+- Long-running integration branches that accumulate merges. Each phase
+  lands as a contiguous run of commits on `main`; the phase commit
+  itself is the integration point.
 
 ## Dispatch prompt templates
 

@@ -35,15 +35,22 @@ crates listed in [`architecture/components.md`](architecture/components.md).
 
 ## Setup
 
-After cloning, install the architecture pre-commit hook:
+After cloning, configure git for this repo:
 
 ```bash
-git config core.hooksPath .githooks
+git config core.hooksPath .githooks   # architecture drift guard
+git config pull.rebase true           # never merge-pull
+git config merge.ff only              # no merge commits; ff-only
 ```
 
-The hook fails any commit that touches source under `crates/`,
-`src-tauri/`, or `ui/src/` without also touching `architecture/`. See
-[`architecture/README.md`](architecture/README.md) for the rationale.
+- **Hook.** The hook fails any commit that touches source under
+  `crates/`, `src-tauri/`, or `ui/src/` without also touching
+  `architecture/`. See [`architecture/README.md`](architecture/README.md)
+  for the rationale.
+- **Rebase + ff-only.** Linear history is required. No merge commits.
+  See
+  [`architecture/agent-dispatch.md`](architecture/agent-dispatch.md) —
+  Branch and merge convention.
 
 ## Build
 

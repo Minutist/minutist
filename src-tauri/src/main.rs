@@ -174,10 +174,12 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 .app_data_dir()
                 .expect("failed to resolve app-data dir");
 
-            // Create required subdirectories.
+            // `logs/` is owned by app-main (see architecture/cross-cutting.md
+            // "Filesystem layout"). `meetings/` is owned by `persistence`, which
+            // creates it on demand via `MeetingFolder::create`; app-main MUST NOT
+            // pre-create it here.
             let meetings_dir = app_data_dir.join("meetings");
             let logs_dir = app_data_dir.join("logs");
-            std::fs::create_dir_all(&meetings_dir).expect("failed to create meetings dir");
             std::fs::create_dir_all(&logs_dir).expect("failed to create logs dir");
 
             tracing::info!(

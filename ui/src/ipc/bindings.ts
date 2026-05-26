@@ -8,8 +8,10 @@ export const commands = {
 /**
  * List all available audio-input devices.
  * 
- * This is a direct call to `AudioCaptureManager::list_devices()` — no
- * orchestrator involvement.
+ * Routes through `Orchestrator::list_devices`, which wraps the FFI-bound
+ * cpal enumeration in `spawn_blocking`. This keeps `ipc-bridge`'s
+ * dependency table honest: it depends on `orchestrator`, not directly on
+ * `audio-capture`.
  */
 async listDevices() : Promise<Result<AudioDeviceType[], IpcError>> {
     try {

@@ -6,9 +6,10 @@
 //!
 //! Commands are `async fn` because the orchestrator's methods are async.
 //!
-//! `list_devices` is the exception: it calls
-//! `AudioCaptureManager::list_devices()` directly — a synchronous associated
-//! function that does not go through the orchestrator.
+//! `list_devices` routes through `Orchestrator::list_devices` (which wraps
+//! the cpal enumeration in `spawn_blocking`), preserving the dependency-table
+//! invariant that `ipc-bridge` depends only on `orchestrator + settings +
+//! common`.
 //!
 //! All commands return `Result<T, IpcError>`.  The `?` operator on
 //! `AppResult<T>` automatically converts via `IpcError::from(AppError)`.
@@ -26,7 +27,6 @@
 //! Each command that needs the orchestrator or settings receives its handles
 //! as `tauri::State<'_, IpcState>`.
 
-use audio_capture::AudioCaptureManager;
 use tauri::State;
 
 use crate::{
@@ -43,12 +43,18 @@ use crate::{
 
 /// List all available audio-input devices.
 ///
-/// This is a direct call to `AudioCaptureManager::list_devices()` — no
-/// orchestrator involvement.
+/// Routes through `Orchestrator::list_devices`, which wraps the FFI-bound
+/// cpal enumeration in `spawn_blocking`. This keeps `ipc-bridge`'s
+/// dependency table honest: it depends on `orchestrator`, not directly on
+/// `audio-capture`.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_devices(_state: State<'_, IpcState>) -> Result<Vec<AudioDeviceType>, IpcError> {
-    let devices = AudioCaptureManager::list_devices().map_err(IpcError::from)?;
+pub async fn list_devices(state: State<'_, IpcState>) -> Result<Vec<AudioDeviceType>, IpcError> {
+    let devices = state
+        .orchestrator
+        .list_devices()
+        .await
+        .map_err(IpcError::from)?;
     Ok(devices.into_iter().map(AudioDeviceType::from).collect())
 }
 

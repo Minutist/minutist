@@ -165,16 +165,27 @@ pub struct ModelDescriptor {
 
 /// Top-level state of the recording pipeline. Emitted to the webview on
 /// transitions via `AppEvent::StateChanged`.
+///
+/// **Timestamp semantics:** `started_at_ms` and `paused_at_ms` are
+/// **wall-clock milliseconds since the Unix epoch** (UTC), not
+/// recording-clock offsets. The webview can compute live elapsed-recording
+/// duration as `Date.now() - started_at_ms` (subtracting accumulated
+/// pause-time client-side if needed). Phase-internal timestamps that are
+/// genuinely recording-clock (e.g. `Segment::start_ms`, `AudioChunk::start_ms`)
+/// remain recording-clock — those are a different namespace and carry the
+/// `_ms` suffix without the `_at` infix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecordingState {
     Idle,
     Recording {
         meeting_id: MeetingId,
+        /// Wall-clock ms since Unix epoch when this Recording started.
         started_at_ms: u64,
     },
     Paused {
         meeting_id: MeetingId,
+        /// Wall-clock ms since Unix epoch when this Pause began.
         paused_at_ms: u64,
     },
     Stopping {

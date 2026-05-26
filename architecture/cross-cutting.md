@@ -71,7 +71,18 @@ Each component uses a static `target` matching the crate name:
 to flag log calls without a target — that's how we keep logs
 filterable.
 
-No `println!` outside test code.
+No `println!` or `eprintln!` outside test code. Two narrow exceptions:
+
+- **Bootstrap-time fallback before the tracing subscriber is initialised.**
+  The `app-main` binary may use `eprintln!` to surface fatal startup errors
+  that prevent the subscriber itself from being constructed. Limit to the
+  pre-subscriber path.
+- **Developer-facing CLI helpers** that intentionally print to stdout as
+  their primary output (e.g. `cargo run --bin generate-bindings` writing the
+  generated bindings path to the console).
+
+The reviewer is expected to flag any `println!` / `eprintln!` outside these
+two carve-outs and outside `#[cfg(test)]`.
 
 ## IPC contract
 

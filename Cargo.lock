@@ -1945,10 +1945,8 @@ dependencies = [
 name = "ipc-bridge"
 version = "0.0.0"
 dependencies = [
- "audio-capture",
  "meeting-app-common",
  "orchestrator",
- "persistence",
  "serde",
  "serde_json",
  "settings",

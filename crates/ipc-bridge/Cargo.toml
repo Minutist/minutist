@@ -10,9 +10,7 @@ authors.workspace = true
 
 [dependencies]
 meeting-app-common = { path = "../common" }
-audio-capture = { path = "../audio-capture" }
 orchestrator = { path = "../orchestrator" }
-persistence = { path = "../persistence" }
 settings = { path = "../settings" }
 serde = { workspace = true }
 serde_json = { workspace = true }

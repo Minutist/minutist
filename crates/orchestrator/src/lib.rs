@@ -348,6 +348,20 @@ impl Orchestrator {
         self.inner.lock().await.state.as_public()
     }
 
+    /// Enumerate available audio-input devices.
+    ///
+    /// Thin wrapper over `audio_capture::AudioCaptureManager::list_devices()`
+    /// so that the IPC layer does not need a direct `audio-capture`
+    /// dependency. Runs on `spawn_blocking` because cpal's device
+    /// enumeration is FFI-bound (especially on Linux/PulseAudio cold-start).
+    pub async fn list_devices(&self) -> AppResult<Vec<meeting_app_common::AudioDevice>> {
+        tokio::task::spawn_blocking(audio_capture::AudioCaptureManager::list_devices)
+            .await
+            .map_err(|join_err| AppError::Internal {
+                context: format!("list_devices spawn_blocking join: {join_err}"),
+            })?
+    }
+
     /// Subscribe to `AppEvent` broadcasts.
     ///
     /// Emitted events include `StateChanged` on every transition and

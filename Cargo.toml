@@ -39,7 +39,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", 
 tracing-appender = "0.2"
 
 # Opus encoder (Phase 1 persistence). audiopus = bindings to libopus.
-audiopus = "0.3"
+# audiopus 0.3.x is pre-release ("0.3.0-rc.0"); Cargo's semver doesn't
+# resolve pre-releases from a "0.3" constraint, so the explicit
+# rc tag is required at the workspace level.
+audiopus = "0.3.0-rc.0"
 ogg = "0.9"
 
 # Tauri 2.x — pinned to Handy's verified versions.

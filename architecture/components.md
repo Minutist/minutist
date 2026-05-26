@@ -188,6 +188,11 @@ The only component allowed to write to the model directory.
 **Owns:** the per-meeting folder layout, the libsql index schema and
 migrations, Opus audio encoding, Tiptap JSON I/O.
 
+**Opus encoder pin.** `audiopus = "0.3.0-rc.0"` (the explicit pre-release
+tag is required at workspace level; Cargo's semver does not resolve
+pre-releases from a `"0.3"` constraint). Container is Ogg via the `ogg`
+crate. Phase 1 writes 16 kHz mono 32 kbps.
+
 **Inputs:** typed write commands from orchestrator and IPC bridge.
 **Outputs:** typed read responses; emits no events itself.
 

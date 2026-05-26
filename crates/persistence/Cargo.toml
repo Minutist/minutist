@@ -11,9 +11,7 @@ authors.workspace = true
 
 [dependencies]
 meeting-app-common = { path = "../common" }
-# audiopus 0.3 is a pre-release; must be pinned explicitly (workspace version
-# "0.3" does not resolve to pre-releases by default in Cargo semver rules).
-audiopus = "0.3.0-rc.0"
+audiopus = { workspace = true }
 chrono = { workspace = true }
 ogg = { workspace = true }
 serde = { workspace = true }

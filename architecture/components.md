@@ -102,8 +102,18 @@ template details required to drive it as ASR.
 **Inputs:** an `AudioChunk`.
 **Outputs:** `Vec<Segment>` for that chunk.
 
-Sub-30s chunks may be padded to 30s — that's a known llama.cpp mtmd
-constraint (see the specification §12). Padding cost is accepted in v1.
+**Encoder-window constraint (confirmed by Phase 0 Spike 1).** mtmd's
+audio encoder uses a fixed 30 s window. Sub-30 s inputs are
+silence-padded internally and the model continues into the padded
+region, hallucinating words that weren't in the audio. The `AsrBackend`
+trait itself is unaffected — implementations handle the constraint.
+
+`orchestrator` is responsible for shaping its calls to this trait
+correctly: VAD chunks shorter than the window must either be (a) batched
+together up to ≥25 s before invoking the backend, (b) padded to 30 s and
+accept the full encode cost per call, or (c) the hallucinated tail must
+be post-filtered. The choice is a Phase-2 design decision — see
+the specification §10 Phase 2.
 
 ### `diarizer`
 **Crate:** `crates/diarizer`

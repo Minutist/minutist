@@ -89,6 +89,26 @@ Events are declared in `common` as enum variants; the IPC bridge owns
 the wire encoding. Adding an event requires updating both the enum and
 the regen step.
 
+## ASR chunking constraint
+
+Phase 0 Spike 1 confirmed that llama.cpp's mtmd audio encoder uses a
+fixed 30 s window. Sub-30 s inputs are silence-padded internally and the
+model hallucinates into the pad. This is binding on every `AsrBackend`
+caller until upstream issue ggml-org/llama.cpp#20914 lands (multi-phase
+streaming work; not in v1's timeframe).
+
+The orchestrator must shape VAD chunks to ≥25 s before invoking
+`AsrBackend::transcribe_chunk`. The default strategy in
+Phase 2 is **batched-VAD**: collect VAD segments into a buffer until
+the buffer reaches 25-30 s of audio or a configurable maximum latency
+window has elapsed, then dispatch. The latency window default is the
+FR-7 budget (10 s post-utterance), which on long-utterance audio
+gracefully degrades to "transcribe-on-stop."
+
+Alternative strategies (pad-to-30s-per-call, post-filter hallucinated
+tail) are documented in Spike 1's README as fallbacks if batched-VAD's
+latency profile is unacceptable.
+
 ## Model lifecycle
 
 Owned by `model-registry`. The contract:

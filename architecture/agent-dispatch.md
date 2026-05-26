@@ -197,6 +197,14 @@ Report:
   this is fine; do not work around the dependency table).
 - Any case where the locked interface in common didn't fit — these
   are architecture issues, escalate rather than work around.
+
+Commit before reporting completion:
+- Stage and commit all your work in the worktree before you report
+  back. Use conventional-commit messages. Linear history is required;
+  each commit must build cleanly on its own. The main session expects
+  to fast-forward your branch onto main; uncommitted work in the
+  worktree forces the main session to stage + commit on your behalf,
+  which loses your authorship and makes review harder.
 ```
 
 ### Template — webview component development

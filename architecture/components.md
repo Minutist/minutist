@@ -272,6 +272,18 @@ lifetime. Wires the components into a running app.
 The thinnest crate — code here should mostly be construction and
 plumbing.
 
+**Tracing:** file appender at `{app-data}/logs/meeting-app.log`, rotated
+daily, 7-day retention via startup cleanup. Console layer in debug builds
+only. `RUST_LOG`-style filtering via `EnvFilter::from_default_env()`.
+
+**Tray menu:** "Open meeting-app" (show/focus main window) + "Quit"
+(`app.exit(0)`). Left-click on the tray icon shows the main window.
+Window close intercepts `CloseRequested` and hides rather than exits.
+
+**Bindings harness:** `cargo run -p meeting-app --bin generate-bindings`
+(alias: `cargo gen-bindings`) writes `ui/src/ipc/bindings.ts` without
+starting the GUI. Run after any `ipc-bridge` command/event surface change.
+
 ## Webview components
 
 The webview is small enough that ownership maps to directories rather

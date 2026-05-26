@@ -1,0 +1,2 @@
+[alias]
+gen-bindings = "run -p meeting-app --bin generate-bindings"

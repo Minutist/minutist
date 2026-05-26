@@ -13,6 +13,34 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 clap = { workspace = true }
 hound = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 meeting-app-common = { path = "../../crates/common" }
+
+# Same pin as Spike 1 (see spikes/asr/Cargo.toml). The mtmd feature is
+# required for the audio path; defaults are off because the workspace is
+# CPU-only on WSL Linux for Phase 0.
+llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["mtmd"] }
+
+# vad-rs pinned to the same commit Handy ships with
+# (Handy's Cargo.lock: `git+https://github.com/cjpais/vad-rs#2a412ed858695b9251f3f5a1a20d95b59fa7c498`).
+# Pinning by SHA per Phase 0 Spike 3. Disable default features so we
+# avoid the `helpers` feature's pull on `ebur128` + `samplerate` (Phase 0
+# resamples in Rust if needed, and the fixture is already 16 kHz).
+vad-rs = { git = "https://github.com/cjpais/vad-rs", rev = "2a412ed858695b9251f3f5a1a20d95b59fa7c498", default-features = false }
+
+# Same crates.io versions Handy uses (src-tauri/Cargo.toml:51-58).
+# cpal/rubato aren't actually used by this spike (WAV-only, no live
+# capture, no resampling — the fixture is 16 kHz mono) but Phase 0
+# Spike 3 calls them out for pin alignment with Phase 1's audio-capture
+# crate. Including only what's actually compiled in to keep the spike's
+# binary small.
+
+# Bounded channels for the WAV-reader → VAD → ASR pipeline.
+# Aligns with cross-cutting.md's "no unbounded channels" rule even
+# though spikes are exempt.
+crossbeam-channel = "0.5"
+
+encoding_rs = "0.8"

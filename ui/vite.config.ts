@@ -1,0 +1,25 @@
+/// <reference types="vitest" />
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react()],
+  clearScreen: false,
+  server: {
+    port: 5173,
+    strictPort: true,
+  },
+  envPrefix: ["VITE_", "TAURI_"],
+  build: {
+    target: "es2022",
+    // Tauri uses Chromium on Windows and WebKit on macOS and Linux
+    minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
+    sourcemap: !!process.env.TAURI_DEBUG,
+  },
+  test: {
+    globals: true,
+    environment: "jsdom",
+    setupFiles: ["./src/__tests__/setup.ts"],
+  },
+});

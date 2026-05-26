@@ -301,6 +301,16 @@ The webview's source of truth for typed messages is the generated
 `bindings.ts` produced by tauri-specta. Hand-edits to that file are not
 allowed.
 
+**Phase 1 implementation notes (Stream G).**
+The Zustand store shape is defined in `ui/src/state/recording.ts` as
+`RecordingStore` with fields `state`, `devices`, `selectedDeviceId`,
+`meter`, and `lastError` plus async action methods and a synchronous
+`handleEvent` dispatcher. The global `"app-event-payload"` event listener
+is mounted once in `App.tsx` via the `useAppEventBridge` hook
+(`ui/src/shell/event-listener.tsx`); it must not be placed inside a
+conditionally-rendered subtree. The Vite dev server runs on port 5173
+(matching `tauri.conf.json` `devUrl`).
+
 ## What lives where — quick reference
 
 - **Editing audio capture buffer size:** `audio-capture` crate.

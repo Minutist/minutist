@@ -57,12 +57,17 @@ update in the same commit.
 
 ### `common`
 **Crate:** `crates/common`
-**Owns:** shared types (`Segment`, `AudioChunk`, `MeetingId`,
-`MeetingMeta`), trait definitions (`AsrBackend`, `Diarizer`,
-`Summariser`), shared error types.
+**Owns:** shared types (`MeetingId`, `ModelId`, `AudioChunk`, `Segment`,
+`WordTimestamp`, `MeetingMeta`, `ModelDescriptor`, `RecordingState`,
+`AppEvent`), trait definitions (`AsrBackend`, `Diarizer`, `Summariser`),
+the shared `AppError` enum + `AppResult<T>` alias.
 
-**Stable surface.** Changes here ripple to every other crate. Treat as
-the architectural contract — bumping it is a coordinated change.
+**Stable surface — locked.** The trait signatures and event variants in
+this crate are the architectural contract that sub-agents implement
+against in parallel. Changes here ripple to every other crate and
+require an architecture-owner decision plus an update to this document
+in the same commit. See [`agent-dispatch.md`](agent-dispatch.md) —
+"Prerequisites for parallel dispatch".
 
 ### `audio-capture`
 **Crate:** `crates/audio-capture`

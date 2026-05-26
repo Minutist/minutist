@@ -15,6 +15,9 @@ interfaces, and ownership.
    model lifecycle, IPC contract. Concerns that touch every component.
 5. [`domain-ownership.md`](domain-ownership.md) — which crate belongs to
    which agent role, what dependencies are allowed, what isn't.
+6. [`agent-dispatch.md`](agent-dispatch.md) — how to hand work to
+   sub-agents: role-to-subagent mapping, dispatch prompt templates,
+   worktree isolation, fan-out planning, anti-patterns to refuse.
 
 ## Authoritative artefacts
 

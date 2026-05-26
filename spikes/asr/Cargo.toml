@@ -16,3 +16,15 @@ hound = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 meeting-app-common = { path = "../../crates/common" }
+
+# Pin llama-cpp-2 exactly. Feature `mtmd` enables the multimodal C++ bindings
+# (image + audio). CPU-only build on WSL Linux for Phase 0; Vulkan/CUDA are
+# follow-ups validated by the user on native Windows.
+#
+# 0.1.146 is the latest stable on crates.io as of 2026-05 and exposes the
+# full mtmd surface used here (MtmdContext, MtmdBitmap::from_audio_data,
+# MtmdInputChunks::eval_chunks). See README for the resolved llama.cpp SHA.
+llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["mtmd"] }
+
+encoding_rs = "0.8"
+sha2 = "0.10"

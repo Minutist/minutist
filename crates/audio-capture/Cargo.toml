@@ -5,11 +5,17 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Phase 1 Stream A skeleton. The audio-engineer fills this in;
-# do not edit dependencies in the workspace Cargo.toml.
-
 [dependencies]
 meeting-app-common = { path = "../common" }
-serde = { workspace = true }
-thiserror = { workspace = true }
+cpal = { workspace = true }
+rubato = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[features]
+test-source = []

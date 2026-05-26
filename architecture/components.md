@@ -82,6 +82,10 @@ internal sample rate (**16 kHz mono — mandated; this matches mtmd's
 encoder input rate per Spike 1's Q-P0-1**, so downstream consumers do
 not resample).
 
+**Back-pressure policy:** the cpal-callback→forwarder channel is bounded
+at 8 frames (drop-oldest with `tracing::warn!` on overflow); meter window
+is 512 samples (~32 ms at 16 kHz, ~30 Hz emission rate).
+
 ### `vad-chunker`
 **Crate:** `crates/vad-chunker`
 **Owns:** Silero VAD model lifecycle (via `vad-rs`), the smoothing

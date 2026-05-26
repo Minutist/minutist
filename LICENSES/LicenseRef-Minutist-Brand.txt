@@ -1,0 +1,9 @@
+Minutist brand assets
+
+The Minutist name, logo, and application icons are trademarks of Andrew
+Leech and are not licensed under the project's code licence. All rights
+reserved. They are included in this repository solely so that official
+builds carry the official branding. See TRADEMARKS.md for the permitted
+uses (nominative reference, unmodified redistribution of official
+releases); forks and derivative works must replace these assets and use a
+different name.

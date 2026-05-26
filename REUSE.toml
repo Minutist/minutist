@@ -1,0 +1,25 @@
+# REUSE Specification 3.2 licensing map (https://reuse.software/spec/).
+#
+# A single closest-precedence annotation covers the whole tree rather than
+# per-file SPDX headers; a file's own header (where one exists) wins over
+# this map. The annotation is deliberately name-agnostic: it covers the
+# project under both its production name (Minutist) and its original
+# working name (meeting-app), and it is carried through the full git
+# history so every commit's tree is licensed identically.
+
+version = 1
+
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Andrew Leech <andrew@alelec.net>"
+SPDX-License-Identifier = "AGPL-3.0-only"
+
+# Brand assets are NOT under the code licence: the name, logo, and app
+# icons are trademark-reserved (see TRADEMARKS.md). Later entries win for
+# the same path.
+[[annotations]]
+path = ["brand/**", "src-tauri/icons/**"]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright (C) 2026 Andrew Leech <andrew@alelec.net>"
+SPDX-License-Identifier = "LicenseRef-Minutist-Brand"

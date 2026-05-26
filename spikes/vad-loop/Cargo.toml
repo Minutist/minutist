@@ -1,0 +1,18 @@
+[package]
+name = "spike-vad-loop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "spike-vad-loop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+hound = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+meeting-app-common = { path = "../../crates/common" }

@@ -2339,6 +2339,7 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+ "specta",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -3809,6 +3810,7 @@ dependencies = [
  "meeting-app-common",
  "serde",
  "serde_json",
+ "specta",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

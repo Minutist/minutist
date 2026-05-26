@@ -14,28 +14,23 @@
 //! All commands return `Result<T, IpcError>`.  The `?` operator on
 //! `AppResult<T>` automatically converts via `IpcError::from(AppError)`.
 //!
-//! ## Type mirror note
+//! ## Specta types
 //!
-//! Command signatures use specta-typed mirror types from `specta_types`
-//! (e.g. `AudioDeviceType`, `MeetingIdType`) instead of the `common` /
-//! `settings` originals, because those originals do not implement
-//! `specta::Type`.  The conversion is transparent — same JSON wire shape.
-//! See `specta_types.rs` for details.
+//! `common` and `settings` derive `specta::Type` directly (gated on the
+//! `specta` feature, which this crate enables on both deps). The mirror
+//! layer that Phase 1 carried in `specta_types.rs` was removed in P0a;
+//! commands return `common` / `settings` types directly.
 //!
 //! ## Tauri State
 //!
 //! Each command that needs the orchestrator or settings receives its handles
 //! as `tauri::State<'_, IpcState>`.
 
+use meeting_app_common::{AudioDevice, MeetingId, MeetingMeta, RecordingState};
+use settings::Settings;
 use tauri::State;
 
-use crate::{
-    error::IpcError,
-    specta_types::{
-        AudioDeviceType, MeetingIdType, MeetingMetaType, RecordingStateType, SettingsType,
-    },
-    IpcState,
-};
+use crate::{error::IpcError, IpcState};
 
 // ---------------------------------------------------------------------------
 // Device enumeration
@@ -49,13 +44,12 @@ use crate::{
 /// `audio-capture`.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_devices(state: State<'_, IpcState>) -> Result<Vec<AudioDeviceType>, IpcError> {
-    let devices = state
+pub async fn list_devices(state: State<'_, IpcState>) -> Result<Vec<AudioDevice>, IpcError> {
+    state
         .orchestrator
         .list_devices()
         .await
-        .map_err(IpcError::from)?;
-    Ok(devices.into_iter().map(AudioDeviceType::from).collect())
+        .map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -73,13 +67,12 @@ pub async fn list_devices(state: State<'_, IpcState>) -> Result<Vec<AudioDeviceT
 pub async fn start_recording(
     device_id: Option<String>,
     state: State<'_, IpcState>,
-) -> Result<MeetingIdType, IpcError> {
-    let meeting_id = state
+) -> Result<MeetingId, IpcError> {
+    state
         .orchestrator
         .start(device_id)
         .await
-        .map_err(IpcError::from)?;
-    Ok(meeting_id.into())
+        .map_err(IpcError::from)
 }
 
 /// Pause the current recording.
@@ -101,9 +94,8 @@ pub async fn resume_recording(state: State<'_, IpcState>) -> Result<(), IpcError
 /// Returns the completed `MeetingMeta` on success.
 #[tauri::command]
 #[specta::specta]
-pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMetaType, IpcError> {
-    let meta = state.orchestrator.stop().await.map_err(IpcError::from)?;
-    Ok(meta.into())
+pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, IpcError> {
+    state.orchestrator.stop().await.map_err(IpcError::from)
 }
 
 /// Return a snapshot of the current recording state.
@@ -111,8 +103,8 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMetaTyp
 #[specta::specta]
 pub async fn get_recording_state(
     state: State<'_, IpcState>,
-) -> Result<RecordingStateType, IpcError> {
-    Ok(state.orchestrator.state().await.into())
+) -> Result<RecordingState, IpcError> {
+    Ok(state.orchestrator.state().await)
 }
 
 // ---------------------------------------------------------------------------
@@ -122,8 +114,8 @@ pub async fn get_recording_state(
 /// Return the current application settings.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_settings(state: State<'_, IpcState>) -> Result<SettingsType, IpcError> {
-    Ok(state.settings.current().into())
+pub async fn get_settings(state: State<'_, IpcState>) -> Result<Settings, IpcError> {
+    Ok(state.settings.current())
 }
 
 /// Persist updated application settings.
@@ -132,13 +124,12 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<SettingsType, Ip
 #[tauri::command]
 #[specta::specta]
 pub async fn update_settings(
-    settings: SettingsType,
+    settings: Settings,
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
-    let new_settings: settings::Settings = settings.into();
     state
         .settings
-        .update(|s| *s = new_settings)
+        .update(|s| *s = settings)
         .await
         .map_err(IpcError::from)
 }

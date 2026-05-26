@@ -7,8 +7,16 @@ authors.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+specta = { workspace = true, optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[features]
+default = []
+# Gates `specta::Type` derives on every IPC-crossing type. Enabled by
+# `ipc-bridge` so tauri-specta can generate the TypeScript bindings
+# directly from these types — eliminates the Phase 1 mirror layer.
+specta = ["dep:specta"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

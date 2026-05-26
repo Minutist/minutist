@@ -9,9 +9,9 @@ authors.workspace = true
 # See architecture/domain-ownership.md — `ipc-bridge` / `systems-engineer` role.
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+meeting-app-common = { path = "../common", features = ["specta"] }
 orchestrator = { path = "../orchestrator" }
-settings = { path = "../settings" }
+settings = { path = "../settings", features = ["specta"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 specta = { workspace = true }

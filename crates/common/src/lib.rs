@@ -22,7 +22,14 @@ use uuid::Uuid;
 /// Stable identifier for a meeting on disk. UUIDv4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MeetingId(pub Uuid);
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
+pub struct MeetingId(
+    // Use `#[specta(type = String)]` so the TS binding mirrors how serde
+    // emits a Uuid (a hyphenated lowercase string) without needing the
+    // optional `uuid` feature on the `specta` crate.
+    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
+);
 
 impl MeetingId {
     pub fn new() -> Self {
@@ -42,6 +49,8 @@ impl Default for MeetingId {
 /// `"silero-vad-v4"`, `"sherpa-pyannote-segmentation-3-0"`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
 pub struct ModelId(pub String);
 
 impl From<&str> for ModelId {
@@ -72,6 +81,7 @@ pub struct AudioChunk {
 /// Speaker is populated by the `Diarizer` impl post-hoc; ASR backends
 /// leave it `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Segment {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -86,6 +96,7 @@ pub struct Segment {
 
 /// Optional per-word timestamp data when the ASR model supports it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct WordTimestamp {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -100,6 +111,7 @@ pub struct WordTimestamp {
 /// display label; `is_default` reflects the OS's default-input choice at
 /// query time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct AudioDevice {
     pub id: String,
     pub name: String,
@@ -113,6 +125,7 @@ pub struct AudioDevice {
 /// over the same window. Consumers may render either; both are cheap to
 /// compute alongside capture.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct AudioMeterFrame {
     pub peak: f32,
     pub rms: f32,
@@ -121,6 +134,7 @@ pub struct AudioMeterFrame {
 /// Audio-file format descriptor captured at write time. Phase 1 writes
 /// Opus 16 kHz mono; downstream phases re-decode using these fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct AudioFormat {
     pub codec: String,
     pub sample_rate: u32,
@@ -138,6 +152,7 @@ pub struct AudioFormat {
 /// Timestamps are ISO 8601 strings to avoid pulling `chrono` into `common`.
 /// Consumers parse as needed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct MeetingMeta {
     pub uuid: MeetingId,
     pub title: String,
@@ -153,6 +168,7 @@ pub struct MeetingMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct ModelDescriptor {
     pub name: String,
     pub quantisation: Option<String>,
@@ -176,6 +192,7 @@ pub struct ModelDescriptor {
 /// `_ms` suffix without the `_at` infix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum RecordingState {
     Idle,
     Recording {
@@ -203,6 +220,7 @@ pub enum RecordingState {
 /// IPC client (decoder), and re-running the bindings generation step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum AppEvent {
     /// Audio meter sample emitted at ~30 Hz while recording. Carries both
     /// peak and RMS so the UI can pick the rendering it wants without an
@@ -251,6 +269,7 @@ pub enum AppEvent {
 /// removing a variant is a breaking IPC change.
 #[derive(Debug, Clone, thiserror::Error, Serialize, Deserialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum AppError {
     #[error("I/O error: {context}")]
     Io { context: String },

@@ -33,6 +33,7 @@ pub use store::{JsonFileStore, SettingsStore};
 /// UI colour-scheme preference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum Theme {
     Light,
     Dark,
@@ -47,6 +48,7 @@ pub enum Theme {
 /// Do **not** add ASR model selection, summary system-prompt, autosave
 /// interval, or telemetry fields here — those are Phase 2+ concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Settings {
     /// The preferred audio-input device, identified by the opaque id
     /// returned by `audio-capture::AudioCaptureManager::list_devices`.
@@ -60,7 +62,12 @@ pub struct Settings {
 
     /// Root directory for meeting data.  `None` means "use the platform
     /// default app-data directory" (resolved by `app-main`).
+    ///
+    /// `specta` lacks a built-in `Type` impl for `PathBuf`; the explicit
+    /// `#[specta(type = Option<String>)]` hint preserves the same wire
+    /// shape (UTF-8 path string or `null`) the manual mirror produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "specta", specta(type = Option<String>))]
     pub data_directory: Option<PathBuf>,
 
     /// If `true`, the main window starts hidden; accessible via the tray icon.

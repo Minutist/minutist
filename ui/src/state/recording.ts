@@ -8,24 +8,24 @@
 import { create } from "zustand";
 import { commands, unwrap, ipcErrorMessage } from "../ipc/client";
 import type {
-  RecordingStateType,
-  AudioDeviceType,
-  AppEventType,
-  SettingsType,
+  RecordingState,
+  AudioDevice,
+  AppEvent,
+  Settings,
 } from "../ipc/bindings";
 
-export type { RecordingStateType, AudioDeviceType, AppEventType, SettingsType };
+export type { RecordingState, AudioDevice, AppEvent, Settings };
 
 export type RecordingStore = {
-  state: RecordingStateType;
-  devices: AudioDeviceType[];
+  state: RecordingState;
+  devices: AudioDevice[];
   selectedDeviceId: string | null;
   /**
    * Persisted settings snapshot. Populated on mount via `refreshSettings`;
    * mutations from the UI go through `setSelectedDevice` (etc.) and write
    * back via `commands.updateSettings`.
    */
-  settings: SettingsType | null;
+  settings: Settings | null;
   meter: { peak: number; rms: number };
   lastError: string | null;
 
@@ -38,7 +38,7 @@ export type RecordingStore = {
   stop: () => Promise<void>;
   setSelectedDevice: (id: string | null) => Promise<void>;
   /** Dispatcher called by the global event listener. */
-  handleEvent: (event: AppEventType) => void;
+  handleEvent: (event: AppEvent) => void;
 };
 
 export const useRecordingStore = create<RecordingStore>((set, get) => ({
@@ -128,7 +128,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       // call after settings load will persist.
       return;
     }
-    const next: SettingsType = { ...current, input_device_id: id };
+    const next: Settings = { ...current, input_device_id: id };
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

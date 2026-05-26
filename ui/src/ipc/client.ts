@@ -8,7 +8,7 @@
 import { events, commands } from "./bindings";
 import type {
   AppEventPayload,
-  AppEventType,
+  AppEvent,
   IpcError,
   Result,
 } from "./bindings";
@@ -17,7 +17,7 @@ import type {
 export { commands };
 
 // Re-export types that callers commonly need.
-export type { AppEventPayload, AppEventType, IpcError, Result };
+export type { AppEventPayload, AppEvent, IpcError, Result };
 
 // ---------------------------------------------------------------------------
 // Typed listen helper
@@ -38,7 +38,7 @@ export type { AppEventPayload, AppEventType, IpcError, Result };
  * ```
  */
 export async function listenAppEvents(
-  callback: (event: AppEventType) => void,
+  callback: (event: AppEvent) => void,
 ): Promise<() => void> {
   return events.appEventPayload.listen((tauriEvent) => {
     callback(tauriEvent.payload);

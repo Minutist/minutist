@@ -49,9 +49,9 @@ vi.mock("../ipc/bindings", () => {
 
 import { commands } from "../ipc/bindings";
 import { useRecordingStore } from "../state/recording";
-import type { SettingsType } from "../ipc/bindings";
+import type { Settings } from "../ipc/bindings";
 
-const okSettings = (s: SettingsType) =>
+const okSettings = (s: Settings) =>
   Promise.resolve({ status: "ok" as const, data: s });
 
 const okVoid = Promise.resolve({ status: "ok" as const, data: null });
@@ -70,7 +70,7 @@ describe("device-picker persistence", () => {
   });
 
   it("refreshSettings populates store from getSettings", async () => {
-    const stored: SettingsType = {
+    const stored: Settings = {
       input_device_id: "hw:1,0",
       theme: "dark",
       data_directory: null,
@@ -86,7 +86,7 @@ describe("device-picker persistence", () => {
   });
 
   it("setSelectedDevice persists via updateSettings", async () => {
-    const initial: SettingsType = {
+    const initial: Settings = {
       input_device_id: null,
       theme: "system",
       data_directory: null,
@@ -120,7 +120,7 @@ describe("device-picker persistence", () => {
   });
 
   it("updateSettings failure surfaces via lastError but does not clobber the local selection", async () => {
-    const initial: SettingsType = {
+    const initial: Settings = {
       input_device_id: null,
       theme: "system",
       data_directory: null,

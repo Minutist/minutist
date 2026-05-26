@@ -1,12 +1,12 @@
 import { useRecordingStore } from "../state/recording";
-import type { RecordingStateType } from "../ipc/bindings";
+import type { RecordingState } from "../ipc/bindings";
 
 /**
  * Returns per-button enabled flags derived from the current recording state.
  *
  * Exported for use in unit tests without requiring the Zustand store.
  */
-export function deriveButtonStates(state: RecordingStateType) {
+export function deriveButtonStates(state: RecordingState) {
   const isIdle = state.kind === "idle";
   const isRecording = state.kind === "recording";
   const isPaused = state.kind === "paused";

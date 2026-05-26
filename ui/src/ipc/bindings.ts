@@ -13,7 +13,7 @@ export const commands = {
  * dependency table honest: it depends on `orchestrator`, not directly on
  * `audio-capture`.
  */
-async listDevices() : Promise<Result<AudioDeviceType[], IpcError>> {
+async listDevices() : Promise<Result<AudioDevice[], IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_devices") };
 } catch (e) {
@@ -29,7 +29,7 @@ async listDevices() : Promise<Result<AudioDeviceType[], IpcError>> {
  * 
  * Returns the new `MeetingId` on success.
  */
-async startRecording(deviceId: string | null) : Promise<Result<MeetingIdType, IpcError>> {
+async startRecording(deviceId: string | null) : Promise<Result<MeetingId, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_recording", { deviceId }) };
 } catch (e) {
@@ -64,7 +64,7 @@ async resumeRecording() : Promise<Result<null, IpcError>> {
  * 
  * Returns the completed `MeetingMeta` on success.
  */
-async stopRecording() : Promise<Result<MeetingMetaType, IpcError>> {
+async stopRecording() : Promise<Result<MeetingMeta, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_recording") };
 } catch (e) {
@@ -75,7 +75,7 @@ async stopRecording() : Promise<Result<MeetingMetaType, IpcError>> {
 /**
  * Return a snapshot of the current recording state.
  */
-async getRecordingState() : Promise<Result<RecordingStateType, IpcError>> {
+async getRecordingState() : Promise<Result<RecordingState, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_recording_state") };
 } catch (e) {
@@ -86,7 +86,7 @@ async getRecordingState() : Promise<Result<RecordingStateType, IpcError>> {
 /**
  * Return the current application settings.
  */
-async getSettings() : Promise<Result<SettingsType, IpcError>> {
+async getSettings() : Promise<Result<Settings, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_settings") };
 } catch (e) {
@@ -99,7 +99,7 @@ async getSettings() : Promise<Result<SettingsType, IpcError>> {
  * 
  * Broadcasts the change to all `SettingsHandle` subscribers.
  */
-async updateSettings(settings: SettingsType) : Promise<Result<null, IpcError>> {
+async updateSettings(settings: Settings) : Promise<Result<null, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_settings", { settings }) };
 } catch (e) {
@@ -125,38 +125,95 @@ appEventPayload: "app-event-payload"
 /** user-defined types **/
 
 /**
- * Typed wrapper that gives `AppEventType` a stable tauri-specta event name.
+ * The shared error type that crosses crate boundaries.
  * 
- * The `Event` derive assigns the wire name `"app-event-payload"`.
- * The serde shape is identical to `common::AppEvent` because `AppEventType`
- * is a full mirror of `AppEvent`.
+ * Per-crate `Error` enums (defined with `thiserror` in their owning
+ * crate) provide structured `From` impls into `AppError`. The webview
+ * only ever sees `AppError`. Variants have stable discriminants — the
+ * TypeScript binding is generated from this enum, so renaming or
+ * removing a variant is a breaking IPC change.
+ */
+export type AppError = { code: "io"; context: string } | { code: "model_load"; model_id: string; context: string } | { code: "model_not_found"; model_id: string } | { code: "model_download"; context: string } | { code: "inference"; backend: string; context: string } | { code: "invalid_input"; context: string } | { code: "cancelled" } | { code: "unsupported"; context: string } | { code: "internal"; context: string }
+/**
+ * Events emitted from the Rust core to the webview via tauri-specta.
  * 
- * Once `common` gains `specta::Type` derives, this type can be replaced
- * by registering `AppEvent` directly in `collect_events!`.
+ * Adding a variant requires updating `ipc-bridge` (encoder), the webview
+ * IPC client (decoder), and re-running the bindings generation step.
  */
-export type AppEventPayload = AppEventType
+export type AppEvent = 
 /**
- * specta-typed mirror of `common::AppEvent`.
+ * Audio meter sample emitted at ~30 Hz while recording. Carries both
+ * peak and RMS so the UI can pick the rendering it wants without an
+ * extra round-trip.
+ */
+{ kind: "audio_meter"; frame: AudioMeterFrame } | 
+/**
+ * The available audio-input device list changed (hotplug or default
+ * device switch). The webview should re-query `list_devices`.
+ */
+{ kind: "devices_changed" } | 
+/**
+ * Recording state changed.
+ */
+{ kind: "state_changed"; state: RecordingState } | 
+/**
+ * A new transcript segment was produced.
+ */
+{ kind: "transcript_segment"; meeting_id: MeetingId; segment: Segment } | 
+/**
+ * Diarization finished assigning speakers to a meeting's segments.
+ */
+{ kind: "diarization_complete"; meeting_id: MeetingId; speaker_count: number } | 
+/**
+ * Summary generation finished; `summary.md` now exists for this meeting.
+ */
+{ kind: "summary_ready"; meeting_id: MeetingId } | 
+/**
+ * Model download progress, used by the first-run flow.
+ */
+{ kind: "model_download_progress"; model_id: ModelId; bytes_done: number; bytes_total: number | null } | 
+/**
+ * User-visible settings changed; subscribers should re-read.
+ */
+{ kind: "settings_changed" } | 
+/**
+ * A recoverable error occurred during a background task. The pipeline
+ * continues; the webview shows a notification.
+ */
+{ kind: "error_occurred"; error: AppError }
+/**
+ * Typed wrapper that gives `AppEvent` a stable tauri-specta event name.
  * 
- * This is the fully-typed version of the event payload, using the mirror
- * types above.  The `AppEventPayload` wrapper in `events.rs` serialises
- * `AppEvent` via `serde` and then deserialises into this type's shape;
- * the JSON wire representations are identical because both are derived from
- * the same serde attributes.
+ * The `Event` derive assigns the wire name `"app-event-payload"`. The
+ * `#[serde(transparent)]` attribute means the wrapper is invisible on the
+ * wire — the JSON shape is exactly `AppEvent`'s own tagged-enum
+ * representation.
  */
-export type AppEventType = { kind: "audio_meter"; frame: AudioMeterFrameType } | { kind: "devices_changed" } | { kind: "state_changed"; state: RecordingStateType } | { kind: "transcript_segment"; meeting_id: MeetingIdType; segment: SegmentType } | { kind: "diarization_complete"; meeting_id: MeetingIdType; speaker_count: number } | { kind: "summary_ready"; meeting_id: MeetingIdType } | { kind: "model_download_progress"; model_id: string; bytes_done: number; bytes_total: number | null } | { kind: "settings_changed" } | { kind: "error_occurred"; error: IpcErrorType }
+export type AppEventPayload = AppEvent
 /**
- * specta-typed mirror of `common::AudioDevice`.
+ * One audio-input device exposed to the device-picker UI.
+ * 
+ * `id` is a stable, opaque string the IPC layer round-trips back to
+ * `audio-capture` to select the device. Format is implementation-defined
+ * (cpal device-name plus host index on the Rust side). `name` is the
+ * display label; `is_default` reflects the OS's default-input choice at
+ * query time.
  */
-export type AudioDeviceType = { id: string; name: string; is_default: boolean }
+export type AudioDevice = { id: string; name: string; is_default: boolean }
 /**
- * specta-typed mirror of `common::AudioFormat`.
+ * Audio-file format descriptor captured at write time. Phase 1 writes
+ * Opus 16 kHz mono; downstream phases re-decode using these fields.
  */
-export type AudioFormatType = { codec: string; sample_rate: number; channels: number; bitrate_kbps: number | null }
+export type AudioFormat = { codec: string; sample_rate: number; channels: number; bitrate_kbps?: number | null }
 /**
- * specta-typed mirror of `common::AudioMeterFrame`.
+ * One audio-meter sample emitted at ~30 Hz while recording.
+ * 
+ * `peak` is the maximum absolute sample magnitude in [0.0, 1.0] over the
+ * most-recent meter window (~33 ms of audio). `rms` is the root-mean-square
+ * over the same window. Consumers may render either; both are cheap to
+ * compute alongside capture.
  */
-export type AudioMeterFrameType = { peak: number; rms: number }
+export type AudioMeterFrame = { peak: number; rms: number }
 /**
  * Error type returned from every Tauri command in `ipc-bridge`.
  * 
@@ -166,60 +223,88 @@ export type AudioMeterFrameType = { peak: number; rms: number }
  */
 export type IpcError = { code: "io"; context: string } | { code: "model_load"; model_id: string; context: string } | { code: "model_not_found"; model_id: string } | { code: "model_download"; context: string } | { code: "inference"; backend: string; context: string } | { code: "invalid_input"; context: string } | { code: "cancelled" } | { code: "unsupported"; context: string } | { code: "internal"; context: string }
 /**
- * specta-typed mirror of `common::AppError` for embedding in events.
+ * Stable identifier for a meeting on disk. UUIDv4.
+ */
+export type MeetingId = string
+/**
+ * Per-meeting metadata persisted as `metadata.json`.
  * 
- * Identical shape to `error::IpcError` but kept separate to avoid a
- * circular dependency in the specta type graph (IpcError appears in command
- * results; IpcErrorType appears inside the AppEventType::ErrorOccurred
- * variant).
+ * Timestamps are ISO 8601 strings to avoid pulling `chrono` into `common`.
+ * Consumers parse as needed.
  */
-export type IpcErrorType = { code: "io"; context: string } | { code: "model_load"; model_id: string; context: string } | { code: "model_not_found"; model_id: string } | { code: "model_download"; context: string } | { code: "inference"; backend: string; context: string } | { code: "invalid_input"; context: string } | { code: "cancelled" } | { code: "unsupported"; context: string } | { code: "internal"; context: string }
+export type MeetingMeta = { uuid: MeetingId; title: string; started_at: string; ended_at: string | null; duration_ms: number; speaker_count: number; audio_format: AudioFormat; asr_model: ModelDescriptor | null; llm_model: ModelDescriptor | null; diarizer: ModelDescriptor | null; app_version: string }
+export type ModelDescriptor = { name: string; quantisation: string | null; version: string }
 /**
- * specta-typed mirror of `common::MeetingId`.
+ * Stable identifier for a model in the registry.
  * 
- * Represented as a transparent `String` because `Uuid` does not implement
- * `specta::Type` in the workspace-pinned version of specta (rc.22 requires
- * the "uuid" feature which would need a workspace Cargo.toml edit).  The
- * JSON wire representation is identical — `Uuid` serialises as a
- * hyphenated lowercase UUID string.
+ * Examples: `"qwen3-asr-1.7b-q8_0"`, `"qwen2.5-3b-instruct-q4_k_m"`,
+ * `"silero-vad-v4"`, `"sherpa-pyannote-segmentation-3-0"`.
  */
-export type MeetingIdType = string
+export type ModelId = string
 /**
- * specta-typed mirror of `common::MeetingMeta`.
- */
-export type MeetingMetaType = { uuid: MeetingIdType; title: string; started_at: string; ended_at: string | null; duration_ms: number; speaker_count: number; audio_format: AudioFormatType; asr_model: ModelDescriptorType | null; llm_model: ModelDescriptorType | null; diarizer: ModelDescriptorType | null; app_version: string }
-/**
- * specta-typed mirror of `common::ModelDescriptor`.
- */
-export type ModelDescriptorType = { name: string; quantisation: string | null; version: string }
-/**
- * specta-typed mirror of `common::RecordingState`.
- */
-export type RecordingStateType = { kind: "idle" } | { kind: "recording"; meeting_id: MeetingIdType; started_at_ms: number } | { kind: "paused"; meeting_id: MeetingIdType; paused_at_ms: number } | { kind: "stopping"; meeting_id: MeetingIdType }
-/**
- * specta-typed mirror of `common::Segment`.
- */
-export type SegmentType = { start_ms: number; end_ms: number; text: string; speaker_id?: string | null; confidence?: number | null; words: WordTimestampType[] }
-/**
- * specta-typed mirror of `settings::Settings`.
+ * Top-level state of the recording pipeline. Emitted to the webview on
+ * transitions via `AppEvent::StateChanged`.
  * 
- * `data_directory` is mapped to `Option<String>` (PathBuf has no
- * specta::Type impl).  The conversion from `Settings` serialises the path as
- * a UTF-8 string; the reverse parses it back.
+ * **Timestamp semantics:** `started_at_ms` and `paused_at_ms` are
+ * **wall-clock milliseconds since the Unix epoch** (UTC), not
+ * recording-clock offsets. The webview can compute live elapsed-recording
+ * duration as `Date.now() - started_at_ms` (subtracting accumulated
+ * pause-time client-side if needed). Phase-internal timestamps that are
+ * genuinely recording-clock (e.g. `Segment::start_ms`, `AudioChunk::start_ms`)
+ * remain recording-clock — those are a different namespace and carry the
+ * `_ms` suffix without the `_at` infix.
  */
-export type SettingsType = { input_device_id?: string | null; theme?: ThemeType; 
+export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id: MeetingId; started_at_ms: number } | { kind: "paused"; meeting_id: MeetingId; paused_at_ms: number } | { kind: "stopping"; meeting_id: MeetingId }
 /**
- * Serialised form of `Settings::data_directory` (`PathBuf` → `String`).
+ * One transcript segment with optional speaker assignment.
+ * 
+ * Speaker is populated by the `Diarizer` impl post-hoc; ASR backends
+ * leave it `None`.
  */
-data_directory?: string | null; start_hidden?: boolean }
+export type Segment = { start_ms: number; end_ms: number; text: string; speaker_id?: string | null; confidence?: number | null; words: WordTimestamp[] }
 /**
- * specta-typed mirror of `settings::Theme`.
+ * Application settings — Phase 1 fields only.
+ * 
+ * Fields added in later phases live in their respective phase plans.
+ * Do **not** add ASR model selection, summary system-prompt, autosave
+ * interval, or telemetry fields here — those are Phase 2+ concerns.
  */
-export type ThemeType = "light" | "dark" | "system"
+export type Settings = { 
 /**
- * specta-typed mirror of `common::WordTimestamp`.
+ * The preferred audio-input device, identified by the opaque id
+ * returned by `audio-capture::AudioCaptureManager::list_devices`.
+ * `None` means "use the OS default".
  */
-export type WordTimestampType = { start_ms: number; end_ms: number; text: string }
+input_device_id?: string | null; 
+/**
+ * UI colour-scheme preference.
+ */
+theme?: Theme; 
+/**
+ * Root directory for meeting data.  `None` means "use the platform
+ * default app-data directory" (resolved by `app-main`).
+ * 
+ * `specta` lacks a built-in `Type` impl for `PathBuf`; the explicit
+ * `#[specta(type = Option<String>)]` hint preserves the same wire
+ * shape (UTF-8 path string or `null`) the manual mirror produced.
+ */
+data_directory?: string | null; 
+/**
+ * If `true`, the main window starts hidden; accessible via the tray icon.
+ */
+start_hidden?: boolean }
+/**
+ * UI colour-scheme preference.
+ */
+export type Theme = "light" | "dark" | 
+/**
+ * Follow the OS preference (default).
+ */
+"system"
+/**
+ * Optional per-word timestamp data when the ASR model supports it.
+ */
+export type WordTimestamp = { start_ms: number; end_ms: number; text: string }
 
 /** tauri-specta globals **/
 

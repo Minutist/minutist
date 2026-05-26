@@ -54,6 +54,8 @@ tauri-plugin-store = "2.4"
 
 # tauri-specta — pinned to Handy's working set; bumping these is a coordinated
 # architecture-owner change because they gate the IPC contract for every phase.
-specta = "=2.0.0-rc.22"
+# `derive` enables `#[derive(specta::Type)]` when the `specta` feature is
+# activated on `common` / `settings`.
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }
 specta-typescript = "0.0.9"
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }

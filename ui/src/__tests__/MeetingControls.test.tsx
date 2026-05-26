@@ -13,7 +13,7 @@ import { render, screen } from "@testing-library/react";
 import { act } from "react";
 import { MeetingControls } from "../shell/MeetingControls";
 import { useRecordingStore } from "../state/recording";
-import type { RecordingStateType } from "../ipc/bindings";
+import type { RecordingState } from "../ipc/bindings";
 
 // ---------------------------------------------------------------------------
 // Tauri API mocks — must be declared before any module that imports bindings.ts
@@ -35,7 +35,7 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 // Helpers
 // ---------------------------------------------------------------------------
 
-function setRecordingState(state: RecordingStateType) {
+function setRecordingState(state: RecordingState) {
   act(() => {
     useRecordingStore.setState({ state });
   });

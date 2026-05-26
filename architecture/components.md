@@ -70,6 +70,11 @@ require an architecture-owner decision plus an update to this document
 in the same commit. See [`agent-dispatch.md`](agent-dispatch.md) —
 "Prerequisites for parallel dispatch".
 
+**`specta` feature.** All IPC-crossing types derive `specta::Type` behind
+the optional `specta` feature. `ipc-bridge` enables the feature on this
+crate (and on `settings`) so the generated TypeScript bindings consume
+the canonical types directly — no mirror layer.
+
 ### `audio-capture`
 **Crate:** `crates/audio-capture`
 **Owns:** the audio device, sample-rate negotiation, the capture ring

@@ -8,33 +8,30 @@
 //!
 //! | Command | Returns |
 //! |---|---|
-//! | `list_devices` | `Vec<AudioDeviceType>` |
-//! | `start_recording` | `MeetingIdType` |
+//! | `list_devices` | `Vec<AudioDevice>` |
+//! | `start_recording` | `MeetingId` |
 //! | `pause_recording` | `()` |
 //! | `resume_recording` | `()` |
-//! | `stop_recording` | `MeetingMetaType` |
-//! | `get_recording_state` | `RecordingStateType` |
-//! | `get_settings` | `SettingsType` |
+//! | `stop_recording` | `MeetingMeta` |
+//! | `get_recording_state` | `RecordingState` |
+//! | `get_settings` | `Settings` |
 //! | `update_settings` | `()` |
 //!
 //! All commands return `Result<T, IpcError>`.
 //!
-//! ## Type mirrors
+//! ## Specta types
 //!
-//! Types in command signatures use specta-typed mirrors from `specta_types`
-//! (e.g. `AudioDeviceType`, `MeetingIdType`).  This is necessary because
-//! `common` and `settings` do not depend on `specta`, so their types don't
-//! implement `specta::Type`.  When an architecture-owner commit adds
-//! `specta::Type` derives to `common` / `settings`, the mirror types in
-//! `specta_types.rs` and the conversion calls in `commands.rs` can be removed.
+//! `common` and `settings` derive `specta::Type` directly behind their
+//! optional `specta` feature, which `ipc-bridge` enables. The mirror layer
+//! that Phase 1 carried in `specta_types.rs` was removed in P0a; the
+//! generated TS bindings consume the `common` / `settings` types directly.
 //!
 //! ## Events
 //!
-//! `AppEventPayload` is a specta-typed wrapper around `AppEventType`, a full
-//! mirror of `common::AppEvent`.  The event name on the wire is
-//! `"app-event-payload"`.  `spawn_event_forwarder` starts a task that
-//! subscribes to the orchestrator's broadcast channel and emits each event to
-//! all Tauri windows via JSON round-trip through `AppEventType`.
+//! `AppEventPayload` is a `#[serde(transparent)]` newtype around
+//! `common::AppEvent`. The wire name is `"app-event-payload"`.
+//! `spawn_event_forwarder` subscribes to the orchestrator's broadcast
+//! channel and emits each event to all Tauri windows.
 //!
 //! ## Tracing
 //!
@@ -43,7 +40,6 @@
 pub mod commands;
 pub mod error;
 pub mod events;
-pub mod specta_types;
 
 use std::sync::Arc;
 

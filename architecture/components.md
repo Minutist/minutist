@@ -189,6 +189,11 @@ components.
 
 The only component allowed to write to the model directory.
 
+**Manifest:** `resources/models.json` at the repo root (loaded via `include_bytes!`
+in `app-main`). Per-kind cache layout: `{app-data}/models/{asr,llm,diarize}/{model-id}/`.
+Concurrent `ensure(same_id)` calls are coalesced via an `Arc<Notify>` in-flight map
+so each model is downloaded at most once per process lifetime.
+
 ### `persistence`
 **Crate:** `crates/persistence`
 **Owns:** the per-meeting folder layout, the libsql index schema and

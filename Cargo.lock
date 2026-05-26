@@ -1874,8 +1874,12 @@ version = "0.0.0"
 dependencies = [
  "meeting-app-common",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

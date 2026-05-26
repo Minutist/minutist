@@ -209,7 +209,12 @@ decision and needs an architecture-doc update.
 ### `settings`
 **Crate:** `crates/settings`
 **Owns:** the settings schema, validation, change notifications.
-Persisted via `tauri-plugin-store`.
+Backed by a single JSON file (`{app-data}/settings.store`) read/written via
+`serde_json` + `std::fs`; the resolved `PathBuf` is injected by `app-main` at
+construction time (no `tauri::*` in this crate). Change notifications use a
+`tokio::sync::watch` channel (capacity 1; subscribers always see the latest
+value) broadcast directly from `SettingsHandle::update` — not via the
+orchestrator.
 
 Single source of truth for runtime configuration. Other components read
 settings via this crate; nobody else parses the store directly.

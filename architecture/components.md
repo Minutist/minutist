@@ -59,9 +59,10 @@ update in the same commit.
 **Crate:** `crates/common`
 **Owns:** shared types (`MeetingId`, `ModelId`, `AudioChunk`, `Segment`,
 `WordTimestamp`, `MeetingMeta`, `ModelDescriptor`, `RecordingState`,
-`AppEvent`, `AudioDevice`, `AudioMeterFrame`, `AudioFormat`), trait
-definitions (`AsrBackend`, `Diarizer`, `Summariser`), the shared
-`AppError` enum + `AppResult<T>` alias.
+`AppEvent`, `AudioDevice`, `AudioMeterFrame`, `AudioFormat`,
+`ModelKind`, `ModelManifestEntry`, `ModelFileEntry`, `ModelStatusState`,
+`ModelStatus`), trait definitions (`AsrBackend`, `Diarizer`,
+`Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
 
 **Stable surface — locked.** The trait signatures and event variants in
 this crate are the architectural contract that sub-agents implement

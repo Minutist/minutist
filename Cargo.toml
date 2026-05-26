@@ -59,3 +59,26 @@ tauri-plugin-store = "2.4"
 specta = { version = "=2.0.0-rc.22", features = ["derive"] }
 specta-typescript = "0.0.9"
 tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
+
+# Phase 2 additions
+
+# llama.cpp text + audio (mtmd) — Phase 0 Spike 1 verified pin. Used by
+# `asr-runtime` (Phase 2) and `summariser` (Phase 5).
+llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["mtmd"] }
+
+# Silero VAD wrapper — same SHA Handy ships in its Cargo.lock; the Spike 3
+# binding-fidelity finding holds at this commit. Default features
+# (`helpers` = `ebur128` + `samplerate`) disabled — we resample in
+# `audio-capture` (rubato) and EBU loudness is not needed.
+vad-rs = { git = "https://github.com/cjpais/vad-rs", rev = "2a412ed858695b9251f3f5a1a20d95b59fa7c498", default-features = false }
+
+# Download + hash for `model-registry`. rustls-tls avoids pulling OpenSSL
+# on Linux / Windows builds; `stream` is required for chunked download
+# into the SHA-256 hasher.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+sha2 = "0.10"
+futures-util = "0.3"
+
+# `vad-chunker` uses crossbeam-channel for the bounded VAD worker channel
+# (matches the Phase 0 Spike 3 pattern).
+crossbeam-channel = "0.5"

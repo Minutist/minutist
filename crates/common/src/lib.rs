@@ -144,6 +144,89 @@ pub struct AudioFormat {
 }
 
 // ---------------------------------------------------------------------------
+// Model registry
+// ---------------------------------------------------------------------------
+
+/// Coarse model classification — drives the per-kind cache subdirectory
+/// under `{app-data}/models/{kind}/` (see `architecture/cross-cutting.md`
+/// "Filesystem layout").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    Asr,
+    Llm,
+    Diarize,
+}
+
+/// Catalogue entry describing one model the app knows about.
+///
+/// `model-registry` reads this from the bundled `resources/models.json`
+/// at startup and surfaces it (plus runtime state) as `ModelStatus`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ModelManifestEntry {
+    pub id: ModelId,
+    pub kind: ModelKind,
+    pub display_name: String,
+    /// Sibling files that belong to this model, relative to the cache
+    /// dir for this entry. For Qwen3-ASR this lists both the GGUF and
+    /// the mmproj.
+    pub files: Vec<ModelFileEntry>,
+    /// Approximate download size in bytes (sum of `files[*].size`).
+    pub total_size_bytes: u64,
+    /// SPDX licence identifier of the underlying weights ("apache-2.0",
+    /// "openrail", etc.). Surfaced in About dialog (Phase 7) and used to
+    /// gate bundling decisions.
+    pub license: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ModelFileEntry {
+    pub filename: String,
+    pub url: String,
+    pub size: u64,
+    /// Lowercase-hex SHA-256.
+    pub sha256: String,
+}
+
+/// Runtime state of one model on this user's machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ModelStatusState {
+    /// Files are present and hashes match. `local_dir` is the cache
+    /// directory absolute path.
+    Available { local_dir: String },
+    /// Files are missing or partial. `bytes_present` and `bytes_total`
+    /// are summed across the manifest's `files`.
+    Missing {
+        bytes_present: u64,
+        bytes_total: u64,
+    },
+    /// A download is in progress. The webview tracks granular progress
+    /// via `AppEvent::ModelDownloadProgress` events; this state is the
+    /// snapshot at query time.
+    Downloading {
+        bytes_done: u64,
+        bytes_total: u64,
+    },
+    /// A previous download or hash check failed. `message` is a stable
+    /// human-readable string suitable for surfacing in UI.
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ModelStatus {
+    pub id: ModelId,
+    pub kind: ModelKind,
+    pub display_name: String,
+    pub status: ModelStatusState,
+}
+
+// ---------------------------------------------------------------------------
 // Meeting metadata
 // ---------------------------------------------------------------------------
 
@@ -461,6 +544,64 @@ mod tests {
         let e = AppEvent::DevicesChanged;
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"kind\":\"devices_changed\""));
+    }
+
+    #[test]
+    fn model_kind_serialises_snake_case() {
+        let asr = serde_json::to_string(&ModelKind::Asr).unwrap();
+        let llm = serde_json::to_string(&ModelKind::Llm).unwrap();
+        let diar = serde_json::to_string(&ModelKind::Diarize).unwrap();
+        assert_eq!(asr, "\"asr\"");
+        assert_eq!(llm, "\"llm\"");
+        assert_eq!(diar, "\"diarize\"");
+    }
+
+    #[test]
+    fn model_status_round_trips_through_json() {
+        let s = ModelStatus {
+            id: ModelId::from("qwen3-asr-0.6b-q8_0"),
+            kind: ModelKind::Asr,
+            display_name: "Qwen3-ASR 0.6B Q8_0".to_string(),
+            status: ModelStatusState::Downloading {
+                bytes_done: 1024 * 1024,
+                bytes_total: 805 * 1024 * 1024,
+            },
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"state\":\"downloading\""));
+        let back: ModelStatus = serde_json::from_str(&json).unwrap();
+        match back.status {
+            ModelStatusState::Downloading {
+                bytes_done,
+                bytes_total,
+            } => {
+                assert_eq!(bytes_done, 1024 * 1024);
+                assert_eq!(bytes_total, 805 * 1024 * 1024);
+            }
+            other => panic!("unexpected state: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_manifest_entry_round_trips() {
+        let m = ModelManifestEntry {
+            id: ModelId::from("qwen3-asr-0.6b-q8_0"),
+            kind: ModelKind::Asr,
+            display_name: "Qwen3-ASR 0.6B Q8_0".to_string(),
+            files: vec![ModelFileEntry {
+                filename: "Qwen3-ASR-0.6B-Q8_0-ggml-org.gguf".to_string(),
+                url: "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main/Qwen3-ASR-0.6B-Q8_0-ggml-org.gguf".to_string(),
+                size: 805_000_000,
+                sha256: "bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971".to_string(),
+            }],
+            total_size_bytes: 805_000_000,
+            license: "apache-2.0".to_string(),
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        let back: ModelManifestEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.files.len(), 1);
+        assert_eq!(back.files[0].sha256.len(), 64);
+        assert_eq!(back.kind, ModelKind::Asr);
     }
 
     #[test]

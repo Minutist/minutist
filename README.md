@@ -70,3 +70,31 @@ scripts/render-architecture.sh
 Requires Docker. Uses `structurizr/structurizr` to export the DSL to
 Mermaid, then `minlag/mermaid-cli` to convert to SVG. SVGs are committed
 alongside [`architecture/workspace.dsl`](architecture/workspace.dsl).
+
+## Running spikes on native Windows
+
+Phase 0 §4 exit criteria require each spike to run on Windows AND Linux.
+The Linux side is verified in WSL/native. The Windows side uses
+[`scripts/run-spike-windows.ps1`](scripts/run-spike-windows.ps1), which
+robocopies the repo to `C:\Users\anl\meeting-app`, sets up the MSVC
+dev shell via vswhere + Launch-VsDevShell.ps1, and runs `cargo build`
+plus the spike binary.
+
+From WSL:
+
+```bash
+powershell.exe -NoProfile -ExecutionPolicy Bypass \
+  -File 'C:\Users\anl\meeting-app\scripts\run-spike-windows.ps1' \
+  -Spike asr -Run
+```
+
+The script must already exist on the Windows side (the `\\wsl.localhost\…`
+UNC path isn't reliably executable). For the first invocation, sync the
+script over with `cp /home/anl/meeting-app/scripts/run-spike-windows.ps1
+/mnt/c/Users/anl/meeting-app/scripts/run-spike-windows.ps1` or run
+`-SyncOnly` from any already-Windows-side copy first.
+
+Toolchain expectations: Rust on PATH, Visual Studio Build Tools 2022,
+LLVM (for `libclang.dll`), Vulkan SDK (optional, only needed for the
+`vulkan` feature). Edit the env-var paths at the top of the script if
+your install differs.

@@ -15,3 +15,16 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 meeting-app-common = { path = "../../crates/common" }
+
+# Pin the same `llama-cpp-2` version Spike 1 validated so the workspace
+# Cargo.lock keeps a single major. Spike 2 needs only the text path; the
+# `mtmd` feature is intentionally NOT enabled here so the LLM spike's build
+# does not pull mmproj / audio dependencies. CPU-only on WSL Linux; Vulkan
+# is a user-side follow-up on native Windows.
+llama-cpp-2 = { version = "=0.1.146", default-features = false }
+
+encoding_rs = "0.8"
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = { workspace = true }

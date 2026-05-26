@@ -194,6 +194,12 @@ migrations, Opus audio encoding, Tiptap JSON I/O.
 The only component allowed to read or write under `{app-data}/meetings/`
 and `{app-data}/index.db`.
 
+**Phase 1 surface:** writes `audio.opus` (Opus 16 kHz mono 32 kbps, Ogg
+container) and `metadata.json` per meeting. Pause/resume inserts zero-sample
+(silent) Opus frames so decoded duration equals wall-clock duration including
+pauses (±20 ms per frame). The libsql index (`index.db`) and
+transcript/notes/summary storage are Phase 4.
+
 ### `orchestrator`
 **Crate:** `crates/orchestrator`
 **Owns:** the live recording state machine. Wires `audio-capture →

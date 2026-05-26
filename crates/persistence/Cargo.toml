@@ -5,13 +5,22 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Phase 1 Stream C skeleton. The data-engineer fills this in. libsql
-# index, transcript/notes/summary storage land in Phase 4 — do NOT
+# Phase 1 minimal surface: per-meeting folder, audio.opus, metadata.json.
+# libsql index, transcript/notes/summary storage land in Phase 4 — do NOT
 # preempt that work here.
 
 [dependencies]
 meeting-app-common = { path = "../common" }
+# audiopus 0.3 is a pre-release; must be pinned explicitly (workspace version
+# "0.3" does not resolve to pre-releases by default in Cargo semver rules).
+audiopus = "0.3.0-rc.0"
+chrono = { workspace = true }
+ogg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber = { workspace = true }

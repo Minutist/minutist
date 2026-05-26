@@ -302,7 +302,7 @@ than packages.
 | Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. |
 | Meeting shell | `ui/src/shell/` | Window chrome, start/stop/pause, audio meter, meeting list. |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
-| UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. |
+| UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 
 The webview's source of truth for typed messages is the generated
 `bindings.ts` produced by tauri-specta. Hand-edits to that file are not

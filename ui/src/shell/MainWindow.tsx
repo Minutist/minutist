@@ -17,11 +17,17 @@ import "./MainWindow.css";
  */
 export function MainWindow() {
   const refreshDevices = useRecordingStore((s) => s.refreshDevices);
+  const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const lastError = useRecordingStore((s) => s.lastError);
 
   useEffect(() => {
+    // Load persisted settings first so `selectedDeviceId` reflects the
+    // user's saved choice; then enumerate devices so the picker is
+    // populated. Either failing is logged via `lastError` but neither
+    // blocks the other.
+    void refreshSettings();
     void refreshDevices();
-  }, [refreshDevices]);
+  }, [refreshDevices, refreshSettings]);
 
   return (
     <div className="main-window">

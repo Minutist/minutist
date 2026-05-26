@@ -11,24 +11,32 @@ import type {
   RecordingStateType,
   AudioDeviceType,
   AppEventType,
+  SettingsType,
 } from "../ipc/bindings";
 
-export type { RecordingStateType, AudioDeviceType, AppEventType };
+export type { RecordingStateType, AudioDeviceType, AppEventType, SettingsType };
 
 export type RecordingStore = {
   state: RecordingStateType;
   devices: AudioDeviceType[];
   selectedDeviceId: string | null;
+  /**
+   * Persisted settings snapshot. Populated on mount via `refreshSettings`;
+   * mutations from the UI go through `setSelectedDevice` (etc.) and write
+   * back via `commands.updateSettings`.
+   */
+  settings: SettingsType | null;
   meter: { peak: number; rms: number };
   lastError: string | null;
 
   // actions
   refreshDevices: () => Promise<void>;
+  refreshSettings: () => Promise<void>;
   start: () => Promise<void>;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
   stop: () => Promise<void>;
-  setSelectedDevice: (id: string | null) => void;
+  setSelectedDevice: (id: string | null) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEventType) => void;
 };
@@ -37,6 +45,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   state: { kind: "idle" },
   devices: [],
   selectedDeviceId: null,
+  settings: null,
   meter: { peak: 0, rms: 0 },
   lastError: null,
 
@@ -45,6 +54,19 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       const result = await commands.listDevices();
       const devices = unwrap(result);
       set({ devices });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  refreshSettings: async () => {
+    try {
+      const result = await commands.getSettings();
+      const settings = unwrap(result);
+      set({
+        settings,
+        selectedDeviceId: settings.input_device_id ?? null,
+      });
     } catch (err) {
       set({ lastError: err instanceof Error ? err.message : String(err) });
     }
@@ -90,8 +112,30 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
-  setSelectedDevice: (id) => {
+  setSelectedDevice: async (id) => {
+    // Update local store immediately for UI responsiveness.
     set({ selectedDeviceId: id });
+
+    // Persist via `update_settings` so the choice survives an app restart.
+    // The orchestrator falls back to `settings.input_device_id` when the
+    // caller passes `device_id = None` (see Orchestrator::start in
+    // crates/orchestrator/src/lib.rs), so persisting is what makes the
+    // device selection sticky.
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object. The next setSelectedDevice
+      // call after settings load will persist.
+      return;
+    }
+    const next: SettingsType = { ...current, input_device_id: id };
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
   },
 
   handleEvent: (event) => {

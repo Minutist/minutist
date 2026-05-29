@@ -198,10 +198,35 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
             tracing::info!(target: "app-main", "settings handle constructed");
 
-            // Construct the orchestrator.
-            let orchestrator = Arc::new(orchestrator::Orchestrator::new(
+            // Single event bus shared by the model registry and the
+            // orchestrator. The IPC forwarder subscribes once (via
+            // Orchestrator::subscribe_events) and sees both orchestrator
+            // events (meter / state / transcript) and the registry's
+            // ModelDownloadProgress. Constructing the channel here breaks the
+            // otherwise-circular dependency (registry is a constructor param of
+            // the orchestrator, but the registry needs the sender too).
+            let (event_tx, _event_rx) = tokio::sync::broadcast::channel(256);
+
+            // Construct the model registry. The manifest is bundled at compile
+            // time from resources/models.json; the cache root is the per-kind
+            // model directory under app-data (model-registry owns this dir).
+            let models_root = app_data_dir.join("models");
+            let manifest =
+                model_registry::load_manifest(include_bytes!("../../resources/models.json"))
+                    .expect("bundled resources/models.json is malformed");
+            let model_registry = Arc::new(
+                model_registry::ModelRegistry::new(models_root, manifest, event_tx.clone())
+                    .expect("failed to initialise model registry"),
+            );
+
+            tracing::info!(target: "app-main", "model registry constructed");
+
+            // Construct the orchestrator sharing the same event bus.
+            let orchestrator = Arc::new(orchestrator::Orchestrator::with_event_tx(
                 settings_handle.clone(),
                 meetings_dir,
+                model_registry,
+                event_tx,
             ));
 
             tracing::info!(target: "app-main", "orchestrator constructed");

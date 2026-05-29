@@ -105,6 +105,23 @@ impl Orchestrator {
         model_registry: Arc<ModelRegistry>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        Self::with_event_tx(settings, persistence_root, model_registry, event_tx)
+    }
+
+    /// Construct an `Orchestrator` sharing an externally-owned event bus.
+    ///
+    /// Used by `app-main` so the `ModelRegistry` and the orchestrator emit
+    /// `AppEvent`s onto the *same* broadcast channel — the IPC forwarder
+    /// subscribes once via [`subscribe_events`](Self::subscribe_events) and
+    /// sees both orchestrator events (meter, state, transcript) and registry
+    /// events (`ModelDownloadProgress`). Construct the channel, pass
+    /// `event_tx.clone()` to `ModelRegistry::new`, and pass `event_tx` here.
+    pub fn with_event_tx(
+        settings: SettingsHandle,
+        persistence_root: PathBuf,
+        model_registry: Arc<ModelRegistry>,
+        event_tx: broadcast::Sender<AppEvent>,
+    ) -> Self {
         Orchestrator {
             settings,
             persistence_root,

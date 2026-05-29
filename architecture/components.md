@@ -32,7 +32,7 @@ appears in:
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `diarizer`, `persistence`, `model-registry`, `settings` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `settings` |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings` |
 
 Any PR adding an edge not in this table requires an architecture-doc
 update in the same commit.
@@ -294,11 +294,11 @@ to the orchestrator broadcast and emits `AppEventPayload` (event name
 `specta = "=2.0.0-rc.22"`, `specta-typescript = "0.0.9"` compile cleanly with
 `tauri = "2.10"`. No version conflict.
 
-**Type mirror pattern:** `common` and `settings` types do not derive
-`specta::Type` (those crates have no `specta` dependency). Mirror types in
-`crates/ipc-bridge/src/specta_types.rs` carry identical serde shapes and the
-required derives. An architecture-owner commit adding `specta::Type` to
-`common` / `settings` can remove the mirror layer.
+**Specta types (post-P0a):** `common` and `settings` derive `specta::Type`
+directly behind their optional `specta` feature, which `ipc-bridge` enables.
+The Phase 1 mirror layer (`specta_types.rs`) was deleted; commands and events
+use the canonical types. `IpcError` remains a local `specta::Type` mirror of
+`AppError` at the boundary (harmless; may be removed in a later cleanup).
 
 ### `app-main` (bin)
 **Crate:** `src-tauri/` (Tauri convention)

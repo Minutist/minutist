@@ -204,12 +204,16 @@ it consumes settings the same way every other component does.
 │   ├── summary.md
 │   └── metadata.json
 ├── models/                     owned by `model-registry` (and nobody else)
-│   ├── manifest.json
-│   ├── asr/...
-│   ├── llm/...
-│   └── diarize/...
+│   ├── asr/{model-id}/...      downloaded GGUF + mmproj per manifest entry
+│   ├── llm/{model-id}/...
+│   └── diarize/{model-id}/...
 └── settings.store              owned by `settings` (tauri-plugin-store)
 ```
+
+The model manifest is **not** written into the cache. It is bundled in the
+binary (`resources/models.json`, loaded via `include_bytes!` in `app-main`
+and parsed by `model_registry::load_manifest`); the cache dir holds only the
+downloaded per-kind / per-model files.
 
 Writes to a directory outside a component's owned scope are a review
 finding.

@@ -128,6 +128,11 @@ pub(crate) struct FlushQueue {
     /// Incremented when the worker pops a payload; decremented when processing
     /// completes. The runner uses this + queue length = 0 to know all work is done.
     pub(crate) in_flight: Arc<AtomicUsize>,
+    /// Set to `true` when the ASR worker thread has exited (either normally or
+    /// due to an unrecoverable error). When this flag is set,
+    /// `wait_all_processed` returns immediately rather than blocking until
+    /// timeout — a dead worker will never decrement `in_flight`.
+    pub(crate) worker_exited: Arc<AtomicBool>,
 }
 
 impl FlushQueue {
@@ -137,6 +142,7 @@ impl FlushQueue {
             notify: Arc::new(Notify::new()),
             closed: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            worker_exited: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -147,6 +153,7 @@ impl FlushQueue {
             notify: Arc::clone(&self.notify),
             closed: Arc::clone(&self.closed),
             in_flight: Arc::clone(&self.in_flight),
+            worker_exited: Arc::clone(&self.worker_exited),
         }
     }
 
@@ -157,16 +164,25 @@ impl FlushQueue {
         self.notify.notify_one();
     }
 
-    /// Block until the flush queue is empty AND no payload is being processed.
+    /// Block until the flush queue is empty AND no payload is being processed,
+    /// or until the ASR worker thread exits (detected via `worker_exited`).
     ///
     /// Returns `true` if all work completed before `timeout` elapsed, `false`
     /// if the timeout was reached.
+    ///
+    /// A dead/terminated worker sets `worker_exited = true`, which causes this
+    /// function to return immediately so `stop()` is never wedged.
     ///
     /// Called by the runner before finalising the `MeetingWriter` so that the
     /// last flush's transcript segments are written to `transcript.json`.
     pub(crate) fn wait_all_processed(&self, timeout: Duration, poll_interval: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
+            // If the worker has exited, there is nobody left to decrement
+            // `in_flight`; return immediately to avoid hanging forever.
+            if self.worker_exited.load(Ordering::Acquire) {
+                return true;
+            }
             let queue_empty = {
                 let deque = self.deque.lock().expect("flush queue mutex poisoned");
                 deque.is_empty()
@@ -730,6 +746,17 @@ fn run_asr_worker(
     event_tx: broadcast::Sender<AppEvent>,
     writer_cmd_tx: mpsc::Sender<WriterCommand>,
 ) {
+    // Guard that sets `worker_exited` when this function returns for any reason
+    // (clean exit or unwind). This ensures `wait_all_processed` is never wedged
+    // by a dead worker that can no longer decrement `in_flight`.
+    struct WorkerExitGuard<'a>(&'a Arc<AtomicBool>);
+    impl Drop for WorkerExitGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let _exit_guard = WorkerExitGuard(&flush_queue.worker_exited);
+
     // Use a single-threaded tokio runtime to allow async calls (model_registry.ensure,
     // Notify::notified) from within this spawn_blocking context.
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -837,10 +864,52 @@ fn run_asr_worker(
             lazy_runtime.as_mut().expect("just initialised")
         };
 
-        let result = process_flush_with_backend(payload, backend, &event_tx, &writer_cmd_tx);
-        if let Err(e) = result {
-            tracing::warn!(target: "orchestrator", "ASR flush error: {e}");
-            let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
+        // Wrap the per-flush call in `catch_unwind` so a panic inside
+        // `transcribe_chunk` is caught, converted to `AppError::Internal`, and
+        // emitted as `AppEvent::ErrorOccurred`. The worker then continues to the
+        // next flush — one bad flush must not kill the worker or the recording.
+        //
+        // Per `architecture/cross-cutting.md`: "A panic inside a `spawn_blocking`
+        // task must abort the parent orchestrator task and surface as a
+        // recoverable `AppError`. The app does not exit on a single bad recording."
+        //
+        // `AssertUnwindSafe` is required because `&mut dyn AsrBackend`,
+        // `broadcast::Sender`, and `mpsc::Sender` are not `UnwindSafe` by default.
+        // We uphold the invariant: on unwind we do not use the backend again in
+        // the same call (the closure is consumed), and the senders are only used
+        // for a `send` before we return from the closure, so there is no risk of
+        // leaving them in a broken intermediate state after an unwind.
+        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_flush_with_backend(payload, backend, &event_tx, &writer_cmd_tx)
+        }));
+
+        match call_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // Backend returned an error; surface it and continue.
+                tracing::warn!(target: "orchestrator", "ASR flush error: {e}");
+                let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
+            }
+            Err(panic_payload) => {
+                // Backend panicked; extract the message if possible.
+                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic payload".to_string()
+                };
+                tracing::warn!(
+                    target: "orchestrator",
+                    "ASR worker caught panic in transcribe_chunk: {msg}; \
+                     continuing to next flush"
+                );
+                let _ = event_tx.send(AppEvent::ErrorOccurred {
+                    error: AppError::Internal {
+                        context: format!("ASR worker panicked: {msg}"),
+                    },
+                });
+            }
         }
         // `_in_flight_guard` drops here, decrementing in_flight.
     }

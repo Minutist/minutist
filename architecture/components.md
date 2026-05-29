@@ -259,6 +259,8 @@ instead of a plain `mpsc`. On overflow the runner drops the **oldest**
 pending flush (not the newest) from the front of the deque and emits
 `AppEvent::ErrorOccurred`. Audio is always preserved in `audio.opus`.
 
+**Panic safety (Phase 2 close-out).** Each per-flush `transcribe_chunk` call is wrapped in `std::panic::catch_unwind`; a panic is caught, converted to `AppError::Internal`, emitted as `AppEvent::ErrorOccurred`, and the worker continues to the next flush. A `worker_exited` flag on `FlushQueue` ensures `stop()` is never wedged by a terminated worker.
+
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration

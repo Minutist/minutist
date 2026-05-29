@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use meeting_app_common::{AppEvent, AppResult, AsrBackend, AudioChunk, MeetingId, Segment};
+use meeting_app_common::{AppError, AppEvent, AppResult, AsrBackend, AudioChunk, MeetingId, Segment};
 use model_registry::ModelRegistry;
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::broadcast;
@@ -159,6 +159,123 @@ impl AsrBackend for StubAsrBackend {
             start_ms: chunk.start_ms,
             end_ms: chunk.end_ms,
             text: self.canned_text.clone(),
+            speaker_id: None,
+            confidence: None,
+            words: vec![],
+        }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error-returning stub — drives the Err(e) → ErrorOccurred path
+// ---------------------------------------------------------------------------
+
+/// An `AsrBackend` stub that always returns `Err(AppError::Inference { .. })`.
+///
+/// Used to verify that the ASR worker emits `AppEvent::ErrorOccurred` on a
+/// backend error and that the pipeline continues (subsequent `Ok` flushes still
+/// produce `TranscriptSegment` events).
+pub struct FailingAsrBackend {
+    /// After `fail_count` failing calls, subsequent calls succeed and return
+    /// `ok_text`. Set to `usize::MAX` for an always-failing backend.
+    pub fail_count: usize,
+    calls: usize,
+    pub ok_text: String,
+}
+
+impl FailingAsrBackend {
+    /// Create a backend that always fails.
+    pub fn always_failing() -> Self {
+        Self {
+            fail_count: usize::MAX,
+            calls: 0,
+            ok_text: String::new(),
+        }
+    }
+
+    /// Create a backend that fails for the first `fail_count` calls, then
+    /// succeeds with `ok_text`.
+    pub fn fail_then_succeed(fail_count: usize, ok_text: impl Into<String>) -> Self {
+        Self {
+            fail_count,
+            calls: 0,
+            ok_text: ok_text.into(),
+        }
+    }
+}
+
+impl AsrBackend for FailingAsrBackend {
+    fn transcribe_chunk(&mut self, chunk: &AudioChunk) -> AppResult<Vec<Segment>> {
+        let call = self.calls;
+        self.calls += 1;
+        if call < self.fail_count {
+            Err(AppError::Inference {
+                backend: "stub-failing".into(),
+                context: format!("stub error on call {call}"),
+            })
+        } else {
+            Ok(vec![Segment {
+                start_ms: chunk.start_ms,
+                end_ms: chunk.end_ms,
+                text: self.ok_text.clone(),
+                speaker_id: None,
+                confidence: None,
+                words: vec![],
+            }])
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Panicking stub — drives the catch_unwind path
+// ---------------------------------------------------------------------------
+
+/// An `AsrBackend` stub that panics inside `transcribe_chunk`.
+///
+/// Used to verify that the `catch_unwind` wrapper in the ASR worker catches
+/// the panic, emits `AppEvent::ErrorOccurred`, and allows the worker to
+/// continue (and `stop()` to return `Ok`).
+///
+/// After `panic_count` panicking calls, subsequent calls succeed and return
+/// `ok_text`. Set `panic_count` to `usize::MAX` for an always-panicking backend.
+pub struct PanickingAsrBackend {
+    pub panic_count: usize,
+    calls: usize,
+    pub ok_text: String,
+}
+
+impl PanickingAsrBackend {
+    /// Create a backend that always panics.
+    pub fn always_panicking() -> Self {
+        Self {
+            panic_count: usize::MAX,
+            calls: 0,
+            ok_text: String::new(),
+        }
+    }
+
+    /// Create a backend that panics for the first `panic_count` calls, then
+    /// succeeds with `ok_text`.
+    pub fn panic_then_succeed(panic_count: usize, ok_text: impl Into<String>) -> Self {
+        Self {
+            panic_count,
+            calls: 0,
+            ok_text: ok_text.into(),
+        }
+    }
+}
+
+impl AsrBackend for PanickingAsrBackend {
+    fn transcribe_chunk(&mut self, chunk: &AudioChunk) -> AppResult<Vec<Segment>> {
+        let call = self.calls;
+        self.calls += 1;
+        if call < self.panic_count {
+            panic!("stub panic on call {call}");
+        }
+        Ok(vec![Segment {
+            start_ms: chunk.start_ms,
+            end_ms: chunk.end_ms,
+            text: self.ok_text.clone(),
             speaker_id: None,
             confidence: None,
             words: vec![],

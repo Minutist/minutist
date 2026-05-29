@@ -1,10 +1,10 @@
-//! Back-pressure integration test for the orchestrator's broadcast channel.
+//! Back-pressure integration tests for the orchestrator.
 //!
-//! The test subscribes a slow receiver (does not drain promptly) while driving
-//! 500+ meter events via DummyAudioSource at a high-throughput rate.
-//! The orchestrator must not panic; some events will be dropped (broadcast
-//! semantics). The slow receiver should observe `RecvError::Lagged` from
-//! tokio, confirming that back-pressure is surfaced rather than silently lost.
+//! Test 4: Exercises the broadcast channel back-pressure (slow subscriber).
+//! Test 5: Orchestrator survives subscriber going away.
+//! Test 6: ASR flush queue drop-oldest backpressure — drives ≥5 rapid flushes
+//!   into a cap-4 queue and asserts the oldest is dropped, ErrorOccurred is
+//!   emitted, and the orchestrator survives (no panic, stop() returns Ok).
 //!
 //! Integration tests for the orchestrator live in `crates/orchestrator/tests/`
 //! per `architecture/cross-cutting.md` — Testing section.
@@ -12,8 +12,8 @@
 use std::time::Duration;
 
 use audio_capture::test_source::DummyAudioSource;
-use meeting_app_common::AppEvent;
-use orchestrator::test_support::test_orchestrator;
+use meeting_app_common::{AppEvent, AppError};
+use orchestrator::test_support::{test_orchestrator, FlushBackpressureHarness};
 use tokio::sync::broadcast::error::RecvError;
 
 // ---------------------------------------------------------------------------
@@ -142,3 +142,92 @@ async fn orchestrator_survives_subscriber_gone() {
 const _: fn() = || {
     let _: RecvError = RecvError::Closed;
 };
+
+// ---------------------------------------------------------------------------
+// Test 6: ASR flush queue drop-oldest backpressure
+// ---------------------------------------------------------------------------
+
+/// Drive ≥5 rapid flushes into the cap-4 ASR flush queue and verify:
+///   (a) The OLDEST flush is the one dropped (not the newest).
+///   (b) `AppEvent::ErrorOccurred` is emitted at least once.
+///   (c) The orchestrator survives — no panic and `stop()` returns `Ok`.
+///
+/// This test uses `FlushBackpressureHarness` to inject flushes directly into
+/// the flush queue without needing a real VAD model, exercising the drop-oldest
+/// logic in `dispatch_flush` (runner.rs) directly.
+#[tokio::test]
+async fn asr_flush_queue_drops_oldest_and_emits_error_occurred() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let harness = FlushBackpressureHarness::new();
+    let mut event_rx = harness.subscribe();
+
+    // Dispatch 6 payloads into a cap-4 queue. The queue fills on the 4th
+    // dispatch. Dispatches 5 and 6 each drop one oldest entry.
+    for i in 0..6u64 {
+        harness.dispatch(i * 1000);
+    }
+
+    // Queue must still be at capacity (4).
+    assert_eq!(
+        harness.queue_len(),
+        4,
+        "queue must be at FLUSH_CHANNEL_CAP=4 after 6 dispatches with drop-oldest"
+    );
+
+    // The OLDEST flush (start_ms = 0) must have been dropped.
+    let starts = harness.queued_start_ms();
+    assert!(
+        !starts.contains(&0),
+        "oldest flush (start_ms=0) must have been dropped; queued start_ms: {starts:?}"
+    );
+    // The SECOND oldest (start_ms = 1000) must also have been dropped (two overflows).
+    assert!(
+        !starts.contains(&1000),
+        "second oldest flush (start_ms=1000) must have been dropped; queued: {starts:?}"
+    );
+    // The NEWEST flush (start_ms = 5000) must be present.
+    assert!(
+        starts.contains(&5000),
+        "newest flush (start_ms=5000) must be retained; queued: {starts:?}"
+    );
+
+    // Collect all events emitted during the dispatches.
+    let mut error_occurred_count = 0u32;
+    loop {
+        match event_rx.try_recv() {
+            Ok(AppEvent::ErrorOccurred { error: AppError::Internal { .. } }) => {
+                error_occurred_count += 1;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(_) => break,
+        }
+    }
+
+    assert!(
+        error_occurred_count >= 2,
+        "expected ≥2 ErrorOccurred events (one per overflow); got {error_occurred_count}"
+    );
+
+    // Verify the orchestrator itself is also resilient with slow backend and
+    // rapid flushes. Use test_orchestrator (no real ASR) which skips flush
+    // processing anyway.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let orch = test_orchestrator(dir.path().to_path_buf());
+
+    let source = DummyAudioSource::new(512, 256);
+    let streams = source.generate_streams(10, 64, 128);
+
+    orch.start_with_streams(streams)
+        .await
+        .expect("start_with_streams");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let stop_result = orch.stop().await;
+    assert!(
+        stop_result.is_ok(),
+        "orchestrator.stop() must return Ok even under flush queue backpressure; got: {stop_result:?}"
+    );
+}

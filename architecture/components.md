@@ -253,6 +253,12 @@ the orchestrator does not pre-emptively drop subscribers. Meeting
 titles use the placeholder convention `"Recording {ISO-8601 start
 timestamp}"` until Phase 3/4 rename support lands.
 
+**ASR flush backpressure (Phase 2).** The runner→ASR-worker flush path
+uses an `Arc<Mutex<VecDeque<FlushPayload>>>` (capacity 4) + `Arc<Notify>`
+instead of a plain `mpsc`. On overflow the runner drops the **oldest**
+pending flush (not the newest) from the front of the deque and emits
+`AppEvent::ErrorOccurred`. Audio is always preserved in `audio.opus`.
+
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration

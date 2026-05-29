@@ -3033,6 +3033,7 @@ dependencies = [
  "audio-capture",
  "audiopus",
  "chrono",
+ "hound",
  "meeting-app-common",
  "model-registry",
  "ogg",

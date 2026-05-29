@@ -141,7 +141,7 @@ pub struct AsrRuntimeConfig {
 
 impl Default for AsrRuntimeConfig {
     fn default() -> Self {
-        let threads = ((num_cpus::get() / 2) as i32).min(8).max(1);
+        let threads = ((num_cpus::get() / 2) as i32).clamp(1, 8);
         Self {
             threads,
             n_ctx: NonZeroU32::new(4096).expect("4096 is non-zero"),

@@ -38,7 +38,7 @@ impl ModelRegistry {
     ) -> AppResult<Self> {
         let http = reqwest::Client::builder()
             .build()
-            .map_err(|e| Error::Http(e))?;
+            .map_err(Error::Http)?;
 
         Ok(Self {
             cache_root,

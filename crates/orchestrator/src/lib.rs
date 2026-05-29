@@ -520,4 +520,61 @@ impl Orchestrator {
 
         Ok(meeting_id)
     }
+
+    /// Test-only constructor that accepts pre-built `AudioStreams` **and** a
+    /// pre-built `AsrBackend` stub.
+    ///
+    /// This allows integration tests to inject a fake ASR backend (returning
+    /// canned `Segment`s) without needing a 1 GB model file. The pipeline
+    /// wiring (VAD → Accumulator → flush dispatch → worker) runs for real.
+    ///
+    /// Available only under the `test-source` feature.
+    pub async fn start_with_streams_and_backend(
+        &self,
+        streams: audio_capture::AudioStreams,
+        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+    ) -> AppResult<MeetingId> {
+        let mut guard = self.inner.lock().await;
+        let (meeting_id, started_at_ms) = transition_start(&mut guard.state)?;
+
+        let started_at =
+            DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64).unwrap_or_else(Utc::now);
+        guard.started_at = Some(started_at);
+
+        let audio_format = AudioFormat {
+            codec: "opus".into(),
+            sample_rate: 16_000,
+            channels: 1,
+            bitrate_kbps: Some(32),
+        };
+
+        let writer = match MeetingWriter::open(&self.persistence_root, meeting_id, audio_format) {
+            Ok(w) => w,
+            Err(e) => {
+                guard.state = InternalState::Idle;
+                return Err(e);
+            }
+        };
+
+        let runner_handle = runner::spawn_runner_with_backend(
+            streams,
+            writer,
+            self.event_tx.clone(),
+            Arc::clone(&self.model_registry),
+            meeting_id,
+            backend,
+        );
+        guard.runner = Some(runner_handle);
+
+        let new_state = guard.state.as_public();
+        self.emit(AppEvent::StateChanged { state: new_state });
+
+        tracing::info!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            "recording started (test-source + stub backend path)"
+        );
+
+        Ok(meeting_id)
+    }
 }

@@ -4,7 +4,7 @@
 //! - The `AudioStreams` (sample + meter mpsc receivers from `audio-capture`).
 //! - The `MeetingWriter` from `persistence`.
 //! - A `VadChunker` for speech-activity detection.
-//! - A bounded mpsc channel to a separate ASR worker task.
+//! - A bounded flush queue to a separate ASR worker task.
 //!
 //! The runner:
 //! - Drains sample batches → `MeetingWriter::push_samples` (audio always saved).
@@ -28,11 +28,15 @@
 //!
 //! ## Threading
 //!
-//! Runner → ASR worker: bounded `mpsc::channel(4)`. On backpressure the runner
-//! drops the OLDEST queued flush (audio is preserved in `audio.opus`; only live
-//! transcript is lost) and emits `AppEvent::ErrorOccurred`.
+//! Runner → ASR worker: `Arc<Mutex<VecDeque<FlushPayload>>>` (capacity 4) + `Arc<Notify>`.
+//! On backpressure the runner drops the OLDEST queued flush (the entry at the
+//! front of the deque), enqueues the newest at the back, and emits
+//! `AppEvent::ErrorOccurred`. Audio is always preserved in `audio.opus`; only
+//! live transcript is lost.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use asr_runtime::{AsrRuntime, AsrRuntimeConfig};
@@ -43,7 +47,7 @@ use meeting_app_common::{
 };
 use model_registry::ModelRegistry;
 use persistence::MeetingWriter;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use vad_chunker::{VadChunker, VadConfig, VadEvent};
 
 // ---------------------------------------------------------------------------
@@ -58,7 +62,7 @@ const SAMPLE_RATE_HZ: u64 = 16_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Hardcoded ASR model ID (Phase 2 LOCKED CHOICE).
 const ASR_MODEL_ID: &str = "qwen3-asr-0.6b-q8_0";
-/// Flush dispatch channel capacity.
+/// Flush dispatch queue capacity. Drop-oldest when this is exceeded.
 const FLUSH_CHANNEL_CAP: usize = 4;
 
 // ---------------------------------------------------------------------------
@@ -92,11 +96,91 @@ enum WriterCommand {
 // ---------------------------------------------------------------------------
 
 /// A complete accumulator snapshot sent to the ASR worker.
-struct FlushPayload {
-    samples: Vec<f32>,
+pub(crate) struct FlushPayload {
+    pub(crate) samples: Vec<f32>,
     /// `(start_ms, end_ms)` for each VAD segment in this buffer.
-    vad_segments: Vec<(u64, u64)>,
-    meeting_id: MeetingId,
+    pub(crate) vad_segments: Vec<(u64, u64)>,
+    pub(crate) meeting_id: MeetingId,
+}
+
+// ---------------------------------------------------------------------------
+// Flush queue: drop-oldest bounded deque + notify
+// ---------------------------------------------------------------------------
+
+/// Shared state between the runner (producer) and the ASR worker (consumer).
+///
+/// `Arc<Notify>` signals the worker that a new payload is available or that
+/// the runner has exited (`closed` is set).
+/// `Arc<StdMutex<VecDeque<FlushPayload>>>` is the bounded drop-oldest queue.
+/// `Arc<AtomicBool>` signals to the worker that the runner has exited so the
+/// worker can drain the remaining queue and then exit.
+///
+/// Choosing `std::sync::Mutex` (not tokio) here because both the runner and
+/// the ASR worker run on `spawn_blocking` threads; there is no async context
+/// while the mutex is held, so the lighter `std` mutex is correct.
+pub(crate) struct FlushQueue {
+    pub(crate) deque: Arc<StdMutex<VecDeque<FlushPayload>>>,
+    pub(crate) notify: Arc<Notify>,
+    /// Set to `true` when the runner has finished; the worker drains remaining
+    /// payloads and then exits.
+    pub(crate) closed: Arc<AtomicBool>,
+    /// Count of payloads currently being processed by the worker.
+    /// Incremented when the worker pops a payload; decremented when processing
+    /// completes. The runner uses this + queue length = 0 to know all work is done.
+    pub(crate) in_flight: Arc<AtomicUsize>,
+}
+
+impl FlushQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            deque: Arc::new(StdMutex::new(VecDeque::with_capacity(FLUSH_CHANNEL_CAP + 1))),
+            notify: Arc::new(Notify::new()),
+            closed: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Clone the consumer side (shared deque + notify, no ownership transfer).
+    pub(crate) fn consumer_clone(&self) -> Self {
+        Self {
+            deque: Arc::clone(&self.deque),
+            notify: Arc::clone(&self.notify),
+            closed: Arc::clone(&self.closed),
+            in_flight: Arc::clone(&self.in_flight),
+        }
+    }
+
+    /// Signal the worker that no more payloads will be produced.
+    pub(crate) fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        // Wake the worker so it can observe the closed flag.
+        self.notify.notify_one();
+    }
+
+    /// Block until the flush queue is empty AND no payload is being processed.
+    ///
+    /// Returns `true` if all work completed before `timeout` elapsed, `false`
+    /// if the timeout was reached.
+    ///
+    /// Called by the runner before finalising the `MeetingWriter` so that the
+    /// last flush's transcript segments are written to `transcript.json`.
+    pub(crate) fn wait_all_processed(&self, timeout: Duration, poll_interval: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let queue_empty = {
+                let deque = self.deque.lock().expect("flush queue mutex poisoned");
+                deque.is_empty()
+            };
+            let idle = queue_empty && self.in_flight.load(Ordering::Acquire) == 0;
+            if idle {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(poll_interval);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +227,7 @@ impl Accumulator {
             // Cap inter-segment gap at MAX_GAP_MS worth of samples.
             let max_gap_samples = (MAX_GAP_MS as usize * SAMPLE_RATE_HZ as usize) / 1000;
             let capped = gap.min(max_gap_samples);
-            self.samples.extend(std::iter::repeat(0.0f32).take(capped));
+            self.samples.extend(std::iter::repeat_n(0.0f32, capped));
         }
 
         self.samples.extend_from_slice(seg_samples);
@@ -197,25 +281,39 @@ pub(crate) fn spawn_runner(
     model_registry: Arc<ModelRegistry>,
     meeting_id: MeetingId,
 ) -> RunnerHandle {
+    spawn_runner_inner(streams, writer, event_tx, model_registry, meeting_id, None)
+}
+
+/// Internal spawn function shared by production and test paths.
+fn spawn_runner_inner(
+    streams: AudioStreams,
+    writer: MeetingWriter,
+    event_tx: broadcast::Sender<AppEvent>,
+    model_registry: Arc<ModelRegistry>,
+    meeting_id: MeetingId,
+    prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
+) -> RunnerHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RunnerCommand>(8);
 
-    // Bounded flush channel: runner → ASR worker.
-    let (flush_tx, flush_rx) = mpsc::channel::<FlushPayload>(FLUSH_CHANNEL_CAP);
+    // Bounded drop-oldest flush queue: runner (producer) → ASR worker (consumer).
+    let flush_queue = FlushQueue::new();
+    let worker_flush_queue = flush_queue.consumer_clone();
 
     // Channel for ASR worker → runner to write transcript segments.
     // Bounded at FLUSH_CHANNEL_CAP * max_segments_per_flush; a rough bound is fine.
     let (writer_cmd_tx, writer_cmd_rx) = mpsc::channel::<WriterCommand>(64);
 
-    // ASR runtime wrapped in a Mutex so the worker can be lazy-initialised
-    // and only one flush is in-flight at a time.
-    let asr_mutex: Arc<Mutex<Option<AsrRuntime>>> = Arc::new(Mutex::new(None));
-
     // Spawn the ASR worker on a separate spawn_blocking thread.
     let asr_event_tx = event_tx.clone();
-    let asr_mutex_clone = Arc::clone(&asr_mutex);
     let asr_registry = Arc::clone(&model_registry);
     tokio::task::spawn_blocking(move || {
-        run_asr_worker(flush_rx, asr_mutex_clone, asr_registry, asr_event_tx, writer_cmd_tx);
+        run_asr_worker(
+            worker_flush_queue,
+            prebuilt_backend,
+            asr_registry,
+            asr_event_tx,
+            writer_cmd_tx,
+        );
     });
 
     // Spawn the runner drain loop.
@@ -225,13 +323,39 @@ pub(crate) fn spawn_runner(
             writer,
             event_tx,
             cmd_rx,
-            flush_tx,
+            flush_queue,
             writer_cmd_rx,
             meeting_id,
         );
     });
 
     RunnerHandle { cmd_tx }
+}
+
+/// Spawn the drain runner with a pre-built ASR backend (test-only path).
+///
+/// Accepts a `Box<dyn AsrBackend + Send>` that is used directly instead of
+/// lazily initialising `AsrRuntime` from the model registry. This allows
+/// integration tests to inject a stub backend without a real model file.
+///
+/// Available only under the `test-source` feature.
+#[cfg(any(test, feature = "test-source"))]
+pub(crate) fn spawn_runner_with_backend(
+    streams: AudioStreams,
+    writer: MeetingWriter,
+    event_tx: broadcast::Sender<AppEvent>,
+    model_registry: Arc<ModelRegistry>,
+    meeting_id: MeetingId,
+    backend: Box<dyn AsrBackend + Send>,
+) -> RunnerHandle {
+    spawn_runner_inner(
+        streams,
+        writer,
+        event_tx,
+        model_registry,
+        meeting_id,
+        Some(backend),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -243,10 +367,19 @@ fn run_drain_loop(
     mut writer: MeetingWriter,
     event_tx: broadcast::Sender<AppEvent>,
     mut cmd_rx: mpsc::Receiver<RunnerCommand>,
-    flush_tx: mpsc::Sender<FlushPayload>,
+    flush_queue: FlushQueue,
     mut writer_cmd_rx: mpsc::Receiver<WriterCommand>,
     meeting_id: MeetingId,
 ) {
+    // Ensure the worker is signalled when this function exits for any reason.
+    // `FlushQueueGuard` calls `close()` when dropped.
+    struct FlushQueueGuard<'a>(&'a FlushQueue);
+    impl Drop for FlushQueueGuard<'_> {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _guard = FlushQueueGuard(&flush_queue);
     let mut writer_paused = false;
     let mut acc = Accumulator::new();
     let latency_window = Duration::from_secs_f32(LATENCY_WINDOW_SECS);
@@ -332,8 +465,19 @@ fn run_drain_loop(
                     if !acc.is_empty() {
                         let (samples, vad_segments) = acc.drain();
                         let payload = FlushPayload { samples, vad_segments, meeting_id };
-                        dispatch_flush(&flush_tx, payload, &event_tx);
+                        dispatch_flush(&flush_queue, payload, &event_tx);
                     }
+
+                    // Wait for the ASR worker to process any remaining flushes
+                    // so that transcript.json is fully written before finalise.
+                    // The runner signals the worker via flush_queue.close() (via
+                    // the Drop guard), so the worker will process all pending
+                    // items and exit. We wait up to 30 s for a slow backend.
+                    wait_for_asr_worker_drain(
+                        &flush_queue,
+                        &mut writer_cmd_rx,
+                        &mut writer,
+                    );
 
                     // Drain any remaining transcript write commands.
                     drain_writer_commands(&mut writer_cmd_rx, &mut writer);
@@ -422,7 +566,7 @@ fn run_drain_loop(
                 if acc.duration_secs() >= FLUSH_MIN_SECS {
                     let (samples, vad_segments) = acc.drain();
                     let payload = FlushPayload { samples, vad_segments, meeting_id };
-                    dispatch_flush(&flush_tx, payload, &event_tx);
+                    dispatch_flush(&flush_queue, payload, &event_tx);
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -437,7 +581,7 @@ fn run_drain_loop(
                     tracing::debug!(target: "orchestrator", "runner: latency-window flush");
                     let (samples, vad_segments) = acc.drain();
                     let payload = FlushPayload { samples, vad_segments, meeting_id };
-                    dispatch_flush(&flush_tx, payload, &event_tx);
+                    dispatch_flush(&flush_queue, payload, &event_tx);
                 } else {
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -471,8 +615,14 @@ fn run_drain_loop(
                     if !acc.is_empty() {
                         let (samples, vad_segments) = acc.drain();
                         let payload = FlushPayload { samples, vad_segments, meeting_id };
-                        dispatch_flush(&flush_tx, payload, &event_tx);
+                        dispatch_flush(&flush_queue, payload, &event_tx);
                     }
+                    // Wait for the ASR worker to process any remaining flushes.
+                    wait_for_asr_worker_drain(
+                        &flush_queue,
+                        &mut writer_cmd_rx,
+                        &mut writer,
+                    );
                     // Drain any remaining transcript write commands.
                     drain_writer_commands(&mut writer_cmd_rx, &mut writer);
                     let unboxed = *meta;
@@ -496,39 +646,66 @@ fn run_drain_loop(
 // Flush dispatch helper
 // ---------------------------------------------------------------------------
 
-/// Try to send a flush payload to the ASR worker.
+/// Push a flush payload to the ASR worker's bounded drop-oldest queue.
 ///
-/// If the channel is full (capacity 4), emit `AppEvent::ErrorOccurred` and
-/// drop the OLDEST pending flush by discarding the current payload (the
-/// oldest is already in the channel; we don't actually pull from it here
-/// since that would require try_recv on the worker channel, which we can't
-/// do from here). We simply drop this newest payload and warn.
+/// If the queue is already at capacity (`FLUSH_CHANNEL_CAP`), the **oldest**
+/// pending flush (the entry at the front of the deque) is removed and
+/// discarded, then the new payload is pushed to the back. An
+/// `AppEvent::ErrorOccurred` is emitted so the UI can surface the warning.
 ///
-/// Audio is always preserved in `audio.opus`; only the live transcript is lost.
+/// Audio is always preserved in `audio.opus`; only the live transcript is
+/// lost for the dropped flush.
 fn dispatch_flush(
-    flush_tx: &mpsc::Sender<FlushPayload>,
+    flush_queue: &FlushQueue,
     payload: FlushPayload,
     event_tx: &broadcast::Sender<AppEvent>,
 ) {
-    match flush_tx.try_send(payload) {
-        Ok(()) => {
-            tracing::debug!(target: "orchestrator", "runner: flush dispatched to ASR worker");
-        }
-        Err(mpsc::error::TrySendError::Full(_dropped)) => {
-            tracing::warn!(
-                target: "orchestrator",
-                "ASR flush channel full (backpressure); dropping oldest flush"
-            );
-            let _ = event_tx.send(AppEvent::ErrorOccurred {
-                error: AppError::Internal {
-                    context: "ASR flush channel full; live transcript delayed (audio.opus unaffected)".into(),
-                },
-            });
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            tracing::warn!(target: "orchestrator", "ASR flush channel closed unexpectedly");
-        }
+    dispatch_flush_inner(flush_queue, payload, event_tx);
+}
+
+/// Public wrapper for `dispatch_flush` used by tests.
+///
+/// Only available under the `test-source` feature (or in `#[cfg(test)]`).
+#[cfg(any(test, feature = "test-source"))]
+pub(crate) fn dispatch_flush_pub(
+    flush_queue: &FlushQueue,
+    payload: FlushPayload,
+    event_tx: &broadcast::Sender<AppEvent>,
+) {
+    dispatch_flush_inner(flush_queue, payload, event_tx);
+}
+
+fn dispatch_flush_inner(
+    flush_queue: &FlushQueue,
+    payload: FlushPayload,
+    event_tx: &broadcast::Sender<AppEvent>,
+) {
+    let mut deque = flush_queue
+        .deque
+        .lock()
+        .expect("flush queue mutex poisoned");
+
+    if deque.len() >= FLUSH_CHANNEL_CAP {
+        // Drop the OLDEST pending flush (the front of the queue).
+        let _dropped = deque.pop_front();
+        tracing::warn!(
+            target: "orchestrator",
+            "ASR flush queue full (backpressure); dropping oldest pending flush \
+             (audio.opus unaffected)"
+        );
+        let _ = event_tx.send(AppEvent::ErrorOccurred {
+            error: AppError::Internal {
+                context: "ASR flush queue full; oldest pending flush dropped (audio.opus unaffected)".into(),
+            },
+        });
     }
+
+    deque.push_back(payload);
+    drop(deque);
+
+    // Signal the worker that a new payload is available.
+    flush_queue.notify.notify_one();
+    tracing::debug!(target: "orchestrator", "runner: flush dispatched to ASR worker");
 }
 
 // ---------------------------------------------------------------------------
@@ -536,21 +713,25 @@ fn dispatch_flush(
 // ---------------------------------------------------------------------------
 
 /// The ASR worker runs as a dedicated `spawn_blocking` task. It drains
-/// `FlushPayload`s from the runner, transcribes each with the ASR runtime,
-/// emits `AppEvent::TranscriptSegment` events, and sends transcript segments
-/// back to the runner via `writer_cmd_tx` for persistence.
+/// `FlushPayload`s from the flush queue, transcribes each with the ASR
+/// runtime, emits `AppEvent::TranscriptSegment` events, and sends transcript
+/// segments back to the runner via `writer_cmd_tx` for persistence.
 ///
-/// The `AsrRuntime` is lazy-initialised on the first flush so that tests and
-/// model-missing paths don't force a model load at session start.
+/// `prebuilt_backend`: when `Some`, the provided backend is used directly
+/// (test injection path). When `None`, the `AsrRuntime` is lazy-initialised
+/// on the first flush from the `model_registry` (production path).
+///
+/// One flush is in-flight at a time: the worker pops one payload, processes
+/// it fully, then waits for the next notification.
 fn run_asr_worker(
-    mut flush_rx: mpsc::Receiver<FlushPayload>,
-    asr_mutex: Arc<Mutex<Option<AsrRuntime>>>,
+    flush_queue: FlushQueue,
+    prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
     model_registry: Arc<ModelRegistry>,
     event_tx: broadcast::Sender<AppEvent>,
     writer_cmd_tx: mpsc::Sender<WriterCommand>,
 ) {
-    // Use a single-threaded tokio runtime to allow async calls (model_registry.ensure)
-    // from within this spawn_blocking context.
+    // Use a single-threaded tokio runtime to allow async calls (model_registry.ensure,
+    // Notify::notified) from within this spawn_blocking context.
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -562,38 +743,117 @@ fn run_asr_worker(
         }
     };
 
-    while let Some(payload) = flush_rx.blocking_recv() {
-        let result = rt.block_on(process_flush(
-            payload,
-            &asr_mutex,
-            &model_registry,
-            &event_tx,
-            &writer_cmd_tx,
-        ));
+    // Production path: lazily-initialised AsrRuntime wrapped in an Option.
+    // Test path: the prebuilt backend is used directly.
+    let mut lazy_runtime: Option<AsrRuntime> = None;
+
+    // Determine which backend to use: either the prebuilt one (test) or a lazy
+    // production one. We use a closure-style dispatch below to avoid lifetimes
+    // across the Option<Box<dyn AsrBackend>>.
+    //
+    // The prebuilt backend is moved into its own Option so we can mutably borrow
+    // it separately from lazy_runtime.
+    let mut prebuilt: Option<Box<dyn AsrBackend + Send>> = prebuilt_backend;
+
+    // `pending_closed`: when true, skip the `notified()` wait and drain the
+    // remaining queue immediately (runner has exited, no more notify_one calls).
+    let mut pending_closed = false;
+
+    loop {
+        if !pending_closed {
+            // Wait for a payload to be available, or the runner to signal closed.
+            rt.block_on(flush_queue.notify.notified());
+        }
+
+        // Pop the oldest pending payload.
+        let (payload, is_closed) = {
+            let mut deque = flush_queue
+                .deque
+                .lock()
+                .expect("flush queue mutex poisoned");
+            let p = deque.pop_front();
+            let closed = flush_queue.closed.load(Ordering::Acquire);
+            (p, closed)
+        };
+
+        // Once the runner signals closed we keep draining without waiting.
+        if is_closed {
+            pending_closed = true;
+        }
+
+        let payload = match payload {
+            Some(p) => {
+                // Track that we have a payload in-flight; decremented via
+                // InFlightGuard below regardless of how this iteration exits.
+                flush_queue.in_flight.fetch_add(1, Ordering::AcqRel);
+                p
+            }
+            None => {
+                if pending_closed {
+                    // Queue is empty and runner has exited — we're done.
+                    tracing::debug!(
+                        target: "orchestrator",
+                        "ASR worker: flush queue closed and drained; exiting"
+                    );
+                    return;
+                }
+                // Spurious wakeup; continue waiting.
+                continue;
+            }
+        };
+
+        // Guard that decrements `in_flight` when dropped (on any loop iteration
+        // exit path: return, continue, or falling through).
+        struct InFlightGuard<'a>(&'a Arc<AtomicUsize>);
+        impl Drop for InFlightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _in_flight_guard = InFlightGuard(&flush_queue.in_flight);
+
+        // Determine the backend to use.
+        let backend: &mut dyn AsrBackend = if let Some(ref mut pb) = prebuilt {
+            pb.as_mut()
+        } else {
+            // Lazy-initialise AsrRuntime on the first flush (production path).
+            if lazy_runtime.is_none() {
+                let result = rt.block_on(init_asr_runtime(&model_registry));
+                match result {
+                    Ok(Some(runtime)) => {
+                        lazy_runtime = Some(runtime);
+                    }
+                    Ok(None) => {
+                        // Model not available; skip this flush.
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(target: "orchestrator", "ASR runtime init failed: {e}");
+                        let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
+                        continue;
+                    }
+                }
+            }
+            lazy_runtime.as_mut().expect("just initialised")
+        };
+
+        let result = process_flush_with_backend(payload, backend, &event_tx, &writer_cmd_tx);
         if let Err(e) = result {
             tracing::warn!(target: "orchestrator", "ASR flush error: {e}");
             let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
         }
+        // `_in_flight_guard` drops here, decrementing in_flight.
     }
-    tracing::debug!(target: "orchestrator", "ASR worker: flush channel closed; exiting");
 }
 
-/// Process one flush payload: ensure model, transcribe, emit events, and
-/// send transcript segments back to the runner for persistence.
-async fn process_flush(
-    payload: FlushPayload,
-    asr_mutex: &Mutex<Option<AsrRuntime>>,
-    model_registry: &ModelRegistry,
-    event_tx: &broadcast::Sender<AppEvent>,
-    writer_cmd_tx: &mpsc::Sender<WriterCommand>,
-) -> AppResult<()> {
-    if payload.vad_segments.is_empty() {
-        return Ok(());
-    }
-
+/// Lazily initialise `AsrRuntime` on the first flush.
+///
+/// Returns `Ok(None)` if the model is not yet available (caller should skip
+/// the flush). Returns `Ok(Some(runtime))` when initialisation succeeded.
+async fn init_asr_runtime(model_registry: &ModelRegistry) -> AppResult<Option<AsrRuntime>> {
     let model_id = ModelId::from(ASR_MODEL_ID);
 
-    // Check whether the model is available (fast sync path via list_models).
+    // Fast path: check whether the model is available.
     let model_available = model_registry
         .list_models()
         .into_iter()
@@ -607,41 +867,47 @@ async fn process_flush(
             "ASR model {} not available; skipping flush",
             ASR_MODEL_ID
         );
-        return Ok(());
+        return Ok(None);
     }
 
-    // Lazy-init the ASR runtime on first flush.
-    let mut guard = asr_mutex.lock().await;
-    if guard.is_none() {
-        let model_dir = model_registry.ensure(&model_id).await.map_err(|e| {
-            tracing::warn!(target: "orchestrator", "model ensure failed: {e}");
-            e
-        })?;
+    let model_dir = model_registry.ensure(&model_id).await.map_err(|e| {
+        tracing::warn!(target: "orchestrator", "model ensure failed: {e}");
+        e
+    })?;
 
-        // Locate gguf and mmproj files. The convention is the first .gguf file
-        // in the model dir. Mmproj is the file whose name contains "mmproj".
-        let gguf_path = find_file_in_dir(&model_dir, |name| {
-            name.ends_with(".gguf") && !name.contains("mmproj")
-        })?;
-        let mmproj_path = find_file_in_dir(&model_dir, |name| name.contains("mmproj"))?;
+    // Locate gguf and mmproj files. The convention is the first .gguf file
+    // in the model dir. Mmproj is the file whose name contains "mmproj".
+    let gguf_path = find_file_in_dir(&model_dir, |name| {
+        name.ends_with(".gguf") && !name.contains("mmproj")
+    })?;
+    let mmproj_path = find_file_in_dir(&model_dir, |name| name.contains("mmproj"))?;
 
-        match AsrRuntime::new(&gguf_path, &mmproj_path, AsrRuntimeConfig::default()) {
-            Ok(runtime) => {
-                tracing::info!(
-                    target: "orchestrator",
-                    "ASR runtime initialised from {}",
-                    model_dir.display()
-                );
-                *guard = Some(runtime);
-            }
-            Err(e) => {
-                tracing::warn!(target: "orchestrator", "ASR runtime init failed: {e}");
-                return Err(e);
-            }
+    match AsrRuntime::new(&gguf_path, &mmproj_path, AsrRuntimeConfig::default()) {
+        Ok(runtime) => {
+            tracing::info!(
+                target: "orchestrator",
+                "ASR runtime initialised from {}",
+                model_dir.display()
+            );
+            Ok(Some(runtime))
+        }
+        Err(e) => {
+            tracing::warn!(target: "orchestrator", "ASR runtime init failed: {e}");
+            Err(e)
         }
     }
+}
 
-    let runtime = guard.as_mut().expect("just initialised");
+/// Process one flush payload with the provided ASR backend.
+fn process_flush_with_backend(
+    payload: FlushPayload,
+    backend: &mut dyn AsrBackend,
+    event_tx: &broadcast::Sender<AppEvent>,
+    writer_cmd_tx: &mpsc::Sender<WriterCommand>,
+) -> AppResult<()> {
+    if payload.vad_segments.is_empty() {
+        return Ok(());
+    }
 
     let chunk = AudioChunk {
         samples: payload.samples,
@@ -650,7 +916,7 @@ async fn process_flush(
         end_ms: payload.vad_segments.last().map(|(_, e)| *e).unwrap_or(0),
     };
 
-    let chunk_segments = match runtime.transcribe_chunk(&chunk) {
+    let chunk_segments = match backend.transcribe_chunk(&chunk) {
         Ok(segs) => segs,
         Err(e) => {
             tracing::warn!(target: "orchestrator", "transcribe_chunk failed: {e}");
@@ -668,10 +934,6 @@ async fn process_flush(
     // Re-split proportionally across the VAD sub-segments.
     let sub_segments = emit_segments_proportional(&combined_text, &payload.vad_segments);
 
-    // Drop the guard before emitting events to avoid holding the lock longer
-    // than needed.
-    drop(guard);
-
     for seg in sub_segments {
         // Emit broadcast event.
         let _ = event_tx.send(AppEvent::TranscriptSegment {
@@ -688,6 +950,33 @@ async fn process_flush(
     }
 
     Ok(())
+}
+
+/// Wait for the ASR worker to finish processing all queued flushes.
+///
+/// After dispatching the final flush before `stop`, the runner calls this to
+/// ensure the ASR worker has processed all pending items and sent back all
+/// `WriterCommand::WriteSegment` commands before `finalise()` is called.
+///
+/// Polls until both the queue is empty AND no payload is in-flight, draining
+/// writer commands as they arrive. Times out after 30 s (covers the slowest
+/// expected inference on the target hardware).
+fn wait_for_asr_worker_drain(
+    flush_queue: &FlushQueue,
+    writer_cmd_rx: &mut mpsc::Receiver<WriterCommand>,
+    writer: &mut MeetingWriter,
+) {
+    let timeout = Duration::from_secs(30);
+    let poll_interval = Duration::from_millis(20);
+    let drained = flush_queue.wait_all_processed(timeout, poll_interval);
+    if !drained {
+        tracing::warn!(
+            target: "orchestrator",
+            "ASR worker did not drain within 30 s; finalising without waiting further"
+        );
+    }
+    // Drain any writer commands that arrived while we were waiting.
+    drain_writer_commands(writer_cmd_rx, writer);
 }
 
 /// Drain any pending `WriterCommand`s from the ASR worker and apply them.
@@ -1002,5 +1291,65 @@ mod tests {
         let segments = emit_segments_proportional("", &vad_segments);
         assert_eq!(segments.len(), 2);
         assert!(segments.iter().all(|s| s.text.is_empty()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: dispatch_flush drop-oldest behaviour
+    // -----------------------------------------------------------------------
+
+    /// When `dispatch_flush` is called with a full queue (FLUSH_CHANNEL_CAP=4),
+    /// it must drop the OLDEST entry (front) and retain the newest (back).
+    #[test]
+    fn dispatch_flush_drops_oldest_when_queue_full() {
+        use meeting_app_common::MeetingId;
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<AppEvent>(16);
+
+        let flush_queue = FlushQueue::new();
+        let meeting_id = MeetingId::new();
+
+        // Fill the queue to capacity with payloads tagged by their index in
+        // vad_segments[0].0 (start_ms) so we can identify which was dropped.
+        for i in 0..FLUSH_CHANNEL_CAP {
+            let payload = FlushPayload {
+                samples: vec![0.0f32; 100],
+                vad_segments: vec![(i as u64 * 1000, i as u64 * 1000 + 500)],
+                meeting_id,
+            };
+            dispatch_flush(&flush_queue, payload, &event_tx);
+        }
+
+        // Queue is now full (4 entries). Dispatching one more should drop index 0.
+        let newest_start_ms = FLUSH_CHANNEL_CAP as u64 * 1000;
+        let newest_payload = FlushPayload {
+            samples: vec![0.0f32; 100],
+            vad_segments: vec![(newest_start_ms, newest_start_ms + 500)],
+            meeting_id,
+        };
+        dispatch_flush(&flush_queue, newest_payload, &event_tx);
+
+        // Drain the queue and collect start_ms values.
+        let deque = flush_queue.deque.lock().unwrap();
+        let starts: Vec<u64> = deque
+            .iter()
+            .map(|p| p.vad_segments[0].0)
+            .collect();
+
+        // The oldest (start_ms = 0) must have been dropped.
+        assert!(
+            !starts.contains(&0),
+            "oldest flush (start_ms=0) must have been dropped; got: {starts:?}"
+        );
+        // The newest must be present.
+        assert!(
+            starts.contains(&newest_start_ms),
+            "newest flush (start_ms={newest_start_ms}) must be retained; got: {starts:?}"
+        );
+        // Queue must not exceed FLUSH_CHANNEL_CAP.
+        assert_eq!(
+            deque.len(),
+            FLUSH_CHANNEL_CAP,
+            "queue must remain at FLUSH_CHANNEL_CAP after drop-oldest; len={}",
+            deque.len()
+        );
     }
 }

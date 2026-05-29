@@ -39,6 +39,7 @@ sha2 = { workspace = true }
 audiopus = { workspace = true }
 ogg = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+hound = { workspace = true }
 
 [[test]]
 name = "start_record_stop"
@@ -50,4 +51,8 @@ required-features = ["test-source"]
 
 [[test]]
 name = "transcription_e2e"
+required-features = ["test-source"]
+
+[[test]]
+name = "pipeline_stub_test"
 required-features = ["test-source"]

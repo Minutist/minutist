@@ -106,6 +106,38 @@ async updateSettings(settings: Settings) : Promise<Result<null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * List all known models with their current runtime status.
+ * 
+ * Routes through `Orchestrator::list_models`, which wraps `ModelRegistry::list_models`
+ * so that `ipc-bridge` does not need a direct `model-registry` dependency.
+ */
+async listModels() : Promise<Result<ModelStatus[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Ensure a model is downloaded and hash-verified.
+ * 
+ * Returns `Ok(())` when the model is ready for use. Starts a download if the
+ * model is absent; the webview tracks granular progress via
+ * `AppEvent::ModelDownloadProgress` events emitted on the broadcast channel.
+ * 
+ * Routes through `Orchestrator::ensure_model`, preserving the dependency-table
+ * invariant that `ipc-bridge` does not depend directly on `model-registry`.
+ */
+async ensureModel(modelId: ModelId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("ensure_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -241,6 +273,38 @@ export type ModelDescriptor = { name: string; quantisation: string | null; versi
  * `"silero-vad-v4"`, `"sherpa-pyannote-segmentation-3-0"`.
  */
 export type ModelId = string
+/**
+ * Coarse model classification — drives the per-kind cache subdirectory
+ * under `{app-data}/models/{kind}/` (see `architecture/cross-cutting.md`
+ * "Filesystem layout").
+ */
+export type ModelKind = "asr" | "llm" | "diarize"
+export type ModelStatus = { id: ModelId; kind: ModelKind; display_name: string; status: ModelStatusState }
+/**
+ * Runtime state of one model on this user's machine.
+ */
+export type ModelStatusState = 
+/**
+ * Files are present and hashes match. `local_dir` is the cache
+ * directory absolute path.
+ */
+{ state: "available"; local_dir: string } | 
+/**
+ * Files are missing or partial. `bytes_present` and `bytes_total`
+ * are summed across the manifest's `files`.
+ */
+{ state: "missing"; bytes_present: number; bytes_total: number } | 
+/**
+ * A download is in progress. The webview tracks granular progress
+ * via `AppEvent::ModelDownloadProgress` events; this state is the
+ * snapshot at query time.
+ */
+{ state: "downloading"; bytes_done: number; bytes_total: number } | 
+/**
+ * A previous download or hash check failed. `message` is a stable
+ * human-readable string suitable for surfacing in UI.
+ */
+{ state: "failed"; message: string }
 /**
  * Top-level state of the recording pipeline. Emitted to the webview on
  * transitions via `AppEvent::StateChanged`.

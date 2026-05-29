@@ -286,6 +286,10 @@ running Tauri app.
 `list_devices`, `start_recording`, `pause_recording`, `resume_recording`,
 `stop_recording`, `get_recording_state`, `get_settings`, `update_settings`.
 
+**Phase 2 additions (10 commands total):** `list_models` (`Vec<ModelStatus>`),
+`ensure_model` (`()`). Both route through `Orchestrator` — no direct
+`model-registry` dependency from `ipc-bridge`.
+
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name
 `"app-event-payload"`) to all windows.

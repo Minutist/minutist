@@ -4,18 +4,20 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Phase 1 commands (8 total)
+//! ## Commands (10 total)
 //!
-//! | Command | Returns |
-//! |---|---|
-//! | `list_devices` | `Vec<AudioDevice>` |
-//! | `start_recording` | `MeetingId` |
-//! | `pause_recording` | `()` |
-//! | `resume_recording` | `()` |
-//! | `stop_recording` | `MeetingMeta` |
-//! | `get_recording_state` | `RecordingState` |
-//! | `get_settings` | `Settings` |
-//! | `update_settings` | `()` |
+//! | Command | Returns | Phase |
+//! |---|---|---|
+//! | `list_devices` | `Vec<AudioDevice>` | 1 |
+//! | `start_recording` | `MeetingId` | 1 |
+//! | `pause_recording` | `()` | 1 |
+//! | `resume_recording` | `()` | 1 |
+//! | `stop_recording` | `MeetingMeta` | 1 |
+//! | `get_recording_state` | `RecordingState` | 1 |
+//! | `get_settings` | `Settings` | 1 |
+//! | `update_settings` | `()` | 1 |
+//! | `list_models` | `Vec<ModelStatus>` | 2 |
+//! | `ensure_model` | `()` | 2 |
 //!
 //! All commands return `Result<T, IpcError>`.
 //!
@@ -66,7 +68,7 @@ pub struct IpcState {
 // bindings_builder — shared builder for app-main and the export helper
 // ---------------------------------------------------------------------------
 
-/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1 commands
+/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1+2 commands
 /// and the `AppEventPayload` event.
 ///
 /// Both `app-main` (to build the invoke handler) and a bindings-export helper
@@ -100,6 +102,8 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::get_recording_state,
             commands::get_settings,
             commands::update_settings,
+            commands::list_models,
+            commands::ensure_model,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -113,8 +117,8 @@ mod tests {
     use super::*;
     use tauri_specta::Event;
 
-    /// Verify that `bindings_builder()` produces a builder with all 8 Phase 1
-    /// command names registered, by inspecting the TypeScript export.
+    /// Verify that `bindings_builder()` produces a builder with all 10 commands
+    /// registered, by inspecting the TypeScript export.
     ///
     /// tauri-specta rc.21 does not expose the internal command list publicly.
     /// We use `export_str` to generate the TypeScript bindings string and scan
@@ -125,7 +129,7 @@ mod tests {
     /// timestamps and byte counts) to export as TypeScript `number` rather
     /// than erroring.  This matches the Handy project's pattern per Phase 1
     #[test]
-    fn bindings_builder_registers_all_eight_commands() {
+    fn bindings_builder_registers_all_ten_commands() {
         use specta_typescript::{BigIntExportBehavior, Typescript};
 
         let builder = bindings_builder();
@@ -143,6 +147,8 @@ mod tests {
             "get_recording_state",
             "get_settings",
             "update_settings",
+            "list_models",
+            "ensure_model",
         ];
 
         for name in &expected {

@@ -1,10 +1,12 @@
-/* Minimal functional styles for Phase 1. Tailwind arrives in Phase 3. */
+/* Minimal functional styles for Phase 1/2. Tailwind arrives in Phase 3. */
 
 .main-window {
   font-family: system-ui, sans-serif;
-  max-width: 640px;
-  margin: 0 auto;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
   padding: 1rem;
+  box-sizing: border-box;
 }
 
 .main-window__header h1 {
@@ -16,6 +18,30 @@
   display: flex;
   flex-direction: column;
   gap: 1rem;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Two-column layout introduced in Phase 2. */
+.main-window__content--columns {
+  flex-direction: row;
+  gap: 1rem;
+}
+
+.main-window__left-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.main-window__right-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
 }
 
 .main-window__controls {
@@ -83,4 +109,40 @@
   color: #c62828;
   padding: 0.5rem 0.75rem;
   font-size: 0.875rem;
+}
+
+/* ModelDownloadStatus */
+.model-download-status {
+  padding: 0.75rem;
+  background: #fff8e1;
+  border: 1px solid #ffd54f;
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  font-size: 0.875rem;
+}
+
+.model-download-status__name {
+  margin: 0;
+  font-weight: 500;
+}
+
+.model-download-status__progress-track {
+  height: 0.5rem;
+  background: #e0e0e0;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.model-download-status__progress-bar {
+  height: 100%;
+  background: #ffa000;
+  transition: width 150ms linear;
+}
+
+.model-download-status__download-btn {
+  align-self: flex-start;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
 }

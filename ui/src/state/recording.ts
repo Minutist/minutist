@@ -12,9 +12,11 @@ import type {
   AudioDevice,
   AppEvent,
   Settings,
+  Segment,
 } from "../ipc/bindings";
+import { useModelsStore } from "./models";
 
-export type { RecordingState, AudioDevice, AppEvent, Settings };
+export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
 
 export type RecordingStore = {
   state: RecordingState;
@@ -28,6 +30,8 @@ export type RecordingStore = {
   settings: Settings | null;
   meter: { peak: number; rms: number };
   lastError: string | null;
+  /** Live transcript for the current recording session. Cleared when a new recording starts. */
+  transcript: Segment[];
 
   // actions
   refreshDevices: () => Promise<void>;
@@ -48,6 +52,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   settings: null,
   meter: { peak: 0, rms: 0 },
   lastError: null,
+  transcript: [],
 
   refreshDevices: async () => {
     try {
@@ -73,6 +78,11 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   },
 
   start: async () => {
+    // Guard: ASR model must be ready before recording can start.
+    if (!useModelsStore.getState().isAsrModelReady) {
+      set({ lastError: "ASR model not yet downloaded" });
+      return;
+    }
     try {
       const result = await commands.startRecording(get().selectedDeviceId);
       unwrap(result);
@@ -141,7 +151,13 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   handleEvent: (event) => {
     switch (event.kind) {
       case "state_changed":
-        set({ state: event.state });
+        // Clear the live transcript when a new recording starts so the
+        // previous session's transcript is no longer shown.
+        if (event.state.kind === "recording") {
+          set({ state: event.state, transcript: [] });
+        } else {
+          set({ state: event.state });
+        }
         break;
       case "audio_meter":
         set({ meter: { peak: event.frame.peak, rms: event.frame.rms } });
@@ -150,12 +166,15 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         // Trigger a re-fetch; ignore the promise — fire and forget.
         void get().refreshDevices();
         break;
+      case "transcript_segment":
+        set((s) => ({ transcript: [...s.transcript, event.segment] }));
+        break;
       case "error_occurred":
         set({ lastError: ipcErrorMessage(event.error) });
         break;
-      // Other event kinds (transcript_segment, diarization_complete,
-      // summary_ready, model_download_progress, settings_changed) are not
-      // handled in Phase 1. They arrive but produce no state change here.
+      // model_download_progress is handled by the models store via its own
+      // handleEvent dispatch (mounted alongside this bridge in event-listener.tsx).
+      // diarization_complete, summary_ready, settings_changed: not handled in Phase 2.
       default:
         break;
     }

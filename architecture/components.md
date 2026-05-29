@@ -351,6 +351,17 @@ is mounted once in `App.tsx` via the `useAppEventBridge` hook
 conditionally-rendered subtree. The Vite dev server runs on port 5173
 (matching `tauri.conf.json` `devUrl`).
 
+**Phase 2 additions (Stream F).** `RecordingStore` gains `transcript: Segment[]`
+(cleared on `state_changed → recording`; appended by `transcript_segment` events).
+`ModelsStore` (`ui/src/state/models.ts`) tracks `ModelStatus[]`, `isAsrModelReady`
+(derived), and `downloadInProgress` progress map; its `handleEvent` is dispatched
+alongside `RecordingStore.handleEvent` from `useAppEventBridge`. The `Start` button
+in `MeetingControls` is disabled when `isAsrModelReady` is false; `ModelDownloadStatus`
+(`ui/src/shell/`) provides the first-run download flow. `TranscriptPane`
+(`ui/src/transcript/`) renders live segments with `MM:SS.cc` timestamps and
+sticky-bottom auto-scroll. `MainWindow` uses a two-column 50/50 layout (controls
+left, transcript right).
+
 ## What lives where — quick reference
 
 - **Editing audio capture buffer size:** `audio-capture` crate.

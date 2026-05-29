@@ -5,6 +5,9 @@
  * of the four RecordingState variants and verifies that the four buttons have
  * the correct enabled/disabled state.
  *
+ * Phase 2: Start also requires `isAsrModelReady = true`; tests set this
+ * explicitly via the models store.
+ *
  * The Tauri runtime is not available in jsdom; Tauri API modules are mocked
  * below to prevent import-time failures.
  */
@@ -13,6 +16,7 @@ import { render, screen } from "@testing-library/react";
 import { act } from "react";
 import { MeetingControls } from "../shell/MeetingControls";
 import { useRecordingStore } from "../state/recording";
+import { useModelsStore } from "../state/models";
 import type { RecordingState } from "../ipc/bindings";
 
 // ---------------------------------------------------------------------------
@@ -51,7 +55,7 @@ function getButton(name: string): HTMLButtonElement {
 
 describe("MeetingControls", () => {
   beforeEach(() => {
-    // Reset store to a known baseline before each test.
+    // Reset stores to a known baseline before each test.
     act(() => {
       useRecordingStore.setState({
         state: { kind: "idle" },
@@ -59,7 +63,10 @@ describe("MeetingControls", () => {
         selectedDeviceId: null,
         meter: { peak: 0, rms: 0 },
         lastError: null,
+        transcript: [],
       });
+      // Phase 2: ASR model is ready by default so Start is enabled in idle.
+      useModelsStore.setState({ isAsrModelReady: true });
     });
   });
 
@@ -71,6 +78,16 @@ describe("MeetingControls", () => {
     expect(getButton("Pause")).toBeDisabled();
     expect(getButton("Resume")).toBeDisabled();
     expect(getButton("Stop")).toBeDisabled();
+  });
+
+  it("Idle + ASR model not ready: Start disabled", () => {
+    act(() => {
+      useModelsStore.setState({ isAsrModelReady: false });
+    });
+    setRecordingState({ kind: "idle" });
+    render(<MeetingControls />);
+
+    expect(getButton("Start")).toBeDisabled();
   });
 
   it("Recording: Pause and Stop enabled; Start and Resume disabled", () => {

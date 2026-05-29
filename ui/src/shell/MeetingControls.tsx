@@ -1,4 +1,5 @@
 import { useRecordingStore } from "../state/recording";
+import { useModelsStore } from "../state/models";
 import type { RecordingState } from "../ipc/bindings";
 
 /**
@@ -6,13 +7,16 @@ import type { RecordingState } from "../ipc/bindings";
  *
  * Exported for use in unit tests without requiring the Zustand store.
  */
-export function deriveButtonStates(state: RecordingState) {
+export function deriveButtonStates(
+  state: RecordingState,
+  isAsrModelReady: boolean,
+) {
   const isIdle = state.kind === "idle";
   const isRecording = state.kind === "recording";
   const isPaused = state.kind === "paused";
 
   return {
-    startEnabled: isIdle,
+    startEnabled: isIdle && isAsrModelReady,
     stopEnabled: isRecording || isPaused,
     pauseEnabled: isRecording,
     resumeEnabled: isPaused,
@@ -25,9 +29,10 @@ export function MeetingControls() {
   const stop = useRecordingStore((s) => s.stop);
   const pause = useRecordingStore((s) => s.pause);
   const resume = useRecordingStore((s) => s.resume);
+  const isAsrModelReady = useModelsStore((s) => s.isAsrModelReady);
 
   const { startEnabled, stopEnabled, pauseEnabled, resumeEnabled } =
-    deriveButtonStates(state);
+    deriveButtonStates(state, isAsrModelReady);
 
   return (
     <div className="meeting-controls">

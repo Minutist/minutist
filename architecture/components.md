@@ -232,6 +232,8 @@ container) and `metadata.json` per meeting. Pause/resume inserts zero-sample
 pauses (±20 ms per frame). The libsql index (`index.db`) and
 transcript/notes/summary storage are Phase 4.
 
+**Phase 2 surface growth:** `TranscriptWriter` writes `transcript.json` (JSON array of `Segment`) per meeting. Flushed on each ASR-worker return so a crash mid-recording loses at most one flush's worth of transcript.
+
 ### `orchestrator`
 **Crate:** `crates/orchestrator`
 **Owns:** the live recording state machine. Wires `audio-capture →

@@ -2,12 +2,13 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use meeting_app_common::{AppResult, AudioFormat, MeetingId, MeetingMeta};
+use meeting_app_common::{AppResult, AudioFormat, MeetingId, MeetingMeta, Segment};
 
 use crate::error::Error;
 use crate::folder::MeetingFolder;
 use crate::metadata::write_metadata;
 use crate::opus_encoder::OggOpusEncoder;
+use crate::transcript::TranscriptWriter;
 
 /// Writes audio samples and metadata for a single meeting recording.
 ///
@@ -19,10 +20,18 @@ use crate::opus_encoder::OggOpusEncoder;
 /// ```text
 /// open() → push_samples()* → [pause() → resume() → push_samples()*]* → finalise()
 /// ```
+///
+/// # Transcript
+///
+/// `transcript_writer` is created eagerly at `open` time so that
+/// `write_transcript_segment` needs no fallible lazy-init path. If no
+/// segments are ever written, `finalise` calls `TranscriptWriter::finalise`
+/// which is a no-op for an empty buffer, leaving `transcript.json` absent.
 pub struct MeetingWriter {
     folder: MeetingFolder,
     encoder: Option<OggOpusEncoder<BufWriter<File>>>,
     format: AudioFormat,
+    transcript_writer: Option<TranscriptWriter>,
 }
 
 impl MeetingWriter {
@@ -40,6 +49,8 @@ impl MeetingWriter {
         let buffered = BufWriter::new(file);
         let encoder = OggOpusEncoder::new(buffered).map_err(meeting_app_common::AppError::from)?;
 
+        let transcript_writer = TranscriptWriter::open(&folder)?;
+
         tracing::info!(
             target: "persistence",
             meeting_id = %meeting_id.0,
@@ -51,6 +62,7 @@ impl MeetingWriter {
             folder,
             encoder: Some(encoder),
             format,
+            transcript_writer: Some(transcript_writer),
         })
     }
 
@@ -79,8 +91,24 @@ impl MeetingWriter {
         self.encoder_mut()?.resume().map_err(Into::into)
     }
 
-    /// Finalise the recording: flush the encoder, write `metadata.json`, and
-    /// return the `MeetingFolder` handle.
+    /// Append a transcript segment to the buffer and flush to `transcript.json`.
+    ///
+    /// Each call is durable: the segment is buffered then immediately written
+    /// to disk so a crash between calls loses at most one flush's worth of
+    /// transcript.
+    pub fn write_transcript_segment(&mut self, segment: Segment) -> AppResult<()> {
+        let tw = self
+            .transcript_writer
+            .as_mut()
+            .ok_or_else(|| meeting_app_common::AppError::Internal {
+                context: "MeetingWriter already finalised".to_string(),
+            })?;
+        tw.append(segment)?;
+        tw.flush()
+    }
+
+    /// Finalise the recording: flush the encoder, finalise the transcript,
+    /// write `metadata.json`, and return the `MeetingFolder` handle.
     pub fn finalise(mut self, meta: MeetingMeta) -> AppResult<MeetingFolder> {
         let encoder =
             self.encoder
@@ -98,6 +126,11 @@ impl MeetingWriter {
             meeting_id = %self.folder.id().0,
             "audio.opus written"
         );
+
+        // Finalise transcript.json (no-op if no segments were written).
+        if let Some(tw) = self.transcript_writer.take() {
+            tw.finalise()?;
+        }
 
         // Write metadata.json.
         write_metadata(self.folder.metadata_path(), &meta)

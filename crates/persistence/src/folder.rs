@@ -62,4 +62,9 @@ impl MeetingFolder {
     pub(crate) fn metadata_path(&self) -> PathBuf {
         self.path.join("metadata.json")
     }
+
+    /// Path to `transcript.json` within the folder.
+    pub(crate) fn transcript_path(&self) -> PathBuf {
+        self.path.join("transcript.json")
+    }
 }

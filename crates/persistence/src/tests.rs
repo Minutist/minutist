@@ -1,17 +1,24 @@
-//! Unit tests for the `persistence` crate (Phase 1).
+//! Unit tests for the `persistence` crate (Phase 1 + Phase 2).
 //!
 //! Tests exercise:
 //! 1. Synthetic 60 s round-trip: encode → decode → duration within ±50 ms.
 //! 2. Metadata round-trip: finalise → deserialise back to `MeetingMeta`.
 //! 3. Pause/resume gap: 5 s + 2 s pause + 5 s → decoded duration ≈ 12 s.
+//!
+//! Phase 2 tests (transcript):
+//! 4. `TranscriptWriter::open` + `append` × 3 + `flush` → file has 3 segments.
+//! 5. Flush idempotency: append 2, flush, append 1, flush → 3 segments (not 5).
+//! 6. `MeetingWriter::write_transcript_segment` → finalise → 2 segments on disk.
+//! 7. Zero-segment meeting: `MeetingWriter::finalise` succeeds; `transcript.json` absent.
 
 use std::io::Cursor;
 use std::time::Duration;
 
-use meeting_app_common::{AudioFormat, MeetingId, MeetingMeta};
+use meeting_app_common::{AudioFormat, MeetingId, MeetingMeta, Segment};
 use tempfile::TempDir;
 
 use crate::opus_encoder::{OggOpusEncoder, SAMPLE_RATE};
+use crate::transcript::TranscriptWriter;
 use crate::writer::MeetingWriter;
 
 // ---------------------------------------------------------------------------
@@ -344,4 +351,147 @@ fn test_finalise_exclusive() {
     // verifies the type system prevents double-finalise (MeetingWriter is
     // consumed by finalise). The compiler enforces this — no runtime test needed.
     // Keeping this test as documentation of the invariant.
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 tests: TranscriptWriter
+// ---------------------------------------------------------------------------
+
+/// Build a minimal `Segment` for testing.
+fn make_segment(start_ms: u64, end_ms: u64, text: &str) -> Segment {
+    Segment {
+        start_ms,
+        end_ms,
+        text: text.to_string(),
+        speaker_id: None,
+        confidence: None,
+        words: vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: TranscriptWriter open + append × 3 + flush → 3 segments on disk
+// ---------------------------------------------------------------------------
+
+/// `TranscriptWriter::open` + `append` × 3 + `flush` produces a
+/// `transcript.json` that deserialises to a `Vec<Segment>` of length 3
+/// with matching fields.
+#[test]
+fn test_transcript_writer_append_flush() {
+    use crate::folder::MeetingFolder;
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    let folder = MeetingFolder::create(tempdir.path(), id).expect("create folder");
+
+    let mut tw = TranscriptWriter::open(&folder).expect("open TranscriptWriter");
+    tw.append(make_segment(0, 500, "hello")).expect("append 1");
+    tw.append(make_segment(600, 1200, "world")).expect("append 2");
+    tw.append(make_segment(1300, 2000, "foo")).expect("append 3");
+    tw.flush().expect("flush");
+
+    let path = folder.path().join("transcript.json");
+    assert!(path.exists(), "transcript.json not created after flush");
+
+    let json = std::fs::read_to_string(&path).expect("read transcript.json");
+    let segments: Vec<Segment> = serde_json::from_str(&json).expect("deserialise transcript.json");
+
+    assert_eq!(segments.len(), 3, "expected 3 segments, got {}", segments.len());
+    assert_eq!(segments[0].start_ms, 0);
+    assert_eq!(segments[0].text, "hello");
+    assert_eq!(segments[1].text, "world");
+    assert_eq!(segments[2].end_ms, 2000);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: flush is idempotent — rewrite replaces, does not double-append
+// ---------------------------------------------------------------------------
+
+/// append 2, flush → file has 2; append 1 more, flush → file has 3 (not 5).
+#[test]
+fn test_transcript_writer_flush_idempotent() {
+    use crate::folder::MeetingFolder;
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    let folder = MeetingFolder::create(tempdir.path(), id).expect("create folder");
+
+    let mut tw = TranscriptWriter::open(&folder).expect("open");
+    tw.append(make_segment(0, 100, "a")).expect("append a");
+    tw.append(make_segment(200, 300, "b")).expect("append b");
+    tw.flush().expect("first flush");
+
+    let path = folder.path().join("transcript.json");
+    let json = std::fs::read_to_string(&path).expect("read after first flush");
+    let segments: Vec<Segment> = serde_json::from_str(&json).expect("parse after first flush");
+    assert_eq!(segments.len(), 2, "expected 2 segments after first flush");
+
+    tw.append(make_segment(400, 500, "c")).expect("append c");
+    tw.flush().expect("second flush");
+
+    let json2 = std::fs::read_to_string(&path).expect("read after second flush");
+    let segments2: Vec<Segment> = serde_json::from_str(&json2).expect("parse after second flush");
+    assert_eq!(
+        segments2.len(),
+        3,
+        "expected 3 segments after second flush, got {} (double-append bug?)",
+        segments2.len()
+    );
+    assert_eq!(segments2[2].text, "c");
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: MeetingWriter::write_transcript_segment writes through to disk
+// ---------------------------------------------------------------------------
+
+/// Open a `MeetingWriter`, write 2 segments, finalise, re-read
+/// `transcript.json` → 2 segments.
+#[test]
+fn test_meeting_writer_write_transcript_segment() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+
+    let mut writer = MeetingWriter::open(tempdir.path(), id, opus_format()).expect("open");
+
+    writer
+        .write_transcript_segment(make_segment(0, 800, "first"))
+        .expect("write segment 1");
+    writer
+        .write_transcript_segment(make_segment(900, 1500, "second"))
+        .expect("write segment 2");
+
+    let meta = dummy_meta(id, 1500);
+    let folder = writer.finalise(meta).expect("finalise");
+
+    let path = folder.path().join("transcript.json");
+    assert!(path.exists(), "transcript.json absent after finalise");
+
+    let json = std::fs::read_to_string(&path).expect("read transcript.json");
+    let segments: Vec<Segment> = serde_json::from_str(&json).expect("parse transcript.json");
+
+    assert_eq!(segments.len(), 2, "expected 2 segments");
+    assert_eq!(segments[0].text, "first");
+    assert_eq!(segments[1].text, "second");
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Zero-segment meeting — finalise succeeds; transcript.json absent
+// ---------------------------------------------------------------------------
+
+/// A meeting with no transcript segments: `MeetingWriter::finalise` must
+/// not error. `transcript.json` is absent (not an empty `[]` array).
+#[test]
+fn test_zero_segment_meeting_finalise_ok() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+
+    let writer = MeetingWriter::open(tempdir.path(), id, opus_format()).expect("open");
+    let meta = dummy_meta(id, 0);
+    let folder = writer.finalise(meta).expect("finalise with zero segments");
+
+    let path = folder.path().join("transcript.json");
+    assert!(
+        !path.exists(),
+        "transcript.json should be absent for a zero-segment meeting"
+    );
 }

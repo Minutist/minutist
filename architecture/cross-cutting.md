@@ -181,14 +181,18 @@ model file that bypasses the registry.
 
 ## Configuration
 
-Single source: `settings` crate, backed by `tauri-plugin-store`. Other
-crates take a `&Settings` or call into `settings::get_*()` functions.
-No component reads the underlying TOML / JSON store directly.
+Single source: the `settings` crate, backed by a `serde_json` + `std::fs`
+`JsonFileStore` at an injected path (`{app-data}/settings.store`). The crate
+has **no `tauri::*` dependency**; `app-main` resolves the path and constructs
+the store. (`tauri-plugin-store` is registered as a Tauri plugin in app-main
+for the webview's own use, but it is not the settings crate's backing store.)
+Other crates hold a `SettingsHandle` and read snapshots via it; nobody parses
+the underlying JSON directly. See `components.md` — `settings`.
 
-Settings changes broadcast a `SettingsChanged` event directly from the
-`settings` crate via a tokio `broadcast` (or `watch`) channel.
-Components that care subscribe. The orchestrator is not a config bus —
-it consumes settings the same way every other component does.
+Settings changes broadcast directly from the `settings` crate via a tokio
+`watch` channel (`SettingsHandle::subscribe`). Components that care subscribe.
+The orchestrator is not a config bus — it consumes settings the same way
+every other component does.
 
 ## Filesystem layout
 

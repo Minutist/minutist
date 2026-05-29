@@ -16,6 +16,9 @@ test-source = ["audio-capture/test-source"]
 [dependencies]
 meeting-app-common = { path = "../common" }
 audio-capture = { path = "../audio-capture" }
+vad-chunker = { path = "../vad-chunker" }
+asr-runtime = { path = "../asr-runtime" }
+model-registry = { path = "../model-registry" }
 persistence = { path = "../persistence" }
 settings = { path = "../settings" }
 chrono = { workspace = true }

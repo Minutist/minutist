@@ -30,7 +30,7 @@ appears in:
 | `persistence` | 1 (minimal) → 4 (full) | `common` |
 | `model-registry` | 2 | `common`, `settings` |
 | `settings` | 1 | `common` |
-| `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `diarizer`, `persistence`, `settings` |
+| `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `diarizer`, `persistence`, `model-registry`, `settings` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `settings` |
 

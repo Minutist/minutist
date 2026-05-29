@@ -1,17 +1,22 @@
-//! `orchestrator` — Phase 1 minimal state machine.
+//! `orchestrator` — Phase 2 live recording pipeline.
 //!
 //! Owns the recording lifecycle (start / pause / resume / stop), wires
-//! `audio-capture` to `persistence`, and fans out `AppEvent` to subscribers.
+//! `audio-capture → vad-chunker → asr-runtime → persistence`, and fans out
+//! `AppEvent` to subscribers.
 //!
-//! The live pipeline (VAD → ASR → transcript events) is **not** part of this
-//! crate in Phase 1. That arrives in Phase 2 per `architecture/components.md`.
+//! Phase 2 adds the live pipeline: VAD → batched-VAD accumulator → ASR →
+//! transcript events. See `runner.rs` for implementation details and
+//! `architecture/cross-cutting.md` "ASR chunking constraint" for constraints.
 //!
 //! ## Threading model
 //!
 //! - `Orchestrator` is `Send + Sync` and intended to live behind an `Arc`.
 //! - A `tokio::sync::Mutex<OrchestratorInner>` serialises state transitions.
 //! - The capture-drain runner runs as one `tokio::task::spawn_blocking` task
-//!   per recording session. It owns `AudioStreams` + `MeetingWriter`.
+//!   per recording session. It owns `AudioStreams`, `MeetingWriter`, and
+//!   `VadChunker`.
+//! - A separate `spawn_blocking` ASR worker drains flush payloads from the
+//!   runner via a bounded mpsc channel (capacity 4).
 //! - Events are broadcast via `tokio::sync::broadcast::channel(256)`.
 //!   Slow subscribers drop old events (broadcast semantics); a `tracing::warn!`
 //!   fires when a subscriber reports lag.
@@ -36,12 +41,15 @@ pub mod test_support;
 mod tests;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
 use meeting_app_common::{
-    AppError, AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, RecordingState,
+    AppError, AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, ModelId, ModelStatus,
+    RecordingState,
 };
+use model_registry::ModelRegistry;
 use persistence::MeetingWriter;
 use settings::SettingsHandle;
 use state::{
@@ -60,6 +68,7 @@ pub use error::Error;
 pub struct Orchestrator {
     settings: SettingsHandle,
     persistence_root: PathBuf,
+    model_registry: Arc<ModelRegistry>,
     /// Internal state machine, serialised by a mutex.
     inner: Mutex<OrchestratorInner>,
     /// Broadcast channel for `AppEvent`. Capacity 256 (~8 s of meter at 30 Hz).
@@ -83,11 +92,23 @@ impl Orchestrator {
     /// `persistence_root` is the directory under which per-meeting folders are
     /// created (typically `{app-data}/meetings/`). The caller resolves the
     /// platform app-data path; this crate carries no `tauri::*` dependency.
-    pub fn new(settings: SettingsHandle, persistence_root: PathBuf) -> Self {
+    ///
+    /// `model_registry` is used by the live pipeline to locate and lazy-load
+    /// the ASR model on the first flush.
+    ///
+    /// **Breaking change from Phase 1**: this constructor now requires a
+    /// `model_registry` parameter. Callers in `src-tauri` must be updated
+    /// (Stream E/F responsibility).
+    pub fn new(
+        settings: SettingsHandle,
+        persistence_root: PathBuf,
+        model_registry: Arc<ModelRegistry>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Orchestrator {
             settings,
             persistence_root,
+            model_registry,
             inner: Mutex::new(OrchestratorInner {
                 state: InternalState::Idle,
                 capture: None,
@@ -96,6 +117,26 @@ impl Orchestrator {
             }),
             event_tx,
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Model registry surface
+    // ------------------------------------------------------------------
+
+    /// Snapshot the runtime status of all known models.
+    ///
+    /// Thin wrapper over `ModelRegistry::list_models` so that the IPC bridge
+    /// does not need a direct `model-registry` dependency.
+    pub fn list_models(&self) -> Vec<ModelStatus> {
+        self.model_registry.list_models()
+    }
+
+    /// Ensure a model is downloaded and hash-verified.
+    ///
+    /// Wraps `ModelRegistry::ensure` for the webview first-run flow. Returns
+    /// `Ok(())` when the model is ready for use.
+    pub async fn ensure_model(&self, model_id: &ModelId) -> AppResult<()> {
+        self.model_registry.ensure(model_id).await.map(|_| ())
     }
 
     // ------------------------------------------------------------------
@@ -158,7 +199,13 @@ impl Orchestrator {
             }
         };
 
-        let runner_handle = runner::spawn_runner(streams, writer, self.event_tx.clone());
+        let runner_handle = runner::spawn_runner(
+            streams,
+            writer,
+            self.event_tx.clone(),
+            Arc::clone(&self.model_registry),
+            meeting_id,
+        );
 
         guard.capture = Some(capture);
         guard.runner = Some(runner_handle);
@@ -435,7 +482,13 @@ impl Orchestrator {
             }
         };
 
-        let runner_handle = runner::spawn_runner(streams, writer, self.event_tx.clone());
+        let runner_handle = runner::spawn_runner(
+            streams,
+            writer,
+            self.event_tx.clone(),
+            Arc::clone(&self.model_registry),
+            meeting_id,
+        );
         guard.runner = Some(runner_handle);
         // No AudioCaptureManager to store (guard.capture stays None).
 

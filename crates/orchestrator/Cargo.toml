@@ -32,8 +32,10 @@ serde_json = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
 audio-capture = { path = "../audio-capture", features = ["test-source"] }
+model-registry = { path = "../model-registry" }
 persistence = { path = "../persistence" }
 settings = { path = "../settings" }
+sha2 = { workspace = true }
 audiopus = { workspace = true }
 ogg = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
@@ -44,4 +46,8 @@ required-features = ["test-source"]
 
 [[test]]
 name = "back_pressure"
+required-features = ["test-source"]
+
+[[test]]
+name = "transcription_e2e"
 required-features = ["test-source"]

@@ -257,7 +257,9 @@ timestamp}"` until Phase 3/4 rename support lands.
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration
 accuracy + invalid transitions) and `back_pressure` (slow subscriber
-lag and subscriber-gone survivability). Run with
+lag and subscriber-gone survivability). Phase 2 integration test:
+`transcription_e2e` (env-var-gated end-to-end pipeline: DummyAudioSource
+→ VAD → ASR → TranscriptSegment events + transcript.json on disk). Run with
 `cargo test -p orchestrator --features test-source`.
 
 ### `settings`

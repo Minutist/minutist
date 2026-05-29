@@ -3040,6 +3040,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

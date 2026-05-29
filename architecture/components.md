@@ -210,6 +210,16 @@ in `app-main`). Per-kind cache layout: `{app-data}/models/{asr,llm,diarize}/{mod
 Concurrent `ensure(same_id)` calls are coalesced via an `Arc<Notify>` in-flight map
 so each model is downloaded at most once per process lifetime.
 
+**Event source.** `ModelRegistry::new(cache_root, manifest, event_tx)` takes a
+`broadcast::Sender<AppEvent>` — the *same* channel the orchestrator broadcasts on
+(app-main constructs the channel once and shares it; see `app-main`). The registry
+emits `AppEvent::ModelDownloadProgress` directly onto that bus during `ensure`,
+throttled to ~10 Hz. So the registry is a legitimate first-class event source
+alongside the orchestrator, not solely a path provider — the IPC forwarder's single
+subscription sees its progress events too. (This refines `cross-cutting.md` "Model
+lifecycle", which still frames the registry as handing out paths: that remains true
+for model *files*, but the registry additionally publishes download-progress events.)
+
 ### `persistence`
 **Crate:** `crates/persistence`
 **Owns:** the per-meeting folder layout, the libsql index schema and

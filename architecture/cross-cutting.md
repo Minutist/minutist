@@ -166,6 +166,11 @@ Owned by `model-registry`. The contract:
   `summariser`, `diarizer`). The registry hands out paths, not loaded
   models — we don't want a model cache that two crates can hold
   references into.
+- The registry is also an **event source**: it holds the orchestrator's
+  shared `broadcast::Sender<AppEvent>` and emits
+  `AppEvent::ModelDownloadProgress` (≈10 Hz) during `ensure`, so the
+  first-run download UI updates live. See `components.md` —
+  `model-registry` "Event source".
 - On settings change to model selection, the consuming crate is
   responsible for tearing down its loaded model and reloading. The
   orchestrator coordinates this — there is no recording during a swap.

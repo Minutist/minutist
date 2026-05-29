@@ -129,9 +129,16 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "asr-runtime"
 version = "0.0.0"
 dependencies = [
+ "encoding_rs",
+ "hound",
+ "llama-cpp-2",
  "meeting-app-common",
+ "model-registry",
+ "num_cpus",
+ "settings",
  "thiserror 1.0.69",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

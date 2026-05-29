@@ -5,9 +5,16 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Phase 2 skeleton. The stream agent fills this in.
-
 [dependencies]
 meeting-app-common = { path = "../common" }
+model-registry = { path = "../model-registry" }
+settings = { path = "../settings" }
+llama-cpp-2 = { workspace = true }
+encoding_rs = "0.8"
+num_cpus = "1.16"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+hound = { workspace = true }
+tracing-subscriber = { workspace = true }

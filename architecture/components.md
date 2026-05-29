@@ -140,6 +140,14 @@ and only then dispatch.
 in addition to EOG — Qwen3-ASR doesn't always emit EOG for sub-window
 audio. See `cross-cutting.md` — ASR chunking constraint.
 
+**Implementation pattern (Phase 2).** `LlamaBackend` is a process-wide
+`OnceLock` singleton; `LlamaModel` + `MtmdContext` are loaded once in
+`AsrRuntime::new`; a fresh `LlamaContext` is allocated per
+`transcribe_chunk` call (cheap, <100 ms) to guarantee a clean KV cache.
+The `</asr_text>` early-stop checks the full concatenated detokenised
+string, not per-token, so the tag is caught even when it spans a token
+boundary.
+
 ### `diarizer`
 **Crate:** `crates/diarizer`
 **Owns:** sherpa-onnx binding, the embedding + clustering pipeline.

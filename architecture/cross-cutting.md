@@ -246,6 +246,22 @@ Test fixtures (sample WAV files, expected transcripts) live under
 `tests/fixtures/` at the repo root and are git-lfs'd if they exceed
 ~1 MB.
 
+Two constraints learned from running the gated pipeline tests on native
+hardware (Phase 2 close-out):
+
+- **Tests that drive audio through the runner must feed real speech.** The
+  runner always instantiates the real Silero VAD, which rejects synthetic
+  tones — a 440 Hz sine never produces a `SegmentEnd`, so the accumulator
+  never fills and no transcript is emitted. Integration tests that exercise
+  the VAD→ASR path use the LibriSpeech fixture, not `DummyAudioSource`.
+  `DummyAudioSource` is still valid for back-pressure / metering tests that
+  do not assert on VAD output.
+- **Event-collection deadlines must tolerate a saturated scheduler.** Cargo
+  runs test *binaries* in parallel. When a model-loading test (gated on
+  `MEETING_APP_ASR_MODEL_PATH`) runs alongside a timing-sensitive one, CPU
+  saturation can starve a tight broadcast-drain loop. Size such deadlines in
+  seconds, not hundreds of milliseconds.
+
 ## Auto-update
 
 Owned by `app-main` (it's process-lifetime work). Uses

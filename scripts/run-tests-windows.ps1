@@ -55,7 +55,12 @@ $build = 'C:\Users\anl\meeting-app'
 
 Set-Location C:\Users\anl
 Write-Host "==> Syncing $src -> $build"
-$rcArgs = @($src, $build, '/MIR', '/XD', 'target', '.git', '.claude', '/NFL', '/NDL', '/NP', '/NJH', '/NJS')
+# Exclude heavy/transient dirs. `/XD <name>` matches that dir name at ANY
+# depth, so nested `target` and `node_modules` are all skipped. node_modules
+# is thousands of files and murders the 9P/UNC copy if not excluded.
+$rcArgs = @($src, $build, '/MIR',
+    '/XD', 'target', '.git', '.claude', 'node_modules', 'dist',
+    '/NFL', '/NDL', '/NP', '/NJH', '/NJS', '/R:1', '/W:1')
 $null = & robocopy.exe @rcArgs
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }
 
@@ -84,12 +89,21 @@ if ($Release) { $cargoArgs += '--release' }
 if ($Features) { $cargoArgs += @('--features', $Features) }
 $cargoArgs += '--'
 if ($Ignored) { $cargoArgs += '--ignored' }
-$cargoArgs += '--nocapture'
+# Gated model tests each load a full ~805 MB GGUF + ~448 MB KV + ~324 MB
+# compute buffer. Cargo's default parallel test execution makes two of them
+# co-reside and OOM the CPU backend's buffer allocator. Force serial.
+$cargoArgs += @('--nocapture', '--test-threads=1')
 
 Write-Host ("==> cargo " + ($cargoArgs -join ' '))
 Write-Host "==> MODEL  = $env:MEETING_APP_ASR_MODEL_PATH"
 Write-Host "==> MMPROJ = $env:MEETING_APP_ASR_MMPROJ_PATH"
-& cargo @cargoArgs
+# cargo writes progress to stderr; with ErrorActionPreference=Stop PowerShell
+# treats the first stderr line as a terminating NativeCommandError and aborts
+# the build. Drop to Continue for the cargo invocation and gate on the exit
+# code instead. Redirect stderr→stdout so everything is captured in order.
+$ErrorActionPreference = 'Continue'
+& cargo @cargoArgs 2>&1
 $code = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
 Write-Host "==> cargo test exit $code"
 exit $code

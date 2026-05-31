@@ -301,8 +301,16 @@ async fn pause_resume_decoded_duration_includes_pause_gap() {
     let _meta = orch.stop().await.expect("stop");
 
     // Collect state-change events and verify the ordering.
+    //
+    // All five transitions are already emitted onto the broadcast channel by
+    // the orchestrator calls above; this loop only drains them. The deadline
+    // must therefore tolerate a saturated scheduler — when the gated
+    // transcription_e2e binary loads a model and runs CPU inference in a
+    // parallel test process, a tight 500 ms window starved this drain loop and
+    // it missed already-queued events. 5 s is ample for draining without
+    // weakening the assertion (it still requires all five variants to appear).
     let mut events: Vec<RecordingState> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if tokio::time::Instant::now() > deadline {
             break;

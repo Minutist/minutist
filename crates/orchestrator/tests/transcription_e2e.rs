@@ -24,14 +24,14 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use audio_capture::test_source::DummyAudioSource;
+use audio_capture::{AudioFrameBatch, AudioStreams};
 use meeting_app_common::{AppEvent, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, Segment};
 use orchestrator::Orchestrator;
 use model_registry::ModelRegistry;
 use settings::{JsonFileStore, SettingsHandle};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 // ---------------------------------------------------------------------------
 // Env-var gate helpers
@@ -133,11 +133,91 @@ fn symlink_model_files(
     let model_link = model_cache.join("Qwen3-ASR-0.6B-Q8_0.gguf");
     let mmproj_link = model_cache.join("mmproj-Qwen3-ASR-0.6B-Q8_0.gguf");
 
-    // Use symlinks so we don't copy ~1 GB of data.
-    std::os::unix::fs::symlink(model_path, &model_link)
-        .unwrap_or_else(|e| panic!("symlink model file: {e}"));
-    std::os::unix::fs::symlink(mmproj_path, &mmproj_link)
-        .unwrap_or_else(|e| panic!("symlink mmproj file: {e}"));
+    // Materialise the model files into the cache dir without copying ~1 GB
+    // when avoidable. Cross-platform ladder: hard link (fast, no privilege,
+    // same-volume) → platform symlink → full copy (cross-filesystem fallback).
+    link_or_copy(model_path, &model_link);
+    link_or_copy(mmproj_path, &mmproj_link);
+}
+
+/// Make `dst` resolve to the same bytes as `src`, preferring zero-copy.
+fn link_or_copy(src: &Path, dst: &Path) {
+    if std::fs::hard_link(src, dst).is_ok() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        if std::os::unix::fs::symlink(src, dst).is_ok() {
+            return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_file(src, dst).is_ok() {
+            return;
+        }
+    }
+    std::fs::copy(src, dst)
+        .unwrap_or_else(|e| panic!("link/copy {src:?} -> {dst:?}: {e}"));
+}
+
+// ---------------------------------------------------------------------------
+// Real-speech fixture helpers
+// ---------------------------------------------------------------------------
+
+/// Load the 16 kHz mono LibriSpeech fixture as f32 samples.
+///
+/// The pipeline runs audio through the real Silero VAD, which only emits
+/// speech segments for genuine speech — a synthetic sine tone is rejected,
+/// so the accumulator would never fill. We must feed real speech.
+fn load_fixture_wav() -> Vec<f32> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/librispeech_0.wav");
+    let mut reader = hound::WavReader::open(&fixture)
+        .unwrap_or_else(|e| panic!("cannot open {:?}: {e}", fixture));
+    let spec = reader.spec();
+    assert_eq!(spec.channels, 1, "fixture must be mono");
+    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
+    reader
+        .samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+        .collect::<Result<_, _>>()
+        .expect("reading samples")
+}
+
+/// Build `AudioStreams` from pre-loaded samples, chunked into `batch_size`
+/// sample batches. The feeder runs on a blocking task; dropping its sender
+/// signals end-of-stream to the runner.
+fn samples_to_streams(
+    samples: Vec<f32>,
+    batch_size: usize,
+) -> (AudioStreams, tokio::task::JoinHandle<()>) {
+    let (sample_tx, sample_rx) = mpsc::channel::<AudioFrameBatch>(256);
+    let (_meter_tx, meter_rx) = mpsc::channel(64);
+
+    let streams = AudioStreams {
+        samples: sample_rx,
+        meter: meter_rx,
+    };
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let sample_rate = 16_000u64;
+        let mut start_ms = 0u64;
+        for chunk in samples.chunks(batch_size) {
+            let duration_ms = (chunk.len() as u64 * 1000) / sample_rate;
+            let batch = AudioFrameBatch {
+                samples: chunk.to_vec(),
+                start_ms,
+                end_ms: start_ms + duration_ms,
+            };
+            if sample_tx.blocking_send(batch).is_err() {
+                break;
+            }
+            start_ms += duration_ms;
+        }
+    });
+
+    (streams, handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,35 +328,34 @@ async fn live_pipeline_emits_transcript_segment_and_writes_transcript_json() {
         .await
         .expect("ensure_model must succeed with pre-staged files");
 
-    // -- Generate a multi-utterance sine-with-silences pattern. --
+    // -- Build a ≥25 s real-speech stream to exercise the size-triggered flush. --
     //
-    // The batched-VAD accumulator requires ≥25 s of audio before flushing to
-    // ASR. We generate enough batches to exceed that threshold:
-    //   - speech_samples = 16_000 (1 s speech per batch)
-    //   - silence_samples = 8_000 (0.5 s silence per batch)
-    //   - batch_count = 20 → 20 × 1.5 s = 30 s of audio
-    //
-    // The accumulator collects VAD segments and flushes at ~25 s. With 30 s
-    // provided, at least one flush occurs, triggering the ASR worker.
-    //
-    // The 30 s permissive wall-clock timeout below accounts for CPU-bound
-    // inference latency (WSL CPU: 6-39 s per flush per Spike 3 measurements).
-    let source = DummyAudioSource::new(
-        16_000, // 1 s of 440 Hz sine at 16 kHz
-        8_000,  // 0.5 s of silence
-    );
-    // sample_capacity=256 is generous (20 batches × ~2 sub-batches per batch);
-    // meter_capacity=512 gives the broadcast channel headroom.
-    let streams = source.generate_streams(20, 256, 512);
+    // The batched-VAD accumulator flushes at FLUSH_MIN_SECS (25 s). The
+    // 5.86 s LibriSpeech clip is repeated 6× (~35 s) so a size-triggered
+    // flush fires mid-stream — the live streaming path — rather than only the
+    // on-stop flush. Silero VAD detects the repeated speech and emits segments
+    // that fill the accumulator.
+    let clip = load_fixture_wav();
+    let mut samples = Vec::with_capacity(clip.len() * 6);
+    for _ in 0..6 {
+        samples.extend_from_slice(&clip);
+    }
+    // 1600 samples = 100 ms at 16 kHz.
+    let (streams, _feeder) = samples_to_streams(samples, 1600);
 
+    let start_instant = Instant::now();
     let meeting_id = orch
         .start_with_streams(streams)
         .await
         .expect("start_with_streams");
 
-    // -- Wait up to 30 s for at least one TranscriptSegment event. --
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // -- Wait up to 90 s for at least one TranscriptSegment event. --
+    //    Budget covers cold model load (~5 s) plus CPU inference on a ~30 s
+    //    buffer. The size-triggered flush fires before the feeder exhausts, so
+    //    the first segment arrives without needing stop().
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut got_transcript_event = false;
+    let mut first_segment_latency: Option<Duration> = None;
 
     while tokio::time::Instant::now() < deadline {
         match event_rx.try_recv() {
@@ -285,6 +364,7 @@ async fn live_pipeline_emits_transcript_segment_and_writes_transcript_json() {
                     mid, meeting_id,
                     "TranscriptSegment meeting_id must match the active recording"
                 );
+                first_segment_latency = Some(start_instant.elapsed());
                 got_transcript_event = true;
                 break;
             }
@@ -301,8 +381,14 @@ async fn live_pipeline_emits_transcript_segment_and_writes_transcript_json() {
 
     assert!(
         got_transcript_event,
-        "expected at least one AppEvent::TranscriptSegment within 30 s; \
+        "expected at least one AppEvent::TranscriptSegment within 90 s; \
          the pipeline may have failed to flush or the ASR inference timed out"
+    );
+
+    eprintln!(
+        "E2E first-segment latency (start → first TranscriptSegment, \
+         incl. cold model load): {:?}",
+        first_segment_latency.expect("latency set when event received")
     );
 
     // -- Stop the recording and verify on-disk artefacts. --

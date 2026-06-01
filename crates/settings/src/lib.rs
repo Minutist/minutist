@@ -42,12 +42,17 @@ pub enum Theme {
     System,
 }
 
-/// Application settings — Phase 1 fields only.
+/// Default notes-autosave interval, in seconds (FR-18/FR-35).
+const fn default_autosave_interval_secs() -> u32 {
+    5
+}
+
+/// Application settings.
 ///
 /// Fields added in later phases live in their respective phase plans.
-/// Do **not** add ASR model selection, summary system-prompt, autosave
-/// interval, or telemetry fields here — those are Phase 2+ concerns.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Do **not** add ASR model selection, summary system-prompt, or telemetry
+/// fields here — those are Phase 2+ concerns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Settings {
     /// The preferred audio-input device, identified by the opaque id
@@ -73,6 +78,26 @@ pub struct Settings {
     /// If `true`, the main window starts hidden; accessible via the tray icon.
     #[serde(default)]
     pub start_hidden: bool,
+
+    /// Notes-editor autosave interval, in seconds (FR-18/FR-35).
+    ///
+    /// The editor debounces autosaves of `notes.json`/`notes.md` to this
+    /// cadence. Defaults to 5 s; an older store written before this field
+    /// existed deserialises to the default via `#[serde(default = ...)]`.
+    #[serde(default = "default_autosave_interval_secs")]
+    pub autosave_interval_secs: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            input_device_id: None,
+            theme: Theme::default(),
+            data_directory: None,
+            start_hidden: false,
+            autosave_interval_secs: default_autosave_interval_secs(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,10 +128,45 @@ mod tests {
             theme: Theme::Dark,
             data_directory: Some(PathBuf::from("/tmp/meeting-data")),
             start_hidden: true,
+            autosave_interval_secs: 17,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(original, restored);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1b. autosave_interval_secs: default value + missing-field deserialisation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn autosave_interval_defaults_to_five() {
+        assert_eq!(Settings::default().autosave_interval_secs, 5);
+    }
+
+    #[test]
+    fn autosave_interval_round_trips() {
+        let original = Settings {
+            autosave_interval_secs: 42,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.autosave_interval_secs, 42);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_autosave_field_defaults_to_five() {
+        // A settings store written before `autosave_interval_secs` existed.
+        let old_json = r#"{ "theme": "dark", "start_hidden": true }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert_eq!(
+            restored.autosave_interval_secs, 5,
+            "missing autosave_interval_secs must deserialise to the default (5)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
     }
 
     // -----------------------------------------------------------------------

@@ -67,4 +67,20 @@ impl MeetingFolder {
     pub(crate) fn transcript_path(&self) -> PathBuf {
         self.path.join("transcript.json")
     }
+
+    /// Path to `notes.json` within the folder.
+    ///
+    /// `notes.json` holds the opaque Tiptap document (see [`crate::NotesStore`]).
+    /// It is written by `NotesStore`, never by `MeetingWriter`.
+    pub fn notes_path(&self) -> PathBuf {
+        self.path.join("notes.json")
+    }
+
+    /// Path to `notes.md` within the folder.
+    ///
+    /// `notes.md` holds the markdown rendering of the notes document, written
+    /// alongside `notes.json` by [`crate::NotesStore`].
+    pub fn notes_md_path(&self) -> PathBuf {
+        self.path.join("notes.md")
+    }
 }

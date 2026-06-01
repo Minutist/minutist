@@ -251,6 +251,27 @@ transcript/notes/summary storage are Phase 4.
 
 **Phase 2 surface growth:** `TranscriptWriter` writes `transcript.json` (JSON array of `Segment`) per meeting. Flushed on each ASR-worker return so a crash mid-recording loses at most one flush's worth of transcript.
 
+**Phase 3 surface growth — notes.** `NotesStore` is a standalone, stateless
+reader/writer for `notes.json` + `notes.md`, **independent of `MeetingWriter`**:
+there is no shared open file handle. `MeetingWriter` owns `audio.opus` /
+`transcript.json` / `metadata.json` while recording and never touches the notes
+files; `NotesStore` only ever touches `notes.json` / `notes.md`. This split lets
+the editor autosave (FR-18/FR-35) run concurrently with an active recording.
+
+- `NotesStore::save(root, meeting_id, notes_json: &serde_json::Value, notes_md: &str) -> AppResult<()>`
+  and `NotesStore::load(root, meeting_id) -> AppResult<Option<NotesData>>`, where
+  `NotesData { json: serde_json::Value, markdown: String }`.
+- **`notes.json` is stored as an opaque `serde_json::Value`** — the document
+  shape is never modelled in Rust. Unknown/custom node types (the Phase-4
+  transcript-chip node) round-trip losslessly. This opacity is the Phase-4
+  transcript-chip guarantee; do not introduce a typed Tiptap model in this crate.
+- Writes are **atomic** (write to a sibling `*.tmp` in the same dir, fsync,
+  rename into place); a successful save leaves no `.tmp` residue. Loading an
+  absent `notes.json` returns `Ok(None)`. `save` writes into the **existing**
+  meeting folder — it does not create the folder and leaves sibling files
+  (`audio.opus` / `transcript.json` / `metadata.json`) untouched.
+- `MeetingFolder` exposes `notes_path()` / `notes_md_path()` helpers.
+
 ### `orchestrator`
 **Crate:** `crates/orchestrator`
 **Owns:** the live recording state machine. Wires `audio-capture →
@@ -299,6 +320,12 @@ orchestrator.
 
 Single source of truth for runtime configuration. Other components read
 settings via this crate; nobody else parses the store directly.
+
+**Phase 3 field — `autosave_interval_secs: u32`.** Notes-editor autosave
+cadence (FR-18/FR-35), `#[serde(default = ...)]` defaulting to 5; an older
+store JSON written before the field existed deserialises to 5. `Settings`
+now carries an explicit `Default` impl (the field's default is non-zero, so
+the derived `Default` no longer suffices).
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

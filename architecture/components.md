@@ -531,6 +531,15 @@ A warm-paper, document-centric **light** theme applied across the webview.
   Vitest (`MODE !== "test"`), and the Tauri global is absent. `ui/src/ipc/client.ts`
   reaches the shim exclusively through a dynamic `import()`, so the production
   build never bundles or fetches it (the chunk is dead-code-eliminated).
+- **Binding on all new views.** Editorial Ink is the webview design language.
+  Every view added in later phases — meeting-list, summary, settings, first-run
+  / onboarding, model-download UI — MUST consume `theme.css` tokens and reuse
+  the established patterns (Fraunces display / Newsreader body, the single
+  oxblood accent used sparingly, paper surfaces, hairline rules, restrained
+  motion respecting `prefers-reduced-motion`). No new view introduces its own
+  palette or type families; a hard-coded colour/font or an off-system pattern
+  is a code-review finding. New views should render in the DEV shim with
+  representative sample data so they can be visually QA'd the same way.
 
 ## What lives where — quick reference
 

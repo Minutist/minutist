@@ -100,10 +100,81 @@ pub async fn resume_recording(state: State<'_, IpcState>) -> Result<(), IpcError
 /// Stop the current recording and finalise the meeting.
 ///
 /// Returns the completed `MeetingMeta` on success.
+///
+/// After the orchestrator finalises the meeting folder, this also **upserts the
+/// libsql index** (FR-33) so the just-recorded meeting appears in
+/// `list_meetings` **in the same session** — without waiting for the next
+/// app-start `rebuild_from_disk`. The orchestrator stays decoupled from the
+/// index (it does not own one); the `ipc-bridge` owns the index handle in
+/// `IpcState`, so the upsert lives here. See `architecture/components.md`,
+/// `ipc-bridge` "Phase 4 additions — stop-upsert".
+///
+/// The blocking transcript read (for the list excerpt) runs on `spawn_blocking`
+/// per the threading model; the async index `upsert` is awaited, never
+/// `block_on`'d (the no-`block_on`-in-command-handlers rule).
+///
+/// An index-upsert failure is logged and swallowed — the recording itself is
+/// safely persisted on disk and the index is a derived cache that the next
+/// startup `rebuild_from_disk` will reconcile, so a failed upsert must not turn
+/// a successful stop into an error.
 #[tauri::command]
 #[specta::specta]
 pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, IpcError> {
-    state.orchestrator.stop().await.map_err(IpcError::from)
+    let meta = state.orchestrator.stop().await.map_err(IpcError::from)?;
+
+    // Build the meeting-list row for the freshly-stopped meeting. The excerpt is
+    // the first transcript segment (if any), read on a blocking thread.
+    let meetings_dir = state.meetings_dir.clone();
+    let meta_for_entry = meta.clone();
+    let entry = tokio::task::spawn_blocking(move || {
+        meeting_list_entry_for_meta(&meetings_dir, &meta_for_entry)
+    })
+    .await;
+
+    match entry {
+        Ok(entry) => {
+            if let Err(e) = state.index.upsert(&entry).await {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meta.uuid.0,
+                    "index upsert after stop_recording failed: {e}; the recording is on disk \
+                     and will be re-indexed on next startup"
+                );
+            }
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                target: "ipc-bridge",
+                meeting_id = %meta.uuid.0,
+                "building index entry after stop_recording failed (join error): {join_err}; \
+                 the recording is on disk and will be re-indexed on next startup"
+            );
+        }
+    }
+
+    Ok(meta)
+}
+
+/// Build the [`MeetingListEntry`] for a just-stopped meeting from its
+/// [`MeetingMeta`] plus the first transcript segment (the list excerpt).
+///
+/// Blocking `std::fs` read of `transcript.json` (via
+/// `persistence::reader::read_transcript`); an absent/empty transcript yields
+/// `excerpt: None`. Extracted so it can be unit-tested without a Tauri runtime.
+fn meeting_list_entry_for_meta(meetings_dir: &Path, meta: &MeetingMeta) -> MeetingListEntry {
+    let meeting_dir = meetings_dir.join(meta.uuid.0.to_string());
+    let excerpt = persistence::read_transcript(&meeting_dir)
+        .ok()
+        .and_then(|segs| segs.first().map(|s| s.text.clone()));
+
+    MeetingListEntry {
+        id: meta.uuid,
+        title: meta.title.clone(),
+        started_at: meta.started_at.clone(),
+        duration_ms: meta.duration_ms,
+        speaker_count: meta.speaker_count,
+        excerpt,
+    }
 }
 
 /// Return a snapshot of the current recording state.
@@ -616,6 +687,75 @@ mod tests {
         let rows = index.list_meetings().await.expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "New title");
+    }
+
+    /// Stop-upsert (FR-33): after a meeting folder is written and its index row
+    /// is upserted (the stop-equivalent the `stop_recording` command performs),
+    /// `list_meetings` returns it **in the same session** — without a
+    /// `rebuild_from_disk`. This is the in-session visibility guarantee that
+    /// `Orchestrator::stop` alone does not provide (it finalises the folder but
+    /// never touches the index).
+    #[tokio::test]
+    async fn stop_upsert_makes_meeting_visible_in_session() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+
+        // A fresh, EMPTY in-memory index — no rebuild_from_disk. This models a
+        // running session where the index was opened at startup and the meeting
+        // recorded afterwards.
+        let index = MeetingIndex::open(":memory:")
+            .await
+            .expect("open in-memory index");
+        assert!(
+            index.list_meetings().await.expect("list").is_empty(),
+            "index must start empty (no rebuild)"
+        );
+
+        // Write a meeting folder + transcript, exactly as a finished recording
+        // leaves on disk.
+        let meeting_id = write_synthetic_meeting(
+            root,
+            "In-session meeting",
+            "2026-06-02T13:00:00Z",
+            Some("first words of the meeting"),
+        );
+
+        // The stop-equivalent: build the list entry from metadata + first
+        // transcript segment, then upsert into the live index — exactly what the
+        // `stop_recording` command does after `orchestrator.stop()`.
+        let meta = persistence::read_metadata(&root.join(meeting_id.0.to_string()))
+            .expect("read metadata");
+        let entry = meeting_list_entry_for_meta(root, &meta);
+        index.upsert(&entry).await.expect("upsert after stop");
+
+        // list_meetings now returns the meeting in the SAME session.
+        let rows = index.list_meetings().await.expect("list after upsert");
+        assert_eq!(rows.len(), 1, "stopped meeting must be visible without a rebuild");
+        assert_eq!(rows[0].id, meeting_id);
+        assert_eq!(rows[0].title, "In-session meeting");
+        assert_eq!(
+            rows[0].excerpt.as_deref(),
+            Some("first words of the meeting"),
+            "excerpt must be the first transcript segment"
+        );
+    }
+
+    /// `meeting_list_entry_for_meta` yields `excerpt: None` when the meeting has
+    /// no transcript (a zero-segment meeting writes no `transcript.json`).
+    #[test]
+    fn stop_upsert_entry_has_no_excerpt_without_transcript() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Silent meeting", "2026-06-02T14:00:00Z", None);
+
+        let meta = persistence::read_metadata(&root.join(meeting_id.0.to_string()))
+            .expect("read metadata");
+        let entry = meeting_list_entry_for_meta(root, &meta);
+
+        assert_eq!(entry.id, meeting_id);
+        assert_eq!(entry.title, "Silent meeting");
+        assert!(entry.excerpt.is_none(), "no transcript → excerpt None");
     }
 
     /// `delete_meeting` removes the on-disk folder and the index row.

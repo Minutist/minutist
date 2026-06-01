@@ -477,6 +477,22 @@ notes_markdown: String }`) because a bare `serde_json::Value` does not derive
 handing it to `NotesStore` and `load_notes` re-serialises the loaded value back
 to a string.
 
+**Phase 4 — `stop_recording` index upsert (FR-33, in-session visibility).**
+`Orchestrator::stop` finalises the meeting folder but deliberately never touches
+the `MeetingIndex` (the orchestrator does not own one). To make a just-recorded
+meeting appear in `list_meetings` **within the same session** — rather than only
+after the next startup `rebuild_from_disk` — the `stop_recording` command, after
+`orchestrator.stop()` returns the `MeetingMeta`, builds a `MeetingListEntry` from
+that meta (id / title / started_at / duration_ms / speaker_count; `excerpt` from
+the first transcript segment via `persistence::read_transcript`, else `None`) and
+`upsert`s it into the shared `IpcState::index`. The blocking transcript read runs
+on `spawn_blocking`; the async `upsert` is awaited (never `block_on`'d). An
+upsert failure is logged and swallowed — the recording is safely on disk and the
+index is a derived cache the next startup reconciles, so a failed upsert must not
+turn a successful stop into an error. This keeps the orchestrator decoupled from
+the index: the index handle lives in `ipc-bridge` (`IpcState`), so the upsert
+lives at the command boundary, not in the orchestrator.
+
 **Phase 4 additions (18 commands total) — meeting list / open / actions.** Six
 commands back the meeting-list view (FR-33):
 

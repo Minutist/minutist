@@ -744,15 +744,15 @@ left, transcript right).
 - **IPC seam (`ui/src/ipc/meetings.ts`).** A thin client (mirroring the Phase-3
   `notes.ts`) over the shim-aware `commands` from `./client` — NOT raw
   `./bindings` — for the six Phase-4 commands (`list_meetings`, `open_meeting`,
-  `rename_meeting`, `delete_meeting`, `re_transcribe`, `re_summarise`). Stream C
-  adds these commands to `ipc-bridge` and regenerates `bindings.ts` before the
-  frontend consumes them; until then `client.ts` routes them through a labelled
-  "pending generation" path (DEV shim in shim-mode, raw `TAURI_INVOKE` with the
-  snake_case wire name otherwise), typed against the canonical
-  `common::MeetingListEntry` / `common::MeetingState` shapes. The DEV shim
-  (`dev-shim.ts`) supplies sample meetings + an opened-meeting payload so the
-  list and an open meeting render under `vite dev`. `re_transcribe` reuses
-  `AppEvent::TranscriptSegment`; `re_summarise` reuses `AppEvent::SummaryReady`.
+  `rename_meeting`, `delete_meeting`, `re_transcribe`, `re_summarise`). These
+  commands are generated into `bindings.ts` (the `ipc-bridge`/orchestrator JOIN
+  added them and regenerated), so `client.ts` routes them uniformly through
+  `callCommand` like every other command — the earlier "pending generation"
+  raw-`TAURI_INVOKE` shim path was collapsed once the bindings regenerated. The
+  DEV shim (`dev-shim.ts`) supplies sample meetings + an opened-meeting payload
+  so the list and an open meeting render under `vite dev`. `re_transcribe`
+  reuses `AppEvent::TranscriptSegment`; `re_summarise` reuses
+  `AppEvent::SummaryReady`.
 
 ### Design system — "Editorial Ink" (light theme)
 

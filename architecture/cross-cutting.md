@@ -152,11 +152,15 @@ Phase 4 cross-reference (FR-22/23, anchor → nearest transcript segment) would
 resolve to the wrong region. `started_at_ms` remains valid for elapsed-time
 *display* only.
 
-Consequence for Phase 4: `audio.opus` is recorded pause-*including*, while
-anchors and segment timestamps are pause-*excluding*. Seek-to-anchor against
-the audio file therefore needs a pause-offset map (a list of pause intervals)
-to convert between the two timelines. This is a Phase 4 concern; Phase 3 only
-has to stamp anchors on the pause-excluding clock.
+Consequence: `audio.opus` is recorded pause-*including* (the encoder pads each
+pause with synthesised silence), while anchors and segment timestamps are
+pause-*excluding*. Phase 4 cross-reference (FR-22/23) operates **entirely on the
+pause-excluding timeline** (`data-anchor-ms` ↔ `Segment::start_ms`), so it needs
+no conversion. Audio-file *seek-to-anchor* (playing the audio at a clicked
+anchor) is the only feature that must bridge the two timelines — it needs a
+pause-offset map (a list of pause intervals) — and it was **deferred out of
+Phase 4** (no audio player shipped this phase). Whatever phase adds audio
+playback owns the pause-offset map.
 
 ## llama.cpp prefill batching
 
@@ -247,6 +251,19 @@ downloaded per-kind / per-model files.
 
 Writes to a directory outside a component's owned scope are a review
 finding.
+
+**`index.db` is a derived, rebuildable cache (binding — Phase 4, A6).** The
+per-meeting folders are the **source of truth**; `index.db` (the libsql
+meeting-list index) is a query cache derived from each meeting's
+`metadata.json` / `transcript.json`. `persistence` opens it lazily and
+**rebuilds it from a folder scan on a missing or corrupt DB**
+(`MeetingIndex::rebuild_from_disk`, invoked at app start by `ipc-bridge`'s
+index bootstrap). A libsql/DB error therefore never risks user data — at worst
+the meeting list is briefly stale until the next rebuild (which is also why an
+index `upsert` failure on stop is logged-and-swallowed, not fatal). The schema
+is versioned and the migration runner is **forward-only** (a `schema_version`
+gate; opening an empty DB or a prior-schema DB migrates up without data loss).
+Nothing depends on `index.db` being byte-stable or even present.
 
 ## Telemetry
 

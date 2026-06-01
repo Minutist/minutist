@@ -319,6 +319,14 @@ hardware (Phase 2 close-out):
   `MEETING_APP_ASR_MODEL_PATH`) runs alongside a timing-sensitive one, CPU
   saturation can starve a tight broadcast-drain loop. Size such deadlines in
   seconds, not hundreds of milliseconds.
+- **Wall-clock duration assertions compare against the *measured* elapsed, not
+  the nominal sleep.** A `sleep(N)` only guarantees *≥ N*; under parallel-binary
+  contention it overshoots, and code that records the real elapsed (e.g. the
+  Opus encoder padding a pause with silence sized to `paused_at.elapsed()`) will
+  then exceed an `N ± ε` window. Capture the actual elapsed in the test and
+  assert against it (`pause_resume_decoded_duration_includes_pause_gap` does
+  this). Where a deterministic gap is needed without any wall-clock, use a
+  `#[cfg(test)]` injection seam (e.g. `OggOpusEncoder::resume_with_pause_frames`).
 
 ## Auto-update
 

@@ -3,7 +3,8 @@
  *
  * Verifies:
  * - a `recording_clock` event updates `recordingClockMs` to `clock_ms`.
- * - transitioning to `idle` (or `stopping`) clears `recordingClockMs` to null.
+ * - transitioning to `idle` / `stopping` / `paused` clears `recordingClockMs`
+ *   to null (every non-recording state stops anchor stamping).
  * - transitioning to `recording` does not pre-populate the clock (it stays at
  *   its prior value until the next `recording_clock` event).
  */
@@ -100,6 +101,20 @@ describe("recording store — recording_clock", () => {
     useRecordingStore.getState().handleEvent({
       kind: "state_changed",
       state: { kind: "stopping", meeting_id: "m1" },
+    });
+
+    expect(useRecordingStore.getState().recordingClockMs).toBeNull();
+  });
+
+  it("transition to paused clears recordingClockMs", () => {
+    // `paused` is a non-recording state: capture is suspended, so the
+    // anchor clock must stop too (a resume re-populates it via the next
+    // `recording_clock` event). Mirrors the idle/stopping behaviour.
+    useRecordingStore.setState({ recordingClockMs: 9000 });
+
+    useRecordingStore.getState().handleEvent({
+      kind: "state_changed",
+      state: { kind: "paused", meeting_id: "m1", paused_at_ms: 4_200 },
     });
 
     expect(useRecordingStore.getState().recordingClockMs).toBeNull();

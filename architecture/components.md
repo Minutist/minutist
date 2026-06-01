@@ -478,8 +478,8 @@ left, transcript right).
   two-column flex layout is replaced.
 - **`RecordingStore` additions.** Gains `recordingClockMs: number | null`,
   updated by a new `recording_clock` event case and cleared to `null` on any
-  transition out of `recording` (idle/stopping). This is the sole anchor-clock
-  source.
+  transition out of `recording` (idle/stopping/paused). This is the sole
+  anchor-clock source.
 - **IPC seams (now in generated bindings — Stream S3).** `save_notes` /
   `load_notes` commands and the `recording_clock` event are wired through
   `ipc-bridge` and present in the regenerated `bindings.ts`. `ui/src/ipc/notes.ts`

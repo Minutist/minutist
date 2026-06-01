@@ -17,7 +17,9 @@ import { useEffect, useRef } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import type { Editor as TiptapEditor } from "@tiptap/core";
 import { useRecordingStore } from "../state/recording";
+import { useMeetingsStore } from "../state/meetings";
 import { useCrossRefStore } from "../state/cross-ref";
+import { activeTranscript } from "../state/active-transcript";
 import { buildEditorExtensions } from "./extensions";
 import { useAutosave } from "./useAutosave";
 import { buildClipboardPayload } from "./clipboard";
@@ -46,17 +48,15 @@ function readAutosaveInterval(settings: unknown): number | null {
 export function Editor() {
   const recordingState = useRecordingStore((s) => s.state);
   const settings = useRecordingStore((s) => s.settings);
-  // FR-22/23 cross-reference: read the live transcript (for the nearest-segment
-  // mapping) and the scroll-request from the cross-ref store.
-  const transcript = useRecordingStore((s) => s.transcript);
+  // FR-22/23 cross-reference: hover maps the hovered paragraph's anchor span to
+  // the transcript RANGE; click publishes a scroll request. The active
+  // transcript (live vs. saved-meeting) is read non-reactively at hover time.
   const hoverNotesAnchor = useCrossRefStore((s) => s.hoverNotesAnchor);
   const scrollRequest = useCrossRefStore((s) => s.scrollRequest);
 
-  // Keep the latest transcript in a ref so the hover reporter (wired once at
-  // editor construction) always maps against the current segments without
-  // re-creating the editor.
-  const transcriptRef = useRef(transcript);
-  transcriptRef.current = transcript;
+  // U1: the restored notes of the open saved meeting (null while recording or on
+  // the live entry surface). Hydrated into the editor by a production effect.
+  const openMeetingState = useMeetingsStore((s) => s.openMeetingState);
 
   // Holds the live editor instance for DOM-event handlers wired at construction
   // time (the `drop` handler), which cannot close over `editor` before it is
@@ -76,11 +76,13 @@ export function Editor() {
           clockMs: s.recordingClockMs,
         };
       },
-      // FR-22: a hovered paragraph's anchor maps to the nearest transcript
-      // segment (on Segment.start_ms, the pause-excluding clock — never
-      // Date.now()). The cross-ref store owns the nearest-segment computation.
-      onHoverAnchor: (anchorMs) =>
-        hoverNotesAnchor(anchorMs, transcriptRef.current),
+      // FR-22: a hovered paragraph's anchor span maps to the RANGE of transcript
+      // segments in [anchorMs, nextAnchorMs) (on Segment.start_ms, the
+      // pause-excluding clock — never Date.now()). The bridge supplies the next
+      // anchored paragraph's anchor; the cross-ref store owns the range
+      // computation against the active transcript (live or saved meeting).
+      onHoverAnchor: (anchorMs, nextAnchorMs) =>
+        hoverNotesAnchor(anchorMs, nextAnchorMs, activeTranscript()),
     }),
     editorProps: {
       attributes: {
@@ -121,13 +123,39 @@ export function Editor() {
     },
   });
 
-  // DEV-only: in a plain `vite dev` browser (no Tauri backend) seed the editor
-  // with sample notes so the themed sheet renders populated for visual QA. The
-  // shim's `loadNotes` returns a heading + paragraphs incl. an anchored one, so
-  // the left-margin timestamp marginalia shows. No-op in production and tests
-  // (the guard is false, and tests mock `../ipc/notes`).
+  // U1 (production): when a saved meeting is open, hydrate the editor from its
+  // restored notes so opening a past meeting shows its notes instead of an empty
+  // sheet (SPEC Phase-4 acceptance: "load a past meeting fully restores notes,
+  // transcript, audio, and cross-reference"). Keyed on the open meeting's notes
+  // so re-opening a different meeting re-hydrates; an open meeting with no saved
+  // notes resets the editor to empty. NOT DEV-gated — this is the real restore
+  // path the DEV shim previously stood in for.
+  useEffect(() => {
+    if (!editor) return;
+    const notes = openMeetingState?.notes ?? null;
+    if (!notes) {
+      // Open meeting with no notes (or no meeting open): start from an empty
+      // sheet rather than carrying a prior meeting's notes over.
+      if (openMeetingState !== null) editor.commands.clearContent();
+      return;
+    }
+    try {
+      editor.commands.setContent(JSON.parse(notes.notes_json));
+    } catch {
+      /* malformed stored notes — leave the editor empty */
+    }
+  }, [editor, openMeetingState]);
+
+  // DEV-only: in a plain `vite dev` browser (no Tauri backend, no open meeting)
+  // seed the editor with sample notes so the themed sheet renders populated for
+  // visual QA. The shim's `loadNotes` returns a heading + paragraphs incl. an
+  // anchored one, so the left-margin timestamp marginalia shows. No-op in
+  // production and tests (the guard is false, and tests mock `../ipc/notes`).
+  // Skips when a saved meeting is open so the production restore effect above
+  // owns the content.
   useEffect(() => {
     if (!editor || !import.meta.env.DEV || !shouldUseDevShim()) return;
+    if (useMeetingsStore.getState().openMeetingState !== null) return;
     let cancelled = false;
     void loadNotes("dev-meeting-0001").then((doc) => {
       if (cancelled || !doc) return;

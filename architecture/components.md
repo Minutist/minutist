@@ -639,16 +639,40 @@ left, transcript right).
   list shows when no meeting is open and nothing is recording; opening a meeting
   or starting a recording reveals the workspace, and a header "Meetings"
   affordance returns to the list when idle.
-- **Cross-reference at segment granularity (FR-22/23).** On the pause-EXCLUDING
-  timeline (`data-anchor-ms` ↔ `Segment.start_ms`, NEVER `Date.now()`).
-  `ui/src/editor/hover-bridge.ts` (`NotesHoverBridge`) is a presentation-only
-  ProseMirror plugin that reports the hovered paragraph's `data-anchor-ms` and
-  **mutates no doc / dispatches no transaction** (so it cannot touch the A4
-  stamping logic, exactly like `AnchorMarginalia`). `ui/src/state/cross-ref.ts`
-  maps that anchor to the nearest `Segment.start_ms` (FR-22) and the transcript
-  pane highlights that row; clicking a transcript row publishes a scroll request
-  whose `start_ms` the editor resolves to the nearest-anchored paragraph via
-  `ui/src/editor/scroll-to-anchor.ts` (FR-23, a pure DOM read + `scrollIntoView`).
+- **Cross-reference, paragraph-RANGE granularity (FR-22/23).** On the
+  pause-EXCLUDING timeline (`data-anchor-ms` ↔ `Segment.start_ms`, NEVER
+  `Date.now()`). `ui/src/editor/hover-bridge.ts` (`NotesHoverBridge`) is a
+  presentation-only ProseMirror plugin that reports the hovered paragraph's
+  `data-anchor-ms` **and the next anchored paragraph's `data-anchor-ms`** (read
+  from the editor DOM in document order), and **mutates no doc / dispatches no
+  transaction** (so it cannot touch the A4 stamping logic, exactly like
+  `AnchorMarginalia`). `ui/src/state/cross-ref.ts` maps that anchor pair to the
+  half-open RANGE of segments whose `start_ms ∈ [anchor(P), anchor(nextP))` —
+  through end-of-recording for the last anchored paragraph (FR-22, the locked
+  Phase 4 decision; `segmentRangeForAnchors` publishes a
+  `{ startIndex, endIndex }` `highlightedRange`, not a single
+  `highlightedSegmentIndex`). The transcript pane highlights every row in that
+  range (oxblood `--accent-tint` wash + left rule, theme tokens only). Clicking a
+  transcript row publishes a scroll request whose `start_ms` the editor resolves
+  to the nearest-anchored paragraph via `ui/src/editor/scroll-to-anchor.ts`
+  (FR-23, a pure DOM read + `scrollIntoView`).
+- **Open-meeting restore wiring (U1, SPEC Phase-4 acceptance).** Opening a saved
+  meeting (`useMeetingsStore.open()` → `open_meeting` → `MeetingState`) fully
+  restores its notes and transcript into the workspace.
+  `ui/src/state/active-transcript.ts` is the single source-of-truth selector:
+  when a saved meeting is open AND nothing is recording
+  (`openMeetingId !== null && recordingState.kind === "idle"`) the transcript
+  pane and the cross-reference read the SAVED meeting's
+  `openMeetingState.transcript`; otherwise (live recording, or no meeting open)
+  they read the live `useRecordingStore.transcript`. The notes editor hydrates
+  from `openMeetingState.notes` in a **production** effect
+  (`editor.commands.setContent(JSON.parse(notes.notes_json))`, keyed on the open
+  meeting's notes; clears to empty when the open meeting has no notes) — no
+  longer gated behind the DEV shim, which now only seeds when no meeting is open.
+  Audio restore is **not** wired this phase: a saved meeting opens with its notes
+  + transcript + working cross-reference, but a full audio player (and the
+  pause-offset seek map from `cross-cutting.md` "Notes paragraph-anchor clock")
+  is deferred to a later phase.
 - **Transcript-chip node + DnD (`ui/src/editor/transcript-chip.ts` +
   `transcript-dnd.ts`, FR-24/25).** `TranscriptChip` is a first-class atom block
   node carrying `startMs` / `endMs` / `speakerId` / `text`, registered in
@@ -662,7 +686,9 @@ left, transcript right).
 - **New stores (`ui/src/state/`).** `MeetingsStore` (`meetings.ts`) holds the
   meeting-list rows + the open-meeting state and routes through the
   `ui/src/ipc/meetings.ts` seam; `CrossRefStore` (`cross-ref.ts`) holds the
-  transient FR-22 highlight + FR-23 scroll-request links.
+  transient FR-22 `highlightedRange` (`{ startIndex, endIndex }`) + FR-23
+  scroll-request links. `active-transcript.ts` is a derived selector (not a
+  store) that picks the live vs. saved-meeting transcript for the panes (U1).
 - **IPC seam (`ui/src/ipc/meetings.ts`).** A thin client (mirroring the Phase-3
   `notes.ts`) over the shim-aware `commands` from `./client` — NOT raw
   `./bindings` — for the six Phase-4 commands (`list_meetings`, `open_meeting`,

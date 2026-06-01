@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
-import { useRecordingStore } from "../state/recording";
 import { useCrossRefStore } from "../state/cross-ref";
+import { useActiveTranscript } from "../state/active-transcript";
 import { writeSegmentDrag } from "../editor/transcript-dnd";
 import type { Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
@@ -39,14 +39,17 @@ export function formatTimestamp(start_ms: number): string {
  *     editor inserts a transcript-chip node carrying the segment.
  *   - FR-23: clicking a row publishes a scroll request so the notes editor
  *     scrolls to the nearest-anchored paragraph.
- *   - FR-22: when a notes paragraph is hovered, the segment nearest its anchor
- *     is highlighted (`highlightedSegmentIndex` from the cross-ref store).
+ *   - FR-22: when a notes paragraph is hovered, every segment in the paragraph's
+ *     transcript span is highlighted — the half-open `[startIndex, endIndex)`
+ *     range published as `highlightedRange` by the cross-ref store.
+ *
+ * The transcript shown is the ACTIVE transcript (`useActiveTranscript`): a
+ * saved meeting's restored segments when viewing a saved meeting (U1), else the
+ * live recording transcript.
  */
 export function TranscriptPane() {
-  const transcript = useRecordingStore((s) => s.transcript);
-  const highlightedSegmentIndex = useCrossRefStore(
-    (s) => s.highlightedSegmentIndex,
-  );
+  const transcript = useActiveTranscript();
+  const highlightedRange = useCrossRefStore((s) => s.highlightedRange);
   const clickTranscriptSegment = useCrossRefStore(
     (s) => s.clickTranscriptSegment,
   );
@@ -87,7 +90,10 @@ export function TranscriptPane() {
       ) : (
         <ol className="transcript-pane__list">
           {transcript.map((seg: Segment, idx: number) => {
-            const highlighted = idx === highlightedSegmentIndex;
+            const highlighted =
+              highlightedRange !== null &&
+              idx >= highlightedRange.startIndex &&
+              idx < highlightedRange.endIndex;
             return (
               <li
                 key={idx}

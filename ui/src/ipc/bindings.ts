@@ -138,6 +138,41 @@ async ensureModel(modelId: ModelId) : Promise<Result<null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Persist a meeting's notes (`notes.json` + `notes.md`).
+ * 
+ * Routes **directly** to `persistence::NotesStore` against
+ * `IpcState::meetings_dir` — notes I/O is independent of the live recording
+ * pipeline (see `architecture/components.md`, `persistence` "Phase 3 surface
+ * growth — notes"), so the orchestrator is not involved. The blocking
+ * filesystem write runs on `spawn_blocking` per the threading model.
+ * 
+ * `notes_json` is parsed from a `String` into a `serde_json::Value`; an
+ * invalid JSON string is rejected as `AppError::InvalidInput`.
+ */
+async saveNotes(meetingId: MeetingId, notesJson: string, notesMarkdown: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_notes", { meetingId, notesJson, notesMarkdown }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Load a meeting's persisted notes, or `None` when no notes have been saved.
+ * 
+ * Routes directly to `persistence::NotesStore`; the loaded opaque
+ * `serde_json::Value` is re-serialised back to a `String` for the wire (see
+ * [`NotesDoc`]).
+ */
+async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDoc | null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_notes", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -192,6 +227,16 @@ export type AppEvent =
  * A new transcript segment was produced.
  */
 { kind: "transcript_segment"; meeting_id: MeetingId; segment: Segment } | 
+/**
+ * The live recording clock advanced. Emitted at a throttled rate
+ * (~5 Hz) while recording. `clock_ms` is the capture-sample,
+ * pause-*excluding* offset from the start of the recording — the same
+ * timeline as `Segment::start_ms` and `AudioChunk::start_ms`. The notes
+ * editor stamps paragraph anchors (`data-anchor-ms`) from this value so
+ * anchors line up with transcript segments; do NOT derive anchors from
+ * `Date.now() - started_at_ms` (that is pause-including wall-clock).
+ */
+{ kind: "recording_clock"; meeting_id: MeetingId; clock_ms: number } | 
 /**
  * Diarization finished assigning speakers to a meeting's segments.
  */
@@ -306,6 +351,18 @@ export type ModelStatusState =
  */
 { state: "failed"; message: string }
 /**
+ * A persisted notes document returned by [`load_notes`].
+ * 
+ * `notes_json` carries the Tiptap/ProseMirror document **as a `String`**, not
+ * a `serde_json::Value`: a bare `serde_json::Value` does not derive
+ * `specta::Type`, so it cannot cross the tauri-specta boundary directly. The
+ * webview owns the (de)serialisation of this opaque document; `persistence`
+ * stores it verbatim (the Phase-4 transcript-chip opacity guarantee). The
+ * `String`-over-the-wire choice keeps the IPC contract typed without forcing a
+ * Rust-side Tiptap model.
+ */
+export type NotesDoc = { notes_json: string; notes_markdown: string }
+/**
  * Top-level state of the recording pipeline. Emitted to the webview on
  * transitions via `AppEvent::StateChanged`.
  * 
@@ -317,6 +374,13 @@ export type ModelStatusState =
  * genuinely recording-clock (e.g. `Segment::start_ms`, `AudioChunk::start_ms`)
  * remain recording-clock — those are a different namespace and carry the
  * `_ms` suffix without the `_at` infix.
+ * 
+ * **Do NOT use `Date.now() - started_at_ms` as a paragraph-anchor source.**
+ * That wall-clock delta is pause-*including* and drifts from the audio
+ * timeline. Notes paragraph anchors must be stamped from
+ * `AppEvent::RecordingClock { clock_ms }`, which is the capture-sample,
+ * pause-*excluding* clock (same origin as `Segment::start_ms`). The
+ * `started_at_ms` recipe above is for elapsed-time *display* only.
  */
 export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id: MeetingId; started_at_ms: number } | { kind: "paused"; meeting_id: MeetingId; paused_at_ms: number } | { kind: "stopping"; meeting_id: MeetingId }
 /**
@@ -327,11 +391,11 @@ export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id:
  */
 export type Segment = { start_ms: number; end_ms: number; text: string; speaker_id?: string | null; confidence?: number | null; words: WordTimestamp[] }
 /**
- * Application settings — Phase 1 fields only.
+ * Application settings.
  * 
  * Fields added in later phases live in their respective phase plans.
- * Do **not** add ASR model selection, summary system-prompt, autosave
- * interval, or telemetry fields here — those are Phase 2+ concerns.
+ * Do **not** add ASR model selection, summary system-prompt, or telemetry
+ * fields here — those are Phase 2+ concerns.
  */
 export type Settings = { 
 /**
@@ -356,7 +420,15 @@ data_directory?: string | null;
 /**
  * If `true`, the main window starts hidden; accessible via the tray icon.
  */
-start_hidden?: boolean }
+start_hidden?: boolean; 
+/**
+ * Notes-editor autosave interval, in seconds (FR-18/FR-35).
+ * 
+ * The editor debounces autosaves of `notes.json`/`notes.md` to this
+ * cadence. Defaults to 5 s; an older store written before this field
+ * existed deserialises to the default via `#[serde(default = ...)]`.
+ */
+autosave_interval_secs?: number }
 /**
  * UI colour-scheme preference.
  */

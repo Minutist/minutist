@@ -299,6 +299,17 @@ pending flush (not the newest) from the front of the deque and emits
 
 **Panic safety (Phase 2 close-out).** Each per-flush `transcribe_chunk` call is wrapped in `std::panic::catch_unwind`; a panic is caught, converted to `AppError::Internal`, emitted as `AppEvent::ErrorOccurred`, and the worker continues to the next flush. A `worker_exited` flag on `FlushQueue` ensures `stop()` is never wedged by a terminated worker.
 
+**Phase 3 — `AppEvent::RecordingClock` emission.** The runner loop emits a
+throttled `AppEvent::RecordingClock { meeting_id, clock_ms }` (~5 Hz; at most one
+every 200 ms, tracked by a `last_clock_emit: Instant`) at the sample-batch
+receive point, with `clock_ms = batch.end_ms` — the capture-sample,
+pause-*excluding* clock (same timeline as `Segment::start_ms`). It is only sent
+on the sample-receive path, so the paused branch (which never receives sample
+batches) naturally does not advance the clock. The notes editor stamps paragraph
+anchors from this event — see `cross-cutting.md` "Notes paragraph-anchor clock".
+This is purely an additional event emission; the live pipeline wiring is
+unchanged.
+
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration
@@ -343,6 +354,23 @@ running Tauri app.
 **Phase 2 additions (10 commands total):** `list_models` (`Vec<ModelStatus>`),
 `ensure_model` (`()`). Both route through `Orchestrator` — no direct
 `model-registry` dependency from `ipc-bridge`.
+
+**Phase 3 additions (12 commands total):** `save_notes`
+(`(meeting_id, notes_json, notes_markdown) -> ()`) and `load_notes`
+(`(meeting_id) -> Option<NotesDoc>`, `None` when no notes saved). Unlike the
+model/recording commands, these route **directly** to `persistence::NotesStore`
+— `persistence` is now a real `ipc-bridge` dependency (already granted in the
+table above) and the orchestrator is *not* involved: notes I/O is independent of
+the live recording pipeline and may run concurrently with an active recording
+(see `persistence` "Phase 3 surface growth — notes"). The blocking filesystem
+write/read runs on `spawn_blocking`. `IpcState` carries a `meetings_dir:
+PathBuf` (a clone of the same `{app-data}/meetings/` root the
+orchestrator/persistence use), resolved and injected by `app-main`. The opaque
+Tiptap document crosses the wire as a `String` (`NotesDoc { notes_json: String,
+notes_markdown: String }`) because a bare `serde_json::Value` does not derive
+`specta::Type`; `save_notes` parses the string to a `serde_json::Value` before
+handing it to `NotesStore` and `load_notes` re-serialises the loaded value back
+to a string.
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name
@@ -452,13 +480,14 @@ left, transcript right).
   updated by a new `recording_clock` event case and cleared to `null` on any
   transition out of `recording` (idle/stopping). This is the sole anchor-clock
   source.
-- **IPC seams (not yet in generated bindings).** `save_notes` / `load_notes`
-  commands and the `recording_clock` event are added on the backend by
-  Stream S3, which regenerates `bindings.ts` at integration. Until then the
-  editor calls the `ui/src/ipc/notes.ts` seam (dynamic `invoke`), and
-  `ui/src/ipc/app-event.ts` locally augments the generated `AppEvent` union with
-  the `recording_clock` variant — neither hand-edits the generated bindings
-  file (per `domain-ownership.md`).
+- **IPC seams (now in generated bindings — Stream S3).** `save_notes` /
+  `load_notes` commands and the `recording_clock` event are wired through
+  `ipc-bridge` and present in the regenerated `bindings.ts`. `ui/src/ipc/notes.ts`
+  remains the single seam the editor uses to persist notes (it now wraps the
+  generated `commands.saveNotes` / `commands.loadNotes` rather than a dynamic
+  `invoke`), so tests keep mocking *this* module. `ui/src/ipc/app-event.ts`
+  collapsed to a verbatim re-export of the generated `AppEvent` union (the local
+  `recording_clock` augmentation is redundant now that the variant is generated).
 
 ## What lives where — quick reference
 

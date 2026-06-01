@@ -2067,6 +2067,7 @@ version = "0.0.0"
 dependencies = [
  "meeting-app-common",
  "orchestrator",
+ "persistence",
  "serde",
  "serde_json",
  "settings",
@@ -2074,6 +2075,7 @@ dependencies = [
  "specta-typescript",
  "tauri",
  "tauri-specta",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

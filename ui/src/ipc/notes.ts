@@ -1,43 +1,24 @@
 /**
  * Thin IPC client for notes persistence.
  *
- * The `save_notes` / `load_notes` Tauri commands are NOT yet present in the
- * generated `bindings.ts` — they are added on the backend by Stream S3, which
- * regenerates `bindings.ts` at integration time. Until then this module is the
- * single seam the editor uses to persist notes, and tests mock *this* module
- * (per the architecture testing policy) rather than faking the generated
+ * The `save_notes` / `load_notes` Tauri commands are generated into
+ * `bindings.ts` by Stream S3 (`commands.saveNotes` / `commands.loadNotes`).
+ * This module is the single seam the editor uses to persist notes — it wraps
+ * the generated commands so callers work with the same `{ meetingId, notesJson,
+ * notesMarkdown }` shape and a `NotesDoc | null` result, and so tests mock
+ * *this* module (per the architecture testing policy) rather than the generated
  * bindings file.
- *
- * Wire contract assumed for S3 (documented for the integrator):
- *
- *   #[tauri::command]
- *   async fn save_notes(
- *       meeting_id: MeetingId,   // hyphenated-lowercase UUID string
- *       notes_json: String,      // serialised Tiptap ProseMirror document JSON
- *       notes_markdown: String,  // markdown export (for summariser / Word paste)
- *   ) -> Result<(), IpcError>;
- *
- *   #[tauri::command]
- *   async fn load_notes(
- *       meeting_id: MeetingId,
- *   ) -> Result<Option<NotesDoc>, IpcError>;
- *
- * where `NotesDoc { notes_json: String, notes_markdown: String }` (a `null`
- * result means "no notes saved yet for this meeting").
  *
  * `persistence` owns the on-disk `notes.json` + `notes.md` files (see
  * `architecture/cross-cutting.md` — Filesystem layout); `ipc-bridge` exposes
- * the two commands. Once S3 regenerates `bindings.ts`, this module is rewired
- * to call `commands.saveNotes` / `commands.loadNotes` and the dynamic invoke
- * below is removed.
+ * the two commands, routing them directly to `persistence::NotesStore`.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "./bindings";
+import type { NotesDoc as GeneratedNotesDoc } from "./bindings";
+import { unwrap } from "./client";
 
 /** A persisted notes document as returned by `load_notes`. */
-export type NotesDoc = {
-  notes_json: string;
-  notes_markdown: string;
-};
+export type NotesDoc = GeneratedNotesDoc;
 
 /** Payload handed to {@link saveNotes}. */
 export type SaveNotesPayload = {
@@ -54,16 +35,18 @@ export type SaveNotesPayload = {
  * recording store's `lastError` if needed.
  */
 export async function saveNotes(payload: SaveNotesPayload): Promise<void> {
-  await invoke("save_notes", {
-    meetingId: payload.meetingId,
-    notesJson: payload.notesJson,
-    notesMarkdown: payload.notesMarkdown,
-  });
+  unwrap(
+    await commands.saveNotes(
+      payload.meetingId,
+      payload.notesJson,
+      payload.notesMarkdown,
+    ),
+  );
 }
 
 /**
  * Load the persisted notes for a meeting, or `null` if none exist yet.
  */
 export async function loadNotes(meetingId: string): Promise<NotesDoc | null> {
-  return (await invoke("load_notes", { meetingId })) as NotesDoc | null;
+  return unwrap(await commands.loadNotes(meetingId));
 }

@@ -221,7 +221,11 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
             tracing::info!(target: "app-main", "model registry constructed");
 
-            // Construct the orchestrator sharing the same event bus.
+            // Construct the orchestrator sharing the same event bus. Clone the
+            // meetings dir first so the IPC state can route `save_notes` /
+            // `load_notes` directly to `persistence::NotesStore` against the
+            // same root the orchestrator/persistence use.
+            let notes_meetings_dir = meetings_dir.clone();
             let orchestrator = Arc::new(orchestrator::Orchestrator::with_event_tx(
                 settings_handle.clone(),
                 meetings_dir,
@@ -238,6 +242,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             app.manage(IpcState {
                 orchestrator: orchestrator.clone(),
                 settings: settings_handle,
+                meetings_dir: notes_meetings_dir,
             });
 
             // Build the tray icon.

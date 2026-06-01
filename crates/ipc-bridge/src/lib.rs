@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (10 total)
+//! ## Commands (12 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -18,8 +18,15 @@
 //! | `update_settings` | `()` | 1 |
 //! | `list_models` | `Vec<ModelStatus>` | 2 |
 //! | `ensure_model` | `()` | 2 |
+//! | `save_notes` | `()` | 3 |
+//! | `load_notes` | `Option<NotesDoc>` | 3 |
 //!
 //! All commands return `Result<T, IpcError>`.
+//!
+//! `save_notes` / `load_notes` route **directly** to `persistence::NotesStore`
+//! against `IpcState::meetings_dir`, bypassing the orchestrator: notes I/O is
+//! independent of the live recording pipeline and may run concurrently with an
+//! active recording.
 //!
 //! ## Specta types
 //!
@@ -43,6 +50,7 @@ pub mod commands;
 pub mod error;
 pub mod events;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use orchestrator::Orchestrator;
@@ -62,13 +70,20 @@ pub use events::{spawn_event_forwarder, AppEventPayload};
 pub struct IpcState {
     pub orchestrator: Arc<Orchestrator>,
     pub settings: SettingsHandle,
+    /// Root of the per-meeting folders (`{app-data}/meetings/`). The same
+    /// directory `orchestrator` / `persistence` use. `save_notes` /
+    /// `load_notes` route directly to `persistence::NotesStore` against this
+    /// root, bypassing the orchestrator (notes I/O is independent of the
+    /// recording pipeline — see `architecture/components.md`, `persistence`
+    /// "Phase 3 surface growth — notes").
+    pub meetings_dir: PathBuf,
 }
 
 // ---------------------------------------------------------------------------
 // bindings_builder — shared builder for app-main and the export helper
 // ---------------------------------------------------------------------------
 
-/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1+2 commands
+/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1–3 commands
 /// and the `AppEventPayload` event.
 ///
 /// Both `app-main` (to build the invoke handler) and a bindings-export helper
@@ -104,6 +119,8 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::update_settings,
             commands::list_models,
             commands::ensure_model,
+            commands::save_notes,
+            commands::load_notes,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -117,7 +134,7 @@ mod tests {
     use super::*;
     use tauri_specta::Event;
 
-    /// Verify that `bindings_builder()` produces a builder with all 10 commands
+    /// Verify that `bindings_builder()` produces a builder with all 12 commands
     /// registered, by inspecting the TypeScript export.
     ///
     /// tauri-specta rc.21 does not expose the internal command list publicly.
@@ -125,11 +142,13 @@ mod tests {
     /// it for each expected command name.  Each command appears in the TS
     /// as a string literal in the `invoke` call.
     ///
+    /// Command-count ledger: P1 8 → P2 10 → P3 12.
+    ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
     /// than erroring.  This matches the Handy project's pattern per Phase 1
     #[test]
-    fn bindings_builder_registers_all_ten_commands() {
+    fn bindings_builder_registers_all_commands() {
         use specta_typescript::{BigIntExportBehavior, Typescript};
 
         let builder = bindings_builder();
@@ -149,7 +168,11 @@ mod tests {
             "update_settings",
             "list_models",
             "ensure_model",
+            "save_notes",
+            "load_notes",
         ];
+
+        assert_eq!(expected.len(), 12, "command ledger must be 12 in Phase 3");
 
         for name in &expected {
             assert!(

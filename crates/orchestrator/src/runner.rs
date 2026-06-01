@@ -58,6 +58,9 @@ const FLUSH_MIN_SECS: f32 = 25.0;
 const LATENCY_WINDOW_SECS: f32 = 10.0;
 const MAX_GAP_MS: u64 = 3000;
 const SAMPLE_RATE_HZ: u64 = 16_000;
+/// Minimum interval between `AppEvent::RecordingClock` emissions (~5 Hz).
+/// See `architecture/cross-cutting.md` — "Notes paragraph-anchor clock".
+const RECORDING_CLOCK_MIN_INTERVAL_MS: u64 = 200;
 /// Poll interval when no audio is arriving (latency-window check).
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Hardcoded ASR model ID (Phase 2 LOCKED CHOICE).
@@ -400,6 +403,19 @@ fn run_drain_loop(
     let mut acc = Accumulator::new();
     let latency_window = Duration::from_secs_f32(LATENCY_WINDOW_SECS);
 
+    // Throttle for `AppEvent::RecordingClock`. The notes editor stamps
+    // paragraph anchors from this event (see `architecture/cross-cutting.md`
+    // "Notes paragraph-anchor clock"); ~5 Hz is plenty for that and avoids
+    // flooding the broadcast channel. We only emit on the sample-batch receive
+    // path below — the paused branch never reaches that path, so the clock is
+    // naturally not advanced while paused, matching the pause-EXCLUDING sample
+    // clock carried by `batch.end_ms`.
+    //
+    // Initialised so the first received batch emits immediately rather than
+    // waiting out the first throttle window.
+    let clock_emit_interval = Duration::from_millis(RECORDING_CLOCK_MIN_INTERVAL_MS);
+    let mut last_clock_emit: Option<Instant> = None;
+
     // Attempt to open the VAD chunker. If the model file is missing we log
     // a warning and operate without VAD (no ASR transcription).
     let mut vad_opt: Option<VadChunker> = {
@@ -558,6 +574,24 @@ fn run_drain_loop(
             Ok(batch) => {
                 // Push to persistent audio.
                 push_batch(&mut writer, &batch);
+
+                // Emit a throttled RecordingClock (~5 Hz) so the notes editor
+                // can stamp paragraph anchors on the pause-EXCLUDING sample
+                // clock. `batch.end_ms` is exactly that clock (it advances only
+                // while samples are flowing; the paused branch never reaches
+                // here). See `architecture/cross-cutting.md` — "Notes
+                // paragraph-anchor clock".
+                let now = Instant::now();
+                let should_emit_clock = last_clock_emit
+                    .map(|t| now.duration_since(t) >= clock_emit_interval)
+                    .unwrap_or(true);
+                if should_emit_clock {
+                    let _ = event_tx.send(AppEvent::RecordingClock {
+                        meeting_id,
+                        clock_ms: batch.end_ms,
+                    });
+                    last_clock_emit = Some(now);
+                }
 
                 // Feed to VAD if available.
                 if let Some(ref mut vad) = vad_opt {

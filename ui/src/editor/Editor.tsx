@@ -17,9 +17,12 @@ import { useEffect, useRef } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import type { Editor as TiptapEditor } from "@tiptap/core";
 import { useRecordingStore } from "../state/recording";
+import { useCrossRefStore } from "../state/cross-ref";
 import { buildEditorExtensions } from "./extensions";
 import { useAutosave } from "./useAutosave";
 import { buildClipboardPayload } from "./clipboard";
+import { handleSegmentDrop } from "./transcript-dnd";
+import { scrollToNearestAnchor } from "./scroll-to-anchor";
 import { shouldUseDevShim } from "../ipc/dev-shim-guard";
 import { loadNotes } from "../ipc/notes";
 import "./Editor.css";
@@ -43,6 +46,22 @@ function readAutosaveInterval(settings: unknown): number | null {
 export function Editor() {
   const recordingState = useRecordingStore((s) => s.state);
   const settings = useRecordingStore((s) => s.settings);
+  // FR-22/23 cross-reference: read the live transcript (for the nearest-segment
+  // mapping) and the scroll-request from the cross-ref store.
+  const transcript = useRecordingStore((s) => s.transcript);
+  const hoverNotesAnchor = useCrossRefStore((s) => s.hoverNotesAnchor);
+  const scrollRequest = useCrossRefStore((s) => s.scrollRequest);
+
+  // Keep the latest transcript in a ref so the hover reporter (wired once at
+  // editor construction) always maps against the current segments without
+  // re-creating the editor.
+  const transcriptRef = useRef(transcript);
+  transcriptRef.current = transcript;
+
+  // Holds the live editor instance for DOM-event handlers wired at construction
+  // time (the `drop` handler), which cannot close over `editor` before it is
+  // assigned. Populated by the effect below once `useEditor` returns.
+  const editorRef = useRef<TiptapEditor | null>(null);
 
   const editor = useEditor({
     extensions: buildEditorExtensions({
@@ -57,16 +76,30 @@ export function Editor() {
           clockMs: s.recordingClockMs,
         };
       },
+      // FR-22: a hovered paragraph's anchor maps to the nearest transcript
+      // segment (on Segment.start_ms, the pause-excluding clock — never
+      // Date.now()). The cross-ref store owns the nearest-segment computation.
+      onHoverAnchor: (anchorMs) =>
+        hoverNotesAnchor(anchorMs, transcriptRef.current),
     }),
     editorProps: {
       attributes: {
         class: "notes-editor__content",
         "aria-label": "Notes",
       },
-      // Override copy/cut to write a Word-friendly HTML payload.
+      // Override copy/cut to write a Word-friendly HTML payload; handle drops of
+      // a transcript segment (FR-24) by inserting a transcript-chip node.
       handleDOMEvents: {
         copy: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
         cut: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
+        drop: (_view, event) => {
+          const current = editorRef.current;
+          if (!current) return false;
+          const dragEvent = event as DragEvent;
+          const handled = handleSegmentDrop(current, dragEvent);
+          if (handled) dragEvent.preventDefault();
+          return handled;
+        },
       },
     },
   });
@@ -108,6 +141,21 @@ export function Editor() {
       cancelled = true;
     };
   }, [editor]);
+
+  // Keep the editor ref current for the construction-time `drop` handler.
+  editorRef.current = editor;
+
+  // FR-23: a clicked transcript segment publishes a scroll request (carrying the
+  // segment's start_ms on the pause-excluding clock). Scroll the notes editor to
+  // the paragraph whose anchor is nearest that value. The `nonce` makes repeated
+  // clicks on the same segment re-trigger the effect.
+  useEffect(() => {
+    if (!editor || !scrollRequest) return;
+    scrollToNearestAnchor(
+      editor.view.dom as HTMLElement,
+      scrollRequest.anchorMs,
+    );
+  }, [editor, scrollRequest]);
 
   // Flush on blur so notes are persisted the instant focus leaves the editor.
   const flushRef = useRef(flush);

@@ -39,6 +39,38 @@
   gap: 0.85rem;
   line-height: 1.55;
   align-items: baseline;
+  /* Drag source (FR-24) + click-to-jump (FR-23). */
+  cursor: grab;
+  border-radius: var(--radius);
+  padding: 0.2rem 0.4rem;
+  margin: 0 -0.4rem;
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+
+.transcript-pane__row:hover {
+  background: var(--sheet);
+}
+
+.transcript-pane__row:active {
+  cursor: grabbing;
+}
+
+/*
+ * FR-22 cross-reference highlight: the segment whose start_ms is nearest the
+ * hovered notes paragraph's anchor. A quiet oxblood wash + left rule so the
+ * linked range reads clearly without shouting.
+ */
+.transcript-pane__row--highlighted {
+  background: var(--accent-tint);
+  box-shadow: inset 2px 0 0 0 var(--accent);
+}
+
+.transcript-pane__row--highlighted .transcript-pane__timestamp {
+  color: var(--accent);
+}
+
+.transcript-pane__row--highlighted .transcript-pane__text {
+  color: var(--ink);
 }
 
 .transcript-pane__timestamp {

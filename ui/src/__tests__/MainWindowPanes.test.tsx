@@ -48,11 +48,31 @@ vi.mock("../ipc/notes", () => ({
   saveNotes: vi.fn().mockResolvedValue(undefined),
   loadNotes: vi.fn().mockResolvedValue(null),
 }));
+vi.mock("../ipc/meetings", () => ({
+  listMeetings: vi.fn().mockResolvedValue([]),
+  openMeeting: vi.fn(),
+  renameMeeting: vi.fn(),
+  deleteMeeting: vi.fn(),
+  reTranscribe: vi.fn(),
+  reSummarise: vi.fn(),
+}));
 
 import { MainWindow } from "../shell/MainWindow";
+import { useMeetingsStore } from "../state/meetings";
 
-/** Render MainWindow and flush its mount effects (settings/devices/models). */
+/**
+ * Render MainWindow in the editor/transcript workspace and flush its mount
+ * effects. The two-pane layout (FR-21) only renders once a meeting is open (the
+ * meeting-list is the default entry surface, FR-33), so put the meetings store
+ * into an open state first.
+ */
 async function renderMainWindow() {
+  act(() => {
+    useMeetingsStore.setState({
+      openMeetingId: "open-meeting-uuid",
+      openMeetingState: null,
+    });
+  });
   const result = render(<MainWindow />);
   // Let the mount-time async refreshes settle so state updates are wrapped.
   await waitFor(() => expect(screen.getByTestId("notes")).toBeInTheDocument());
@@ -62,6 +82,9 @@ async function renderMainWindow() {
 describe("MainWindow two-pane layout", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    act(() => {
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+    });
   });
 
   it("renders the notes editor (primary) and transcript (secondary) panes", async () => {

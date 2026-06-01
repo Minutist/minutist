@@ -10,3 +10,20 @@ export {
   wrapHtmlDocument,
 } from "./clipboard";
 export type { ClipboardPayload } from "./clipboard";
+export { TranscriptChip, CHIP_NODE_NAME } from "./transcript-chip";
+export type { TranscriptChipAttrs } from "./transcript-chip";
+export { NotesHoverBridge } from "./hover-bridge";
+export type { HoverAnchorReporter } from "./hover-bridge";
+export {
+  TRANSCRIPT_SEGMENT_MIME,
+  writeSegmentDrag,
+  readSegmentDrag,
+  segmentToDragPayload,
+  dragPayloadToChipAttrs,
+  handleSegmentDrop,
+} from "./transcript-dnd";
+export type { DraggedSegment } from "./transcript-dnd";
+export {
+  nearestAnchoredElement,
+  scrollToNearestAnchor,
+} from "./scroll-to-anchor";

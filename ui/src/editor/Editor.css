@@ -200,6 +200,45 @@
   color: var(--stone);
 }
 
+/* --- Transcript chip (dragged-in segment, FR-24/25) ---------------------- */
+/*
+ * A quiet quotation card: an oxblood left rule (echoing the blockquote), a
+ * stone tabular timestamp / speaker meta line, and the quoted text in reading
+ * italic. Reads as a transcript citation embedded in the notes, distinct from a
+ * hand-typed blockquote.
+ */
+.transcript-chip {
+  position: relative;
+  margin: 1em 0;
+  padding: 0.65rem 0.9rem 0.65rem 1rem;
+  border-left: 2px solid var(--accent);
+  background: var(--sheet-quiet);
+  border-radius: var(--radius);
+  /* The chip is an atom node; this signals it is a single selectable block. */
+  cursor: grab;
+}
+
+.transcript-chip__meta {
+  display: block;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--stone);
+  margin-bottom: 0.25rem;
+}
+
+.transcript-chip__text {
+  display: block;
+  font-style: italic;
+  color: var(--ink-soft);
+  line-height: 1.55;
+}
+
+/* Selected-atom outline using the oxblood accent (matches focus treatment). */
+.transcript-chip.ProseMirror-selectednode {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* --- Anchor marginalia (left-gutter editorial side-note) ----------------- */
 /*
  * The decoration widget is injected at the paragraph start; absolute

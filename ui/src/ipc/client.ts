@@ -5,12 +5,15 @@
  * that any future shim (mock in tests, offline-mode stub) has a single
  * injection point.
  */
+import { invoke as TAURI_INVOKE } from "@tauri-apps/api/core";
 import { events, commands as generatedCommands } from "./bindings";
 import type {
   AppEventPayload,
   IpcError,
+  MeetingId,
   Result,
 } from "./bindings";
+import type { MeetingListEntry, MeetingState } from "./meetings";
 import type { AppEvent } from "./app-event";
 import { shouldUseDevShim } from "./dev-shim-guard";
 
@@ -56,8 +59,59 @@ async function callCommand<K extends CommandName>(
   )) as Out;
 }
 
+/**
+ * The Phase-4 meeting commands not yet present on the generated `commands`
+ * object (Stream C adds them and regenerates `bindings.ts`). Typed here against
+ * the canonical `common::MeetingListEntry` / `common::MeetingState` shapes so
+ * the seam is fully typed before the regeneration.
+ */
+export type PendingCommands = {
+  listMeetings: () => Promise<Result<MeetingListEntry[], IpcError>>;
+  openMeeting: (meetingId: MeetingId) => Promise<Result<MeetingState, IpcError>>;
+  renameMeeting: (
+    meetingId: MeetingId,
+    title: string,
+  ) => Promise<Result<null, IpcError>>;
+  deleteMeeting: (meetingId: MeetingId) => Promise<Result<null, IpcError>>;
+  reTranscribe: (meetingId: MeetingId) => Promise<Result<null, IpcError>>;
+  reSummarise: (meetingId: MeetingId) => Promise<Result<null, IpcError>>;
+};
+
+/** The dev-shim's runtime surface for the pending commands (camelCase names). */
+type DevPending = Record<
+  string,
+  (...args: unknown[]) => Promise<Result<unknown, IpcError>>
+>;
+
+/**
+ * Invoke a command that is not yet on the generated `commands` object.
+ *
+ * In DEV-shim mode the dev shim already supplies the camelCase method; call it.
+ * Otherwise invoke the real backend via `TAURI_INVOKE` using the `snake_case`
+ * wire name and `args` object, wrapping the call in the same `Result` shape the
+ * generated bindings produce. Once Stream C regenerates `bindings.ts`, callers
+ * can move to `callCommand`; the wire behaviour is identical.
+ */
+async function callPendingCommand<T>(
+  devName: string,
+  wireName: string,
+  args: Record<string, unknown>,
+): Promise<Result<T, IpcError>> {
+  if (import.meta.env.DEV && shouldUseDevShim()) {
+    const dev = (await loadDevCommands()) as unknown as DevPending;
+    const argList = Object.values(args);
+    return (await dev[devName](...argList)) as Result<T, IpcError>;
+  }
+  try {
+    return { status: "ok", data: (await TAURI_INVOKE(wireName, args)) as T };
+  } catch (e) {
+    if (e instanceof Error) throw e;
+    return { status: "error", error: e as IpcError };
+  }
+}
+
 /** Delegating commands surface; see {@link callCommand}. */
-export const commands: Commands = {
+export const commands: Commands & PendingCommands = {
   listDevices: () => callCommand("listDevices", []),
   startRecording: (deviceId) => callCommand("startRecording", [deviceId]),
   pauseRecording: () => callCommand("pauseRecording", []),
@@ -71,6 +125,24 @@ export const commands: Commands = {
   saveNotes: (meetingId, notesJson, notesMarkdown) =>
     callCommand("saveNotes", [meetingId, notesJson, notesMarkdown]),
   loadNotes: (meetingId) => callCommand("loadNotes", [meetingId]),
+  // Phase 4 meeting-list + open surface. These commands are added to the
+  // backend by Stream C, which regenerates `bindings.ts` to include them; until
+  // that regeneration lands they are not on the generated `commands` object, so
+  // they route through `callPendingCommand` (DEV shim in shim-mode, raw
+  // `TAURI_INVOKE` with the snake_case wire name otherwise) rather than through
+  // `callCommand` (which is keyed on the generated names). Once regenerated,
+  // these can fold into `callCommand` with no call-site change.
+  listMeetings: () => callPendingCommand("listMeetings", "list_meetings", {}),
+  openMeeting: (meetingId) =>
+    callPendingCommand("openMeeting", "open_meeting", { meetingId }),
+  renameMeeting: (meetingId, title) =>
+    callPendingCommand("renameMeeting", "rename_meeting", { meetingId, title }),
+  deleteMeeting: (meetingId) =>
+    callPendingCommand("deleteMeeting", "delete_meeting", { meetingId }),
+  reTranscribe: (meetingId) =>
+    callPendingCommand("reTranscribe", "re_transcribe", { meetingId }),
+  reSummarise: (meetingId) =>
+    callPendingCommand("reSummarise", "re_summarise", { meetingId }),
 };
 
 // Re-export types that callers commonly need. `AppEvent` is the generated

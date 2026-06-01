@@ -18,6 +18,12 @@
  *   - AnchorMarginalia — presentation-only decoration that renders each
  *     anchored paragraph's timestamp as quiet left-margin marginalia
  *     (see ./anchor-marginalia); adds no attrs and dispatches no transactions.
+ *   - TranscriptChip — first-class block node for a dragged-in transcript
+ *     segment (FR-24/25; see ./transcript-chip). Survives notes.json round-trip
+ *     and exports to markdown as a fenced quotation.
+ *   - NotesHoverBridge — presentation-only plugin reporting the hovered
+ *     paragraph's `data-anchor-ms` (FR-22 read side; see ./hover-bridge); adds
+ *     no attrs and dispatches no transactions, so it cannot affect anchoring.
  */
 import StarterKit from "@tiptap/starter-kit";
 import { Link } from "@tiptap/extension-link";
@@ -31,10 +37,19 @@ import type { Extensions } from "@tiptap/core";
 import { ParagraphAnchor } from "./paragraph-anchor";
 import type { AnchorClockSource } from "./paragraph-anchor";
 import { AnchorMarginalia } from "./anchor-marginalia";
+import { TranscriptChip } from "./transcript-chip";
+import { NotesHoverBridge } from "./hover-bridge";
+import type { HoverAnchorReporter } from "./hover-bridge";
 
 export type BuildExtensionsOptions = {
   /** Supplies the recording state + pause-excluding clock to ParagraphAnchor. */
   clockSource: AnchorClockSource;
+  /**
+   * Optional FR-22 hover reporter — receives the hovered paragraph's
+   * `data-anchor-ms` (or `null`). Defaults to a no-op when omitted (e.g. in
+   * editor tests that don't exercise cross-reference).
+   */
+  onHoverAnchor?: HoverAnchorReporter;
 };
 
 /**
@@ -71,5 +86,12 @@ export function buildEditorExtensions(
     // Adds no node attrs and dispatches no transactions, so it cannot affect
     // ParagraphAnchor's stamping logic.
     AnchorMarginalia,
+    // First-class dragged-in transcript segment (FR-24/25).
+    TranscriptChip,
+    // FR-22 read side: reports the hovered paragraph's anchor. Presentation-only
+    // (no doc mutation), so it cannot affect ParagraphAnchor's stamping.
+    NotesHoverBridge.configure({
+      onHoverAnchor: options.onHoverAnchor ?? (() => {}),
+    }),
   ];
 }

@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useRecordingStore } from "../state/recording";
+import { useCrossRefStore } from "../state/cross-ref";
+import { writeSegmentDrag } from "../editor/transcript-dnd";
 import type { Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
 
@@ -31,9 +33,23 @@ export function formatTimestamp(start_ms: number): string {
  *
  * Auto-scrolls to the bottom on new segments unless the user has scrolled
  * up more than 50 px from the bottom (sticky-bottom behaviour).
+ *
+ * Cross-reference (Phase 4):
+ *   - FR-24: each row is a native drag source — dragging it into the notes
+ *     editor inserts a transcript-chip node carrying the segment.
+ *   - FR-23: clicking a row publishes a scroll request so the notes editor
+ *     scrolls to the nearest-anchored paragraph.
+ *   - FR-22: when a notes paragraph is hovered, the segment nearest its anchor
+ *     is highlighted (`highlightedSegmentIndex` from the cross-ref store).
  */
 export function TranscriptPane() {
   const transcript = useRecordingStore((s) => s.transcript);
+  const highlightedSegmentIndex = useCrossRefStore(
+    (s) => s.highlightedSegmentIndex,
+  );
+  const clickTranscriptSegment = useCrossRefStore(
+    (s) => s.clickTranscriptSegment,
+  );
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Track whether the user has scrolled away from the bottom.
@@ -70,14 +86,31 @@ export function TranscriptPane() {
         </p>
       ) : (
         <ol className="transcript-pane__list">
-          {transcript.map((seg: Segment, idx: number) => (
-            <li key={idx} className="transcript-pane__row">
-              <span className="transcript-pane__timestamp">
-                {formatTimestamp(seg.start_ms)}
-              </span>
-              <span className="transcript-pane__text">{seg.text}</span>
-            </li>
-          ))}
+          {transcript.map((seg: Segment, idx: number) => {
+            const highlighted = idx === highlightedSegmentIndex;
+            return (
+              <li
+                key={idx}
+                className={
+                  highlighted
+                    ? "transcript-pane__row transcript-pane__row--highlighted"
+                    : "transcript-pane__row"
+                }
+                draggable
+                aria-current={highlighted ? "true" : undefined}
+                title="Drag into your notes, or click to jump to the linked paragraph"
+                onDragStart={(e) => {
+                  if (e.dataTransfer) writeSegmentDrag(e.dataTransfer, seg);
+                }}
+                onClick={() => clickTranscriptSegment(seg)}
+              >
+                <span className="transcript-pane__timestamp tnum">
+                  {formatTimestamp(seg.start_ms)}
+                </span>
+                <span className="transcript-pane__text">{seg.text}</span>
+              </li>
+            );
+          })}
         </ol>
       )}
     </div>

@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
+import { useMeetingsStore } from "../state/meetings";
 import { DevicePicker } from "./DevicePicker";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
+import { MeetingList } from "./MeetingList";
 import { Editor } from "../editor/Editor";
 import { TranscriptPane } from "../transcript/TranscriptPane";
 import "./MainWindow.css";
@@ -33,7 +35,15 @@ export function MainWindow() {
   const refreshDevices = useRecordingStore((s) => s.refreshDevices);
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const lastError = useRecordingStore((s) => s.lastError);
+  const recordingState = useRecordingStore((s) => s.state);
   const refreshModels = useModelsStore((s) => s.refreshModels);
+  const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
+  const closeMeeting = useMeetingsStore((s) => s.close);
+
+  // The meeting-list is the entry surface (FR-33): shown when no meeting is
+  // open and nothing is being recorded. Opening a meeting, or starting a
+  // recording, switches to the editor/transcript workspace.
+  const inWorkspace = openMeetingId !== null || recordingState.kind !== "idle";
 
   const transcriptPanelRef = usePanelRef();
   const [transcriptCollapsed, setTranscriptCollapsed] = useState(false);
@@ -78,19 +88,35 @@ export function MainWindow() {
         </div>
 
         <div className="main-window__controls">
+          {/*
+            Return to the meeting-list (FR-33 entry surface). Shown only when a
+            meeting is open AND nothing is recording — leaving an open meeting
+            mid-recording would be ambiguous.
+          */}
+          {inWorkspace && openMeetingId !== null && recordingState.kind === "idle" && (
+            <button
+              type="button"
+              className="main-window__toggle-transcript"
+              onClick={closeMeeting}
+            >
+              Meetings
+            </button>
+          )}
           <MeetingControls />
           <div className="main-window__meter" aria-label="Audio level">
             <AudioMeter />
           </div>
           <DevicePicker />
-          <button
-            type="button"
-            className="main-window__toggle-transcript"
-            aria-pressed={transcriptCollapsed}
-            onClick={toggleTranscript}
-          >
-            {transcriptCollapsed ? "Show transcript" : "Hide transcript"}
-          </button>
+          {inWorkspace && (
+            <button
+              type="button"
+              className="main-window__toggle-transcript"
+              aria-pressed={transcriptCollapsed}
+              onClick={toggleTranscript}
+            >
+              {transcriptCollapsed ? "Show transcript" : "Hide transcript"}
+            </button>
+          )}
         </div>
       </header>
 
@@ -108,32 +134,36 @@ export function MainWindow() {
         )}
       </div>
 
-      <Group orientation="horizontal" className="main-window__panes ink-reveal">
-        <Panel
-          id="notes"
-          className="main-window__pane main-window__pane--notes"
-          minSize="20%"
-        >
-          <Editor />
-        </Panel>
+      {inWorkspace ? (
+        <Group orientation="horizontal" className="main-window__panes ink-reveal">
+          <Panel
+            id="notes"
+            className="main-window__pane main-window__pane--notes"
+            minSize="20%"
+          >
+            <Editor />
+          </Panel>
 
-        <Separator className="main-window__resize-handle">
-          <span className="main-window__resize-grip" aria-hidden="true" />
-        </Separator>
+          <Separator className="main-window__resize-handle">
+            <span className="main-window__resize-grip" aria-hidden="true" />
+          </Separator>
 
-        <Panel
-          id="transcript"
-          panelRef={transcriptPanelRef}
-          className="main-window__pane main-window__pane--transcript"
-          collapsible
-          collapsedSize="0%"
-          minSize="15%"
-          defaultSize="35%"
-          onResize={(size) => setTranscriptCollapsed(size.asPercentage <= 0)}
-        >
-          <TranscriptPane />
-        </Panel>
-      </Group>
+          <Panel
+            id="transcript"
+            panelRef={transcriptPanelRef}
+            className="main-window__pane main-window__pane--transcript"
+            collapsible
+            collapsedSize="0%"
+            minSize="15%"
+            defaultSize="35%"
+            onResize={(size) => setTranscriptCollapsed(size.asPercentage <= 0)}
+          >
+            <TranscriptPane />
+          </Panel>
+        </Group>
+      ) : (
+        <MeetingList />
+      )}
     </div>
   );
 }

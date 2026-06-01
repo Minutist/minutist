@@ -563,6 +563,54 @@ left, transcript right).
   collapsed to a verbatim re-export of the generated `AppEvent` union (the local
   `recording_clock` augmentation is redundant now that the variant is generated).
 
+**Phase 4 additions (Stream B — meeting-list + cross-reference + transcript-chip).**
+
+- **Meeting-list view (`ui/src/shell/MeetingList.tsx` + `.css`, FR-33).** The
+  entry surface shown before a meeting is open: a quiet index of ruled paper
+  rows (Editorial Ink) listing title / date / duration / speaker-count /
+  excerpt, with per-row open / rename / delete / re-transcribe / re-summarise
+  actions. `MainWindow` switches between this view and the editor/transcript
+  workspace on `useMeetingsStore.openMeetingId` (and the recording state): the
+  list shows when no meeting is open and nothing is recording; opening a meeting
+  or starting a recording reveals the workspace, and a header "Meetings"
+  affordance returns to the list when idle.
+- **Cross-reference at segment granularity (FR-22/23).** On the pause-EXCLUDING
+  timeline (`data-anchor-ms` ↔ `Segment.start_ms`, NEVER `Date.now()`).
+  `ui/src/editor/hover-bridge.ts` (`NotesHoverBridge`) is a presentation-only
+  ProseMirror plugin that reports the hovered paragraph's `data-anchor-ms` and
+  **mutates no doc / dispatches no transaction** (so it cannot touch the A4
+  stamping logic, exactly like `AnchorMarginalia`). `ui/src/state/cross-ref.ts`
+  maps that anchor to the nearest `Segment.start_ms` (FR-22) and the transcript
+  pane highlights that row; clicking a transcript row publishes a scroll request
+  whose `start_ms` the editor resolves to the nearest-anchored paragraph via
+  `ui/src/editor/scroll-to-anchor.ts` (FR-23, a pure DOM read + `scrollIntoView`).
+- **Transcript-chip node + DnD (`ui/src/editor/transcript-chip.ts` +
+  `transcript-dnd.ts`, FR-24/25).** `TranscriptChip` is a first-class atom block
+  node carrying `startMs` / `endMs` / `speakerId` / `text`, registered in
+  `editor/extensions.ts`. Native HTML5 drag-and-drop (`transcript-dnd.ts`, MIME
+  `application/x-meeting-app-segment`) carries a dragged transcript segment; the
+  editor's `drop` handler inserts a chip (FR-24). The chip survives the
+  `notes.json` `getJSON`↔`setContent` round-trip (relies on the Phase-3 opacity
+  guarantee) and exports via tiptap-markdown's node `serialize` hook as a fenced
+  ```transcript quotation carrying the metadata + segment text (FR-25). The
+  transcript pane rows are the drag source.
+- **New stores (`ui/src/state/`).** `MeetingsStore` (`meetings.ts`) holds the
+  meeting-list rows + the open-meeting state and routes through the
+  `ui/src/ipc/meetings.ts` seam; `CrossRefStore` (`cross-ref.ts`) holds the
+  transient FR-22 highlight + FR-23 scroll-request links.
+- **IPC seam (`ui/src/ipc/meetings.ts`).** A thin client (mirroring the Phase-3
+  `notes.ts`) over the shim-aware `commands` from `./client` — NOT raw
+  `./bindings` — for the six Phase-4 commands (`list_meetings`, `open_meeting`,
+  `rename_meeting`, `delete_meeting`, `re_transcribe`, `re_summarise`). Stream C
+  adds these commands to `ipc-bridge` and regenerates `bindings.ts` before the
+  frontend consumes them; until then `client.ts` routes them through a labelled
+  "pending generation" path (DEV shim in shim-mode, raw `TAURI_INVOKE` with the
+  snake_case wire name otherwise), typed against the canonical
+  `common::MeetingListEntry` / `common::MeetingState` shapes. The DEV shim
+  (`dev-shim.ts`) supplies sample meetings + an opened-meeting payload so the
+  list and an open meeting render under `vite dev`. `re_transcribe` reuses
+  `AppEvent::TranscriptSegment`; `re_summarise` reuses `AppEvent::SummaryReady`.
+
 ### Design system — "Editorial Ink" (light theme)
 
 A warm-paper, document-centric **light** theme applied across the webview.

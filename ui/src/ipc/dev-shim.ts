@@ -29,6 +29,7 @@ import type {
   MeetingMeta,
   NotesDoc,
 } from "./bindings";
+import type { MeetingListEntry, MeetingState } from "./meetings";
 
 // The activation guard lives in its own data-free module so the main bundle
 // can import it without pulling in any of the sample data below. Re-exported
@@ -176,8 +177,81 @@ const DEV_NOTES_JSON = JSON.stringify({
 const DEV_NOTES_MD =
   "# Launch sync — Tuesday\n\nThree open risks against the date; offline model download is the one to watch. First-run should feel deliberate.\n\nOwner: progress affordance + retry path. Target: this week.\n\n## Design direction\n\nTranscript and notes should read as one document — warm paper, a single oxblood ink accent, timestamps as quiet marginalia.\n\n> It should feel like writing on a fine sheet of paper on a warm desk.\n";
 
+/**
+ * Sample meeting-list rows (FR-33) so the entry surface renders populated under
+ * `vite dev`. Dates span a few weeks; durations / speaker counts vary; each has
+ * a transcript excerpt for the row preview.
+ */
+const DEV_MEETINGS: MeetingListEntry[] = [
+  {
+    id: DEV_MEETING_ID,
+    title: "Launch sync — Tuesday",
+    started_at: new Date(STARTED_AT_MS).toISOString(),
+    duration_ms: 32 * 60 * 1000,
+    speaker_count: 3,
+    excerpt:
+      "Three open risks against the date; offline model download is the one to watch. Owner and retry path agreed for this week.",
+  },
+  {
+    id: "dev-meeting-0002",
+    title: "Design review — Editorial Ink",
+    started_at: "2026-05-26T14:05:00Z",
+    duration_ms: 47 * 60 * 1000,
+    speaker_count: 2,
+    excerpt:
+      "Warm paper, a single oxblood ink accent, timestamps as quiet marginalia. Sign-off on the two-pane sheet treatment.",
+  },
+  {
+    id: "dev-meeting-0003",
+    title: "Customer interview — onboarding friction",
+    started_at: "2026-05-19T09:30:00Z",
+    duration_ms: 58 * 60 * 1000,
+    speaker_count: 4,
+    excerpt:
+      "First-run download felt broken without a deliberate progress affordance; users abandoned before the model finished.",
+  },
+  {
+    id: "dev-meeting-0004",
+    title: "Quick standup",
+    started_at: "2026-05-18T08:00:00Z",
+    duration_ms: 8 * 60 * 1000,
+    speaker_count: 5,
+    excerpt: null,
+  },
+];
+
 function ok<T>(data: T): Result<T, IpcError> {
   return { status: "ok", data };
+}
+
+/** Build the `open_meeting` restore payload for a dev meeting id. */
+function devMeetingState(meetingId: MeetingId): MeetingState {
+  const entry =
+    DEV_MEETINGS.find((m) => m.id === meetingId) ?? DEV_MEETINGS[0];
+  return {
+    meta: {
+      uuid: entry.id,
+      title: entry.title,
+      started_at: entry.started_at,
+      ended_at: new Date(
+        new Date(entry.started_at).getTime() + entry.duration_ms,
+      ).toISOString(),
+      duration_ms: entry.duration_ms,
+      speaker_count: entry.speaker_count,
+      audio_format: {
+        codec: "opus",
+        sample_rate: 16_000,
+        channels: 1,
+        bitrate_kbps: 32,
+      },
+      asr_model: null,
+      llm_model: null,
+      diarizer: null,
+      app_version: "0.0.0-dev",
+    },
+    transcript: DEV_TRANSCRIPT,
+    notes: { notes_json: DEV_NOTES_JSON, notes_markdown: DEV_NOTES_MD },
+  };
 }
 
 /** A `commands`-shaped object backed entirely by in-memory sample data. */
@@ -237,6 +311,30 @@ export const devCommands = {
     _meetingId: MeetingId,
   ): Promise<Result<NotesDoc | null, IpcError>> {
     return ok({ notes_json: DEV_NOTES_JSON, notes_markdown: DEV_NOTES_MD });
+  },
+  // --- Phase 4 meeting-list + open surface (FR-33) ------------------------
+  async listMeetings(): Promise<Result<MeetingListEntry[], IpcError>> {
+    return ok(DEV_MEETINGS);
+  },
+  async openMeeting(
+    meetingId: MeetingId,
+  ): Promise<Result<MeetingState, IpcError>> {
+    return ok(devMeetingState(meetingId));
+  },
+  async renameMeeting(
+    _meetingId: MeetingId,
+    _title: string,
+  ): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async reTranscribe(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async reSummarise(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    return ok(null);
   },
 };
 

@@ -1,6 +1,6 @@
 //! Integration tests for the Phase 4 offline `Orchestrator::re_transcribe`.
 //!
-//! Three scenarios, per `architecture/cross-cutting.md` — Automated-testing
+//! Four scenarios, per `architecture/cross-cutting.md` — Automated-testing
 //! policy:
 //!
 //! 1. **save → drop → open round-trip** (DEFAULT suite, no model). A synthetic
@@ -16,6 +16,18 @@
 //! 3. **`re_transcribe` refuses during a live recording** (DEFAULT suite, no
 //!    model). With the orchestrator not `Idle`, `re_transcribe` returns
 //!    `AppError::InvalidInput` without touching the meeting.
+//! 4. **`re_transcribe_with_backend` over the LibriSpeech fixture, stub ASR**
+//!    (DEFAULT suite, no model). The offline counterpart of scenario 2 with the
+//!    ASR model replaced by a `StubAsrBackend` (the same seam
+//!    `pipeline_stub_test.rs` uses for the live path). A synthetic meeting
+//!    folder whose `audio.opus` is the committed LibriSpeech fixture encoded via
+//!    the persistence Opus encoder is built, its `transcript.json` is emptied,
+//!    and the offline re-transcribe drives the **real** Silero VAD over the real
+//!    speech and asserts `transcript.json` is rewritten with the stub text, an
+//!    `AppEvent::TranscriptSegment` is emitted, and the index excerpt is
+//!    refreshed. This is the model-free coverage of the offline
+//!    `re_transcribe_buffer` → `transcribe_one_flush` → `write_transcript` →
+//!    index-upsert path that scenario 2 gates on a real model.
 //!
 //! The model-staging helpers (manifest with real SHA-256, hard-link/symlink the
 //! model files into the registry cache) mirror `transcription_e2e.rs`.
@@ -30,9 +42,9 @@ use meeting_app_common::{
     ModelManifestEntry, Segment,
 };
 use model_registry::ModelRegistry;
-use orchestrator::test_support::test_orchestrator;
+use orchestrator::test_support::{test_orchestrator, StubAsrBackend};
 use orchestrator::Orchestrator;
-use persistence::MeetingIndex;
+use persistence::{MeetingIndex, MeetingWriter};
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::{broadcast, mpsc};
 
@@ -463,4 +475,155 @@ async fn re_transcribe_rewrites_transcript_over_fixture() {
     let rows = index.list_meetings().await.expect("list");
     let row = rows.iter().find(|r| r.id == meeting_id).expect("indexed");
     assert!(row.excerpt.is_some(), "index excerpt must be refreshed");
+}
+
+// ---------------------------------------------------------------------------
+// 4. re_transcribe_with_backend over the LibriSpeech fixture, stub ASR
+//    (DEFAULT suite — no model env vars)
+// ---------------------------------------------------------------------------
+
+/// Build a meeting folder on disk whose `audio.opus` is `samples` encoded via
+/// the persistence Opus encoder (`MeetingWriter`), plus a `metadata.json`.
+/// Returns the meeting id.
+///
+/// `transcript.json` is left **empty** (`[]`) to prove the offline
+/// re-transcribe REWRITES it from the audio rather than reading a stale file.
+fn build_meeting_with_audio(root: &Path, title: &str, samples: &[f32]) -> MeetingId {
+    let meeting_id = MeetingId::new();
+    let format = AudioFormat {
+        codec: "opus".into(),
+        sample_rate: 16_000,
+        channels: 1,
+        bitrate_kbps: Some(32),
+    };
+
+    // Encode audio.opus + create the folder via the production writer so the
+    // on-disk layout (and the Opus stream the reader decodes) matches exactly.
+    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
+    writer.push_samples(samples).expect("push fixture samples");
+
+    let meta = MeetingMeta {
+        uuid: meeting_id,
+        title: title.to_string(),
+        started_at: "2026-06-02T09:00:00Z".to_string(),
+        ended_at: Some("2026-06-02T09:00:06Z".to_string()),
+        duration_ms: (samples.len() as u64 * 1000) / 16_000,
+        speaker_count: 1,
+        audio_format: format,
+        asr_model: None,
+        llm_model: None,
+        diarizer: None,
+        app_version: "0.0.0".into(),
+    };
+    let folder = writer.finalise(meta).expect("finalise writer");
+
+    // Overwrite transcript.json with an empty array — re_transcribe must rewrite it.
+    std::fs::write(
+        folder.path().join("transcript.json"),
+        serde_json::to_vec_pretty(&Vec::<Segment>::new()).unwrap(),
+    )
+    .expect("write empty transcript.json");
+
+    meeting_id
+}
+
+/// Offline re-transcribe with a stub ASR backend over a real-speech fixture.
+///
+/// This test ALWAYS runs — it is NOT gated on any env var. It exercises the
+/// full offline path (decode → real Silero VAD → batched-VAD accumulator →
+/// `transcribe_one_flush` → `write_transcript` → index upsert) with a stub
+/// backend, so the model-free CI suite covers everything scenario 2 gates on a
+/// real model.
+///
+/// Verifies:
+/// 1. `transcript.json` is rewritten with the stub text (was emptied first).
+/// 2. At least one `AppEvent::TranscriptSegment` is emitted for the meeting.
+/// 3. The index excerpt is refreshed to the new first segment.
+#[tokio::test(flavor = "multi_thread")]
+async fn re_transcribe_with_stub_backend_rewrites_transcript_over_fixture() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+
+    // A no-model test orchestrator is sufficient: the stub backend is injected,
+    // so the registry is never consulted for an ASR model.
+    let orch = test_orchestrator(root.clone());
+    let mut event_rx = orch.subscribe_events();
+
+    // Real speech, repeated so the VAD reliably yields ≥1 segment (the same
+    // approach the gated fixture test uses).
+    let clip = load_fixture_wav();
+    let mut samples = Vec::with_capacity(clip.len() * 4);
+    for _ in 0..4 {
+        samples.extend_from_slice(&clip);
+    }
+
+    let meeting_id = build_meeting_with_audio(&root, "Stub re-transcribe", &samples);
+
+    // transcript.json starts empty.
+    let meeting_dir = root.join(meeting_id.0.to_string());
+    let before = persistence::read_transcript(&meeting_dir).expect("read transcript before");
+    assert!(before.is_empty(), "transcript.json must start empty");
+
+    // Seed an in-memory index from disk (excerpt is None while transcript empty).
+    let index = MeetingIndex::open(":memory:").await.expect("open index");
+    index
+        .rebuild_from_disk(&root)
+        .await
+        .expect("seed index from disk");
+    let seeded = index.list_meetings().await.expect("list seeded");
+    let seeded_row = seeded.iter().find(|r| r.id == meeting_id).expect("seeded row");
+    assert!(
+        seeded_row.excerpt.is_none(),
+        "index excerpt must be None before re-transcribe (transcript empty)"
+    );
+
+    // Run the offline re-transcribe with the stub backend.
+    let stub = Box::new(StubAsrBackend::new("stub transcript text"));
+    orch.re_transcribe_with_backend(&index, meeting_id, stub)
+        .await
+        .expect("re_transcribe_with_backend must succeed");
+
+    // 1. transcript.json rewritten with the stub text.
+    let rewritten = persistence::read_transcript(&meeting_dir).expect("read transcript after");
+    assert!(
+        !rewritten.is_empty(),
+        "re_transcribe must rewrite transcript.json with at least one segment"
+    );
+    assert!(
+        rewritten.iter().any(|s| s.text.contains("stub")),
+        "rewritten transcript must carry the stub text; got: {rewritten:?}"
+    );
+
+    // 2. At least one TranscriptSegment event for this meeting was emitted.
+    let mut got_event = false;
+    loop {
+        match event_rx.try_recv() {
+            Ok(AppEvent::TranscriptSegment { meeting_id: mid, segment }) => {
+                assert_eq!(mid, meeting_id, "event meeting_id must match");
+                if segment.text.contains("stub") {
+                    got_event = true;
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    assert!(
+        got_event,
+        "re_transcribe_with_backend must emit at least one AppEvent::TranscriptSegment \
+         (check the Silero VAD model at resources/silero/silero_vad_v4.onnx)"
+    );
+
+    // 3. Index excerpt refreshed to the new first segment.
+    let rows = index.list_meetings().await.expect("list after");
+    let row = rows.iter().find(|r| r.id == meeting_id).expect("indexed");
+    assert!(
+        row.excerpt.as_deref().is_some_and(|e| e.contains("stub")),
+        "index excerpt must be refreshed to the rewritten transcript; got: {:?}",
+        row.excerpt
+    );
 }

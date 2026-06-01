@@ -415,6 +415,21 @@ explicit user-triggered re-transcribe with no available model is an error
 (`AppError::ModelLoad`). The orchestrator does not own a `MeetingIndex`; the
 index handle is passed in by `ipc-bridge` (which owns it in `IpcState`).
 
+**Test seam — `re_transcribe_with_backend(&MeetingIndex, MeetingId, Box<dyn
+AsrBackend + Send>)`.** A `#[cfg(any(test, feature = "test-source"))]`-gated
+sibling of `re_transcribe`, mirroring the live path's
+`start_with_streams_and_backend`. It decodes `audio.opus` and drives the **same**
+`runner::re_transcribe_buffer` machinery (real Silero VAD + the batched-VAD
+accumulator + `transcribe_one_flush` + `write_transcript` + index `upsert`) the
+production `re_transcribe` uses, but with a caller-supplied `AsrBackend` stub
+instead of resolving a real `AsrRuntime`. Both paths share the private
+`ensure_idle_for_retranscribe` (the `Idle`-only invariant) and
+`finalise_retranscribe` (transcript rewrite + index-row refresh) helpers, so the
+only difference is segment *production*. This lets the **default** test suite
+cover the whole offline path over the committed real-speech fixture without a
+~1 GB model (see "Integration tests" below). It is compiled out of production
+builds, so the public production surface is unchanged.
+
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration
@@ -422,7 +437,15 @@ accuracy + invalid transitions) and `back_pressure` (slow subscriber
 lag and subscriber-gone survivability). Phase 2 integration test:
 `transcription_e2e` (env-var-gated end-to-end pipeline: DummyAudioSource
 → VAD → ASR → TranscriptSegment events + transcript.json on disk). Run with
-`cargo test -p orchestrator --features test-source`.
+`cargo test -p orchestrator --features test-source`. Phase 4 offline
+re-transcribe tests (`re_transcribe`): the gated
+`re_transcribe_rewrites_transcript_over_fixture` (records via the real ASR model,
+then re-transcribes) plus the **default-suite, model-free**
+`re_transcribe_with_stub_backend_rewrites_transcript_over_fixture` — it encodes
+the committed LibriSpeech fixture into `audio.opus` via the persistence Opus
+encoder, empties `transcript.json`, then runs `re_transcribe_with_backend` with a
+`StubAsrBackend` so the real Silero VAD + offline accumulator + transcript
+rewrite + index-excerpt refresh are exercised in CI without a model.
 
 ### `settings`
 **Crate:** `crates/settings`

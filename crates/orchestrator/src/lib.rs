@@ -438,16 +438,7 @@ impl Orchestrator {
     ///   available or fails to load (unlike the live path's best-effort skip, an
     ///   explicit user-triggered re-transcribe with no model is an error).
     pub async fn re_transcribe(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
-        // Refuse unless Idle — re-transcribe must not run while the live
-        // pipeline holds the ASR model.
-        {
-            let guard = self.inner.lock().await;
-            if !matches!(guard.state, InternalState::Idle) {
-                return Err(AppError::InvalidInput {
-                    context: "re_transcribe requires the recorder to be Idle".into(),
-                });
-            }
-        }
+        self.ensure_idle_for_retranscribe().await?;
 
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
@@ -491,8 +482,43 @@ impl Orchestrator {
             context: format!("re_transcribe spawn_blocking join failed: {e}"),
         })??;
 
+        self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
+            .await
+    }
+
+    /// Refuse a re-transcribe unless the recorder is `Idle`.
+    ///
+    /// Shared by [`Self::re_transcribe`] and the test-only
+    /// `re_transcribe_with_backend` so both honour the same offline-only
+    /// invariant.
+    async fn ensure_idle_for_retranscribe(&self) -> AppResult<()> {
+        let guard = self.inner.lock().await;
+        if !matches!(guard.state, InternalState::Idle) {
+            return Err(AppError::InvalidInput {
+                context: "re_transcribe requires the recorder to be Idle".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Rewrite `transcript.json` from the refreshed `segments` and refresh the
+    /// supplied index row so the meeting-list excerpt reflects the new first
+    /// segment.
+    ///
+    /// Shared by the production [`Self::re_transcribe`] and the test-only
+    /// `re_transcribe_with_backend`: both produce a `Vec<Segment>` via the same
+    /// `runner::re_transcribe_buffer` machinery, then persist + index it
+    /// identically. The blocking `std::fs` writes run on `spawn_blocking`; the
+    /// async index `upsert` is awaited (never `block_on`).
+    async fn finalise_retranscribe(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+        segments: Vec<Segment>,
+    ) -> AppResult<()> {
         // Rewrite transcript.json from the refreshed segments (blocking fs).
-        let meeting_dir_for_write = meeting_dir.clone();
+        let meeting_dir_for_write = meeting_dir.to_path_buf();
         let segments_for_write = segments.clone();
         tokio::task::spawn_blocking(move || -> AppResult<()> {
             persistence::write_transcript(&meeting_dir_for_write, &segments_for_write)
@@ -503,7 +529,7 @@ impl Orchestrator {
         })??;
 
         // Refresh the index row so the list excerpt reflects the new transcript.
-        let meeting_dir_for_meta = meeting_dir.clone();
+        let meeting_dir_for_meta = meeting_dir.to_path_buf();
         let entry: MeetingListEntry = tokio::task::spawn_blocking(move || -> AppResult<MeetingListEntry> {
             let meta = persistence::read_metadata(&meeting_dir_for_meta)?;
             let transcript = persistence::read_transcript(&meeting_dir_for_meta)?;
@@ -697,5 +723,53 @@ impl Orchestrator {
         );
 
         Ok(meeting_id)
+    }
+
+    /// Offline re-transcribe driven by a caller-supplied [`AsrBackend`] stub,
+    /// mirroring [`Self::start_with_streams_and_backend`] for the offline path.
+    ///
+    /// This is the stub-injectable seam for the offline re-transcribe pipeline:
+    /// it decodes the meeting's `audio.opus` to pause-INCLUDING PCM via
+    /// `persistence::reader::read_audio_pcm` and drives the **same**
+    /// `runner::re_transcribe_buffer` machinery the production
+    /// [`Self::re_transcribe`] uses (real Silero VAD + the batched-VAD
+    /// accumulator + `transcribe_one_flush`), but with the injected `backend`
+    /// instead of a real `AsrRuntime`. It then rewrites `transcript.json` and
+    /// refreshes the index row exactly as the production path does
+    /// ([`Self::finalise_retranscribe`]).
+    ///
+    /// This lets a DEFAULT-suite test exercise the whole offline path —
+    /// real VAD over a real-speech fixture, `transcript.json` rewrite,
+    /// `AppEvent::TranscriptSegment` emission, and index-excerpt refresh —
+    /// without a ~1 GB ASR model.
+    ///
+    /// Honours the same `Idle`-only invariant as the production path.
+    ///
+    /// Available only under the `test-source` feature.
+    pub async fn re_transcribe_with_backend(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+    ) -> AppResult<()> {
+        self.ensure_idle_for_retranscribe().await?;
+
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        let event_tx = self.event_tx.clone();
+        let meeting_dir_for_blocking = meeting_dir.clone();
+
+        let segments: Vec<Segment> = tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
+            let pcm = persistence::read_audio_pcm(&meeting_dir_for_blocking)?;
+            let mut backend = backend;
+            runner::re_transcribe_buffer(&pcm, backend.as_mut(), &event_tx, meeting_id)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("re_transcribe_with_backend spawn_blocking join failed: {e}"),
+        })??;
+
+        self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
+            .await
     }
 }

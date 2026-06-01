@@ -315,7 +315,17 @@ on `common`.
     real zero samples, so the buffer's duration equals wall-clock recording
     duration. This is what Phase 6 diarization and Phase 4 re-transcribe
     consume, and why the orchestrator sources audio through this reader so
-    `diarizer` need not depend on `persistence`.
+    `diarizer` need not depend on `persistence`. The pause-INCLUDING property is
+    covered in the **default** suite by a deterministic test
+    (`test_read_audio_pcm_includes_silent_gap_deterministic`) that drives the
+    actual pause path — `pause()` then a `#[cfg(test)]` `resume_with_pause_frames`
+    seam that runs the same `finish_resume` silent-frame synthesis as `resume()`
+    but with an injected frame count (no wall-clock sleep) — and asserts the
+    decoded buffer spans ~4 s (so the synthesised pause silence was not dropped)
+    with the injected-pause region decoding to ~zero. Because it exercises the
+    real synthesis path, a regression that stops `resume()` writing silent frames
+    fails this test (verified by mutation: the earlier draft pushed the silence
+    through the sample stream and did **not** catch that regression).
   - `read_meeting_state(meeting_dir) -> AppResult<MeetingState>` — assembles
     `meta` + `transcript` + optional `notes` (via `NotesStore::load`, mapped to
     `common::NotesDocument`; the opaque `notes.json` value is re-serialised to

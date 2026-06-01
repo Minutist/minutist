@@ -218,13 +218,19 @@ impl<W: Write> OggOpusEncoder<W> {
         let pause_samples_f = elapsed.as_secs_f64() * SAMPLE_RATE as f64;
         let pause_frames = (pause_samples_f / FRAME_SAMPLES as f64).round() as u64;
 
-        self.pause_state = PauseState::Recording;
+        self.finish_resume(pause_frames, elapsed.as_millis() as u64)
+    }
 
-        // Reset encoder state so the post-gap audio isn't contaminated by
-        // pre-pause residue.
+    /// Shared resume tail: leave the paused state, reset the encoder so post-gap
+    /// audio isn't contaminated by pre-pause residue, and synthesise
+    /// `pause_frames` zero-sample (silent) Opus frames so the decoded audio
+    /// includes the pause interval (option b). This is the single code path that
+    /// makes `read_audio_pcm` pause-INCLUDING; `resume()` drives it from the
+    /// measured wall-clock pause, the test seam from an injected frame count.
+    fn finish_resume(&mut self, pause_frames: u64, pause_ms: u64) -> Result<()> {
+        self.pause_state = PauseState::Recording;
         self.encoder.reset_state()?;
 
-        // Write silent frames to fill the pause interval.
         let silent = vec![0.0f32; FRAME_SAMPLES];
         for _ in 0..pause_frames {
             self.encode_frame(&silent)?;
@@ -232,13 +238,31 @@ impl<W: Write> OggOpusEncoder<W> {
 
         tracing::debug!(
             target: "persistence",
-            pause_ms = elapsed.as_millis(),
+            pause_ms,
             pause_frames,
             new_granule = self.granule,
             "encoder resumed; silence frames written"
         );
 
         Ok(())
+    }
+
+    /// Test-only resume that injects a deterministic `pause_frames` count rather
+    /// than measuring wall-clock, so a pause gap can be exercised without a
+    /// real sleep. It runs the **same** `finish_resume` silent-frame synthesis
+    /// `resume()` uses, so a regression that drops the pause silence fails the
+    /// test that drives this seam (unlike a test that merely pushes a silence
+    /// run through `push_samples`, which exercises only the codec).
+    #[cfg(test)]
+    pub fn resume_with_pause_frames(&mut self, pause_frames: u64) -> Result<()> {
+        match self.pause_state {
+            PauseState::Paused { .. } => {}
+            PauseState::Recording => {
+                return Err(Error::InvalidState("resume called while not paused"))
+            }
+        }
+        let pause_ms = pause_frames * (FRAME_SAMPLES as u64 * 1000 / SAMPLE_RATE as u64);
+        self.finish_resume(pause_frames, pause_ms)
     }
 
     /// Flush remaining samples as a zero-padded frame and end the Ogg stream.

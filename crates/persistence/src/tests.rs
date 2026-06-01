@@ -624,6 +624,99 @@ fn test_opus_pcm_buffer_includes_pause_samples() {
     );
 }
 
+/// Deterministic (no wall-clock sleep) proof that `read_audio_pcm` includes a
+/// silent pause gap in the decoded buffer.
+///
+/// The `#[ignore]`d `test_opus_pcm_buffer_includes_pause_samples` is the only
+/// other check that a pause gap lands in the decoded buffer, but it relies on a
+/// 1 s wall-clock sleep (so it is skipped in the fast suite); the non-ignored
+/// `test_opus_pcm_round_trip_pause_including` uses a near-zero pause and so
+/// cannot distinguish a pause-INCLUDING decoder from a pause-EXCLUDING one.
+///
+/// This test instead writes the silence span **directly into the audio stream**
+/// as a known run of zero samples (driving the encoder's frame path the same
+/// way the existing `test_pause_resume_gap_granule` test drives it, but with a
+/// known fixed gap rather than a wall-clock measurement). The layout is:
+///
+/// ```text
+/// [ 1 s speech ][ 2 s silence ][ 1 s speech ]   →  4 s total
+/// ```
+///
+/// All three spans are exact multiples of `FRAME_SAMPLES` (320), so they align
+/// to Opus frame boundaries and the decoded sample count is deterministic
+/// (modulo the single zero-padded final frame the encoder always appends). The
+/// test asserts both that the decoded length covers the full 4 s (so the silent
+/// middle was NOT dropped) and that the middle region decodes to ~zero (so it is
+/// genuinely silence, not interpolated speech).
+#[test]
+fn test_read_audio_pcm_includes_silent_gap_deterministic() {
+    let sr = SAMPLE_RATE as usize;
+    // Layout: 1 s speech, a 2 s pause INJECTED via the encoder's resume()
+    // silent-frame synthesis (NOT a silence run pushed through the sample
+    // stream), then 1 s speech. Driving pause() + resume_with_pause_frames runs
+    // the exact pause-INCLUDING path (`finish_resume`) that `resume()` uses, so
+    // a regression dropping the synthesised silence yields a ~2 s decode and
+    // fails here — the property is genuinely guarded, deterministically, with
+    // no wall-clock sleep. (Pushing a silence run through `push_samples` would
+    // only exercise the codec, not the pause mechanism.)
+    let speech_a = sine_samples(1.0); // 16_000 samples
+    let speech_b = sine_samples(1.0); // 16_000 samples
+    const PAUSE_FRAMES: u64 = 100; // 100 × FRAME_SAMPLES(320) = 32_000 = 2 s
+    let pause_samples = PAUSE_FRAMES as usize * crate::opus_encoder::FRAME_SAMPLES;
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    let mut writer = MeetingWriter::open(tempdir.path(), id, opus_format()).expect("open");
+    writer.push_samples(&speech_a).expect("pre-pause speech");
+    writer.pause().expect("pause");
+    writer
+        .resume_with_pause_frames(PAUSE_FRAMES)
+        .expect("resume with injected pause frames");
+    writer.push_samples(&speech_b).expect("post-pause speech");
+    let folder = writer.finalise(dummy_meta(id, 4_000)).expect("finalise");
+
+    let pcm = reader::read_audio_pcm(folder.path()).expect("read pcm");
+    let decoded_secs = pcm.len() as f64 / sr as f64;
+
+    // 1. The decoded buffer must span ~4 s — speech + the SYNTHESISED pause
+    //    silence. A pause-EXCLUDING decode (resume not writing silent frames)
+    //    would yield ~2 s; require within 0.2 s of 4 s to discriminate.
+    let diff = (decoded_secs - 4.0).abs();
+    assert!(
+        diff <= 0.2,
+        "decoded duration {decoded_secs:.3} s; expected ~4 s (1 s speech + 2 s injected \
+         pause silence + 1 s speech). diff {diff:.3} s — the synthesised pause silence was \
+         dropped (pause-EXCLUDING resume)."
+    );
+
+    // 2. The injected-pause region must decode to ~silence. The pause spans
+    //    roughly [speech_a.len() .. speech_a.len() + pause_samples); sample its
+    //    centre half, away from the speech/silence boundaries where lossy
+    //    ringing is largest.
+    let sil_start = speech_a.len() + pause_samples / 4;
+    let sil_end = speech_a.len() + (pause_samples * 3) / 4;
+    assert!(sil_end <= pcm.len(), "pause window must lie within the decoded buffer");
+    let max_abs = pcm[sil_start..sil_end]
+        .iter()
+        .fold(0.0f32, |m, &s| m.max(s.abs()));
+    assert!(
+        max_abs < 0.02,
+        "the injected pause region must decode to ~silence; peak amplitude {max_abs} too high \
+         (a pause-EXCLUDING decode would have placed speech_b here)"
+    );
+
+    // 3. The leading speech region must be clearly non-silent, so the test
+    //    cannot pass by decoding all-zero audio.
+    let speech_peak = pcm[..speech_a.len() / 2]
+        .iter()
+        .fold(0.0f32, |m, &s| m.max(s.abs()));
+    assert!(
+        speech_peak > 0.1,
+        "leading speech region must be non-silent (peak {speech_peak}); the encoder \
+         may not have produced audio"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 11/12/13: reader round-trips
 // ---------------------------------------------------------------------------

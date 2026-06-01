@@ -91,6 +91,16 @@ impl MeetingWriter {
         self.encoder_mut()?.resume().map_err(Into::into)
     }
 
+    /// Test-only resume injecting a deterministic pause-frame count (no
+    /// wall-clock), delegating to the encoder's `resume_with_pause_frames` so
+    /// the pause-INCLUDING silent-frame synthesis is exercised deterministically.
+    #[cfg(test)]
+    pub fn resume_with_pause_frames(&mut self, pause_frames: u64) -> AppResult<()> {
+        self.encoder_mut()?
+            .resume_with_pause_frames(pause_frames)
+            .map_err(Into::into)
+    }
+
     /// Append a transcript segment to the buffer and flush to `transcript.json`.
     ///
     /// Each call is durable: the segment is buffered then immediately written

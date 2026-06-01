@@ -15,6 +15,9 @@
  *     autosave can persist `notes.md` and copy can include a markdown view.
  *   - ParagraphAnchor — stamps `data-anchor-ms` on first keystroke while
  *     recording (see ./paragraph-anchor).
+ *   - AnchorMarginalia — presentation-only decoration that renders each
+ *     anchored paragraph's timestamp as quiet left-margin marginalia
+ *     (see ./anchor-marginalia); adds no attrs and dispatches no transactions.
  */
 import StarterKit from "@tiptap/starter-kit";
 import { Link } from "@tiptap/extension-link";
@@ -27,6 +30,7 @@ import { Markdown } from "tiptap-markdown";
 import type { Extensions } from "@tiptap/core";
 import { ParagraphAnchor } from "./paragraph-anchor";
 import type { AnchorClockSource } from "./paragraph-anchor";
+import { AnchorMarginalia } from "./anchor-marginalia";
 
 export type BuildExtensionsOptions = {
   /** Supplies the recording state + pause-excluding clock to ParagraphAnchor. */
@@ -63,5 +67,9 @@ export function buildEditorExtensions(
       transformPastedText: true,
     }),
     ParagraphAnchor.configure({ clockSource: options.clockSource }),
+    // Presentation-only: renders anchor timestamps as left-margin marginalia.
+    // Adds no node attrs and dispatches no transactions, so it cannot affect
+    // ParagraphAnchor's stamping logic.
+    AnchorMarginalia,
   ];
 }

@@ -13,9 +13,12 @@
  * `architecture/cross-cutting.md` — Filesystem layout); `ipc-bridge` exposes
  * the two commands, routing them directly to `persistence::NotesStore`.
  */
-import { commands } from "./bindings";
+// Route through `./client` (not `./bindings` directly) so the DEV shim's single
+// injection point also covers notes load/save. Importing the raw generated
+// `commands` from `./bindings` would bypass the shim, so a `vite dev` browser
+// with no Tauri backend hits an undefined `invoke` and the editor can't seed.
+import { commands, unwrap } from "./client";
 import type { NotesDoc as GeneratedNotesDoc } from "./bindings";
-import { unwrap } from "./client";
 
 /** A persisted notes document as returned by `load_notes`. */
 export type NotesDoc = GeneratedNotesDoc;

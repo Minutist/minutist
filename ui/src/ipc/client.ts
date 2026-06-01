@@ -5,16 +5,73 @@
  * that any future shim (mock in tests, offline-mode stub) has a single
  * injection point.
  */
-import { events, commands } from "./bindings";
+import { events, commands as generatedCommands } from "./bindings";
 import type {
   AppEventPayload,
   IpcError,
   Result,
 } from "./bindings";
 import type { AppEvent } from "./app-event";
+import { shouldUseDevShim } from "./dev-shim-guard";
 
-// Re-export the generated commands surface verbatim.
-export { commands };
+/**
+ * The commands surface consumers import.
+ *
+ * In a `vite dev` browser with no Tauri backend the DEV-only shim
+ * ({@link shouldUseDevShim}) supplies sample data so the themed UI renders for
+ * visual QA. Every method delegates through {@link callCommand}, which lazily
+ * `import()`s the shim ONLY in that mode — so the shim module (with all its
+ * sample data) is loaded as a separate dynamic chunk that the real app and the
+ * production build never fetch, and the main bundle stays free of sample data.
+ *
+ * `shouldUseDevShim()` is evaluated per call (cheap) so behaviour matches the
+ * actual runtime; the dynamic import is memoised after the first DEV call.
+ */
+type Commands = typeof generatedCommands;
+type CommandName = keyof Commands;
+
+let devCommandsPromise: Promise<Commands> | null = null;
+async function loadDevCommands(): Promise<Commands> {
+  if (!devCommandsPromise) {
+    devCommandsPromise = import("./dev-shim").then(
+      (m) => m.devCommands as unknown as Commands,
+    );
+  }
+  return devCommandsPromise;
+}
+
+async function callCommand<K extends CommandName>(
+  name: K,
+  args: Parameters<Commands[K]>,
+): Promise<Awaited<ReturnType<Commands[K]>>> {
+  type Out = Awaited<ReturnType<Commands[K]>>;
+  if (import.meta.env.DEV && shouldUseDevShim()) {
+    const dev = await loadDevCommands();
+    return (await (dev[name] as (...a: unknown[]) => Promise<Out>)(
+      ...args,
+    )) as Out;
+  }
+  return (await (generatedCommands[name] as (...a: unknown[]) => Promise<Out>)(
+    ...args,
+  )) as Out;
+}
+
+/** Delegating commands surface; see {@link callCommand}. */
+export const commands: Commands = {
+  listDevices: () => callCommand("listDevices", []),
+  startRecording: (deviceId) => callCommand("startRecording", [deviceId]),
+  pauseRecording: () => callCommand("pauseRecording", []),
+  resumeRecording: () => callCommand("resumeRecording", []),
+  stopRecording: () => callCommand("stopRecording", []),
+  getRecordingState: () => callCommand("getRecordingState", []),
+  getSettings: () => callCommand("getSettings", []),
+  updateSettings: (settings) => callCommand("updateSettings", [settings]),
+  listModels: () => callCommand("listModels", []),
+  ensureModel: (modelId) => callCommand("ensureModel", [modelId]),
+  saveNotes: (meetingId, notesJson, notesMarkdown) =>
+    callCommand("saveNotes", [meetingId, notesJson, notesMarkdown]),
+  loadNotes: (meetingId) => callCommand("loadNotes", [meetingId]),
+};
 
 // Re-export types that callers commonly need. `AppEvent` is the generated
 // event union (re-exported via `./app-event`, which is the webview's single
@@ -42,6 +99,14 @@ export type { AppEventPayload, AppEvent, IpcError, Result };
 export async function listenAppEvents(
   callback: (event: AppEvent) => void,
 ): Promise<() => void> {
+  // DEV-only: with no Tauri backend, drive a representative sample event stream
+  // (recording state + transcript + live meter/clock) so the UI populates. The
+  // shim is loaded via a dynamic `import()` only in this mode, so production
+  // never bundles or fetches it.
+  if (import.meta.env.DEV && shouldUseDevShim()) {
+    const { startDevEventStream } = await import("./dev-shim");
+    return startDevEventStream(callback);
+  }
   return events.appEventPayload.listen((tauriEvent) => {
     callback(tauriEvent.payload);
   });

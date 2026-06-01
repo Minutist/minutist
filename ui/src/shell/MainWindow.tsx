@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
@@ -6,6 +6,7 @@ import { DevicePicker } from "./DevicePicker";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
+import { RecordingStatus } from "./RecordingStatus";
 import { Editor } from "../editor/Editor";
 import { TranscriptPane } from "../transcript/TranscriptPane";
 import "./MainWindow.css";
@@ -60,9 +61,28 @@ export function MainWindow() {
 
   return (
     <div className="main-window">
-      <header className="main-window__header">
-        <div className="main-window__title-row">
-          <h1>meeting-app</h1>
+      {/*
+        Top bar — calm, hairline-ruled. Left: wordmark. Centre/focal:
+        recording status (oxblood dot + elapsed clock). Right: grouped
+        transport, audio meter, and device affordance. The most-used action
+        (Record/Stop) is the strongest control in MeetingControls; Pause is
+        quieter.
+      */}
+      <header className="main-window__topbar ink-reveal">
+        <div className="main-window__brand">
+          <span className="main-window__wordmark">meeting-app</span>
+        </div>
+
+        <div className="main-window__status">
+          <RecordingStatus />
+        </div>
+
+        <div className="main-window__controls">
+          <MeetingControls />
+          <div className="main-window__meter" aria-label="Audio level">
+            <AudioMeter />
+          </div>
+          <DevicePicker />
           <button
             type="button"
             className="main-window__toggle-transcript"
@@ -72,27 +92,23 @@ export function MainWindow() {
             {transcriptCollapsed ? "Show transcript" : "Hide transcript"}
           </button>
         </div>
+      </header>
 
+      {/*
+        Restrained chrome strip below the bar: first-run model download status
+        (self-hides once the ASR model is ready) + recoverable errors. Empty
+        in the steady state so it does not compete with the writing surface.
+      */}
+      <div className="main-window__chrome">
         <ModelDownloadStatus />
-
-        <div className="main-window__controls">
-          <DevicePicker />
-          <MeetingControls />
-        </div>
-
-        <section className="main-window__meter">
-          <label>Audio level</label>
-          <AudioMeter />
-        </section>
-
         {lastError && (
           <div className="main-window__error" role="alert">
             {lastError}
           </div>
         )}
-      </header>
+      </div>
 
-      <Group orientation="horizontal" className="main-window__panes">
+      <Group orientation="horizontal" className="main-window__panes ink-reveal">
         <Panel
           id="notes"
           className="main-window__pane main-window__pane--notes"
@@ -101,7 +117,9 @@ export function MainWindow() {
           <Editor />
         </Panel>
 
-        <Separator className="main-window__resize-handle" />
+        <Separator className="main-window__resize-handle">
+          <span className="main-window__resize-grip" aria-hidden="true" />
+        </Separator>
 
         <Panel
           id="transcript"

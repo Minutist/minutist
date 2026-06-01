@@ -1,0 +1,79 @@
+/*
+ * Editorial Ink — design tokens (single source of truth).
+ *
+ * A warm-paper, literary, document-centric LIGHT theme. The notes surface
+ * reads like writing on a fine sheet of paper on a warm desk; one oxblood ink
+ * accent is used sparingly (rec dot, links, active state, focus, selection);
+ * a characterful serif display (Fraunces) sits above a reading serif
+ * (Newsreader) that also drives the UI chrome.
+ *
+ * Imported once, globally, from `main.tsx` ahead of every component stylesheet.
+ * Component CSS references these variables only — no hard-coded colours,
+ * radii, or shadows live in component files.
+ */
+
+:root {
+  /* --- Surfaces --------------------------------------------------------- */
+  --bg: #f4f0e7; /* warm desk (app field) */
+  --sheet: #fcfaf4; /* notes paper — brightest reading surface */
+  --sheet-quiet: #f7f3eb; /* transcript column — slightly recessed */
+
+  /* --- Ink / text ------------------------------------------------------- */
+  --ink: #1c1a17; /* primary text */
+  --ink-soft: #423d35; /* secondary text */
+  --stone: #6f685c; /* muted meta: timestamps, placeholders, labels.
+                       Darkened from the brief's #8b8378 to clear 4.5:1
+                       on --sheet for body-level meta; see header note. */
+  --stone-faint: #8b8378; /* decorative-only stone (never load-bearing text) */
+
+  /* --- Accent (oxblood) ------------------------------------------------- */
+  --accent: #7a2e2e; /* sparing: rec dot, links, active, focus, selection */
+  --accent-rgb: 122, 46, 46; /* oxblood channels for rgba() composition */
+  --accent-soft: #9e4a43; /* hover */
+  --accent-tint: rgba(122, 46, 46, 0.14); /* ::selection wash */
+
+  /* --- Rules / dividers ------------------------------------------------- */
+  --rule: #e4dccd; /* warm hairline dividers */
+  --rule-strong: #d8cdb8;
+
+  /* --- Elevation -------------------------------------------------------- */
+  --shadow-sheet: 0 1px 2px rgba(28, 26, 23, 0.04),
+    0 8px 24px rgba(28, 26, 23, 0.06); /* page lift */
+
+  /* --- Geometry --------------------------------------------------------- */
+  --radius: 4px; /* restrained; this is paper, not bubbles */
+
+  /* --- Type ------------------------------------------------------------- */
+  --font-display: "Fraunces Variable", Georgia, "Times New Roman", serif;
+  --font-text: "Newsreader Variable", Georgia, "Times New Roman", serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Code", monospace;
+
+  /* Reading column measure (notes sheet). */
+  --reading-measure: 70ch;
+
+  /* Motion timing for the orchestrated load reveal + hovers. */
+  --reveal-duration: 520ms;
+  --reveal-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/*
+ * Optional dark token block — trivial overrides only. The product is
+ * light-first; this exists so a future `data-theme="dark"` toggle has a
+ * starting point without re-plumbing component CSS. Not wired to any control
+ * yet (the brief asked for a light theme).
+ */
+:root[data-theme="dark"] {
+  --bg: #16140f;
+  --sheet: #211e18;
+  --sheet-quiet: #1b1813;
+  --ink: #ece6d8;
+  --ink-soft: #c5bdac;
+  --stone: #9b9486;
+  --stone-faint: #7d7669;
+  --accent: #c06a5f;
+  --accent-soft: #d68a80;
+  --accent-tint: rgba(192, 106, 95, 0.18);
+  --rule: #322d24;
+  --rule-strong: #423b2f;
+  --shadow-sheet: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.4);
+}

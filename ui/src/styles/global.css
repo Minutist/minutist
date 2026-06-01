@@ -1,0 +1,107 @@
+/*
+ * Editorial Ink — global base layer.
+ *
+ * Imported once from `main.tsx` after `theme.css` and the two Fontsource
+ * stylesheets. Sets the warm-desk field, the reading-serif default, the
+ * oxblood selection / focus treatment, and the orchestrated load-reveal
+ * keyframes used by the top bar and panes.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-text);
+  font-size: 14px;
+  line-height: 1.5;
+  /* Crisper serif rendering on the warm field. */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Oxblood selection wash everywhere. */
+::selection {
+  background: var(--accent-tint);
+  color: var(--ink);
+}
+
+/* Oxblood focus ring on keyboard navigation only. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+
+/* Quiet, warm scrollbars so they recede into the paper. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--rule-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--stone-faint);
+  background-clip: padding-box;
+}
+
+/* Tabular figures helper for timestamps / elapsed clocks. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* --- Orchestrated load reveal ------------------------------------------ */
+/*
+ * A single calm entrance: chrome and panes fade + rise into place with a
+ * small stagger via per-element `animation-delay`. Respects reduced motion.
+ */
+@keyframes ink-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.ink-reveal {
+  opacity: 0;
+  animation: ink-rise var(--reveal-duration) var(--reveal-ease) forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ink-reveal {
+    /* Show immediately; no translate/fade. */
+    opacity: 1;
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

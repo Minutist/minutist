@@ -489,6 +489,49 @@ left, transcript right).
   collapsed to a verbatim re-export of the generated `AppEvent` union (the local
   `recording_clock` augmentation is redundant now that the variant is generated).
 
+### Design system — "Editorial Ink" (light theme)
+
+A warm-paper, document-centric **light** theme applied across the webview.
+
+- **Token source.** `ui/src/styles/theme.css` is the single source of truth for
+  all colour / radius / shadow / type tokens (CSS custom properties). Component
+  CSS references these variables only — no hard-coded colour/radius/shadow
+  literals. `ui/src/styles/global.css` holds the base layer (warm-desk field,
+  oxblood `::selection` + focus-visible ring, the orchestrated load-reveal
+  keyframes). Both are imported once from `ui/src/main.tsx`. The accent is a
+  single oxblood ink used sparingly (recording dot, links, active/primary
+  control, focus, selection); `--stone` is darkened from the brief's value to
+  clear 4.5:1 on the paper surface for body-level meta.
+- **Fonts (local-first, no CDN).** Bundled via Fontsource:
+  `@fontsource-variable/fraunces` (display — app wordmark + editor headings, via
+  its `full` axis CSS exposing opsz/wght/SOFT/WONK) and
+  `@fontsource-variable/newsreader` (reading body + UI chrome). Italic faces of
+  both back blockquotes / emphasis. These are the only two UI font families;
+  woff2 files ship as build assets so the app renders offline.
+- **Two-pane sheet/transcript treatment.** The notes editor (`ui/src/editor/`)
+  renders as a centered reading column on a `--sheet` page that lifts off the
+  field with `--shadow-sheet` + a hairline edge. The transcript pane
+  (`ui/src/transcript/`) is the quiet, recessed `--sheet-quiet` secondary
+  column. The collapsible + resizable `react-resizable-panels` structure,
+  panel `id`s (`notes` / `transcript`), and the transcript collapse toggle are
+  unchanged. The top bar (`ui/src/shell/`) is calm and hairline-ruled: wordmark
+  left, recording status focal (oxblood dot, gentle pulse only while recording,
+  plus a tabular elapsed clock in `RecordingStatus.tsx`), grouped transport +
+  slim meter + device affordance right.
+- **Margin-anchor marginalia.** `ui/src/editor/anchor-marginalia.ts` is a
+  **presentation-only** ProseMirror decoration extension: it renders each
+  anchored paragraph's `data-anchor-ms` value as a quiet timestamp in the sheet's
+  left-margin gutter (editorial side-note). It adds no node attributes and
+  dispatches no transactions, so it cannot interfere with `ParagraphAnchor`'s
+  stamping logic and never shifts the text column.
+- **Dev render shim (DEV-only).** `ui/src/ipc/dev-shim.ts` (sample data) +
+  `ui/src/ipc/dev-shim-guard.ts` (`shouldUseDevShim`) let the full app render
+  under `vite dev` in a plain browser with no Tauri backend, for visual QA. The
+  guard activates only when `import.meta.env.DEV` is true, the runner is not
+  Vitest (`MODE !== "test"`), and the Tauri global is absent. `ui/src/ipc/client.ts`
+  reaches the shim exclusively through a dynamic `import()`, so the production
+  build never bundles or fetches it (the chunk is dead-code-eliminated).
+
 ## What lives where — quick reference
 
 - **Editing audio capture buffer size:** `audio-capture` crate.

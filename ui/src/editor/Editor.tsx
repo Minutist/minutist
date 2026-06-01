@@ -20,6 +20,8 @@ import { useRecordingStore } from "../state/recording";
 import { buildEditorExtensions } from "./extensions";
 import { useAutosave } from "./useAutosave";
 import { buildClipboardPayload } from "./clipboard";
+import { shouldUseDevShim } from "../ipc/dev-shim-guard";
+import { loadNotes } from "../ipc/notes";
 import "./Editor.css";
 
 /**
@@ -86,6 +88,27 @@ export function Editor() {
     },
   });
 
+  // DEV-only: in a plain `vite dev` browser (no Tauri backend) seed the editor
+  // with sample notes so the themed sheet renders populated for visual QA. The
+  // shim's `loadNotes` returns a heading + paragraphs incl. an anchored one, so
+  // the left-margin timestamp marginalia shows. No-op in production and tests
+  // (the guard is false, and tests mock `../ipc/notes`).
+  useEffect(() => {
+    if (!editor || !import.meta.env.DEV || !shouldUseDevShim()) return;
+    let cancelled = false;
+    void loadNotes("dev-meeting-0001").then((doc) => {
+      if (cancelled || !doc) return;
+      try {
+        editor.commands.setContent(JSON.parse(doc.notes_json));
+      } catch {
+        /* malformed seed — leave the editor empty */
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [editor]);
+
   // Flush on blur so notes are persisted the instant focus leaves the editor.
   const flushRef = useRef(flush);
   flushRef.current = flush;
@@ -100,7 +123,16 @@ export function Editor() {
 
   return (
     <div className="notes-editor">
-      <EditorContent editor={editor} />
+      {/*
+        The scroll field is the warm desk; the inner `__sheet` is the page —
+        a centered reading column with a page lift + hairline edge so the notes
+        read like writing on a fine sheet of paper.
+      */}
+      <div className="notes-editor__field">
+        <div className="notes-editor__sheet">
+          <EditorContent editor={editor} />
+        </div>
+      </div>
     </div>
   );
 }

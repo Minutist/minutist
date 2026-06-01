@@ -2,10 +2,12 @@
  * Unit tests for TranscriptPane.
  *
  * Verifies empty-state copy and per-row rendering with correct MM:SS.cc
- * timestamp prefixes.
+ * timestamp prefixes, plus the Phase-4 cross-reference interactions:
+ * highlight range (FR-22), click-to-scroll (FR-23), drag source (FR-24), and
+ * the active-transcript saved-meeting branch.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { act } from "react";
 
 // ---------------------------------------------------------------------------
@@ -26,6 +28,10 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 
 import { TranscriptPane, formatTimestamp } from "../transcript/TranscriptPane";
 import { useRecordingStore } from "../state/recording";
+import { useCrossRefStore } from "../state/cross-ref";
+import { useMeetingsStore } from "../state/meetings";
+import { TRANSCRIPT_SEGMENT_MIME } from "../editor/transcript-dnd";
+import type { MeetingState } from "../state/meetings";
 import type { Segment } from "../ipc/bindings";
 
 // ---------------------------------------------------------------------------
@@ -114,5 +120,205 @@ describe("TranscriptPane", () => {
     expect(
       screen.queryByText("Transcript will appear here while you record."),
     ).not.toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-reference interactions (FR-22 / FR-23 / FR-24)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a minimal stand-in `DataTransfer` for a synthetic dragstart. jsdom does
+ * not construct a real `DataTransfer`, so we record `setData` calls and expose
+ * the written entries for assertions on the payload shape.
+ */
+function makeDataTransfer(): DataTransfer & { store: Map<string, string> } {
+  const store = new Map<string, string>();
+  return {
+    store,
+    setData: (type: string, value: string) => {
+      store.set(type, value);
+    },
+    getData: (type: string) => store.get(type) ?? "",
+    effectAllowed: "none",
+  } as unknown as DataTransfer & { store: Map<string, string> };
+}
+
+describe("TranscriptPane cross-reference interactions", () => {
+  const SEGMENTS: Segment[] = [
+    makeSegment(0, "first"),
+    makeSegment(5_000, "second"),
+    makeSegment(10_000, "third"),
+    makeSegment(15_000, "fourth"),
+  ];
+
+  beforeEach(() => {
+    act(() => {
+      useRecordingStore.setState({
+        state: { kind: "idle" },
+        transcript: SEGMENTS,
+      });
+      useCrossRefStore.setState({ highlightedRange: null, scrollRequest: null });
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    act(() => {
+      useCrossRefStore.setState({ highlightedRange: null, scrollRequest: null });
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+    });
+  });
+
+  // FR-22 --------------------------------------------------------------------
+
+  it("highlights exactly the rows in highlightedRange [startIndex, endIndex) and no others", () => {
+    act(() => {
+      // Half-open [1, 3): rows at index 1 and 2 only.
+      useCrossRefStore.setState({
+        highlightedRange: { startIndex: 1, endIndex: 3 },
+      });
+    });
+    render(<TranscriptPane />);
+
+    const rows = screen.getAllByRole("listitem");
+    expect(rows).toHaveLength(4);
+
+    // Index 0: outside the range — not highlighted.
+    expect(rows[0]).not.toHaveClass("transcript-pane__row--highlighted");
+    expect(rows[0]).not.toHaveAttribute("aria-current");
+    // Index 1, 2: inside the range — highlighted + aria-current.
+    expect(rows[1]).toHaveClass("transcript-pane__row--highlighted");
+    expect(rows[1]).toHaveAttribute("aria-current", "true");
+    expect(rows[2]).toHaveClass("transcript-pane__row--highlighted");
+    expect(rows[2]).toHaveAttribute("aria-current", "true");
+    // Index 3 == endIndex (exclusive) — not highlighted.
+    expect(rows[3]).not.toHaveClass("transcript-pane__row--highlighted");
+    expect(rows[3]).not.toHaveAttribute("aria-current");
+  });
+
+  it("highlights no rows when highlightedRange is null", () => {
+    act(() => {
+      useCrossRefStore.setState({ highlightedRange: null });
+    });
+    render(<TranscriptPane />);
+
+    for (const row of screen.getAllByRole("listitem")) {
+      expect(row).not.toHaveClass("transcript-pane__row--highlighted");
+      expect(row).not.toHaveAttribute("aria-current");
+    }
+  });
+
+  // FR-23 --------------------------------------------------------------------
+
+  it("publishes a scroll request with the clicked segment's start_ms on row click", () => {
+    render(<TranscriptPane />);
+
+    expect(useCrossRefStore.getState().scrollRequest).toBeNull();
+
+    // Click the third row (index 2 → start_ms 10_000).
+    const rows = screen.getAllByRole("listitem");
+    act(() => {
+      fireEvent.click(rows[2]);
+    });
+
+    const req = useCrossRefStore.getState().scrollRequest;
+    expect(req).not.toBeNull();
+    expect(req?.anchorMs).toBe(10_000);
+
+    // A second click on a different row re-triggers with a fresh nonce so the
+    // editor scroll effect fires again.
+    const firstNonce = req?.nonce ?? 0;
+    act(() => {
+      fireEvent.click(rows[0]);
+    });
+    const req2 = useCrossRefStore.getState().scrollRequest;
+    expect(req2?.anchorMs).toBe(0);
+    expect(req2?.nonce).toBe(firstNonce + 1);
+  });
+
+  // FR-24 --------------------------------------------------------------------
+
+  it("writes the dragged segment payload onto dataTransfer on dragstart", () => {
+    const speakerSegment: Segment = {
+      start_ms: 5_000,
+      end_ms: 6_000,
+      text: "second",
+      speaker_id: "spk_2",
+      words: [],
+    };
+    act(() => {
+      useRecordingStore.setState({
+        transcript: [makeSegment(0, "first"), speakerSegment],
+      });
+    });
+    render(<TranscriptPane />);
+
+    const rows = screen.getAllByRole("listitem");
+    const dataTransfer = makeDataTransfer();
+    fireEvent.dragStart(rows[1], { dataTransfer });
+
+    // The private MIME type carries the JSON payload in the documented shape.
+    const raw = dataTransfer.store.get(TRANSCRIPT_SEGMENT_MIME);
+    expect(raw).toBeDefined();
+    const payload = JSON.parse(raw as string);
+    expect(payload).toEqual({
+      startMs: 5_000,
+      endMs: 6_000,
+      speakerId: "spk_2",
+      text: "second",
+    });
+
+    // A text/plain fallback carries the bare text; effectAllowed is "copy".
+    expect(dataTransfer.store.get("text/plain")).toBe("second");
+    expect(dataTransfer.effectAllowed).toBe("copy");
+  });
+
+  it("writes speakerId null when the dragged segment has no speaker_id", () => {
+    render(<TranscriptPane />);
+    const rows = screen.getAllByRole("listitem");
+    const dataTransfer = makeDataTransfer();
+    fireEvent.dragStart(rows[0], { dataTransfer });
+
+    const payload = JSON.parse(
+      dataTransfer.store.get(TRANSCRIPT_SEGMENT_MIME) as string,
+    );
+    expect(payload.speakerId).toBeNull();
+    expect(payload.text).toBe("first");
+  });
+
+  // Saved-meeting branch -----------------------------------------------------
+
+  it("renders the restored saved-meeting transcript when a meeting is open + idle", () => {
+    const restored: Segment[] = [
+      makeSegment(1_000, "restored alpha"),
+      makeSegment(2_000, "restored beta"),
+    ];
+    const restoredState = {
+      transcript: restored,
+    } as unknown as MeetingState;
+
+    act(() => {
+      // Live store holds DIFFERENT segments — proving the pane reads the saved
+      // source, not the live one, while a meeting is open and idle.
+      useRecordingStore.setState({
+        state: { kind: "idle" },
+        transcript: [makeSegment(99_000, "live should not show")],
+      });
+      useMeetingsStore.setState({
+        openMeetingId: "saved-0001",
+        openMeetingState: restoredState,
+      });
+    });
+
+    render(<TranscriptPane />);
+
+    expect(screen.getByText("restored alpha")).toBeInTheDocument();
+    expect(screen.getByText("restored beta")).toBeInTheDocument();
+    expect(
+      screen.queryByText("live should not show"),
+    ).not.toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
   });
 });

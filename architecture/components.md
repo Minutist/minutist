@@ -721,7 +721,10 @@ left, transcript right).
   Audio restore is **not** wired this phase: a saved meeting opens with its notes
   + transcript + working cross-reference, but a full audio player (and the
   pause-offset seek map from `cross-cutting.md` "Notes paragraph-anchor clock")
-  is deferred to a later phase.
+  is deferred to a later phase. Test coverage: `TranscriptPane`'s cross-reference
+  interactions (FR-22 highlight range, FR-23 click-to-scroll, FR-24 drag-source
+  payload) and the `active-transcript.ts` recording-takes-precedence branch are
+  under test (`ui/src/__tests__/TranscriptPane.test.tsx`, `ActiveTranscript.test.ts`).
 - **Transcript-chip node + DnD (`ui/src/editor/transcript-chip.ts` +
   `transcript-dnd.ts`, FR-24/25).** `TranscriptChip` is a first-class atom block
   node carrying `startMs` / `endMs` / `speakerId` / `text`, registered in

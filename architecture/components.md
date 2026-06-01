@@ -61,8 +61,19 @@ update in the same commit.
 `WordTimestamp`, `MeetingMeta`, `ModelDescriptor`, `RecordingState`,
 `AppEvent`, `AudioDevice`, `AudioMeterFrame`, `AudioFormat`,
 `ModelKind`, `ModelManifestEntry`, `ModelFileEntry`, `ModelStatusState`,
-`ModelStatus`), trait definitions (`AsrBackend`, `Diarizer`,
+`ModelStatus`, `MeetingListEntry`, `NotesDocument`, `MeetingState`),
+trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
+
+**Phase 4 precursors.** `MeetingListEntry` (meeting-list row, FR-33),
+`NotesDocument { notes_json, notes_markdown }` (the canonical wire-facing
+notes carrier — `String` fields because `serde_json::Value` has no
+`specta::Type`; `ipc-bridge`'s local `NotesDoc` collapses into this), and
+`MeetingState { meta, transcript, notes }` (the `open_meeting` restore
+payload). Re-transcribe reuses `AppEvent::TranscriptSegment` — no new event.
+The local index uses **libsql** (`default-features=false, features=["core"]`;
+Gate-A-confirmed building on Linux + Windows MSVC); `index.db` is a derived
+cache rebuildable from the per-meeting folders.
 
 **Stable surface — locked.** The trait signatures and event variants in
 this crate are the architectural contract that sub-agents implement

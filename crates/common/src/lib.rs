@@ -259,6 +259,52 @@ pub struct ModelDescriptor {
 }
 
 // ---------------------------------------------------------------------------
+// Meeting-list + restore types (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// A summary row for the meeting-list view (FR-33). Cheap to query from the
+/// `persistence` index without loading a meeting's full transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct MeetingListEntry {
+    pub id: MeetingId,
+    pub title: String,
+    /// RFC3339 start timestamp (wall-clock), mirroring `MeetingMeta::started_at`.
+    pub started_at: String,
+    pub duration_ms: u64,
+    pub speaker_count: u32,
+    /// Short transcript excerpt for the list preview, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+}
+
+/// The notes document as it crosses the IPC boundary.
+///
+/// `notes_json` is the Tiptap document serialised to a JSON **string** —
+/// `serde_json::Value` does not derive `specta::Type`, so the opaque document
+/// rides the wire as a string and the webview owns its (de)serialisation.
+/// `persistence` stores it verbatim (the transcript-chip opacity guarantee).
+/// This is the canonical wire-facing notes carrier; `ipc-bridge` re-uses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct NotesDocument {
+    pub notes_json: String,
+    pub notes_markdown: String,
+}
+
+/// The full restorable state of a meeting, assembled by `persistence` for
+/// `open_meeting`: metadata, transcript segments, and the notes document
+/// (absent when the meeting has no saved notes yet).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct MeetingState {
+    pub meta: MeetingMeta,
+    pub transcript: Vec<Segment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<NotesDocument>,
+}
+
+// ---------------------------------------------------------------------------
 // Recording state
 // ---------------------------------------------------------------------------
 
@@ -663,5 +709,73 @@ mod tests {
         assert_eq!(back.audio_format.sample_rate, 16_000);
         assert_eq!(back.audio_format.channels, 1);
         assert_eq!(back.audio_format.bitrate_kbps, Some(32));
+    }
+
+    #[test]
+    fn meeting_list_entry_round_trips_and_omits_absent_excerpt() {
+        let e = MeetingListEntry {
+            id: MeetingId::new(),
+            title: "Launch sync".to_string(),
+            started_at: "2026-06-02T09:58:00Z".to_string(),
+            duration_ms: 1_800_000,
+            speaker_count: 2,
+            excerpt: None,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("excerpt"), "absent excerpt must be omitted");
+        let back: MeetingListEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn meeting_state_round_trips_with_and_without_notes() {
+        let meta = MeetingMeta {
+            uuid: MeetingId::new(),
+            title: "Sample".to_string(),
+            started_at: "2026-06-02T10:00:00Z".to_string(),
+            ended_at: Some("2026-06-02T10:30:00Z".to_string()),
+            duration_ms: 1_800_000,
+            speaker_count: 1,
+            audio_format: AudioFormat {
+                codec: "opus".to_string(),
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate_kbps: Some(32),
+            },
+            asr_model: None,
+            llm_model: None,
+            diarizer: None,
+            app_version: "0.0.0".to_string(),
+        };
+        let segment = Segment {
+            start_ms: 100,
+            end_ms: 2_000,
+            text: "hello world".to_string(),
+            speaker_id: None,
+            confidence: None,
+            words: Vec::new(),
+        };
+        let with_notes = MeetingState {
+            meta: meta.clone(),
+            transcript: vec![segment.clone()],
+            notes: Some(NotesDocument {
+                notes_json: "{\"type\":\"doc\"}".to_string(),
+                notes_markdown: "# Notes".to_string(),
+            }),
+        };
+        let json = serde_json::to_string(&with_notes).unwrap();
+        let back: MeetingState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.transcript.len(), 1);
+        assert_eq!(back.notes.as_ref().unwrap().notes_markdown, "# Notes");
+
+        let without_notes = MeetingState {
+            meta,
+            transcript: vec![segment],
+            notes: None,
+        };
+        let json = serde_json::to_string(&without_notes).unwrap();
+        assert!(!json.contains("notes"), "absent notes must be omitted");
+        let back: MeetingState = serde_json::from_str(&json).unwrap();
+        assert!(back.notes.is_none());
     }
 }

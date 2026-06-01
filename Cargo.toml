@@ -85,3 +85,14 @@ futures-util = "0.3"
 # `vad-chunker` uses crossbeam-channel for the bounded VAD worker channel
 # (matches the Phase 0 Spike 3 pattern).
 crossbeam-channel = "0.5"
+
+# Phase 4 additions
+# libsql (Turso) as the local meeting index, used by `persistence`.
+# default-features=false + "core" gives the embedded local database WITHOUT the
+# replication / remote / HTTP stack we do not use in v1. Gate-A spike confirmed
+# it builds AND runs on Linux and Windows MSVC (libsql-ffi compiles the C
+# amalgamation via cc + bindgen; LIBCLANG_PATH is already required for the
+# llama-cpp bindgen build). Honours the locked choice of libsql; the index
+# is a derived cache, rebuildable from the per-meeting folders on disk (see
+# cross-cutting.md — Filesystem layout).
+libsql = { version = "0.9.30", default-features = false, features = ["core"] }

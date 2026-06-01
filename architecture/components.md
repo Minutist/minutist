@@ -71,6 +71,13 @@ require an architecture-owner decision plus an update to this document
 in the same commit. See [`agent-dispatch.md`](agent-dispatch.md) —
 "Prerequisites for parallel dispatch".
 
+**Phase 3 precursor — `AppEvent::RecordingClock { meeting_id, clock_ms }`.**
+Additive variant carrying the live capture-sample, pause-*excluding*
+recording offset (same timeline as `Segment::start_ms`), emitted throttled
+(~5 Hz) by the orchestrator runner. The notes editor stamps paragraph
+anchors from this, not from wall-clock `Date.now() - started_at_ms`. See
+[`cross-cutting.md`](cross-cutting.md) — "Notes paragraph-anchor clock".
+
 **`specta` feature.** All IPC-crossing types derive `specta::Type` behind
 the optional `specta` feature. `ipc-bridge` enables the feature on this
 crate (and on `settings`) so the generated TypeScript bindings consume

@@ -137,6 +137,27 @@ Alternative strategies (pad-to-30s-per-call, post-filter hallucinated
 tail) are documented in Spike 1's README as fallbacks if batched-VAD's
 latency profile is unacceptable.
 
+## Notes paragraph-anchor clock
+
+Phase 3 binding rule (stress-test correction A4). Notes paragraph anchors
+(`data-anchor-ms` on each paragraph, first-keystroke-per-paragraph while
+recording) MUST be stamped from the capture-sample, pause-**excluding**
+recording clock — the same timeline as `Segment::start_ms`. That value is
+exposed to the webview as `AppEvent::RecordingClock { meeting_id, clock_ms }`,
+emitted throttled (~5 Hz) from the orchestrator runner loop.
+
+Do **not** derive anchors from `Date.now() - started_at_ms`: that wall-clock
+delta is pause-*including* and drifts from the audio/transcript timeline, so
+Phase 4 cross-reference (FR-22/23, anchor → nearest transcript segment) would
+resolve to the wrong region. `started_at_ms` remains valid for elapsed-time
+*display* only.
+
+Consequence for Phase 4: `audio.opus` is recorded pause-*including*, while
+anchors and segment timestamps are pause-*excluding*. Seek-to-anchor against
+the audio file therefore needs a pause-offset map (a list of pause intervals)
+to convert between the two timelines. This is a Phase 4 concern; Phase 3 only
+has to stamp anchors on the pause-excluding clock.
+
 ## llama.cpp prefill batching
 
 Phase 0 Spike 2 found that `cparams.n_batch` is a **per-decode hard

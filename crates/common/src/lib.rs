@@ -273,6 +273,13 @@ pub struct ModelDescriptor {
 /// genuinely recording-clock (e.g. `Segment::start_ms`, `AudioChunk::start_ms`)
 /// remain recording-clock — those are a different namespace and carry the
 /// `_ms` suffix without the `_at` infix.
+///
+/// **Do NOT use `Date.now() - started_at_ms` as a paragraph-anchor source.**
+/// That wall-clock delta is pause-*including* and drifts from the audio
+/// timeline. Notes paragraph anchors must be stamped from
+/// `AppEvent::RecordingClock { clock_ms }`, which is the capture-sample,
+/// pause-*excluding* clock (same origin as `Segment::start_ms`). The
+/// `started_at_ms` recipe above is for elapsed-time *display* only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
@@ -318,6 +325,17 @@ pub enum AppEvent {
     TranscriptSegment {
         meeting_id: MeetingId,
         segment: Segment,
+    },
+    /// The live recording clock advanced. Emitted at a throttled rate
+    /// (~5 Hz) while recording. `clock_ms` is the capture-sample,
+    /// pause-*excluding* offset from the start of the recording — the same
+    /// timeline as `Segment::start_ms` and `AudioChunk::start_ms`. The notes
+    /// editor stamps paragraph anchors (`data-anchor-ms`) from this value so
+    /// anchors line up with transcript segments; do NOT derive anchors from
+    /// `Date.now() - started_at_ms` (that is pause-including wall-clock).
+    RecordingClock {
+        meeting_id: MeetingId,
+        clock_ms: u64,
     },
     /// Diarization finished assigning speakers to a meeting's segments.
     DiarizationComplete {
@@ -544,6 +562,21 @@ mod tests {
         let e = AppEvent::DevicesChanged;
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"kind\":\"devices_changed\""));
+    }
+
+    #[test]
+    fn app_event_recording_clock_round_trips() {
+        let e = AppEvent::RecordingClock {
+            meeting_id: MeetingId::new(),
+            clock_ms: 42_000,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"recording_clock\""));
+        assert!(json.contains("\"clock_ms\":42000"));
+        match serde_json::from_str::<AppEvent>(&json).unwrap() {
+            AppEvent::RecordingClock { clock_ms, .. } => assert_eq!(clock_ms, 42_000),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

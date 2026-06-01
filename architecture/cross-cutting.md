@@ -246,6 +246,43 @@ Test fixtures (sample WAV files, expected transcripts) live under
 `tests/fixtures/` at the repo root and are git-lfs'd if they exceed
 ~1 MB.
 
+### Automated-testing policy (binding on every phase)
+
+Every phase ships automated tests that cover its acceptance criteria.
+This is a phase close-out gate, not a nicety — the PO and `phase-verify`
+test-adequacy dimension fail a phase whose acceptance is only manually
+demonstrated.
+
+- **Synthetic data is generated where behaviour needs input.** Where a
+  test needs a recording, transcript, meeting, or multi-speaker audio that
+  doesn't exist as a fixture, generate it deterministically and commit it
+  (or a generator) under `tests/fixtures/`. Examples: a synthetic
+  multi-utterance recording for VAD/accumulator tests; a hand-labelled
+  two-speaker fixture (concatenate two distinct single-speaker clips with
+  known boundaries) for diarization accuracy; a synthetic 30-minute
+  transcript (`Vec<Segment>`) for summariser chunked-prefill and latency;
+  a synthetic meeting folder (audio + transcript + notes + metadata) for
+  persistence save/reload. The Silero-VAD-rejects-tones constraint above
+  still applies — synthetic *speech-path* audio must be real speech
+  (repeat/concatenate the LibriSpeech fixture), not tones.
+- **The default suite runs in CI with no manual step and no native
+  hardware.** `cargo test --workspace` and `bun run test` must pass on a
+  machine with no model files, GPU, or microphone. Tests that need a real
+  model, GPU, or native build are **gated behind env vars** (the Phase 2
+  `MEETING_APP_ASR_MODEL_PATH` pattern) with a no-op skip path, and are run
+  on demand via `scripts/run-tests-windows.ps1`.
+- **Manual acceptance is additive, never a substitute.** Items that
+  genuinely cannot be asserted in software (copy-paste-into-Word fidelity,
+  the GPU portability matrix, clean-VM install) are recorded as
+  native-hardware evidence in the engineering journal *in addition to* automated
+  coverage of everything around them (e.g. the HTML-clipboard serialiser is
+  unit-tested even though the paste into Word is checked by hand; the
+  updater state machine is tested against a synthetic signed-manifest
+  endpoint even though the cross-OS install is run on VMs).
+- **Frontend behaviour is tested with Vitest + Testing Library** against
+  the generated IPC bindings (mock the Tauri command layer); editor and
+  cross-reference interactions assert behaviour, not snapshots.
+
 Two constraints learned from running the gated pipeline tests on native
 hardware (Phase 2 close-out):
 

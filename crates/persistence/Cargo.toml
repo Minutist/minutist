@@ -5,18 +5,24 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# Phase 1 minimal surface: per-meeting folder, audio.opus, metadata.json.
-# libsql index, transcript/notes/summary storage land in Phase 4 — do NOT
-# preempt that work here.
+# Phase 4 full surface: readers (incl. graduated Opus decoder), the libsql
+# `index.db` index + forward-only migration runner + rebuild-from-disk,
+# rename/delete meeting ops, summary.md I/O, and the MeetingState assembler.
 
 [dependencies]
 meeting-app-common = { path = "../common" }
 audiopus = { workspace = true }
 chrono = { workspace = true }
+libsql = { workspace = true }
 ogg = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# tokio: `spawn_blocking` drives the synchronous folder readers from the async
+# `rebuild_from_disk` path (see the threading model in
+# `architecture/cross-cutting.md`). The crate exposes async fns over libsql but
+# never calls `block_on`.
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

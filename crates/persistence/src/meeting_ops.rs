@@ -1,0 +1,150 @@
+//! Rename / delete meeting operations that keep the on-disk folder and the
+//! `index.db` row consistent.
+//!
+//! A rename updates `metadata.json`'s `title` (the authoritative copy) and then
+//! the index row. A delete removes the meeting folder and then the index row.
+//! In both cases the folder is the source of truth and the index is updated to
+//! match, so a crash between the two steps leaves the index stale-but-rebuildable
+//! ([`crate::MeetingIndex::rebuild_from_disk`] reconciles it).
+
+use std::path::Path;
+
+use meeting_app_common::{AppResult, MeetingId};
+
+use crate::error::Error;
+use crate::index::MeetingIndex;
+use crate::reader;
+
+/// Rename a meeting: update `metadata.json`'s `title` in place, then refresh
+/// the index row.
+///
+/// `meetings_root` is `{app-data}/meetings/`; the folder is `{root}/{uuid}/`.
+/// Returns `AppError::InvalidInput` (via `Error::MeetingNotFound`) if the
+/// folder has no `metadata.json`.
+pub async fn rename_meeting(
+    meetings_root: &Path,
+    index: &MeetingIndex,
+    id: MeetingId,
+    new_title: &str,
+) -> AppResult<()> {
+    let folder = meetings_root.join(id.0.to_string());
+    let metadata_path = folder.join("metadata.json");
+
+    if !metadata_path.exists() {
+        return Err(Error::MeetingNotFound(id).into());
+    }
+
+    // Read, mutate title, write back atomically (tmp + rename), all on disk
+    // first — the folder is authoritative.
+    let mut meta = reader::read_metadata_inner(&folder)?;
+    meta.title = new_title.to_string();
+
+    write_metadata_atomic(&metadata_path, &meta)?;
+
+    // Refresh the index row to match the renamed meeting.
+    let entry = list_entry_from(&folder)?;
+    index.upsert(&entry).await?;
+
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        new_title,
+        "meeting renamed"
+    );
+
+    Ok(())
+}
+
+/// Delete a meeting: remove the folder recursively, then remove the index row.
+///
+/// An absent folder is treated as already-deleted (the index row is still
+/// removed so the two converge). The index `delete` is a no-op for an absent
+/// row.
+pub async fn delete_meeting(
+    meetings_root: &Path,
+    index: &MeetingIndex,
+    id: MeetingId,
+) -> AppResult<()> {
+    let folder = meetings_root.join(id.0.to_string());
+
+    match std::fs::remove_dir_all(&folder) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e).into()),
+    }
+
+    index.delete(id).await?;
+
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        "meeting deleted"
+    );
+
+    Ok(())
+}
+
+/// Build a `MeetingListEntry` from a meeting folder's metadata + transcript.
+///
+/// Shares the same projection as `rebuild_from_disk` (metadata fields + first
+/// transcript segment as excerpt). Kept here (rather than reused from `index`)
+/// because the index module's variant runs on `spawn_blocking`; this one is a
+/// direct call in an already-async path.
+fn list_entry_from(folder: &Path) -> Result<meeting_app_common::MeetingListEntry, Error> {
+    let meta = reader::read_metadata_inner(folder)?;
+    let excerpt = reader::read_transcript_inner(folder)
+        .ok()
+        .and_then(|segs| segs.first().map(|s| truncate_excerpt(&s.text)));
+
+    Ok(meeting_app_common::MeetingListEntry {
+        id: meta.uuid,
+        title: meta.title,
+        started_at: meta.started_at,
+        duration_ms: meta.duration_ms,
+        speaker_count: meta.speaker_count,
+        excerpt,
+    })
+}
+
+fn truncate_excerpt(text: &str) -> String {
+    const MAX: usize = 120;
+    if text.chars().count() <= MAX {
+        text.to_string()
+    } else {
+        let truncated: String = text.chars().take(MAX).collect();
+        format!("{truncated}…")
+    }
+}
+
+/// Atomically write `meta` to `metadata.json` (tmp + rename), matching the
+/// durability of the notes/summary writers.
+fn write_metadata_atomic(path: &Path, meta: &meeting_app_common::MeetingMeta) -> Result<(), Error> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or(Error::InvalidState("metadata path has no parent"))?;
+    let tmp_path = parent.join("metadata.json.tmp");
+
+    let json = serde_json::to_vec_pretty(meta).map_err(Error::Serialise)?;
+
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(&json)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::Io(e));
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::Io(e));
+    }
+
+    Ok(())
+}

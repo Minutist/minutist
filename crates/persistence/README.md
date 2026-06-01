@@ -1,16 +1,50 @@
 # persistence
 
-Phase 1 minimal surface: per-meeting folder, `audio.opus`, `metadata.json`.
+Full Phase-4 read/write surface for per-meeting storage and the libsql
+meeting index. Owns `{app-data}/meetings/{uuid}/...` and `{app-data}/index.db`.
 
-Phase 4 will add the libsql index, transcript/notes/summary storage, and
-meeting-list queries. Nothing from Phase 4 is preempted here.
-
-## Phase 1 surface
+## Write surface
 
 | Item | Description |
 |---|---|
-| `MeetingFolder` | On-disk handle for `{root}/{uuid}/`. Created by `MeetingFolder::create(root, id)`. |
-| `MeetingWriter` | Opens the folder, accepts f32 PCM samples via `push_samples`, supports `pause`/`resume`, finalises to `audio.opus` + `metadata.json` via `finalise(meta)`. |
+| `MeetingFolder` | On-disk handle for `{root}/{uuid}/`. Created by `MeetingFolder::create(root, id)`. Path helpers: `audio_path` / `metadata_path` / `transcript_path` / `notes_path` / `notes_md_path` / `summary_path`. |
+| `MeetingWriter` | Opens the folder, accepts f32 PCM samples via `push_samples`, supports `pause`/`resume`, finalises to `audio.opus` + `metadata.json` (+ buffered `transcript.json`) via `finalise(meta)`. |
+| `TranscriptWriter` | Buffered append writer for `transcript.json`. |
+| `NotesStore` | Standalone reader/writer for the opaque `notes.json` + `notes.md`. |
+| `summary::{write_summary, read_summary}` | Atomic `summary.md` I/O (producer lands in Phase 5). |
+
+## Read surface (`reader` module)
+
+Synchronous blocking `std::fs` readers; callers in an async context drive
+them via `tokio::task::spawn_blocking`.
+
+| Function | Returns |
+|---|---|
+| `read_metadata(meeting_dir)` | `AppResult<MeetingMeta>` |
+| `read_transcript(meeting_dir)` | `AppResult<Vec<Segment>>` (absent file → empty) |
+| `read_audio_pcm(meeting_dir)` | `AppResult<Vec<f32>>` — graduated Opus decoder; **pause-INCLUDING** 16 kHz mono buffer (diarization + re-transcribe source) |
+| `read_meeting_state(meeting_dir)` | `AppResult<MeetingState>` — meta + transcript + optional notes (`open_meeting` payload) |
+
+## libsql index (`index` + `migrations` modules)
+
+`MeetingIndex` is the `index.db` meeting index — a **derived cache** over the
+per-meeting folders, rebuildable from disk. libsql is async (tokio); all index
+methods are `async fn` and the crate never calls `block_on`.
+
+| Method | Description |
+|---|---|
+| `MeetingIndex::open(db_path)` | Open-or-create at an injected path (`":memory:"` in tests); runs the forward-only migration runner. |
+| `list_meetings()` | Most-recent first (`started_at DESC`). |
+| `search(query)` | Case-insensitive `LIKE` over title + excerpt (wildcards escaped). |
+| `upsert(&entry)` / `delete(id)` | Keyed on `MeetingId`. |
+| `rebuild_from_disk(meetings_root)` | Clears + repopulates from `{root}/{uuid}/metadata.json`. |
+
+Migrations: a single-row `schema_version` table; `migrations::run` is
+idempotent and migrates both an empty DB and a prior-schema DB forward without
+data loss (additive `CREATE ... IF NOT EXISTS` steps).
+
+`meeting_ops::{rename_meeting, delete_meeting}` keep the folder and index row
+consistent (folder authoritative, index updated to match).
 
 ## Encoding parameters
 

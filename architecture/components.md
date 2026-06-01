@@ -40,9 +40,13 @@ update in the same commit.
 ### Crates that grow across phases
 
 - **`persistence`** appears in Phase 1 as a minimal writer of
-  `audio.opus` + `metadata.json` to a per-meeting folder. The libsql
-  index, transcript/notes/summary storage, and meeting-list queries
-  arrive in Phase 4.
+  `audio.opus` + `metadata.json` to a per-meeting folder. Phase 4 grows it
+  to the full surface: the folder readers (incl. the graduated
+  pause-INCLUDING Opus decoder and the `MeetingState` assembler), the libsql
+  `index.db` index + forward-only migration runner + `rebuild_from_disk`,
+  rename/delete meeting operations, and the `summary.md` path + I/O. It still
+  depends only on `common` (libsql / tokio are external crates, not workspace
+  components).
 - **`orchestrator`** appears in Phase 1 as a tiny state machine for
   start / stop / pause with the audio meter and capture lifecycle. The
   full live pipeline (VAD → ASR → transcript events → diarizer trigger)
@@ -282,6 +286,65 @@ the editor autosave (FR-18/FR-35) run concurrently with an active recording.
   meeting folder — it does not create the folder and leaves sibling files
   (`audio.opus` / `transcript.json` / `metadata.json`) untouched.
 - `MeetingFolder` exposes `notes_path()` / `notes_md_path()` helpers.
+
+**Phase 4 surface growth — readers, libsql index, summary, meeting ops.**
+The minimal write-only crate grows to its full read/write surface. The
+`libsql` dependency moves from "planned" to declared in
+`crates/persistence/Cargo.toml` (the workspace pin already existed;
+`tokio` is also now a direct dependency for `spawn_blocking`). No new
+cross-component dependency edge is added — `persistence` still depends only
+on `common`.
+
+- **Readers (`reader` module), synchronous blocking `std::fs`.** Callers in
+  an async context drive them via `tokio::task::spawn_blocking` (the
+  threading-model rule). All take an explicit `meeting_dir` (`{root}/{uuid}/`):
+  - `read_metadata(meeting_dir) -> AppResult<MeetingMeta>`
+  - `read_transcript(meeting_dir) -> AppResult<Vec<Segment>>` — an absent
+    `transcript.json` reads as an empty `Vec` (a zero-segment meeting writes
+    no file), not an error.
+  - `read_audio_pcm(meeting_dir) -> AppResult<Vec<f32>>` — the **graduated
+    Opus decoder** (previously test-only). Returns the full **pause-INCLUDING**
+    16 kHz mono f32 buffer: the silent frames written for pause gaps decode to
+    real zero samples, so the buffer's duration equals wall-clock recording
+    duration. This is what Phase 6 diarization and Phase 4 re-transcribe
+    consume, and why the orchestrator sources audio through this reader so
+    `diarizer` need not depend on `persistence`.
+  - `read_meeting_state(meeting_dir) -> AppResult<MeetingState>` — assembles
+    `meta` + `transcript` + optional `notes` (via `NotesStore::load`, mapped to
+    `common::NotesDocument`; the opaque `notes.json` value is re-serialised to
+    the wire-facing string). This is the `open_meeting` restore payload.
+- **libsql index (`index` + `migrations` modules).** `MeetingIndex` opens (or
+  creates) `index.db` at an **injected** path (`":memory:"` in tests) and runs
+  a **forward-only migration runner** (`migrations::run`): a single-row
+  `schema_version` table records the highest applied migration; `run` is
+  idempotent and converges both an empty DB and a prior-schema DB onto the
+  current schema additively (each step is `CREATE TABLE/INDEX IF NOT EXISTS`),
+  so a derived-cache rebuild never loses reconstructable rows. The index holds
+  one `meetings` row per `MeetingListEntry`. libsql is **async (tokio)**; the
+  index API is `async fn` and the crate **never calls `block_on`**:
+  - `MeetingIndex::open(db_path) -> AppResult<MeetingIndex>`
+  - `list_meetings() -> AppResult<Vec<MeetingListEntry>>` (most-recent first,
+    `started_at DESC`)
+  - `search(query) -> AppResult<Vec<MeetingListEntry>>` (case-insensitive
+    `LIKE` over title + excerpt; user wildcards escaped to match literally)
+  - `upsert(&MeetingListEntry) -> AppResult<()>` (keyed on `id`)
+  - `delete(MeetingId) -> AppResult<()>` (no-op when absent)
+  - `rebuild_from_disk(meetings_root) -> AppResult<usize>` — `index.db` is a
+    **derived cache**: this clears and repopulates the index by scanning every
+    `{root}/{uuid}/` folder containing a `metadata.json`, deriving each
+    `MeetingListEntry` (excerpt = first transcript segment). One unreadable
+    folder is skipped with a warning rather than aborting the rebuild.
+- **Meeting operations (`meeting_ops` module).** `rename_meeting(root, &index,
+  id, new_title)` and `delete_meeting(root, &index, id)` (both `async fn ->
+  AppResult<()>`) keep the on-disk folder and the index row consistent: the
+  folder is authoritative (rename rewrites `metadata.json` atomically, delete
+  removes the folder), then the index row is updated/removed to match. A crash
+  between the two steps leaves the index stale-but-rebuildable.
+- **Summary hook (`summary` module + `MeetingFolder::summary_path()`).**
+  `write_summary(meeting_dir, &str)` (atomic tmp+rename) and
+  `read_summary(meeting_dir) -> AppResult<Option<String>>` for `summary.md`.
+  Phase 5's `summariser` produces the file; Phase 4 lands only the path helper
+  and the I/O seam.
 
 ### `orchestrator`
 **Crate:** `crates/orchestrator`

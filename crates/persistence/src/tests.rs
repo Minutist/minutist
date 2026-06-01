@@ -495,3 +495,535 @@ fn test_zero_segment_meeting_finalise_ok() {
         "transcript.json should be absent for a zero-segment meeting"
     );
 }
+
+// ===========================================================================
+// Phase 4 tests
+// ===========================================================================
+//
+// 10. Opus encode→decode round-trip INCLUDING a pause gap: the decoded f32
+//     buffer's duration reflects the pause-including audio.
+// 11. Synthetic meeting-folder fixture: write meta + transcript + notes, then
+//     `read_meeting_state` round-trips all three.
+// 12. read_meeting_state with no notes yields `notes: None`.
+// 13. read_transcript on an absent file is Ok(empty), not an error.
+// 14. summary.md write/read round-trip; absent summary yields Ok(None).
+// 15. libsql empty-DB migration brings the schema to current.
+// 16. libsql prior-schema (v0/v1) DB migrates forward without data loss.
+// 17. libsql list/upsert/delete behave; list is most-recent first.
+// 18. libsql search matches title and excerpt.
+// 19. rebuild_from_disk repopulates from a synthetic meetings root.
+// 20. rename/delete meeting keep folder + index consistent.
+
+use meeting_app_common::{MeetingState, NotesDocument};
+
+use crate::index::MeetingIndex;
+use crate::reader;
+
+/// Build a synthetic meeting folder on disk with metadata + transcript + notes
+/// and return `(root, id, folder_dir)`.
+fn write_synthetic_meeting(
+    root: &std::path::Path,
+    title: &str,
+    started_at: &str,
+    segments: &[Segment],
+    notes_json: Option<&serde_json::Value>,
+    notes_md: Option<&str>,
+) -> MeetingId {
+    let id = MeetingId::new();
+    let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
+
+    let mut meta = dummy_meta(id, 5_000);
+    meta.title = title.to_string();
+    meta.started_at = started_at.to_string();
+    meta.speaker_count = 2;
+    crate::metadata::write_metadata(folder.metadata_path(), &meta).expect("write metadata");
+
+    if !segments.is_empty() {
+        let mut tw = TranscriptWriter::open(&folder).expect("open transcript");
+        for s in segments {
+            tw.append(s.clone()).expect("append");
+        }
+        tw.flush().expect("flush");
+    }
+
+    if let (Some(j), Some(m)) = (notes_json, notes_md) {
+        crate::notes::NotesStore::save(root, id, j, m).expect("save notes");
+    }
+
+    id
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Opus round-trip INCLUDING a pause gap (decoded f32 buffer)
+// ---------------------------------------------------------------------------
+
+/// Encode 5 s + pause(~0 wall-clock) + 5 s into an in-memory Opus stream, then
+/// decode it via the graduated reader and assert the decoded f32 buffer's
+/// duration reflects the pause-including audio (~10 s here; the pause is near
+/// zero wall-clock so no large silence gap is injected, matching the existing
+/// granule test's near-zero-pause approach). The point is that the decoder
+/// returns the full PCM buffer the silent frames are part of.
+#[test]
+fn test_opus_pcm_round_trip_pause_including() {
+    use crate::opus_encoder::OggOpusEncoder;
+
+    let mut buf = Vec::<u8>::new();
+    let mut enc = OggOpusEncoder::new(Cursor::new(&mut buf)).expect("encoder");
+
+    enc.push_samples(&sine_samples(5.0)).expect("pre-pause");
+    enc.pause().expect("pause");
+    // Inject a deterministic silent gap by writing silence directly: resume()
+    // measures wall-clock, so to make the gap large and deterministic we sleep
+    // a small known amount and rely on the granule arithmetic only being
+    // exercised for the near-zero case. Here we keep the wall-clock pause near
+    // zero and assert the buffer is ~10 s of real audio.
+    enc.resume().expect("resume");
+    enc.push_samples(&sine_samples(5.0)).expect("post-pause");
+    enc.finalise().expect("finalise");
+
+    let pcm = reader::decode_opus_ogg_for_test(&buf).expect("decode");
+    let decoded_secs = pcm.len() as f64 / SAMPLE_RATE as f64;
+
+    // 5 + ~0 + 5 = ~10 s. Generous ±0.5 s for the zero-padded final frame and
+    // Opus pre-skip (not subtracted at decode time).
+    let diff = (decoded_secs - 10.0).abs();
+    assert!(
+        diff <= 0.5,
+        "decoded pcm duration {decoded_secs:.3} s differs from ~10 s by {diff:.3} s"
+    );
+    assert!(!pcm.is_empty(), "decoded pcm buffer is empty");
+}
+
+/// The decoded buffer for a recording with a *real* (wall-clock) pause gap
+/// includes the silent pause samples, so its duration exceeds the recorded
+/// audio alone. Uses a 1 s real pause; marked `#[ignore]` so the fast suite
+/// stays quick (matches the existing `test_pause_resume_gap_real_time` style).
+#[test]
+#[ignore = "takes ~1 s wall-clock (real pause simulation)"]
+fn test_opus_pcm_buffer_includes_pause_samples() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    let mut writer = MeetingWriter::open(tempdir.path(), id, opus_format()).expect("open");
+
+    writer.push_samples(&sine_samples(2.0)).expect("pre-pause");
+    writer.pause().expect("pause");
+    std::thread::sleep(Duration::from_millis(1_000));
+    writer.resume().expect("resume");
+    writer.push_samples(&sine_samples(2.0)).expect("post-pause");
+
+    let folder = writer.finalise(dummy_meta(id, 5_000)).expect("finalise");
+
+    let pcm = reader::read_audio_pcm(folder.path()).expect("read pcm");
+    let decoded_secs = pcm.len() as f64 / SAMPLE_RATE as f64;
+
+    // 2 + 1 (pause) + 2 = ~5 s; the pause samples must be present.
+    let diff = (decoded_secs - 5.0).abs();
+    assert!(
+        diff <= 0.5,
+        "decoded pcm duration {decoded_secs:.3} s; expected ~5 s (pause-including); diff {diff:.3} s"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11/12/13: reader round-trips
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_read_meeting_state_round_trips_with_notes() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let segments = vec![
+        make_segment(0, 1_000, "opening remarks"),
+        make_segment(1_100, 2_000, "second point"),
+    ];
+    let notes_json = serde_json::json!({
+        "type": "doc",
+        "content": [{ "type": "paragraph", "attrs": { "data-anchor-ms": 100 } }]
+    });
+    let notes_md = "# Meeting notes\n\n- opening remarks\n";
+
+    let id = write_synthetic_meeting(
+        root,
+        "Quarterly review",
+        "2026-06-01T09:00:00Z",
+        &segments,
+        Some(&notes_json),
+        Some(notes_md),
+    );
+
+    let folder_dir = root.join(id.0.to_string());
+    let state: MeetingState = reader::read_meeting_state(&folder_dir).expect("read state");
+
+    assert_eq!(state.meta.uuid, id);
+    assert_eq!(state.meta.title, "Quarterly review");
+    assert_eq!(state.transcript.len(), 2);
+    assert_eq!(state.transcript[0].text, "opening remarks");
+
+    let notes: NotesDocument = state.notes.expect("notes present");
+    assert_eq!(notes.notes_markdown, notes_md);
+    // notes_json is the opaque document re-serialised; parse it back and compare.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&notes.notes_json).expect("parse notes_json");
+    assert_eq!(parsed, notes_json, "notes.json did not round-trip via MeetingState");
+}
+
+#[test]
+fn test_read_meeting_state_without_notes_yields_none() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = write_synthetic_meeting(
+        root,
+        "Notes-free meeting",
+        "2026-06-01T10:00:00Z",
+        &[make_segment(0, 500, "hi")],
+        None,
+        None,
+    );
+
+    let folder_dir = root.join(id.0.to_string());
+    let state = reader::read_meeting_state(&folder_dir).expect("read state");
+    assert!(state.notes.is_none(), "expected notes: None for a notes-free meeting");
+    assert_eq!(state.transcript.len(), 1);
+}
+
+#[test]
+fn test_read_transcript_absent_is_empty() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    let folder = crate::folder::MeetingFolder::create(tempdir.path(), id).expect("folder");
+    // No transcript.json written.
+    let segs = reader::read_transcript(folder.path()).expect("read transcript");
+    assert!(segs.is_empty(), "absent transcript.json must read as empty Vec");
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: summary.md write/read round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_summary_write_read_round_trip() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    let folder = crate::folder::MeetingFolder::create(tempdir.path(), id).expect("folder");
+
+    // Absent summary first.
+    assert!(
+        crate::summary::read_summary(folder.path())
+            .expect("read absent")
+            .is_none(),
+        "absent summary.md must yield Ok(None)"
+    );
+
+    let body = "# Summary\n\nKey decisions:\n\n- Ship Phase 4\n";
+    crate::summary::write_summary(folder.path(), body).expect("write summary");
+
+    // summary_path helper points at the right file.
+    assert!(folder.summary_path().ends_with("summary.md"));
+    assert!(folder.summary_path().exists(), "summary.md not created");
+
+    let loaded = crate::summary::read_summary(folder.path())
+        .expect("read")
+        .expect("present");
+    assert_eq!(loaded, body, "summary.md did not round-trip");
+
+    // No .tmp residue after write.
+    let residue: Vec<_> = std::fs::read_dir(folder.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(residue.is_empty(), "expected no .tmp residue, found {residue:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: empty-DB migration brings schema to current
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_index_empty_db_migrates_to_current() {
+    let index = MeetingIndex::open(":memory:").await.expect("open index");
+    // A fresh index lists zero meetings and queries succeed (schema present).
+    let meetings = index.list_meetings().await.expect("list");
+    assert!(meetings.is_empty(), "fresh index must be empty");
+}
+
+/// The migration runner is idempotent: opening twice over the same file DB
+/// (which re-runs `run`) leaves the schema and data intact.
+#[tokio::test]
+async fn test_index_migration_idempotent_over_file() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let db_path = tempdir.path().join("index.db");
+
+    {
+        let index = MeetingIndex::open(&db_path).await.expect("open 1");
+        index.upsert(&list_entry("A", "2026-06-01T09:00:00Z")).await.expect("upsert");
+    }
+    // Re-open: migration runner runs again, must not wipe data or error.
+    let index = MeetingIndex::open(&db_path).await.expect("open 2");
+    let meetings = index.list_meetings().await.expect("list");
+    assert_eq!(meetings.len(), 1, "re-running migrations must preserve data");
+    assert_eq!(meetings[0].title, "A");
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: prior-schema DB migrates forward without data loss
+// ---------------------------------------------------------------------------
+
+/// Simulate a "prior schema" DB: create the v1 `meetings` table by hand and
+/// stamp `schema_version = 0` (pre-runner), seed a row, then run the migration
+/// runner via `MeetingIndex::open`. The runner must bring the version current
+/// and preserve the seeded row.
+#[tokio::test]
+async fn test_index_prior_schema_migrates_without_data_loss() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let db_path = tempdir.path().join("index.db");
+
+    // Hand-build a prior-schema DB: the meetings table exists but the
+    // schema_version table records 0 (as if written by an older build before
+    // the runner stamped it). Use libsql directly.
+    {
+        let db = libsql::Builder::new_local(&db_path)
+            .build()
+            .await
+            .expect("build prior db");
+        let conn = db.connect().expect("connect");
+        conn.execute(
+            "CREATE TABLE meetings (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, started_at TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL, speaker_count INTEGER NOT NULL, excerpt TEXT
+            )",
+            (),
+        )
+        .await
+        .expect("create prior table");
+        conn.execute(
+            "INSERT INTO meetings VALUES (?1, 'Legacy meeting', '2026-05-01T08:00:00Z', 1000, 1, 'legacy excerpt')",
+            libsql::params![MeetingId::new().0.to_string()],
+        )
+        .await
+        .expect("seed legacy row");
+        // Note: no schema_version table — the runner treats current = 0 and
+        // applies migration 1, which is `CREATE TABLE IF NOT EXISTS`, so the
+        // existing data survives.
+    }
+
+    let index = MeetingIndex::open(&db_path).await.expect("open + migrate");
+    let meetings = index.list_meetings().await.expect("list");
+    assert_eq!(meetings.len(), 1, "legacy row must survive forward migration");
+    assert_eq!(meetings[0].title, "Legacy meeting");
+    assert_eq!(meetings[0].excerpt.as_deref(), Some("legacy excerpt"));
+}
+
+// ---------------------------------------------------------------------------
+// Test 17/18: list / upsert / delete / search
+// ---------------------------------------------------------------------------
+
+/// Build a `MeetingListEntry` for index tests.
+fn list_entry(title: &str, started_at: &str) -> meeting_app_common::MeetingListEntry {
+    meeting_app_common::MeetingListEntry {
+        id: MeetingId::new(),
+        title: title.to_string(),
+        started_at: started_at.to_string(),
+        duration_ms: 1_000,
+        speaker_count: 1,
+        excerpt: Some(format!("{title} excerpt")),
+    }
+}
+
+#[tokio::test]
+async fn test_index_list_upsert_delete() {
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+
+    let early = list_entry("Standup", "2026-06-01T09:00:00Z");
+    let late = list_entry("Retro", "2026-06-03T15:00:00Z");
+    index.upsert(&early).await.expect("upsert early");
+    index.upsert(&late).await.expect("upsert late");
+
+    // list is most-recent first.
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].title, "Retro", "most-recent first");
+    assert_eq!(listed[1].title, "Standup");
+
+    // upsert is idempotent on id: re-upsert with a new title overwrites.
+    let mut renamed = early.clone();
+    renamed.title = "Standup (renamed)".to_string();
+    index.upsert(&renamed).await.expect("re-upsert");
+    let listed = index.list_meetings().await.expect("list after re-upsert");
+    assert_eq!(listed.len(), 2, "upsert must not create a duplicate row");
+    assert!(listed.iter().any(|m| m.title == "Standup (renamed)"));
+
+    // delete removes the row.
+    index.delete(early.id).await.expect("delete");
+    let listed = index.list_meetings().await.expect("list after delete");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "Retro");
+
+    // delete of an absent id is a no-op (not an error).
+    index.delete(MeetingId::new()).await.expect("delete absent");
+}
+
+#[tokio::test]
+async fn test_index_search_matches_title_and_excerpt() {
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+
+    let mut launch = list_entry("Launch planning", "2026-06-01T09:00:00Z");
+    launch.excerpt = Some("we discussed the rollout".to_string());
+    let mut budget = list_entry("Budget review", "2026-06-02T09:00:00Z");
+    budget.excerpt = Some("Q3 numbers".to_string());
+    index.upsert(&launch).await.expect("upsert launch");
+    index.upsert(&budget).await.expect("upsert budget");
+
+    // Title match.
+    let r = index.search("Launch").await.expect("search title");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].title, "Launch planning");
+
+    // Excerpt match.
+    let r = index.search("rollout").await.expect("search excerpt");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].title, "Launch planning");
+
+    // No match.
+    let r = index.search("nonexistent term").await.expect("search none");
+    assert!(r.is_empty());
+
+    // A wildcard char in the query is matched literally, not as a wildcard.
+    let r = index.search("%").await.expect("search literal percent");
+    assert!(r.is_empty(), "'%' must be escaped to match literally");
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: rebuild_from_disk repopulates from a synthetic meetings root
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_index_rebuild_from_disk() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id_a = write_synthetic_meeting(
+        root,
+        "Meeting A",
+        "2026-06-01T09:00:00Z",
+        &[make_segment(0, 500, "alpha excerpt text")],
+        None,
+        None,
+    );
+    let _id_b = write_synthetic_meeting(
+        root,
+        "Meeting B",
+        "2026-06-03T09:00:00Z",
+        &[make_segment(0, 500, "bravo")],
+        None,
+        None,
+    );
+    // A stray non-meeting directory (no metadata.json) must be skipped.
+    std::fs::create_dir_all(root.join("not-a-meeting")).expect("stray dir");
+    std::fs::write(root.join("not-a-meeting").join("readme.txt"), b"x").expect("stray file");
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    let n = index.rebuild_from_disk(root).await.expect("rebuild");
+    assert_eq!(n, 2, "expected 2 meetings indexed, got {n}");
+
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 2);
+    // Most-recent first → Meeting B (2026-06-03) before Meeting A (2026-06-01).
+    assert_eq!(listed[0].title, "Meeting B");
+    assert_eq!(listed[1].title, "Meeting A");
+    // Excerpt is the first transcript segment's text.
+    let a_row = listed.iter().find(|m| m.id == id_a).expect("A present");
+    assert_eq!(a_row.excerpt.as_deref(), Some("alpha excerpt text"));
+
+    // rebuild is idempotent: running again yields the same count.
+    let n2 = index.rebuild_from_disk(root).await.expect("rebuild 2");
+    assert_eq!(n2, 2);
+    assert_eq!(index.list_meetings().await.expect("list").len(), 2);
+}
+
+#[tokio::test]
+async fn test_index_rebuild_from_missing_root_is_empty() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let missing = tempdir.path().join("does-not-exist");
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    let n = index.rebuild_from_disk(&missing).await.expect("rebuild missing");
+    assert_eq!(n, 0, "missing meetings root yields an empty index");
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: rename / delete meeting keep folder + index consistent
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_rename_meeting_updates_folder_and_index() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = write_synthetic_meeting(
+        root,
+        "Original title",
+        "2026-06-01T09:00:00Z",
+        &[make_segment(0, 500, "hello")],
+        None,
+        None,
+    );
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    index.rebuild_from_disk(root).await.expect("rebuild");
+
+    crate::meeting_ops::rename_meeting(root, &index, id, "Renamed title")
+        .await
+        .expect("rename");
+
+    // metadata.json on disk reflects the new title.
+    let folder_dir = root.join(id.0.to_string());
+    let meta = reader::read_metadata(&folder_dir).expect("read meta");
+    assert_eq!(meta.title, "Renamed title", "metadata.json title not updated");
+
+    // index row reflects the new title too.
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "Renamed title", "index title not updated");
+
+    // Renaming an unknown meeting errors.
+    let err = crate::meeting_ops::rename_meeting(root, &index, MeetingId::new(), "x").await;
+    assert!(err.is_err(), "renaming an absent meeting must error");
+}
+
+#[tokio::test]
+async fn test_delete_meeting_removes_folder_and_index() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = write_synthetic_meeting(
+        root,
+        "To delete",
+        "2026-06-01T09:00:00Z",
+        &[make_segment(0, 500, "bye")],
+        None,
+        None,
+    );
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    index.rebuild_from_disk(root).await.expect("rebuild");
+    assert_eq!(index.list_meetings().await.expect("list").len(), 1);
+
+    crate::meeting_ops::delete_meeting(root, &index, id)
+        .await
+        .expect("delete");
+
+    let folder_dir = root.join(id.0.to_string());
+    assert!(!folder_dir.exists(), "meeting folder not removed");
+    assert!(
+        index.list_meetings().await.expect("list").is_empty(),
+        "index row not removed"
+    );
+
+    // Deleting again (folder + row both gone) is a no-op, not an error.
+    crate::meeting_ops::delete_meeting(root, &index, id)
+        .await
+        .expect("delete idempotent");
+}

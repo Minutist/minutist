@@ -1,15 +1,35 @@
-//! `persistence` — Phase 1/2 write surface.
+//! `persistence` — full Phase-4 read/write surface.
 //!
-//! Writes per-meeting `audio.opus`, `metadata.json`, and (Phase 2)
-//! `transcript.json` to `{app-data}/meetings/{uuid}/`. This is the **only**
-//! crate in the workspace allowed to write under that directory
+//! Writes per-meeting `audio.opus`, `metadata.json`, `transcript.json`,
+//! `notes.json` / `notes.md`, and `summary.md` to `{app-data}/meetings/{uuid}/`,
+//! and owns the libsql `index.db` meeting index. This is the **only** crate in
+//! the workspace allowed to write under those paths
 //! (`architecture/cross-cutting.md` — Filesystem layout).
 //!
-//! Phase 3 adds [`NotesStore`], a standalone reader/writer for `notes.json`
-//! (opaque Tiptap document) + `notes.md`, independent of [`MeetingWriter`].
+//! # Write surface
 //!
-//! Phase 4 will add the libsql index, summary storage, and meeting-list
-//! queries. Do **not** preempt Phase 4 here.
+//! - [`MeetingWriter`] (Phase 1/2): `audio.opus`, `metadata.json`,
+//!   `transcript.json` while a recording is in flight.
+//! - [`NotesStore`] (Phase 3): standalone reader/writer for the opaque
+//!   `notes.json` + `notes.md`, independent of [`MeetingWriter`].
+//! - [`summary`] (Phase 4): `summary.md` write/read I/O (the producer lands in
+//!   Phase 5; the path + I/O seam is here).
+//!
+//! # Read surface (Phase 4)
+//!
+//! [`reader`] holds the synchronous folder readers — [`reader::read_metadata`],
+//! [`reader::read_transcript`], [`reader::read_audio_pcm`] (the graduated
+//! pause-INCLUDING Opus decoder), and [`reader::read_meeting_state`] (the
+//! `open_meeting` restore-payload assembler).
+//!
+//! # Index (Phase 4)
+//!
+//! [`MeetingIndex`] is the libsql `index.db` — a **derived cache** over the
+//! per-meeting folders, rebuildable via [`MeetingIndex::rebuild_from_disk`].
+//! libsql is async (tokio); the index methods are `async fn` and the crate
+//! never calls `block_on` (see `architecture/cross-cutting.md` — Async runtime).
+//! [`meeting_ops`] holds the rename/delete operations that keep the on-disk
+//! folder and the index row consistent.
 //!
 //! # Tracing
 //!
@@ -17,21 +37,30 @@
 //!
 //! # No Tauri
 //!
-//! This crate does **not** import `tauri::*`. The path to `{app-data}` is
-//! passed in by the caller (typically the orchestrator).
+//! This crate does **not** import `tauri::*`. The paths to `{app-data}/meetings/`
+//! and `{app-data}/index.db` are passed in by the caller (orchestrator /
+//! app-main).
 
 pub mod error;
 pub mod folder;
+pub mod index;
+pub mod meeting_ops;
 pub mod metadata;
+pub mod migrations;
 pub mod notes;
 pub mod opus_encoder;
+pub mod reader;
+pub mod summary;
 pub mod transcript;
 pub mod writer;
 
 // Public re-exports for the crate's primary surface.
 pub use error::Error;
 pub use folder::MeetingFolder;
+pub use index::MeetingIndex;
 pub use notes::{NotesData, NotesStore};
+pub use reader::{read_audio_pcm, read_meeting_state, read_metadata, read_transcript};
+pub use summary::{read_summary, write_summary};
 pub use transcript::TranscriptWriter;
 pub use writer::MeetingWriter;
 

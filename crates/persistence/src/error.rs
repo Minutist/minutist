@@ -17,6 +17,18 @@ pub enum Error {
 
     #[error("invalid state: {0}")]
     InvalidState(&'static str),
+
+    #[error("Opus decode error: {0}")]
+    OpusDecode(String),
+
+    #[error("index database error: {0}")]
+    Index(#[from] libsql::Error),
+
+    #[error("meeting not found: {}", .0 .0)]
+    MeetingNotFound(meeting_app_common::MeetingId),
+
+    #[error("schema migration error: {0}")]
+    Migration(String),
 }
 
 impl From<audiopus::Error> for Error {
@@ -40,6 +52,18 @@ impl From<Error> for AppError {
             },
             Error::InvalidState(msg) => AppError::InvalidInput {
                 context: msg.to_string(),
+            },
+            Error::OpusDecode(msg) => AppError::Internal {
+                context: format!("opus decode: {msg}"),
+            },
+            Error::Index(inner) => AppError::Internal {
+                context: format!("index database: {inner}"),
+            },
+            Error::MeetingNotFound(id) => AppError::InvalidInput {
+                context: format!("meeting not found: {}", id.0),
+            },
+            Error::Migration(msg) => AppError::Internal {
+                context: format!("schema migration: {msg}"),
             },
         }
     }

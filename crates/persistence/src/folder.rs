@@ -54,18 +54,28 @@ impl MeetingFolder {
     }
 
     /// Path to `audio.opus` within the folder.
-    pub(crate) fn audio_path(&self) -> PathBuf {
+    pub fn audio_path(&self) -> PathBuf {
         self.path.join("audio.opus")
     }
 
     /// Path to `metadata.json` within the folder.
-    pub(crate) fn metadata_path(&self) -> PathBuf {
+    pub fn metadata_path(&self) -> PathBuf {
         self.path.join("metadata.json")
     }
 
     /// Path to `transcript.json` within the folder.
-    pub(crate) fn transcript_path(&self) -> PathBuf {
+    pub fn transcript_path(&self) -> PathBuf {
         self.path.join("transcript.json")
+    }
+
+    /// Path to `summary.md` within the folder.
+    ///
+    /// `summary.md` holds the markdown summary produced by `summariser`
+    /// (Phase 5). Phase 4 lands only the path helper and the
+    /// [`crate::summary`] read/write I/O; the file is written by `summariser`
+    /// via `persistence` in Phase 5.
+    pub fn summary_path(&self) -> PathBuf {
+        self.path.join("summary.md")
     }
 
     /// Path to `notes.json` within the folder.

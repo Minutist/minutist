@@ -416,7 +416,253 @@ async fn pause_resume_decoded_duration_includes_pause_gap() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: invalid state transitions
+// Test 3: RecordingClock is the pause-EXCLUDING sample clock (binding A4)
+// ---------------------------------------------------------------------------
+
+/// Regression for binding correction A4 (`architecture/cross-cutting.md` —
+/// "Notes paragraph-anchor clock").
+///
+/// The runner emits `AppEvent::RecordingClock { clock_ms: batch.end_ms }` on
+/// the sample-batch receive path, throttled to ~5 Hz. The notes editor stamps
+/// paragraph anchors from this value, so the clock MUST track the
+/// pause-EXCLUDING capture-sample timeline (the same origin as
+/// `Segment::start_ms`), never pause-including wall-clock.
+///
+/// This test drives the orchestrator through start → record → pause → (wall
+/// time elapses) → resume → record → stop with deterministic batches whose
+/// `end_ms` lie on the sample timeline, collecting every emitted
+/// `RecordingClock { clock_ms, .. }`. It asserts:
+///
+/// 1. `RecordingClock` IS emitted while recording.
+/// 2. `clock_ms` is monotonically non-decreasing.
+/// 3. Every emitted `clock_ms` equals one of the fed `batch.end_ms` values
+///    (the pause-EXCLUDING clock) — it is never wall-clock and never a value
+///    inflated by the pause wall-time.
+/// 4. The LOAD-BEARING property: across the pause, the clock does not advance
+///    by the pause duration. The post-resume batches continue contiguously on
+///    the sample timeline (their `end_ms` resume from the pre-pause tail, NOT
+///    from `tail + pause_wall`), and no emitted `clock_ms` ever equals a
+///    pause-inflated offset.
+///
+/// Batches are spaced by > `RECORDING_CLOCK_MIN_INTERVAL_MS` of wall time so
+/// each crosses the ~5 Hz throttle window and is emitted; the assertions are
+/// nonetheless written against the *sequence* of emitted values (a subset of
+/// the fed `end_ms` set in order), not a fixed count, so they remain correct
+/// if the throttle coalesces some emissions.
+///
+/// `DummyAudioSource`-style synchronous generation would deliver every batch
+/// before the runner drains the first one, collapsing the throttle to a single
+/// emission and making the pause boundary unobservable in the event stream.
+/// The live-streams harness with paced sends is the correct fixture for the
+/// clock/metering path here (this asserts the clock timeline, not VAD speech
+/// output — valid per `cross-cutting.md` §Testing).
+#[tokio::test]
+async fn recording_clock_is_pause_excluding_across_pause_resume() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Comfortably larger than RECORDING_CLOCK_MIN_INTERVAL_MS (200 ms) so each
+    // paced batch lands in its own throttle window and emits a RecordingClock.
+    const SEND_SPACING_MS: u64 = 300;
+    const PAUSE_WALL_MS: u64 = 800;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let orch = test_orchestrator(dir.path().to_path_buf());
+    let mut rx = orch.subscribe_events();
+
+    let (sample_tx, meter_tx, streams) = live_streams(64, 64);
+
+    let meeting_id = orch
+        .start_with_streams(streams)
+        .await
+        .expect("start_with_streams");
+
+    // Drives one paced batch into the runner and drains every RecordingClock
+    // that has accumulated on the broadcast bus so far, appending each
+    // `clock_ms` (in arrival order) to `clocks`.
+    //
+    // The sample-clock offset advances by exactly 100 ms per batch (the batch
+    // duration), independent of how much wall time passes — this is what makes
+    // the post-pause clock pause-EXCLUDING.
+    async fn feed_and_collect(
+        sample_tx: &mpsc::Sender<AudioFrameBatch>,
+        meter_tx: &mpsc::Sender<AudioMeterFrame>,
+        rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        sample_offset_ms: u64,
+        clocks: &mut Vec<u64>,
+        expected_meeting_id: MeetingId,
+    ) {
+        sample_tx
+            .send(make_batch(sample_offset_ms))
+            .await
+            .expect("send batch");
+        meter_tx
+            .send(AudioMeterFrame {
+                peak: 0.4,
+                rms: 0.25,
+            })
+            .await
+            .expect("send meter");
+        // Let the runner drain this batch and emit the throttled clock.
+        tokio::time::sleep(Duration::from_millis(SEND_SPACING_MS)).await;
+        drain_recording_clocks(rx, clocks, expected_meeting_id);
+    }
+
+    // Drain all currently-queued RecordingClock events into `clocks`.
+    fn drain_recording_clocks(
+        rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+        clocks: &mut Vec<u64>,
+        expected_meeting_id: MeetingId,
+    ) {
+        loop {
+            match rx.try_recv() {
+                Ok(AppEvent::RecordingClock {
+                    meeting_id: mid,
+                    clock_ms,
+                }) => {
+                    assert_eq!(
+                        mid, expected_meeting_id,
+                        "RecordingClock meeting_id must match the active recording"
+                    );
+                    clocks.push(clock_ms);
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+    }
+
+    let mut clocks: Vec<u64> = Vec::new();
+
+    // --- Pre-pause: feed batches at sample offsets 0, 100, 200 ms.
+    // Their end_ms values are 100, 200, 300 ms (pause-EXCLUDING sample clock).
+    let pre_pause_offsets = [0u64, 100, 200];
+    for off in pre_pause_offsets {
+        feed_and_collect(&sample_tx, &meter_tx, &mut rx, off, &mut clocks, meeting_id)
+            .await;
+    }
+
+    // Snapshot every clock emitted up to (and including) the moment we pause.
+    let clocks_before_pause = clocks.clone();
+
+    // The last sample end_ms before the pause. Post-resume must continue from
+    // here on the sample timeline, NOT from here + PAUSE_WALL_MS.
+    let pre_pause_tail_end_ms = pre_pause_offsets.last().copied().unwrap() + 100; // 300 ms
+
+    orch.pause().await.expect("pause");
+
+    // Wall time elapses during the pause. A pause-INCLUDING (wall-clock) clock
+    // would advance by ~PAUSE_WALL_MS here; the pause-EXCLUDING sample clock
+    // must not. No batches are fed while paused, and the runner's paused branch
+    // never reaches the RecordingClock emit site, so no clock must be emitted.
+    tokio::time::sleep(Duration::from_millis(PAUSE_WALL_MS)).await;
+    drain_recording_clocks(&mut rx, &mut clocks, meeting_id);
+    let clocks_at_pause_end = clocks.clone();
+
+    orch.resume().await.expect("resume");
+
+    // --- Post-resume: continue CONTIGUOUSLY on the sample timeline.
+    // Offsets 300, 400, 500 ms → end_ms 400, 500, 600 ms. Crucially these do
+    // NOT skip ahead by PAUSE_WALL_MS; the sample clock only counts captured
+    // audio, not pause wall-time.
+    let post_resume_offsets = [
+        pre_pause_tail_end_ms,       // 300 ms — contiguous with pre-pause tail
+        pre_pause_tail_end_ms + 100, // 400 ms
+        pre_pause_tail_end_ms + 200, // 500 ms
+    ];
+    for off in post_resume_offsets {
+        feed_and_collect(&sample_tx, &meter_tx, &mut rx, off, &mut clocks, meeting_id)
+            .await;
+    }
+
+    drop(sample_tx);
+    drop(meter_tx);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drain_recording_clocks(&mut rx, &mut clocks, meeting_id);
+
+    let _meta = orch.stop().await.expect("stop");
+    drain_recording_clocks(&mut rx, &mut clocks, meeting_id);
+
+    // -------------------- Assertions --------------------
+
+    // (1) RecordingClock IS emitted while recording.
+    assert!(
+        !clocks.is_empty(),
+        "expected at least one AppEvent::RecordingClock while recording, got none"
+    );
+
+    // (2) Monotonically non-decreasing.
+    for w in clocks.windows(2) {
+        assert!(
+            w[1] >= w[0],
+            "RecordingClock clock_ms must be monotonically non-decreasing; \
+             saw {} after {} in sequence {clocks:?}",
+            w[1],
+            w[0]
+        );
+    }
+
+    // (3) Every emitted clock_ms is a fed batch end_ms (the pause-EXCLUDING
+    //     sample clock) — never wall-clock, never a pause-inflated value.
+    let fed_end_ms: std::collections::BTreeSet<u64> = pre_pause_offsets
+        .iter()
+        .chain(post_resume_offsets.iter())
+        .map(|off| off + 100) // make_batch sets end_ms = start_ms + 100
+        .collect();
+    for &c in &clocks {
+        assert!(
+            fed_end_ms.contains(&c),
+            "clock_ms {c} is not one of the fed sample-batch end_ms values \
+             {fed_end_ms:?} — the clock leaked wall-clock or a pause-inflated \
+             offset; full sequence: {clocks:?}"
+        );
+    }
+
+    // (4a) LOAD-BEARING: no RecordingClock was emitted during the paused
+    //      interval. The paused branch must never reach the emit site, so the
+    //      snapshot taken at the END of the pause window (after PAUSE_WALL_MS of
+    //      wall time elapsed, before resume) must be byte-for-byte identical to
+    //      the snapshot taken at the START of the pause. Any growth here means a
+    //      clock leaked out while paused.
+    assert_eq!(
+        clocks_at_pause_end, clocks_before_pause,
+        "RecordingClock was emitted during the pause; the emit site must be \
+         unreachable while paused. before pause: {clocks_before_pause:?}, \
+         after {PAUSE_WALL_MS} ms paused: {clocks_at_pause_end:?}"
+    );
+
+    // (4b) LOAD-BEARING: the clock never advanced by the pause wall-time. The
+    //      maximum emitted clock_ms must equal the maximum fed sample end_ms
+    //      (600 ms), NOT a value inflated toward (600 + PAUSE_WALL_MS). A
+    //      pause-INCLUDING clock would necessarily emit a value above the
+    //      sample-timeline maximum once post-resume batches flowed.
+    let max_sample_end_ms = post_resume_offsets.last().copied().unwrap() + 100; // 600 ms
+    let max_clock = clocks.iter().copied().max().unwrap();
+    assert!(
+        max_clock <= max_sample_end_ms,
+        "max RecordingClock {max_clock} exceeds the max sample-timeline end_ms \
+         {max_sample_end_ms}; the clock advanced across the pause \
+         (pause-INCLUDING). PAUSE_WALL_MS={PAUSE_WALL_MS}; sequence: {clocks:?}"
+    );
+
+    // (4c) The post-resume clock continues contiguously from the pre-pause
+    //      tail: at least one emitted value lies at or beyond the pre-pause
+    //      tail end_ms, confirming recording genuinely resumed and advanced the
+    //      sample clock — without the pause gap. (Guards against the test
+    //      trivially passing because post-resume audio never reached the emit
+    //      site at all.)
+    assert!(
+        clocks.iter().any(|&c| c > pre_pause_tail_end_ms),
+        "no RecordingClock advanced past the pre-pause tail {pre_pause_tail_end_ms} ms; \
+         post-resume sample audio did not advance the clock as expected; \
+         sequence: {clocks:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: invalid state transitions
 // ---------------------------------------------------------------------------
 
 /// `pause()` from Idle returns `AppError::InvalidInput`.

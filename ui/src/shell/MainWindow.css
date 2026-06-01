@@ -1,4 +1,4 @@
-/* Minimal functional styles for Phase 1/2. Tailwind arrives in Phase 3. */
+/* Functional styles. */
 
 .main-window {
   font-family: system-ui, sans-serif;
@@ -7,41 +7,70 @@
   flex-direction: column;
   padding: 1rem;
   box-sizing: border-box;
+  gap: 1rem;
+}
+
+.main-window__header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  flex: 0 0 auto;
 }
 
 .main-window__header h1 {
   font-size: 1.25rem;
-  margin: 0 0 1rem;
+  margin: 0;
 }
 
-.main-window__content {
+.main-window__title-row {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  justify-content: space-between;
   gap: 1rem;
+}
+
+.main-window__toggle-transcript {
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+
+/*
+ * Resizable two-pane body (Phase 3). Notes editor (primary) + transcript pane
+ * (secondary, collapsible + resizable) via react-resizable-panels.
+ */
+.main-window__panes {
   flex: 1;
   min-height: 0;
 }
 
-/* Two-column layout introduced in Phase 2. */
-.main-window__content--columns {
-  flex-direction: row;
-  gap: 1rem;
-}
-
-.main-window__left-col {
-  flex: 1;
+.main-window__pane {
   display: flex;
   flex-direction: column;
-  gap: 1rem;
-  min-width: 0;
-}
-
-.main-window__right-col {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
   min-height: 0;
+  overflow: hidden;
+}
+
+.main-window__pane--notes {
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+}
+
+.main-window__pane--transcript {
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+}
+
+.main-window__resize-handle {
+  width: 6px;
+  background: #e0e0e0;
+  border-radius: 3px;
+  cursor: col-resize;
+  transition: background 120ms ease;
+}
+
+.main-window__resize-handle:hover,
+.main-window__resize-handle[data-resize-handle-active] {
+  background: #bdbdbd;
 }
 
 .main-window__controls {

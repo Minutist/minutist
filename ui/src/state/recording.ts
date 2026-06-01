@@ -10,10 +10,10 @@ import { commands, unwrap, ipcErrorMessage } from "../ipc/client";
 import type {
   RecordingState,
   AudioDevice,
-  AppEvent,
   Settings,
   Segment,
 } from "../ipc/bindings";
+import type { AppEvent } from "../ipc/app-event";
 import { useModelsStore } from "./models";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
@@ -32,6 +32,20 @@ export type RecordingStore = {
   lastError: string | null;
   /** Live transcript for the current recording session. Cleared when a new recording starts. */
   transcript: Segment[];
+  /**
+   * The live capture-sample, pause-**excluding** recording clock in ms — the
+   * same timeline as `Segment::start_ms`. Updated by `recording_clock` events
+   * (~5 Hz) and reset to `null` when recording stops (transition to
+   * idle/stopping).
+   *
+   * This is the ONLY valid source for notes paragraph anchors. Do NOT derive
+   * anchors from `Date.now() - started_at_ms`: that wall-clock delta is
+   * pause-including and drifts from the audio/transcript timeline (see
+   * `architecture/cross-cutting.md` — "Notes paragraph-anchor clock").
+   *
+   * `null` while idle (no recording in progress).
+   */
+  recordingClockMs: number | null;
 
   // actions
   refreshDevices: () => Promise<void>;
@@ -53,6 +67,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   meter: { peak: 0, rms: 0 },
   lastError: null,
   transcript: [],
+  recordingClockMs: null,
 
   refreshDevices: async () => {
     try {
@@ -152,15 +167,22 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     switch (event.kind) {
       case "state_changed":
         // Clear the live transcript when a new recording starts so the
-        // previous session's transcript is no longer shown.
+        // previous session's transcript is no longer shown. Reset the
+        // recording clock to null on any transition out of `recording`
+        // (idle/stopping/paused) so notes anchors stop stamping once
+        // capture is no longer advancing; the next `recording_clock`
+        // event re-populates it while recording or after resume.
         if (event.state.kind === "recording") {
           set({ state: event.state, transcript: [] });
         } else {
-          set({ state: event.state });
+          set({ state: event.state, recordingClockMs: null });
         }
         break;
       case "audio_meter":
         set({ meter: { peak: event.frame.peak, rms: event.frame.rms } });
+        break;
+      case "recording_clock":
+        set({ recordingClockMs: event.clock_ms });
         break;
       case "devices_changed":
         // Trigger a re-fetch; ignore the promise — fire and forget.

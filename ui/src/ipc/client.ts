@@ -8,15 +8,17 @@
 import { events, commands } from "./bindings";
 import type {
   AppEventPayload,
-  AppEvent,
   IpcError,
   Result,
 } from "./bindings";
+import type { AppEvent } from "./app-event";
 
 // Re-export the generated commands surface verbatim.
 export { commands };
 
-// Re-export types that callers commonly need.
+// Re-export types that callers commonly need. `AppEvent` is the webview-extended
+// union (generated variants + the not-yet-generated `recording_clock`), see
+// `./app-event`.
 export type { AppEventPayload, AppEvent, IpcError, Result };
 
 // ---------------------------------------------------------------------------
@@ -41,7 +43,9 @@ export async function listenAppEvents(
   callback: (event: AppEvent) => void,
 ): Promise<() => void> {
   return events.appEventPayload.listen((tauriEvent) => {
-    callback(tauriEvent.payload);
+    // The runtime payload may carry the `recording_clock` variant before the
+    // generated bindings include it; widen to the extended `AppEvent` union.
+    callback(tauriEvent.payload as AppEvent);
   });
 }
 

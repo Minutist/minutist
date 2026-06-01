@@ -416,6 +416,50 @@ in `MeetingControls` is disabled when `isAsrModelReady` is false; `ModelDownload
 sticky-bottom auto-scroll. `MainWindow` uses a two-column 50/50 layout (controls
 left, transcript right).
 
+**Phase 3 additions (Stream S2 — notes editor).**
+
+- **Notes editor (`ui/src/editor/`).** A Tiptap v3 WYSIWYG editor is the primary
+  view (`Editor.tsx`). It composes `StarterKit` (with `link: false`) +
+  `@tiptap/extension-link` + `@tiptap/extension-typography` + the
+  `@tiptap/extension-table` family + `tiptap-markdown` via
+  `extensions.ts::buildEditorExtensions`. Markdown-shortcut input rules
+  (StarterKit + Typography) transform while typing (FR-15/16/20).
+- **Paragraph-anchor extension (`ui/src/editor/paragraph-anchor.ts`).** A custom
+  Tiptap/ProseMirror extension that registers a nullable `data-anchor-ms`
+  attribute on the paragraph node and stamps it on the FIRST keystroke into a
+  paragraph, ONLY while `recordingState.kind === "recording"`, from the store's
+  `recordingClockMs` (the pause-**excluding** capture clock fed by
+  `AppEvent::RecordingClock`) — never `Date.now() - started_at_ms` (FR-19,
+  binding correction A4; see `cross-cutting.md` "Notes paragraph-anchor clock").
+  Already-anchored paragraphs are never re-stamped; split-created paragraphs
+  reset their inherited anchor so the next keystroke stamps fresh. The clock is
+  injected as an `AnchorClockSource`, decoupling the extension from the store.
+- **Autosave (`ui/src/editor/useAutosave.ts`).** Interval autosave
+  (`autosave_interval_secs`, default 5 s) plus flush-on-blur, persisting notes
+  through the `save_notes` IPC seam (`ui/src/ipc/notes.ts`). No-op when there is
+  no active recording / MeetingId (FR-18).
+- **HTML clipboard (`ui/src/editor/clipboard.ts`).** `buildClipboardPayload`
+  produces a `text/html` (+ `text/plain`) copy payload — a self-contained UTF-8
+  document with internal `data-anchor-ms` attributes stripped — so paste into
+  Word retains formatting (FR-17). The editor overrides copy/cut via ProseMirror
+  `editorProps.handleDOMEvents`.
+- **`MainWindow` (`ui/src/shell/`)** is now a collapsible AND resizable two-pane
+  layout via `react-resizable-panels` (FR-21): notes editor primary, transcript
+  pane secondary. A header toggle collapses/expands the transcript via the
+  panel's imperative handle; a `Separator` provides drag-resize. The Phase 2
+  two-column flex layout is replaced.
+- **`RecordingStore` additions.** Gains `recordingClockMs: number | null`,
+  updated by a new `recording_clock` event case and cleared to `null` on any
+  transition out of `recording` (idle/stopping). This is the sole anchor-clock
+  source.
+- **IPC seams (not yet in generated bindings).** `save_notes` / `load_notes`
+  commands and the `recording_clock` event are added on the backend by
+  Stream S3, which regenerates `bindings.ts` at integration. Until then the
+  editor calls the `ui/src/ipc/notes.ts` seam (dynamic `invoke`), and
+  `ui/src/ipc/app-event.ts` locally augments the generated `AppEvent` union with
+  the `recording_clock` variant — neither hand-edits the generated bindings
+  file (per `domain-ownership.md`).
+
 ## What lives where — quick reference
 
 - **Editing audio capture buffer size:** `audio-capture` crate.

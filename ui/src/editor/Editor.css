@@ -1,0 +1,100 @@
+/* Notes editor styles (Phase 3). */
+
+.notes-editor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.notes-editor .tiptap,
+.notes-editor__content {
+  flex: 1;
+  min-height: 0;
+  padding: 0.75rem;
+  outline: none;
+  font-family: system-ui, sans-serif;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.notes-editor__content h1 {
+  font-size: 1.6rem;
+  margin: 0.6em 0 0.3em;
+}
+
+.notes-editor__content h2 {
+  font-size: 1.35rem;
+  margin: 0.6em 0 0.3em;
+}
+
+.notes-editor__content h3 {
+  font-size: 1.15rem;
+  margin: 0.6em 0 0.3em;
+}
+
+.notes-editor__content p {
+  margin: 0.4em 0;
+}
+
+.notes-editor__content ul,
+.notes-editor__content ol {
+  padding-left: 1.5rem;
+  margin: 0.4em 0;
+}
+
+.notes-editor__content blockquote {
+  border-left: 3px solid #d0d0d0;
+  margin: 0.5em 0;
+  padding-left: 0.75rem;
+  color: #555;
+}
+
+.notes-editor__content pre {
+  background: #f4f4f4;
+  border-radius: 4px;
+  padding: 0.6rem 0.8rem;
+  overflow-x: auto;
+  font-family: ui-monospace, monospace;
+}
+
+.notes-editor__content code {
+  background: #f4f4f4;
+  border-radius: 3px;
+  padding: 0.05em 0.3em;
+  font-family: ui-monospace, monospace;
+}
+
+.notes-editor__content a {
+  color: #1565c0;
+  text-decoration: underline;
+}
+
+.notes-editor__content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5em 0;
+}
+
+.notes-editor__content th,
+.notes-editor__content td {
+  border: 1px solid #d0d0d0;
+  padding: 0.3rem 0.5rem;
+  text-align: left;
+}
+
+.notes-editor__content th {
+  background: #f4f4f4;
+  font-weight: 600;
+}
+
+/* The selectedCell decoration ProseMirror tables add during cell selection. */
+.notes-editor__content .selectedCell::after {
+  background: rgba(33, 150, 243, 0.15);
+  content: "";
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+  z-index: 2;
+}

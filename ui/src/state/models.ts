@@ -7,7 +7,8 @@
  */
 import { create } from "zustand";
 import { commands, unwrap } from "../ipc/client";
-import type { ModelStatus, AppEvent } from "../ipc/bindings";
+import type { ModelStatus } from "../ipc/bindings";
+import type { AppEvent } from "../ipc/app-event";
 
 export type { ModelStatus };
 

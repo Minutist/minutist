@@ -1124,6 +1124,177 @@ fn find_file_in_dir(
 }
 
 // ---------------------------------------------------------------------------
+// Offline re-transcribe (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// Re-run transcription over a fully-decoded PCM buffer, reusing the live
+/// pipeline's batched-VAD [`Accumulator`] + ASR-dispatch machinery.
+///
+/// This is the offline counterpart of [`run_drain_loop`]: instead of draining a
+/// live capture stream, it feeds an already-decoded `pcm` buffer (the
+/// pause-INCLUDING 16 kHz mono samples from
+/// `persistence::reader::read_audio_pcm`) through the **same** `VadChunker` →
+/// [`Accumulator`] → [`process_flush_with_backend`]-equivalent path. The 30 s
+/// encoder-window constraint and the silence-preservation rule therefore hold
+/// identically — the accumulator zero-pads inter-utterance gaps (capped at
+/// `MAX_GAP_MS`) exactly as the live path does.
+///
+/// Differences from the live path:
+/// - No flush queue / ASR worker thread: the work runs synchronously on the
+///   caller's `spawn_blocking` thread, one accumulator flush at a time, so the
+///   produced segments can be collected in order and returned to the caller for
+///   `transcript.json` rewrite + index upsert.
+/// - `AppEvent::TranscriptSegment` is emitted as each segment is produced
+///   (same event the live path emits), so the webview's transcript pane
+///   appends them live.
+///
+/// Feeds the buffer to the VAD in `BATCH_SAMPLES`-sized batches (matching the
+/// live path's batch granularity) so VAD frame alignment behaves the same.
+/// Returns all produced segments in start-time order.
+pub(crate) fn re_transcribe_buffer(
+    pcm: &[f32],
+    backend: &mut dyn AsrBackend,
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+) -> AppResult<Vec<Segment>> {
+    // Same VAD model + config the live path uses. If the VAD model is missing
+    // we cannot segment the audio, so re-transcribe yields no segments.
+    let model_path = vad_chunker::default_model_path();
+    let mut vad = VadChunker::open(&model_path, VadConfig::default()).map_err(|e| {
+        tracing::warn!(
+            target: "orchestrator",
+            "re_transcribe: VAD chunker unavailable ({e}); cannot segment audio"
+        );
+        e
+    })?;
+
+    let mut acc = Accumulator::new();
+    let mut produced: Vec<Segment> = Vec::new();
+
+    // 1600 samples = 100 ms at 16 kHz — the same batch granularity the live
+    // feeder uses, so VAD framing is identical to the live path.
+    const BATCH_SAMPLES: usize = 1600;
+    let mut start_ms = 0u64;
+    for chunk in pcm.chunks(BATCH_SAMPLES) {
+        let duration_ms = (chunk.len() as u64 * 1000) / SAMPLE_RATE_HZ;
+        match vad.process_samples(chunk, start_ms) {
+            Ok(events) => {
+                for ev in events {
+                    if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
+                        acc.append(start_ms, end_ms, &samples);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "orchestrator", "re_transcribe VAD error: {e}");
+            }
+        }
+        start_ms += duration_ms;
+
+        // Size-triggered flush, identical threshold to the live path.
+        if acc.duration_secs() >= FLUSH_MIN_SECS {
+            let (samples, vad_segments) = acc.drain();
+            transcribe_one_flush(
+                samples,
+                vad_segments,
+                backend,
+                event_tx,
+                meeting_id,
+                &mut produced,
+            )?;
+        }
+    }
+
+    // End-of-stream VAD flush closes any in-progress segment.
+    match vad.flush_end_of_stream() {
+        Ok(events) => {
+            for ev in events {
+                if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
+                    acc.append(start_ms, end_ms, &samples);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(target: "orchestrator", "re_transcribe flush_end_of_stream error: {e}");
+        }
+    }
+
+    // Final flush of whatever remains in the accumulator.
+    if !acc.is_empty() {
+        let (samples, vad_segments) = acc.drain();
+        transcribe_one_flush(
+            samples,
+            vad_segments,
+            backend,
+            event_tx,
+            meeting_id,
+            &mut produced,
+        )?;
+    }
+
+    Ok(produced)
+}
+
+/// Transcribe a single accumulator flush synchronously and append the produced
+/// segments to `out`, emitting an `AppEvent::TranscriptSegment` for each.
+///
+/// Mirrors [`process_flush_with_backend`] (same `AudioChunk` construction +
+/// proportional re-split) but collects the segments for the offline caller
+/// rather than queueing writer commands.
+fn transcribe_one_flush(
+    samples: Vec<f32>,
+    vad_segments: Vec<(u64, u64)>,
+    backend: &mut dyn AsrBackend,
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+    out: &mut Vec<Segment>,
+) -> AppResult<()> {
+    if vad_segments.is_empty() {
+        return Ok(());
+    }
+
+    let chunk = AudioChunk {
+        samples,
+        sample_rate: SAMPLE_RATE_HZ as u32,
+        start_ms: vad_segments.first().map(|(s, _)| *s).unwrap_or(0),
+        end_ms: vad_segments.last().map(|(_, e)| *e).unwrap_or(0),
+    };
+
+    let chunk_segments = backend.transcribe_chunk(&chunk)?;
+
+    let combined_text: String = chunk_segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let sub_segments = emit_segments_proportional(&combined_text, &vad_segments);
+
+    for seg in sub_segments {
+        let _ = event_tx.send(AppEvent::TranscriptSegment {
+            meeting_id,
+            segment: seg.clone(),
+        });
+        out.push(seg);
+    }
+
+    Ok(())
+}
+
+/// Resolve and construct the production `AsrRuntime` for the re-transcribe path.
+///
+/// Reuses the live-path model-resolution logic ([`init_asr_runtime`]): the ASR
+/// model must already be `Available` in the registry. Returns `Ok(None)` when
+/// the model is not available (the caller surfaces this as an error, since an
+/// explicit user-triggered re-transcribe with no model is a failure, unlike the
+/// live path's best-effort skip).
+pub(crate) async fn build_asr_runtime_for_retranscribe(
+    model_registry: &ModelRegistry,
+) -> AppResult<Option<AsrRuntime>> {
+    init_asr_runtime(model_registry).await
+}
+
+// ---------------------------------------------------------------------------
 // Proportional word allocation (Phase 2)
 // ---------------------------------------------------------------------------
 

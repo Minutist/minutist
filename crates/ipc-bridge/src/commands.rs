@@ -26,10 +26,13 @@
 //! Each command that needs the orchestrator or settings receives its handles
 //! as `tauri::State<'_, IpcState>`.
 
+use std::path::Path;
+
 use meeting_app_common::{
-    AppError, AudioDevice, MeetingId, MeetingMeta, ModelId, ModelStatus, RecordingState,
+    AppError, AudioDevice, MeetingId, MeetingListEntry, MeetingMeta, MeetingState, ModelId,
+    ModelStatus, RecordingState,
 };
-use persistence::NotesStore;
+use persistence::{meeting_ops, NotesStore};
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use specta::Type;
@@ -285,6 +288,128 @@ fn load_notes_inner(
 }
 
 // ---------------------------------------------------------------------------
+// Meeting list + open + actions (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// List all meetings for the meeting-list view (FR-33), most-recent first.
+///
+/// Reads straight from the libsql `index.db` ([`MeetingIndex::list_meetings`])
+/// — a cheap projection that never loads a meeting's full transcript. The index
+/// is async (libsql/tokio); the future is awaited here, never `block_on`'d.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_meetings(state: State<'_, IpcState>) -> Result<Vec<MeetingListEntry>, IpcError> {
+    state.index.list_meetings().await.map_err(IpcError::from)
+}
+
+/// Open a meeting, returning its full restorable [`MeetingState`]
+/// (metadata + transcript + optional notes).
+///
+/// Resolves the per-meeting folder under `IpcState::meetings_dir` and assembles
+/// the state via `persistence::read_meeting_state`. The blocking `std::fs` reads
+/// run on `spawn_blocking` per the threading model — the index is not consulted
+/// (the folder is authoritative for the full state).
+#[tauri::command]
+#[specta::specta]
+pub async fn open_meeting(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<MeetingState, IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || open_meeting_inner(&meetings_dir, meeting_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("open_meeting task join failed: {e}"),
+        })?
+        .map_err(IpcError::from)
+}
+
+/// Rename a meeting: updates `metadata.json` (authoritative) then the index row.
+///
+/// Routes to `persistence::meeting_ops::rename_meeting`, which keeps the on-disk
+/// folder and the index consistent (see `architecture/components.md`,
+/// `persistence` "Phase 4 surface growth — meeting ops").
+#[tauri::command]
+#[specta::specta]
+pub async fn rename_meeting(
+    meeting_id: MeetingId,
+    title: String,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    meeting_ops::rename_meeting(&state.meetings_dir, &state.index, meeting_id, &title)
+        .await
+        .map_err(IpcError::from)
+}
+
+/// Delete a meeting: removes the folder then the index row.
+///
+/// Routes to `persistence::meeting_ops::delete_meeting`.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_meeting(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    meeting_ops::delete_meeting(&state.meetings_dir, &state.index, meeting_id)
+        .await
+        .map_err(IpcError::from)
+}
+
+/// Re-run transcription for a meeting offline (FR-33 action).
+///
+/// Routes to `Orchestrator::re_transcribe`, which decodes the meeting audio and
+/// drives the same batched-VAD + ASR pipeline the live recorder uses, rewrites
+/// `transcript.json`, refreshes the index row, and emits
+/// `AppEvent::TranscriptSegment` events. Refused while a recording is in
+/// progress (the orchestrator returns `AppError::InvalidInput`). The index
+/// handle is shared from `IpcState` so the orchestrator need not own one.
+#[tauri::command]
+#[specta::specta]
+pub async fn re_transcribe(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    state
+        .orchestrator
+        .re_transcribe(&state.index, meeting_id)
+        .await
+        .map_err(IpcError::from)
+}
+
+/// Re-run summarisation for a meeting (FR-33 action) — **Phase 5 stub**.
+///
+/// The `summariser` crate (Phase 5) produces `summary.md` and emits
+/// `AppEvent::SummaryReady`. Until then this command returns
+/// `AppError::Unsupported` so the command surface + generated binding exist for
+/// Stream B's meeting-list action without a backing implementation.
+#[tauri::command]
+#[specta::specta]
+pub async fn re_summarise(
+    meeting_id: MeetingId,
+    _state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    tracing::info!(
+        target: "ipc-bridge",
+        meeting_id = %meeting_id.0,
+        "re_summarise requested; not yet implemented (Phase 5)"
+    );
+    Err(IpcError::from(AppError::Unsupported {
+        context: "re-summarise is not implemented until Phase 5".into(),
+    }))
+}
+
+/// Inner body of [`open_meeting`]: assemble the [`MeetingState`] from the
+/// meeting folder under `meetings_dir`. Extracted so it can be unit-tested
+/// without a Tauri runtime.
+fn open_meeting_inner(
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+) -> Result<MeetingState, AppError> {
+    let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
+    persistence::read_meeting_state(&meeting_dir)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -292,7 +417,7 @@ fn load_notes_inner(
 mod tests {
     use super::*;
     use meeting_app_common::MeetingId;
-    use persistence::MeetingFolder;
+    use persistence::{MeetingFolder, MeetingIndex};
     use tempfile::TempDir;
 
     /// `save_notes` → `load_notes` round-trip through a tempdir `meetings_dir`,
@@ -342,5 +467,177 @@ mod tests {
         let err = save_notes_inner(tempdir.path(), meeting_id, "not json", "")
             .expect_err("invalid JSON must error");
         assert!(matches!(err, AppError::InvalidInput { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 meeting list/open/rename/delete round-trips (no Tauri runtime,
+    // no model — a synthetic meeting folder + in-memory libsql index).
+    // -----------------------------------------------------------------------
+
+    use meeting_app_common::{AudioFormat, MeetingMeta, Segment};
+
+    /// Write a synthetic meeting folder (`metadata.json` + optional
+    /// `transcript.json`) under `root` and return its `MeetingId`. Mirrors the
+    /// on-disk layout `persistence` produces so the readers + index agree.
+    fn write_synthetic_meeting(
+        root: &Path,
+        title: &str,
+        started_at: &str,
+        first_segment_text: Option<&str>,
+    ) -> MeetingId {
+        let meeting_id = MeetingId::new();
+        let folder = MeetingFolder::create(root, meeting_id).expect("create meeting folder");
+
+        let meta = MeetingMeta {
+            uuid: meeting_id,
+            title: title.to_string(),
+            started_at: started_at.to_string(),
+            ended_at: Some(started_at.to_string()),
+            duration_ms: 60_000,
+            speaker_count: 1,
+            audio_format: AudioFormat {
+                codec: "opus".into(),
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate_kbps: Some(32),
+            },
+            asr_model: None,
+            llm_model: None,
+            diarizer: None,
+            app_version: "0.0.0".into(),
+        };
+        let meta_json = serde_json::to_vec_pretty(&meta).expect("serialise metadata");
+        std::fs::write(folder.metadata_path(), meta_json).expect("write metadata.json");
+
+        if let Some(text) = first_segment_text {
+            let segments = vec![Segment {
+                start_ms: 0,
+                end_ms: 1_000,
+                text: text.to_string(),
+                speaker_id: None,
+                confidence: None,
+                words: Vec::new(),
+            }];
+            let seg_json = serde_json::to_vec_pretty(&segments).expect("serialise transcript");
+            std::fs::write(folder.transcript_path(), seg_json).expect("write transcript.json");
+        }
+
+        meeting_id
+    }
+
+    /// Open an in-memory index seeded by rebuilding from the meeting folders.
+    async fn seeded_index(meetings_root: &Path) -> MeetingIndex {
+        let index = MeetingIndex::open(":memory:")
+            .await
+            .expect("open in-memory index");
+        index
+            .rebuild_from_disk(meetings_root)
+            .await
+            .expect("rebuild index from disk");
+        index
+    }
+
+    /// `list_meetings` returns every indexed meeting, most-recent first, with the
+    /// first transcript segment as the excerpt.
+    #[tokio::test]
+    async fn list_meetings_returns_indexed_rows_most_recent_first() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+
+        let _older = write_synthetic_meeting(
+            root,
+            "Older meeting",
+            "2026-06-01T09:00:00Z",
+            Some("older excerpt"),
+        );
+        let _newer = write_synthetic_meeting(
+            root,
+            "Newer meeting",
+            "2026-06-02T09:00:00Z",
+            Some("newer excerpt"),
+        );
+
+        let index = seeded_index(root).await;
+        let rows = index.list_meetings().await.expect("list_meetings");
+
+        assert_eq!(rows.len(), 2, "both meetings must be indexed");
+        assert_eq!(rows[0].title, "Newer meeting", "most-recent first");
+        assert_eq!(rows[0].excerpt.as_deref(), Some("newer excerpt"));
+        assert_eq!(rows[1].title, "Older meeting");
+    }
+
+    /// `open_meeting_inner` assembles a `MeetingState` matching what was written
+    /// to the synthetic folder (metadata + transcript; no notes saved → None).
+    #[test]
+    fn open_meeting_returns_meeting_state_matching_disk() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Launch sync", "2026-06-02T10:00:00Z", Some("hello world"));
+
+        let state = open_meeting_inner(root, meeting_id).expect("open_meeting");
+
+        assert_eq!(state.meta.uuid, meeting_id);
+        assert_eq!(state.meta.title, "Launch sync");
+        assert_eq!(state.transcript.len(), 1);
+        assert_eq!(state.transcript[0].text, "hello world");
+        assert!(state.notes.is_none(), "no notes saved → None");
+    }
+
+    /// `open_meeting_inner` errors for a meeting folder that does not exist.
+    #[test]
+    fn open_meeting_errors_for_missing_meeting() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let missing = MeetingId::new();
+        let err = open_meeting_inner(tempdir.path(), missing).expect_err("missing meeting must error");
+        assert!(matches!(err, AppError::Io { .. }));
+    }
+
+    /// `rename_meeting` rewrites `metadata.json` and refreshes the index row so a
+    /// subsequent `list_meetings` shows the new title.
+    #[tokio::test]
+    async fn rename_meeting_updates_disk_and_index() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Old title", "2026-06-02T11:00:00Z", Some("excerpt"));
+
+        let index = seeded_index(root).await;
+        meeting_ops::rename_meeting(root, &index, meeting_id, "New title")
+            .await
+            .expect("rename");
+
+        // On-disk metadata reflects the new title.
+        let meeting_dir = root.join(meeting_id.0.to_string());
+        let meta = persistence::read_metadata(&meeting_dir).expect("read metadata");
+        assert_eq!(meta.title, "New title");
+
+        // Index row reflects the new title.
+        let rows = index.list_meetings().await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "New title");
+    }
+
+    /// `delete_meeting` removes the on-disk folder and the index row.
+    #[tokio::test]
+    async fn delete_meeting_removes_folder_and_index_row() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Doomed", "2026-06-02T12:00:00Z", Some("excerpt"));
+
+        let index = seeded_index(root).await;
+        assert_eq!(index.list_meetings().await.expect("list").len(), 1);
+
+        meeting_ops::delete_meeting(root, &index, meeting_id)
+            .await
+            .expect("delete");
+
+        let meeting_dir = root.join(meeting_id.0.to_string());
+        assert!(!meeting_dir.exists(), "folder must be removed");
+        assert!(
+            index.list_meetings().await.expect("list").is_empty(),
+            "index row must be removed"
+        );
     }
 }

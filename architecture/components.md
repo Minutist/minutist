@@ -266,6 +266,13 @@ transcript/notes/summary storage are Phase 4.
 
 **Phase 2 surface growth:** `TranscriptWriter` writes `transcript.json` (JSON array of `Segment`) per meeting. Flushed on each ASR-worker return so a crash mid-recording loses at most one flush's worth of transcript.
 
+**Phase 4 surface growth — `write_transcript(meeting_dir, &[Segment])`.** A free
+function (in the `transcript` module) that rewrites `transcript.json` wholesale
+from a slice, atomically (tmp + fsync + rename), for the Phase-4 offline
+re-transcribe path (`orchestrator::re_transcribe`). An empty slice removes any
+existing `transcript.json` rather than writing `[]`, preserving the
+"absent-means-empty" invariant `TranscriptWriter` already honours.
+
 **Phase 3 surface growth — notes.** `NotesStore` is a standalone, stateless
 reader/writer for `notes.json` + `notes.md`, **independent of `MeetingWriter`**:
 there is no shared open file handle. `MeetingWriter` owns `audio.opus` /
@@ -384,6 +391,30 @@ anchors from this event — see `cross-cutting.md` "Notes paragraph-anchor clock
 This is purely an additional event emission; the live pipeline wiring is
 unchanged.
 
+**Phase 4 — `Orchestrator::re_transcribe(&MeetingIndex, MeetingId)`.** The
+offline re-run of transcription for a previously-recorded meeting (FR-33). It
+refuses unless the recorder is `Idle` (returns `AppError::InvalidInput`) — an
+offline re-transcribe must not contend with the live pipeline for the ASR model.
+It decodes the meeting's `audio.opus` to the pause-INCLUDING 16 kHz mono PCM via
+`persistence::reader::read_audio_pcm`, then **reuses the live runner's batched-VAD
+machinery**: the same `VadChunker` + `Accumulator` (zero-padded, `MAX_GAP_MS`-capped
+silence preservation) + the same `FLUSH_MIN_SECS` size-trigger + the same
+proportional re-split (`emit_segments_proportional`) and the same `AsrRuntime`
+resolution path (`init_asr_runtime` → model-registry `ensure`) the live worker
+uses (`runner::re_transcribe_buffer`). The 30 s encoder-window constraint and the
+silence-preservation rule therefore hold identically; the accumulator code is not
+re-implemented. Differences from the live path: no flush queue / ASR-worker
+thread — the work runs synchronously on one `spawn_blocking` thread, one
+accumulator flush at a time, so segments can be collected in order. As segments
+are produced it emits `AppEvent::TranscriptSegment` (the same event the live path
+emits), rewrites `transcript.json` via `persistence::write_transcript` (atomic
+tmp+rename; an empty result removes the file), and refreshes the index row
+(`MeetingIndex::upsert`) so the meeting-list excerpt reflects the new first
+segment. Unlike the live path's best-effort skip when no model is present, an
+explicit user-triggered re-transcribe with no available model is an error
+(`AppError::ModelLoad`). The orchestrator does not own a `MeetingIndex`; the
+index handle is passed in by `ipc-bridge` (which owns it in `IpcState`).
+
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration
@@ -445,6 +476,40 @@ notes_markdown: String }`) because a bare `serde_json::Value` does not derive
 `specta::Type`; `save_notes` parses the string to a `serde_json::Value` before
 handing it to `NotesStore` and `load_notes` re-serialises the loaded value back
 to a string.
+
+**Phase 4 additions (18 commands total) — meeting list / open / actions.** Six
+commands back the meeting-list view (FR-33):
+
+- `list_meetings() -> Vec<MeetingListEntry>` — queries the shared libsql index
+  (`MeetingIndex::list_meetings`, most-recent first).
+- `open_meeting(meeting_id) -> MeetingState` — assembles the restore payload via
+  `persistence::read_meeting_state` (blocking folder reads on `spawn_blocking`);
+  the index is **not** consulted (the folder is authoritative for full state).
+- `rename_meeting(meeting_id, title) -> ()` and
+  `delete_meeting(meeting_id) -> ()` — route to
+  `persistence::meeting_ops::{rename_meeting, delete_meeting}`, which keep the
+  on-disk folder and the index row consistent.
+- `re_transcribe(meeting_id) -> ()` — the **only** Phase-4 read/action command
+  that routes through the orchestrator (`Orchestrator::re_transcribe`): an
+  offline re-run of the live ASR pipeline (see `orchestrator` below). The shared
+  `IpcState::index` handle is passed into the call so the orchestrator refreshes
+  the index row without owning an index of its own.
+- `re_summarise(meeting_id) -> ()` — a Phase-4 **stub** returning
+  `AppError::Unsupported`; Phase 5's `summariser` fills it in (it will produce
+  `summary.md` and emit `AppEvent::SummaryReady`).
+
+`IpcState` gains `index_db_path: PathBuf` (resolved by `app-main` via
+`persistence::index::index_db_path`) and `index: Arc<MeetingIndex>` — a single
+libsql connection opened **once** at startup. libsql's index methods are
+`async fn`; the command handlers `await` them and never `block_on` (the
+no-`block_on`-in-command-handlers rule). The index is opened (and rebuilt from
+disk) at startup by the `ipc_bridge::open_meeting_index` helper, which `app-main`
+calls — keeping the `persistence` edge inside `ipc-bridge` so `app-main` does not
+acquire a direct `persistence` dependency. That helper drives libsql's async
+`open` + `rebuild_from_disk` on a one-shot `block_on` (startup-only; the
+no-`block_on` rule binds command handlers, not bootstrap). `MeetingListEntry` /
+`MeetingState` are the canonical `common` types (Phase-4 precursors), so the
+generated bindings consume them directly with no mirror.
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name

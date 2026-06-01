@@ -17,12 +17,72 @@
 //! succeed.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use meeting_app_common::{AppResult, Segment};
 
 use crate::error::Error;
 use crate::folder::MeetingFolder;
+
+/// Rewrite `transcript.json` in `meeting_dir` from `segments`.
+///
+/// The Phase-4 re-transcribe entry point: replaces the file's contents wholesale
+/// (the same replace-not-append semantics as [`TranscriptWriter::flush`]). The
+/// write is atomic (write to a sibling `transcript.json.tmp`, fsync, rename into
+/// place), matching the durability of the notes/summary/metadata writers, so a
+/// crash mid-rewrite never leaves a half-written `transcript.json`.
+///
+/// An **empty** `segments` slice removes any existing `transcript.json` rather
+/// than writing `[]`, preserving the crate-wide invariant that a zero-segment
+/// meeting has no transcript file (see [`TranscriptWriter`]).
+///
+/// `meeting_dir` is the `{root}/{uuid}/` folder; it must already exist.
+pub fn write_transcript(meeting_dir: &Path, segments: &[Segment]) -> AppResult<()> {
+    Ok(write_transcript_inner(meeting_dir, segments)?)
+}
+
+fn write_transcript_inner(meeting_dir: &Path, segments: &[Segment]) -> Result<(), Error> {
+    let path = meeting_dir.join("transcript.json");
+
+    if segments.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+        return Ok(());
+    }
+
+    let tmp_path = meeting_dir.join("transcript.json.tmp");
+    let json = serde_json::to_vec_pretty(segments).map_err(Error::Serialise)?;
+
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(&json)?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::Io(e));
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, &path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(Error::Io(e));
+    }
+
+    tracing::info!(
+        target: "persistence",
+        path = %path.display(),
+        segments = segments.len(),
+        "transcript.json rewritten"
+    );
+
+    Ok(())
+}
 
 /// Buffered, append-on-flush writer for `transcript.json`.
 ///

@@ -61,7 +61,7 @@ pub use index::MeetingIndex;
 pub use notes::{NotesData, NotesStore};
 pub use reader::{read_audio_pcm, read_meeting_state, read_metadata, read_transcript};
 pub use summary::{read_summary, write_summary};
-pub use transcript::TranscriptWriter;
+pub use transcript::{write_transcript, TranscriptWriter};
 pub use writer::MeetingWriter;
 
 #[cfg(test)]

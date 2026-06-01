@@ -173,6 +173,100 @@ async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDoc | null, IpcError
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * List all meetings for the meeting-list view (FR-33), most-recent first.
+ * 
+ * Reads straight from the libsql `index.db` ([`MeetingIndex::list_meetings`])
+ * — a cheap projection that never loads a meeting's full transcript. The index
+ * is async (libsql/tokio); the future is awaited here, never `block_on`'d.
+ */
+async listMeetings() : Promise<Result<MeetingListEntry[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_meetings") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open a meeting, returning its full restorable [`MeetingState`]
+ * (metadata + transcript + optional notes).
+ * 
+ * Resolves the per-meeting folder under `IpcState::meetings_dir` and assembles
+ * the state via `persistence::read_meeting_state`. The blocking `std::fs` reads
+ * run on `spawn_blocking` per the threading model — the index is not consulted
+ * (the folder is authoritative for the full state).
+ */
+async openMeeting(meetingId: MeetingId) : Promise<Result<MeetingState, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_meeting", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Rename a meeting: updates `metadata.json` (authoritative) then the index row.
+ * 
+ * Routes to `persistence::meeting_ops::rename_meeting`, which keeps the on-disk
+ * folder and the index consistent (see `architecture/components.md`,
+ * `persistence` "Phase 4 surface growth — meeting ops").
+ */
+async renameMeeting(meetingId: MeetingId, title: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rename_meeting", { meetingId, title }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Delete a meeting: removes the folder then the index row.
+ * 
+ * Routes to `persistence::meeting_ops::delete_meeting`.
+ */
+async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_meeting", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-run transcription for a meeting offline (FR-33 action).
+ * 
+ * Routes to `Orchestrator::re_transcribe`, which decodes the meeting audio and
+ * drives the same batched-VAD + ASR pipeline the live recorder uses, rewrites
+ * `transcript.json`, refreshes the index row, and emits
+ * `AppEvent::TranscriptSegment` events. Refused while a recording is in
+ * progress (the orchestrator returns `AppError::InvalidInput`). The index
+ * handle is shared from `IpcState` so the orchestrator need not own one.
+ */
+async reTranscribe(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("re_transcribe", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Re-run summarisation for a meeting (FR-33 action) — **Phase 5 stub**.
+ * 
+ * The `summariser` crate (Phase 5) produces `summary.md` and emits
+ * `AppEvent::SummaryReady`. Until then this command returns
+ * `AppError::Unsupported` so the command surface + generated binding exist for
+ * Stream B's meeting-list action without a backing implementation.
+ */
+async reSummarise(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("re_summarise", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -304,12 +398,31 @@ export type IpcError = { code: "io"; context: string } | { code: "model_load"; m
  */
 export type MeetingId = string
 /**
+ * A summary row for the meeting-list view (FR-33). Cheap to query from the
+ * `persistence` index without loading a meeting's full transcript.
+ */
+export type MeetingListEntry = { id: MeetingId; title: string; 
+/**
+ * RFC3339 start timestamp (wall-clock), mirroring `MeetingMeta::started_at`.
+ */
+started_at: string; duration_ms: number; speaker_count: number; 
+/**
+ * Short transcript excerpt for the list preview, when available.
+ */
+excerpt?: string | null }
+/**
  * Per-meeting metadata persisted as `metadata.json`.
  * 
  * Timestamps are ISO 8601 strings to avoid pulling `chrono` into `common`.
  * Consumers parse as needed.
  */
 export type MeetingMeta = { uuid: MeetingId; title: string; started_at: string; ended_at: string | null; duration_ms: number; speaker_count: number; audio_format: AudioFormat; asr_model: ModelDescriptor | null; llm_model: ModelDescriptor | null; diarizer: ModelDescriptor | null; app_version: string }
+/**
+ * The full restorable state of a meeting, assembled by `persistence` for
+ * `open_meeting`: metadata, transcript segments, and the notes document
+ * (absent when the meeting has no saved notes yet).
+ */
+export type MeetingState = { meta: MeetingMeta; transcript: Segment[]; notes?: NotesDocument | null }
 export type ModelDescriptor = { name: string; quantisation: string | null; version: string }
 /**
  * Stable identifier for a model in the registry.
@@ -362,6 +475,16 @@ export type ModelStatusState =
  * Rust-side Tiptap model.
  */
 export type NotesDoc = { notes_json: string; notes_markdown: string }
+/**
+ * The notes document as it crosses the IPC boundary.
+ * 
+ * `notes_json` is the Tiptap document serialised to a JSON **string** —
+ * `serde_json::Value` does not derive `specta::Type`, so the opaque document
+ * rides the wire as a string and the webview owns its (de)serialisation.
+ * `persistence` stores it verbatim (the transcript-chip opacity guarantee).
+ * This is the canonical wire-facing notes carrier; `ipc-bridge` re-uses it.
+ */
+export type NotesDocument = { notes_json: string; notes_markdown: string }
 /**
  * Top-level state of the recording pipeline. Emitted to the webview on
  * transitions via `AppEvent::StateChanged`.

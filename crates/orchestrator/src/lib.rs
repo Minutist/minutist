@@ -50,11 +50,11 @@ use std::sync::Arc;
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
 use meeting_app_common::{
-    AppError, AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, ModelId, ModelStatus,
-    RecordingState,
+    AppError, AppEvent, AppResult, AudioFormat, MeetingId, MeetingListEntry, MeetingMeta, ModelId,
+    ModelStatus, RecordingState, Segment,
 };
 use model_registry::ModelRegistry;
-use persistence::MeetingWriter;
+use persistence::{MeetingIndex, MeetingWriter};
 use settings::SettingsHandle;
 use state::{
     transition_idle, transition_pause, transition_resume, transition_start, transition_stop,
@@ -414,6 +414,123 @@ impl Orchestrator {
     /// Return a snapshot of the current recording state.
     pub async fn state(&self) -> RecordingState {
         self.inner.lock().await.state.as_public()
+    }
+
+    /// Re-run transcription for a previously-recorded meeting offline.
+    ///
+    /// Decodes the meeting's `audio.opus` (pause-INCLUDING 16 kHz mono PCM via
+    /// `persistence::reader::read_audio_pcm`) and runs it through the **same**
+    /// batched-VAD accumulator + `AsrBackend` machinery the live pipeline uses
+    /// (`runner::re_transcribe_buffer`), so the 30 s encoder window and the
+    /// silence-preservation constraint hold identically. The refreshed
+    /// transcript replaces `transcript.json`; `AppEvent::TranscriptSegment`
+    /// events are emitted as segments are produced, and the supplied
+    /// [`MeetingIndex`] row is refreshed (`upsert`) so the meeting-list excerpt
+    /// reflects the new first segment. The heavy decode + inference runs on
+    /// `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// - `AppError::InvalidInput` if a recording is in progress (state is not
+    ///   `Idle`) — re-transcribe is an offline operation and must not contend
+    ///   with the live pipeline for the ASR model.
+    /// - `AppError::ModelLoad` / `AppError::Inference` if the ASR model is not
+    ///   available or fails to load (unlike the live path's best-effort skip, an
+    ///   explicit user-triggered re-transcribe with no model is an error).
+    pub async fn re_transcribe(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
+        // Refuse unless Idle — re-transcribe must not run while the live
+        // pipeline holds the ASR model.
+        {
+            let guard = self.inner.lock().await;
+            if !matches!(guard.state, InternalState::Idle) {
+                return Err(AppError::InvalidInput {
+                    context: "re_transcribe requires the recorder to be Idle".into(),
+                });
+            }
+        }
+
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        // Decode audio + run VAD + ASR on a blocking thread. Build the ASR
+        // backend inside the blocking closure so the heavy model load is off the
+        // async worker threads. The model is resolved via the same registry path
+        // the live pipeline uses.
+        let registry = Arc::clone(&self.model_registry);
+        let event_tx = self.event_tx.clone();
+        let meeting_dir_for_blocking = meeting_dir.clone();
+
+        let segments: Vec<Segment> = tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
+            // Decode pause-INCLUDING PCM.
+            let pcm = persistence::read_audio_pcm(&meeting_dir_for_blocking)?;
+
+            // Build the production AsrRuntime. `init_asr_runtime` is async; drive
+            // it on a current-thread runtime inside this blocking context (the
+            // same approach the ASR worker uses). Model resolution itself is the
+            // only async step.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| AppError::Internal {
+                    context: format!("re_transcribe runtime build failed: {e}"),
+                })?;
+
+            let mut runtime = match rt.block_on(runner::build_asr_runtime_for_retranscribe(&registry))? {
+                Some(r) => r,
+                None => {
+                    return Err(AppError::ModelLoad {
+                        model_id: "qwen3-asr-0.6b-q8_0".into(),
+                        context: "ASR model not available; cannot re-transcribe".into(),
+                    });
+                }
+            };
+
+            runner::re_transcribe_buffer(&pcm, &mut runtime, &event_tx, meeting_id)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("re_transcribe spawn_blocking join failed: {e}"),
+        })??;
+
+        // Rewrite transcript.json from the refreshed segments (blocking fs).
+        let meeting_dir_for_write = meeting_dir.clone();
+        let segments_for_write = segments.clone();
+        tokio::task::spawn_blocking(move || -> AppResult<()> {
+            persistence::write_transcript(&meeting_dir_for_write, &segments_for_write)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("re_transcribe transcript write join failed: {e}"),
+        })??;
+
+        // Refresh the index row so the list excerpt reflects the new transcript.
+        let meeting_dir_for_meta = meeting_dir.clone();
+        let entry: MeetingListEntry = tokio::task::spawn_blocking(move || -> AppResult<MeetingListEntry> {
+            let meta = persistence::read_metadata(&meeting_dir_for_meta)?;
+            let transcript = persistence::read_transcript(&meeting_dir_for_meta)?;
+            Ok(MeetingListEntry {
+                id: meta.uuid,
+                title: meta.title,
+                started_at: meta.started_at,
+                duration_ms: meta.duration_ms,
+                speaker_count: meta.speaker_count,
+                excerpt: transcript.first().map(|s| s.text.clone()),
+            })
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("re_transcribe metadata read join failed: {e}"),
+        })??;
+
+        index.upsert(&entry).await?;
+
+        tracing::info!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            segments = segments.len(),
+            "re_transcribe completed"
+        );
+
+        Ok(())
     }
 
     /// Enumerate available audio-input devices.

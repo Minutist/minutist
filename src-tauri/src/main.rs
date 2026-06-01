@@ -223,7 +223,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
             // Construct the orchestrator sharing the same event bus. Clone the
             // meetings dir first so the IPC state can route `save_notes` /
-            // `load_notes` directly to `persistence::NotesStore` against the
+            // `load_notes` / `open_meeting` directly to `persistence` against the
             // same root the orchestrator/persistence use.
             let notes_meetings_dir = meetings_dir.clone();
             let orchestrator = Arc::new(orchestrator::Orchestrator::with_event_tx(
@@ -235,6 +235,20 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
             tracing::info!(target: "app-main", "orchestrator constructed");
 
+            // Open the libsql meeting index (`{app-data}/index.db`) via the
+            // `ipc-bridge` helper (which owns the `persistence` dependency — see
+            // the dependency table in architecture/components.md; app-main does
+            // not depend on `persistence` directly). libsql is async; `setup` is
+            // not a command handler, so the helper's one-shot block_on at startup
+            // is acceptable (the no-block_on rule binds command handlers, not
+            // bootstrap). The index is a derived cache — the helper rebuilds it
+            // from the per-meeting folders on startup so it converges even if a
+            // prior run crashed between a folder write and the index update.
+            let (index_db_path, index) =
+                ipc_bridge::open_meeting_index(&app_data_dir, &notes_meetings_dir);
+
+            tracing::info!(target: "app-main", "meeting index opened");
+
             // Spawn the event forwarder so orchestrator events reach the webview.
             spawn_event_forwarder(orchestrator.clone(), app_handle.clone());
 
@@ -243,6 +257,8 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 orchestrator: orchestrator.clone(),
                 settings: settings_handle,
                 meetings_dir: notes_meetings_dir,
+                index_db_path,
+                index,
             });
 
             // Build the tray icon.

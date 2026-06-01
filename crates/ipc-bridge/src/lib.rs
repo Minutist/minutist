@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (12 total)
+//! ## Commands (18 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -20,6 +20,12 @@
 //! | `ensure_model` | `()` | 2 |
 //! | `save_notes` | `()` | 3 |
 //! | `load_notes` | `Option<NotesDoc>` | 3 |
+//! | `list_meetings` | `Vec<MeetingListEntry>` | 4 |
+//! | `open_meeting` | `MeetingState` | 4 |
+//! | `rename_meeting` | `()` | 4 |
+//! | `delete_meeting` | `()` | 4 |
+//! | `re_transcribe` | `()` | 4 |
+//! | `re_summarise` | `()` (stub → `Unsupported`) | 4 |
 //!
 //! All commands return `Result<T, IpcError>`.
 //!
@@ -27,6 +33,12 @@
 //! against `IpcState::meetings_dir`, bypassing the orchestrator: notes I/O is
 //! independent of the live recording pipeline and may run concurrently with an
 //! active recording.
+//!
+//! The Phase-4 read/action commands route directly to `persistence`
+//! (`list_meetings` / `rename_meeting` / `delete_meeting` via the shared
+//! `IpcState::index`; `open_meeting` via `read_meeting_state`), except
+//! `re_transcribe`, which routes to `Orchestrator::re_transcribe` (offline
+//! re-run of the live ASR pipeline) and `re_summarise`, a Phase-5 stub.
 //!
 //! ## Specta types
 //!
@@ -54,6 +66,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use orchestrator::Orchestrator;
+use persistence::MeetingIndex;
 use settings::SettingsHandle;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
@@ -72,11 +85,72 @@ pub struct IpcState {
     pub settings: SettingsHandle,
     /// Root of the per-meeting folders (`{app-data}/meetings/`). The same
     /// directory `orchestrator` / `persistence` use. `save_notes` /
-    /// `load_notes` route directly to `persistence::NotesStore` against this
-    /// root, bypassing the orchestrator (notes I/O is independent of the
+    /// `load_notes` / `open_meeting` route directly to `persistence` against
+    /// this root, bypassing the orchestrator (folder I/O is independent of the
     /// recording pipeline — see `architecture/components.md`, `persistence`
-    /// "Phase 3 surface growth — notes").
+    /// "Phase 3 surface growth — notes" and "Phase 4 surface growth").
     pub meetings_dir: PathBuf,
+    /// Path to the libsql `index.db` (`{app-data}/index.db`), resolved by
+    /// `app-main` via `persistence::index::index_db_path`. Retained for
+    /// diagnostics / rebuild; the live query handle is [`Self::index`].
+    pub index_db_path: PathBuf,
+    /// The shared, already-open libsql meeting index. Opened once by `app-main`
+    /// (libsql is async, so `open` is awaited at startup) and shared here so the
+    /// Phase-4 meeting commands (`list_meetings`, `rename_meeting`,
+    /// `delete_meeting`, and the index-upsert side of `re_transcribe`) query a
+    /// single connection without re-opening per command. The index methods are
+    /// `async fn` and are awaited in the command handlers — never `block_on`'d.
+    pub index: Arc<MeetingIndex>,
+}
+
+// ---------------------------------------------------------------------------
+// Meeting-index bootstrap helper
+// ---------------------------------------------------------------------------
+
+/// Open the libsql meeting index and rebuild it from disk, for `app-main` to
+/// inject into [`IpcState`].
+///
+/// Resolves `index.db` under `app_data_root` via
+/// `persistence::index::index_db_path`, opens the index (running its forward-only
+/// migrations), and rebuilds it from the per-meeting folders under
+/// `meetings_root` (the index is a derived cache, so a startup rebuild makes it
+/// converge even after a crash between a folder write and an index update).
+///
+/// libsql is async; this helper drives the open + rebuild on
+/// `tauri::async_runtime::block_on`. It is **startup-only** — the no-`block_on`
+/// rule binds Tauri command handlers, not bootstrap. Keeping the helper here
+/// (rather than in `app-main`) preserves the dependency table: `ipc-bridge`
+/// owns the `persistence` edge, `app-main` does not.
+///
+/// A rebuild failure is logged and swallowed (the existing index is kept) so a
+/// single unreadable folder never blocks startup.
+pub fn open_meeting_index(
+    app_data_root: &std::path::Path,
+    meetings_root: &std::path::Path,
+) -> (PathBuf, Arc<MeetingIndex>) {
+    let index_db_path = persistence::index::index_db_path(app_data_root);
+    let meetings_root = meetings_root.to_path_buf();
+    let db_path = index_db_path.clone();
+
+    let index = tauri::async_runtime::block_on(async move {
+        let index = MeetingIndex::open(&db_path)
+            .await
+            .expect("failed to open index.db");
+        match index.rebuild_from_disk(&meetings_root).await {
+            Ok(n) => tracing::info!(
+                target: "ipc-bridge",
+                indexed = n,
+                "index.db rebuilt from disk on startup"
+            ),
+            Err(e) => tracing::warn!(
+                target: "ipc-bridge",
+                "index.db rebuild on startup failed: {e}; continuing with existing index"
+            ),
+        }
+        Arc::new(index)
+    });
+
+    (index_db_path, index)
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +195,12 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::ensure_model,
             commands::save_notes,
             commands::load_notes,
+            commands::list_meetings,
+            commands::open_meeting,
+            commands::rename_meeting,
+            commands::delete_meeting,
+            commands::re_transcribe,
+            commands::re_summarise,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -134,21 +214,21 @@ mod tests {
     use super::*;
     use tauri_specta::Event;
 
-    /// Verify that `bindings_builder()` produces a builder with all 12 commands
-    /// registered, by inspecting the TypeScript export.
+    /// Verify that `bindings_builder()` produces a builder with the full command
+    /// surface registered, by inspecting the TypeScript export.
     ///
     /// tauri-specta rc.21 does not expose the internal command list publicly.
     /// We use `export_str` to generate the TypeScript bindings string and scan
     /// it for each expected command name.  Each command appears in the TS
     /// as a string literal in the `invoke` call.
     ///
-    /// Command-count ledger: P1 8 → P2 10 → P3 12.
+    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18.
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
     /// than erroring.  This matches the Handy project's pattern per Phase 1
     #[test]
-    fn bindings_builder_registers_all_commands() {
+    fn bindings_builder_registers_expected_command_ledger() {
         use specta_typescript::{BigIntExportBehavior, Typescript};
 
         let builder = bindings_builder();
@@ -170,9 +250,15 @@ mod tests {
             "ensure_model",
             "save_notes",
             "load_notes",
+            "list_meetings",
+            "open_meeting",
+            "rename_meeting",
+            "delete_meeting",
+            "re_transcribe",
+            "re_summarise",
         ];
 
-        assert_eq!(expected.len(), 12, "command ledger must be 12 in Phase 3");
+        assert_eq!(expected.len(), 18, "command ledger must be 18 in Phase 4");
 
         for name in &expected {
             assert!(

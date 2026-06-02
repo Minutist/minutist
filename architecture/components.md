@@ -193,6 +193,25 @@ normalise to first-seen-order labels (`A`, `B`, …) before populating
 `Segment::speaker_id`. The binding's `eyre::Result` is mapped to
 `common::AppError::Inference` at the trait boundary.
 
+**Phase 6 — public surface + model bundle (license-verified 2026-06).** The
+crate exposes `SherpaDiarizer::open(seg_onnx, emb_onnx, DiarizerConfig)` and
+`impl Diarizer` (`assign_speakers(audio, sample_rate=16000, &mut [Segment])`),
+which runs sherpa `Diarize::compute`, relabels first-seen `A`/`B`/…, and
+overlays `speaker_id` onto the ASR segments by max-overlap interval-join (no
+`common::SpeakerTurn` type — overlay only). It takes RESOLVED model paths and
+depends only on `common` + `model-registry` (NOT `persistence`). Bundled models
+(settings-selectable via `model-registry`): **segmentation =
+pyannote/segmentation-3.0 (MIT)**; **embedding = 3D-Speaker CAM++ zh-cn
+16k-common (Apache-2.0, Alibaba in-house corpus — NOT VoxCeleb)**. This corrects
+Spike-4's TitaNet, which is VoxCeleb-trained and not cleanly redistributable in
+a paid product; ERes2NetV2 (same license) is the
+swap-in accuracy upgrade. The orchestrator owns the lifecycle: it builds the
+diarizer (resolving both model dirs via `model-registry`), runs the on-stop pass
+(gated on `settings.diarization_enabled`, default off) and the `rediarize`
+re-pass, and emits `AppEvent::DiarizationComplete` on its shared bus. Ship the
+MIT + Apache NOTICE/attribution (the k2-fsa / HF mirrors don't carry the
+upstream notices).
+
 ### `summariser`
 **Crate:** `crates/summariser`
 **Owns:** llama-cpp-2 text-LLM lifecycle, summarisation prompts, the

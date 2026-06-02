@@ -9,6 +9,7 @@ members = [
     "crates/model-registry",
     "crates/asr-runtime",
     "crates/summariser",
+    "crates/diarizer",
     "crates/orchestrator",
     "crates/ipc-bridge",
     "src-tauri",
@@ -97,3 +98,11 @@ crossbeam-channel = "0.5"
 # is a derived cache, rebuildable from the per-meeting folders on disk (see
 # cross-cutting.md — Filesystem layout).
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
+
+# Phase 6 additions
+# sherpa-rs (Thewh1teagle binding to sherpa-onnx) for opt-in offline speaker
+# diarization, used by `diarizer`. =0.6.8 → sherpa-rs-sys 0.6.7 pins sherpa-onnx
+# v1.12.9 (Spike 4). `download-binaries` fetches the matching prebuilt
+# sherpa-onnx libs; default features (tts etc.) disabled. The static-bundle
+# feature is a Phase-7 concern. Pinned EXACT; bumping is a coordinated change.
+sherpa-rs = { version = "=0.6.8", default-features = false, features = ["download-binaries"] }

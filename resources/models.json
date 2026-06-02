@@ -36,6 +36,36 @@
           "sha256": "90ce98129eb3e8cc57e62433d500c97c624b1e3af1fcc85dd3b55ad7e0313e9f"
         }
       ]
+    },
+    {
+      "id": "pyannote-segmentation-3-0",
+      "kind": "diarize",
+      "display_name": "pyannote segmentation 3.0",
+      "license": "mit",
+      "total_size_bytes": 5992913,
+      "files": [
+        {
+          "filename": "model.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/9403a6902bb58e3d5ae8c7e77c3422de279db2e0/model.onnx",
+          "size": 5992913,
+          "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079"
+        }
+      ]
+    },
+    {
+      "id": "3dspeaker-campplus-zh-cn-16k-common",
+      "kind": "diarize",
+      "display_name": "3D-Speaker CAM++ (zh-cn 16k common)",
+      "license": "apache-2.0",
+      "total_size_bytes": 28281138,
+      "files": [
+        {
+          "filename": "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+          "url": "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
+          "size": 28281138,
+          "sha256": "f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11"
+        }
+      ]
     }
   ]
 }

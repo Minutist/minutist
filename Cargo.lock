@@ -938,6 +938,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "diarizer"
+version = "0.0.0"
+dependencies = [
+ "meeting-app-common",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

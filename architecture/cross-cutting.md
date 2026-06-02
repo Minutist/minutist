@@ -423,11 +423,12 @@ config is `{ "endpoints": [], "pubkey": "" }`, so `check()` is a logged no-op an
 dev/unsigned builds are unaffected. Enabling updates is a release step: set the
 real `endpoints` + minisign `pubkey` in `tauri.conf.json`, keep the private key
 as the `TAURI_SIGNING_PRIVATE_KEY` CI secret, and enable updater-artefact
-signing in the release workflow. NOTE (Phase 7 follow-up): the app-wide Tauri 2
-capability configuration (`src-tauri/capabilities/`) is not yet set up — required
-for the packaged webview to invoke commands and emit `updater://apply` at
-runtime — and is a precondition for end-to-end updater operation, tracked
-separately from this wiring.
+signing in the release workflow. The app-wide Tauri 2 capability is `src-tauri/capabilities/default.json`
+(`core:default` + `core:event:allow-emit`/`allow-listen`, scoped to the `main`
+window) — without a capability a Tauri 2 webview has no IPC access at all, so
+this is what lets the webview invoke the tauri-specta commands, receive
+`AppEvent` payloads, and emit `updater://apply`. The build-time ACL
+(`gen/schemas/capabilities.json`) is generated from it.
 
 ## GPU portability
 

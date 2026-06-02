@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Default capability for the main window: grants the webview access to the core IPC layer so it can invoke the application's tauri-specta commands and receive AppEvent payloads (listen), plus event emit so it can signal the updater apply (updater://apply). Without a capability a Tauri 2 webview has no IPC access at all.","local":true,"windows":["main"],"permissions":["core:default","core:event:allow-emit","core:event:allow-listen"]}}

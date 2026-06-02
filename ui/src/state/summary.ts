@@ -78,13 +78,17 @@ export const useSummaryStore = create<SummaryStore>((set, get) => ({
   },
 
   save: async (meetingId, summaryMarkdown) => {
-    // Optimistically reflect the edit so the rendered view matches the editor.
+    // Optimistically reflect the edit so the rendered view matches the editor,
+    // capturing the prior value first so a failed persist can roll it back —
+    // the store must not transiently misrepresent what is persisted on disk.
+    const previousMarkdown = get().summaryMarkdown;
     set({ summaryMarkdown, meetingId });
     try {
       await saveSummary(meetingId, summaryMarkdown);
       set({ lastError: null });
     } catch (err) {
-      set({ lastError: errorMessage(err) });
+      // Persist failed — roll back the optimistic edit and surface the error.
+      set({ summaryMarkdown: previousMarkdown, lastError: errorMessage(err) });
     }
   },
 

@@ -885,6 +885,8 @@ left, transcript right).
   `useAppEventBridge` and handles `AppEvent::SummaryReady` by re-reading the
   summary (`get_summary`) and leaving the in-progress state — scoped to the
   loaded meeting so an unrelated meeting's event does not clobber the view.
+  `save()` rolls back the optimistic markdown on error so the store never
+  retains an unsaved edit as if it persisted.
 - **IPC seam (`ui/src/ipc/summary.ts`).** A thin client (mirroring `notes.ts` /
   `meetings.ts`) over the shim-aware `commands` from `./client` — NOT raw
   `./bindings` — for the three Phase-5 commands: `summarise_meeting(meeting_id)

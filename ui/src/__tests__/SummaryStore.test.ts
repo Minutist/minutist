@@ -93,6 +93,19 @@ describe("useSummaryStore", () => {
     expect(useSummaryStore.getState().summaryMarkdown).toBe("edited summary");
   });
 
+  it("save rolls back the optimistic edit and sets lastError when save_summary rejects", async () => {
+    // A persisted value is loaded before the failing edit.
+    useSummaryStore.setState({ summaryMarkdown: "persisted", meetingId: MEETING });
+    vi.mocked(saveSummary).mockRejectedValueOnce(new Error("disk full"));
+
+    await useSummaryStore.getState().save(MEETING, "unsaved edit");
+
+    expect(saveSummary).toHaveBeenCalledWith(MEETING, "unsaved edit");
+    // The store must not retain the unsaved edit as if it persisted.
+    expect(useSummaryStore.getState().summaryMarkdown).toBe("persisted");
+    expect(useSummaryStore.getState().lastError).toBe("disk full");
+  });
+
   it("read loads the persisted summary", async () => {
     vi.mocked(getSummary).mockResolvedValueOnce("loaded");
     await useSummaryStore.getState().read(MEETING);

@@ -10,6 +10,9 @@ serde = { workspace = true }
 specta = { workspace = true, optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+# Optional: the shared process-wide LlamaBackend singleton (feature-gated so the
+# default `common` build stays pure — only asr-runtime + summariser enable it).
+llama-cpp-2 = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -17,6 +20,10 @@ default = []
 # `ipc-bridge` so tauri-specta can generate the TypeScript bindings
 # directly from these types — eliminates the Phase 1 mirror layer.
 specta = ["dep:specta"]
+# Exposes `llama_backend::shared_llama_backend()` — the single process-wide
+# `LlamaBackend` both llama.cpp-using crates (asr-runtime, summariser) must
+# share, because `LlamaBackend::init()` is global and runs once per process.
+llama-backend = ["dep:llama-cpp-2"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

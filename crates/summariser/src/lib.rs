@@ -40,7 +40,6 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -93,38 +92,17 @@ impl Default for SummariserConfig {
 // LlamaBackend singleton
 // ---------------------------------------------------------------------------
 
-/// Process-wide singleton. `LlamaBackend::init` may only be called once per
-/// process; subsequent calls return an error. `asr-runtime` owns its own copy
-/// of this pattern — both crates share the single underlying backend because
-/// only one of them can win the `init()` race and the loser falls back to the
-/// populated `OnceLock`.
-static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
-
+/// Return the process-wide `LlamaBackend`.
+///
+/// Delegates to the SHARED singleton in `common`. `LlamaBackend::init()` is
+/// global (once per process) and `asr-runtime` also loads a GGUF model in the
+/// same app process, so a private per-crate `OnceLock` here would make
+/// whichever crate inits second fail — exactly the record-then-summarise bug
+/// this delegation fixes. See `meeting_app_common::llama_backend`.
 fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
-    if let Some(b) = LLAMA_BACKEND.get() {
-        return Ok(b);
-    }
-    // We may lose a race here between two concurrent callers both seeing
-    // `None`. `OnceLock::get_or_try_init` would handle this atomically, but it
-    // is nightly-only. Instead: the first caller wins, the second caller's
-    // `init()` call fails, and we fall back to a second `get()` which by that
-    // point is populated.
-    match LlamaBackend::init() {
-        Ok(b) => {
-            let _ = LLAMA_BACKEND.set(b);
-        }
-        Err(e) => {
-            if LLAMA_BACKEND.get().is_none() {
-                return Err(Error::ModelLoad {
-                    path: "llama-backend".to_string(),
-                    context: e.to_string(),
-                });
-            }
-        }
-    }
-    LLAMA_BACKEND.get().ok_or_else(|| Error::ModelLoad {
+    meeting_app_common::llama_backend::shared_llama_backend().map_err(|e| Error::ModelLoad {
         path: "llama-backend".to_string(),
-        context: "OnceLock unexpectedly empty".to_string(),
+        context: e.to_string(),
     })
 }
 

@@ -16,7 +16,7 @@ cuda = ["llama-cpp-2/cuda"]
 rocm = ["llama-cpp-2/rocm"]
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+meeting-app-common = { path = "../common", features = ["llama-backend"] }
 model-registry = { path = "../model-registry" }
 settings = { path = "../settings" }
 llama-cpp-2 = { workspace = true }

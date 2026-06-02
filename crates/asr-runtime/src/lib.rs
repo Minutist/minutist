@@ -21,7 +21,6 @@
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -92,32 +91,16 @@ impl From<Error> for AppError {
 // LlamaBackend singleton
 // ---------------------------------------------------------------------------
 
-/// Process-wide singleton. `LlamaBackend::init` may only be called once per
-/// process; subsequent calls return an error. We initialise it once here and
-/// share the reference for the lifetime of the process.
-static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
-
+/// Return the process-wide `LlamaBackend`.
+///
+/// Delegates to the SHARED singleton in `common` rather than owning a private
+/// `OnceLock` here: `LlamaBackend::init()` is global (once per process), and
+/// `summariser` also loads a GGUF model in the same app process, so a private
+/// per-crate cell would make whichever crate inits second fail. See
+/// `meeting_app_common::llama_backend`.
 fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
-    if let Some(b) = LLAMA_BACKEND.get() {
-        return Ok(b);
-    }
-    // We may lose a race here between two concurrent callers both seeing
-    // `None`; `OnceLock::get_or_try_init` would handle this atomically,
-    // but it is nightly-only. Instead: the first caller wins, the second
-    // caller's `init()` call will fail, and we fall back to a second
-    // `get()` which by that point is populated.
-    match LlamaBackend::init() {
-        Ok(b) => {
-            let _ = LLAMA_BACKEND.set(b);
-        }
-        Err(e) => {
-            // Another thread may have already initialised it.
-            if LLAMA_BACKEND.get().is_none() {
-                return Err(Error::BackendInit(e.to_string()));
-            }
-        }
-    }
-    LLAMA_BACKEND.get().ok_or_else(|| Error::BackendInit("OnceLock unexpectedly empty".to_string()))
+    meeting_app_common::llama_backend::shared_llama_backend()
+        .map_err(|e| Error::BackendInit(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

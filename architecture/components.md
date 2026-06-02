@@ -26,7 +26,7 @@ appears in:
 | `vad-chunker` | 2 | `common` |
 | `asr-runtime` | 2 | `common`, `model-registry`, `settings` |
 | `diarizer` | 6 | `common` |
-| `summariser` | 5 | `common`, `model-registry`, `settings`, `persistence` |
+| `summariser` | 5 | `common` |
 | `persistence` | 1 (minimal) → 4 (full) | `common` |
 | `model-registry` | 2 | `common`, `settings` |
 | `settings` | 1 | `common` |
@@ -68,6 +68,17 @@ update in the same commit.
 `ModelStatus`, `MeetingListEntry`, `NotesDocument`, `MeetingState`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
+
+**Phase 7 — shared LlamaBackend (feature-gated).** Behind the optional
+`llama-backend` feature (`dep:llama-cpp-2`, OFF by default so the default
+`common` build stays pure), `common` exposes
+`llama_backend::shared_llama_backend() -> AppResult<&'static LlamaBackend>` — the
+single process-wide backend. `LlamaBackend::init()` is global (once per
+process), and both `asr-runtime` and `summariser` load GGUF models in the same
+app process, so they MUST share one cell; each enables the feature and delegates
+to this function. (A private `OnceLock` per crate made whichever initialised
+second fail — the record-then-summarise bug fixed in the Phase-7 review pass.)
+This adds no workspace dependency edge; `llama-cpp-2` is an external FFI dep.
 
 **Phase 4 precursors.** `MeetingListEntry` (meeting-list row, FR-33),
 `NotesDocument { notes_json, notes_markdown }` (the canonical wire-facing

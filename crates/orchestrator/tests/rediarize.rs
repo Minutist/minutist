@@ -42,9 +42,18 @@ const SEG_MODEL_ID: &str = "pyannote-segmentation-3-0";
 const EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-cn-16k-common";
 
 fn diarize_model_env_vars() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let seg = std::env::var("MEETING_APP_DIARIZE_SEG_PATH").ok()?;
-    let emb = std::env::var("MEETING_APP_DIARIZE_EMB_PATH").ok()?;
+    // Treat an EMPTY value as unset (skip) so `VAR=""` does not stage an empty
+    // path and panic; only a non-empty path counts as "set".
+    let seg = non_empty_env("MEETING_APP_DIARIZE_SEG_PATH")?;
+    let emb = non_empty_env("MEETING_APP_DIARIZE_EMB_PATH")?;
     Some((std::path::PathBuf::from(seg), std::path::PathBuf::from(emb)))
+}
+
+/// Read `name` from the environment, returning `None` when it is unset OR set
+/// to an empty string. This keeps `VAR=""` equivalent to "unset" so the gated
+/// tests skip cleanly instead of staging an empty model path.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -107,10 +116,11 @@ fn stage_model(cache_dir: &Path, id: &str, filename: &str, src: &Path) {
 // Fixture (S1 two-speaker synthetic real-speech clip)
 // ---------------------------------------------------------------------------
 
-/// Decode the committed S1 two-speaker fixture (16 kHz mono s16 WAV).
-fn load_two_speaker_fixture() -> Vec<f32> {
+/// Decode a committed 16 kHz mono s16 WAV diarizer fixture into f32 PCM.
+fn load_diarizer_fixture(filename: &str) -> Vec<f32> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/diarizer/tests/fixtures/two_speakers_synth.wav");
+        .join("../../crates/diarizer/tests/fixtures")
+        .join(filename);
     let mut reader = hound::WavReader::open(&fixture)
         .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
     let spec = reader.spec();
@@ -181,24 +191,31 @@ fn diarize_orchestrator(
 }
 
 // ---------------------------------------------------------------------------
-// Gated end-to-end re-diarize
+// Gated end-to-end re-diarize (shared core)
 // ---------------------------------------------------------------------------
 
-/// Re-diarize a meeting whose audio is the S1 two-speaker fixture, using the
-/// real sherpa models. Verifies that `transcript.json` is rewritten with
-/// `speaker_id`s, `metadata.json`'s `speaker_count` is updated (≥ 1), the index
-/// row is refreshed, and an `AppEvent::DiarizationComplete` is emitted. Gated on
-/// the diarize-model env vars; the no-op skip path is what CI runs.
-#[tokio::test(flavor = "multi_thread")]
-async fn rediarize_assigns_speakers_over_two_speaker_fixture() {
+/// Run the gated end-to-end `rediarize` over a diarizer fixture under the
+/// production `DiarizerConfig::default()` (threshold/auto-count mode — the only
+/// shipped config), asserting `metadata.json`'s `speaker_count` equals
+/// `expected_speakers`.
+///
+/// Stages the real sherpa models into a tempdir registry cache, encodes the
+/// fixture as a meeting whose `transcript.json` tiles the clip in 1 s segments,
+/// runs `orch.rediarize`, and asserts: `transcript.json` rewritten with at least
+/// one `speaker_id`, `metadata.json`'s `speaker_count == expected_speakers`,
+/// the index row refreshed, and `AppEvent::DiarizationComplete` emitted with the
+/// same count. The segment tiling derives from audio length, so no boundary
+/// constants are needed and the assertion holds against the genuine-distinct /
+/// genuine-single fixture contract.
+async fn run_gated_rediarize_over_fixture(fixture_filename: &str, expected_speakers: u32) {
     let _ = tracing_subscriber::fmt::try_init();
 
     let (seg_path, emb_path) = match diarize_model_env_vars() {
         Some(paths) => paths,
         None => {
             eprintln!(
-                "skipping rediarize_assigns_speakers_over_two_speaker_fixture; diarize model env \
-                 vars not set (MEETING_APP_DIARIZE_SEG_PATH and MEETING_APP_DIARIZE_EMB_PATH)"
+                "skipping gated rediarize over {fixture_filename}; diarize model env vars not set \
+                 (MEETING_APP_DIARIZE_SEG_PATH and MEETING_APP_DIARIZE_EMB_PATH)"
             );
             return;
         }
@@ -230,9 +247,9 @@ async fn rediarize_assigns_speakers_over_two_speaker_fixture() {
     let (orch, mut event_rx) =
         diarize_orchestrator(persistence_root.clone(), model_cache, manifest);
 
-    // Encode the two-speaker fixture as a meeting + a transcript that tiles the
-    // clip in 1 s segments (covering both speakers across the recording).
-    let samples = load_two_speaker_fixture();
+    // Encode the fixture as a meeting + a transcript that tiles the clip in 1 s
+    // segments (derived from audio length, covering the whole recording).
+    let samples = load_diarizer_fixture(fixture_filename);
     let total_ms = (samples.len() as u64 * 1000) / 16_000;
     let mut segments = Vec::new();
     let mut start = 0u64;
@@ -270,9 +287,13 @@ async fn rediarize_assigns_speakers_over_two_speaker_fixture() {
         "re-diarize must overlay at least one speaker_id"
     );
 
-    // metadata.json speaker_count updated (≥ 1) + diarizer recorded.
+    // metadata.json speaker_count equals the genuine fixture speaker count under
+    // the production DiarizerConfig::default() + diarizer recorded.
     let meta = persistence::read_metadata(&meeting_dir).expect("read metadata");
-    assert!(meta.speaker_count >= 1, "speaker_count must be updated");
+    assert_eq!(
+        meta.speaker_count, expected_speakers,
+        "speaker_count must equal the fixture's genuine speaker count under the production config"
+    );
     assert!(meta.diarizer.is_some(), "diarizer descriptor must be recorded");
 
     // index row speaker_count refreshed.
@@ -297,4 +318,27 @@ async fn rediarize_assigns_speakers_over_two_speaker_fixture() {
         }
     }
     assert!(got, "rediarize must emit AppEvent::DiarizationComplete");
+}
+
+// ---------------------------------------------------------------------------
+// Gated end-to-end re-diarize (per-fixture)
+// ---------------------------------------------------------------------------
+
+/// Re-diarize a meeting whose audio is the two-speaker fixture (two genuinely
+/// distinct concatenated real readers), using the real sherpa models under the
+/// production `DiarizerConfig::default()`. Asserts `speaker_count == 2`. Gated on
+/// the diarize-model env vars; the no-op skip path is what CI runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn rediarize_assigns_speakers_over_two_speaker_fixture() {
+    run_gated_rediarize_over_fixture("two_speakers_synth.wav", 2).await;
+}
+
+/// Single-speaker control: re-diarize a meeting whose audio is one real speaker
+/// repeated, under the same production `DiarizerConfig::default()` + staging +
+/// re-diarize path. Asserts `speaker_count == 1`, proving the auto-count
+/// threshold mode does not over-segment a single speaker into multiple. Gated on
+/// the diarize-model env vars; the no-op skip path is what CI runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn rediarize_reports_single_speaker_over_control_fixture() {
+    run_gated_rediarize_over_fixture("single_speaker_control.wav", 1).await;
 }

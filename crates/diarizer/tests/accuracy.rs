@@ -12,9 +12,16 @@
 //!   MEETING_APP_DIARIZE_EMB_PATH=/path/to/embedding.onnx \
 //!   cargo test -p diarizer --test accuracy
 //!
-//! Fixtures (committed, synthetic real-speech — see `tests/fixtures/README.md`):
-//!   * `two_speakers_synth.wav`     — A then gap then pitch-shifted-A (= B).
-//!   * `single_speaker_control.wav` — A then gap then A (one speaker).
+//! Fixtures (committed, real speech — see `tests/fixtures/README.md`): two
+//! genuinely distinct LibriSpeech readers concatenated with a silence gap.
+//!   * `two_speakers_synth.wav`     — reader 1089 then gap then reader 1221.
+//!   * `single_speaker_control.wav` — reader 1089 then gap then reader 1089.
+//!
+//! Both gated tests build the diarizer with the **production**
+//! `DiarizerConfig::default()` (threshold/auto-count mode), so the measured
+//! accuracy and single-speaker cleanliness reflect the config the shipped app
+//! actually runs (the speaker count is unknown at record time), not an oracle
+//! `num_clusters` that would pass by construction.
 
 use std::path::{Path, PathBuf};
 
@@ -24,14 +31,18 @@ use meeting_app_common::{Diarizer, Segment};
 const SAMPLE_RATE: u32 = 16_000;
 /// Speaker A occupies `[0, A_END_MS)` of the two-speaker fixture; speaker B the
 /// remainder after the gap. See `tests/fixtures/README.md`.
-const A_END_MS: u64 = 5_855;
-const GAP_END_MS: u64 = 6_255;
+const A_END_MS: u64 = 5_000;
+const GAP_END_MS: u64 = 5_400;
 const SEGMENT_MS: u64 = 1_000;
 
 /// Resolve the gated model paths, or `None` (→ skip) when either is unset.
+///
+/// An empty-string env var (`VAR=""`) is treated as unset → skip, so a blank
+/// value does not turn into a bogus `PathBuf::from("")` that panics on open.
 fn model_paths() -> Option<(PathBuf, PathBuf)> {
-    let seg = std::env::var("MEETING_APP_DIARIZE_SEG_PATH").ok()?;
-    let emb = std::env::var("MEETING_APP_DIARIZE_EMB_PATH").ok()?;
+    let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let seg = non_empty("MEETING_APP_DIARIZE_SEG_PATH")?;
+    let emb = non_empty("MEETING_APP_DIARIZE_EMB_PATH")?;
     Some((PathBuf::from(seg), PathBuf::from(emb)))
 }
 
@@ -140,13 +151,11 @@ fn two_speaker_accuracy_at_least_80pct() {
     let total_ms = (pcm.len() as u64 * 1000) / SAMPLE_RATE as u64;
     let (mut segments, truth) = build_segments(total_ms);
 
-    // Two known speakers → exact-cluster mode for a fair accuracy measure.
-    let config = DiarizerConfig {
-        num_clusters: Some(2),
-        cluster_threshold: 0.5,
-    };
-    let diarizer =
-        SherpaDiarizer::open(&seg_path, &emb_path, config).expect("open diarizer with valid models");
+    // Production config: threshold/auto-count mode (the shipped app does not
+    // know the speaker count at record time). The diarizer must DISCOVER that
+    // there are two distinct speakers — this is the real test, not an oracle.
+    let diarizer = SherpaDiarizer::open(&seg_path, &emb_path, DiarizerConfig::default())
+        .expect("open diarizer with valid models");
 
     let count = diarizer
         .assign_speakers(&pcm, SAMPLE_RATE, &mut segments)
@@ -188,14 +197,12 @@ fn single_speaker_control_one_label() {
         start += SEGMENT_MS;
     }
 
-    // Conservative single-speaker path: num_clusters = Some(1) so one speaker
-    // is not over-split.
-    let config = DiarizerConfig {
-        num_clusters: Some(1),
-        cluster_threshold: 0.5,
-    };
-    let diarizer =
-        SherpaDiarizer::open(&seg_path, &emb_path, config).expect("open diarizer with valid models");
+    // Production config (threshold/auto-count mode) — the same config the
+    // shipped app runs. A single speaker must NOT be over-split: this is a
+    // genuine over-segmentation guard, not an oracle `num_clusters = Some(1)`
+    // that would pass by construction.
+    let diarizer = SherpaDiarizer::open(&seg_path, &emb_path, DiarizerConfig::default())
+        .expect("open diarizer with valid models");
 
     let count = diarizer
         .assign_speakers(&pcm, SAMPLE_RATE, &mut segments)
@@ -206,30 +213,7 @@ fn single_speaker_control_one_label() {
     );
 }
 
-#[test]
-fn rejects_non_16khz() {
-    // No model needed: the sample-rate guard fires before any sherpa call.
-    // We still need a constructed diarizer, which needs models — so this only
-    // asserts the guard when models are present; otherwise it skips.
-    let Some((seg_path, emb_path)) = model_paths() else {
-        eprintln!("skipping rejects_non_16khz: model env vars unset");
-        return;
-    };
-    let diarizer =
-        SherpaDiarizer::open(&seg_path, &emb_path, DiarizerConfig::default()).expect("open");
-    let mut segments = vec![Segment {
-        start_ms: 0,
-        end_ms: 1_000,
-        text: String::new(),
-        speaker_id: None,
-        confidence: None,
-        words: Vec::new(),
-    }];
-    let err = diarizer
-        .assign_speakers(&[0.0f32; 8_000], 8_000, &mut segments)
-        .expect_err("8 kHz must be rejected");
-    match err {
-        meeting_app_common::AppError::InvalidInput { .. } => {}
-        other => panic!("expected InvalidInput, got {other}"),
-    }
-}
+// The 16 kHz sample-rate-rejection guard is unit-tested model-free in
+// `src/lib.rs` (`require_supported_sample_rate`), so it needs no gated test
+// here — the guard is a pure pre-engine check and does not require a
+// constructed `SherpaDiarizer` (which would need the ONNX models).

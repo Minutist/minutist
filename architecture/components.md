@@ -25,7 +25,7 @@ appears in:
 | `audio-capture` | 1 | `common` |
 | `vad-chunker` | 2 | `common` |
 | `asr-runtime` | 2 | `common`, `model-registry`, `settings` |
-| `diarizer` | 6 | `common`, `model-registry` |
+| `diarizer` | 6 | `common` |
 | `summariser` | 5 | `common`, `model-registry`, `settings`, `persistence` |
 | `persistence` | 1 (minimal) → 4 (full) | `common` |
 | `model-registry` | 2 | `common`, `settings` |
@@ -199,7 +199,10 @@ crate exposes `SherpaDiarizer::open(seg_onnx, emb_onnx, DiarizerConfig)` and
 which runs sherpa `Diarize::compute`, relabels first-seen `A`/`B`/…, and
 overlays `speaker_id` onto the ASR segments by max-overlap interval-join (no
 `common::SpeakerTurn` type — overlay only). It takes RESOLVED model paths and
-depends only on `common` + `model-registry` (NOT `persistence`). Bundled models
+depends only on `common` (NOT `model-registry`, NOT `persistence`). All
+model-registry resolution lives in the orchestrator's `runner::build_diarizer`,
+which ensures both model dirs and passes the resolved `&Path`s into
+`SherpaDiarizer::open`. Bundled models
 (settings-selectable via `model-registry`): **segmentation =
 pyannote/segmentation-3.0 (MIT)**; **embedding = 3D-Speaker CAM++ zh-cn
 16k-common (Apache-2.0, Alibaba in-house corpus — NOT VoxCeleb)**. This corrects
@@ -219,8 +222,11 @@ and diarization is single-threaded per call so the mutex is never contended on
 the hot path). `DiarizerConfig` maps onto sherpa's `DiarizeConfig`:
 `num_clusters = Some(n)` → exact-cluster mode; `None` → `num_clusters = Some(-1)`
 (sherpa's "use threshold" sentinel, Spike 4) with `cluster_threshold`. The
-orchestrator passes `num_clusters = Some(1)` for the conservative single-speaker
-pass so one speaker is not over-split. `assign_speakers` rejects any
+orchestrator constructs the diarizer with `DiarizerConfig::default()`
+(`num_clusters = None`, `cluster_threshold = 0.5`) for BOTH the on-stop pass and
+the user-triggered re-diarize pass: at record time the speaker count is unknown,
+so production uses threshold/auto-count mode to discover it rather than fixing a
+cluster count. There is no `Some(1)` production path. `assign_speakers` rejects any
 `sample_rate != 16000` with `AppError::InvalidInput`, short-circuits empty
 audio/segments to `0`, runs `Diarize::compute`, and overlays via a pure
 `overlay_speakers(&[sherpa::Segment], &mut [Segment]) -> u32`: per ASR segment it
@@ -235,9 +241,10 @@ dep). `sherpa-rs = { workspace = true }` is added to `crates/diarizer/Cargo.toml
 suite covers `overlay_speakers` (interval-join, no-overlap=None, tie-break,
 first-seen relabel, stale-label clearing) with no model; the env-var-gated
 `tests/accuracy.rs` (`MEETING_APP_DIARIZE_SEG_PATH` + `MEETING_APP_DIARIZE_EMB_PATH`,
-skip-on-unset) runs `assign_speakers` over committed synthetic real-speech
-fixtures (`tests/fixtures/two_speakers_synth.wav` = LibriSpeech clip + a
-pitch-shifted copy; `single_speaker_control.wav`), asserting ≥ 80 %
+skip-on-unset) runs `assign_speakers` over committed
+fixtures (`tests/fixtures/two_speakers_synth.wav` = two distinct real-speech
+speaker clips concatenated, with self-authored ground truth;
+`single_speaker_control.wav` = one real speaker repeated), asserting ≥ 80 %
 permutation-invariant segment accuracy and exactly one label on the control.
 
 ### `summariser`
@@ -1065,28 +1072,27 @@ left, transcript right).
   checkbox ("Diarize on stop", off by default) round-trips the
   `diarization_enabled` setting through `commands.updateSettings`, the same
   round-trip-through-settings pattern as the device selection. The field is
-  owned by the `settings` crate; until the backend JOIN (Stream S5) regenerates
-  the `Settings` type in `bindings.ts`, `diarization-settings.ts` models it as
-  an optional augmentation of the generated `Settings` and reads/writes it as an
-  extra JSON property the round-trip carries losslessly (it collapses into the
-  canonical shape once the field lands). It gates the orchestrator's on-stop
+  owned by the `settings` crate and is a first-class member of the generated
+  `Settings` type in `bindings.ts` (`diarization_enabled?: boolean`).
+  `diarization-settings.ts` reads/writes that canonical field directly and keeps
+  `SettingsWithDiarization` only as a named alias of `Settings` so existing call
+  sites and tests need no change. It gates the orchestrator's on-stop
   diarization pass; re-diarize is independent of it.
 - **Re-diarize action + IPC seam (`ui/src/ipc/meetings.ts::rediarize` +
   `MeetingList.tsx` row action + `MainWindow.tsx` open-meeting workspace menu).**
-  `rediarize(meeting_id)` wraps the **not-yet-generated** `rediarize_meeting`
-  command via a new shim-aware `callPendingCommand` raw-`invoke` path in
-  `ui/src/ipc/client.ts` (the same approach the Phase-4 meeting commands and
-  Phase-5 summary commands used before their bindings regenerated — A9: no
-  hand-written bindings stub; Stream S5 regenerates `bindings.ts` and folds it
-  into `callCommand`). The DEV shim (`dev-shim.ts`) supplies sample
-  speaker-tagged transcript segments, a `devPendingCommands` `rediarize_meeting`
-  handler, and a `diarization_complete` fan-out so the chips and re-read render
-  under `vite dev`. Tests mock the `../ipc/meetings` seam. **Assumed
-  `rediarize_meeting` signature Stream S5 MUST match:** snake-case command
-  `rediarize_meeting(meeting_id: MeetingId) -> ()` (camelCase `rediarizeMeeting`
-  on the generated surface); decodes the meeting's pause-INCLUDING PCM, runs the
-  `SherpaDiarizer` over the stored segments, rewrites `transcript.json` with the
-  overlaid `speaker_id`s, refreshes the index row's `speaker_count`, emits
+  `rediarize(meeting_id)` calls the generated `rediarizeMeeting` command, which
+  is present on the generated `commands` surface and routes through `callCommand`
+  in `ui/src/ipc/client.ts` like every other command (the earlier shim-aware
+  `callPendingCommand` raw-`invoke` path was collapsed — A9 — and survives only
+  in past-tense comments). The DEV shim (`dev-shim.ts`) supplies sample
+  speaker-tagged transcript segments, a `rediarize_meeting` handler, and a
+  `diarization_complete` fan-out so the chips and re-read render under
+  `vite dev`. Tests mock the `../ipc/meetings` seam. The command is the
+  snake-case `rediarize_meeting(meeting_id: MeetingId) -> ()` (camelCase
+  `rediarizeMeeting` on the generated surface); it decodes the meeting's
+  pause-INCLUDING PCM, runs the `SherpaDiarizer` over the stored segments,
+  rewrites `transcript.json` with the overlaid `speaker_id`s, refreshes the
+  index row's `speaker_count`, emits
   `AppEvent::DiarizationComplete { meeting_id, speaker_count }`, and (like
   `re_transcribe`) refuses unless the recorder is `Idle`.
 

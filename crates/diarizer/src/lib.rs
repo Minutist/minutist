@@ -44,9 +44,10 @@ pub use error::Error;
 ///
 /// Exactly one of `num_clusters` (known speaker count) or `cluster_threshold`
 /// (unknown count; smaller → more speakers) drives sherpa's agglomerative
-/// stage. For single-speaker cleanliness, callers set `num_clusters = Some(1)`
-/// when the count is known, else a conservative threshold so one speaker is not
-/// over-split.
+/// stage. Production builds this via [`Default`] (`num_clusters = None`,
+/// threshold mode) because the speaker count is unknown at record time;
+/// `num_clusters = Some(n)` is available for callers that genuinely know the
+/// count (e.g. fixed-count tests).
 #[derive(Debug, Clone)]
 pub struct DiarizerConfig {
     /// Fixed speaker count, when known. `None` → use `cluster_threshold`.
@@ -70,6 +71,23 @@ impl Default for DiarizerConfig {
 /// standardises the whole pipeline on 16 kHz mono, so a mismatch is a wiring
 /// bug, not a runtime condition to resample around.
 const REQUIRED_SAMPLE_RATE: u32 = 16_000;
+
+/// Reject any input not at [`REQUIRED_SAMPLE_RATE`].
+///
+/// A pure pre-engine check (no sherpa, no model), factored out so the default
+/// test suite covers the guard without constructing a `SherpaDiarizer` (which
+/// would need the ONNX models). `audio-capture` standardises the whole pipeline
+/// on 16 kHz mono, so a mismatch is a wiring bug, not a runtime condition to
+/// resample around.
+fn require_supported_sample_rate(sample_rate: u32) -> AppResult<()> {
+    if sample_rate != REQUIRED_SAMPLE_RATE {
+        return Err(Error::InvalidInput(format!(
+            "diarizer requires {REQUIRED_SAMPLE_RATE} Hz mono audio; got {sample_rate} Hz"
+        ))
+        .into());
+    }
+    Ok(())
+}
 
 /// A speaker diarizer backed by a sherpa-onnx segmentation + embedding pipeline.
 ///
@@ -140,8 +158,10 @@ impl SherpaDiarizer {
 /// `num_clusters = Some(n)` → exact-cluster mode (`n` clusters). `None` →
 /// `num_clusters = Some(-1)`, sherpa's "use threshold instead" sentinel (Spike
 /// 4), with the agglomerative `cluster_threshold`. `min_duration_*` keep
-/// sherpa's defaults; the orchestrator passes `num_clusters = Some(1)` for the
-/// conservative single-speaker pass so one speaker is not over-split.
+/// sherpa's defaults. Production (both the on-stop and re-diarize passes) builds
+/// the diarizer with [`DiarizerConfig::default`] → threshold mode, since the
+/// speaker count is unknown at record time; the conservative `cluster_threshold`
+/// is what guards against over-splitting one speaker.
 fn sherpa_diarize_config(config: &DiarizerConfig) -> DiarizeConfig {
     DiarizeConfig {
         num_clusters: match config.num_clusters {
@@ -164,12 +184,7 @@ impl Diarizer for SherpaDiarizer {
         sample_rate: u32,
         segments: &mut [Segment],
     ) -> AppResult<u32> {
-        if sample_rate != REQUIRED_SAMPLE_RATE {
-            return Err(Error::InvalidInput(format!(
-                "diarizer requires {REQUIRED_SAMPLE_RATE} Hz mono audio; got {sample_rate} Hz"
-            ))
-            .into());
-        }
+        require_supported_sample_rate(sample_rate)?;
 
         // Nothing to assign — empty transcript or empty audio. Don't invoke
         // sherpa (its `compute` bail!s on zero-length input).
@@ -324,6 +339,22 @@ mod tests {
             speaker_id: None,
             confidence: None,
             words: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn require_supported_sample_rate_accepts_16khz_rejects_others() {
+        // 16 kHz is accepted.
+        require_supported_sample_rate(16_000).expect("16 kHz must be accepted");
+
+        // Anything else is rejected as InvalidInput, model-free.
+        for bad in [8_000u32, 22_050, 44_100, 48_000, 0] {
+            let err = require_supported_sample_rate(bad)
+                .expect_err("non-16 kHz must be rejected");
+            assert!(
+                matches!(err, meeting_app_common::AppError::InvalidInput { .. }),
+                "expected InvalidInput for {bad} Hz, got {err}"
+            );
         }
     }
 

@@ -5,21 +5,30 @@
 # ///
 """Deterministically (re)generate the diarizer accuracy fixtures.
 
-Produces two committed 16 kHz mono s16 WAVs from the single committed
-real-speech clip `tests/fixtures/librispeech_0.wav` (workspace root):
+Produces two committed 16 kHz mono s16 WAVs by concatenating two committed
+single-speaker real-speech clips — two GENUINELY DISTINCT LibriSpeech readers,
+so the gated accuracy test in `tests/accuracy.rs` measures real speaker
+discrimination (not a self-similar pitch trick):
 
-  two_speakers_synth.wav      Speaker A (the original LibriSpeech clip) then a
-                              0.4 s silence gap then Speaker B (a pitch-shifted
-                              copy of A — pitch + formants moved enough that the
-                              speaker-embedding model clusters it as a distinct
-                              speaker, while staying real speech, not a tone).
-  single_speaker_control.wav  Speaker A repeated (same speaker), with the same
-                              0.4 s gap — exactly one distinct speaker.
+  two_speakers_synth.wav      Speaker A then a 0.4 s silence gap then Speaker B
+                              (two different LibriSpeech readers). Self-authored
+                              ground truth: we built the boundary, so we know it
+                              exactly.
+  single_speaker_control.wav  Speaker A then the same 0.4 s gap then Speaker A
+                              again (one reader) — exactly one distinct speaker.
 
-The pitch shift resamples by a factor and stretches back to the original
-length, so duration is unchanged. Re-running this script reproduces the
-committed bytes exactly (pure-Python, no external tools). See `README.md` for
-the ground-truth segment boundaries the gated accuracy test asserts against.
+Inputs (committed alongside this script):
+
+  speaker_a.wav   LibriSpeech reader 1089 (male),   first 5.000 s.
+  speaker_b.wav   LibriSpeech reader 1221 (female), first 5.000 s.
+
+Both source clips are the first 80 000 samples (5.000 s) of the canonical
+sherpa-onnx English `test_wavs/{0,1}.wav` (LibriSpeech test-clean excerpts,
+CC-BY-4.0). See `README.md` for the source URLs + original SHA-256s. The trim
+to a common length keeps the two speakers balanced in the accuracy measure.
+
+Pure-Python, no external tools / no network: re-running reproduces the
+committed bytes exactly.
 
 Usage (from the workspace root):
     uv run crates/diarizer/tests/fixtures/generate_fixtures.py
@@ -27,17 +36,13 @@ Usage (from the workspace root):
 
 import array
 import hashlib
-import math
 import os
 import wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE_ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
-SRC = os.path.join(WORKSPACE_ROOT, "tests", "fixtures", "librispeech_0.wav")
 
 SAMPLE_RATE = 16_000
 GAP_S = 0.4
-PITCH_FACTOR = 0.8  # < 1.0 raises pitch when re-stretched to original length.
 
 
 def read_wav_i16(path):
@@ -62,34 +67,19 @@ def write_wav_i16(path, samples):
     w.close()
 
 
-def pitch_shift(samples, factor):
-    n = len(samples)
-    inter_len = int(round(n / factor))
-    inter = []
-    for i in range(inter_len):
-        src = i * factor
-        i0 = int(math.floor(src))
-        i1 = min(i0 + 1, n - 1)
-        frac = src - i0
-        inter.append(samples[i0] * (1 - frac) + samples[i1] * frac)
-    out = []
-    m = len(inter)
-    for i in range(n):
-        src = i * (m - 1) / (n - 1) if n > 1 else 0
-        i0 = int(math.floor(src))
-        i1 = min(i0 + 1, m - 1)
-        frac = src - i0
-        out.append(inter[i0] * (1 - frac) + inter[i1] * frac)
-    return out
-
-
 def main():
-    speaker_a = read_wav_i16(SRC)
+    speaker_a = read_wav_i16(os.path.join(HERE, "speaker_a.wav"))
+    speaker_b = read_wav_i16(os.path.join(HERE, "speaker_b.wav"))
     gap = [0] * int(GAP_S * SAMPLE_RATE)
-    speaker_b = pitch_shift(speaker_a, PITCH_FACTOR)
 
     two = list(speaker_a) + gap + list(speaker_b)
     single = list(speaker_a) + gap + list(speaker_a)
+
+    a_end_ms = len(speaker_a) * 1000 // SAMPLE_RATE
+    gap_end_ms = a_end_ms + int(GAP_S * 1000)
+    print(f"A_END_MS={a_end_ms} GAP_END_MS={gap_end_ms} "
+          f"two_total_ms={len(two) * 1000 // SAMPLE_RATE} "
+          f"single_total_ms={len(single) * 1000 // SAMPLE_RATE}")
 
     for name, samples in (
         ("two_speakers_synth.wav", two),

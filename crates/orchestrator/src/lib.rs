@@ -88,6 +88,16 @@ struct OrchestratorInner {
     runner: Option<runner::RunnerHandle>,
     /// Wall-clock instant the current recording started.
     started_at: Option<DateTime<Utc>>,
+    /// Test-only override for the on-stop diarization pass: when `Some`, the
+    /// next `stop()` whose `diarization_enabled` is true consumes this injected
+    /// diarizer instead of building the production `SherpaDiarizer` via
+    /// `runner::build_diarizer`. This lets a default-suite test drive the FULL
+    /// toggle-ON gate branch of `stop()` model-free, mirroring how
+    /// `rediarize_with_diarizer` injects a diarizer into the re-diarize seam.
+    /// `None` in production (the field is only ever set by the test-only
+    /// `inject_on_stop_diarizer`).
+    #[cfg(any(test, feature = "test-source"))]
+    on_stop_diarizer_override: Option<Box<dyn Diarizer + Send>>,
 }
 
 impl Orchestrator {
@@ -135,6 +145,8 @@ impl Orchestrator {
                 capture: None,
                 runner: None,
                 started_at: None,
+                #[cfg(any(test, feature = "test-source"))]
+                on_stop_diarizer_override: None,
             }),
             event_tx,
         }
@@ -456,14 +468,28 @@ impl Orchestrator {
     /// Run the on-stop diarization pass for `meeting_id` and return the distinct
     /// speaker count.
     ///
-    /// Builds the bundled `SherpaDiarizer` off the async worker threads,
-    /// decodes + diarizes the meeting, and persists the result via the shared
-    /// [`Self::finalise_diarization`] (rewriting `transcript.json`, updating
-    /// `metadata.json`'s `{ speaker_count, diarizer }`, and emitting
-    /// `AppEvent::DiarizationComplete`). No index `upsert` — the `stop_recording`
-    /// command upserts from the returned `MeetingMeta`.
+    /// Builds the bundled `SherpaDiarizer` off the async worker threads (or, in
+    /// tests, consumes a `StubDiarizer` injected via `inject_on_stop_diarizer`),
+    /// then hands the owned `Box<dyn Diarizer + Send>` to the shared
+    /// [`Self::diarize_on_stop_inner`]. This build → dispatch split mirrors the
+    /// [`Self::rediarize`] → [`Self::rediarize_inner`] seam so a default-suite
+    /// test can drive the toggle-ON `stop()` branch model-free.
     async fn diarize_on_stop(&self, meeting_id: MeetingId) -> AppResult<u32> {
-        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+        // Test seam: a `StubDiarizer` injected via `inject_on_stop_diarizer`
+        // takes precedence over building the production `SherpaDiarizer`, so a
+        // default-suite test drives the full toggle-ON gate branch (build →
+        // dispatch → finalise) with no sherpa model. In production this is
+        // always `None`, so the build path below runs unchanged.
+        #[cfg(any(test, feature = "test-source"))]
+        {
+            // Take the override in its own scope so the `inner` guard drops
+            // before the multi-second blocking dispatch below — never hold the
+            // central mutex across `diarize_on_stop_inner`.
+            let injected = self.inner.lock().await.on_stop_diarizer_override.take();
+            if let Some(diarizer) = injected {
+                return self.diarize_on_stop_inner(meeting_id, diarizer).await;
+            }
+        }
 
         let registry = Arc::clone(&self.model_registry);
         let diarizer: Box<dyn Diarizer + Send> =
@@ -481,6 +507,27 @@ impl Orchestrator {
             .map_err(|e| AppError::Internal {
                 context: format!("on-stop diarizer-build join failed: {e}"),
             })??;
+
+        self.diarize_on_stop_inner(meeting_id, diarizer).await
+    }
+
+    /// Shared on-stop diarization core: decode + diarize the meeting with the
+    /// supplied owned `diarizer`, then persist the result via
+    /// [`Self::finalise_diarization`] (rewriting `transcript.json`, updating
+    /// `metadata.json`'s `{ speaker_count, diarizer }`, and emitting
+    /// `AppEvent::DiarizationComplete`). Returns the distinct speaker count. No
+    /// index `upsert` — the `stop_recording` command upserts from the returned
+    /// `MeetingMeta`, whose `speaker_count` this pass has updated.
+    ///
+    /// Driven by [`Self::diarize_on_stop`] with the production `SherpaDiarizer`
+    /// (or a test-injected `StubDiarizer`), exactly as
+    /// [`Self::rediarize_inner`] is driven for the user-triggered re-diarize.
+    async fn diarize_on_stop_inner(
+        &self,
+        meeting_id: MeetingId,
+        diarizer: Box<dyn Diarizer + Send>,
+    ) -> AppResult<u32> {
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
         let (segments, speaker_count) =
             run_diarization_blocking(meeting_dir.clone(), diarizer).await?;
@@ -1086,5 +1133,33 @@ impl Orchestrator {
     ) -> AppResult<()> {
         self.ensure_idle_for_rediarize().await?;
         self.rediarize_inner(index, meeting_id, diarizer).await
+    }
+
+    /// Inject a `diarizer` for the next on-stop diarization pass, so a real
+    /// [`Self::stop`] call with `diarization_enabled = true` exercises the FULL
+    /// toggle-ON gate branch (`settings.diarization_enabled == true → build →
+    /// dispatch → finalise`) without building a real `SherpaDiarizer`.
+    ///
+    /// [`Self::diarize_on_stop`] consumes this override (via `take()`) in place
+    /// of `runner::build_diarizer`; everything downstream — decode, diarize,
+    /// `transcript.json` / `metadata.json` rewrite, and the
+    /// `AppEvent::DiarizationComplete` emission — is the production path. The
+    /// override is one-shot: once consumed, the next `stop()` builds the real
+    /// diarizer again.
+    ///
+    /// This is the on-stop analogue of [`Self::rediarize_with_diarizer`].
+    /// Available only under the `test-source` feature (or in `#[cfg(test)]`).
+    pub async fn inject_on_stop_diarizer(&self, diarizer: Box<dyn Diarizer + Send>) {
+        self.inner.lock().await.on_stop_diarizer_override = Some(diarizer);
+    }
+
+    /// Borrow the orchestrator's `SettingsHandle` so a test can flip a setting
+    /// (e.g. `diarization_enabled`) on the same handle `stop()` reads.
+    ///
+    /// `test_orchestrator` builds the handle internally; this accessor lets the
+    /// W3 on-stop test enable diarization without a parallel handle.
+    /// Available only under the `test-source` feature (or in `#[cfg(test)]`).
+    pub fn settings_handle_for_test(&self) -> &SettingsHandle {
+        &self.settings
     }
 }

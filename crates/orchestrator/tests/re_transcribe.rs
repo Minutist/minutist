@@ -53,12 +53,20 @@ use tokio::sync::{broadcast, mpsc};
 // ---------------------------------------------------------------------------
 
 fn model_env_vars() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let model = std::env::var("MEETING_APP_ASR_MODEL_PATH").ok()?;
-    let mmproj = std::env::var("MEETING_APP_ASR_MMPROJ_PATH").ok()?;
+    // Treat an EMPTY value as unset (skip) so `VAR=""` does not stage an empty
+    // path and panic; only a non-empty path counts as "set".
+    let model = non_empty_env("MEETING_APP_ASR_MODEL_PATH")?;
+    let mmproj = non_empty_env("MEETING_APP_ASR_MMPROJ_PATH")?;
     Some((
         std::path::PathBuf::from(model),
         std::path::PathBuf::from(mmproj),
     ))
+}
+
+/// Read `name` from the environment, returning `None` when it is unset OR set
+/// to an empty string, so `VAR=""` is equivalent to "unset" for the gate.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 // ---------------------------------------------------------------------------

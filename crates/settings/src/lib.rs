@@ -123,6 +123,15 @@ pub struct Settings {
     /// via `#[serde(default)]`.
     #[serde(default)]
     pub llm_model_id: Option<ModelId>,
+
+    /// Whether the post-recording diarization pass runs (FR-11).
+    ///
+    /// Diarization is post-hoc and off by default: the orchestrator gates its
+    /// on-stop diarizer pass (and the user-triggered re-diarize) on this flag.
+    /// `#[serde(default)]` defaults to `false`; an older store written before
+    /// this field existed deserialises to `false`.
+    #[serde(default)]
+    pub diarization_enabled: bool,
 }
 
 impl Default for Settings {
@@ -135,6 +144,7 @@ impl Default for Settings {
             autosave_interval_secs: default_autosave_interval_secs(),
             summary_system_prompt: default_summary_system_prompt(),
             llm_model_id: None,
+            diarization_enabled: false,
         }
     }
 }
@@ -170,6 +180,7 @@ mod tests {
             autosave_interval_secs: 17,
             summary_system_prompt: "Summarise tersely.".to_string(),
             llm_model_id: Some(ModelId::from("gemma-4-e4b-it-q4_k_m")),
+            diarization_enabled: true,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -260,6 +271,45 @@ mod tests {
         assert_eq!(
             restored.llm_model_id, None,
             "missing llm_model_id must deserialise to None"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1d. diarization_enabled: default + round-trip + missing-field
+    //     deserialisation (FR-11)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn diarization_enabled_defaults_to_false() {
+        assert!(
+            !Settings::default().diarization_enabled,
+            "diarization is post-hoc and off by default (FR-11)"
+        );
+    }
+
+    #[test]
+    fn diarization_enabled_round_trips() {
+        let original = Settings {
+            diarization_enabled: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(restored.diarization_enabled);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_diarization_field_defaults_to_false() {
+        // A settings store written before `diarization_enabled` existed (it
+        // still carries the Phase-3/Phase-5 fields).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            !restored.diarization_enabled,
+            "missing diarization_enabled must deserialise to false (FR-11 default)"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

@@ -39,7 +39,7 @@ pub async fn rename_meeting(
     let mut meta = reader::read_metadata_inner(&folder)?;
     meta.title = new_title.to_string();
 
-    write_metadata_atomic(&metadata_path, &meta)?;
+    crate::metadata::write_metadata(&folder, &meta)?;
 
     // Refresh the index row to match the renamed meeting.
     let entry = list_entry_from(&folder)?;
@@ -114,37 +114,4 @@ fn truncate_excerpt(text: &str) -> String {
         let truncated: String = text.chars().take(MAX).collect();
         format!("{truncated}…")
     }
-}
-
-/// Atomically write `meta` to `metadata.json` (tmp + rename), matching the
-/// durability of the notes/summary writers.
-fn write_metadata_atomic(path: &Path, meta: &meeting_app_common::MeetingMeta) -> Result<(), Error> {
-    use std::io::Write;
-
-    let parent = path
-        .parent()
-        .ok_or(Error::InvalidState("metadata path has no parent"))?;
-    let tmp_path = parent.join("metadata.json.tmp");
-
-    let json = serde_json::to_vec_pretty(meta).map_err(Error::Serialise)?;
-
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&json)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    Ok(())
 }

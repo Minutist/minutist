@@ -6,7 +6,7 @@ use meeting_app_common::{AppResult, AudioFormat, MeetingId, MeetingMeta, Segment
 
 use crate::error::Error;
 use crate::folder::MeetingFolder;
-use crate::metadata::write_metadata;
+use crate::metadata::write_metadata_to_path;
 use crate::opus_encoder::OggOpusEncoder;
 use crate::transcript::TranscriptWriter;
 
@@ -143,7 +143,7 @@ impl MeetingWriter {
         }
 
         // Write metadata.json.
-        write_metadata(self.folder.metadata_path(), &meta)
+        write_metadata_to_path(&self.folder.metadata_path(), &meta)
             .map_err(meeting_app_common::AppError::from)?;
 
         tracing::info!(

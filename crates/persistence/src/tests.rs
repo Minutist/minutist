@@ -536,7 +536,7 @@ fn write_synthetic_meeting(
     meta.title = title.to_string();
     meta.started_at = started_at.to_string();
     meta.speaker_count = 2;
-    crate::metadata::write_metadata(folder.metadata_path(), &meta).expect("write metadata");
+    crate::metadata::write_metadata(folder.path(), &meta).expect("write metadata");
 
     if !segments.is_empty() {
         let mut tw = TranscriptWriter::open(&folder).expect("open transcript");
@@ -822,6 +822,87 @@ fn test_summary_write_read_round_trip() {
     assert_eq!(loaded, body, "summary.md did not round-trip");
 
     // No .tmp residue after write.
+    let residue: Vec<_> = std::fs::read_dir(folder.path())
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".tmp"))
+        .collect();
+    assert!(residue.is_empty(), "expected no .tmp residue, found {residue:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Test 14b: public write_metadata → read_metadata round-trip; siblings untouched
+// ---------------------------------------------------------------------------
+
+/// `metadata::write_metadata(meeting_dir, &meta)` round-trips through
+/// `reader::read_metadata` and updates `{ speaker_count, diarizer }` (the
+/// Phase-6 orchestrator use) **without** disturbing the sibling files
+/// (`audio.opus` / `transcript.json` / `notes.json`) or leaving `.tmp` residue.
+#[test]
+fn test_write_metadata_round_trip_leaves_siblings_untouched() {
+    use meeting_app_common::ModelDescriptor;
+
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+    let id = MeetingId::new();
+    let folder = crate::folder::MeetingFolder::create(root, id).expect("folder");
+
+    // Lay down sibling files alongside metadata.json. Their byte contents are
+    // captured so we can prove write_metadata leaves them untouched.
+    let audio_path = folder.audio_path();
+    let transcript_path = folder.transcript_path();
+    let notes_path = folder.notes_path();
+    std::fs::write(&audio_path, b"OPUS-PLACEHOLDER-BYTES").expect("write audio sibling");
+    std::fs::write(&transcript_path, b"[{\"placeholder\":true}]").expect("write transcript sibling");
+    std::fs::write(&notes_path, b"{\"placeholder\":true}").expect("write notes sibling");
+
+    let audio_before = std::fs::read(&audio_path).expect("read audio before");
+    let transcript_before = std::fs::read(&transcript_path).expect("read transcript before");
+    let notes_before = std::fs::read(&notes_path).expect("read notes before");
+
+    // Initial metadata with speaker_count 0 / diarizer None (pre-diarization).
+    let mut meta = dummy_meta(id, 5_000);
+    meta.speaker_count = 0;
+    meta.diarizer = None;
+    crate::metadata::write_metadata(folder.path(), &meta).expect("initial write");
+
+    // The Phase-6 orchestrator overlay: bump speaker_count and stamp the
+    // diarizer descriptor, then atomically rewrite metadata.json.
+    meta.speaker_count = 3;
+    meta.diarizer = Some(ModelDescriptor {
+        name: "pyannote-segmentation-3.0".to_string(),
+        quantisation: None,
+        version: "3.0".to_string(),
+    });
+    crate::metadata::write_metadata(folder.path(), &meta).expect("diarization update write");
+
+    // read_metadata reflects the updated fields.
+    let back = reader::read_metadata(folder.path()).expect("read metadata");
+    assert_eq!(back.uuid, id);
+    assert_eq!(back.speaker_count, 3, "speaker_count not updated");
+    let diarizer = back.diarizer.expect("diarizer descriptor present");
+    assert_eq!(diarizer.name, "pyannote-segmentation-3.0");
+    assert_eq!(diarizer.version, "3.0");
+
+    // Siblings are byte-for-byte unchanged.
+    assert_eq!(
+        std::fs::read(&audio_path).expect("read audio after"),
+        audio_before,
+        "audio.opus was modified by write_metadata"
+    );
+    assert_eq!(
+        std::fs::read(&transcript_path).expect("read transcript after"),
+        transcript_before,
+        "transcript.json was modified by write_metadata"
+    );
+    assert_eq!(
+        std::fs::read(&notes_path).expect("read notes after"),
+        notes_before,
+        "notes.json was modified by write_metadata"
+    );
+
+    // No .tmp residue after the atomic write.
     let residue: Vec<_> = std::fs::read_dir(folder.path())
         .expect("read dir")
         .filter_map(|e| e.ok())

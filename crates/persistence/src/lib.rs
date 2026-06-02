@@ -58,6 +58,7 @@ pub mod writer;
 pub use error::Error;
 pub use folder::MeetingFolder;
 pub use index::MeetingIndex;
+pub use metadata::write_metadata;
 pub use notes::{NotesData, NotesStore};
 pub use reader::{read_audio_pcm, read_meeting_state, read_metadata, read_transcript};
 pub use summary::{read_summary, write_summary};

@@ -453,6 +453,20 @@ on `common`.
   Phase 5's `summariser` produces the file; Phase 4 lands only the path helper
   and the I/O seam.
 
+**Phase 6 surface growth — public atomic `write_metadata(meeting_dir,
+&MeetingMeta)`.** A public free function in the `metadata` module (re-exported
+at the crate root) that **atomically** (tmp + fsync + rename, matching the
+notes/summary writers) rewrites `metadata.json` inside an existing
+`{root}/{uuid}/` folder. It is the seam the orchestrator uses to update
+`metadata.json`'s `{ speaker_count, diarizer }` after the diarization pass while
+`persistence` stays the **sole** writer under `meetings/{uuid}/` (the diarizer
+itself never touches disk). It does not create the folder and leaves the sibling
+files (`audio.opus` / `transcript.json` / `notes.json`) untouched. The Phase-1
+`MeetingWriter::finalise` path now also writes through the same atomic
+implementation (via the crate-private `write_metadata_to_path`); `meeting_ops`'s
+rename re-uses the public function rather than its prior private copy. No new
+cross-component dependency edge — `persistence` still depends only on `common`.
+
 ### `orchestrator`
 **Crate:** `crates/orchestrator`
 **Owns:** the live recording state machine. Wires `audio-capture →
@@ -584,6 +598,14 @@ as the chat `system` message; an older store deserialises to that default.
 to `None` ("use the bundled default model"); the model is settings-selected,
 never hard-coded (switching is a manifest + `llm_model_id` change). `ModelId`
 is re-used from `common` — no new dependency edge.
+
+**Phase 6 field — `diarization_enabled: bool` (FR-11).** Gates the post-hoc
+diarization pass. `#[serde(default)]`-defaults to `false` (diarization is
+post-hoc and off by default); an older store written before the field existed
+deserialises to `false`. The orchestrator reads this flag to decide whether to
+run the on-stop diarizer pass (and the user-triggered re-diarize), per the
+diarizer design above. Added to the hand-written `Default` impl alongside the
+Phase-3/Phase-5 fields. No new dependency edge.
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

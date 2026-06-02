@@ -793,6 +793,40 @@ left, transcript right).
   reuses `AppEvent::TranscriptSegment`; `re_summarise` reuses
   `AppEvent::SummaryReady`.
 
+**Phase 5 additions (Stream S4 — summary view).**
+
+- **Summary view (`ui/src/shell/SummaryView.tsx` + `.css`, FR-30).** A reading
+  surface in the Editorial Ink language that renders the meeting's `summary.md`
+  markdown (via `markdown-it`, `html: false`) as a paper sheet, exposes a
+  Summarise action with an in-progress affordance while the LLM runs, and lets
+  the user edit the raw markdown and persist it. It is an optional third
+  workspace pane in `MainWindow` — revealed by a header "Summary" toggle when a
+  meeting is open or recording; the meeting it summarises is the open meeting
+  else the live recording's `meeting_id`. The meeting-list row's Summarise
+  action (renamed from the Phase-4 "Re-summarise" stub button) also runs the
+  real summariser through the summary store.
+- **Summary store (`ui/src/state/summary.ts`).** Transient UI state only
+  (`summaryMarkdown`, `summarising`, `meetingId`, `lastError`) routed through the
+  `ui/src/ipc/summary.ts` seam; `summary.md` on disk is authoritative. Its
+  `handleEvent` is dispatched alongside `RecordingStore`/`ModelsStore` from
+  `useAppEventBridge` and handles `AppEvent::SummaryReady` by re-reading the
+  summary (`get_summary`) and leaving the in-progress state — scoped to the
+  loaded meeting so an unrelated meeting's event does not clobber the view.
+- **IPC seam (`ui/src/ipc/summary.ts`).** A thin client (mirroring `notes.ts` /
+  `meetings.ts`) over the shim-aware `commands` from `./client` — NOT raw
+  `./bindings` — for the three Phase-5 commands: `summarise_meeting(meeting_id)
+  -> ()`, `get_summary(meeting_id) -> Option<String>`, and
+  `save_summary(meeting_id, summary_markdown) -> ()`. These commands are added
+  to `ipc-bridge` by the Phase-5 backend JOIN (Stream S5), which regenerates
+  `bindings.ts`. Until that regeneration lands, `client.ts` routes them through a
+  shim-aware `callPendingCommand` raw-`invoke` path (the same approach the
+  Phase-4 meeting commands used before Stream C regenerated the bindings); once
+  regenerated they fold into `callCommand` like every other command. The DEV
+  shim (`dev-shim.ts`) supplies a sample `summary.md` + a `summary_ready`
+  fan-out so the view renders and updates under `vite dev`. The summary crosses
+  the wire as an opaque markdown `String`; `summarise_meeting` reuses
+  `AppEvent::SummaryReady` (no new event).
+
 ### Design system — "Editorial Ink" (light theme)
 
 A warm-paper, document-centric **light** theme applied across the webview.

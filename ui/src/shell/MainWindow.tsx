@@ -9,6 +9,7 @@ import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
 import { MeetingList } from "./MeetingList";
+import { SummaryView } from "./SummaryView";
 import { Editor } from "../editor/Editor";
 import { TranscriptPane } from "../transcript/TranscriptPane";
 import "./MainWindow.css";
@@ -45,8 +46,17 @@ export function MainWindow() {
   // recording, switches to the editor/transcript workspace.
   const inWorkspace = openMeetingId !== null || recordingState.kind !== "idle";
 
+  // The meeting the workspace is operating on: the opened saved meeting, else
+  // the live recording's meeting (recording / paused / stopping carry the id).
+  // This is the meeting the summary view summarises.
+  const activeMeetingId =
+    openMeetingId ??
+    (recordingState.kind !== "idle" ? recordingState.meeting_id : null);
+
   const transcriptPanelRef = usePanelRef();
   const [transcriptCollapsed, setTranscriptCollapsed] = useState(false);
+  // The summary panel is hidden by default; the header toggle reveals it (FR-30).
+  const [summaryOpen, setSummaryOpen] = useState(false);
 
   useEffect(() => {
     // Load persisted settings first so `selectedDeviceId` reflects the
@@ -117,6 +127,16 @@ export function MainWindow() {
               {transcriptCollapsed ? "Show transcript" : "Hide transcript"}
             </button>
           )}
+          {inWorkspace && activeMeetingId !== null && (
+            <button
+              type="button"
+              className="main-window__toggle-transcript"
+              aria-pressed={summaryOpen}
+              onClick={() => setSummaryOpen((open) => !open)}
+            >
+              {summaryOpen ? "Hide summary" : "Summary"}
+            </button>
+          )}
         </div>
       </header>
 
@@ -160,6 +180,25 @@ export function MainWindow() {
           >
             <TranscriptPane />
           </Panel>
+
+          {summaryOpen && activeMeetingId !== null && (
+            <>
+              <Separator className="main-window__resize-handle">
+                <span
+                  className="main-window__resize-grip"
+                  aria-hidden="true"
+                />
+              </Separator>
+              <Panel
+                id="summary"
+                className="main-window__pane main-window__pane--summary"
+                minSize="20%"
+                defaultSize="35%"
+              >
+                <SummaryView meetingId={activeMeetingId} />
+              </Panel>
+            </>
+          )}
         </Group>
       ) : (
         <MeetingList />

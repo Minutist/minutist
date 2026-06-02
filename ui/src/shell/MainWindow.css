@@ -341,6 +341,11 @@
   background: transparent;
 }
 
+/* Summary — a third optional column; the sheet treatment lives in SummaryView.css. */
+.main-window__pane--summary {
+  background: transparent;
+}
+
 /* Hairline divider with a subtle, centred grip. */
 .main-window__resize-handle {
   position: relative;

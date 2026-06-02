@@ -11,6 +11,7 @@
  */
 import { useEffect, useState } from "react";
 import { useMeetingsStore } from "../state/meetings";
+import { useSummaryStore } from "../state/summary";
 import type { MeetingListEntry } from "../state/meetings";
 import "./MeetingList.css";
 
@@ -46,7 +47,7 @@ type MeetingRowProps = {
   onRename: (title: string) => void;
   onDelete: () => void;
   onReTranscribe: () => void;
-  onReSummarise: () => void;
+  onSummarise: () => void;
 };
 
 function MeetingRow(props: MeetingRowProps) {
@@ -138,9 +139,9 @@ function MeetingRow(props: MeetingRowProps) {
         <button
           type="button"
           className="meeting-list__action"
-          onClick={props.onReSummarise}
+          onClick={props.onSummarise}
         >
-          Re-summarise
+          Summarise
         </button>
         <button
           type="button"
@@ -162,7 +163,9 @@ export function MeetingList() {
   const rename = useMeetingsStore((s) => s.rename);
   const remove = useMeetingsStore((s) => s.remove);
   const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
-  const reSummarise = useMeetingsStore((s) => s.reSummarise);
+  // Phase 5: the row Summarise action runs the real summariser via the summary
+  // store (`summarise_meeting`), superseding the Phase-4 `re_summarise` stub.
+  const summarise = useSummaryStore((s) => s.summarise);
 
   useEffect(() => {
     void refresh();
@@ -193,7 +196,7 @@ export function MeetingList() {
               onRename={(title) => void rename(meeting.id, title)}
               onDelete={() => void remove(meeting.id)}
               onReTranscribe={() => void reTranscribe(meeting.id)}
-              onReSummarise={() => void reSummarise(meeting.id)}
+              onSummarise={() => void summarise(meeting.id)}
             />
           ))}
         </ol>

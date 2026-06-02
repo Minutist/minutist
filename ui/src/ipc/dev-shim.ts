@@ -178,6 +178,34 @@ const DEV_NOTES_MD =
   "# Launch sync — Tuesday\n\nThree open risks against the date; offline model download is the one to watch. First-run should feel deliberate.\n\nOwner: progress affordance + retry path. Target: this week.\n\n## Design direction\n\nTranscript and notes should read as one document — warm paper, a single oxblood ink accent, timestamps as quiet marginalia.\n\n> It should feel like writing on a fine sheet of paper on a warm desk.\n";
 
 /**
+ * Sample meeting summary (Phase 5, FR-30) so the summary view renders populated
+ * under `vite dev`. Markdown with a heading, prose, a decisions list, and an
+ * action-items list — the shape the summariser produces from a transcript +
+ * notes. Keyed per dev meeting id in {@link devSummaries} so opening different
+ * meetings shows distinct content.
+ */
+const DEV_SUMMARY_MD = `## Summary
+
+The launch sync covered the release checklist with three open risks against the date. The standout concern is the offline model download: the first-run experience needs to feel deliberate rather than broken, since users abandoned earlier builds before the model finished.
+
+### Decisions
+
+- Ship the deliberate first-run progress affordance with an explicit retry path.
+- Hold the editorial direction: warm paper, a single oxblood ink accent, timestamps as quiet marginalia.
+
+### Action items
+
+- **Owner** — build the progress affordance and retry path (target: this week).
+- Confirm sign-off on the two-pane sheet/transcript treatment.
+`;
+
+/** Per-meeting sample summaries; meetings without an entry have no summary yet. */
+const devSummaries = new Map<MeetingId, string>([
+  [DEV_MEETING_ID, DEV_SUMMARY_MD],
+  ["dev-meeting-0002", "## Summary\n\nDesign review signed off the Editorial Ink treatment: warm paper, one oxblood accent, marginal timestamps.\n"],
+]);
+
+/**
  * Sample meeting-list rows (FR-33) so the entry surface renders populated under
  * `vite dev`. Dates span a few weeks; durations / speaker counts vary; each has
  * a transcript excerpt for the row preview.
@@ -336,7 +364,37 @@ export const devCommands = {
   async reSummarise(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
     return ok(null);
   },
+  // --- Phase 5 summary surface (FR-30) ------------------------------------
+  async summariseMeeting(meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    // Seed a summary for this meeting so a follow-up `getSummary` returns
+    // content, and notify the live event stream so the store re-reads it (the
+    // real backend emits `AppEvent::SummaryReady`).
+    devSummaries.set(meetingId, devSummaries.get(meetingId) ?? DEV_SUMMARY_MD);
+    devSummaryReadyListeners.forEach((cb) =>
+      cb({ kind: "summary_ready", meeting_id: meetingId }),
+    );
+    return ok(null);
+  },
+  async getSummary(
+    meetingId: MeetingId,
+  ): Promise<Result<string | null, IpcError>> {
+    return ok(devSummaries.get(meetingId) ?? null);
+  },
+  async saveSummary(
+    meetingId: MeetingId,
+    summaryMarkdown: string,
+  ): Promise<Result<null, IpcError>> {
+    devSummaries.set(meetingId, summaryMarkdown);
+    return ok(null);
+  },
 };
+
+/**
+ * DEV-only `summary_ready` fan-out so the dev shim's `summariseMeeting` can
+ * notify the live event stream started by {@link startDevEventStream}. The
+ * real backend emits `AppEvent::SummaryReady`; this mirrors it in the browser.
+ */
+const devSummaryReadyListeners = new Set<(event: AppEvent) => void>();
 
 /**
  * Drive a representative live event stream into the supplied callback.
@@ -355,6 +413,10 @@ export function startDevEventStream(
   const emit = (event: AppEvent) => {
     if (!cancelled) callback(event);
   };
+
+  // Forward dev `summary_ready` notifications (fired by the shim's
+  // `summariseMeeting`) into this event stream so the summary store re-reads.
+  devSummaryReadyListeners.add(emit);
 
   // Establish the recording state on the next tick (after stores subscribe).
   timers.push(
@@ -388,6 +450,7 @@ export function startDevEventStream(
 
   return () => {
     cancelled = true;
+    devSummaryReadyListeners.delete(emit);
     timers.forEach(clearTimeout);
     clearInterval(tick);
   };

@@ -6,7 +6,8 @@
  * injection point.
  */
 import { events, commands as generatedCommands } from "./bindings";
-import type { AppEventPayload, IpcError, Result } from "./bindings";
+import { invoke as TAURI_INVOKE } from "@tauri-apps/api/core";
+import type { AppEventPayload, IpcError, MeetingId, Result } from "./bindings";
 import type { AppEvent } from "./app-event";
 import { shouldUseDevShim } from "./dev-shim-guard";
 
@@ -23,8 +24,35 @@ import { shouldUseDevShim } from "./dev-shim-guard";
  * `shouldUseDevShim()` is evaluated per call (cheap) so behaviour matches the
  * actual runtime; the dynamic import is memoised after the first DEV call.
  */
-type Commands = typeof generatedCommands;
-type CommandName = keyof Commands;
+type GeneratedCommands = typeof generatedCommands;
+
+/**
+ * The Phase-5 summary command surface (`summarise_meeting`, `get_summary`,
+ * `save_summary`).
+ *
+ * These commands are added to `ipc-bridge` by the Phase-5 backend JOIN (Stream
+ * S5), which regenerates `bindings.ts` to include them on the generated
+ * `commands` object. Until that regeneration lands, the generated `commands`
+ * has no entry for them, so this module declares their shape locally and routes
+ * them through {@link callPendingCommand} (the shim-aware raw-`invoke` path) —
+ * mirroring the Phase-4 meeting commands' "pending generation" path before
+ * Stream C regenerated the bindings. The signatures below MUST match the JOIN's
+ * generated bindings exactly (see the dev report's S5 JOIN signatures note).
+ *
+ * Once Stream S5 regenerates `bindings.ts`, these can fold into `callCommand`
+ * like every other command and this declaration can be dropped.
+ */
+type SummaryCommands = {
+  summariseMeeting(meetingId: MeetingId): Promise<Result<null, IpcError>>;
+  getSummary(meetingId: MeetingId): Promise<Result<string | null, IpcError>>;
+  saveSummary(
+    meetingId: MeetingId,
+    summaryMarkdown: string,
+  ): Promise<Result<null, IpcError>>;
+};
+
+type Commands = GeneratedCommands & SummaryCommands;
+type CommandName = keyof GeneratedCommands;
 
 let devCommandsPromise: Promise<Commands> | null = null;
 async function loadDevCommands(): Promise<Commands> {
@@ -34,6 +62,33 @@ async function loadDevCommands(): Promise<Commands> {
     );
   }
   return devCommandsPromise;
+}
+
+/**
+ * Shim-aware raw-`invoke` path for commands not yet present on the generated
+ * `commands` object (the Phase-5 summary surface, until Stream S5 regenerates
+ * `bindings.ts`). In a `vite dev` browser with no Tauri backend it routes
+ * through the DEV shim; otherwise it calls `TAURI_INVOKE` directly. Tests mock
+ * the higher-level `../ipc/summary` seam, so this path is never exercised under
+ * Vitest.
+ */
+async function callPendingCommand<T>(
+  name: keyof SummaryCommands,
+  tauriCommand: string,
+  args: Record<string, unknown>,
+): Promise<Result<T, IpcError>> {
+  if (import.meta.env.DEV && shouldUseDevShim()) {
+    const dev = await loadDevCommands();
+    return (dev[name] as (...a: unknown[]) => Promise<Result<T, IpcError>>)(
+      ...Object.values(args),
+    );
+  }
+  try {
+    return { status: "ok", data: await TAURI_INVOKE(tauriCommand, args) };
+  } catch (e) {
+    if (e instanceof Error) throw e;
+    return { status: "error", error: e as IpcError };
+  }
 }
 
 async function callCommand<K extends CommandName>(
@@ -79,6 +134,24 @@ export const commands: Commands = {
   deleteMeeting: (meetingId) => callCommand("deleteMeeting", [meetingId]),
   reTranscribe: (meetingId) => callCommand("reTranscribe", [meetingId]),
   reSummarise: (meetingId) => callCommand("reSummarise", [meetingId]),
+  // Phase 5 summary surface (FR-30). Not yet on the generated `commands`
+  // object — Stream S5's backend JOIN regenerates `bindings.ts` to add them;
+  // until then they route through the shim-aware `callPendingCommand` raw
+  // `invoke` path (the same approach the Phase-4 meeting commands used before
+  // Stream C regenerated the bindings). The DEV shim still intercepts here.
+  summariseMeeting: (meetingId) =>
+    callPendingCommand<null>("summariseMeeting", "summarise_meeting", {
+      meetingId,
+    }),
+  getSummary: (meetingId) =>
+    callPendingCommand<string | null>("getSummary", "get_summary", {
+      meetingId,
+    }),
+  saveSummary: (meetingId, summaryMarkdown) =>
+    callPendingCommand<null>("saveSummary", "save_summary", {
+      meetingId,
+      summaryMarkdown,
+    }),
 };
 
 // Re-export types that callers commonly need. `AppEvent` is the generated

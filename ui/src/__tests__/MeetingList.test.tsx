@@ -3,10 +3,12 @@
  *
  * Asserts:
  *   - rows render with title / date / duration / speaker-count / excerpt,
- *   - the open / rename / delete / re-transcribe / re-summarise actions fire the
- *     corresponding meetings-store calls (which route through the mocked
- *     `../ipc/meetings` seam — per the architecture testing policy, the seam is
- *     mocked, not the generated bindings file).
+ *   - the open / rename / delete / re-transcribe actions fire the corresponding
+ *     meetings-store calls (which route through the mocked `../ipc/meetings`
+ *     seam), and the Summarise action routes through the summary store's
+ *     `summarise_meeting` (mocked at the `../ipc/summary` seam) — per the
+ *     architecture testing policy, the seams are mocked, not the generated
+ *     bindings file.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
@@ -28,9 +30,18 @@ vi.mock("../ipc/meetings", () => ({
   reSummarise: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The Phase-5 row Summarise action routes through the summary store, which
+// wraps the `../ipc/summary` seam. Mock the seam so the action is observable.
+vi.mock("../ipc/summary", () => ({
+  summariseMeeting: vi.fn().mockResolvedValue(undefined),
+  getSummary: vi.fn().mockResolvedValue(null),
+  saveSummary: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { MeetingList, formatDuration } from "../shell/MeetingList";
 import { useMeetingsStore } from "../state/meetings";
 import * as meetingsIpc from "../ipc/meetings";
+import * as summaryIpc from "../ipc/summary";
 
 const sampleMeetings = [
   {
@@ -164,14 +175,14 @@ describe("MeetingList view (FR-33)", () => {
     );
   });
 
-  it("Re-summarise fires re_summarise for the row's meeting", async () => {
+  it("Summarise fires summarise_meeting for the row's meeting", async () => {
     await renderList();
-    const buttons = screen.getAllByRole("button", { name: "Re-summarise" });
+    const buttons = screen.getAllByRole("button", { name: "Summarise" });
     act(() => {
       fireEvent.click(buttons[0]);
     });
     await waitFor(() =>
-      expect(meetingsIpc.reSummarise).toHaveBeenCalledWith("meeting-0001"),
+      expect(summaryIpc.summariseMeeting).toHaveBeenCalledWith("meeting-0001"),
     );
   });
 

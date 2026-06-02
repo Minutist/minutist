@@ -433,6 +433,18 @@ export type AppEvent =
  */
 { kind: "model_download_progress"; model_id: ModelId; bytes_done: number; bytes_total: number | null } | 
 /**
+ * A newer release is available (the updater's check found one). The
+ * webview shows an update-available prompt. Emitted by app-main's
+ * `tauri-plugin-updater` integration; see `architecture/cross-cutting.md`
+ * "Auto-update".
+ */
+{ kind: "update_available"; version: string; notes: string | null } | 
+/**
+ * Update-download progress while applying an accepted update. `total_bytes`
+ * is `None` when the server sends no content length.
+ */
+{ kind: "update_progress"; downloaded_bytes: number; total_bytes: number | null } | 
+/**
  * User-visible settings changed; subscribers should re-read.
  */
 { kind: "settings_changed" } | 
@@ -667,7 +679,17 @@ llm_model_id?: ModelId | null;
  * `#[serde(default)]` defaults to `false`; an older store written before
  * this field existed deserialises to `false`.
  */
-diarization_enabled?: boolean }
+diarization_enabled?: boolean; 
+/**
+ * Whether the first-run onboarding flow has been completed (Phase 7).
+ * 
+ * The webview gates the main UI behind this: `false` shows the onboarding
+ * flow (welcome → model download → settings tour), which sets it `true` on
+ * completion. `#[serde(default)]` defaults to `false`; an older store
+ * written before this field existed deserialises to `false` (so existing
+ * users see onboarding once on upgrade — acceptable for a pre-release).
+ */
+onboarding_completed?: boolean }
 /**
  * UI colour-scheme preference.
  */

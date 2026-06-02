@@ -202,14 +202,27 @@ optional external-LLM dispatcher (Ollama / LM Studio).
 **Inputs:** transcript + notes (read via `persistence`).
 **Outputs:** a markdown summary written via `persistence`.
 
-**Chat-template handling (confirmed by Phase 0 Spike 2).** Use
-`LlamaModel::chat_template(None::<&str>)` to read the GGUF's baked-in
+**Bundled default model (Phase 5, primary-source verified 2026-06).**
+**Gemma 4 E4B-it** (`gemma4` arch, **Apache-2.0** — Google moved Gemma 4 off
+the restrictive Gemma ToU), the newest on-device Gemma. Loads in the pinned
+llama.cpp b8783 (vendored by `llama-cpp-2 =0.1.146`) with no bump; 128K
+context fits a 30-min transcript in one pass. Bundle the **text-only**
+Q4_K_M GGUF (skip the multimodal `mmproj`). Low-end tier: **Gemma 4 E2B-it**
+(same family/loader). Fallback if the Gemma-4 PLE forward-graph bug
+(llama.cpp #22243) degrades quality: **IBM Granite 4.1-3b** (Apache-2.0,
+dense, no PLE, non-thinking). The model is **settings-selected** — never
+hard-coded — so switching is a manifest + `llm_model_id` change.
+
+**Chat-template handling — MODEL-AGNOSTIC (Phase 0 Spike 2).** Use
+`LlamaModel::chat_template(None::<&str>)` to read the GGUF's **baked-in**
 template, then `LlamaModel::apply_chat_template(template, messages,
-add_ass=true)` to render the prompt. Do NOT pull in `tokenizers` —
-llama-cpp-2 covers this cleanly. If the template is missing or the
-model isn't Qwen-shaped, fail the request explicitly rather than
-falling back to a hand-built ChatML scaffold (the manual scaffold only
-matches Qwen's template).
+add_ass=true)` to render the prompt. Do NOT pull in `tokenizers` and do NOT
+hand-build a model-specific scaffold (the old ChatML scaffold only matched
+Qwen) — relying on the GGUF's own template keeps the summariser model-agnostic
+across Gemma 4 / Qwen / Granite. If the template is missing, fail the request
+explicitly (`AppError::InvalidInput`) rather than guessing. For Gemma 4 run
+with **thinking disabled** (do not inject the `<|think|>` token); if a future
+selected model emits a `<think>` block, strip it before persisting the summary.
 
 **Prefill must chunk by `n_batch`** — see `cross-cutting.md`, "llama.cpp
 prefill batching". Long transcripts exceed `n_batch` (default 512) and

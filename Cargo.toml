@@ -8,6 +8,7 @@ members = [
     "crates/persistence",
     "crates/model-registry",
     "crates/asr-runtime",
+    "crates/summariser",
     "crates/orchestrator",
     "crates/ipc-bridge",
     "src-tauri",

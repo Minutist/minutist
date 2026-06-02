@@ -1,0 +1,16 @@
+[package]
+name = "summariser"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+meeting-app-common = { path = "../common" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# Optional external-LLM (Ollama) dispatcher (FR-29); off by default. Stream S1
+# wires the HTTP client (reqwest, optional) behind this feature.
+external-ollama = []

@@ -212,6 +212,34 @@ re-pass, and emits `AppEvent::DiarizationComplete` on its shared bus. Ship the
 MIT + Apache NOTICE/attribution (the k2-fsa / HF mirrors don't carry the
 upstream notices).
 
+**Implementation (Phase 6 Stream S1).** `SherpaDiarizer::open` constructs the
+`sherpa_rs::diarize::Diarize` engine once and holds it behind a `Mutex` (the
+`common::Diarizer` trait takes `&self`; sherpa's `compute` takes `&mut self`,
+and diarization is single-threaded per call so the mutex is never contended on
+the hot path). `DiarizerConfig` maps onto sherpa's `DiarizeConfig`:
+`num_clusters = Some(n)` → exact-cluster mode; `None` → `num_clusters = Some(-1)`
+(sherpa's "use threshold" sentinel, Spike 4) with `cluster_threshold`. The
+orchestrator passes `num_clusters = Some(1)` for the conservative single-speaker
+pass so one speaker is not over-split. `assign_speakers` rejects any
+`sample_rate != 16000` with `AppError::InvalidInput`, short-circuits empty
+audio/segments to `0`, runs `Diarize::compute`, and overlays via a pure
+`overlay_speakers(&[sherpa::Segment], &mut [Segment]) -> u32`: per ASR segment it
+picks the max-overlap sherpa turn (seconds→ms, half-open `[start_ms, end_ms)`;
+ties resolve to the earlier turn; no overlap → `speaker_id = None`), relabels the
+chosen `i32` cluster ids to first-seen-order `A`/`B`/… across segment slice
+order, and returns the distinct-label count. The sherpa `eyre::Result` is mapped
+to `Error::ModelLoad`/`Error::Inference` → `AppError::{ModelLoad,Inference{backend:"diarizer"}}`
+at the boundary (eyre arrives transitively via `sherpa-rs`; no separate `eyre`
+dep). `sherpa-rs = { workspace = true }` is added to `crates/diarizer/Cargo.toml`;
+`hound` is a dev-dependency for the gated test's WAV decode. Tests: the default
+suite covers `overlay_speakers` (interval-join, no-overlap=None, tie-break,
+first-seen relabel, stale-label clearing) with no model; the env-var-gated
+`tests/accuracy.rs` (`MEETING_APP_DIARIZE_SEG_PATH` + `MEETING_APP_DIARIZE_EMB_PATH`,
+skip-on-unset) runs `assign_speakers` over committed synthetic real-speech
+fixtures (`tests/fixtures/two_speakers_synth.wav` = LibriSpeech clip + a
+pitch-shifted copy; `single_speaker_control.wav`), asserting ≥ 80 %
+permutation-invariant segment accuracy and exactly one label on the control.
+
 ### `summariser`
 **Crate:** `crates/summariser`
 **Owns:** llama-cpp-2 text-LLM lifecycle, summarisation prompts, the

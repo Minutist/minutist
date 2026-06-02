@@ -9,6 +9,10 @@ authors.workspace = true
 meeting-app-common = { path = "../common" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# sherpa-onnx offline speaker diarization (segmentation + embedding + clustering).
+# Workspace-pinned =0.6.8 with `download-binaries`; see workspace Cargo.toml.
+sherpa-rs = { workspace = true }
 
-# NOTE: Stream S1 adds `sherpa-rs = { workspace = true }` in-stream when it fills
-# the inference body. The skeleton (stub) does not need it to compile.
+[dev-dependencies]
+# WAV decoding for the env-var-gated accuracy fixtures (`tests/accuracy.rs`).
+hound = { workspace = true }

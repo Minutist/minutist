@@ -941,7 +941,9 @@ dependencies = [
 name = "diarizer"
 version = "0.0.0"
 dependencies = [
+ "hound",
  "meeting-app-common",
+ "sherpa-rs",
  "thiserror 1.0.69",
  "tracing",
 ]

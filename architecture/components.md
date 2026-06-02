@@ -668,6 +668,14 @@ run the on-stop diarizer pass (and the user-triggered re-diarize), per the
 diarizer design above. Added to the hand-written `Default` impl alongside the
 Phase-3/Phase-5 fields. No new dependency edge.
 
+**Phase 7 field — `onboarding_completed: bool`.** Gates the first-run
+onboarding flow. `#[serde(default)]`-defaults to `false` (first run shows
+onboarding); an older store deserialises to `false`. The webview gates the main
+UI on it; the onboarding flow's final step sets it `true` (via the
+`complete_onboarding` ipc command). No new dependency edge. (Phase 7 also adds
+two app-main updater events to `common` — `AppEvent::UpdateAvailable` /
+`UpdateProgress` — see `cross-cutting.md` "Auto-update".)
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates

@@ -132,6 +132,16 @@ pub struct Settings {
     /// this field existed deserialises to `false`.
     #[serde(default)]
     pub diarization_enabled: bool,
+
+    /// Whether the first-run onboarding flow has been completed (Phase 7).
+    ///
+    /// The webview gates the main UI behind this: `false` shows the onboarding
+    /// flow (welcome → model download → settings tour), which sets it `true` on
+    /// completion. `#[serde(default)]` defaults to `false`; an older store
+    /// written before this field existed deserialises to `false` (so existing
+    /// users see onboarding once on upgrade — acceptable for a pre-release).
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 impl Default for Settings {
@@ -145,6 +155,7 @@ impl Default for Settings {
             summary_system_prompt: default_summary_system_prompt(),
             llm_model_id: None,
             diarization_enabled: false,
+            onboarding_completed: false,
         }
     }
 }
@@ -181,6 +192,7 @@ mod tests {
             summary_system_prompt: "Summarise tersely.".to_string(),
             llm_model_id: Some(ModelId::from("gemma-4-e4b-it-q4_k_m")),
             diarization_enabled: true,
+            onboarding_completed: true,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -313,6 +325,43 @@ mod tests {
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1e. onboarding_completed: default + round-trip + missing-field
+    //     deserialisation (Phase 7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn onboarding_completed_defaults_to_false() {
+        assert!(
+            !Settings::default().onboarding_completed,
+            "first run shows onboarding (Phase 7)"
+        );
+    }
+
+    #[test]
+    fn onboarding_completed_round_trips() {
+        let original = Settings {
+            onboarding_completed: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(restored.onboarding_completed);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_onboarding_field_defaults_to_false() {
+        // A store written before `onboarding_completed` existed.
+        let old_json = r#"{ "theme": "dark", "diarization_enabled": true }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            !restored.onboarding_completed,
+            "missing onboarding_completed must deserialise to false"
+        );
+        assert!(restored.diarization_enabled);
     }
 
     // -----------------------------------------------------------------------

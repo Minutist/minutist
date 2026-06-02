@@ -396,6 +396,20 @@ pub enum AppEvent {
         bytes_done: u64,
         bytes_total: Option<u64>,
     },
+    /// A newer release is available (the updater's check found one). The
+    /// webview shows an update-available prompt. Emitted by app-main's
+    /// `tauri-plugin-updater` integration; see `architecture/cross-cutting.md`
+    /// "Auto-update".
+    UpdateAvailable {
+        version: String,
+        notes: Option<String>,
+    },
+    /// Update-download progress while applying an accepted update. `total_bytes`
+    /// is `None` when the server sends no content length.
+    UpdateProgress {
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    },
     /// User-visible settings changed; subscribers should re-read.
     SettingsChanged,
     /// A recoverable error occurred during a background task. The pipeline

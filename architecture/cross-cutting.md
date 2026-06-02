@@ -404,6 +404,16 @@ Owned by `app-main` (it's process-lifetime work). Uses
 `tauri-plugin-updater` against a static HTTPS endpoint serving signed
 artefacts. Introduced in Phase 7; no other crate touches updater logic.
 
+Updater status reaches the webview event-driven on the shared `AppEvent` bus:
+`AppEvent::UpdateAvailable { version, notes }` when a check finds a newer
+release, and `AppEvent::UpdateProgress { downloaded_bytes, total_bytes }` while
+an accepted update downloads (mirroring `ModelDownloadProgress`). The verify
+step uses the Tauri updater's **minisign** keypair — a separate key from the OS
+code-signing certs (Windows EV / Apple Developer ID); the updater rejects an
+artefact whose minisign signature does not verify. Per Q7, v1 ships one artefact
+per platform built with a portable GPU backend (Vulkan on Windows/Linux, Metal
+on macOS) with runtime CPU fallback, so there is no per-backend update fan-out.
+
 ## What's not decided here
 
 These need decisions but are not yet binding:

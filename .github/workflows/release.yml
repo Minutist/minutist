@@ -1,0 +1,135 @@
+# release.yml — signed release-bundle build + GitHub Release on `v*` tags.
+#
+# Cross-OS signed builds and the GPU hardware matrix are validated in CI / on
+# hardware, NOT locally. Each OS leg builds the ONE artefact v1 ships for that
+# platform (Q7): Vulkan on Windows/Linux, Metal on macOS. tauri-action creates
+# (or reuses) the GitHub Release named after the tag, attaches each platform's
+# signed bundle, and — with includeUpdaterJson — publishes the
+# tauri-plugin-updater `latest.json` manifest.
+#
+# Signing is gated on secrets being present:
+#   - Updater signing requires TAURI_SIGNING_PRIVATE_KEY; without it the
+#     updater .sig files (and a meaningful latest.json) cannot be produced.
+#   - Windows Authenticode / Apple notarization apply only when their secrets
+#     are populated; an empty secret is treated as "not configured" and that
+#     signing step is skipped, so the build still completes (unsigned for that
+#     platform). For a real release these secrets are expected to be set.
+---
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# tauri-action needs write access to create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+            features: vulkan
+          - platform: windows
+            os: windows-latest
+            features: vulkan
+          - platform: macos
+            os: macos-latest
+            features: metal
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev
+
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y libvulkan-dev glslang-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build + registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Set LIBCLANG_PATH (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+
+      - name: Set LIBCLANG_PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "LIBCLANG_PATH=$(brew --prefix llvm@18 2>/dev/null || brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Set LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path $llvm)) {
+            $llvm = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
+          }
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+        shell: pwsh
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      # Build + sign + bundle, then create/attach to the GitHub Release named
+      # after the pushed tag. includeUpdaterJson:true emits latest.json so
+      # tauri-plugin-updater clients can pull this release. Signing env mirrors
+      # build.yml; for releases these secrets are expected to be populated.
+      - name: Build, sign, and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: src-tauri
+          args: --features ${{ matrix.features }}
+          # The pushed tag, e.g. refs/tags/v1.2.3 -> v1.2.3.
+          tagName: ${{ github.ref_name }}
+          releaseName: "meeting-app ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true

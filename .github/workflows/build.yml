@@ -1,0 +1,153 @@
+# build.yml — release-bundle build on push to main + manual dispatch.
+#
+# Cross-OS signed builds and the GPU hardware matrix are validated in CI / on
+# hardware, NOT locally. Each OS leg builds the ONE artefact v1 ships for that
+# platform (Q7): Vulkan on Windows/Linux, Metal on macOS
+# (architecture/cross-cutting.md "GPU portability"). Signing is parameterized:
+# the build SUCCEEDS unsigned when the signing secrets are empty, and only
+# signs / notarizes when they are present. This workflow uploads the bundles as
+# build artifacts; it does NOT create a release (see release.yml for tags).
+---
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+            features: vulkan
+          - platform: windows
+            os: windows-latest
+            features: vulkan
+          - platform: macos
+            os: macos-latest
+            features: metal
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev
+
+      # Vulkan loader/headers for the `vulkan` feature on Linux. macOS uses
+      # Metal (built into the OS); Windows runners ship the Vulkan loader and
+      # llama.cpp builds the shaders from the bundled headers, so no SDK install
+      # step is required there for a loader-linked build.
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y libvulkan-dev glslang-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build + registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Set LIBCLANG_PATH (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+
+      - name: Set LIBCLANG_PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "LIBCLANG_PATH=$(brew --prefix llvm@18 2>/dev/null || brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Set LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path $llvm)) {
+            $llvm = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
+          }
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+        shell: pwsh
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      # tauri-action runs the configured beforeBuildCommand (npm run build) and
+      # bundles the app. `--features <gpu>` selects the single per-platform GPU
+      # backend. Signing happens only when the corresponding env is populated:
+      #   - Updater signing:    TAURI_SIGNING_PRIVATE_KEY (+ password)
+      #   - Windows code sign:  WINDOWS_CERTIFICATE (+ password)
+      #   - macOS notarization: APPLE_* family
+      # When a secret is unset GitHub injects an empty string, which tauri-action
+      # treats as "not configured" and skips that signing step — so the build
+      # still succeeds unsigned. Empty secrets are normal on this workflow.
+      - name: Build release bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # Updater signing (tauri-plugin-updater). Empty => unsigned bundle.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Windows Authenticode (base64 PFX + password). Empty => unsigned .exe/.msi.
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # Apple notarization. Empty => unsigned, un-notarized .app/.dmg.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: src-tauri
+          args: --features ${{ matrix.features }}
+
+      # Collect every bundle tauri-action produced for this OS. The bundle
+      # output lives under the workspace target dir; glob broadly so we capture
+      # .deb/.AppImage/.rpm (Linux), .msi/.exe (Windows), .app/.dmg (macOS).
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/release/bundle/**/*.deb
+            target/release/bundle/**/*.AppImage
+            target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.dmg
+            target/release/bundle/**/*.app/**
+            target/release/bundle/**/*.sig
+            target/release/bundle/**/*.tar.gz
+            target/release/bundle/**/*.zip

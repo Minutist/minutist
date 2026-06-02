@@ -61,6 +61,30 @@ cargo build --workspace
 Models, native dependencies, and platform-specific build instructions
 land here as Phase 0 progresses.
 
+## CI
+
+GitHub Actions under [`.github/workflows/`](.github/workflows/):
+
+- **`test.yml`** — push / PR. Runs `cargo test --workspace` plus the UI
+  build and Vitest suite across ubuntu / windows / macos. CPU-only; no GPU
+  feature flags.
+- **`build.yml`** — push to `main` + manual dispatch. Builds the one
+  release bundle v1 ships per platform (Vulkan on Windows/Linux, Metal on
+  macOS) and uploads it as a build artifact. Builds succeed unsigned;
+  signing applies only when the signing secrets are present.
+- **`release.yml`** — `v*` tags. Same per-OS bundle build with signing +
+  notarization (gated on secrets), publishes a GitHub Release and the
+  `tauri-plugin-updater` `latest.json` manifest.
+
+[`scripts/generate-update-manifest.py`](scripts/generate-update-manifest.py)
+(run via `uv run`) is a fallback for assembling `latest.json` by hand from
+built bundles and their `.sig` files, for off-CI release work.
+
+Cross-OS signed builds and the GPU hardware matrix are validated in CI / on
+hardware, not locally. The matrix lives in
+[`architecture/cross-cutting.md`](architecture/cross-cutting.md) under "GPU
+portability".
+
 ## Rendering the architecture diagrams
 
 ```bash

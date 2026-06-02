@@ -1,0 +1,103 @@
+# test.yml — workspace + UI test matrix on push / PR.
+#
+# Cross-OS execution and the GPU hardware matrix are validated in CI / on
+# hardware, NOT locally: this file is authored on Linux and its Windows and
+# macOS legs only ever run on GitHub-hosted runners. The default build here is
+# CPU-only (no GPU feature flags); the GPU portability matrix is exercised in
+# build.yml / on hardware, per architecture/cross-cutting.md "GPU portability".
+---
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux WebKit / Tauri system dependencies. Only needed on the Ubuntu
+      # leg; Windows and macOS ship the required webview with the OS.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build + registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      # bindgen (llama-cpp-2, libsql) needs libclang. The path differs per OS;
+      # set it explicitly so the build does not depend on auto-discovery.
+      - name: Set LIBCLANG_PATH (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+
+      - name: Set LIBCLANG_PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "LIBCLANG_PATH=$(brew --prefix llvm@18 2>/dev/null || brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      # windows-latest ships LLVM under the Chocolatey path; fall back to the
+      # standard install location if the env var is unset.
+      - name: Set LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path $llvm)) {
+            $llvm = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
+          }
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+        shell: pwsh
+
+      # CPU-only workspace tests. sherpa-rs pulls its prebuilt libs via the
+      # `download-binaries` feature on first build (network access required).
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      - name: Test UI
+        working-directory: ui
+        run: npm run test

@@ -671,8 +671,9 @@ Phase-3/Phase-5 fields. No new dependency edge.
 **Phase 7 field — `onboarding_completed: bool`.** Gates the first-run
 onboarding flow. `#[serde(default)]`-defaults to `false` (first run shows
 onboarding); an older store deserialises to `false`. The webview gates the main
-UI on it; the onboarding flow's final step sets it `true` (via the
-`complete_onboarding` ipc command). No new dependency edge. (Phase 7 also adds
+UI on it; the onboarding flow's final step sets it `true` through the existing
+`update_settings` command (no dedicated `complete_onboarding` command). No new
+dependency edge. (Phase 7 also adds
 two app-main updater events to `common` — `AppEvent::UpdateAvailable` /
 `UpdateProgress` — see `cross-cutting.md` "Auto-update".)
 
@@ -1103,6 +1104,22 @@ left, transcript right).
   index row's `speaker_count`, emits
   `AppEvent::DiarizationComplete { meeting_id, speaker_count }`, and (like
   `re_transcribe`) refuses unless the recorder is `Idle`.
+
+**Phase 7 additions (first-run onboarding gate).** `App.tsx` is the gate point:
+it fetches `settings` (via the recording store's `refreshSettings`) + the model
+list on mount, holds the UI neutral (`return null`) while settings are pending
+(so a returning user is never flashed onboarding), then renders `Onboarding`
+(`ui/src/shell/Onboarding.tsx`) when `settings.onboarding_completed` is `false`,
+else `MainWindow`. The `useAppEventBridge` hook stays mounted ABOVE this gate so
+the event listener is never dropped by the conditional render. The onboarding
+flow is a 3-step Editorial-Ink sheet (welcome → model download [reuses
+`ModelDownloadStatus`] → quick settings [theme + diarization toggle]); its final
+step persists `onboarding_completed = true` through the **existing**
+`commands.updateSettings` seam (the recording store's single settings path) —
+there is NO dedicated `complete_onboarding` command and no raw-`invoke` shim
+(rule A9). Onboarding step navigation is a tiny `useOnboardingStore`
+(`ui/src/state/onboarding.ts`); completion lives only in persisted settings (the
+single source of truth), not in that store.
 
 ### Design system — "Editorial Ink" (light theme)
 

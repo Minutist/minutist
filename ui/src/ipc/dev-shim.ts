@@ -74,6 +74,10 @@ const DEV_SETTINGS: Settings = {
   // first-class `Settings` field (the Phase-6 JOIN regenerated `bindings.ts`),
   // so the previous augmentation cast collapsed.
   diarization_enabled: true,
+  // Phase 7 onboarding gate. Seeded complete so `vite dev` lands on the main
+  // app for visual QA; the onboarding flow itself renders in the shim by
+  // starting from a non-completed settings snapshot (see Onboarding.tsx note).
+  onboarding_completed: true,
 };
 
 /**

@@ -1,0 +1,201 @@
+/*
+ * Editorial Ink — first-run onboarding flow (Phase 7).
+ *
+ * A single centered paper sheet on the warm desk field. All colour / radius /
+ * shadow / type values come from `styles/theme.css`; no hard-coded literals.
+ */
+
+.onboarding {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-text);
+  box-sizing: border-box;
+}
+
+/* The sheet lifts off the field — same treatment as the notes paper. */
+.onboarding__sheet {
+  width: 100%;
+  max-width: 36rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  padding: 2.25rem 2.5rem 1.75rem;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+}
+
+.onboarding__body {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 11rem;
+}
+
+.onboarding__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 540;
+  font-size: 1.75rem;
+  letter-spacing: 0.005em;
+  color: var(--ink);
+  font-variation-settings: "opsz" 36, "SOFT" 24, "WONK" 0;
+}
+
+.onboarding__lede {
+  margin: 0;
+  font-size: 1rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+}
+
+.onboarding__prose {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.55;
+  color: var(--stone);
+}
+
+.onboarding__prose--ready {
+  color: var(--accent);
+}
+
+/* --- Quick-settings step ------------------------------------------------ */
+
+.onboarding__field {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.onboarding__field-label {
+  padding: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+.onboarding__theme-options {
+  display: flex;
+  gap: 1.1rem;
+  flex-wrap: wrap;
+}
+
+.onboarding__theme-option,
+.onboarding__toggle {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+  cursor: pointer;
+  user-select: none;
+}
+
+.onboarding__theme-option input,
+.onboarding__toggle input {
+  /* The single oxblood accent drives native radio/checkbox marks. */
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin-top: 0.15rem;
+}
+
+.onboarding__theme-option input:disabled,
+.onboarding__toggle input:disabled {
+  cursor: default;
+}
+
+.onboarding__hint {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--stone);
+}
+
+/* --- Footer: step dots + actions ---------------------------------------- */
+
+.onboarding__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--rule);
+}
+
+.onboarding__steps {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.onboarding__step {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--rule-strong);
+  transition: background 150ms ease;
+}
+
+.onboarding__step--active {
+  background: var(--accent);
+}
+
+.onboarding__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.onboarding__btn {
+  font-family: var(--font-text);
+  font-size: 0.88rem;
+  border-radius: var(--radius);
+  padding: 0.4rem 1.1rem;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease,
+    background 120ms ease, transform 120ms ease;
+}
+
+.onboarding__btn--quiet {
+  color: var(--stone);
+  background: transparent;
+  border: 1px solid var(--rule);
+}
+
+.onboarding__btn--quiet:hover {
+  color: var(--ink-soft);
+  border-color: var(--rule-strong);
+}
+
+/* Primary action — the single strong oxblood control. */
+.onboarding__btn--primary {
+  color: var(--sheet);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.onboarding__btn--primary:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+  transform: translateY(-1px);
+}
+
+.onboarding__btn--primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}

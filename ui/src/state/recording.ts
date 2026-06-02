@@ -16,6 +16,8 @@ import type {
 import type { AppEvent } from "../ipc/app-event";
 import { useModelsStore } from "./models";
 import { withDiarizationEnabled } from "./diarization-settings";
+import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
+import type { Theme } from "../ipc/bindings";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
 
@@ -62,6 +64,19 @@ export type RecordingStore = {
    * same round-trip-through-settings pattern as `setSelectedDevice`.
    */
   setDiarizationEnabled: (enabled: boolean) => Promise<void>;
+  /**
+   * Set the UI colour-scheme preference, persisting via `commands.updateSettings`
+   * (the same round-trip-through-settings pattern as `setSelectedDevice`). Used
+   * by the Phase-7 onboarding quick-settings step.
+   */
+  setTheme: (theme: Theme) => Promise<void>;
+  /**
+   * Mark the first-run onboarding flow complete (Phase 7), persisting
+   * `onboarding_completed = true` via `commands.updateSettings`. The shell gate
+   * reads this back from the settings snapshot to reveal the main app. Same
+   * round-trip-through-settings pattern as `setDiarizationEnabled`.
+   */
+  setOnboardingCompleted: (completed: boolean) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -183,6 +198,43 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withDiarizationEnabled(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setTheme: async (theme) => {
+    // Persist via `update_settings` (same round-trip as `setSelectedDevice`).
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withTheme(current, theme);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setOnboardingCompleted: async (completed) => {
+    // Persist via `update_settings` so the gate stays satisfied across restarts,
+    // the same round-trip-through-settings pattern `setDiarizationEnabled` uses.
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withOnboardingCompleted(current, completed);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

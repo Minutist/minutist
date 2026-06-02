@@ -24,8 +24,9 @@
 //! # In-flight deduplication
 //!
 //! Concurrent `ensure(same_id)` calls are coalesced: the second caller blocks
-//! on a `tokio::sync::Notify` until the first finishes, then re-checks the
-//! local files rather than starting a second download.
+//! on a shared `tokio::sync::watch` channel until the first finishes, then
+//! adopts the first caller's outcome (the same `Ok` path, or the first
+//! caller's real error) rather than starting a second download.
 //!
 //! # Tracing target
 //!
@@ -35,6 +36,7 @@
 pub mod error;
 pub mod manifest;
 pub mod registry;
+#[cfg(test)]
 mod tests;
 
 pub use error::Error;

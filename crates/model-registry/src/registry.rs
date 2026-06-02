@@ -2,17 +2,16 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::sync::{broadcast, watch, Mutex};
 
 use meeting_app_common::{
-    AppEvent, AppResult, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, ModelStatus,
-    ModelStatusState,
+    AppError, AppEvent, AppResult, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry,
+    ModelStatus, ModelStatusState,
 };
 
 use crate::error::Error;
@@ -20,11 +19,24 @@ use crate::error::Error;
 /// Minimum interval between `ModelDownloadProgress` events — enforces 10 Hz cap.
 const PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Outcome of an in-flight download, published by the owning task to all
+/// waiters. `None` is the initial (in-progress) state; `Some(Ok(()))` on
+/// success, or `Some(Err(..))` carrying the owner's actual error.
+///
+/// `AppError` is `Clone`, so each waiter receives a faithful copy of the
+/// owner's error rather than a fabricated not-found.
+type DownloadOutcome = Option<Result<(), AppError>>;
+
 pub struct ModelRegistry {
     cache_root: PathBuf,
     manifest: Vec<ModelManifestEntry>,
     event_tx: broadcast::Sender<AppEvent>,
-    in_flight: Mutex<HashMap<ModelId, Arc<Notify>>>,
+    /// Map of model id → a `watch::Receiver` of the in-flight download's
+    /// outcome.  A `watch` channel is used (rather than a bare `Notify`)
+    /// because it is not subject to lost-wakeup races: a waiter that subscribes
+    /// *after* the owner publishes still observes the final value via
+    /// `borrow()`, and the stored value carries the owner's real `Result`.
+    in_flight: Mutex<HashMap<ModelId, watch::Receiver<DownloadOutcome>>>,
     http: reqwest::Client,
 }
 
@@ -73,8 +85,9 @@ impl ModelRegistry {
     /// Returns the per-model cache directory.
     ///
     /// If two callers race on the same `model_id`, only one download runs;
-    /// the second waits via an `Arc<Notify>` and returns the same `Ok(PathBuf)`
-    /// once the first completes.
+    /// the second waits on a shared `watch` channel and adopts the owner's
+    /// outcome — the same `Ok(PathBuf)` on success, or the owner's real
+    /// `AppError` on failure.
     pub async fn ensure(&self, model_id: &ModelId) -> AppResult<PathBuf> {
         let entry = self.find_entry(model_id)?.clone();
         let model_dir = self.model_dir(&entry);
@@ -85,44 +98,63 @@ impl ModelRegistry {
         }
 
         // In-flight dedup: check whether another caller is already downloading.
-        let notify = {
+        let outcome_tx = {
             let mut in_flight = self.in_flight.lock().await;
-            if let Some(existing_notify) = in_flight.get(model_id) {
-                // Another download is running — wait for it.
-                let waiter = Arc::clone(existing_notify);
+            if let Some(existing) = in_flight.get(model_id) {
+                // Another download is running — wait for it and adopt its
+                // outcome.  Clone the receiver under the lock, then release it
+                // before awaiting so the owner can make progress.
+                let mut rx = existing.clone();
                 drop(in_flight);
-                waiter.notified().await;
-                // Re-check after the first caller finished.
-                if self.all_files_valid(&entry, &model_dir).await {
-                    return Ok(model_dir);
-                } else {
-                    return Err(Error::ManifestEntryNotFound {
-                        model_id: model_id.0.clone(),
+
+                // Wait until the owner publishes a terminal outcome. `watch`
+                // has no lost-wakeup race: if the owner already published before
+                // we cloned, the current `borrow()` is already `Some`. Otherwise
+                // `changed()` resolves when the owner sends.
+                let outcome = loop {
+                    if let Some(outcome) = rx.borrow().clone() {
+                        break outcome;
                     }
-                    .into());
-                }
+                    // The sender is dropped only after publishing, so a
+                    // `changed()` error means the value was already set (handled
+                    // by the borrow above on the next iteration / below).
+                    if rx.changed().await.is_err() {
+                        break rx.borrow().clone().unwrap_or(Ok(()));
+                    }
+                };
+
+                // Adopt the owner's result verbatim so a download/network
+                // failure surfaces the owner's actual `AppError` instead of a
+                // fabricated not-found.
+                return outcome.map(|()| model_dir);
             } else {
-                let notify = Arc::new(Notify::new());
-                in_flight.insert(model_id.clone(), Arc::clone(&notify));
-                notify
+                let (tx, rx) = watch::channel::<DownloadOutcome>(None);
+                in_flight.insert(model_id.clone(), rx);
+                tx
             }
         };
 
         // This caller owns the download.  Ensure directory exists.
-        tokio::fs::create_dir_all(&model_dir)
-            .await
-            .map_err(Error::Io)?;
+        let result = match tokio::fs::create_dir_all(&model_dir).await {
+            Ok(()) => self
+                .download_entry(&entry, &model_dir)
+                .await
+                .map_err(AppError::from),
+            Err(e) => Err(Error::Io(e).into()),
+        };
 
-        let result = self.download_entry(&entry, &model_dir).await;
-
-        // Remove from in-flight and wake waiters regardless of outcome.
+        // Publish the owner's real outcome to any waiters, then remove the
+        // entry from the in-flight map. Publishing before removal guarantees a
+        // concurrent caller either sees the live receiver (and waits for this
+        // value) or, after removal, starts its own attempt.
+        let _ = outcome_tx.send(Some(result.clone()));
         {
             let mut in_flight = self.in_flight.lock().await;
             in_flight.remove(model_id);
         }
-        notify.notify_waiters();
+        drop(outcome_tx);
 
-        result.map(|()| model_dir).map_err(Into::into)
+        result.map(|()| model_dir)
     }
 
     // -----------------------------------------------------------------------

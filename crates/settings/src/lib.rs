@@ -436,6 +436,89 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 3b. Persist-before-publish — a failed save must NOT publish the change,
+    //     even though the blocking save now runs on `spawn_blocking`.
+    // -----------------------------------------------------------------------
+
+    /// A store whose `save` always fails. `load` returns defaults so the
+    /// handle constructs cleanly.
+    struct FailingSaveStore;
+
+    impl SettingsStore for FailingSaveStore {
+        fn load(&self) -> Result<Settings, Error> {
+            Ok(Settings::default())
+        }
+
+        fn save(&self, _settings: &Settings) -> Result<(), Error> {
+            Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated save failure",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_save_does_not_publish() {
+        let handle = SettingsHandle::new(FailingSaveStore).expect("handle");
+
+        // A live subscriber lets us assert no change was broadcast.
+        let mut rx = handle.subscribe();
+        rx.borrow_and_update();
+
+        let result = handle.update(|s| s.diarization_enabled = true).await;
+        assert!(result.is_err(), "save failure must propagate as an error");
+
+        // The change was NOT published: `current()` (which reads the watch
+        // value, kept current by `send_replace`) still reflects the old value.
+        assert!(
+            !handle.current().diarization_enabled,
+            "a failed save must not publish the change (persist-before-publish)"
+        );
+
+        // No broadcast fired: `has_changed` is false because the watch value
+        // was never replaced.
+        assert!(
+            !rx.has_changed().expect("sender alive"),
+            "a failed save must not notify subscribers"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3c. Concurrent updates remain serialised / read-modify-write atomic,
+    //     even with the save running on the blocking pool.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_updates_are_serialised_and_atomic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.store");
+        let handle = SettingsHandle::new(JsonFileStore::new(path.clone())).expect("handle");
+
+        // Two independent fields mutated concurrently: each update reads-modifies
+        // -writes the whole struct, so without serialisation one would clobber
+        // the other. After both complete, both mutations must be present.
+        let h1 = handle.clone();
+        let h2 = handle.clone();
+        let t1 = tokio::spawn(async move {
+            h1.update(|s| s.diarization_enabled = true).await.expect("update1");
+        });
+        let t2 = tokio::spawn(async move {
+            h2.update(|s| s.theme = Theme::Light).await.expect("update2");
+        });
+        t1.await.expect("join1");
+        t2.await.expect("join2");
+
+        let current = handle.current();
+        assert!(current.diarization_enabled, "first mutation retained");
+        assert_eq!(current.theme, Theme::Light, "second mutation retained");
+
+        // Disk reflects the final state too (last-writer-wins is well defined).
+        let loaded = JsonFileStore::new(path).load().expect("reload");
+        assert!(loaded.diarization_enabled);
+        assert_eq!(loaded.theme, Theme::Light);
+    }
+
+    // -----------------------------------------------------------------------
     // 4. Corruption recovery — garbage file → defaults + no panic
     // -----------------------------------------------------------------------
 

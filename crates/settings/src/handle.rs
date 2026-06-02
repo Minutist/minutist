@@ -81,21 +81,42 @@ impl SettingsHandle {
     /// Apply `f` to a mutable copy of the current settings, then persist and
     /// broadcast the result.
     ///
-    /// The write lock is held only while `f` runs and the watch is sent.
-    /// `store.save` is a synchronous local-file write and is called directly;
-    /// the IPC bridge may wrap this method in `spawn_blocking` if called from
-    /// an async command handler.
+    /// The write lock is held for the whole read-modify-write so concurrent
+    /// `update` calls are serialised and last-writer-wins is well defined.
+    /// `store.save` is a synchronous, blocking local-file write; it is run on
+    /// the blocking thread pool via [`tokio::task::spawn_blocking`] so it does
+    /// **not** block the async worker thread the caller is running on (the
+    /// "no blocking I/O on an async worker" rule in
+    /// `architecture/cross-cutting.md` — Threading model / Persistence writes).
+    /// The guard is held across that `.await`, which is correct: the worker
+    /// thread is yielded back to the scheduler while the blocking task runs,
+    /// and serialisation against other `update` calls is preserved.
     pub async fn update<F>(&self, f: F) -> AppResult<()>
     where
         F: FnOnce(&mut Settings) + Send,
     {
         let mut guard = self.inner.state.write().await;
         f(&mut guard);
-        // Persist first; if the save fails, don't publish the change.
-        self.inner
-            .store
-            .save(&guard)
+        // Snapshot the new value to hand to the blocking save and (on success)
+        // to publish. Cloning under the lock keeps it consistent with the
+        // committed in-memory state.
+        let new_value = guard.clone();
+
+        // Persist first; if the save fails, don't publish the change. Run the
+        // blocking fs write on the blocking pool rather than directly on this
+        // async worker. We clone the `Arc<Inner>` (cheap) so the spawned task
+        // owns a `'static` handle to the store; the write guard is still held
+        // across the `.await`, so the read-modify-write stays atomic against
+        // concurrent `update` calls.
+        let inner = Arc::clone(&self.inner);
+        let value_for_save = new_value.clone();
+        tokio::task::spawn_blocking(move || inner.store.save(&value_for_save))
+            .await
+            .map_err(|e| meeting_app_common::AppError::Internal {
+                context: format!("settings save task failed to join: {e}"),
+            })?
             .map_err(meeting_app_common::AppError::from)?;
+
         // Publish via `send_replace`, NOT `send`. `send` is a no-op (returns
         // `Err`, discarded) when there are no live subscribers, which would
         // leave the value `current()` reads stale until app restart — and
@@ -103,7 +124,7 @@ impl SettingsHandle {
         // `current().diarization_enabled` / `.input_device_id` directly).
         // `send_replace` always stores the new value (and still notifies any
         // subscribers), so `current()` is authoritative without one.
-        self.inner.tx.send_replace(guard.clone());
+        self.inner.tx.send_replace(new_value);
         Ok(())
     }
 

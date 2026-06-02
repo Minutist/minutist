@@ -12,6 +12,9 @@
 //! endpoints + minisign `pubkey` (see `architecture/cross-cutting.md`
 //! "Auto-update").
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use meeting_app_common::{AppError, AppEvent, AppResult};
 use tauri::{AppHandle, Listener};
 use tauri_plugin_updater::UpdaterExt;
@@ -53,13 +56,38 @@ async fn check(app: &AppHandle) -> AppResult<Option<(String, Option<String>)>> {
 }
 
 /// Listen for the webview's accept signal and apply the update when it fires.
+///
+/// `updater://apply` can fire repeatedly (a double-click, or the webview
+/// re-emitting). The `in_progress` flag guards against concurrent applies:
+/// only the first event that flips it `false -> true` runs `apply`; events
+/// arriving while one is in flight log and return without starting a second
+/// download/install/`restart` race. The flag is cleared when the in-flight
+/// apply finishes (whether it succeeded, skipped, or errored), so a later
+/// genuine retry is still allowed.
 fn register_apply_listener(app: &AppHandle, event_tx: Sender<AppEvent>) {
     let app_handle = app.clone();
+    let in_progress = Arc::new(AtomicBool::new(false));
     app.listen_any(APPLY_EVENT, move |_event| {
+        // Claim the in-flight slot; bail if an apply is already running.
+        if in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            tracing::info!(target: "app-main", "update apply already in progress; ignoring duplicate request");
+            return;
+        }
+
         let app = app_handle.clone();
         let event_tx = event_tx.clone();
+        let in_progress = in_progress.clone();
         tauri::async_runtime::spawn(async move {
-            if let Err(e) = apply(&app, &event_tx).await {
+            let result = apply(&app, &event_tx).await;
+            // Release the slot before reacting to the outcome. On the success
+            // path `apply` calls `app.restart()` (diverging), so this only runs
+            // when the apply did not relaunch — i.e. a skip or an error — at
+            // which point a subsequent retry should be permitted.
+            in_progress.store(false, Ordering::SeqCst);
+            if let Err(e) = result {
                 tracing::warn!(target: "app-main", "update apply failed: {e}");
                 let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
             }

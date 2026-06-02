@@ -121,9 +121,20 @@ internal sample rate (**16 kHz mono — mandated; this matches mtmd's
 encoder input rate per Spike 1's Q-P0-1**, so downstream consumers do
 not resample).
 
-**Back-pressure policy:** the cpal-callback→forwarder channel is bounded
-at 8 frames (drop-oldest with `tracing::warn!` on overflow); meter window
-is 512 samples (~32 ms at 16 kHz, ~30 Hz emission rate).
+**Back-pressure policy:** the cpal-callback→forwarder channel is a bounded
+(8-frame) `Mutex<VecDeque>` + `Condvar` ring. The cpal real-time callback
+produces via `try_lock` only (never blocks the RT thread); on overflow it pops
+the OLDEST frame and pushes the newest, so drop-oldest is genuinely honoured
+(an earlier `sync_channel` design held the lock for the whole session and
+silently degraded to drop-newest). Meter window is 512 samples (~32 ms at
+16 kHz, ~30 Hz emission rate).
+
+**Device identity:** `AudioDevice.id` is an opaque `String` of the form
+`"{enumeration-index}\u{1f}{name}"` (ASCII unit separator, which a device name
+cannot contain) so same-named ALSA devices get distinct ids; `is_default` is the
+first name-match. `resolve_device` parses the composite id (index authoritative,
+name-consistency-checked) and falls back to name matching for legacy bare-name
+ids persisted in `settings.input_device_id`.
 
 ### `vad-chunker`
 **Crate:** `crates/vad-chunker`

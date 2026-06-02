@@ -14,7 +14,7 @@ machine; nothing it does requires network access by default.
 | **User** | The only human in the loop. Drives recording, types notes, triggers summaries. |
 | **Microphone (OS device)** | Provided by the operating system. The app talks to it via WASAPI (Windows), CoreAudio (macOS), or ALSA/PulseAudio (Linux). |
 | **Model files on disk** | GGUF (ASR + summary LLM) and ONNX (diarization) files cached under the app data directory. The app reads them; on first run it downloads them from a vendored manifest. Treated as external because the lifetime is decoupled from the app version. |
-| **Update endpoint** | Static HTTPS host for signed updates. Phase 7 deliverable; not present in earlier phases. |
+| **Update endpoint** | Static HTTPS host for signed updates. The auto-updater is implemented (wired in `app-main` via `UpdaterExt`); the release config — endpoints and minisign pubkey — is still pending, so shipped builds do not yet poll a live endpoint. |
 | **External LLM (optional)** | An Ollama or LM Studio instance the user has running locally. Off by default. When enabled, summarisation can dispatch over loopback HTTP instead of running the bundled LLM. |
 
 ## Out of scope at this level
@@ -31,8 +31,10 @@ These are deliberately not actors:
 - The user's filesystem is the trust boundary. Everything inside it
   (audio, transcripts, notes, summaries, models) is treated as the
   user's data and never leaves the machine except via explicit export.
-- Network access is opt-in per feature. Update polling is on by default
-  in shipped builds (phase 7); external-LLM dispatch is off by default.
+- Network access is opt-in per feature. Update polling becomes active
+  once the release config sets a real update endpoint (the committed
+  default leaves `endpoints` empty, so `check()` is a no-op);
+  external-LLM dispatch is off by default.
 
 ## Why this level exists
 

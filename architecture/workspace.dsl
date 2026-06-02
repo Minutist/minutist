@@ -37,8 +37,8 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
             tags "External"
         }
 
-        updateServer = softwareSystem "Update endpoint" "Static HTTPS host serving signed update artefacts for tauri-plugin-updater. Out of scope until phase 7." {
-            tags "External" "Future"
+        updateServer = softwareSystem "Update endpoint" "Static HTTPS host serving signed update artefacts for tauri-plugin-updater. Updater is implemented (wired in app-main via UpdaterExt); release config — endpoints + minisign pubkey — is pending." {
+            tags "External"
         }
 
         externalLlm = softwareSystem "External LLM (Ollama / LM Studio)" "Optional user-configured local LLM backend reachable over loopback HTTP. Default disabled." {
@@ -103,7 +103,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
                 tags "Container" "Native"
             }
 
-            sherpaNative = container "sherpa-onnx" "Bundled native library for diarization (TitaNet or 3D-Speaker embeddings + spectral clustering)." "C++ / ONNX Runtime" {
+            sherpaNative = container "sherpa-onnx" "Bundled native library for diarization (pyannote/segmentation-3.0 segmentation + 3D-Speaker CAM++ embeddings + clustering)." "C++ / ONNX Runtime" {
                 tags "Container" "Native"
             }
 
@@ -134,7 +134,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         meetingApp.webview -> meetingApp.core "Tauri commands + events (typed via tauri-specta)"
         meetingApp.core -> microphone "Captures audio frames"
         meetingApp.core -> meetingApp.llamaNative "ASR + LLM inference" "FFI via llama-cpp-2"
-        meetingApp.core -> meetingApp.sherpaNative "Diarization" "FFI via sherpa-onnx-rs"
+        meetingApp.core -> meetingApp.sherpaNative "Diarization" "FFI via sherpa-rs"
         meetingApp.core -> meetingApp.sqliteDb "Reads/writes meeting index" "libsql"
         meetingApp.core -> meetingApp.meetingFs "Reads/writes per-meeting files" "std::fs"
         meetingApp.core -> modelHost "Reads / downloads model files"
@@ -163,14 +163,12 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
 
         // Model lifecycle.
         meetingApp.core.asrRuntime  -> meetingApp.core.modelRegistry "Resolves + loads ASR model"
-        meetingApp.core.summariser  -> meetingApp.core.modelRegistry "Resolves + loads text-LLM model"
-        meetingApp.core.diarizer    -> meetingApp.core.modelRegistry "Resolves + loads diarization models"
         meetingApp.core.modelRegistry -> modelHost "Reads / downloads model files"
 
         // FFI boundaries.
         meetingApp.core.asrRuntime  -> meetingApp.llamaNative "Inference" "llama-cpp-2 FFI"
         meetingApp.core.summariser  -> meetingApp.llamaNative "Inference" "llama-cpp-2 FFI"
-        meetingApp.core.diarizer    -> meetingApp.sherpaNative "Inference" "sherpa-onnx-rs FFI"
+        meetingApp.core.diarizer    -> meetingApp.sherpaNative "Inference" "sherpa-rs FFI"
 
         // Persistence.
         meetingApp.core.persistence -> meetingApp.sqliteDb "Index reads/writes" "libsql"
@@ -184,7 +182,6 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // Settings.
         meetingApp.core.settings    -> meetingApp.meetingFs "Persists user preferences" "tauri-plugin-store"
         meetingApp.core.orchestrator -> meetingApp.core.settings "Reads runtime config"
-        meetingApp.core.summariser   -> meetingApp.core.settings "Reads prompt + model selection"
         meetingApp.core.asrRuntime   -> meetingApp.core.settings "Reads model selection"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.

@@ -32,7 +32,7 @@ that.
 | Workload | Where it runs |
 |---|---|
 | Audio capture callback (cpal) | cpal's own thread; pushes frames into a bounded channel. |
-| VAD inference | A dedicated `spawn_blocking` task draining the frame channel. |
+| VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
 | Diarization | One-shot `spawn_blocking` task triggered on stop or user action. |
 | Summarisation | One-shot `spawn_blocking` task triggered by user action. |
@@ -54,9 +54,14 @@ Two layers:
    `common::AppError` that carries a stable code + display string.
    `From` impls live in the source crate.
 
-The webview only ever sees `AppError`. It never sees a per-crate error
-shape. This keeps the TypeScript binding stable as internal error enums
-churn.
+The webview never sees a per-crate error shape. At the Tauri command
+surface, `AppError` is re-encoded into `ipc-bridge`'s `IpcError` — a
+hand-mirrored enum carrying the same discriminants and the same serde
+shape (`{"code": "...", ...}`). `IpcError` exists because `common` has
+no `specta` dependency by design, so `AppError` cannot derive
+`specta::Type`; the derive lives on `IpcError` in `ipc-bridge` instead.
+The webview literally receives `IpcError`, which mirrors `AppError`, so
+the TypeScript binding stays stable as internal error enums churn.
 
 Panics: never as control flow. A panic inside a `spawn_blocking` task
 must abort the parent orchestrator task and surface as a recoverable
@@ -231,7 +236,7 @@ on every clean build, on every platform) — there is no system-lib link.
 Owned by `model-registry`. The contract:
 
 - A model is identified by a stable `ModelId` (e.g.
-  `qwen3-asr-1.7b-q8_0`).
+  `qwen3-asr-0.6b-q8_0`).
 - `model-registry::ensure(model_id)` resolves to a local path; downloads
   if absent; verifies hash.
 - Loaded models are owned by the consuming crate (`asr-runtime`,
@@ -247,14 +252,20 @@ Owned by `model-registry`. The contract:
   responsible for tearing down its loaded model and reloading. The
   orchestrator coordinates this — there is no recording during a swap.
 
-**Exception: Silero VAD.** The Silero VAD ONNX file (~1.5 MB) is
-**vendored as a bundled resource** under `resources/silero/` in the
-installer, not managed by `model-registry`. `vad-chunker` loads it from
-its bundled location. The rationale: Silero is small enough that
-downloading it on first run adds friction without value; it never
-changes per-user; and a single-file vendored asset avoids forcing every
-phase that uses VAD to also pull in `model-registry`. This is the only
-model file that bypasses the registry.
+**Exception: Silero VAD.** The Silero VAD ONNX file (~1.5 MB) lives in
+the source tree under `resources/silero/` and is **not** managed by
+`model-registry`. `vad-chunker` resolves it at **build time** via
+`vad_chunker::default_model_path()`: it prefers the `MEETING_APP_SILERO_PATH`
+build-time env var (`option_env!`), falling back to a source-tree path
+relative to `CARGO_MANIFEST_DIR`. It is *not* wired into the Tauri
+bundle today (`tauri.conf.json` `bundle` has no `resources` key — see
+"Bundle topology" in `containers.md`), so a packaged installer would not
+ship it via the current config; productionising the packaged path is
+still open. The rationale for keeping it outside the registry: Silero is
+small enough that downloading it on first run adds friction without
+value; it never changes per-user; and a single-file source asset avoids
+forcing every phase that uses VAD to also pull in `model-registry`. This
+is the only model file that bypasses the registry.
 
 ## Configuration
 
@@ -299,7 +310,7 @@ change.
 │   ├── asr/{model-id}/...      downloaded GGUF + mmproj per manifest entry
 │   ├── llm/{model-id}/...
 │   └── diarize/{model-id}/...
-└── settings.store              owned by `settings` (tauri-plugin-store)
+└── settings.store              owned by `settings` (JsonFileStore: serde_json + std::fs)
 ```
 
 The model manifest is **not** written into the cache. It is bundled in the
@@ -362,8 +373,9 @@ demonstrated.
   still applies — synthetic *speech-path* audio must be real speech
   (repeat/concatenate the LibriSpeech fixture), not tones.
 - **The default suite runs in CI with no manual step and no native
-  hardware.** `cargo test --workspace` and `bun run test` must pass on a
-  machine with no model files, GPU, or microphone. Tests that need a real
+  hardware.** `cargo test --workspace` and `npm test` (the `ui/`
+  package's `vitest run` script) must pass on a machine with no model
+  files, GPU, or microphone. Tests that need a real
   model, GPU, or native build are **gated behind env vars** (the Phase 2
   `MEETING_APP_ASR_MODEL_PATH` pattern) with a no-op skip path, and are run
   on demand via `scripts/run-tests-windows.ps1`.
@@ -426,7 +438,9 @@ on accept, emits the `updater://apply` event back; app-main then downloads
 All updater calls are **guarded** — the committed default `plugins.updater`
 config is `{ "endpoints": [], "pubkey": "" }`, so `check()` is a logged no-op and
 dev/unsigned builds are unaffected. Enabling updates is a release step: set the
-real `endpoints` + minisign `pubkey` in `tauri.conf.json`, keep the private key
+real `endpoints` + minisign `pubkey` in `tauri.conf.json`, set
+`bundle.createUpdaterArtifacts` to `true` (it is **unset** today, so
+release builds currently emit no updater artefacts), keep the private key
 as the `TAURI_SIGNING_PRIVATE_KEY` CI secret, and enable updater-artefact
 signing in the release workflow. The app-wide Tauri 2 capability is `src-tauri/capabilities/default.json`
 (`core:default` + `core:event:allow-emit`/`allow-listen`, scoped to the `main`

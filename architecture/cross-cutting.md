@@ -266,6 +266,17 @@ Settings changes broadcast directly from the `settings` crate via a tokio
 The orchestrator is not a config bus — it consumes settings the same way
 every other component does.
 
+`SettingsHandle::current()` is the authoritative synchronous snapshot and MUST
+reflect the latest `update()` whether or not any subscriber is alive — no
+component is required to hold a `subscribe()` receiver for `current()` to be
+correct (the orchestrator reads `current().diarization_enabled` /
+`.input_device_id` directly, with no subscription). `update()` therefore
+publishes the new value with `watch::Sender::send_replace`, **not** `send`:
+`send` is a no-op that returns `Err` when there are no live receivers, which
+would silently leave `current()` stale until the next process start. Persist
+before publish: `store.save` runs first so a save failure never publishes a
+change.
+
 ## Filesystem layout
 
 ```

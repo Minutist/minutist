@@ -69,7 +69,11 @@ impl SettingsHandle {
 
     /// Return a snapshot of the current settings.
     ///
-    /// This is a cheap clone of the in-memory value; no I/O.
+    /// This is a cheap, synchronous clone of the published in-memory value; no
+    /// I/O. It reads the `watch` value, which [`Self::update`] keeps current via
+    /// `send_replace` regardless of whether any subscriber is alive — see the
+    /// note there. (Reading the `RwLock` here instead is not an option: it is a
+    /// `tokio` async lock and `current` is synchronous.)
     pub fn current(&self) -> Settings {
         self.inner.tx.borrow().clone()
     }
@@ -87,13 +91,19 @@ impl SettingsHandle {
     {
         let mut guard = self.inner.state.write().await;
         f(&mut guard);
-        // Persist first; if the save fails, don't broadcast the change.
+        // Persist first; if the save fails, don't publish the change.
         self.inner
             .store
             .save(&guard)
             .map_err(meeting_app_common::AppError::from)?;
-        // Broadcast — ignore send errors (no subscribers is not an error).
-        let _ = self.inner.tx.send(guard.clone());
+        // Publish via `send_replace`, NOT `send`. `send` is a no-op (returns
+        // `Err`, discarded) when there are no live subscribers, which would
+        // leave the value `current()` reads stale until app restart — and
+        // nothing in production holds a subscriber (the orchestrator reads
+        // `current().diarization_enabled` / `.input_device_id` directly).
+        // `send_replace` always stores the new value (and still notifies any
+        // subscribers), so `current()` is authoritative without one.
+        self.inner.tx.send_replace(guard.clone());
         Ok(())
     }
 

@@ -355,6 +355,37 @@ mod tests {
         assert_eq!(new_settings.theme, Theme::Light);
     }
 
+    #[tokio::test]
+    async fn current_reflects_update_with_no_live_subscriber() {
+        // Regression: `update` must publish via `send_replace`, not `send`.
+        // `watch::Sender::send` is a no-op when there are no live subscribers,
+        // which would leave `current()` stale until app restart. Nothing in
+        // production holds a subscriber, and the orchestrator reads
+        // `current().diarization_enabled` to gate the on-stop diarization pass —
+        // so a stale read silently disables the feature.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.store");
+        let handle = SettingsHandle::new(JsonFileStore::new(path)).expect("handle");
+
+        // No `subscribe()` anywhere — the channel has zero live receivers.
+        assert!(!handle.current().diarization_enabled, "default is off");
+
+        handle
+            .update(|s| s.diarization_enabled = true)
+            .await
+            .expect("update");
+
+        assert!(
+            handle.current().diarization_enabled,
+            "current() must reflect the update even with no live subscriber"
+        );
+
+        // A second, unrelated update is also reflected (not just the first).
+        handle.update(|s| s.theme = Theme::Light).await.expect("update");
+        assert_eq!(handle.current().theme, Theme::Light);
+        assert!(handle.current().diarization_enabled, "prior field retained");
+    }
+
     // -----------------------------------------------------------------------
     // 4. Corruption recovery — garbage file → defaults + no panic
     // -----------------------------------------------------------------------

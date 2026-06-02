@@ -12,6 +12,15 @@ authors.workspace = true
 # Enables the test-support module and the start_with_streams constructor.
 # Used by integration tests that need deterministic audio without a real device.
 test-source = ["audio-capture/test-source"]
+# GPU acceleration backends (Phase 7), OFF by default — fan out to the ML crates
+# orchestrator owns (asr-runtime + diarizer; summariser is reached via ipc-bridge,
+# not here — rule A5). vulkan/metal/rocm drive the llama.cpp-backed asr-runtime;
+# cuda also reaches the sherpa-backed diarizer; directml is diarizer-only.
+vulkan = ["asr-runtime/vulkan"]
+metal = ["asr-runtime/metal"]
+rocm = ["asr-runtime/rocm"]
+cuda = ["asr-runtime/cuda", "diarizer/cuda"]
+directml = ["diarizer/directml"]
 
 [dependencies]
 meeting-app-common = { path = "../common" }

@@ -414,6 +414,35 @@ artefact whose minisign signature does not verify. Per Q7, v1 ships one artefact
 per platform built with a portable GPU backend (Vulkan on Windows/Linux, Metal
 on macOS) with runtime CPU fallback, so there is no per-backend update fan-out.
 
+## GPU portability
+
+GPU acceleration is selected at **build time** via Cargo features, all **OFF by
+default** so the default `cargo build --workspace` is CPU-only and needs no GPU
+SDK installed. Feature names match the backend they enable:
+
+- `vulkan` / `metal` / `cuda` / `rocm` forward to `llama-cpp-2/<backend>` (the
+  ASR + summariser path).
+- `cuda` / `directml` forward to `sherpa-rs/<backend>` (the diarizer path);
+  there is no Vulkan/Metal diarization backend, so on those platforms the
+  diarizer stays on the ONNX Runtime CPU EP.
+
+The features fan out through a single chain so the app binary is the only place
+a backend is chosen: `meeting-app` (src-tauri) → `ipc-bridge` → {`summariser`,
+`orchestrator` → {`asr-runtime`, `diarizer`}}. `ipc-bridge` is the fan-out point
+because it sits above both `summariser` (direct dep) and `orchestrator` (which
+owns `asr-runtime` + `diarizer`); the orchestrator does NOT depend on summariser
+(rule A5), so summariser is reached via ipc-bridge, not orchestrator.
+
+**Q7 — one artefact per platform.** v1 ships a single build per OS with a
+portable backend — **Vulkan** on Windows/Linux, **Metal** on macOS — and
+relies on llama.cpp's runtime CPU fallback when no compatible device is present.
+This avoids a per-backend artefact matrix. CUDA/ROCm/DirectML device-specific
+builds are a post-v1 optimization, not a shipped fan-out. CI builds each
+selected feature on the appropriate runner (`cargo build --features vulkan`
+etc.); the GPU portability matrix (NVIDIA / AMD / Intel iGPU / Apple Silicon /
+CPU-only, with WER/RTF/warm-first-segment latency) is recorded as manual
+hardware evidence in the engineering journal.
+
 ## What's not decided here
 
 These need decisions but are not yet binding:

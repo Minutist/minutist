@@ -5,6 +5,16 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# GPU acceleration backends (Phase 7). All OFF by default → the default build
+# is CPU-only and needs no GPU SDK. Each forwards to the matching llama-cpp-2
+# backend feature; CI selects one per platform (vulkan on Windows/Linux, metal
+# on macOS) and llama.cpp falls back to CPU at runtime when no device exists.
+vulkan = ["llama-cpp-2/vulkan"]
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+rocm = ["llama-cpp-2/rocm"]
+
 [dependencies]
 meeting-app-common = { path = "../common" }
 model-registry = { path = "../model-registry" }

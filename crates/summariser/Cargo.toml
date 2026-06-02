@@ -31,3 +31,8 @@ serde_json = { workspace = true }
 # summarisation to a local Ollama / LM-Studio-compatible chat endpoint instead
 # of loading a GGUF in-process.
 external-ollama = ["dep:reqwest", "dep:serde"]
+# GPU acceleration backends (Phase 7), OFF by default — forward to llama-cpp-2.
+vulkan = ["llama-cpp-2/vulkan"]
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+rocm = ["llama-cpp-2/rocm"]

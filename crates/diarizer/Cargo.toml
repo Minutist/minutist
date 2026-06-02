@@ -5,6 +5,14 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# GPU acceleration backends (Phase 7), OFF by default — forward to sherpa-rs.
+# sherpa-onnx exposes CUDA and (Windows) DirectML; there is no Vulkan/Metal
+# diarization backend, so the diarizer follows the llama.cpp backend on those
+# platforms by staying CPU (ONNX Runtime CPU EP).
+cuda = ["sherpa-rs/cuda"]
+directml = ["sherpa-rs/directml"]
+
 [dependencies]
 meeting-app-common = { path = "../common" }
 thiserror = { workspace = true }

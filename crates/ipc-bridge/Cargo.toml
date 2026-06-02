@@ -8,6 +8,16 @@ authors.workspace = true
 # The ONLY non-app-main crate allowed to import `tauri::*`.
 # See architecture/domain-ownership.md — `ipc-bridge` / `systems-engineer` role.
 
+[features]
+# GPU acceleration backends (Phase 7), OFF by default. ipc-bridge sits above
+# BOTH summariser (its direct dep) and orchestrator (asr + diarizer), so it is
+# the single fan-out point that reaches every ML crate. src-tauri forwards here.
+vulkan = ["summariser/vulkan", "orchestrator/vulkan"]
+metal = ["summariser/metal", "orchestrator/metal"]
+rocm = ["summariser/rocm", "orchestrator/rocm"]
+cuda = ["summariser/cuda", "orchestrator/cuda"]
+directml = ["orchestrator/directml"]
+
 [dependencies]
 meeting-app-common = { path = "../common", features = ["specta"] }
 orchestrator = { path = "../orchestrator" }

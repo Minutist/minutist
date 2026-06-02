@@ -17,6 +17,18 @@ path = "src/main.rs"
 name = "generate-bindings"
 path = "src/bin/generate-bindings.rs"
 
+[features]
+# GPU acceleration backends (Phase 7), OFF by default → the default build is
+# CPU-only and needs no GPU SDK. Forwarded to ipc-bridge, the single fan-out
+# point over every ML crate (summariser + orchestrator's asr + diarizer).
+# CI selects one per platform: `cargo build --features vulkan` (Windows/Linux),
+# `--features metal` (macOS). See architecture/cross-cutting.md "GPU portability".
+vulkan = ["ipc-bridge/vulkan"]
+metal = ["ipc-bridge/metal"]
+rocm = ["ipc-bridge/rocm"]
+cuda = ["ipc-bridge/cuda"]
+directml = ["ipc-bridge/directml"]
+
 [build-dependencies]
 tauri-build = { workspace = true }
 

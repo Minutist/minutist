@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 
+use meeting_app_common::ModelId;
 use serde::{Deserialize, Serialize};
 
 pub mod error;
@@ -47,11 +48,27 @@ const fn default_autosave_interval_secs() -> u32 {
     5
 }
 
+/// Default summary system prompt (FR-28).
+///
+/// A model-agnostic instruction asking for a structured meeting summary:
+/// headings, key decisions, and action items. The summariser passes this
+/// verbatim as the chat `system` message; users may override it from the
+/// settings UI. An older store written before this field existed
+/// deserialises to this value via `#[serde(default = ...)]`.
+fn default_summary_system_prompt() -> String {
+    "You are a meeting-notes assistant. Summarise the meeting transcript and \
+     the user's notes into clear Markdown. Use these sections with `##` \
+     headings, omitting any that have no content: Summary (a short overview), \
+     Key Decisions (a bulleted list of decisions made), and Action Items (a \
+     bulleted list of follow-ups, naming the owner when stated). Be concise \
+     and factual; do not invent information that is not present in the \
+     transcript or notes."
+        .to_string()
+}
+
 /// Application settings.
 ///
 /// Fields added in later phases live in their respective phase plans.
-/// Do **not** add ASR model selection, summary system-prompt, or telemetry
-/// fields here — those are Phase 2+ concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Settings {
@@ -86,6 +103,26 @@ pub struct Settings {
     /// existed deserialises to the default via `#[serde(default = ...)]`.
     #[serde(default = "default_autosave_interval_secs")]
     pub autosave_interval_secs: u32,
+
+    /// Summary system prompt passed to the summariser (FR-28).
+    ///
+    /// The `summariser` forwards this verbatim as the chat `system` message
+    /// when generating `summary.md`. Defaults to a structured-summary
+    /// instruction (headings / key decisions / action items); an older store
+    /// written before this field existed deserialises to the default via
+    /// `#[serde(default = ...)]`.
+    #[serde(default = "default_summary_system_prompt")]
+    pub summary_system_prompt: String,
+
+    /// Selected LLM model for summarisation (FR-35).
+    ///
+    /// `None` means "use the bundled default model" (resolved by the
+    /// summariser against the model registry). The model is settings-selected,
+    /// never hard-coded; switching is a manifest + `llm_model_id` change. An
+    /// older store written before this field existed deserialises to `None`
+    /// via `#[serde(default)]`.
+    #[serde(default)]
+    pub llm_model_id: Option<ModelId>,
 }
 
 impl Default for Settings {
@@ -96,6 +133,8 @@ impl Default for Settings {
             data_directory: None,
             start_hidden: false,
             autosave_interval_secs: default_autosave_interval_secs(),
+            summary_system_prompt: default_summary_system_prompt(),
+            llm_model_id: None,
         }
     }
 }
@@ -129,6 +168,8 @@ mod tests {
             data_directory: Some(PathBuf::from("/tmp/meeting-data")),
             start_hidden: true,
             autosave_interval_secs: 17,
+            summary_system_prompt: "Summarise tersely.".to_string(),
+            llm_model_id: Some(ModelId::from("gemma-4-e4b-it-q4_k_m")),
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -164,6 +205,61 @@ mod tests {
         assert_eq!(
             restored.autosave_interval_secs, 5,
             "missing autosave_interval_secs must deserialise to the default (5)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1c. summary_system_prompt + llm_model_id: defaults + missing-field
+    //     deserialisation (FR-28 / FR-35)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn summary_system_prompt_defaults_to_structured_instruction() {
+        let prompt = Settings::default().summary_system_prompt;
+        assert!(!prompt.is_empty(), "default prompt must be non-empty");
+        // The default asks for the three structured sections (FR-28).
+        assert!(prompt.contains("Key Decisions"));
+        assert!(prompt.contains("Action Items"));
+    }
+
+    #[test]
+    fn llm_model_id_defaults_to_none() {
+        assert_eq!(Settings::default().llm_model_id, None);
+    }
+
+    #[test]
+    fn summary_prompt_and_llm_model_id_round_trip() {
+        let original = Settings {
+            summary_system_prompt: "Be brief.".to_string(),
+            llm_model_id: Some(ModelId::from("granite-4.1-3b-q4_k_m")),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.summary_system_prompt, "Be brief.");
+        assert_eq!(
+            restored.llm_model_id,
+            Some(ModelId::from("granite-4.1-3b-q4_k_m"))
+        );
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_summary_fields_defaults() {
+        // A settings store written before `summary_system_prompt` and
+        // `llm_model_id` existed (it still carries the Phase-3 field).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert_eq!(
+            restored.summary_system_prompt,
+            default_summary_system_prompt(),
+            "missing summary_system_prompt must deserialise to the default"
+        );
+        assert_eq!(
+            restored.llm_model_id, None,
+            "missing llm_model_id must deserialise to None"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

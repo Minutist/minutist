@@ -505,6 +505,16 @@ store JSON written before the field existed deserialises to 5. `Settings`
 now carries an explicit `Default` impl (the field's default is non-zero, so
 the derived `Default` no longer suffices).
 
+**Phase 5 fields — `summary_system_prompt: String` (FR-28) and
+`llm_model_id: Option<ModelId>` (FR-35).** The summary prompt
+`#[serde(default = ...)]`-defaults to a structured-summary instruction
+(headings / key decisions / action items) the `summariser` forwards verbatim
+as the chat `system` message; an older store deserialises to that default.
+`llm_model_id` selects the summarisation LLM, `#[serde(default)]`-defaulting
+to `None` ("use the bundled default model"); the model is settings-selected,
+never hard-coded (switching is a manifest + `llm_model_id` change). `ModelId`
+is re-used from `common` — no new dependency edge.
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates

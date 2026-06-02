@@ -101,3 +101,111 @@ jobs:
       - name: Test UI
         working-directory: ui
         run: npm run test
+
+  # GPU feature-graph gate. The CPU `test` job above never enables a GPU
+  # feature, and build.yml only builds vulkan/metal (and only on push to main),
+  # so a broken feature-forward (e.g. a renamed/typo'd asr-runtime/vulkan edge,
+  # or cuda/rocm/directml fan-out that no longer resolves) could merge green.
+  #
+  # This job validates the FULL GPU feature graph on every PR. For each backend
+  # we resolve `cargo tree -e features`, which expands every inter-crate
+  # feature-forward edge and exits non-zero if any edge is missing/renamed —
+  # WITHOUT invoking the C++/CUDA/ROCm/DirectML build scripts, so it needs no
+  # GPU toolkit installed. vulkan (Linux/Windows) and metal (macOS) are then
+  # additionally `cargo check`ed because their toolchain is present on the
+  # runner, validating the build-script/link path too. cuda/rocm (NVIDIA/AMD
+  # toolkits absent) and directml (Windows-only, SDK absent) are graph-only:
+  # the goal is that a broken feature-forward fails CI, not a full kernel build.
+  gpu-features:
+    name: gpu-features (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: vulkan SDK installed -> full check; cuda/rocm graph-only.
+          - os: ubuntu-latest
+            check_features: vulkan
+            graph_features: cuda rocm
+          # macOS: metal is in the OS -> full check. (cuda/rocm/directml N/A.)
+          - os: macos-latest
+            check_features: metal
+            graph_features: ""
+          # Windows: vulkan loader present -> full check; directml graph-only
+          # (sherpa DirectML backend); cuda/rocm graph-only.
+          - os: windows-latest
+            check_features: vulkan
+            graph_features: cuda rocm directml
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libasound2-dev
+
+      # Vulkan loader/headers + glslang for the `vulkan` cargo check on Linux.
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y libvulkan-dev glslang-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build + registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set LIBCLANG_PATH (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+
+      - name: Set LIBCLANG_PATH (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "LIBCLANG_PATH=$(brew --prefix llvm@18 2>/dev/null || brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - name: Set LIBCLANG_PATH (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path $llvm)) {
+            $llvm = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin"
+          }
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+        shell: pwsh
+
+      # Resolve the feature graph for the toolkit-absent backends. `cargo tree
+      # -e features` expands every inter-crate forward edge and fails if one is
+      # broken, without compiling any GPU kernel. Runs on bash (Git Bash on
+      # Windows-hosted runners).
+      - name: Validate GPU feature graph (toolkit-absent backends)
+        if: matrix.graph_features != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for feat in ${{ matrix.graph_features }}; do
+            echo "::group::cargo tree -e features --features $feat"
+            cargo tree -p meeting-app --no-default-features \
+              --features "$feat" -e features --locked
+            echo "::endgroup::"
+          done
+
+      # Full cargo check for the backend whose toolchain is present on this
+      # runner (vulkan SDK on Linux/Windows, Metal on macOS). This validates the
+      # feature graph AND the build-script/link path.
+      - name: cargo check (${{ matrix.check_features }})
+        shell: bash
+        run: |
+          cargo check -p meeting-app --no-default-features \
+            --features ${{ matrix.check_features }} --locked

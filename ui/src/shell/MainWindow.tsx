@@ -11,6 +11,7 @@ import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
 import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
+import { About } from "./About";
 import { Editor } from "../editor/Editor";
 import { TranscriptPane } from "../transcript/TranscriptPane";
 import "./MainWindow.css";
@@ -65,6 +66,9 @@ export function MainWindow() {
   const [transcriptCollapsed, setTranscriptCollapsed] = useState(false);
   // The summary panel is hidden by default; the header toggle reveals it (FR-30).
   const [summaryOpen, setSummaryOpen] = useState(false);
+  // The About dialog (Phase 7, S6) is hidden by default; a header affordance
+  // opens it. Presentational overlay; closing returns to the prior surface.
+  const [aboutOpen, setAboutOpen] = useState(false);
 
   useEffect(() => {
     // Load persisted settings first so `selectedDeviceId` reflects the
@@ -177,6 +181,20 @@ export function MainWindow() {
               {summaryOpen ? "Hide summary" : "Summary"}
             </button>
           )}
+          {/*
+            Phase 7 (S6) — About affordance. Always available (product info, not
+            workspace-scoped). Opens the About dialog listing bundled-model SPDX
+            licenses + NOTICE/attribution. Quiet control, same idiom as the
+            other header toggles.
+          */}
+          <button
+            type="button"
+            className="main-window__toggle-transcript"
+            aria-haspopup="dialog"
+            onClick={() => setAboutOpen(true)}
+          >
+            About
+          </button>
         </div>
       </header>
 
@@ -243,6 +261,8 @@ export function MainWindow() {
       ) : (
         <MeetingList />
       )}
+
+      {aboutOpen && <About onClose={() => setAboutOpen(false)} />}
     </div>
   );
 }

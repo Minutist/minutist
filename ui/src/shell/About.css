@@ -1,0 +1,160 @@
+/*
+ * Editorial Ink — About dialog (Phase 7, S6).
+ *
+ * A centered paper sheet on a dimmed warm-desk field. Reuses the onboarding
+ * sheet treatment (sheet surface, hairline edge, page-lift shadow) and the
+ * single oxblood accent. All colour / radius / shadow / type values come from
+ * `styles/theme.css`; no hard-coded literals.
+ */
+
+.about-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  /* Dim the desk field behind the sheet using the warm background channels. */
+  background: rgba(28, 26, 23, 0.32);
+  box-sizing: border-box;
+}
+
+.about {
+  width: 100%;
+  max-width: 34rem;
+  max-height: 85vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  padding: 2rem 2.25rem 1.5rem;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+  color: var(--ink);
+  font-family: var(--font-text);
+}
+
+/* --- Head --------------------------------------------------------------- */
+
+.about__head {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.about__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 540;
+  font-size: 1.6rem;
+  letter-spacing: 0.005em;
+  color: var(--ink);
+  font-variation-settings: "opsz" 36, "SOFT" 24, "WONK" 0;
+}
+
+.about__version {
+  margin: 0;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+.about__lede {
+  margin: 0.25rem 0 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: var(--ink-soft);
+}
+
+/* --- Sections ----------------------------------------------------------- */
+
+.about__section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.about__section-title {
+  margin: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+.about__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.about__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.about__row:last-child {
+  border-bottom: 0;
+}
+
+.about__row-name {
+  font-size: 0.92rem;
+  color: var(--ink);
+}
+
+.about__row-license {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  letter-spacing: 0.01em;
+  color: var(--stone);
+}
+
+.about__notice {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--stone);
+}
+
+/* --- Footer ------------------------------------------------------------- */
+
+.about__footer {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+}
+
+.about__btn {
+  font-family: var(--font-text);
+  font-size: 0.88rem;
+  border-radius: var(--radius);
+  padding: 0.4rem 1.1rem;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease,
+    background 120ms ease, transform 120ms ease;
+}
+
+/* Primary action — the single strong oxblood control. */
+.about__btn--primary {
+  color: var(--sheet);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.about__btn--primary:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+  transform: translateY(-1px);
+}

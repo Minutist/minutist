@@ -1295,6 +1295,57 @@ pub(crate) async fn build_asr_runtime_for_retranscribe(
 }
 
 // ---------------------------------------------------------------------------
+// Diarizer construction (Phase 6)
+// ---------------------------------------------------------------------------
+
+/// Manifest id of the bundled segmentation model (pyannote/segmentation-3.0,
+/// MIT). See `resources/models.json` and `architecture/components.md` —
+/// `diarizer`.
+pub(crate) const DIARIZE_SEG_MODEL_ID: &str = "pyannote-segmentation-3-0";
+/// Manifest id of the bundled speaker-embedding model (3D-Speaker CAM++ zh-cn
+/// 16k-common, Apache-2.0).
+pub(crate) const DIARIZE_EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-cn-16k-common";
+
+/// Lazily build the production `SherpaDiarizer`, mirroring
+/// [`build_asr_runtime_for_retranscribe`].
+///
+/// Resolves both diarize model directories via `ModelRegistry::ensure`
+/// (downloading + hash-verifying when absent), locates the single `.onnx` file
+/// in each directory, and opens a `SherpaDiarizer` over the
+/// `(segmentation, embedding)` pair with `DiarizerConfig::default()`.
+///
+/// Unlike the ASR runtime, the model directories are *ensured* (not merely
+/// checked for `Available`): both the on-stop pass and the user-triggered
+/// re-diarize are explicit operations, so a missing model is a downloadable
+/// dependency rather than a best-effort skip. A resolution / load failure is an
+/// error (`AppError::ModelLoad` / the registry's download error), surfaced to
+/// the caller.
+pub(crate) async fn build_diarizer(
+    model_registry: &ModelRegistry,
+) -> AppResult<diarizer::SherpaDiarizer> {
+    let seg_id = ModelId::from(DIARIZE_SEG_MODEL_ID);
+    let emb_id = ModelId::from(DIARIZE_EMB_MODEL_ID);
+
+    let seg_dir = model_registry.ensure(&seg_id).await?;
+    let emb_dir = model_registry.ensure(&emb_id).await?;
+
+    let seg_onnx = find_file_in_dir(&seg_dir, |name| name.ends_with(".onnx"))?;
+    let emb_onnx = find_file_in_dir(&emb_dir, |name| name.ends_with(".onnx"))?;
+
+    let diarizer =
+        diarizer::SherpaDiarizer::open(&seg_onnx, &emb_onnx, diarizer::DiarizerConfig::default())?;
+
+    tracing::info!(
+        target: "orchestrator",
+        seg = %seg_onnx.display(),
+        emb = %emb_onnx.display(),
+        "diarizer initialised"
+    );
+
+    Ok(diarizer)
+}
+
+// ---------------------------------------------------------------------------
 // Proportional word allocation (Phase 2)
 // ---------------------------------------------------------------------------
 

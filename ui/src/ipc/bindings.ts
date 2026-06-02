@@ -328,6 +328,34 @@ async saveSummary(meetingId: MeetingId, summaryMarkdown: string) : Promise<Resul
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Re-run speaker diarization for a meeting offline (Phase 6, FR-11 action).
+ * 
+ * Routes to `Orchestrator::rediarize`, which decodes the meeting's
+ * pause-INCLUDING PCM, runs the bundled `SherpaDiarizer` over the stored
+ * transcript segments (resolving both diarize model directories via
+ * `model-registry`), rewrites `transcript.json` with the overlaid
+ * `speaker_id`s, updates `metadata.json`'s `{ speaker_count, diarizer }`,
+ * refreshes the index row's `speaker_count`, and emits
+ * `AppEvent::DiarizationComplete { meeting_id, speaker_count }` — the event is
+ * emitted by the **orchestrator** (not here), on the shared bus the forwarder
+ * subscribes to. Refused while a recording is in progress (the orchestrator
+ * returns `AppError::InvalidInput`).
+ * 
+ * The `model-registry` edge stays inside the orchestrator (the diarizer is
+ * built there) — there is **no** `ipc-bridge → diarizer` Cargo edge;
+ * `ipc-bridge` routes via the orchestrator. The shared `IpcState::index` handle
+ * is passed into the call so the orchestrator refreshes the index row without
+ * owning an index of its own.
+ */
+async rediarizeMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rediarize_meeting", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -630,7 +658,16 @@ summary_system_prompt?: string;
  * older store written before this field existed deserialises to `None`
  * via `#[serde(default)]`.
  */
-llm_model_id?: ModelId | null }
+llm_model_id?: ModelId | null; 
+/**
+ * Whether the post-recording diarization pass runs (FR-11).
+ * 
+ * Diarization is post-hoc and off by default: the orchestrator gates its
+ * on-stop diarizer pass (and the user-triggered re-diarize) on this flag.
+ * `#[serde(default)]` defaults to `false`; an older store written before
+ * this field existed deserialises to `false`.
+ */
+diarization_enabled?: boolean }
 /**
  * UI colour-scheme preference.
  */

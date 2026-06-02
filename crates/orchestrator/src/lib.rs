@@ -50,8 +50,8 @@ use std::sync::Arc;
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
 use meeting_app_common::{
-    AppError, AppEvent, AppResult, AudioFormat, MeetingId, MeetingListEntry, MeetingMeta, ModelId,
-    ModelStatus, RecordingState, Segment,
+    AppError, AppEvent, AppResult, AudioFormat, Diarizer, MeetingId, MeetingListEntry, MeetingMeta,
+    ModelDescriptor, ModelId, ModelStatus, RecordingState, Segment,
 };
 use model_registry::ModelRegistry;
 use persistence::{MeetingIndex, MeetingWriter};
@@ -422,7 +422,73 @@ impl Orchestrator {
             "recording stopped and finalised"
         );
 
+        // On-stop diarization pass (FR-11), gated on `settings.diarization_enabled`
+        // (default OFF → `stop()` behaviour is unchanged). The meeting is fully
+        // finalised on disk and the recorder is back to `Idle`, so this runs the
+        // same diarization pass the user-triggered re-diarize uses, INLINE
+        // (awaited) so the returned `MeetingMeta.speaker_count` is correct. The
+        // `stop_recording` command upserts the index from the returned meta, so
+        // no index handle is needed here.
+        let mut finalised_meta = finalised_meta;
+        if self.settings.current().diarization_enabled {
+            match self.diarize_on_stop(meeting_id).await {
+                Ok(speaker_count) => {
+                    finalised_meta.speaker_count = speaker_count;
+                    finalised_meta.diarizer = Some(diarizer_descriptor());
+                }
+                Err(e) => {
+                    // Diarization is a best-effort post-pass; a failure must not
+                    // turn a successful stop into an error (the recording is
+                    // safely on disk). Surface it as a recoverable event.
+                    tracing::warn!(
+                        target: "orchestrator",
+                        meeting_id = %meeting_id.0,
+                        "on-stop diarization failed: {e}; recording is finalised without speaker labels"
+                    );
+                    self.emit(AppEvent::ErrorOccurred { error: e });
+                }
+            }
+        }
+
         Ok(finalised_meta)
+    }
+
+    /// Run the on-stop diarization pass for `meeting_id` and return the distinct
+    /// speaker count.
+    ///
+    /// Builds the bundled `SherpaDiarizer` off the async worker threads,
+    /// decodes + diarizes the meeting, and persists the result via the shared
+    /// [`Self::finalise_diarization`] (rewriting `transcript.json`, updating
+    /// `metadata.json`'s `{ speaker_count, diarizer }`, and emitting
+    /// `AppEvent::DiarizationComplete`). No index `upsert` — the `stop_recording`
+    /// command upserts from the returned `MeetingMeta`.
+    async fn diarize_on_stop(&self, meeting_id: MeetingId) -> AppResult<u32> {
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        let registry = Arc::clone(&self.model_registry);
+        let diarizer: Box<dyn Diarizer + Send> =
+            tokio::task::spawn_blocking(move || -> AppResult<Box<dyn Diarizer + Send>> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Internal {
+                        context: format!("on-stop diarize runtime build failed: {e}"),
+                    })?;
+                let diarizer = rt.block_on(runner::build_diarizer(&registry))?;
+                Ok(Box::new(diarizer))
+            })
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("on-stop diarizer-build join failed: {e}"),
+            })??;
+
+        let (segments, speaker_count) =
+            run_diarization_blocking(meeting_dir.clone(), diarizer).await?;
+
+        self.finalise_diarization(meeting_id, &meeting_dir, &segments, speaker_count)
+            .await?;
+
+        Ok(speaker_count)
     }
 
     /// Return a snapshot of the current recording state.
@@ -573,6 +639,177 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Re-run speaker diarization for a previously-recorded meeting offline
+    /// (FR-11 user action).
+    ///
+    /// Mirrors [`Self::re_transcribe`]'s offline one-shot idiom: it refuses
+    /// unless the recorder is `Idle` (an offline diarization pass must not
+    /// contend with the live pipeline), then on a `spawn_blocking` thread it
+    /// decodes the meeting's `audio.opus` (pause-INCLUDING 16 kHz mono PCM via
+    /// `persistence::reader::read_audio_pcm`), reads `transcript.json`
+    /// (`persistence::read_transcript`), and runs the bundled `SherpaDiarizer`
+    /// over the segment array. The diarizer overlays `speaker_id` onto the
+    /// segments in place (`Diarizer::assign_speakers`, returning the distinct
+    /// speaker count); the refreshed transcript replaces `transcript.json`
+    /// (`persistence::write_transcript`), `metadata.json` is updated
+    /// (`persistence::write_metadata`, setting `speaker_count` + the `diarizer`
+    /// [`ModelDescriptor`]), the supplied [`MeetingIndex`] row's `speaker_count`
+    /// is refreshed (`upsert`), and `AppEvent::DiarizationComplete` is emitted on
+    /// the shared bus.
+    ///
+    /// The diarizer is built lazily inside the blocking closure (resolving both
+    /// model directories via `model-registry` and opening sherpa over the two
+    /// `.onnx` files), mirroring the re-transcribe lazy ASR-runtime pattern so
+    /// the heavy model load is off the async worker threads.
+    ///
+    /// # Errors
+    ///
+    /// - `AppError::InvalidInput` if a recording is in progress (state is not
+    ///   `Idle`).
+    /// - `AppError::ModelLoad` / `AppError::ModelDownload` if a diarize model is
+    ///   not available or fails to load.
+    /// - `AppError::Inference` if sherpa diarization fails.
+    pub async fn rediarize(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
+        self.ensure_idle_for_rediarize().await?;
+
+        // Build the production diarizer off the async worker threads (the model
+        // load is heavy). It is then handed to the shared inner path as an owned
+        // `Box<dyn Diarizer>`, exactly like the test seam supplies a StubDiarizer.
+        let registry = Arc::clone(&self.model_registry);
+        let diarizer: Box<dyn Diarizer + Send> =
+            tokio::task::spawn_blocking(move || -> AppResult<Box<dyn Diarizer + Send>> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Internal {
+                        context: format!("rediarize runtime build failed: {e}"),
+                    })?;
+                let diarizer = rt.block_on(runner::build_diarizer(&registry))?;
+                Ok(Box::new(diarizer))
+            })
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("rediarize diarizer-build join failed: {e}"),
+            })??;
+
+        self.rediarize_inner(index, meeting_id, diarizer).await
+    }
+
+    /// Refuse a re-diarize unless the recorder is `Idle`.
+    ///
+    /// Shared by [`Self::rediarize`] and the test-only `rediarize_with_diarizer`
+    /// so both honour the same offline-only invariant.
+    async fn ensure_idle_for_rediarize(&self) -> AppResult<()> {
+        let guard = self.inner.lock().await;
+        if !matches!(guard.state, InternalState::Idle) {
+            return Err(AppError::InvalidInput {
+                context: "rediarize requires the recorder to be Idle".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Shared diarization-and-persist core for the user-triggered re-diarize.
+    ///
+    /// Driven by the production [`Self::rediarize`] (with the bundled
+    /// `SherpaDiarizer`) and the test-only `rediarize_with_diarizer` (with a
+    /// `StubDiarizer`). On a `spawn_blocking` thread it decodes the meeting's
+    /// pause-INCLUDING PCM (`persistence::read_audio_pcm`), reads
+    /// `transcript.json` (`persistence::read_transcript`), and runs the supplied
+    /// diarizer's `assign_speakers` (which overlays `speaker_id` in place and
+    /// returns the distinct speaker count). It then calls
+    /// [`Self::finalise_diarization`] to rewrite `transcript.json` + update
+    /// `metadata.json`, and finally refreshes the supplied index row's
+    /// `speaker_count` (`upsert`).
+    async fn rediarize_inner(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        diarizer: Box<dyn Diarizer + Send>,
+    ) -> AppResult<()> {
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        let (segments, speaker_count) =
+            run_diarization_blocking(meeting_dir.clone(), diarizer).await?;
+
+        self.finalise_diarization(meeting_id, &meeting_dir, &segments, speaker_count)
+            .await?;
+
+        // Refresh the index row's speaker_count (and keep the excerpt current).
+        let meeting_dir_for_meta = meeting_dir.clone();
+        let entry: MeetingListEntry =
+            tokio::task::spawn_blocking(move || -> AppResult<MeetingListEntry> {
+                let meta = persistence::read_metadata(&meeting_dir_for_meta)?;
+                let transcript = persistence::read_transcript(&meeting_dir_for_meta)?;
+                Ok(MeetingListEntry {
+                    id: meta.uuid,
+                    title: meta.title,
+                    started_at: meta.started_at,
+                    duration_ms: meta.duration_ms,
+                    speaker_count: meta.speaker_count,
+                    excerpt: transcript.first().map(|s| s.text.clone()),
+                })
+            })
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("rediarize metadata read join failed: {e}"),
+            })??;
+
+        index.upsert(&entry).await?;
+
+        tracing::info!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            speaker_count,
+            "rediarize completed"
+        );
+
+        Ok(())
+    }
+
+    /// Persist a diarization result and announce it (no index touch).
+    ///
+    /// Shared by [`Self::rediarize_inner`] and the on-stop pass. Rewrites
+    /// `transcript.json` (with the overlaid `speaker_id`s) and updates
+    /// `metadata.json`'s `{ speaker_count, diarizer }` via
+    /// `persistence::write_metadata`, keeping `persistence` the sole writer under
+    /// `meetings/{uuid}/` (the diarizer never touches disk), then emits
+    /// `AppEvent::DiarizationComplete` on the shared `event_tx`. The blocking
+    /// `std::fs` writes run on `spawn_blocking`.
+    ///
+    /// The user-triggered re-diarize layers an index `upsert` on top of this; the
+    /// on-stop pass does not (the `stop_recording` command upserts from the
+    /// returned `MeetingMeta`, whose `speaker_count` this pass has updated).
+    async fn finalise_diarization(
+        &self,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+        segments: &[Segment],
+        speaker_count: u32,
+    ) -> AppResult<()> {
+        let meeting_dir_for_write = meeting_dir.to_path_buf();
+        let segments_for_write = segments.to_vec();
+        let descriptor = diarizer_descriptor();
+        tokio::task::spawn_blocking(move || -> AppResult<()> {
+            persistence::write_transcript(&meeting_dir_for_write, &segments_for_write)?;
+            let mut meta = persistence::read_metadata(&meeting_dir_for_write)?;
+            meta.speaker_count = speaker_count;
+            meta.diarizer = Some(descriptor);
+            persistence::write_metadata(&meeting_dir_for_write, &meta)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("diarization transcript/metadata write join failed: {e}"),
+        })??;
+
+        self.emit(AppEvent::DiarizationComplete {
+            meeting_id,
+            speaker_count,
+        });
+
+        Ok(())
+    }
+
     /// Enumerate available audio-input devices.
     ///
     /// Thin wrapper over `audio_capture::AudioCaptureManager::list_devices()`
@@ -617,6 +854,45 @@ impl Orchestrator {
                 tracing::trace!(target: "orchestrator", "AppEvent dropped (no subscribers)");
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diarization helpers (shared by the user-triggered re-diarize + on-stop pass)
+// ---------------------------------------------------------------------------
+
+/// Decode the meeting's PCM + transcript and run `diarizer` over the segments,
+/// all on a `spawn_blocking` thread.
+///
+/// Returns the segments with `speaker_id` overlaid and the distinct speaker
+/// count `assign_speakers` reported. The diarizer is consumed (moved into the
+/// blocking closure) so a `SherpaDiarizer` or a test `StubDiarizer` both work.
+async fn run_diarization_blocking(
+    meeting_dir: PathBuf,
+    diarizer: Box<dyn Diarizer + Send>,
+) -> AppResult<(Vec<Segment>, u32)> {
+    tokio::task::spawn_blocking(move || -> AppResult<(Vec<Segment>, u32)> {
+        let pcm = persistence::read_audio_pcm(&meeting_dir)?;
+        let mut segments = persistence::read_transcript(&meeting_dir)?;
+        let speaker_count = diarizer.assign_speakers(&pcm, 16_000, &mut segments)?;
+        Ok((segments, speaker_count))
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("diarization spawn_blocking join failed: {e}"),
+    })?
+}
+
+/// The `ModelDescriptor` recorded in `metadata.json` after a diarization pass.
+///
+/// Identifies the bundled segmentation model (the diarizer is a two-model
+/// pipeline; the segmentation model is the diarizer's primary identity for the
+/// `MeetingMeta.diarizer` field). The `version` mirrors the manifest id.
+fn diarizer_descriptor() -> ModelDescriptor {
+    ModelDescriptor {
+        name: runner::DIARIZE_SEG_MODEL_ID.to_string(),
+        quantisation: None,
+        version: runner::DIARIZE_SEG_MODEL_ID.to_string(),
     }
 }
 
@@ -785,5 +1061,30 @@ impl Orchestrator {
 
         self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
             .await
+    }
+
+    /// Offline re-diarize driven by a caller-supplied [`Diarizer`], mirroring
+    /// [`Self::re_transcribe_with_backend`] for the diarization path.
+    ///
+    /// This is the stub-injectable seam for the re-diarize pipeline: it drives
+    /// the **same** [`Self::rediarize_inner`] core the production
+    /// [`Self::rediarize`] uses (decode PCM + transcript → `assign_speakers` →
+    /// `transcript.json` rewrite + `metadata.json` `{ speaker_count, diarizer }`
+    /// update → index `upsert` → `AppEvent::DiarizationComplete`), but with the
+    /// injected `diarizer` instead of building a real `SherpaDiarizer`. This lets
+    /// the DEFAULT test suite exercise the whole wiring with a `StubDiarizer`
+    /// (NO model).
+    ///
+    /// Honours the same `Idle`-only invariant as the production path.
+    ///
+    /// Available only under the `test-source` feature.
+    pub async fn rediarize_with_diarizer(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        diarizer: Box<dyn Diarizer + Send>,
+    ) -> AppResult<()> {
+        self.ensure_idle_for_rediarize().await?;
+        self.rediarize_inner(index, meeting_id, diarizer).await
     }
 }

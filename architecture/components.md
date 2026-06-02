@@ -553,6 +553,51 @@ the `model-registry` edge inside the orchestrator. This adds **no**
 `orchestrator → summariser` edge — the summariser is loaded in `ipc-bridge`
 (the granted `ipc-bridge → summariser` edge), not here.
 
+**Phase 6 — diarization (FR-11): the granted `orchestrator → diarizer` edge,
+the on-stop pass, and `Orchestrator::rediarize`.** The orchestrator owns the
+diarizer lifecycle (per the `diarizer` section above): `diarizer = { path =
+"../diarizer" }` is added to `crates/orchestrator/Cargo.toml`, realising the
+`orchestrator → diarizer` edge in the dependency table. A lazy builder
+(`runner::build_diarizer`, mirroring `build_asr_runtime_for_retranscribe`)
+resolves the two diarize model directories via `model-registry`
+(`ModelRegistry::ensure` for `pyannote-segmentation-3-0` +
+`3dspeaker-campplus-zh-cn-16k-common`), locates each `.onnx`, and opens
+`SherpaDiarizer::open(seg, emb, DiarizerConfig::default())` — so the
+`model-registry` edge stays inside the orchestrator and `diarizer` need not
+depend on `persistence` (the orchestrator sources audio through
+`persistence::read_audio_pcm`).
+
+- `Orchestrator::rediarize(&MeetingIndex, MeetingId)` — the offline
+  user-triggered re-diarize, copying `re_transcribe`'s one-shot idiom: it refuses
+  unless `Idle` (`AppError::InvalidInput`), then on `spawn_blocking` decodes the
+  pause-INCLUDING PCM (`read_audio_pcm`) + reads `transcript.json`
+  (`read_transcript`) and runs `Diarizer::assign_speakers(&audio, 16000, &mut
+  segments)` (distinct-count). It rewrites `transcript.json` with the overlaid
+  `speaker_id`s (`write_transcript`), updates `metadata.json`'s `{ speaker_count,
+  diarizer: Some(ModelDescriptor{..}) }` (`persistence::write_metadata`), refreshes
+  the supplied index row's `speaker_count` (`MeetingIndex::upsert`), and emits
+  `AppEvent::DiarizationComplete { meeting_id, speaker_count }` on the shared
+  `event_tx`. The index handle is passed in by `ipc-bridge` (the orchestrator does
+  not own one), exactly as for `re_transcribe`.
+- **On-stop pass.** `stop()`, AFTER the meeting is finalised and the recorder is
+  back to `Idle`, runs the **same** diarization pass INLINE (awaited) when
+  `settings.diarization_enabled` is true, so the returned `MeetingMeta`'s
+  `speaker_count` + `diarizer` are correct (the `stop_recording` command upserts
+  the index from that meta, so the on-stop pass takes no index handle). It writes
+  `transcript.json` + `metadata.json` and emits `DiarizationComplete` via the same
+  shared `finalise_diarization` helper. The flag defaults to **false**, so
+  `stop()`'s default behaviour is unchanged; an on-stop diarization failure is
+  best-effort (logged + `AppEvent::ErrorOccurred`), never turning a successful stop
+  into an error.
+- **Test seam — `rediarize_with_diarizer(&MeetingIndex, MeetingId, Box<dyn
+  Diarizer + Send>)`.** A `#[cfg(any(test, feature = "test-source"))]`-gated
+  sibling of `rediarize` (mirroring `re_transcribe_with_backend`): both `rediarize`
+  and this seam delegate to a shared `rediarize_inner` taking an owned
+  `Box<dyn Diarizer + Send>`, so the default suite exercises the full
+  decode → assign → `transcript.json` rewrite → `metadata.json` update →
+  index-upsert → `DiarizationComplete` wiring with a `StubDiarizer` (NO model).
+  `DiarizationComplete` is emitted by the **orchestrator**, not `ipc-bridge`.
+
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration
@@ -568,7 +613,16 @@ then re-transcribes) plus the **default-suite, model-free**
 the committed LibriSpeech fixture into `audio.opus` via the persistence Opus
 encoder, empties `transcript.json`, then runs `re_transcribe_with_backend` with a
 `StubAsrBackend` so the real Silero VAD + offline accumulator + transcript
-rewrite + index-excerpt refresh are exercised in CI without a model.
+rewrite + index-excerpt refresh are exercised in CI without a model. Phase 6
+diarization tests: the **default-suite, model-free** `StubDiarizer` lib tests
+(`tests::diarization`) drive the re-diarize inner path
+(`rediarize_with_diarizer` → `transcript.json` rewrite with `speaker_id`s +
+`metadata.json` `speaker_count` + `DiarizationComplete`) and a **toggle-OFF**
+`stop()` pass (`diarization_enabled = false` → all `speaker_id == None`, no
+`DiarizationComplete`); plus the env-var-gated `rediarize` integration test
+(`MEETING_APP_DIARIZE_SEG_PATH` + `MEETING_APP_DIARIZE_EMB_PATH`, skip-on-unset)
+that stages the two real sherpa models into the registry cache and re-diarizes a
+meeting whose audio is the S1 two-speaker fixture.
 
 ### `settings`
 **Crate:** `crates/settings`
@@ -740,6 +794,23 @@ That test uses `model-registry` as a **dev-dependency** only (it lives in
 through `Orchestrator` at runtime, so there is no production `model-registry`
 edge in the dependency table above (mirroring `orchestrator`'s test-only
 dev-dependencies).
+
+**Phase 6 addition (21 commands total) — re-diarize (FR-11).** One command lands:
+
+- `rediarize_meeting(meeting_id) -> ()` — routes to `Orchestrator::rediarize`
+  (the offline re-diarize): decode → `SherpaDiarizer::assign_speakers` →
+  `transcript.json` rewrite with `speaker_id`s → `metadata.json` `speaker_count`
+  update → index-row refresh → `AppEvent::DiarizationComplete`. The shared
+  `IpcState::index` handle is passed into the call so the orchestrator refreshes
+  the index row without owning one. The diarizer is built **inside the
+  orchestrator** (which holds the granted `orchestrator → diarizer` edge and
+  resolves the diarize models via `model-registry`), so there is **no**
+  `ipc-bridge → diarizer` Cargo edge — `ipc-bridge` routes via the orchestrator,
+  mirroring how the ASR/summariser model-registry edges stay out of `ipc-bridge`.
+  `AppEvent::DiarizationComplete` is emitted by the **orchestrator**, not here.
+
+The command ledger is now **21** (P5 20 + `rediarize_meeting`), asserted by the
+`bindings_builder_registers_expected_command_ledger` test.
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name

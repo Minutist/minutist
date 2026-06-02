@@ -3123,6 +3123,7 @@ dependencies = [
  "audio-capture",
  "audiopus",
  "chrono",
+ "diarizer",
  "hound",
  "meeting-app-common",
  "model-registry",

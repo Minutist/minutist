@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (20 total)
+//! ## Commands (21 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -28,6 +28,7 @@
 //! | `summarise_meeting` | `()` | 5 |
 //! | `get_summary` | `Option<String>` | 5 |
 //! | `save_summary` | `()` | 5 |
+//! | `rediarize_meeting` | `()` | 6 |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
@@ -55,6 +56,14 @@
 //! on `spawn_blocking`, writes `summary.md` via `persistence::write_summary`,
 //! and emits `AppEvent::SummaryReady` on `IpcState::event_tx`. `get_summary` /
 //! `save_summary` route directly to `persistence::{read_summary, write_summary}`.
+//!
+//! The Phase-6 `rediarize_meeting` command routes to `Orchestrator::rediarize`
+//! (the offline re-diarize). The diarizer is built **inside the orchestrator**
+//! (which holds the granted `orchestrator → diarizer` edge and resolves the
+//! diarize models via `model-registry`), so there is **no**
+//! `ipc-bridge → diarizer` edge — `ipc-bridge` routes via the orchestrator. The
+//! `AppEvent::DiarizationComplete` event is emitted by the **orchestrator**, not
+//! here.
 //!
 //! ## Specta types
 //!
@@ -185,7 +194,7 @@ pub fn open_meeting_index(
 // bindings_builder — shared builder for app-main and the export helper
 // ---------------------------------------------------------------------------
 
-/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1–5 commands
+/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1–6 commands
 /// and the `AppEventPayload` event.
 ///
 /// Both `app-main` (to build the invoke handler) and a bindings-export helper
@@ -231,6 +240,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::summarise_meeting,
             commands::get_summary,
             commands::save_summary,
+            commands::rediarize_meeting,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -252,9 +262,9 @@ mod tests {
     /// it for each expected command name.  Each command appears in the TS
     /// as a string literal in the `invoke` call.
     ///
-    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20
+    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21
     /// (P5 removes `re_summarise` and adds `summarise_meeting` / `get_summary`
-    /// / `save_summary`: 18 − 1 + 3 = 20).
+    /// / `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`: 20 + 1 = 21).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -290,9 +300,10 @@ mod tests {
             "summarise_meeting",
             "get_summary",
             "save_summary",
+            "rediarize_meeting",
         ];
 
-        assert_eq!(expected.len(), 20, "command ledger must be 20 in Phase 5");
+        assert_eq!(expected.len(), 21, "command ledger must be 21 in Phase 6");
 
         // `re_summarise` was removed in Phase 5 (no caller once
         // `summarise_meeting` landed); assert it is gone from the surface.

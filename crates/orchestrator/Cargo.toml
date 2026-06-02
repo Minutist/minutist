@@ -18,6 +18,7 @@ meeting-app-common = { path = "../common" }
 audio-capture = { path = "../audio-capture" }
 vad-chunker = { path = "../vad-chunker" }
 asr-runtime = { path = "../asr-runtime" }
+diarizer = { path = "../diarizer" }
 model-registry = { path = "../model-registry" }
 persistence = { path = "../persistence" }
 settings = { path = "../settings" }
@@ -63,4 +64,8 @@ required-features = ["test-source"]
 
 [[test]]
 name = "re_transcribe"
+required-features = ["test-source"]
+
+[[test]]
+name = "rediarize"
 required-features = ["test-source"]

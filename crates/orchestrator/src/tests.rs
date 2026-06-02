@@ -316,3 +316,214 @@ async fn audio_meter_events_arrive_within_one_second() {
         "expected at least one AudioMeter event within 1 second"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 — diarization wiring (DEFAULT suite, no model)
+//
+// A `StubDiarizer` (a `common::Diarizer` that assigns speaker_ids
+// deterministically, no sherpa model) drives the re-diarize inner path over a
+// synthetic meeting folder, and a toggle-OFF `stop()` test proves the on-stop
+// pass is gated.
+// ---------------------------------------------------------------------------
+
+mod diarization {
+    use super::*;
+    use meeting_app_common::{
+        AppResult, AudioFormat, Diarizer, MeetingId, MeetingMeta, Segment,
+    };
+    use persistence::{MeetingIndex, MeetingWriter};
+
+    /// A `common::Diarizer` with no model: it assigns first-seen-order labels
+    /// `"A"`, `"B"`, … round-robin across the segments and reports the distinct
+    /// count, so the orchestrator's persistence + index + event wiring can be
+    /// exercised without sherpa or any ONNX file.
+    struct StubDiarizer {
+        /// Number of distinct speakers to spread across the segments.
+        speakers: u32,
+    }
+
+    impl Diarizer for StubDiarizer {
+        fn assign_speakers(
+            &self,
+            audio: &[f32],
+            sample_rate: u32,
+            segments: &mut [Segment],
+        ) -> AppResult<u32> {
+            assert_eq!(sample_rate, 16_000, "orchestrator must call with 16 kHz");
+            assert!(!audio.is_empty(), "orchestrator must decode non-empty PCM");
+            if segments.is_empty() || self.speakers == 0 {
+                return Ok(0);
+            }
+            let labels = ["A", "B", "C", "D"];
+            let used = (self.speakers as usize).min(labels.len()).min(segments.len());
+            for (i, seg) in segments.iter_mut().enumerate() {
+                seg.speaker_id = Some(labels[i % used].to_string());
+            }
+            Ok(used as u32)
+        }
+    }
+
+    /// Build a synthetic meeting folder on disk: `audio.opus` encoded from
+    /// `samples` via the production `MeetingWriter`, a `metadata.json` with
+    /// `speaker_count = 0` / `diarizer = None`, and a `transcript.json` with
+    /// `segment_texts.len()` segments (all `speaker_id = None`). Returns the id.
+    fn build_meeting(
+        root: &std::path::Path,
+        samples: &[f32],
+        segment_texts: &[&str],
+    ) -> MeetingId {
+        let meeting_id = MeetingId::new();
+        let format = AudioFormat {
+            codec: "opus".into(),
+            sample_rate: 16_000,
+            channels: 1,
+            bitrate_kbps: Some(32),
+        };
+
+        let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
+        writer.push_samples(samples).expect("push samples");
+
+        let meta = MeetingMeta {
+            uuid: meeting_id,
+            title: "Diarize me".into(),
+            started_at: "2026-06-02T09:00:00Z".into(),
+            ended_at: Some("2026-06-02T09:00:06Z".into()),
+            duration_ms: (samples.len() as u64 * 1000) / 16_000,
+            speaker_count: 0,
+            audio_format: format,
+            asr_model: None,
+            llm_model: None,
+            diarizer: None,
+            app_version: "0.0.0".into(),
+        };
+        let folder = writer.finalise(meta).expect("finalise");
+
+        let segments: Vec<Segment> = segment_texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Segment {
+                start_ms: i as u64 * 1000,
+                end_ms: i as u64 * 1000 + 800,
+                text: (*t).to_string(),
+                speaker_id: None,
+                confidence: None,
+                words: Vec::new(),
+            })
+            .collect();
+        std::fs::write(
+            folder.path().join("transcript.json"),
+            serde_json::to_vec_pretty(&segments).unwrap(),
+        )
+        .expect("write transcript.json");
+
+        meeting_id
+    }
+
+    /// The re-diarize inner path (driven via the `rediarize_with_diarizer` stub
+    /// seam) rewrites `transcript.json` with overlaid `speaker_id`s, updates
+    /// `metadata.json`'s `speaker_count` + `diarizer`, refreshes the index row,
+    /// and emits `DiarizationComplete` — all without a sherpa model.
+    #[tokio::test]
+    async fn rediarize_with_stub_writes_speaker_ids_and_emits() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+        let mut event_rx = orch.subscribe_events();
+
+        // Non-zero PCM (the stub asserts non-empty; content is irrelevant).
+        let samples = vec![0.25f32; 16_000];
+        let meeting_id = build_meeting(&root, &samples, &["hello", "there", "again"]);
+        let meeting_dir = root.join(meeting_id.0.to_string());
+
+        // Before: every segment is unlabelled, metadata speaker_count is 0.
+        let before = persistence::read_transcript(&meeting_dir).expect("read transcript");
+        assert!(before.iter().all(|s| s.speaker_id.is_none()));
+
+        let index = MeetingIndex::open(":memory:").await.expect("open index");
+        index.rebuild_from_disk(&root).await.expect("seed index");
+
+        let stub = Box::new(StubDiarizer { speakers: 2 });
+        orch.rediarize_with_diarizer(&index, meeting_id, stub)
+            .await
+            .expect("rediarize_with_diarizer must succeed");
+
+        // 1. transcript.json rewritten with speaker_ids (A/B round-robin).
+        let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(after[1].speaker_id.as_deref(), Some("B"));
+        assert_eq!(after[2].speaker_id.as_deref(), Some("A"));
+
+        // 2. metadata.json speaker_count updated + diarizer descriptor set.
+        let meta = persistence::read_metadata(&meeting_dir).expect("read metadata");
+        assert_eq!(meta.speaker_count, 2);
+        assert!(meta.diarizer.is_some(), "diarizer descriptor must be recorded");
+
+        // 3. index row speaker_count refreshed.
+        let rows = index.list_meetings().await.expect("list");
+        let row = rows.iter().find(|r| r.id == meeting_id).expect("row");
+        assert_eq!(row.speaker_count, 2);
+
+        // 4. DiarizationComplete emitted with the right meeting_id + count.
+        let mut got = false;
+        loop {
+            match event_rx.try_recv() {
+                Ok(AppEvent::DiarizationComplete { meeting_id: mid, speaker_count }) => {
+                    assert_eq!(mid, meeting_id);
+                    assert_eq!(speaker_count, 2);
+                    got = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(got, "DiarizationComplete must be emitted");
+    }
+
+    /// With `diarization_enabled = false` (the default), `stop()` runs no
+    /// diarization pass: the returned `MeetingMeta` and the on-disk transcript
+    /// keep every `speaker_id == None`, `speaker_count == 0`, and NO
+    /// `DiarizationComplete` event is emitted.
+    #[tokio::test]
+    async fn stop_with_diarization_disabled_leaves_segments_unlabelled() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orch = test_orchestrator(dir.path().to_path_buf());
+        // The default SettingsHandle has diarization_enabled = false.
+        let mut event_rx = orch.subscribe_events();
+
+        let source = DummyAudioSource::new(3200, 1600);
+        let streams = source.generate_streams(5, 32, 64);
+        let meeting_id = orch.start_with_streams(streams).await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let meta = orch.stop().await.expect("stop");
+
+        // Returned meta carries no speaker labels.
+        assert_eq!(meta.speaker_count, 0, "toggle-OFF stop must not diarize");
+        assert!(meta.diarizer.is_none(), "toggle-OFF stop must not set diarizer");
+
+        // On-disk transcript (if any) has no speaker_ids.
+        let meeting_dir = dir.path().join(meeting_id.0.to_string());
+        let transcript = persistence::read_transcript(&meeting_dir).expect("read transcript");
+        assert!(
+            transcript.iter().all(|s| s.speaker_id.is_none()),
+            "no segment may carry a speaker_id when diarization is disabled"
+        );
+
+        // No DiarizationComplete event was emitted.
+        let mut saw_diarization = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, AppEvent::DiarizationComplete { .. }) {
+                saw_diarization = true;
+            }
+        }
+        assert!(
+            !saw_diarization,
+            "no DiarizationComplete event may be emitted with diarization disabled"
+        );
+    }
+}

@@ -70,13 +70,11 @@ const DEV_SETTINGS: Settings = {
   start_hidden: false,
   autosave_interval_secs: 5,
   // Phase 6 diarization toggle. Production default is OFF; the dev shim seeds
-  // it ON so the toggle reads as checked under `vite dev` for visual QA.
-  // Modelled as an extra property on the round-tripped settings object until
-  // `settings.diarization_enabled` lands in the generated `Settings` type
-  // (Stream S5 regenerates the bindings); the JSON round-trip carries it
-  // losslessly. See `../state/diarization-settings`.
+  // it ON so the toggle reads as checked under `vite dev` for visual QA. Now a
+  // first-class `Settings` field (the Phase-6 JOIN regenerated `bindings.ts`),
+  // so the previous augmentation cast collapsed.
   diarization_enabled: true,
-} as Settings & { diarization_enabled: boolean };
+};
 
 /**
  * Recording-clock offsets (ms, pause-excluding) for the seeded transcript.
@@ -405,24 +403,15 @@ export const devCommands = {
     devSummaries.set(meetingId, summaryMarkdown);
     return ok(null);
   },
-};
-
-/**
- * DEV-only handlers for commands not yet on the generated `commands` surface
- * (Phase 6 `rediarize_meeting`), keyed by their snake_case Tauri command name.
- * {@link callPendingCommand} delegates here under the DEV shim so the action
- * works (and fans out a `diarization_complete` event) under `vite dev`.
- */
-export const devPendingCommands: Record<
-  string,
-  (...args: unknown[]) => Promise<Result<unknown, IpcError>>
-> = {
+  // --- Phase 6 re-diarize (FR-11) -----------------------------------------
   // `rediarize_meeting(meeting_id) -> ()`: assign speakers to the meeting's
   // segments, then notify the live event stream so the meetings store re-reads
   // that meeting's transcript (the real backend emits
-  // `AppEvent::DiarizationComplete`).
-  async rediarize_meeting(...args: unknown[]): Promise<Result<null, IpcError>> {
-    const meetingId = args[0] as MeetingId;
+  // `AppEvent::DiarizationComplete`). Now a first-class `devCommands` entry —
+  // the Phase-6 JOIN regenerated `bindings.ts`, so this folded out of the
+  // temporary `devPendingCommands` map alongside the `callPendingCommand`
+  // collapse (A9).
+  async rediarizeMeeting(meetingId: MeetingId): Promise<Result<null, IpcError>> {
     devDiarizationListeners.forEach((cb) =>
       cb({
         kind: "diarization_complete",

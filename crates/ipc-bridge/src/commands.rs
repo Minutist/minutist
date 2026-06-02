@@ -478,6 +478,37 @@ pub async fn re_transcribe(
         .map_err(IpcError::from)
 }
 
+/// Re-run speaker diarization for a meeting offline (Phase 6, FR-11 action).
+///
+/// Routes to `Orchestrator::rediarize`, which decodes the meeting's
+/// pause-INCLUDING PCM, runs the bundled `SherpaDiarizer` over the stored
+/// transcript segments (resolving both diarize model directories via
+/// `model-registry`), rewrites `transcript.json` with the overlaid
+/// `speaker_id`s, updates `metadata.json`'s `{ speaker_count, diarizer }`,
+/// refreshes the index row's `speaker_count`, and emits
+/// `AppEvent::DiarizationComplete { meeting_id, speaker_count }` — the event is
+/// emitted by the **orchestrator** (not here), on the shared bus the forwarder
+/// subscribes to. Refused while a recording is in progress (the orchestrator
+/// returns `AppError::InvalidInput`).
+///
+/// The `model-registry` edge stays inside the orchestrator (the diarizer is
+/// built there) — there is **no** `ipc-bridge → diarizer` Cargo edge;
+/// `ipc-bridge` routes via the orchestrator. The shared `IpcState::index` handle
+/// is passed into the call so the orchestrator refreshes the index row without
+/// owning an index of its own.
+#[tauri::command]
+#[specta::specta]
+pub async fn rediarize_meeting(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    state
+        .orchestrator
+        .rediarize(&state.index, meeting_id)
+        .await
+        .map_err(IpcError::from)
+}
+
 // ---------------------------------------------------------------------------
 // Summary (Phase 5)
 // ---------------------------------------------------------------------------

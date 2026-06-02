@@ -21,6 +21,11 @@ that.
   expose async functions; the orchestrator chooses how they're driven.
 - No use of `block_on` inside Tauri command handlers. Commands return
   futures that the runtime polls.
+- Spawning from Tauri's `setup()` hook MUST use `tauri::async_runtime::spawn`,
+  NOT a bare `tokio::spawn`: `setup` runs on the main thread with no entered
+  Tokio runtime, so `tokio::spawn` panics ("there is no reactor running"). Tauri's
+  async runtime is tokio-backed, so tokio primitives (broadcast receivers, etc.)
+  work inside it. (The event forwarder is spawned from `setup`.)
 
 ## Threading model
 

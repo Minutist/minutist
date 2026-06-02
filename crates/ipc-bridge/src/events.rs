@@ -54,7 +54,11 @@ pub struct AppEventPayload(pub AppEvent);
 pub fn spawn_event_forwarder(orchestrator: Arc<Orchestrator>, app_handle: AppHandle) {
     let mut rx: broadcast::Receiver<AppEvent> = orchestrator.subscribe_events();
 
-    tokio::spawn(async move {
+    // `tauri::async_runtime::spawn`, NOT `tokio::spawn`: this is called from
+    // Tauri's `setup()` hook, which runs on the main thread with no entered
+    // Tokio runtime, so a bare `tokio::spawn` panics ("no reactor running").
+    // Tauri's async runtime is tokio-backed, so the broadcast receiver works.
+    tauri::async_runtime::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {

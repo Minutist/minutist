@@ -56,6 +56,9 @@ tauri = { version = "2.10", features = [] }
 tauri-build = "2.4"
 tauri-plugin-fs = "2.4"
 tauri-plugin-store = "2.4"
+# Auto-update (Phase 7). Driven from Rust via UpdaterExt (no JS plugin needed);
+# see architecture/cross-cutting.md "Auto-update".
+tauri-plugin-updater = "2.10"
 
 # tauri-specta — pinned to Handy's working set; bumping these is a coordinated
 # architecture-owner change because they gate the IPC contract for every phase.

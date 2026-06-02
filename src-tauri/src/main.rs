@@ -11,6 +11,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Manager, WindowEvent};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod updater;
+
 fn main() {
     // ---------------------------------------------------------------------------
     // Logging — file appender + optional console.
@@ -160,6 +162,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // Mount events first so the event channel is ready before any
@@ -211,6 +214,9 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // orchestrator/registry broadcast on (the event forwarder subscribes
             // once via Orchestrator::subscribe_events and sees it too).
             let ipc_event_tx = event_tx.clone();
+            // Clone for the auto-updater (Phase 7) so it emits UpdateAvailable /
+            // UpdateProgress on the SAME bus the forwarder relays to the webview.
+            let updater_event_tx = event_tx.clone();
 
             // Construct the model registry. The manifest is bundled at compile
             // time from resources/models.json; the cache root is the per-kind
@@ -256,6 +262,12 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
             // Spawn the event forwarder so orchestrator events reach the webview.
             spawn_event_forwarder(orchestrator.clone(), app_handle.clone());
+
+            // Wire the auto-updater (Phase 7): a guarded startup check + the
+            // apply-on-accept listener. A no-op when `plugins.updater` is
+            // unconfigured (the committed default), so dev/unsigned builds are
+            // unaffected.
+            updater::start(&app_handle, updater_event_tx);
 
             // Register the IPC state so command handlers can access it.
             app.manage(IpcState {

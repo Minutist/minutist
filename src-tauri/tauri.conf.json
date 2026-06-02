@@ -37,5 +37,11 @@
       "icons/32x32.png",
       "icons/16x16.png"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [],
+      "pubkey": ""
+    }
   }
 }

@@ -414,6 +414,21 @@ artefact whose minisign signature does not verify. Per Q7, v1 ships one artefact
 per platform built with a portable GPU backend (Vulkan on Windows/Linux, Metal
 on macOS) with runtime CPU fallback, so there is no per-backend update fan-out.
 
+The flow is driven entirely from Rust via `UpdaterExt` (no JS updater plugin):
+app-main checks on startup and emits `UpdateAvailable`; the webview prompts and,
+on accept, emits the `updater://apply` event back; app-main then downloads
+(emitting `UpdateProgress`), installs, and relaunches (`AppHandle::restart`).
+All updater calls are **guarded** — the committed default `plugins.updater`
+config is `{ "endpoints": [], "pubkey": "" }`, so `check()` is a logged no-op and
+dev/unsigned builds are unaffected. Enabling updates is a release step: set the
+real `endpoints` + minisign `pubkey` in `tauri.conf.json`, keep the private key
+as the `TAURI_SIGNING_PRIVATE_KEY` CI secret, and enable updater-artefact
+signing in the release workflow. NOTE (Phase 7 follow-up): the app-wide Tauri 2
+capability configuration (`src-tauri/capabilities/`) is not yet set up — required
+for the packaged webview to invoke commands and emit `updater://apply` at
+runtime — and is a precondition for end-to-end updater operation, tracked
+separately from this wiring.
+
 ## GPU portability
 
 GPU acceleration is selected at **build time** via Cargo features, all **OFF by

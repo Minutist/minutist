@@ -41,6 +41,7 @@ settings = { path = "../crates/settings" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-fs = { workspace = true }
 tauri-plugin-store = { workspace = true }
+tauri-plugin-updater = { workspace = true }
 tauri-specta = { workspace = true }
 specta-typescript = { workspace = true }
 tokio = { workspace = true }

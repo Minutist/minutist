@@ -113,7 +113,22 @@ export function TranscriptPane() {
                 <span className="transcript-pane__timestamp tnum">
                   {formatTimestamp(seg.start_ms)}
                 </span>
-                <span className="transcript-pane__text">{seg.text}</span>
+                <span className="transcript-pane__text">
+                  {/*
+                    Phase 6: a quiet "Speaker {id}" chip when diarization has
+                    assigned this segment a speaker. Hidden entirely when
+                    `speaker_id` is null/undefined (un-diarized). The id is the
+                    diarizer's first-seen label (A / B / …); we surface it
+                    verbatim. Tokens only (oxblood/stone) — no hard-coded
+                    colours.
+                  */}
+                  {seg.speaker_id != null && (
+                    <span className="transcript-pane__speaker">
+                      Speaker {seg.speaker_id}
+                    </span>
+                  )}
+                  {seg.text}
+                </span>
               </li>
             );
           })}

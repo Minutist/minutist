@@ -5,6 +5,7 @@
  * that any future shim (mock in tests, offline-mode stub) has a single
  * injection point.
  */
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { events, commands as generatedCommands } from "./bindings";
 import type { AppEventPayload, IpcError, Result } from "./bindings";
 import type { AppEvent } from "./app-event";
@@ -90,6 +91,82 @@ export const commands: Commands = {
   saveSummary: (meetingId, summaryMarkdown) =>
     callCommand("saveSummary", [meetingId, summaryMarkdown]),
 };
+
+/**
+ * Invoke a command that is NOT yet on the generated `commands` surface.
+ *
+ * Some backend commands land in `ipc-bridge` (and thus in the regenerated
+ * `bindings.ts`) in a later stream than the webview slice that calls them. The
+ * webview cannot hand-edit `bindings.ts` (A9 — it is generated), so until the
+ * backend JOIN regenerates it, those commands route through this thin
+ * shim-aware raw-`invoke` path. It mirrors the tauri-specta calling convention
+ * exactly so the eventual move to `callCommand` is a no-op for callers:
+ *
+ *   - the command name is the **snake_case** Tauri command name,
+ *   - positional `args` are mapped onto the named-argument envelope by index
+ *     using the supplied `argNames` (tauri-specta passes
+ *     `TAURI_INVOKE(name, { camelCaseArg })`),
+ *   - the result is wrapped in the same `Result<T, IpcError>` envelope the
+ *     generated stubs produce.
+ *
+ * In `vite dev` with no Tauri backend the DEV-only shim
+ * ({@link shouldUseDevShim}) answers via its `devPendingCommands` map (keyed by
+ * the snake_case name), loaded through the same dynamic `import()` as
+ * {@link callCommand} so the production build never bundles the sample data.
+ *
+ * This was the path the Phase-4 meeting commands and the Phase-5 summary
+ * commands used before their bindings regenerated; the Phase-6
+ * `rediarize_meeting` command uses it now (Stream S5 regenerates the bindings
+ * and folds it into `callCommand`).
+ */
+let devPendingPromise: Promise<
+  Record<string, (...a: unknown[]) => Promise<Result<unknown, IpcError>>>
+> | null = null;
+async function loadDevPendingCommands(): Promise<
+  Record<string, (...a: unknown[]) => Promise<Result<unknown, IpcError>>>
+> {
+  if (!devPendingPromise) {
+    devPendingPromise = import("./dev-shim").then(
+      (m) =>
+        m.devPendingCommands as Record<
+          string,
+          (...a: unknown[]) => Promise<Result<unknown, IpcError>>
+        >,
+    );
+  }
+  return devPendingPromise;
+}
+
+// The single not-yet-generated command Phase 6 needs and its argument name, so
+// the named-argument envelope matches what tauri-specta will generate.
+const PENDING_ARG_NAMES: Record<string, readonly string[]> = {
+  rediarize_meeting: ["meetingId"],
+};
+
+export async function callPendingCommand<T>(
+  name: string,
+  args: unknown[],
+): Promise<Result<T, IpcError>> {
+  if (import.meta.env.DEV && shouldUseDevShim()) {
+    const dev = await loadDevPendingCommands();
+    const handler = dev[name];
+    if (handler) {
+      return (await handler(...args)) as Result<T, IpcError>;
+    }
+  }
+  const argNames = PENDING_ARG_NAMES[name] ?? [];
+  const payload: Record<string, unknown> = {};
+  argNames.forEach((argName, i) => {
+    payload[argName] = args[i];
+  });
+  try {
+    const data = (await tauriInvoke(name, payload)) as T;
+    return { status: "ok", data };
+  } catch (e) {
+    if (e instanceof Error) throw e;
+    return { status: "error", error: e as IpcError };
+  }
+}
 
 // Re-export types that callers commonly need. `AppEvent` is the generated
 // event union (re-exported via `./app-event`, which is the webview's single

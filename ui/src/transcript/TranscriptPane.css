@@ -87,6 +87,27 @@
   word-break: break-word;
 }
 
+/*
+ * Phase 6 speaker chip: a quiet inline label preceding the segment text when
+ * diarization has tagged the row. Stone ink on a faint oxblood tint with a
+ * hairline rule — present but unobtrusive, in keeping with the single-accent
+ * Editorial Ink language (tokens only, no hard-coded colour).
+ */
+.transcript-pane__speaker {
+  display: inline-block;
+  margin-right: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--radius);
+  background: var(--accent-tint);
+  border: 1px solid var(--rule);
+  color: var(--stone);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
 /* Subtle emphasis on the most-recent (last) segment. */
 .transcript-pane__row:last-child .transcript-pane__text {
   color: var(--ink);

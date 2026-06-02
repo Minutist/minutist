@@ -18,9 +18,11 @@ import {
   renameMeeting,
   deleteMeeting,
   reTranscribe,
+  rediarize,
 } from "../ipc/meetings";
 import type { MeetingListEntry, MeetingState } from "../ipc/meetings";
 import type { MeetingId } from "../ipc/bindings";
+import type { AppEvent } from "../ipc/app-event";
 
 export type { MeetingListEntry, MeetingState };
 
@@ -48,6 +50,10 @@ export type MeetingsStore = {
   remove: (meetingId: MeetingId) => Promise<void>;
   /** Re-run transcription for a meeting. */
   reTranscribe: (meetingId: MeetingId) => Promise<void>;
+  /** Re-run speaker diarization for a meeting (Phase 6). */
+  rediarize: (meetingId: MeetingId) => Promise<void>;
+  /** Dispatcher called by the global event listener. */
+  handleEvent: (event: AppEvent) => void;
 };
 
 function errorMessage(err: unknown): string {
@@ -125,5 +131,48 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
     } catch (err) {
       set({ lastError: errorMessage(err) });
     }
+  },
+
+  rediarize: async (meetingId) => {
+    try {
+      await rediarize(meetingId);
+      set({ lastError: null });
+    } catch (err) {
+      set({ lastError: errorMessage(err) });
+    }
+  },
+
+  handleEvent: (event) => {
+    if (event.kind !== "diarization_complete") return;
+    // Diarization finished assigning speakers to THIS meeting's segments
+    // (`transcript.json` was rewritten with the overlaid `speaker_id`s). Re-read
+    // that meeting's transcript via `open_meeting` SCOPED TO THE EVENT'S
+    // `meeting_id` — not the live recording store — so the restored
+    // `openMeetingState.transcript` (the source the transcript pane reads for a
+    // saved meeting, U1) reflects the new speaker tags. Only act when the event
+    // is for the meeting currently open, so an unrelated meeting's event does
+    // not clobber the open-meeting view (and a re-diarize triggered from the
+    // list while no meeting is open quietly refreshes only the list).
+    const eventMeetingId = event.meeting_id;
+    if (get().openMeetingId !== eventMeetingId) {
+      // Not the open meeting: refresh the list so the row's speaker count
+      // reflects the new diarization, but do not touch the open-meeting state.
+      void get().refresh();
+      return;
+    }
+    void (async () => {
+      try {
+        const state = await openMeeting(eventMeetingId);
+        // Guard against a race: only apply if THIS meeting is still the open
+        // one once the async read resolves.
+        if (get().openMeetingId === eventMeetingId) {
+          set({ openMeetingState: state, lastError: null });
+        }
+      } catch (err) {
+        set({ lastError: errorMessage(err) });
+      }
+    })();
+    // Keep the list's speaker counts current too.
+    void get().refresh();
   },
 }));

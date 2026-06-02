@@ -27,6 +27,7 @@ vi.mock("../ipc/meetings", () => ({
   renameMeeting: vi.fn().mockResolvedValue(undefined),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
   reTranscribe: vi.fn().mockResolvedValue(undefined),
+  rediarize: vi.fn().mockResolvedValue(undefined),
 }));
 
 // The Phase-5 row Summarise action routes through the summary store, which
@@ -171,6 +172,17 @@ describe("MeetingList view (FR-33)", () => {
     });
     await waitFor(() =>
       expect(meetingsIpc.reTranscribe).toHaveBeenCalledWith("meeting-0001"),
+    );
+  });
+
+  it("Re-diarize fires the rediarize seam for the row's meeting (Phase 6)", async () => {
+    await renderList();
+    const buttons = screen.getAllByRole("button", { name: "Re-diarize" });
+    act(() => {
+      fireEvent.click(buttons[1]);
+    });
+    await waitFor(() =>
+      expect(meetingsIpc.rediarize).toHaveBeenCalledWith("meeting-0002"),
     );
   });
 

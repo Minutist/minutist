@@ -15,6 +15,7 @@ import type {
 } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
 import { useModelsStore } from "./models";
+import { withDiarizationEnabled } from "./diarization-settings";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
 
@@ -55,6 +56,12 @@ export type RecordingStore = {
   resume: () => Promise<void>;
   stop: () => Promise<void>;
   setSelectedDevice: (id: string | null) => Promise<void>;
+  /**
+   * Toggle the Phase-6 diarization-enabled setting (off by default), persisting
+   * via `commands.updateSettings` so the choice survives an app restart — the
+   * same round-trip-through-settings pattern as `setSelectedDevice`.
+   */
+  setDiarizationEnabled: (enabled: boolean) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -163,6 +170,28 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
+  setDiarizationEnabled: async (enabled) => {
+    // Persist via `update_settings` so the choice survives an app restart, the
+    // same round-trip-through-settings pattern `setSelectedDevice` uses. The
+    // `diarization_enabled` field is modelled as an augmentation of the
+    // generated `Settings` type until the backend JOIN regenerates the bindings
+    // (see `./diarization-settings`); the JSON round-trip carries it losslessly.
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withDiarizationEnabled(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
   handleEvent: (event) => {
     switch (event.kind) {
       case "state_changed":
@@ -196,7 +225,9 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         break;
       // model_download_progress is handled by the models store via its own
       // handleEvent dispatch (mounted alongside this bridge in event-listener.tsx).
-      // diarization_complete, summary_ready, settings_changed: not handled in Phase 2.
+      // diarization_complete is handled by the meetings store (it re-reads the
+      // affected meeting's transcript). summary_ready is handled by the summary
+      // store. settings_changed: not handled here.
       default:
         break;
     }

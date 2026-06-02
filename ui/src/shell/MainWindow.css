@@ -242,6 +242,34 @@
   border-color: var(--rule-strong);
 }
 
+/* --- Phase 6 diarization-enabled toggle --------------------------------- */
+
+.main-window__diarize-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: var(--font-text);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+  color: var(--stone);
+  cursor: pointer;
+  user-select: none;
+}
+
+.main-window__diarize-toggle input {
+  /* The single oxblood accent drives the native checkbox tick. */
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.main-window__diarize-toggle input:disabled {
+  cursor: default;
+}
+
+.main-window__diarize-toggle:hover {
+  color: var(--ink-soft);
+}
+
 /* --- Chrome strip (model download + errors) ----------------------------- */
 
 .main-window__chrome:not(:empty) {

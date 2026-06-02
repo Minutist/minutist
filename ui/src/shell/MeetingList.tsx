@@ -4,7 +4,8 @@
  * A quiet index of ruled paper rows in the Editorial Ink language: each row is
  * a meeting showing its title (Fraunces), a stone meta line (date · duration ·
  * speaker count), and a transcript excerpt set in reading italic. Hovering a row
- * reveals its actions: open / rename / delete / re-transcribe / re-summarise.
+ * reveals its actions: open / rename / delete / re-transcribe / re-diarize /
+ * summarise.
  *
  * The view consumes `theme.css` tokens only (no hard-coded colour/type) and
  * renders in the DEV shim with sample meetings for visual QA.
@@ -47,6 +48,7 @@ type MeetingRowProps = {
   onRename: (title: string) => void;
   onDelete: () => void;
   onReTranscribe: () => void;
+  onReDiarize: () => void;
   onSummarise: () => void;
 };
 
@@ -139,6 +141,13 @@ function MeetingRow(props: MeetingRowProps) {
         <button
           type="button"
           className="meeting-list__action"
+          onClick={props.onReDiarize}
+        >
+          Re-diarize
+        </button>
+        <button
+          type="button"
+          className="meeting-list__action"
           onClick={props.onSummarise}
         >
           Summarise
@@ -163,6 +172,8 @@ export function MeetingList() {
   const rename = useMeetingsStore((s) => s.rename);
   const remove = useMeetingsStore((s) => s.remove);
   const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
+  // Phase 6: re-run speaker diarization for the row's meeting via the seam.
+  const reDiarize = useMeetingsStore((s) => s.rediarize);
   // Phase 5: the row Summarise action runs the real summariser via the summary
   // store (`summarise_meeting`), superseding the Phase-4 `re_summarise` stub.
   const summarise = useSummaryStore((s) => s.summarise);
@@ -196,6 +207,7 @@ export function MeetingList() {
               onRename={(title) => void rename(meeting.id, title)}
               onDelete={() => void remove(meeting.id)}
               onReTranscribe={() => void reTranscribe(meeting.id)}
+              onReDiarize={() => void reDiarize(meeting.id)}
               onSummarise={() => void summarise(meeting.id)}
             />
           ))}

@@ -971,6 +971,54 @@ left, transcript right).
   the wire as an opaque markdown `String`; `summarise_meeting` reuses
   `AppEvent::SummaryReady` (no new event).
 
+**Phase 6 additions (Stream S4 — diarization overlay + re-diarize + toggle).**
+
+- **Speaker chip (`ui/src/transcript/TranscriptPane.tsx` + `.css`).** Each
+  transcript row renders a quiet "Speaker {id}" chip before its text when the
+  segment carries a `speaker_id` (the diarizer's first-seen label `A`/`B`/…,
+  already present on `Segment` in `bindings.ts` — no regen). The chip is hidden
+  entirely when `speaker_id` is `null`/absent (un-diarized). Editorial Ink:
+  `--accent-tint` background, `--rule` hairline, `--stone` ink — tokens only.
+- **`diarization_complete` re-read (`ui/src/state/meetings.ts`).** The meetings
+  store gains a `handleEvent` (dispatched alongside the recording / models /
+  summary stores from `useAppEventBridge`) that, on
+  `AppEvent::DiarizationComplete { meeting_id, speaker_count }`, re-reads **that
+  meeting's** transcript via `open_meeting` scoped to the **event's**
+  `meeting_id` (NOT the live recording store) when it is the open meeting, so
+  the restored `openMeetingState.transcript` (the source the transcript pane
+  reads for a saved meeting, U1) reflects the new speaker tags; for a
+  non-open meeting it refreshes only the list so the row's speaker count
+  updates. The recording store does **not** handle this event.
+- **Diarization-enabled toggle (`ui/src/state/recording.ts` +
+  `ui/src/state/diarization-settings.ts` + `MainWindow.tsx`).** A header
+  checkbox ("Diarize on stop", off by default) round-trips the
+  `diarization_enabled` setting through `commands.updateSettings`, the same
+  round-trip-through-settings pattern as the device selection. The field is
+  owned by the `settings` crate; until the backend JOIN (Stream S5) regenerates
+  the `Settings` type in `bindings.ts`, `diarization-settings.ts` models it as
+  an optional augmentation of the generated `Settings` and reads/writes it as an
+  extra JSON property the round-trip carries losslessly (it collapses into the
+  canonical shape once the field lands). It gates the orchestrator's on-stop
+  diarization pass; re-diarize is independent of it.
+- **Re-diarize action + IPC seam (`ui/src/ipc/meetings.ts::rediarize` +
+  `MeetingList.tsx` row action + `MainWindow.tsx` open-meeting workspace menu).**
+  `rediarize(meeting_id)` wraps the **not-yet-generated** `rediarize_meeting`
+  command via a new shim-aware `callPendingCommand` raw-`invoke` path in
+  `ui/src/ipc/client.ts` (the same approach the Phase-4 meeting commands and
+  Phase-5 summary commands used before their bindings regenerated — A9: no
+  hand-written bindings stub; Stream S5 regenerates `bindings.ts` and folds it
+  into `callCommand`). The DEV shim (`dev-shim.ts`) supplies sample
+  speaker-tagged transcript segments, a `devPendingCommands` `rediarize_meeting`
+  handler, and a `diarization_complete` fan-out so the chips and re-read render
+  under `vite dev`. Tests mock the `../ipc/meetings` seam. **Assumed
+  `rediarize_meeting` signature Stream S5 MUST match:** snake-case command
+  `rediarize_meeting(meeting_id: MeetingId) -> ()` (camelCase `rediarizeMeeting`
+  on the generated surface); decodes the meeting's pause-INCLUDING PCM, runs the
+  `SherpaDiarizer` over the stored segments, rewrites `transcript.json` with the
+  overlaid `speaker_id`s, refreshes the index row's `speaker_count`, emits
+  `AppEvent::DiarizationComplete { meeting_id, speaker_count }`, and (like
+  `re_transcribe`) refuses unless the recorder is `Idle`.
+
 ### Design system — "Editorial Ink" (light theme)
 
 A warm-paper, document-centric **light** theme applied across the webview.

@@ -3,6 +3,7 @@ import { listenAppEvents } from "../ipc/client";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useSummaryStore } from "../state/summary";
+import { useMeetingsStore } from "../state/meetings";
 
 /**
  * Mount the global Tauri event bridge exactly once.
@@ -19,6 +20,7 @@ export function useAppEventBridge(): void {
   const handleRecordingEvent = useRecordingStore((s) => s.handleEvent);
   const handleModelsEvent = useModelsStore((s) => s.handleEvent);
   const handleSummaryEvent = useSummaryStore((s) => s.handleEvent);
+  const handleMeetingsEvent = useMeetingsStore((s) => s.handleEvent);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -27,6 +29,7 @@ export function useAppEventBridge(): void {
       handleRecordingEvent(event);
       handleModelsEvent(event);
       handleSummaryEvent(event);
+      handleMeetingsEvent(event);
     })
       .then((fn) => {
         unlisten = fn;
@@ -40,5 +43,10 @@ export function useAppEventBridge(): void {
     };
   // The handleEvent functions are stable Zustand store references; the dep
   // array is intentionally exhaustive.
-  }, [handleRecordingEvent, handleModelsEvent, handleSummaryEvent]);
+  }, [
+    handleRecordingEvent,
+    handleModelsEvent,
+    handleSummaryEvent,
+    handleMeetingsEvent,
+  ]);
 }

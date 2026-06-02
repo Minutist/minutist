@@ -55,6 +55,7 @@ vi.mock("../ipc/meetings", () => ({
   renameMeeting: vi.fn(),
   deleteMeeting: vi.fn(),
   reTranscribe: vi.fn(),
+  rediarize: vi.fn(),
 }));
 
 import { MainWindow } from "../shell/MainWindow";

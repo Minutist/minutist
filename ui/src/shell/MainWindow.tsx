@@ -3,6 +3,7 @@ import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
+import { readDiarizationEnabled } from "../state/diarization-settings";
 import { DevicePicker } from "./DevicePicker";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
@@ -37,9 +38,16 @@ export function MainWindow() {
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const lastError = useRecordingStore((s) => s.lastError);
   const recordingState = useRecordingStore((s) => s.state);
+  const settings = useRecordingStore((s) => s.settings);
+  const setDiarizationEnabled = useRecordingStore(
+    (s) => s.setDiarizationEnabled,
+  );
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
+  const reDiarize = useMeetingsStore((s) => s.rediarize);
+
+  const diarizationEnabled = readDiarizationEnabled(settings);
 
   // The meeting-list is the entry surface (FR-33): shown when no meeting is
   // open and nothing is being recorded. Opening a meeting, or starting a
@@ -112,11 +120,43 @@ export function MainWindow() {
               Meetings
             </button>
           )}
+          {/*
+            Phase 6 — re-diarize the OPEN saved meeting from its workspace menu.
+            Shown only when a saved meeting is open and nothing is recording (a
+            re-diarize must not contend with the live pipeline; the backend
+            refuses unless `Idle`). The `diarization_complete` event re-reads the
+            open meeting's transcript so the speaker chips appear.
+          */}
+          {openMeetingId !== null && recordingState.kind === "idle" && (
+            <button
+              type="button"
+              className="main-window__toggle-transcript"
+              onClick={() => void reDiarize(openMeetingId)}
+            >
+              Re-diarize
+            </button>
+          )}
           <MeetingControls />
           <div className="main-window__meter" aria-label="Audio level">
             <AudioMeter />
           </div>
           <DevicePicker />
+          {/*
+            Phase 6 — diarization-enabled toggle (off by default). When on, the
+            orchestrator runs speaker diarization on stop. Persists via
+            `update_settings` so the choice survives an app restart. Disabled
+            until the settings snapshot has loaded so the round-trip never
+            clobbers settings with a partial object.
+          */}
+          <label className="main-window__diarize-toggle">
+            <input
+              type="checkbox"
+              checked={diarizationEnabled}
+              disabled={settings === null}
+              onChange={(e) => void setDiarizationEnabled(e.target.checked)}
+            />
+            <span>Diarize on stop</span>
+          </label>
           {inWorkspace && (
             <button
               type="button"

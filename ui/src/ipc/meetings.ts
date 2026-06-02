@@ -21,7 +21,7 @@
  * shapes) so call sites and the DEV shim keep importing them from this seam with
  * no change.
  */
-import { commands, unwrap } from "./client";
+import { commands, unwrap, callPendingCommand } from "./client";
 import type { MeetingId } from "./bindings";
 import type { MeetingListEntry, MeetingState } from "./bindings";
 
@@ -58,4 +58,39 @@ export async function deleteMeeting(meetingId: MeetingId): Promise<void> {
 /** Re-run transcription for a meeting (FR-33 action). */
 export async function reTranscribe(meetingId: MeetingId): Promise<void> {
   unwrap(await commands.reTranscribe(meetingId));
+}
+
+/**
+ * Re-run speaker diarization for a meeting (Phase 6).
+ *
+ * The backend command (`rediarize_meeting`) is NOT yet on the generated
+ * `commands` surface — the diarizer/orchestrator/ipc-bridge JOIN (Stream S5)
+ * adds it and regenerates `bindings.ts`. Until then this routes through the
+ * shim-aware `callPendingCommand` raw-`invoke` path (the same approach the
+ * Phase-4 meeting commands and the Phase-5 summary commands used before their
+ * bindings regenerated — A9: do NOT hand-write a bindings stub). Once
+ * regenerated it folds into `commands.rediarizeMeeting` like every other
+ * command.
+ *
+ * Tests mock THIS module (per `architecture/cross-cutting.md` — Automated
+ * testing policy); they do not fake the generated bindings file.
+ *
+ * Assumed signature the JOIN (Stream S5) MUST match:
+ *
+ *   `rediarize_meeting(meeting_id: MeetingId) -> ()`
+ *
+ *   Snake-case command name `rediarize_meeting`; tauri-specta generates the
+ *   camelCase `rediarizeMeeting` method. It decodes the meeting's
+ *   pause-INCLUDING PCM (`persistence::reader::read_audio_pcm`), runs the
+ *   `SherpaDiarizer` over the stored transcript segments (resolving both model
+ *   dirs via `model-registry`), rewrites `transcript.json`
+ *   (`persistence::write_transcript`) with the overlaid `speaker_id`s, refreshes
+ *   the index row's `speaker_count`, and emits
+ *   `AppEvent::DiarizationComplete { meeting_id, speaker_count }` on the shared
+ *   bus. Long-running (sherpa inference on a `spawn_blocking` task); resolves
+ *   once the run is dispatched/complete. Like `re_transcribe`, it refuses unless
+ *   the recorder is `Idle`.
+ */
+export async function rediarize(meetingId: MeetingId): Promise<void> {
+  unwrap(await callPendingCommand<null>("rediarize_meeting", [meetingId]));
 }

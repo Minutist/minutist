@@ -69,44 +69,63 @@ const DEV_SETTINGS: Settings = {
   data_directory: null,
   start_hidden: false,
   autosave_interval_secs: 5,
-};
+  // Phase 6 diarization toggle. Production default is OFF; the dev shim seeds
+  // it ON so the toggle reads as checked under `vite dev` for visual QA.
+  // Modelled as an extra property on the round-tripped settings object until
+  // `settings.diarization_enabled` lands in the generated `Settings` type
+  // (Stream S5 regenerates the bindings); the JSON round-trip carries it
+  // losslessly. See `../state/diarization-settings`.
+  diarization_enabled: true,
+} as Settings & { diarization_enabled: boolean };
 
-/** Recording-clock offsets (ms, pause-excluding) for the seeded transcript. */
+/**
+ * Recording-clock offsets (ms, pause-excluding) for the seeded transcript.
+ *
+ * Carries `speaker_id`s (first-seen-order labels `A`/`B`, per the diarizer's
+ * normalisation) so the transcript pane's per-row "Speaker {id}" chips render
+ * under `vite dev` for visual QA of the Phase-6 diarization overlay.
+ */
 const DEV_TRANSCRIPT: Segment[] = [
   {
     start_ms: 4_200,
     end_ms: 9_800,
     text: "Right, let's get going — thanks everyone for making the time today.",
+    speaker_id: "A",
     words: [],
   },
   {
     start_ms: 12_400,
     end_ms: 21_300,
     text: "First item is the launch checklist. We're tracking three open risks against the date.",
+    speaker_id: "A",
     words: [],
   },
   {
     start_ms: 24_100,
     end_ms: 33_900,
     text: "The big one is the offline model download — first-run experience needs to feel deliberate, not broken.",
+    speaker_id: "B",
     words: [],
   },
   {
     start_ms: 38_600,
     end_ms: 47_200,
     text: "Agreed. I'll own the progress affordance and the retry path. Should land this week.",
+    speaker_id: "A",
     words: [],
   },
   {
     start_ms: 51_000,
     end_ms: 61_700,
     text: "Second, the transcript and notes need to read as one document, not two competing panes.",
+    speaker_id: "B",
     words: [],
   },
   {
     start_ms: 64_300,
     end_ms: 74_100,
     text: "That's the editorial direction — warm paper, one ink accent, marginal timestamps. Sign-off pending.",
+    speaker_id: "B",
     words: [],
   },
 ];
@@ -389,6 +408,40 @@ export const devCommands = {
 };
 
 /**
+ * DEV-only handlers for commands not yet on the generated `commands` surface
+ * (Phase 6 `rediarize_meeting`), keyed by their snake_case Tauri command name.
+ * {@link callPendingCommand} delegates here under the DEV shim so the action
+ * works (and fans out a `diarization_complete` event) under `vite dev`.
+ */
+export const devPendingCommands: Record<
+  string,
+  (...args: unknown[]) => Promise<Result<unknown, IpcError>>
+> = {
+  // `rediarize_meeting(meeting_id) -> ()`: assign speakers to the meeting's
+  // segments, then notify the live event stream so the meetings store re-reads
+  // that meeting's transcript (the real backend emits
+  // `AppEvent::DiarizationComplete`).
+  async rediarize_meeting(...args: unknown[]): Promise<Result<null, IpcError>> {
+    const meetingId = args[0] as MeetingId;
+    devDiarizationListeners.forEach((cb) =>
+      cb({
+        kind: "diarization_complete",
+        meeting_id: meetingId,
+        speaker_count: 2,
+      }),
+    );
+    return ok(null);
+  },
+};
+
+/**
+ * DEV-only `diarization_complete` fan-out so the dev shim's `rediarize_meeting`
+ * can notify the live event stream started by {@link startDevEventStream}. The
+ * real backend emits `AppEvent::DiarizationComplete`; this mirrors it.
+ */
+const devDiarizationListeners = new Set<(event: AppEvent) => void>();
+
+/**
  * DEV-only `summary_ready` fan-out so the dev shim's `summariseMeeting` can
  * notify the live event stream started by {@link startDevEventStream}. The
  * real backend emits `AppEvent::SummaryReady`; this mirrors it in the browser.
@@ -416,6 +469,9 @@ export function startDevEventStream(
   // Forward dev `summary_ready` notifications (fired by the shim's
   // `summariseMeeting`) into this event stream so the summary store re-reads.
   devSummaryReadyListeners.add(emit);
+  // Likewise forward dev `diarization_complete` notifications (fired by the
+  // shim's `rediarize_meeting`) so the meetings store re-reads the transcript.
+  devDiarizationListeners.add(emit);
 
   // Establish the recording state on the next tick (after stores subscribe).
   timers.push(
@@ -450,6 +506,7 @@ export function startDevEventStream(
   return () => {
     cancelled = true;
     devSummaryReadyListeners.delete(emit);
+    devDiarizationListeners.delete(emit);
     timers.forEach(clearTimeout);
     clearInterval(tick);
   };

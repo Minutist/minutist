@@ -461,6 +461,15 @@ SDK installed. Feature names match the backend they enable:
   there is no Vulkan/Metal diarization backend, so on those platforms the
   diarizer stays on the ONNX Runtime CPU EP.
 
+Enabling a feature also offloads work to the device: `asr-runtime` and
+`summariser` set `n_gpu_layers` (via a cfg-gated `gpu_layers()`/
+`default_n_gpu_layers()` → `u32::MAX`, clamped to `i32::MAX` = "all layers")
+ONLY when a GPU feature is compiled in; the default build passes `0` (CPU). The
+mtmd `use_gpu` flag follows the same cfg. llama.cpp falls back to CPU at runtime
+when no device is present, so a GPU-feature build is still safe on a CPU-only
+machine. (Before this, the features compiled a GPU backend but the code
+hard-coded `n_gpu_layers(0)`, so they offloaded nothing.)
+
 The features fan out through a single chain so the app binary is the only place
 a backend is chosen: `meeting-app` (src-tauri) → `ipc-bridge` → {`summariser`,
 `orchestrator` → {`asr-runtime`, `diarizer`}}. `ipc-bridge` is the fan-out point

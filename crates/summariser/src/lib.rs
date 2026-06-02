@@ -106,6 +106,24 @@ fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
     })
 }
 
+/// Number of model layers to offload to the GPU, selected at build time.
+///
+/// CPU-only by default (`0`); when any GPU backend feature (`vulkan` / `metal`
+/// / `cuda` / `rocm`) is compiled in, offload all layers. `u32::MAX` is clamped
+/// to `i32::MAX` by `with_n_gpu_layers`, which llama.cpp interprets as "every
+/// layer". The features only forward to `llama-cpp-2`; the layer count is the
+/// summariser's responsibility (mirrors `asr-runtime`).
+const fn gpu_layers() -> u32 {
+    #[cfg(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm"))]
+    {
+        u32::MAX
+    }
+    #[cfg(not(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm")))]
+    {
+        0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LlamaSummariser
 // ---------------------------------------------------------------------------
@@ -143,9 +161,12 @@ impl LlamaSummariser {
             .into());
         }
 
-        // Text-only model: no GPU layers offloaded by default (CPU-first, as
-        // with `asr-runtime`).
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
+        // GPU offload is selected at build time (Phase 7, see
+        // `cross-cutting.md` "GPU portability"): when a backend feature is
+        // compiled in, offload all layers; otherwise stay CPU-only. `u32::MAX`
+        // clamps to `i32::MAX` inside `with_n_gpu_layers`, which llama.cpp reads
+        // as "offload every layer".
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers());
         let model =
             LlamaModel::load_from_file(backend, &model_path, &model_params).map_err(|e| {
                 Error::ModelLoad {
@@ -250,14 +271,12 @@ impl LlamaSummariser {
             return Err(Error::Inference("templated prompt tokenised to zero tokens".to_string()));
         }
 
-        // The prompt plus at least one generated token must fit the context.
-        if tokens.len() >= self.config.n_ctx as usize {
-            return Err(Error::ContextOverflow(format!(
-                "prompt is {} tokens but context window is {}",
-                tokens.len(),
-                self.config.n_ctx
-            )));
-        }
+        // The prompt AND the tokens it will generate must both fit the context
+        // window: generation grows the KV cache by one slot per token, so a
+        // prompt that fits on its own can still overflow mid-generation. Reserve
+        // `max_tokens` of headroom up front rather than aborting partway and
+        // losing the summary.
+        check_context_budget(tokens.len(), self.config.max_tokens, self.config.n_ctx)?;
 
         // --- Chunked prefill ---
         let plan = plan_prefill(tokens.len(), self.config.n_batch);
@@ -421,6 +440,37 @@ pub fn plan_prefill(prompt_len: usize, n_batch: u32) -> PrefillPlan {
 }
 
 // ---------------------------------------------------------------------------
+// Context-budget guard (pure, unit-tested)
+// ---------------------------------------------------------------------------
+
+/// Verify the prompt plus its generation headroom fit the context window.
+///
+/// The KV cache holds the prompt AND every generated token, so the budget is
+/// `prompt_tokens + max_tokens`. Checking only `prompt_tokens` (as a naïve
+/// guard does) lets a prompt in `(n_ctx - max_tokens, n_ctx)` pass, then
+/// overflow the KV cache part-way through generation — losing the whole
+/// summary. Requiring `prompt_tokens + max_tokens <= n_ctx` reserves room for
+/// the full generation up front.
+///
+/// Pure (no llama.cpp state) so the boundary is unit-tested without a model.
+/// The error carries the three quantities so the caller can see why it didn't
+/// fit. `usize` addition is saturating to stay total even with absurd inputs.
+fn check_context_budget(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    n_ctx: u32,
+) -> Result<(), Error> {
+    let required = prompt_tokens.saturating_add(max_tokens);
+    if required > n_ctx as usize {
+        return Err(Error::ContextOverflow(format!(
+            "prompt is {prompt_tokens} tokens and generation reserves {max_tokens} more \
+             ({required} total) but the context window is only {n_ctx}"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -516,6 +566,87 @@ mod tests {
             assert_eq!(chunk.len, 1);
         }
         assert!(plan.chunks.last().unwrap().logits_at_last);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context-budget guard — pure, always runs, no model
+    // -----------------------------------------------------------------------
+
+    /// Regression for the headroom bug: a prompt that fits the context window
+    /// on its own (`prompt < n_ctx`) but leaves no room for generation
+    /// (`prompt + max_tokens > n_ctx`) MUST be rejected. The old guard only
+    /// compared `prompt >= n_ctx`, so this case slipped through and overflowed
+    /// the KV cache mid-generation.
+    #[test]
+    fn context_budget_rejects_prompt_that_starves_generation() {
+        // n_ctx = 1000, max_tokens = 100. A 950-token prompt is < n_ctx (passes
+        // the old guard) but 950 + 100 = 1050 > 1000, so it must now fail.
+        let n_ctx = 1_000;
+        let max_tokens = 100;
+        let prompt_tokens = 950;
+        assert!(prompt_tokens < n_ctx as usize, "precondition: old guard would pass");
+
+        let result = check_context_budget(prompt_tokens, max_tokens, n_ctx);
+        let err = result.expect_err("prompt that starves generation must be rejected");
+        match err {
+            Error::ContextOverflow(msg) => {
+                assert!(msg.contains("950"), "error must report the prompt size: {msg}");
+                assert!(msg.contains("100"), "error must report the reserved headroom: {msg}");
+                assert!(msg.contains("1000"), "error must report the context window: {msg}");
+            }
+            other => panic!("expected ContextOverflow, got {other:?}"),
+        }
+    }
+
+    /// The exact boundary: `prompt + max_tokens == n_ctx` fits (the KV cache
+    /// holds exactly the prompt plus the full generation).
+    #[test]
+    fn context_budget_accepts_exact_fit() {
+        assert!(check_context_budget(900, 100, 1_000).is_ok());
+    }
+
+    /// One token over the boundary fails.
+    #[test]
+    fn context_budget_rejects_one_token_over() {
+        assert!(check_context_budget(901, 100, 1_000).is_err());
+    }
+
+    /// A comfortable prompt with headroom to spare passes.
+    #[test]
+    fn context_budget_accepts_prompt_with_headroom() {
+        assert!(check_context_budget(500, 100, 1_000).is_ok());
+    }
+
+    /// Saturating addition keeps the guard total: an absurd `max_tokens` near
+    /// `usize::MAX` must reject (not panic on overflow) rather than wrap to a
+    /// small value that spuriously passes.
+    #[test]
+    fn context_budget_saturates_on_overflow() {
+        assert!(check_context_budget(usize::MAX, usize::MAX, u32::MAX).is_err());
+    }
+
+    /// The guard maps to `AppError::InvalidInput` (via `Error::ContextOverflow`)
+    /// so the caller surfaces it as caller-input, never a panic.
+    #[test]
+    fn context_budget_error_maps_to_invalid_input() {
+        use meeting_app_common::AppError;
+        let err = check_context_budget(950, 100, 1_000).unwrap_err();
+        let app: AppError = err.into();
+        assert!(matches!(app, AppError::InvalidInput { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // GPU-offload selection — cfg-gated, pure
+    // -----------------------------------------------------------------------
+
+    /// The default (no GPU feature) build stays CPU-only; a GPU-feature build
+    /// offloads all layers (`u32::MAX` → `i32::MAX` inside `with_n_gpu_layers`).
+    #[test]
+    fn gpu_layers_matches_compiled_backend() {
+        #[cfg(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm"))]
+        assert_eq!(gpu_layers(), u32::MAX, "a GPU feature must offload all layers");
+        #[cfg(not(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm")))]
+        assert_eq!(gpu_layers(), 0, "the default build must stay CPU-only");
     }
 
     // -----------------------------------------------------------------------

@@ -60,6 +60,9 @@ pub enum Error {
 
     #[error("output parse failed: {0}")]
     OutputParse(String),
+
+    #[error("invalid ASR input: {0}")]
+    InvalidInput(String),
 }
 
 impl From<Error> for AppError {
@@ -83,8 +86,36 @@ impl From<Error> for AppError {
                     context: ctx,
                 }
             }
+            Error::InvalidInput(ctx) => AppError::InvalidInput { context: ctx },
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Input contract
+// ---------------------------------------------------------------------------
+
+/// Sample rate the mtmd audio encoder is fixed at.
+///
+/// Qwen3-ASR's mtmd encoder resamples nothing: it treats the incoming `f32`
+/// samples as 16 kHz mono. The whole pipeline (`audio-capture` → VAD → ASR) is
+/// standardised on 16 kHz mono, so a different rate is a wiring bug that would
+/// otherwise be transcribed as garbage rather than surfaced as an error.
+const REQUIRED_SAMPLE_RATE: u32 = 16_000;
+
+/// Reject any chunk not at [`REQUIRED_SAMPLE_RATE`].
+///
+/// A pure pre-engine check (no model required), factored out so the default test
+/// suite covers the guard without loading the GGUF. Mirrors the diarizer's
+/// `require_supported_sample_rate`.
+fn require_supported_sample_rate(sample_rate: u32) -> AppResult<()> {
+    if sample_rate != REQUIRED_SAMPLE_RATE {
+        return Err(Error::InvalidInput(format!(
+            "asr-runtime requires {REQUIRED_SAMPLE_RATE} Hz mono audio; got {sample_rate} Hz"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +132,42 @@ impl From<Error> for AppError {
 fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
     meeting_app_common::llama_backend::shared_llama_backend()
         .map_err(|e| Error::BackendInit(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// GPU offload policy
+// ---------------------------------------------------------------------------
+
+/// Number of model layers to offload to the GPU, decided at compile time.
+///
+/// The crate's `vulkan`/`metal`/`cuda`/`rocm` Cargo features each forward to the
+/// matching `llama-cpp-2` backend feature, compiling a GPU-capable llama.cpp. If
+/// the build selects one of those backends but the runtime still loads the model
+/// with `n_gpu_layers = 0`, every layer runs on the CPU and the compiled backend
+/// offloads nothing — the GPU feature is dead weight.
+///
+/// - **Any GPU feature enabled** → `u32::MAX`. `LlamaModelParams::with_n_gpu_layers`
+///   clamps an out-of-`i32` value to `i32::MAX`, which llama.cpp interprets as
+///   "offload all layers". llama.cpp falls back to CPU at runtime when no device
+///   is present, so this is safe on machines without a GPU.
+/// - **No GPU feature (default build)** → `0`. CPU-only; no GPU SDK required.
+const fn default_n_gpu_layers() -> u32 {
+    #[cfg(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm"))]
+    {
+        u32::MAX
+    }
+    #[cfg(not(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm")))]
+    {
+        0
+    }
+}
+
+/// Whether the mtmd encoder should use the GPU, decided at compile time.
+///
+/// Mirrors [`default_n_gpu_layers`]: `true` when any GPU feature is enabled (so
+/// the audio encoder runs on the same device as the model), `false` otherwise.
+const fn default_mtmd_use_gpu() -> bool {
+    cfg!(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm"))
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +246,8 @@ impl AsrRuntime {
             }));
         }
 
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(0);
+        let model_params =
+            LlamaModelParams::default().with_n_gpu_layers(default_n_gpu_layers());
         let model = LlamaModel::load_from_file(backend, model_path, &model_params)
             .map_err(|e| {
                 AppError::from(Error::ModelLoad {
@@ -202,7 +270,7 @@ impl AsrRuntime {
             }))?;
 
         let mtmd_params = MtmdContextParams {
-            use_gpu: false,
+            use_gpu: default_mtmd_use_gpu(),
             print_timings: false,
             n_threads: config.threads,
             media_marker: CString::new(mtmd_default_marker())
@@ -249,6 +317,11 @@ impl AsrBackend for AsrRuntime {
     /// segment carries the chunk's `start_ms` and `end_ms`; `speaker_id` is
     /// left `None` (diarization is a separate post-hoc pass).
     ///
+    /// # Errors
+    ///
+    /// Returns `AppError::InvalidInput` when `chunk.sample_rate` is not 16 kHz:
+    /// the mtmd encoder resamples nothing, so any other rate produces garbage.
+    ///
     /// # Stop conditions
     ///
     /// - `model.is_eog_token(token)` → stop immediately.
@@ -258,6 +331,10 @@ impl AsrBackend for AsrRuntime {
     ///   is against the complete string, not per-token, so the tag is caught
     ///   even when it spans a token boundary.
     fn transcribe_chunk(&mut self, chunk: &AudioChunk) -> AppResult<Vec<Segment>> {
+        // The mtmd encoder is fixed at 16 kHz and resamples nothing; a mismatch
+        // would be silently transcribed as garbage, so reject it up front.
+        require_supported_sample_rate(chunk.sample_rate)?;
+
         let result = transcribe_inner(
             &self.model,
             &self.mtmd_ctx,
@@ -502,6 +579,41 @@ mod tests {
     fn config_default_max_tokens_is_256() {
         let cfg = AsrRuntimeConfig::default();
         assert_eq!(cfg.max_tokens, 256);
+    }
+
+    #[test]
+    fn require_supported_sample_rate_accepts_16khz_rejects_others() {
+        // 16 kHz is accepted.
+        require_supported_sample_rate(16_000).expect("16 kHz must be accepted");
+
+        // Anything else is rejected as InvalidInput, model-free.
+        for bad in [8_000u32, 22_050, 44_100, 48_000, 0] {
+            let err = require_supported_sample_rate(bad)
+                .expect_err("non-16 kHz must be rejected");
+            assert!(
+                matches!(err, AppError::InvalidInput { .. }),
+                "expected InvalidInput for {bad} Hz, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_n_gpu_layers_matches_build_features() {
+        let n = default_n_gpu_layers();
+        if cfg!(any(
+            feature = "vulkan",
+            feature = "metal",
+            feature = "cuda",
+            feature = "rocm"
+        )) {
+            // GPU build: offload all layers (clamped to i32::MAX downstream).
+            assert_eq!(n, u32::MAX, "GPU build must offload all layers");
+            assert!(default_mtmd_use_gpu(), "GPU build must enable mtmd GPU");
+        } else {
+            // Default build: CPU-only.
+            assert_eq!(n, 0, "default build must keep model on CPU");
+            assert!(!default_mtmd_use_gpu(), "default build must disable mtmd GPU");
+        }
     }
 
     /// (no-model, always runs) — loading from a nonexistent path must

@@ -232,6 +232,22 @@ will assert otherwise.
 itself). Stop generation on `model.is_eog_token(token)`, which covers
 both EOS and `<|im_end|>` for Qwen.
 
+**Implementation (Phase 5 Stream S1).** `LlamaSummariser::open(model_path,
+SummariserConfig)` loads the GGUF once (process-wide `LlamaBackend` `OnceLock`
+singleton, mirroring `asr-runtime`) and retains the `LlamaModel`; each
+`summarise` call allocates a fresh `LlamaContext` sized to `config.n_ctx` /
+`config.n_batch`. `SummariserConfig` adds a `threads` field (default
+`(num_cpus / 2).clamp(1, 8)`, matching `asr-runtime`) alongside `n_ctx`
+(32 768), `n_batch` (512), `max_tokens` (2 048). The chunked-prefill split is a
+pure `plan_prefill(prompt_len, n_batch) -> PrefillPlan` function (unit-tested
+without a model): it tiles `[0, prompt_len)` into `≤ n_batch` chunks and marks
+the final chunk's last token as the sole `logits = true` position. Generation
+is greedy with incremental `encoding_rs` detokenisation; a `<think>…</think>`
+block (if a model emits one) is stripped before return. The optional
+`external-ollama` feature adds `OllamaSummariser` (a `reqwest::blocking`
+dispatcher to a local `/api/chat` endpoint); `reqwest` + `serde` are pulled in
+only by that feature.
+
 ### `model-registry`
 **Crate:** `crates/model-registry`
 **Owns:** the on-disk model cache, the model-manifest schema, download

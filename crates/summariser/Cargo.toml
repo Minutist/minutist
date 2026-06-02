@@ -7,10 +7,22 @@ authors.workspace = true
 
 [dependencies]
 meeting-app-common = { path = "../common" }
+llama-cpp-2 = { workspace = true }
+encoding_rs = "0.8"
+num_cpus = "1.16"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+# Optional external-LLM dispatcher dependencies (FR-29), pulled in only by the
+# `external-ollama` feature.
+reqwest = { workspace = true, features = ["blocking", "json"], optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
 [features]
-# Optional external-LLM (Ollama) dispatcher (FR-29); off by default. Stream S1
-# wires the HTTP client (reqwest, optional) behind this feature.
-external-ollama = []
+# Optional external-LLM (Ollama) dispatcher (FR-29); off by default. Routes
+# summarisation to a local Ollama / LM-Studio-compatible chat endpoint instead
+# of loading a GGUF in-process.
+external-ollama = ["dep:reqwest", "dep:serde"]

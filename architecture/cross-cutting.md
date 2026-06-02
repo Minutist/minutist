@@ -108,6 +108,18 @@ model hallucinates into the pad. This is binding on every `AsrBackend`
 caller until upstream issue ggml-org/llama.cpp#20914 lands (multi-phase
 streaming work; not in v1's timeframe).
 
+**Verified still binding (2026-06).** A primary-source investigation
+confirmed #20914 (realtime/streaming ASR) has NOT landed — its Phase-1
+APIs are absent from llama.cpp master (the original monolithic PRs were
+rejected; the issue was reopened 2026-06-01) — and the audio encoder
+window is still a fixed 30 s everywhere. The pinned `llama-cpp-2 =0.1.146`
+already vendors a current llama.cpp (commit `e21cdc11`, build b8783,
+2026-04-13) that includes Qwen3-ASR mtmd audio, so there is no version lag
+to chase. All three sub-rules below (≥25 s shaping, silence preservation,
+`</asr_text>` early-stop) remain mandatory. They can only be revisited
+when #20914 actually merges incremental decode — a future-phase change,
+not v1.
+
 The orchestrator must shape VAD chunks to ≥25 s before invoking
 `AsrBackend::transcribe_chunk`. The default strategy in Phase 2 is
 **batched-VAD**: collect VAD segments into a buffer until the buffer
@@ -178,6 +190,36 @@ chunked-prefill.
 
 `asr-runtime` is not affected: `mtmd_helper_eval_chunks` performs the
 chunking internally for audio-bearing prompts.
+
+## llama.cpp build + version policy
+
+Both `asr-runtime` (mtmd audio) and `summariser` (text) drive llama.cpp
+through `llama-cpp-2` (workspace pin `=0.1.146`, `features = ["mtmd"]`).
+The native library is **built from source** by `llama-cpp-sys-2` from its
+vendored llama.cpp submodule (hence `LIBCLANG_PATH` is required for bindgen
+on every clean build, on every platform) — there is no system-lib link.
+
+- **Pin policy.** `llama-cpp-2`/`-sys-2` are pinned with `=EXACT` and bumped
+  **deliberately**, never floated — the crate does not follow semver
+  meaningfully, so each bump is a separately-verified change. As of 2026-06,
+  `=0.1.146` (published 2026-04-30) is the latest published release and
+  vendors llama.cpp build b8783 (commit `e21cdc11`, 2026-04-13), which
+  already includes the April-2026 audio wave (Qwen3-ASR / Qwen3-Omni,
+  Gemma 4 audio). There is no version lag.
+- **Going past the latest crate requires a fork.** `llama-cpp-sys-2` has no
+  `LLAMA_CPP_SRC`/`PATH` override; to ride a newer llama.cpp than the latest
+  crate you must fork `llama-cpp-rs`, bump the submodule, regenerate bindings,
+  and reconcile FFI drift (it compiles internal `common_chat_*` C++ with no
+  stability contract), wired via `[patch.crates-io]`. Reserve this for a
+  specific load-bearing upstream fix; it is not warranted now.
+- **Bump/fork verification gotchas (Phase 7 + any future bump).** Re-run the
+  gated ASR WER + early-stop tests and the orchestrator pipeline test after
+  any crate/submodule change (canary for binding/model drift). Known traps
+  past b8783: MSVC LTO break (#22186, after commit 6990e2f → set
+  `-DGGML_LTO=OFF` + `-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF`); Vulkan
+  `shaderc ≥ 2025.2` bf16 false-positive (#15344 → pin `shaderc 2024.0`);
+  macOS Metal needs `GGML_METAL_EMBED_LIBRARY=ON` to find `default.metallib`
+  inside the Tauri `.app` bundle.
 
 ## Model lifecycle
 

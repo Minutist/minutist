@@ -71,6 +71,43 @@ struct ChatResponseMessage {
     content: String,
 }
 
+/// Assemble the `/api/chat` endpoint URL from a base URL, tolerating a trailing
+/// slash so `http://host:11434` and `http://host:11434/` both yield the same
+/// endpoint. Pure (no I/O) so the normalisation can be unit-tested.
+fn chat_url(base_url: &str) -> String {
+    format!("{}/api/chat", base_url.trim_end_matches('/'))
+}
+
+/// Build the system + user chat request body. Pure (no I/O) so the serde shape
+/// (roles/content, `stream: false`) can be asserted without a live server.
+fn build_chat_request<'a>(
+    model: &'a str,
+    system_prompt: &'a str,
+    user_content: &'a str,
+) -> ChatRequest<'a> {
+    ChatRequest {
+        model,
+        messages: vec![
+            ChatMessage {
+                role: "system",
+                content: system_prompt,
+            },
+            ChatMessage {
+                role: "user",
+                content: user_content,
+            },
+        ],
+        stream: false,
+    }
+}
+
+/// Map a non-2xx HTTP status to the crate `Error::Inference` carried for the
+/// ollama backend. Pure so the status→error mapping can be unit-tested without
+/// issuing a request.
+fn inference_error_for_status(status: reqwest::StatusCode) -> Error {
+    Error::Inference(format!("ollama returned HTTP {status}"))
+}
+
 impl Summariser for OllamaSummariser {
     fn summarise(
         &self,
@@ -79,22 +116,9 @@ impl Summariser for OllamaSummariser {
         system_prompt: &str,
     ) -> AppResult<String> {
         let user_content = render_user_content(transcript, notes_markdown);
-        let body = ChatRequest {
-            model: &self.model,
-            messages: vec![
-                ChatMessage {
-                    role: "system",
-                    content: system_prompt,
-                },
-                ChatMessage {
-                    role: "user",
-                    content: &user_content,
-                },
-            ],
-            stream: false,
-        };
+        let body = build_chat_request(&self.model, system_prompt, &user_content);
 
-        let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        let url = chat_url(&self.base_url);
         let resp = self
             .client
             .post(&url)
@@ -103,11 +127,7 @@ impl Summariser for OllamaSummariser {
             .map_err(|e| Error::Inference(format!("ollama request: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(Error::Inference(format!(
-                "ollama returned HTTP {}",
-                resp.status()
-            ))
-            .into());
+            return Err(inference_error_for_status(resp.status()).into());
         }
 
         let parsed: ChatResponse = resp
@@ -115,5 +135,83 @@ impl Summariser for OllamaSummariser {
             .map_err(|e| Error::Inference(format!("ollama response decode: {e}")))?;
 
         Ok(strip_think_block(&parsed.message.content))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the pure URL/serde/status-mapping seams (no live server). The only
+// untested line in `summarise` is the `reqwest` `send()` itself.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meeting_app_common::AppError;
+
+    /// A base URL without a trailing slash yields the `/api/chat` endpoint.
+    #[test]
+    fn chat_url_appends_endpoint_without_trailing_slash() {
+        assert_eq!(
+            chat_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434/api/chat"
+        );
+    }
+
+    /// A base URL with a trailing slash is normalised (no doubled slash).
+    #[test]
+    fn chat_url_normalises_trailing_slash() {
+        assert_eq!(
+            chat_url("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434/api/chat"
+        );
+    }
+
+    /// The request body serialises to the expected JSON: model, the two
+    /// system/user messages with roles + content, and `stream: false`.
+    #[test]
+    fn chat_request_serialises_to_expected_json() {
+        let req = build_chat_request("gemma3:4b", "you are an assistant", "the transcript");
+        let value = serde_json::to_value(&req).expect("serialise request");
+
+        let expected = serde_json::json!({
+            "model": "gemma3:4b",
+            "messages": [
+                { "role": "system", "content": "you are an assistant" },
+                { "role": "user", "content": "the transcript" }
+            ],
+            "stream": false
+        });
+        assert_eq!(value, expected);
+    }
+
+    /// A canned `/api/chat` response JSON deserialises to the message content.
+    #[test]
+    fn chat_response_deserialises_message_content() {
+        let json = "{\"message\":{\"role\":\"assistant\",\"content\":\"## Summary\\n\\n- a point\"}}";
+        let parsed: ChatResponse = serde_json::from_str(json).expect("deserialise response");
+        assert_eq!(parsed.message.content, "## Summary\n\n- a point");
+    }
+
+    /// A non-2xx HTTP status maps to `Error::Inference`, which converts to
+    /// `AppError::Inference` carrying the `"summariser"` backend label.
+    #[test]
+    fn non_2xx_status_maps_to_inference_error() {
+        let err = inference_error_for_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        match &err {
+            Error::Inference(context) => assert!(
+                context.contains("500"),
+                "context must carry the status: {context}"
+            ),
+            other => panic!("expected Error::Inference, got {other:?}"),
+        }
+
+        let app: AppError = err.into();
+        match app {
+            AppError::Inference { backend, context } => {
+                assert_eq!(backend, "summariser", "backend label must be set");
+                assert!(context.contains("500"));
+            }
+            other => panic!("expected AppError::Inference, got {other:?}"),
+        }
     }
 }

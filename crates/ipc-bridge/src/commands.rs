@@ -49,7 +49,27 @@ use crate::{error::IpcError, IpcState};
 /// summariser — so a user override is honoured first; this constant is only the
 /// fallback. See `architecture/components.md` — `summariser` "Bundled default
 /// model".
-const DEFAULT_LLM_MODEL_ID: &str = "gemma-4-e4b-it-q4_k_m";
+///
+/// `pub` so the manifest-consistency guard test
+/// (`crates/ipc-bridge/tests/default_model_manifest.rs`) can assert this id
+/// stays a real `kind = Llm` entry in `resources/models.json` — turning a
+/// manifest rename into a failing test rather than a silently-broken default
+/// summarise path.
+pub const DEFAULT_LLM_MODEL_ID: &str = "gemma-4-e4b-it-q4_k_m";
+
+/// Resolve the LLM model id used by [`summarise_meeting`]: the user-selected
+/// `settings.llm_model_id` if set, else the bundled default
+/// [`DEFAULT_LLM_MODEL_ID`].
+///
+/// Extracted (rather than inlined in the command) so the settings-override /
+/// fallback decision is unit-testable without a Tauri runtime or an
+/// orchestrator (a Phase 5 design decision).
+fn resolve_llm_model_id(settings: &Settings) -> ModelId {
+    settings
+        .llm_model_id
+        .clone()
+        .unwrap_or_else(|| ModelId::from(DEFAULT_LLM_MODEL_ID))
+}
 
 // ---------------------------------------------------------------------------
 // Device enumeration
@@ -491,10 +511,7 @@ pub async fn summarise_meeting(
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
     let settings = state.settings.current();
-    let model_id = settings
-        .llm_model_id
-        .clone()
-        .unwrap_or_else(|| ModelId(DEFAULT_LLM_MODEL_ID.to_string()));
+    let model_id = resolve_llm_model_id(&settings);
 
     // Resolve (download if needed) the model directory on the async worker.
     let model_dir = state
@@ -1198,6 +1215,38 @@ mod tests {
 
         let err = find_gguf_weights(dir).expect_err("no text weights → error");
         assert!(matches!(err, AppError::ModelLoad { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // LLM model-id resolution (Phase 5) — the settings-override / bundled
+    // default decision, unit-tested without a Tauri runtime or orchestrator.
+    // -----------------------------------------------------------------------
+
+    /// A set `settings.llm_model_id` resolves to that id (the user override
+    /// wins over the bundled default).
+    #[test]
+    fn resolve_llm_model_id_honours_settings_override() {
+        let settings = Settings {
+            llm_model_id: Some(ModelId::from("granite-4.1-3b-q4_k_m")),
+            ..Settings::default()
+        };
+        assert_eq!(
+            resolve_llm_model_id(&settings),
+            ModelId::from("granite-4.1-3b-q4_k_m")
+        );
+    }
+
+    /// An unset `settings.llm_model_id` falls back to the bundled default.
+    #[test]
+    fn resolve_llm_model_id_falls_back_to_default() {
+        let settings = Settings {
+            llm_model_id: None,
+            ..Settings::default()
+        };
+        assert_eq!(
+            resolve_llm_model_id(&settings),
+            ModelId::from(DEFAULT_LLM_MODEL_ID)
+        );
     }
 
     // -----------------------------------------------------------------------

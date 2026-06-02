@@ -82,6 +82,29 @@ $null = & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -SkipAutomat
 Set-Location $build
 
 # ---------------------------------------------------------------------------
+# summariser external-ollama feature build (FR-29)
+# ---------------------------------------------------------------------------
+# The `external-ollama` dispatcher is off by default, so a plain
+# `cargo test -p summariser` never COMPILES it and its unit tests never run.
+# When testing the summariser, also run the feature build so the ollama
+# URL/serde/status-mapping tests are exercised in the gated suite. These are
+# fast, non-#[ignore]'d, no-live-server tests, so they always run (no
+# `--ignored` / `--test-threads=1` gating needed). Tracked separately so its
+# exit code folds into the final result.
+$ollamaCode = 0
+if ($Package -eq 'summariser') {
+    $ollamaArgs = @('test', '-p', 'summariser', '--features', 'external-ollama')
+    if ($Release) { $ollamaArgs += '--release' }
+    $ollamaArgs += @('--', '--nocapture')
+    Write-Host ("==> cargo " + ($ollamaArgs -join ' '))
+    $ErrorActionPreference = 'Continue'
+    & cargo @ollamaArgs 2>&1
+    $ollamaCode = $LASTEXITCODE
+    $ErrorActionPreference = 'Stop'
+    Write-Host "==> summariser external-ollama test exit $ollamaCode"
+}
+
+# ---------------------------------------------------------------------------
 # Run tests
 # ---------------------------------------------------------------------------
 $cargoArgs = @('test', '-p', $Package)
@@ -106,4 +129,6 @@ $ErrorActionPreference = 'Continue'
 $code = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 Write-Host "==> cargo test exit $code"
+# Fold in the summariser external-ollama feature run: fail if either run failed.
+if ($code -eq 0 -and $ollamaCode -ne 0) { $code = $ollamaCode }
 exit $code

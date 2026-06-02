@@ -248,6 +248,20 @@ block (if a model emits one) is stripped before return. The optional
 dispatcher to a local `/api/chat` endpoint); `reqwest` + `serde` are pulled in
 only by that feature.
 
+**`external-ollama` test coverage + verification.** `OllamaSummariser`'s
+deterministic seams are factored into pure functions — `chat_url` (base-URL
+normalisation, trailing slash tolerant), `build_chat_request` (the
+`ChatRequest` serde shape: system/user roles + `stream: false`), and
+`inference_error_for_status` (non-2xx → `Error::Inference` → `AppError::Inference`
+with the `"summariser"` backend label) — each covered by `#[cfg(test)]` unit
+tests in `ollama.rs` (no live server; the `reqwest` `send()` is the only
+untested line). Because the feature is off by default, `cargo test -p
+summariser` does not compile these; the gated verification harness
+(`scripts/run-tests-windows.ps1`) runs `cargo test -p summariser --features
+external-ollama` as an extra step whenever `-Package summariser`, so the ollama
+tests are exercised (the feature build reports more tests than the default
+build).
+
 ### `model-registry`
 **Crate:** `crates/model-registry`
 **Owns:** the on-disk model cache, the model-manifest schema, download
@@ -617,8 +631,10 @@ commands land, realising the granted `ipc-bridge → summariser` dependency edge
 (`summariser = { path = "../summariser" }` in `ipc-bridge`'s Cargo.toml — already
 in the dependency table above):
 
-- `summarise_meeting(meeting_id) -> ()` — resolves the LLM model id
-  (`settings.llm_model_id`, else the bundled default `gemma-4-e4b-it-q4_k_m`),
+- `summarise_meeting(meeting_id) -> ()` — resolves the LLM model id via the
+  `resolve_llm_model_id(&Settings) -> ModelId` seam (`settings.llm_model_id`,
+  else the bundled default `gemma-4-e4b-it-q4_k_m`, exposed as the `pub const
+  commands::DEFAULT_LLM_MODEL_ID`),
   resolves the model **directory** via `Orchestrator::ensure_model_path` (so the
   `model-registry` edge stays in the orchestrator — there is **no**
   `orchestrator → summariser` edge), locates the single `.gguf` in that dir
@@ -645,7 +661,16 @@ is shared. The summary crosses the wire as an opaque markdown `String`;
 `summarise_meeting_inner(&dyn Summariser, …)` seam lets the default test suite
 exercise the read → summarise → write → event wiring with a `StubSummariser`,
 without a model or Tauri runtime (mirroring the orchestrator's re_transcribe
-stub-backend seam).
+stub-backend seam). The `resolve_llm_model_id` seam is covered by unit tests for
+both branches (settings override, default fallback). A manifest-consistency
+guard test (`tests/default_model_manifest.rs`) parses `resources/models.json`
+and asserts `DEFAULT_LLM_MODEL_ID` stays a `kind = Llm` entry, so a manifest
+rename fails a test rather than silently breaking the default summarise path.
+That test uses `model-registry` as a **dev-dependency** only (it lives in
+`tests/`, touches no `src`): `ipc-bridge` still resolves models exclusively
+through `Orchestrator` at runtime, so there is no production `model-registry`
+edge in the dependency table above (mirroring `orchestrator`'s test-only
+dev-dependencies).
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name

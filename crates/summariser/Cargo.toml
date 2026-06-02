@@ -20,6 +20,11 @@ serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# Test-only: the `external-ollama` ollama.rs unit tests assert the ChatRequest
+# serde shape / deserialise a canned ChatResponse. `serde_json` is not a
+# production dependency (the feature uses `reqwest`'s `.json()` helper, which
+# pulls its own serde_json transitively); declaring it here keeps it test-only.
+serde_json = { workspace = true }
 
 [features]
 # Optional external-LLM (Ollama) dispatcher (FR-29); off by default. Routes

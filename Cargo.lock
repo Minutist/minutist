@@ -2100,6 +2100,7 @@ name = "ipc-bridge"
 version = "0.0.0"
 dependencies = [
  "meeting-app-common",
+ "model-registry",
  "orchestrator",
  "persistence",
  "serde",
@@ -4535,6 +4536,7 @@ dependencies = [
  "num_cpus",
  "reqwest 0.12.28",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

@@ -361,10 +361,9 @@ export const devCommands = {
   async reTranscribe(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
     return ok(null);
   },
-  async reSummarise(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
-    return ok(null);
-  },
   // --- Phase 5 summary surface (FR-30) ------------------------------------
+  // (`re_summarise` was removed in Phase 5; the row Summarise action uses
+  // `summarise_meeting` below.)
   async summariseMeeting(meetingId: MeetingId): Promise<Result<null, IpcError>> {
     // Seed a summary for this meeting so a follow-up `getSummary` returns
     // content, and notify the live event stream so the store re-reads it (the

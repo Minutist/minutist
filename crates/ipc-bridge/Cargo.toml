@@ -12,6 +12,7 @@ authors.workspace = true
 meeting-app-common = { path = "../common", features = ["specta"] }
 orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }
+summariser = { path = "../summariser" }
 settings = { path = "../settings", features = ["specta"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

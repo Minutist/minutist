@@ -29,16 +29,27 @@
 use std::path::Path;
 
 use meeting_app_common::{
-    AppError, AudioDevice, MeetingId, MeetingListEntry, MeetingMeta, MeetingState, ModelId,
-    ModelStatus, RecordingState,
+    AppError, AppEvent, AudioDevice, MeetingId, MeetingListEntry, MeetingMeta, MeetingState,
+    ModelId, ModelStatus, RecordingState, Summariser,
 };
 use persistence::{meeting_ops, NotesStore};
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use specta::Type;
+use summariser::{LlamaSummariser, SummariserConfig};
 use tauri::State;
+use tokio::sync::broadcast;
 
 use crate::{error::IpcError, IpcState};
+
+/// The bundled default LLM model id used when `settings.llm_model_id` is unset.
+///
+/// Matches the `gemma-4-e4b-it-q4_k_m` entry in `resources/models.json`
+/// (`kind = "llm"`). The model is settings-selected — never hard-coded into the
+/// summariser — so a user override is honoured first; this constant is only the
+/// fallback. See `architecture/components.md` — `summariser` "Bundled default
+/// model".
+const DEFAULT_LLM_MODEL_ID: &str = "gemma-4-e4b-it-q4_k_m";
 
 // ---------------------------------------------------------------------------
 // Device enumeration
@@ -447,26 +458,243 @@ pub async fn re_transcribe(
         .map_err(IpcError::from)
 }
 
-/// Re-run summarisation for a meeting (FR-33 action) — **Phase 5 stub**.
+// ---------------------------------------------------------------------------
+// Summary (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// Run summarisation for a meeting (FR-30): produce `summary.md` and emit
+/// `AppEvent::SummaryReady`.
 ///
-/// The `summariser` crate (Phase 5) produces `summary.md` and emits
-/// `AppEvent::SummaryReady`. Until then this command returns
-/// `AppError::Unsupported` so the command surface + generated binding exist for
-/// Stream B's meeting-list action without a backing implementation.
+/// Pipeline:
+/// 1. Resolve the LLM model id — `settings.llm_model_id` if set, else the
+///    bundled default [`DEFAULT_LLM_MODEL_ID`].
+/// 2. Resolve the model **directory** via `Orchestrator::ensure_model_path`
+///    (downloads + verifies when absent). This keeps the `model-registry` edge
+///    in the orchestrator — there is **no** `orchestrator → summariser` edge;
+///    the summariser is loaded here, in `ipc-bridge` (the granted
+///    `ipc-bridge → summariser` edge).
+/// 3. Open a [`LlamaSummariser`] over the single `.gguf` in that directory
+///    (skipping any `mmproj-*`), read the transcript + notes markdown, run the
+///    summary, and write `summary.md` — **all on `spawn_blocking`** because the
+///    summariser's `open` + `summarise` are heavy and synchronous (the
+///    threading-model rule: inference on `spawn_blocking`, never in a handler).
+/// 4. Emit `AppEvent::SummaryReady { meeting_id }` on the shared `event_tx` so
+///    the summary view re-reads the persisted markdown.
+///
+/// The model resolution (`ensure_model_path`) is awaited on the async worker
+/// (it may download); only the synchronous summariser work runs on
+/// `spawn_blocking`.
 #[tauri::command]
 #[specta::specta]
-pub async fn re_summarise(
+pub async fn summarise_meeting(
     meeting_id: MeetingId,
-    _state: State<'_, IpcState>,
+    state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
+    let settings = state.settings.current();
+    let model_id = settings
+        .llm_model_id
+        .clone()
+        .unwrap_or_else(|| ModelId(DEFAULT_LLM_MODEL_ID.to_string()));
+
+    // Resolve (download if needed) the model directory on the async worker.
+    let model_dir = state
+        .orchestrator
+        .ensure_model_path(&model_id)
+        .await
+        .map_err(IpcError::from)?;
+
+    let meetings_dir = state.meetings_dir.clone();
+    let system_prompt = settings.summary_system_prompt.clone();
+
+    // Heavy, synchronous summariser work on a blocking thread. The summariser
+    // is constructed inside the closure so the GGUF load happens off the async
+    // worker threads.
+    let summary_md = tokio::task::spawn_blocking(move || {
+        let summariser = open_summariser_in_dir(&model_dir)?;
+        summarise_meeting_inner(&meetings_dir, meeting_id, &summariser, &system_prompt)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("summarise_meeting task join failed: {e}"),
+    })?
+    .map_err(IpcError::from)?;
+
+    // Emit SummaryReady so the webview re-reads `summary.md`.
+    emit_summary_ready(&state.event_tx, meeting_id);
+
     tracing::info!(
         target: "ipc-bridge",
         meeting_id = %meeting_id.0,
-        "re_summarise requested; not yet implemented (Phase 5)"
+        summary_len = summary_md.len(),
+        "summary generated and persisted"
     );
-    Err(IpcError::from(AppError::Unsupported {
-        context: "re-summarise is not implemented until Phase 5".into(),
-    }))
+
+    Ok(())
+}
+
+/// Read a meeting's persisted summary markdown, or `None` when none exists.
+///
+/// Routes directly to `persistence::read_summary` (a blocking `std::fs` read on
+/// `spawn_blocking`).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_summary(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<Option<String>, IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || get_summary_inner(&meetings_dir, meeting_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("get_summary task join failed: {e}"),
+        })?
+        .map_err(IpcError::from)
+}
+
+/// Persist an edited summary back to `summary.md` (FR-30).
+///
+/// Routes directly to `persistence::write_summary` (atomic tmp+rename) on
+/// `spawn_blocking`.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_summary(
+    meeting_id: MeetingId,
+    summary_markdown: String,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        save_summary_inner(&meetings_dir, meeting_id, &summary_markdown)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("save_summary task join failed: {e}"),
+    })?
+    .map_err(IpcError::from)
+}
+
+// ---------------------------------------------------------------------------
+// Summary command bodies — extracted so they can be unit-tested without a
+// Tauri runtime, a real model, or the orchestrator. The summarise inner takes
+// a `&dyn Summariser` so a `StubSummariser` exercises the read → summarise →
+// write → event wiring (mirroring the orchestrator's re_transcribe stub-backend
+// seam).
+// ---------------------------------------------------------------------------
+
+/// Inner body of [`summarise_meeting`]: read the meeting's transcript + notes
+/// markdown, run `summariser`, and write `summary.md`. Returns the summary
+/// markdown so the caller can log its length and the test can assert on it.
+///
+/// Synchronous (blocking `std::fs` + sync `Summariser::summarise`) — the caller
+/// drives it on `spawn_blocking`. Takes `&dyn Summariser` so a stub can be
+/// injected in tests.
+fn summarise_meeting_inner(
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+    summariser: &dyn Summariser,
+    system_prompt: &str,
+) -> Result<String, AppError> {
+    let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
+
+    let transcript = persistence::read_transcript(&meeting_dir)?;
+    // The notes markdown comes from the assembled meeting state (notes are
+    // optional — an empty string when the meeting has none).
+    let notes_markdown = persistence::read_meeting_state(&meeting_dir)?
+        .notes
+        .map(|n| n.notes_markdown)
+        .unwrap_or_default();
+
+    let summary_md = summariser.summarise(&transcript, &notes_markdown, system_prompt)?;
+
+    persistence::write_summary(&meeting_dir, &summary_md)?;
+
+    Ok(summary_md)
+}
+
+/// Inner body of [`get_summary`]: read `summary.md` via `persistence`.
+fn get_summary_inner(
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+) -> Result<Option<String>, AppError> {
+    let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
+    persistence::read_summary(&meeting_dir)
+}
+
+/// Inner body of [`save_summary`]: write `summary.md` via `persistence`.
+fn save_summary_inner(
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+    summary_markdown: &str,
+) -> Result<(), AppError> {
+    let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
+    persistence::write_summary(&meeting_dir, summary_markdown)
+}
+
+/// Open a [`LlamaSummariser`] over the single `.gguf` weights file in
+/// `model_dir`, skipping any `mmproj-*` multimodal projector.
+///
+/// The LLM is text-only (the bundled Gemma 4 GGUF ships without a projector),
+/// but the helper defends against a directory that also contains an `mmproj-*`
+/// file so the wrong file is never loaded. A missing or ambiguous weights file
+/// is an `AppError::ModelLoad`.
+fn open_summariser_in_dir(model_dir: &Path) -> Result<LlamaSummariser, AppError> {
+    let gguf_path = find_gguf_weights(model_dir)?;
+    LlamaSummariser::open(gguf_path, SummariserConfig::default())
+}
+
+/// Locate the single non-`mmproj` `.gguf` file in `model_dir`.
+fn find_gguf_weights(model_dir: &Path) -> Result<std::path::PathBuf, AppError> {
+    let read_dir = std::fs::read_dir(model_dir).map_err(|e| AppError::ModelLoad {
+        model_id: model_dir.display().to_string(),
+        context: format!("cannot read model directory: {e}"),
+    })?;
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let is_gguf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        // Skip the multimodal projector — the summariser uses the text weights.
+        if is_gguf && !name.to_ascii_lowercase().starts_with("mmproj") {
+            candidates.push(path);
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.pop().expect("len == 1")),
+        0 => Err(AppError::ModelLoad {
+            model_id: model_dir.display().to_string(),
+            context: "no .gguf weights file found in model directory".into(),
+        }),
+        n => Err(AppError::ModelLoad {
+            model_id: model_dir.display().to_string(),
+            context: format!("expected one .gguf weights file, found {n}"),
+        }),
+    }
+}
+
+/// Emit `AppEvent::SummaryReady { meeting_id }` on the shared broadcast sender.
+///
+/// A send with no live subscribers is not an error (broadcast semantics); it is
+/// logged at trace, mirroring `Orchestrator::emit`.
+fn emit_summary_ready(event_tx: &broadcast::Sender<AppEvent>, meeting_id: MeetingId) {
+    match event_tx.send(AppEvent::SummaryReady { meeting_id }) {
+        Ok(n) => tracing::trace!(
+            target: "ipc-bridge",
+            receivers = n,
+            "SummaryReady broadcast"
+        ),
+        Err(_) => tracing::trace!(
+            target: "ipc-bridge",
+            "SummaryReady dropped (no subscribers)"
+        ),
+    }
 }
 
 /// Inner body of [`open_meeting`]: assemble the [`MeetingState`] from the
@@ -779,5 +1007,256 @@ mod tests {
             index.list_meetings().await.expect("list").is_empty(),
             "index row must be removed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 summary wiring (no model, no Tauri runtime). The summarise inner
+    // path is driven by a `StubSummariser` so the read → summarise → write →
+    // event wiring is exercised in CI without a ~3 GB GGUF — mirroring the
+    // orchestrator's re_transcribe stub-backend seam.
+    // -----------------------------------------------------------------------
+
+    use meeting_app_common::Summariser;
+
+    /// A `common::Summariser` that returns a fixed markdown, recording the
+    /// transcript length, notes markdown, and system prompt it was handed so the
+    /// test can assert the inner path forwarded them.
+    struct StubSummariser {
+        fixed_markdown: String,
+        seen_transcript_len: std::sync::Mutex<Option<usize>>,
+        seen_notes: std::sync::Mutex<Option<String>>,
+        seen_prompt: std::sync::Mutex<Option<String>>,
+    }
+
+    impl StubSummariser {
+        fn new(markdown: &str) -> Self {
+            Self {
+                fixed_markdown: markdown.to_string(),
+                seen_transcript_len: std::sync::Mutex::new(None),
+                seen_notes: std::sync::Mutex::new(None),
+                seen_prompt: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    impl Summariser for StubSummariser {
+        fn summarise(
+            &self,
+            transcript: &[Segment],
+            notes_markdown: &str,
+            system_prompt: &str,
+        ) -> Result<String, AppError> {
+            *self.seen_transcript_len.lock().unwrap() = Some(transcript.len());
+            *self.seen_notes.lock().unwrap() = Some(notes_markdown.to_string());
+            *self.seen_prompt.lock().unwrap() = Some(system_prompt.to_string());
+            Ok(self.fixed_markdown.clone())
+        }
+    }
+
+    /// Save notes for a synthetic meeting via the same `NotesStore` path the
+    /// `save_notes` command uses, so `read_meeting_state(..).notes` is populated.
+    fn write_synthetic_notes(root: &Path, meeting_id: MeetingId, markdown: &str) {
+        let value: serde_json::Value = serde_json::json!({ "type": "doc", "content": [] });
+        NotesStore::save(root, meeting_id, &value, markdown).expect("save notes");
+    }
+
+    /// `summarise_meeting_inner` reads the meeting's transcript + notes markdown,
+    /// runs the stub summariser, writes `summary.md`, and (separately) the
+    /// command emits `SummaryReady`. Here we assert the inner write + the event
+    /// emission, since the inner fn and the emit helper compose what the command
+    /// does without needing a model or Tauri runtime.
+    #[test]
+    fn summarise_inner_reads_writes_and_returns_markdown() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = write_synthetic_meeting(
+            root,
+            "Planning sync",
+            "2026-06-02T15:00:00Z",
+            Some("first agenda item"),
+        );
+        write_synthetic_notes(root, meeting_id, "- own the resume bug");
+
+        let stub = StubSummariser::new("## Summary\n\nWe planned the sprint.\n");
+        let prompt = "You are a meeting-notes assistant.";
+
+        let returned = summarise_meeting_inner(root, meeting_id, &stub, prompt)
+            .expect("summarise inner must succeed");
+
+        // The returned markdown is the stub's fixed output.
+        assert_eq!(returned, "## Summary\n\nWe planned the sprint.\n");
+
+        // The stub saw the transcript + notes + prompt the inner path read.
+        assert_eq!(*stub.seen_transcript_len.lock().unwrap(), Some(1));
+        assert_eq!(
+            stub.seen_notes.lock().unwrap().as_deref(),
+            Some("- own the resume bug")
+        );
+        assert_eq!(stub.seen_prompt.lock().unwrap().as_deref(), Some(prompt));
+
+        // `summary.md` is persisted and readable via the get-summary inner path.
+        let loaded = get_summary_inner(root, meeting_id).expect("read summary");
+        assert_eq!(
+            loaded.as_deref(),
+            Some("## Summary\n\nWe planned the sprint.\n"),
+            "summary.md must be written by the inner path"
+        );
+    }
+
+    /// The full `summarise_meeting` wiring sans Tauri: inner write + the same
+    /// `SummaryReady` event the command emits, observed on a broadcast
+    /// subscriber — proving the event carries the right `meeting_id`.
+    #[tokio::test]
+    async fn summarise_emits_summary_ready_for_meeting() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Standup", "2026-06-02T16:00:00Z", Some("status update"));
+
+        let (event_tx, mut event_rx) = broadcast::channel::<AppEvent>(8);
+        let stub = StubSummariser::new("## Summary\n\nStandup notes.\n");
+
+        let returned =
+            summarise_meeting_inner(root, meeting_id, &stub, "prompt").expect("summarise");
+        assert_eq!(returned, "## Summary\n\nStandup notes.\n");
+
+        emit_summary_ready(&event_tx, meeting_id);
+
+        let event = event_rx.recv().await.expect("an event must be broadcast");
+        match event {
+            AppEvent::SummaryReady { meeting_id: got } => assert_eq!(got, meeting_id),
+            other => panic!("expected SummaryReady, got {other:?}"),
+        }
+    }
+
+    /// Notes-free meeting: the inner path passes an empty notes markdown rather
+    /// than erroring (FR-30 — a meeting with no notes still summarises).
+    #[test]
+    fn summarise_inner_handles_meeting_without_notes() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Quiet", "2026-06-02T17:00:00Z", Some("only words"));
+        // No notes saved.
+
+        let stub = StubSummariser::new("## Summary\n");
+        summarise_meeting_inner(root, meeting_id, &stub, "prompt").expect("summarise");
+
+        assert_eq!(
+            stub.seen_notes.lock().unwrap().as_deref(),
+            Some(""),
+            "absent notes must pass an empty markdown string"
+        );
+    }
+
+    /// `save_summary` → `get_summary` round-trip over a tempdir, exercising the
+    /// command bodies directly (no Tauri runtime).
+    #[test]
+    fn save_then_get_summary_round_trips() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Edited", "2026-06-02T18:00:00Z", Some("words"));
+
+        // No summary yet → None.
+        assert!(
+            get_summary_inner(root, meeting_id).expect("read").is_none(),
+            "absent summary must read as None"
+        );
+
+        let edited = "## Summary\n\nUser-edited summary.\n";
+        save_summary_inner(root, meeting_id, edited).expect("save summary");
+
+        let loaded = get_summary_inner(root, meeting_id).expect("read summary");
+        assert_eq!(loaded.as_deref(), Some(edited), "summary must round-trip");
+    }
+
+    /// `find_gguf_weights` picks the single text-weights `.gguf`, skipping an
+    /// `mmproj-*` projector that may sit alongside it.
+    #[test]
+    fn find_gguf_weights_skips_mmproj() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let dir = tempdir.path();
+        std::fs::write(dir.join("gemma-4-E4B-it-Q4_K_M.gguf"), b"weights").expect("write weights");
+        std::fs::write(dir.join("mmproj-gemma-4-E4B-it.gguf"), b"proj").expect("write proj");
+        std::fs::write(dir.join("README.md"), b"notes").expect("write readme");
+
+        let found = find_gguf_weights(dir).expect("must find the text weights");
+        assert_eq!(
+            found.file_name().and_then(|n| n.to_str()),
+            Some("gemma-4-E4B-it-Q4_K_M.gguf")
+        );
+    }
+
+    /// `find_gguf_weights` errors (rather than panicking) when no weights file
+    /// is present.
+    #[test]
+    fn find_gguf_weights_errors_when_absent() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let dir = tempdir.path();
+        std::fs::write(dir.join("mmproj-only.gguf"), b"proj").expect("write proj");
+
+        let err = find_gguf_weights(dir).expect_err("no text weights → error");
+        assert!(matches!(err, AppError::ModelLoad { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Gated real-model test — skips when MEETING_APP_LLM_MODEL_PATH is unset.
+    //
+    // To run:
+    //   MEETING_APP_LLM_MODEL_PATH=/path/to/gemma-4-E4B-it-Q4_K_M.gguf \
+    //   cargo test -p ipc-bridge -- --include-ignored
+    // -----------------------------------------------------------------------
+
+    /// End-to-end summarise over a synthetic meeting folder using the **real**
+    /// Gemma-4 GGUF pointed to by `MEETING_APP_LLM_MODEL_PATH`: open the model,
+    /// run `summarise_meeting_inner`, assert a non-empty markdown summary is
+    /// written, and record latency. No-op skip when the env var is unset.
+    #[test]
+    #[ignore = "requires MEETING_APP_LLM_MODEL_PATH"]
+    fn summarise_real_model_writes_non_empty_summary() {
+        let model_path = match std::env::var("MEETING_APP_LLM_MODEL_PATH") {
+            Ok(p) => p,
+            Err(_) => return, // no-op skip path
+        };
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = write_synthetic_meeting(
+            root,
+            "Gated meeting",
+            "2026-06-02T19:00:00Z",
+            Some("Let's review the quarterly plan and assign action items."),
+        );
+        write_synthetic_notes(root, meeting_id, "- Decision: ship Phase 5");
+
+        let summariser = LlamaSummariser::open(
+            std::path::PathBuf::from(&model_path),
+            SummariserConfig::default(),
+        )
+        .expect("model load must succeed with a valid path");
+
+        let prompt =
+            "You are a meeting-notes assistant. Produce a concise markdown summary with headings.";
+
+        let start = std::time::Instant::now();
+        let summary = summarise_meeting_inner(root, meeting_id, &summariser, prompt)
+            .expect("summarise must succeed");
+        let elapsed = start.elapsed();
+
+        tracing::info!(
+            target: "ipc-bridge",
+            elapsed_ms = elapsed.as_millis() as u64,
+            summary_len = summary.len(),
+            "gated summarise_meeting complete"
+        );
+
+        assert!(!summary.trim().is_empty(), "summary must be non-empty");
+
+        // `summary.md` must be on disk and match what was returned.
+        let loaded = get_summary_inner(root, meeting_id)
+            .expect("read summary")
+            .expect("summary.md must exist after summarise");
+        assert_eq!(loaded, summary, "persisted summary must match returned");
     }
 }

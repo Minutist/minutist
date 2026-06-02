@@ -63,6 +63,23 @@ async resumeRecording() : Promise<Result<null, IpcError>> {
  * Stop the current recording and finalise the meeting.
  * 
  * Returns the completed `MeetingMeta` on success.
+ * 
+ * After the orchestrator finalises the meeting folder, this also **upserts the
+ * libsql index** (FR-33) so the just-recorded meeting appears in
+ * `list_meetings` **in the same session** — without waiting for the next
+ * app-start `rebuild_from_disk`. The orchestrator stays decoupled from the
+ * index (it does not own one); the `ipc-bridge` owns the index handle in
+ * `IpcState`, so the upsert lives here. See `architecture/components.md`,
+ * `ipc-bridge` "Phase 4 additions — stop-upsert".
+ * 
+ * The blocking transcript read (for the list excerpt) runs on `spawn_blocking`
+ * per the threading model; the async index `upsert` is awaited, never
+ * `block_on`'d (the no-`block_on`-in-command-handlers rule).
+ * 
+ * An index-upsert failure is logged and swallowed — the recording itself is
+ * safely persisted on disk and the index is a derived cache that the next
+ * startup `rebuild_from_disk` will reconcile, so a failed upsert must not turn
+ * a successful stop into an error.
  */
 async stopRecording() : Promise<Result<MeetingMeta, IpcError>> {
     try {
@@ -253,16 +270,60 @@ async reTranscribe(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
 }
 },
 /**
- * Re-run summarisation for a meeting (FR-33 action) — **Phase 5 stub**.
+ * Run summarisation for a meeting (FR-30): produce `summary.md` and emit
+ * `AppEvent::SummaryReady`.
  * 
- * The `summariser` crate (Phase 5) produces `summary.md` and emits
- * `AppEvent::SummaryReady`. Until then this command returns
- * `AppError::Unsupported` so the command surface + generated binding exist for
- * Stream B's meeting-list action without a backing implementation.
+ * Pipeline:
+ * 1. Resolve the LLM model id — `settings.llm_model_id` if set, else the
+ * bundled default [`DEFAULT_LLM_MODEL_ID`].
+ * 2. Resolve the model **directory** via `Orchestrator::ensure_model_path`
+ * (downloads + verifies when absent). This keeps the `model-registry` edge
+ * in the orchestrator — there is **no** `orchestrator → summariser` edge;
+ * the summariser is loaded here, in `ipc-bridge` (the granted
+ * `ipc-bridge → summariser` edge).
+ * 3. Open a [`LlamaSummariser`] over the single `.gguf` in that directory
+ * (skipping any `mmproj-*`), read the transcript + notes markdown, run the
+ * summary, and write `summary.md` — **all on `spawn_blocking`** because the
+ * summariser's `open` + `summarise` are heavy and synchronous (the
+ * threading-model rule: inference on `spawn_blocking`, never in a handler).
+ * 4. Emit `AppEvent::SummaryReady { meeting_id }` on the shared `event_tx` so
+ * the summary view re-reads the persisted markdown.
+ * 
+ * The model resolution (`ensure_model_path`) is awaited on the async worker
+ * (it may download); only the synchronous summariser work runs on
+ * `spawn_blocking`.
  */
-async reSummarise(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+async summariseMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("re_summarise", { meetingId }) };
+    return { status: "ok", data: await TAURI_INVOKE("summarise_meeting", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a meeting's persisted summary markdown, or `None` when none exists.
+ * 
+ * Routes directly to `persistence::read_summary` (a blocking `std::fs` read on
+ * `spawn_blocking`).
+ */
+async getSummary(meetingId: MeetingId) : Promise<Result<string | null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_summary", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Persist an edited summary back to `summary.md` (FR-30).
+ * 
+ * Routes directly to `persistence::write_summary` (atomic tmp+rename) on
+ * `spawn_blocking`.
+ */
+async saveSummary(meetingId: MeetingId, summaryMarkdown: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_summary", { meetingId, summaryMarkdown }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -517,8 +578,6 @@ export type Segment = { start_ms: number; end_ms: number; text: string; speaker_
  * Application settings.
  * 
  * Fields added in later phases live in their respective phase plans.
- * Do **not** add ASR model selection, summary system-prompt, or telemetry
- * fields here — those are Phase 2+ concerns.
  */
 export type Settings = { 
 /**
@@ -551,7 +610,27 @@ start_hidden?: boolean;
  * cadence. Defaults to 5 s; an older store written before this field
  * existed deserialises to the default via `#[serde(default = ...)]`.
  */
-autosave_interval_secs?: number }
+autosave_interval_secs?: number; 
+/**
+ * Summary system prompt passed to the summariser (FR-28).
+ * 
+ * The `summariser` forwards this verbatim as the chat `system` message
+ * when generating `summary.md`. Defaults to a structured-summary
+ * instruction (headings / key decisions / action items); an older store
+ * written before this field existed deserialises to the default via
+ * `#[serde(default = ...)]`.
+ */
+summary_system_prompt?: string; 
+/**
+ * Selected LLM model for summarisation (FR-35).
+ * 
+ * `None` means "use the bundled default model" (resolved by the
+ * summariser against the model registry). The model is settings-selected,
+ * never hard-coded; switching is a manifest + `llm_model_id` change. An
+ * older store written before this field existed deserialises to `None`
+ * via `#[serde(default)]`.
+ */
+llm_model_id?: ModelId | null }
 /**
  * UI colour-scheme preference.
  */

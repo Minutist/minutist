@@ -18,7 +18,6 @@ import {
   renameMeeting,
   deleteMeeting,
   reTranscribe,
-  reSummarise,
 } from "../ipc/meetings";
 import type { MeetingListEntry, MeetingState } from "../ipc/meetings";
 import type { MeetingId } from "../ipc/bindings";
@@ -49,8 +48,6 @@ export type MeetingsStore = {
   remove: (meetingId: MeetingId) => Promise<void>;
   /** Re-run transcription for a meeting. */
   reTranscribe: (meetingId: MeetingId) => Promise<void>;
-  /** Re-run summarisation for a meeting. */
-  reSummarise: (meetingId: MeetingId) => Promise<void>;
 };
 
 function errorMessage(err: unknown): string {
@@ -124,15 +121,6 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   reTranscribe: async (meetingId) => {
     try {
       await reTranscribe(meetingId);
-      set({ lastError: null });
-    } catch (err) {
-      set({ lastError: errorMessage(err) });
-    }
-  },
-
-  reSummarise: async (meetingId) => {
-    try {
-      await reSummarise(meetingId);
       set({ lastError: null });
     } catch (err) {
       set({ lastError: errorMessage(err) });

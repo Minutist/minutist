@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (18 total)
+//! ## Commands (20 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -25,7 +25,13 @@
 //! | `rename_meeting` | `()` | 4 |
 //! | `delete_meeting` | `()` | 4 |
 //! | `re_transcribe` | `()` | 4 |
-//! | `re_summarise` | `()` (stub → `Unsupported`) | 4 |
+//! | `summarise_meeting` | `()` | 5 |
+//! | `get_summary` | `Option<String>` | 5 |
+//! | `save_summary` | `()` | 5 |
+//!
+//! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
+//! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
+//! action points at `summarise_meeting`, so the stub had no caller.
 //!
 //! All commands return `Result<T, IpcError>`.
 //!
@@ -38,7 +44,17 @@
 //! (`list_meetings` / `rename_meeting` / `delete_meeting` via the shared
 //! `IpcState::index`; `open_meeting` via `read_meeting_state`), except
 //! `re_transcribe`, which routes to `Orchestrator::re_transcribe` (offline
-//! re-run of the live ASR pipeline) and `re_summarise`, a Phase-5 stub.
+//! re-run of the live ASR pipeline).
+//!
+//! The Phase-5 summary commands (`summarise_meeting` / `get_summary` /
+//! `save_summary`) realise the granted `ipc-bridge → summariser` edge.
+//! `summarise_meeting` resolves the selected LLM directory via
+//! `Orchestrator::ensure_model_path` (keeping the `model-registry` edge in the
+//! orchestrator — there is **no** `orchestrator → summariser` edge), opens a
+//! `summariser::LlamaSummariser`, runs it over the meeting's transcript + notes
+//! on `spawn_blocking`, writes `summary.md` via `persistence::write_summary`,
+//! and emits `AppEvent::SummaryReady` on `IpcState::event_tx`. `get_summary` /
+//! `save_summary` route directly to `persistence::{read_summary, write_summary}`.
 //!
 //! ## Specta types
 //!
@@ -65,10 +81,12 @@ pub mod events;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use meeting_app_common::AppEvent;
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use settings::SettingsHandle;
 use tauri_specta::{collect_commands, collect_events, Builder};
+use tokio::sync::broadcast;
 
 pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
@@ -101,6 +119,16 @@ pub struct IpcState {
     /// single connection without re-opening per command. The index methods are
     /// `async fn` and are awaited in the command handlers — never `block_on`'d.
     pub index: Arc<MeetingIndex>,
+    /// The shared `AppEvent` broadcast sender — the **same** channel `app-main`
+    /// constructs once and hands to both the `ModelRegistry` and the
+    /// `Orchestrator` (via `with_event_tx`). The event forwarder subscribes to
+    /// it via `Orchestrator::subscribe_events`, so any event emitted here
+    /// reaches the webview. `summarise_meeting` (Phase 5) emits
+    /// `AppEvent::SummaryReady` on this sender after `summary.md` is written, so
+    /// the summary view re-reads the persisted markdown. Cloning the sender (not
+    /// re-deriving it from the orchestrator) keeps the single-bus invariant from
+    /// `architecture/cross-cutting.md` "Model lifecycle".
+    pub event_tx: broadcast::Sender<AppEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -157,7 +185,7 @@ pub fn open_meeting_index(
 // bindings_builder — shared builder for app-main and the export helper
 // ---------------------------------------------------------------------------
 
-/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1–3 commands
+/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1–5 commands
 /// and the `AppEventPayload` event.
 ///
 /// Both `app-main` (to build the invoke handler) and a bindings-export helper
@@ -200,7 +228,9 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::rename_meeting,
             commands::delete_meeting,
             commands::re_transcribe,
-            commands::re_summarise,
+            commands::summarise_meeting,
+            commands::get_summary,
+            commands::save_summary,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -222,7 +252,9 @@ mod tests {
     /// it for each expected command name.  Each command appears in the TS
     /// as a string literal in the `invoke` call.
     ///
-    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18.
+    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20
+    /// (P5 removes `re_summarise` and adds `summarise_meeting` / `get_summary`
+    /// / `save_summary`: 18 − 1 + 3 = 20).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -255,10 +287,19 @@ mod tests {
             "rename_meeting",
             "delete_meeting",
             "re_transcribe",
-            "re_summarise",
+            "summarise_meeting",
+            "get_summary",
+            "save_summary",
         ];
 
-        assert_eq!(expected.len(), 18, "command ledger must be 18 in Phase 4");
+        assert_eq!(expected.len(), 20, "command ledger must be 20 in Phase 5");
+
+        // `re_summarise` was removed in Phase 5 (no caller once
+        // `summarise_meeting` landed); assert it is gone from the surface.
+        assert!(
+            !ts.contains("re_summarise"),
+            "re_summarise must be removed from the command surface in Phase 5"
+        );
 
         for name in &expected {
             assert!(

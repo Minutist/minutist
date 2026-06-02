@@ -206,6 +206,11 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // otherwise-circular dependency (registry is a constructor param of
             // the orchestrator, but the registry needs the sender too).
             let (event_tx, _event_rx) = tokio::sync::broadcast::channel(256);
+            // Clone the sender for IpcState so the Phase-5 `summarise_meeting`
+            // command can emit `AppEvent::SummaryReady` on the SAME bus the
+            // orchestrator/registry broadcast on (the event forwarder subscribes
+            // once via Orchestrator::subscribe_events and sees it too).
+            let ipc_event_tx = event_tx.clone();
 
             // Construct the model registry. The manifest is bundled at compile
             // time from resources/models.json; the cache root is the per-kind
@@ -259,6 +264,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 meetings_dir: notes_meetings_dir,
                 index_db_path,
                 index,
+                event_tx: ipc_event_tx,
             });
 
             // Build the tray icon.

@@ -160,6 +160,20 @@ impl Orchestrator {
         self.model_registry.ensure(model_id).await.map(|_| ())
     }
 
+    /// Ensure a model is present and return its on-disk model **directory**.
+    ///
+    /// A thin wrapper over `ModelRegistry::ensure` (which downloads + verifies
+    /// when absent and resolves to the per-model directory under
+    /// `{app-data}/models/{kind}/{model-id}/`). `ipc-bridge`'s
+    /// `summarise_meeting` calls this to resolve the selected LLM directory
+    /// before locating the `.gguf` and opening the summariser — keeping the
+    /// `model-registry` edge inside the orchestrator (there is **no**
+    /// `orchestrator → summariser` edge; the summariser is loaded in
+    /// `ipc-bridge`).
+    pub async fn ensure_model_path(&self, model_id: &ModelId) -> AppResult<PathBuf> {
+        self.model_registry.ensure(model_id).await
+    }
+
     // ------------------------------------------------------------------
     // Public command surface
     // ------------------------------------------------------------------

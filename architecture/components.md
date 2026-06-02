@@ -469,6 +469,15 @@ cover the whole offline path over the committed real-speech fixture without a
 ~1 GB model (see "Integration tests" below). It is compiled out of production
 builds, so the public production surface is unchanged.
 
+**Phase 5 — `Orchestrator::ensure_model_path(&ModelId) -> AppResult<PathBuf>`.**
+An **additive** thin wrapper over the existing `model-registry` handle
+(`ModelRegistry::ensure`, which downloads + verifies when absent) that returns
+the resolved per-model **directory**. `ipc-bridge`'s `summarise_meeting` calls
+it to locate the selected LLM directory before opening the summariser, keeping
+the `model-registry` edge inside the orchestrator. This adds **no**
+`orchestrator → summariser` edge — the summariser is loaded in `ipc-bridge`
+(the granted `ipc-bridge → summariser` edge), not here.
+
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
 `start_record_stop` (full lifecycle + pause/resume decoded-duration
@@ -565,8 +574,9 @@ turn a successful stop into an error. This keeps the orchestrator decoupled from
 the index: the index handle lives in `ipc-bridge` (`IpcState`), so the upsert
 lives at the command boundary, not in the orchestrator.
 
-**Phase 4 additions (18 commands total) — meeting list / open / actions.** Six
-commands back the meeting-list view (FR-33):
+**Phase 4 additions (18 commands at Phase 4; `re_summarise` removed in Phase 5)
+— meeting list / open / actions.** Six commands back the meeting-list view
+(FR-33):
 
 - `list_meetings() -> Vec<MeetingListEntry>` — queries the shared libsql index
   (`MeetingIndex::list_meetings`, most-recent first).
@@ -582,9 +592,11 @@ commands back the meeting-list view (FR-33):
   offline re-run of the live ASR pipeline (see `orchestrator` below). The shared
   `IpcState::index` handle is passed into the call so the orchestrator refreshes
   the index row without owning an index of its own.
-- `re_summarise(meeting_id) -> ()` — a Phase-4 **stub** returning
-  `AppError::Unsupported`; Phase 5's `summariser` fills it in (it will produce
-  `summary.md` and emit `AppEvent::SummaryReady`).
+- `re_summarise(meeting_id) -> ()` — **a Phase-4 stub, removed in Phase 5.**
+  It returned `AppError::Unsupported` as a placeholder until the `summariser`
+  landed. Phase 5 replaced it with `summarise_meeting` (below); the meeting-list
+  row's Summarise action repoints to that command, so the stub had no caller and
+  was deleted.
 
 `IpcState` gains `index_db_path: PathBuf` (resolved by `app-main` via
 `persistence::index::index_db_path`) and `index: Arc<MeetingIndex>` — a single
@@ -598,6 +610,42 @@ acquire a direct `persistence` dependency. That helper drives libsql's async
 no-`block_on` rule binds command handlers, not bootstrap). `MeetingListEntry` /
 `MeetingState` are the canonical `common` types (Phase-4 precursors), so the
 generated bindings consume them directly with no mirror.
+
+**Phase 5 additions (20 commands total) — summary surface + the `summariser`
+edge (FR-30).** The Phase-4 `re_summarise` stub is **removed** and three real
+commands land, realising the granted `ipc-bridge → summariser` dependency edge
+(`summariser = { path = "../summariser" }` in `ipc-bridge`'s Cargo.toml — already
+in the dependency table above):
+
+- `summarise_meeting(meeting_id) -> ()` — resolves the LLM model id
+  (`settings.llm_model_id`, else the bundled default `gemma-4-e4b-it-q4_k_m`),
+  resolves the model **directory** via `Orchestrator::ensure_model_path` (so the
+  `model-registry` edge stays in the orchestrator — there is **no**
+  `orchestrator → summariser` edge), locates the single `.gguf` in that dir
+  (skipping any `mmproj-*`), opens a `summariser::LlamaSummariser`, reads the
+  transcript (`persistence::read_transcript`) + the notes markdown
+  (`read_meeting_state(..).notes`, empty when absent), runs `summarise`, and
+  writes `summary.md` (`persistence::write_summary`) — the summariser `open` +
+  `summarise` and the folder I/O run on `spawn_blocking` (the threading-model
+  rule: inference off the command handler). It then emits
+  `AppEvent::SummaryReady { meeting_id }` on the shared `event_tx`.
+- `get_summary(meeting_id) -> Option<String>` — reads `summary.md` via
+  `persistence::read_summary` (blocking read on `spawn_blocking`); `None` when
+  no summary exists.
+- `save_summary(meeting_id, summary_markdown) -> ()` — persists an edited
+  summary via `persistence::write_summary` (`spawn_blocking`).
+
+`IpcState` gains `event_tx: broadcast::Sender<AppEvent>` — a clone of the
+**same** bus `app-main` constructs once and shares with the `ModelRegistry` and
+the `Orchestrator` (via `with_event_tx`). Emitting `SummaryReady` here is the
+only place `ipc-bridge` produces an event directly; the event forwarder's single
+subscription (via `Orchestrator::subscribe_events`) sees it because the channel
+is shared. The summary crosses the wire as an opaque markdown `String`;
+`summarise_meeting` reuses `AppEvent::SummaryReady` (no new event). A
+`summarise_meeting_inner(&dyn Summariser, …)` seam lets the default test suite
+exercise the read → summarise → write → event wiring with a `StubSummariser`,
+without a model or Tauri runtime (mirroring the orchestrator's re_transcribe
+stub-backend seam).
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name

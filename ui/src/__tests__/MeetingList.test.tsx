@@ -27,7 +27,6 @@ vi.mock("../ipc/meetings", () => ({
   renameMeeting: vi.fn().mockResolvedValue(undefined),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
   reTranscribe: vi.fn().mockResolvedValue(undefined),
-  reSummarise: vi.fn().mockResolvedValue(undefined),
 }));
 
 // The Phase-5 row Summarise action routes through the summary store, which

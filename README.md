@@ -4,7 +4,10 @@ Local-first desktop meeting-notes application. Records meetings,
 transcribes them on-device, takes hand-typed notes alongside, summarises
 with a local LLM. Cross-platform (Windows / macOS / Linux).
 
-**Status:** pre-prototype. Phase 0 spikes in progress.
+**Status:** in development. The full pipeline (record → transcribe → notes →
+summarise → opt-in diarize) is implemented across the workspace crates and the
+Tauri 2 + React app; native Windows/macOS/Linux builds run. Distribution
+(code-signing, auto-update) and on-hardware validation are the remaining work.
 
 ## Architecture
 
@@ -17,21 +20,28 @@ Read [`architecture/README.md`](architecture/README.md) first.
 ```
 architecture/     C4 docs + Structurizr DSL + rendered SVGs
 crates/
-  common/         shared types and trait definitions
-spikes/
-  asr/            llama-cpp-2 mtmd ASR spike
-  llm/            llama-cpp-2 text LLM spike
-  vad-loop/       Silero VAD + ASR end-to-end
-  diarize/        sherpa-onnx diarization spike
-scripts/
-  render-architecture.sh   regenerate SVGs from workspace.dsl
+  common/         shared types + trait definitions (the architectural contract)
+  audio-capture/  cpal capture + device enumeration
+  vad-chunker/    Silero VAD + batched-VAD chunking
+  asr-runtime/    llama-cpp-2 mtmd ASR
+  summariser/     llama-cpp-2 text-LLM summarisation
+  diarizer/       sherpa-onnx speaker diarization (opt-in)
+  model-registry/ model download + SHA-256 verification
+  persistence/    meeting folders, Opus audio, transcript/notes/metadata, libsql index
+  settings/       settings schema, store, change notifications
+  orchestrator/   recording lifecycle + the live VAD→ASR pipeline
+  ipc-bridge/     Tauri command + event surface (tauri-specta bindings)
+src-tauri/        Tauri 2 app shell (app-main): bootstrap, tray, updater, capabilities
+ui/               React 19 + Tiptap + Zustand frontend
+spikes/           throwaway Phase-0 API-proof crates (asr, llm, vad-loop, diarize)
+scripts/          build / test / render helpers
 .githooks/
   pre-commit      architecture drift guard (install: see below)
 ```
 
-The `spikes/` crates are deliberately throwaway. Once Phase 0 exits, the
-patterns that work move into `crates/common` and the real application
-crates listed in [`architecture/components.md`](architecture/components.md).
+Component boundaries, the dependency table, and ownership are authoritative in
+[`architecture/components.md`](architecture/components.md). The `spikes/` crates
+are throwaway Phase-0 API proofs, exempt from the cross-cutting rules.
 
 ## Setup
 
@@ -52,14 +62,26 @@ git config merge.ff only              # no merge commits; ff-only
   [`architecture/agent-dispatch.md`](architecture/agent-dispatch.md) —
   Branch and merge convention.
 
-## Build
+## Development
 
-```bash
-cargo build --workspace
-```
+Common tasks are wrapped in the [`Makefile`](Makefile) — run `make` (or
+`make help`) for the full list:
 
-Models, native dependencies, and platform-specific build instructions
-land here as Phase 0 progresses.
+| Command | Does |
+|---|---|
+| `make build` | debug build of the whole workspace |
+| `make test` | the full default suite — `cargo test --workspace` + the UI build + Vitest |
+| `make clippy` / `make fmt` | lint / format |
+| `make bindings` | regenerate `ui/src/ipc/bindings.ts` from the Rust IPC surface |
+| `make render-arch` | re-render the C4 SVGs (needs Docker) |
+| `make clean` / `make clean-all` | remove `target/` + `ui/dist` (`clean-all` also drops `ui/node_modules`) |
+
+`bindgen` (pulled in by `llama-cpp-2`) needs `libclang`, so the Makefile sets
+`LIBCLANG_PATH=/usr/lib/llvm-18/lib`; override it in the environment if your LLVM
+lives elsewhere. Models download on first run; GPU feature flags and the
+single-portable-backend artefact policy are documented in
+[`architecture/cross-cutting.md`](architecture/cross-cutting.md) under "GPU
+portability".
 
 ## CI
 
@@ -95,30 +117,28 @@ Requires Docker. Uses `structurizr/structurizr` to export the DSL to
 Mermaid, then `minlag/mermaid-cli` to convert to SVG. SVGs are committed
 alongside [`architecture/workspace.dsl`](architecture/workspace.dsl).
 
-## Running spikes on native Windows
+## Native Windows builds + tests
 
-Phase 0 §4 exit criteria require each spike to run on Windows AND Linux.
-The Linux side is verified in WSL/native. The Windows side uses
-[`scripts/run-spike-windows.ps1`](scripts/run-spike-windows.ps1), which
-robocopies the repo to `C:\Users\anl\meeting-app`, sets up the MSVC
-dev shell via vswhere + Launch-VsDevShell.ps1, and runs `cargo build`
-plus the spike binary.
+These run on the Windows side from WSL via `powershell.exe`. The scripts
+robocopy-mirror the repo to `C:\Users\anl\meeting-app`, set up the MSVC dev
+shell (vswhere + `Launch-VsDevShell.ps1`), and build/test there. The frontend is
+prebuilt in WSL and synced, so Node is not required on Windows.
 
-From WSL:
+- **App build** — `make windows-build` (CPU) or `make windows-build-vulkan`
+  (GPU), wrapping
+  [`scripts/build-windows-app.ps1`](scripts/build-windows-app.ps1). Output is a
+  run-from-folder at `dist-windows\meeting-app[-vulkan]\` (the exe + native DLLs
+  + the bundled Silero model) plus a zip; run `meeting-app.exe` directly, no
+  install. It builds with `cargo tauri build --no-bundle` so the webview serves
+  the embedded frontend over `tauri://` — a bare `cargo build` is dev-mode and
+  points the webview at the (absent) Vite dev server.
+- **Gated tests** —
+  [`scripts/run-tests-windows.ps1`](scripts/run-tests-windows.ps1) runs the
+  env-var-gated MSVC tests (`-Package <crate> -Ignored`).
+- **Boot smoke** — [`scripts/smoke-windows.ps1`](scripts/smoke-windows.ps1) and
+  [`scripts/verify-windows-zip.ps1`](scripts/verify-windows-zip.ps1) launch the
+  built app / unzipped artifact briefly and capture the startup log.
 
-```bash
-powershell.exe -NoProfile -ExecutionPolicy Bypass \
-  -File 'C:\Users\anl\meeting-app\scripts\run-spike-windows.ps1' \
-  -Spike asr -Run
-```
-
-The script must already exist on the Windows side (the `\\wsl.localhost\…`
-UNC path isn't reliably executable). For the first invocation, sync the
-script over with `cp /home/anl/meeting-app/scripts/run-spike-windows.ps1
-/mnt/c/Users/anl/meeting-app/scripts/run-spike-windows.ps1` or run
-`-SyncOnly` from any already-Windows-side copy first.
-
-Toolchain expectations: Rust on PATH, Visual Studio Build Tools 2022,
-LLVM (for `libclang.dll`), Vulkan SDK (optional, only needed for the
-`vulkan` feature). Edit the env-var paths at the top of the script if
-your install differs.
+Toolchain: Rust on PATH, Visual Studio Build Tools 2022, LLVM (`libclang.dll`),
+and — for the `vulkan` feature — the Vulkan SDK + `ninja`. Edit the env-var paths
+at the top of the scripts if your install differs.

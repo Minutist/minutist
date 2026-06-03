@@ -701,6 +701,20 @@ dependency edge. (Phase 7 also adds
 two app-main updater events to `common` — `AppEvent::UpdateAvailable` /
 `UpdateProgress` — see `cross-cutting.md` "Auto-update".)
 
+**Field — `gpu_acceleration: bool`.** The runtime GPU-acceleration toggle.
+`#[serde(default = ...)]`-defaults to `true` (GPU on by default); an older store
+written before the field existed deserialises to `true`, preserving the prior
+compile-time behaviour. Added to the hand-written `Default` impl (`true`). GPU
+offload happens ONLY when BOTH (a) the build was compiled with a GPU feature
+(`vulkan`/`metal`/`cuda`/`rocm`) AND (b) this flag is `true`; when `false`,
+inference runs on CPU (`n_gpu_layers = 0`) even in a GPU-feature build — the
+runtime escape hatch for weak GPUs / driver trouble. In a default CPU-only build
+the flag has no effect (inference is always on CPU). The orchestrator reads it
+(`current().gpu_acceleration`) to resolve the live + offline-re-transcribe ASR
+`n_gpu_layers`, and `ipc-bridge`'s `summarise_meeting` reads it to resolve the
+summariser `n_gpu_layers`. No new dependency edge. See `cross-cutting.md` —
+"GPU portability".
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates

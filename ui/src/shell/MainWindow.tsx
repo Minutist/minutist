@@ -4,6 +4,7 @@ import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
 import { readDiarizationEnabled } from "../state/diarization-settings";
+import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
 import { DevicePicker } from "./DevicePicker";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
@@ -43,12 +44,14 @@ export function MainWindow() {
   const setDiarizationEnabled = useRecordingStore(
     (s) => s.setDiarizationEnabled,
   );
+  const setGpuAcceleration = useRecordingStore((s) => s.setGpuAcceleration);
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
   const reDiarize = useMeetingsStore((s) => s.rediarize);
 
   const diarizationEnabled = readDiarizationEnabled(settings);
+  const gpuAcceleration = readGpuAcceleration(settings);
 
   // The meeting-list is the entry surface (FR-33): shown when no meeting is
   // open and nothing is being recorded. Opening a meeting, or starting a
@@ -160,6 +163,24 @@ export function MainWindow() {
               onChange={(e) => void setDiarizationEnabled(e.target.checked)}
             />
             <span>Diarize on stop</span>
+          </label>
+          {/*
+            Runtime GPU-acceleration toggle (on by default). When off, inference
+            runs on CPU (`n_gpu_layers = 0`) even in a GPU-feature build — the
+            escape hatch for weak GPUs / driver trouble. In a default CPU-only
+            build the flag has no effect. Persists via `update_settings` so the
+            choice survives an app restart. Disabled until the settings snapshot
+            has loaded so the round-trip never clobbers settings with a partial
+            object. See `architecture/cross-cutting.md` — "GPU portability".
+          */}
+          <label className="main-window__gpu-toggle">
+            <input
+              type="checkbox"
+              checked={gpuAcceleration}
+              disabled={settings === null}
+              onChange={(e) => void setGpuAcceleration(e.target.checked)}
+            />
+            <span>GPU acceleration</span>
           </label>
           {inWorkspace && (
             <button

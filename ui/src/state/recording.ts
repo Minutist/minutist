@@ -16,6 +16,7 @@ import type {
 import type { AppEvent } from "../ipc/app-event";
 import { useModelsStore } from "./models";
 import { withDiarizationEnabled } from "./diarization-settings";
+import { withGpuAcceleration } from "./gpu-acceleration-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
 import type { Theme } from "../ipc/bindings";
 
@@ -64,6 +65,13 @@ export type RecordingStore = {
    * same round-trip-through-settings pattern as `setSelectedDevice`.
    */
   setDiarizationEnabled: (enabled: boolean) => Promise<void>;
+  /**
+   * Toggle the runtime GPU-acceleration setting (on by default), persisting via
+   * `commands.updateSettings` so the choice survives an app restart — the same
+   * round-trip-through-settings pattern as `setDiarizationEnabled`. When off,
+   * inference runs on CPU even in a GPU-feature build.
+   */
+  setGpuAcceleration: (enabled: boolean) => Promise<void>;
   /**
    * Set the UI colour-scheme preference, persisting via `commands.updateSettings`
    * (the same round-trip-through-settings pattern as `setSelectedDevice`). Used
@@ -198,6 +206,25 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withDiarizationEnabled(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setGpuAcceleration: async (enabled) => {
+    // Persist via `update_settings` so the choice survives an app restart, the
+    // same round-trip-through-settings pattern `setDiarizationEnabled` uses.
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withGpuAcceleration(current, enabled);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

@@ -48,6 +48,21 @@ const fn default_autosave_interval_secs() -> u32 {
     5
 }
 
+/// Default GPU-acceleration toggle.
+///
+/// GPU is **on by default** (`true`): a GPU-feature build (Vulkan/Metal/etc.)
+/// offloads inference to the device, and llama.cpp falls back to CPU at runtime
+/// when no device is present, so defaulting to `true` is safe even on CPU-only
+/// machines. An older store written before this field existed deserialises to
+/// `true` via `#[serde(default = ...)]`, preserving the prior compile-time
+/// behaviour (a GPU build offloaded; a CPU build did not — see below). The flag
+/// is only effective in a GPU-feature build: a default CPU-only build always runs
+/// on CPU regardless of this setting. See `architecture/cross-cutting.md` —
+/// "GPU portability".
+const fn default_gpu_acceleration() -> bool {
+    true
+}
+
 /// Default summary system prompt (FR-28).
 ///
 /// A model-agnostic instruction asking for a structured meeting summary:
@@ -142,6 +157,19 @@ pub struct Settings {
     /// users see onboarding once on upgrade — acceptable for a pre-release).
     #[serde(default)]
     pub onboarding_completed: bool,
+
+    /// Whether GPU acceleration is used at runtime when the build supports it.
+    ///
+    /// GPU offload happens ONLY when BOTH (a) the build was compiled with a GPU
+    /// feature (`vulkan`/`metal`/`cuda`/`rocm`) AND (b) this setting is `true`.
+    /// When `false`, inference runs on CPU (`n_gpu_layers = 0`) even in a
+    /// GPU-feature build — the runtime escape hatch for weak GPUs / driver
+    /// trouble. `#[serde(default = ...)]` defaults to `true` (GPU on); an older
+    /// store written before this field existed deserialises to `true`. In a
+    /// default CPU-only build the flag has no effect (inference is always on
+    /// CPU). See `architecture/cross-cutting.md` — "GPU portability".
+    #[serde(default = "default_gpu_acceleration")]
+    pub gpu_acceleration: bool,
 }
 
 impl Default for Settings {
@@ -156,6 +184,7 @@ impl Default for Settings {
             llm_model_id: None,
             diarization_enabled: false,
             onboarding_completed: false,
+            gpu_acceleration: default_gpu_acceleration(),
         }
     }
 }
@@ -193,6 +222,7 @@ mod tests {
             llm_model_id: Some(ModelId::from("gemma-4-e4b-it-q4_k_m")),
             diarization_enabled: true,
             onboarding_completed: true,
+            gpu_acceleration: false,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -362,6 +392,47 @@ mod tests {
             "missing onboarding_completed must deserialise to false"
         );
         assert!(restored.diarization_enabled);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1f. gpu_acceleration: default + round-trip + missing-field
+    //     deserialisation (runtime GPU toggle)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gpu_acceleration_defaults_to_true() {
+        assert!(
+            Settings::default().gpu_acceleration,
+            "GPU acceleration is on by default; a GPU-feature build offloads, a \
+             CPU-only build ignores the flag (llama.cpp falls back to CPU)"
+        );
+    }
+
+    #[test]
+    fn gpu_acceleration_round_trips() {
+        let original = Settings {
+            gpu_acceleration: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(!restored.gpu_acceleration);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_gpu_acceleration_field_defaults_to_true() {
+        // A settings store written before `gpu_acceleration` existed must
+        // deserialise to `true`, preserving the prior compile-time behaviour
+        // (a GPU build offloaded by default).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            restored.gpu_acceleration,
+            "missing gpu_acceleration must deserialise to true (GPU on by default)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
     }
 
     // -----------------------------------------------------------------------

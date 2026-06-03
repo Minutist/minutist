@@ -242,9 +242,10 @@
   border-color: var(--rule-strong);
 }
 
-/* --- Phase 6 diarization-enabled toggle --------------------------------- */
+/* --- Header settings toggles (diarization, GPU acceleration) ------------ */
 
-.main-window__diarize-toggle {
+.main-window__diarize-toggle,
+.main-window__gpu-toggle {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
@@ -256,17 +257,20 @@
   user-select: none;
 }
 
-.main-window__diarize-toggle input {
+.main-window__diarize-toggle input,
+.main-window__gpu-toggle input {
   /* The single oxblood accent drives the native checkbox tick. */
   accent-color: var(--accent);
   cursor: pointer;
 }
 
-.main-window__diarize-toggle input:disabled {
+.main-window__diarize-toggle input:disabled,
+.main-window__gpu-toggle input:disabled {
   cursor: default;
 }
 
-.main-window__diarize-toggle:hover {
+.main-window__diarize-toggle:hover,
+.main-window__gpu-toggle:hover {
   color: var(--ink-soft);
 }
 

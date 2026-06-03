@@ -138,7 +138,7 @@ fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
 // GPU offload policy
 // ---------------------------------------------------------------------------
 
-/// Number of model layers to offload to the GPU, decided at compile time.
+/// Compile-time GPU-offload ceiling for this build.
 ///
 /// The crate's `vulkan`/`metal`/`cuda`/`rocm` Cargo features each forward to the
 /// matching `llama-cpp-2` backend feature, compiling a GPU-capable llama.cpp. If
@@ -151,7 +151,13 @@ fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
 ///   "offload all layers". llama.cpp falls back to CPU at runtime when no device
 ///   is present, so this is safe on machines without a GPU.
 /// - **No GPU feature (default build)** → `0`. CPU-only; no GPU SDK required.
-const fn default_n_gpu_layers() -> u32 {
+///
+/// This is the **compile-time ceiling** and the `Default` source for
+/// [`AsrRuntimeConfig::n_gpu_layers`]. The actual per-run layer count is now a
+/// **runtime** decision: the orchestrator sets `config.n_gpu_layers` from this
+/// value when the `gpu_acceleration` setting is on, or `0` to force CPU even in a
+/// GPU build (see `architecture/cross-cutting.md` — "GPU portability").
+pub const fn default_n_gpu_layers() -> u32 {
     #[cfg(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm"))]
     {
         u32::MAX
@@ -160,14 +166,6 @@ const fn default_n_gpu_layers() -> u32 {
     {
         0
     }
-}
-
-/// Whether the mtmd encoder should use the GPU, decided at compile time.
-///
-/// Mirrors [`default_n_gpu_layers`]: `true` when any GPU feature is enabled (so
-/// the audio encoder runs on the same device as the model), `false` otherwise.
-const fn default_mtmd_use_gpu() -> bool {
-    cfg!(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm"))
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +185,14 @@ pub struct AsrRuntimeConfig {
     pub n_batch: u32,
     /// Maximum tokens to generate per call. Default: 256.
     pub max_tokens: i32,
+    /// Number of model layers to offload to the GPU.
+    ///
+    /// Default is the compile-time [`default_n_gpu_layers`] (`u32::MAX` in a
+    /// GPU-feature build, `0` otherwise). The mtmd encoder's `use_gpu` flag is
+    /// derived from this at model-open time (`> 0` → GPU). The caller (the
+    /// orchestrator) sets this at **runtime** from the `gpu_acceleration`
+    /// setting, passing `0` to force CPU even in a GPU build.
+    pub n_gpu_layers: u32,
 }
 
 impl Default for AsrRuntimeConfig {
@@ -197,6 +203,7 @@ impl Default for AsrRuntimeConfig {
             n_ctx: NonZeroU32::new(4096).expect("4096 is non-zero"),
             n_batch: 512,
             max_tokens: 256,
+            n_gpu_layers: default_n_gpu_layers(),
         }
     }
 }
@@ -246,8 +253,13 @@ impl AsrRuntime {
             }));
         }
 
+        // GPU offload is a RUNTIME decision driven by `config.n_gpu_layers`
+        // (the orchestrator sets it from the `gpu_acceleration` setting; the
+        // `Default` is the compile-time ceiling). `0` forces CPU even in a
+        // GPU-feature build. See `architecture/cross-cutting.md` — "GPU
+        // portability".
         let model_params =
-            LlamaModelParams::default().with_n_gpu_layers(default_n_gpu_layers());
+            LlamaModelParams::default().with_n_gpu_layers(config.n_gpu_layers);
         let model = LlamaModel::load_from_file(backend, model_path, &model_params)
             .map_err(|e| {
                 AppError::from(Error::ModelLoad {
@@ -269,8 +281,11 @@ impl AsrRuntime {
                 context: "path is not valid UTF-8".to_string(),
             }))?;
 
+        // The mtmd encoder follows the same runtime decision as the model: it
+        // uses the GPU iff layers are being offloaded (`n_gpu_layers > 0`), so
+        // forcing CPU (`n_gpu_layers = 0`) keeps the encoder on CPU too.
         let mtmd_params = MtmdContextParams {
-            use_gpu: default_mtmd_use_gpu(),
+            use_gpu: config.n_gpu_layers > 0,
             print_timings: false,
             n_threads: config.threads,
             media_marker: CString::new(mtmd_default_marker())
@@ -608,12 +623,54 @@ mod tests {
         )) {
             // GPU build: offload all layers (clamped to i32::MAX downstream).
             assert_eq!(n, u32::MAX, "GPU build must offload all layers");
-            assert!(default_mtmd_use_gpu(), "GPU build must enable mtmd GPU");
         } else {
             // Default build: CPU-only.
             assert_eq!(n, 0, "default build must keep model on CPU");
-            assert!(!default_mtmd_use_gpu(), "default build must disable mtmd GPU");
         }
+    }
+
+    /// The config default's `n_gpu_layers` is the compile-time ceiling, and the
+    /// derived mtmd `use_gpu` (`n_gpu_layers > 0`) matches the build features.
+    #[test]
+    fn config_default_n_gpu_layers_matches_build_features() {
+        let cfg = AsrRuntimeConfig::default();
+        assert_eq!(cfg.n_gpu_layers, default_n_gpu_layers());
+        if cfg!(any(
+            feature = "vulkan",
+            feature = "metal",
+            feature = "cuda",
+            feature = "rocm"
+        )) {
+            assert_eq!(cfg.n_gpu_layers, u32::MAX, "GPU build offloads all layers");
+            assert!(cfg.n_gpu_layers > 0, "GPU build derives mtmd use_gpu = true");
+        } else {
+            assert_eq!(cfg.n_gpu_layers, 0, "default build stays on CPU");
+            let use_gpu = cfg.n_gpu_layers > 0; // the derivation the open site uses
+            assert!(!use_gpu, "default build derives mtmd use_gpu = false");
+        }
+    }
+
+    /// Forcing `n_gpu_layers = 0` (the runtime GPU-off path) derives
+    /// `use_gpu = false` regardless of the compiled backend — the CPU escape
+    /// hatch. This asserts the pure derivation the open site uses
+    /// (`config.n_gpu_layers > 0`), so it needs no model.
+    #[test]
+    fn forced_zero_gpu_layers_yields_use_gpu_false() {
+        let cfg = AsrRuntimeConfig {
+            n_gpu_layers: 0,
+            ..AsrRuntimeConfig::default()
+        };
+        assert_eq!(cfg.n_gpu_layers, 0);
+        // The open site computes `use_gpu` as `config.n_gpu_layers > 0`.
+        let use_gpu = cfg.n_gpu_layers > 0;
+        assert!(!use_gpu, "n_gpu_layers = 0 must keep the mtmd encoder on CPU");
+
+        // A non-zero override flips it the other way.
+        let cfg_gpu = AsrRuntimeConfig {
+            n_gpu_layers: u32::MAX,
+            ..AsrRuntimeConfig::default()
+        };
+        assert!(cfg_gpu.n_gpu_layers > 0, "non-zero layers enable mtmd GPU");
     }
 
     /// (no-model, always runs) — loading from a nonexistent path must

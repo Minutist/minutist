@@ -549,12 +549,17 @@ pub async fn summarise_meeting(
 
     let meetings_dir = state.meetings_dir.clone();
     let system_prompt = settings.summary_system_prompt.clone();
+    // GPU offload is a runtime decision: only when BOTH the build has a GPU
+    // feature AND the `gpu_acceleration` setting is on. `resolve_summariser_gpu_layers`
+    // returns the compile-time ceiling when on, `0` (force CPU) when off (see
+    // `architecture/cross-cutting.md` — "GPU portability").
+    let n_gpu_layers = resolve_summariser_gpu_layers(settings.gpu_acceleration);
 
     // Heavy, synchronous summariser work on a blocking thread. The summariser
     // is constructed inside the closure so the GGUF load happens off the async
     // worker threads.
     let summary_md = tokio::task::spawn_blocking(move || {
-        let summariser = open_summariser_in_dir(&model_dir)?;
+        let summariser = open_summariser_in_dir(&model_dir, n_gpu_layers)?;
         summarise_meeting_inner(&meetings_dir, meeting_id, &summariser, &system_prompt)
     })
     .await
@@ -674,16 +679,44 @@ fn save_summary_inner(
     persistence::write_summary(&meeting_dir, summary_markdown)
 }
 
+/// Resolve the summariser `n_gpu_layers` from the runtime `gpu_acceleration`
+/// setting.
+///
+/// GPU offload happens ONLY when BOTH (a) the build was compiled with a GPU
+/// feature AND (b) the setting is on. `enabled == true` → the compile-time
+/// ceiling [`summariser::gpu_layers`] (already `0` in a default CPU-only build,
+/// so a CPU build is unaffected by the flag); `enabled == false` → `0` (force
+/// CPU even in a GPU build). Pure + unit-tested so the wiring is verified
+/// without a model. See `architecture/cross-cutting.md` — "GPU portability".
+fn resolve_summariser_gpu_layers(enabled: bool) -> u32 {
+    if enabled {
+        summariser::gpu_layers()
+    } else {
+        0
+    }
+}
+
 /// Open a [`LlamaSummariser`] over the single `.gguf` weights file in
 /// `model_dir`, skipping any `mmproj-*` multimodal projector.
+///
+/// `n_gpu_layers` is the runtime-resolved GPU-offload count (see
+/// [`resolve_summariser_gpu_layers`]); it is set on the `SummariserConfig` so
+/// the summariser honours the `gpu_acceleration` setting.
 ///
 /// The LLM is text-only (the bundled Gemma 4 GGUF ships without a projector),
 /// but the helper defends against a directory that also contains an `mmproj-*`
 /// file so the wrong file is never loaded. A missing or ambiguous weights file
 /// is an `AppError::ModelLoad`.
-fn open_summariser_in_dir(model_dir: &Path) -> Result<LlamaSummariser, AppError> {
+fn open_summariser_in_dir(
+    model_dir: &Path,
+    n_gpu_layers: u32,
+) -> Result<LlamaSummariser, AppError> {
     let gguf_path = find_gguf_weights(model_dir)?;
-    LlamaSummariser::open(gguf_path, SummariserConfig::default())
+    let config = SummariserConfig {
+        n_gpu_layers,
+        ..SummariserConfig::default()
+    };
+    LlamaSummariser::open(gguf_path, config)
 }
 
 /// Locate the single non-`mmproj` `.gguf` file in `model_dir`.
@@ -1261,6 +1294,31 @@ mod tests {
             resolve_llm_model_id(&settings),
             ModelId::from("granite-4.1-3b-q4_k_m")
         );
+    }
+
+    /// GPU off (`gpu_acceleration = false`) MUST force CPU (`0`); GPU on MUST
+    /// resolve to the compile-time ceiling — itself `0` in the default CPU-only
+    /// build, so a CPU build is unaffected by the flag. Pure, no model.
+    #[test]
+    fn resolve_summariser_gpu_layers_off_forces_cpu() {
+        assert_eq!(resolve_summariser_gpu_layers(false), 0, "GPU off must force CPU");
+
+        let on = resolve_summariser_gpu_layers(true);
+        assert_eq!(
+            on,
+            summariser::gpu_layers(),
+            "GPU on must use the compile-time ceiling"
+        );
+        if cfg!(any(
+            feature = "vulkan",
+            feature = "metal",
+            feature = "cuda",
+            feature = "rocm"
+        )) {
+            assert_eq!(on, u32::MAX, "a GPU-feature build offloads all layers when on");
+        } else {
+            assert_eq!(on, 0, "a default CPU-only build stays on CPU even when on");
+        }
     }
 
     /// An unset `settings.llm_model_id` falls back to the bundled default.

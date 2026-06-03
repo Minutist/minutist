@@ -293,14 +293,25 @@ pub(crate) struct RunnerHandle {
 /// `event_tx`       — the orchestrator's broadcast sender for `AppEvent`.
 /// `model_registry` — used to locate the ASR model on first flush.
 /// `meeting_id`     — used when emitting `TranscriptSegment` events.
+/// `n_gpu_layers`   — runtime-resolved GPU-offload count (from the
+///                    `gpu_acceleration` setting via [`resolve_gpu_layers`]).
 pub(crate) fn spawn_runner(
     streams: AudioStreams,
     writer: MeetingWriter,
     event_tx: broadcast::Sender<AppEvent>,
     model_registry: Arc<ModelRegistry>,
     meeting_id: MeetingId,
+    n_gpu_layers: u32,
 ) -> RunnerHandle {
-    spawn_runner_inner(streams, writer, event_tx, model_registry, meeting_id, None)
+    spawn_runner_inner(
+        streams,
+        writer,
+        event_tx,
+        model_registry,
+        meeting_id,
+        n_gpu_layers,
+        None,
+    )
 }
 
 /// Internal spawn function shared by production and test paths.
@@ -310,6 +321,7 @@ fn spawn_runner_inner(
     event_tx: broadcast::Sender<AppEvent>,
     model_registry: Arc<ModelRegistry>,
     meeting_id: MeetingId,
+    n_gpu_layers: u32,
     prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
 ) -> RunnerHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RunnerCommand>(8);
@@ -330,6 +342,7 @@ fn spawn_runner_inner(
             worker_flush_queue,
             prebuilt_backend,
             asr_registry,
+            n_gpu_layers,
             asr_event_tx,
             writer_cmd_tx,
         );
@@ -367,12 +380,15 @@ pub(crate) fn spawn_runner_with_backend(
     meeting_id: MeetingId,
     backend: Box<dyn AsrBackend + Send>,
 ) -> RunnerHandle {
+    // The prebuilt backend is used directly, so the lazy production-path
+    // `n_gpu_layers` is moot here — pass the compile-time ceiling for parity.
     spawn_runner_inner(
         streams,
         writer,
         event_tx,
         model_registry,
         meeting_id,
+        asr_runtime::default_n_gpu_layers(),
         Some(backend),
     )
 }
@@ -752,12 +768,17 @@ fn dispatch_flush_inner(
 /// (test injection path). When `None`, the `AsrRuntime` is lazy-initialised
 /// on the first flush from the `model_registry` (production path).
 ///
+/// `n_gpu_layers`: the runtime-resolved GPU-offload count (from the
+/// `gpu_acceleration` setting via [`resolve_gpu_layers`]) applied to the lazily
+/// built production `AsrRuntime`.
+///
 /// One flush is in-flight at a time: the worker pops one payload, processes
 /// it fully, then waits for the next notification.
 fn run_asr_worker(
     flush_queue: FlushQueue,
     prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
     model_registry: Arc<ModelRegistry>,
+    n_gpu_layers: u32,
     event_tx: broadcast::Sender<AppEvent>,
     writer_cmd_tx: mpsc::Sender<WriterCommand>,
 ) {
@@ -860,7 +881,7 @@ fn run_asr_worker(
         } else {
             // Lazy-initialise AsrRuntime on the first flush (production path).
             if lazy_runtime.is_none() {
-                let result = rt.block_on(init_asr_runtime(&model_registry));
+                let result = rt.block_on(init_asr_runtime(&model_registry, n_gpu_layers));
                 match result {
                     Ok(Some(runtime)) => {
                         lazy_runtime = Some(runtime);
@@ -930,11 +951,35 @@ fn run_asr_worker(
     }
 }
 
+/// Resolve the ASR `n_gpu_layers` from the runtime `gpu_acceleration` setting.
+///
+/// GPU offload happens ONLY when BOTH (a) the build was compiled with a GPU
+/// feature AND (b) the setting is on. `enabled == true` → the compile-time
+/// ceiling [`asr_runtime::default_n_gpu_layers`] (which is already `0` in a
+/// default CPU-only build, so a CPU build is unaffected by the flag);
+/// `enabled == false` → `0` (force CPU even in a GPU build). Pure + unit-tested
+/// so the wiring is verified without a model. See `architecture/cross-cutting.md`
+/// — "GPU portability".
+pub(crate) fn resolve_gpu_layers(enabled: bool) -> u32 {
+    if enabled {
+        asr_runtime::default_n_gpu_layers()
+    } else {
+        0
+    }
+}
+
 /// Lazily initialise `AsrRuntime` on the first flush.
+///
+/// `n_gpu_layers` is the runtime-resolved GPU-offload count (see
+/// [`resolve_gpu_layers`]); it is set on the `AsrRuntimeConfig` so the model and
+/// the mtmd encoder honour the `gpu_acceleration` setting.
 ///
 /// Returns `Ok(None)` if the model is not yet available (caller should skip
 /// the flush). Returns `Ok(Some(runtime))` when initialisation succeeded.
-async fn init_asr_runtime(model_registry: &ModelRegistry) -> AppResult<Option<AsrRuntime>> {
+async fn init_asr_runtime(
+    model_registry: &ModelRegistry,
+    n_gpu_layers: u32,
+) -> AppResult<Option<AsrRuntime>> {
     let model_id = ModelId::from(ASR_MODEL_ID);
 
     // Fast path: check whether the model is available.
@@ -966,7 +1011,11 @@ async fn init_asr_runtime(model_registry: &ModelRegistry) -> AppResult<Option<As
     })?;
     let mmproj_path = find_file_in_dir(&model_dir, |name| name.contains("mmproj"))?;
 
-    match AsrRuntime::new(&gguf_path, &mmproj_path, AsrRuntimeConfig::default()) {
+    let config = AsrRuntimeConfig {
+        n_gpu_layers,
+        ..AsrRuntimeConfig::default()
+    };
+    match AsrRuntime::new(&gguf_path, &mmproj_path, config) {
         Ok(runtime) => {
             tracing::info!(
                 target: "orchestrator",
@@ -1457,14 +1506,18 @@ fn transcribe_one_flush(
 /// Resolve and construct the production `AsrRuntime` for the re-transcribe path.
 ///
 /// Reuses the live-path model-resolution logic ([`init_asr_runtime`]): the ASR
-/// model must already be `Available` in the registry. Returns `Ok(None)` when
-/// the model is not available (the caller surfaces this as an error, since an
-/// explicit user-triggered re-transcribe with no model is a failure, unlike the
-/// live path's best-effort skip).
+/// model must already be `Available` in the registry. `n_gpu_layers` is the
+/// runtime-resolved GPU-offload count (from the `gpu_acceleration` setting via
+/// [`resolve_gpu_layers`]), so an offline re-transcribe honours the same GPU
+/// toggle as the live path. Returns `Ok(None)` when the model is not available
+/// (the caller surfaces this as an error, since an explicit user-triggered
+/// re-transcribe with no model is a failure, unlike the live path's best-effort
+/// skip).
 pub(crate) async fn build_asr_runtime_for_retranscribe(
     model_registry: &ModelRegistry,
+    n_gpu_layers: u32,
 ) -> AppResult<Option<AsrRuntime>> {
-    init_asr_runtime(model_registry).await
+    init_asr_runtime(model_registry, n_gpu_layers).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1629,6 +1682,36 @@ mod tests {
     // Convenience: ms-to-sample count at 16 kHz.
     fn ms_to_samples(ms: u64) -> usize {
         (ms as usize * SAMPLE_RATE_HZ as usize) / 1000
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_gpu_layers — the runtime GPU toggle wiring (pure, no model)
+    // -----------------------------------------------------------------------
+
+    /// GPU off (`gpu_acceleration = false`) MUST force CPU (`0`), regardless of
+    /// the compiled backend. GPU on MUST resolve to the compile-time ceiling —
+    /// which is itself `0` in the default CPU-only build, so a CPU build is
+    /// unaffected by the flag.
+    #[test]
+    fn resolve_gpu_layers_off_forces_cpu() {
+        assert_eq!(resolve_gpu_layers(false), 0, "GPU off must force CPU");
+
+        let on = resolve_gpu_layers(true);
+        assert_eq!(
+            on,
+            asr_runtime::default_n_gpu_layers(),
+            "GPU on must use the compile-time ceiling"
+        );
+        if cfg!(any(
+            feature = "vulkan",
+            feature = "metal",
+            feature = "cuda",
+            feature = "rocm"
+        )) {
+            assert_eq!(on, u32::MAX, "a GPU-feature build offloads all layers when on");
+        } else {
+            assert_eq!(on, 0, "a default CPU-only build stays on CPU even when on");
+        }
     }
 
     // -----------------------------------------------------------------------

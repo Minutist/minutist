@@ -677,7 +677,20 @@ diarization_enabled?: boolean;
  * written before this field existed deserialises to `false` (so existing
  * users see onboarding once on upgrade — acceptable for a pre-release).
  */
-onboarding_completed?: boolean }
+onboarding_completed?: boolean; 
+/**
+ * Whether GPU acceleration is used at runtime when the build supports it.
+ * 
+ * GPU offload happens ONLY when BOTH (a) the build was compiled with a GPU
+ * feature (`vulkan`/`metal`/`cuda`/`rocm`) AND (b) this setting is `true`.
+ * When `false`, inference runs on CPU (`n_gpu_layers = 0`) even in a
+ * GPU-feature build — the runtime escape hatch for weak GPUs / driver
+ * trouble. `#[serde(default = ...)]` defaults to `true` (GPU on); an older
+ * store written before this field existed deserialises to `true`. In a
+ * default CPU-only build the flag has no effect (inference is always on
+ * CPU). See `architecture/cross-cutting.md` — "GPU portability".
+ */
+gpu_acceleration?: boolean }
 /**
  * UI colour-scheme preference.
  */

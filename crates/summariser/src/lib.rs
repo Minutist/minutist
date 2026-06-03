@@ -72,6 +72,14 @@ pub struct SummariserConfig {
     /// CPU threads for llama.cpp inference. Default: `(num_cpus / 2).min(8)`,
     /// min 1 — matching `asr-runtime`.
     pub threads: i32,
+    /// Number of model layers to offload to the GPU.
+    ///
+    /// Default is the compile-time [`gpu_layers`] ceiling (`u32::MAX` in a
+    /// GPU-feature build, `0` otherwise). The caller (`ipc-bridge`) sets this at
+    /// **runtime** from the `gpu_acceleration` setting, passing `0` to force CPU
+    /// even in a GPU build. See `architecture/cross-cutting.md` — "GPU
+    /// portability".
+    pub n_gpu_layers: u32,
 }
 
 impl Default for SummariserConfig {
@@ -84,6 +92,7 @@ impl Default for SummariserConfig {
             n_batch: 512,
             max_tokens: 2_048,
             threads,
+            n_gpu_layers: gpu_layers(),
         }
     }
 }
@@ -106,14 +115,20 @@ fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
     })
 }
 
-/// Number of model layers to offload to the GPU, selected at build time.
+/// Compile-time GPU-offload ceiling for this build.
 ///
 /// CPU-only by default (`0`); when any GPU backend feature (`vulkan` / `metal`
 /// / `cuda` / `rocm`) is compiled in, offload all layers. `u32::MAX` is clamped
 /// to `i32::MAX` by `with_n_gpu_layers`, which llama.cpp interprets as "every
 /// layer". The features only forward to `llama-cpp-2`; the layer count is the
 /// summariser's responsibility (mirrors `asr-runtime`).
-const fn gpu_layers() -> u32 {
+///
+/// This is the **compile-time ceiling** and the `Default` source for
+/// [`SummariserConfig::n_gpu_layers`]. The actual per-run layer count is a
+/// **runtime** decision: `ipc-bridge` sets `config.n_gpu_layers` from this value
+/// when the `gpu_acceleration` setting is on, or `0` to force CPU even in a GPU
+/// build (see `architecture/cross-cutting.md` — "GPU portability").
+pub const fn gpu_layers() -> u32 {
     #[cfg(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm"))]
     {
         u32::MAX
@@ -161,12 +176,13 @@ impl LlamaSummariser {
             .into());
         }
 
-        // GPU offload is selected at build time (Phase 7, see
-        // `cross-cutting.md` "GPU portability"): when a backend feature is
-        // compiled in, offload all layers; otherwise stay CPU-only. `u32::MAX`
-        // clamps to `i32::MAX` inside `with_n_gpu_layers`, which llama.cpp reads
-        // as "offload every layer".
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(gpu_layers());
+        // GPU offload is a RUNTIME decision driven by `config.n_gpu_layers`
+        // (`ipc-bridge` sets it from the `gpu_acceleration` setting; the
+        // `Default` is the compile-time ceiling). `0` forces CPU even in a
+        // GPU-feature build. `u32::MAX` clamps to `i32::MAX` inside
+        // `with_n_gpu_layers`, which llama.cpp reads as "offload every layer".
+        // See `architecture/cross-cutting.md` — "GPU portability".
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(config.n_gpu_layers);
         let model =
             LlamaModel::load_from_file(backend, &model_path, &model_params).map_err(|e| {
                 Error::ModelLoad {
@@ -647,6 +663,31 @@ mod tests {
         assert_eq!(gpu_layers(), u32::MAX, "a GPU feature must offload all layers");
         #[cfg(not(any(feature = "vulkan", feature = "metal", feature = "cuda", feature = "rocm")))]
         assert_eq!(gpu_layers(), 0, "the default build must stay CPU-only");
+    }
+
+    /// The config default's `n_gpu_layers` is the compile-time ceiling.
+    #[test]
+    fn config_default_n_gpu_layers_is_compile_time_ceiling() {
+        assert_eq!(SummariserConfig::default().n_gpu_layers, gpu_layers());
+    }
+
+    /// Forcing `n_gpu_layers = 0` (the runtime GPU-off path) keeps the layer
+    /// count at zero regardless of the compiled backend — the CPU escape hatch
+    /// `with_n_gpu_layers(0)` passes through verbatim. No model needed.
+    #[test]
+    fn config_forced_zero_gpu_layers_stays_zero() {
+        let cfg = SummariserConfig {
+            n_gpu_layers: 0,
+            ..SummariserConfig::default()
+        };
+        assert_eq!(cfg.n_gpu_layers, 0, "forced CPU keeps n_gpu_layers = 0");
+
+        // A non-zero override is preserved too (the GPU-on path).
+        let cfg_gpu = SummariserConfig {
+            n_gpu_layers: u32::MAX,
+            ..SummariserConfig::default()
+        };
+        assert_eq!(cfg_gpu.n_gpu_layers, u32::MAX);
     }
 
     // -----------------------------------------------------------------------

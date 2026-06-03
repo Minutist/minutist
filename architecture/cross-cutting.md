@@ -500,14 +500,30 @@ SDK installed. Feature names match the backend they enable:
   there is no Vulkan/Metal diarization backend, so on those platforms the
   diarizer stays on the ONNX Runtime CPU EP.
 
-Enabling a feature also offloads work to the device: `asr-runtime` and
-`summariser` set `n_gpu_layers` (via a cfg-gated `gpu_layers()`/
-`default_n_gpu_layers()` → `u32::MAX`, clamped to `i32::MAX` = "all layers")
-ONLY when a GPU feature is compiled in; the default build passes `0` (CPU). The
-mtmd `use_gpu` flag follows the same cfg. llama.cpp falls back to CPU at runtime
-when no device is present, so a GPU-feature build is still safe on a CPU-only
-machine. (Before this, the features compiled a GPU backend but the code
-hard-coded `n_gpu_layers(0)`, so they offloaded nothing.)
+Enabling a feature also offloads work to the device, but the layer count is a
+**runtime** decision driven by the `settings.gpu_acceleration` flag (on by
+default). GPU offload happens ONLY when BOTH (a) the build was compiled with a
+GPU feature AND (b) `gpu_acceleration` is `true`. When the flag is `false`,
+inference runs on CPU (`n_gpu_layers = 0`) even in a GPU-feature build — the
+runtime escape hatch for weak GPUs / driver trouble. In a default CPU-only build
+the flag has no effect (the compile-time ceiling is already `0`).
+
+Wiring: `asr-runtime`'s `AsrRuntimeConfig` and `summariser`'s `SummariserConfig`
+each carry a `n_gpu_layers: u32` field whose `Default` is the cfg-gated
+compile-time ceiling (`default_n_gpu_layers()` / `gpu_layers()` → `u32::MAX`,
+clamped to `i32::MAX` = "all layers", when a GPU feature is compiled in, else
+`0`). The model-open site uses `config.n_gpu_layers` for `with_n_gpu_layers(...)`,
+and the mtmd `use_gpu` is derived from `config.n_gpu_layers > 0`. The callers
+resolve the runtime value from the setting: the orchestrator
+(`runner::resolve_gpu_layers(enabled)`) for the live + offline-re-transcribe ASR
+path, and `ipc-bridge`'s `summarise_meeting`
+(`resolve_summariser_gpu_layers(enabled)`) for the summariser — each returning
+the compile-time ceiling when the flag is on, `0` when off. llama.cpp falls back
+to CPU at runtime when no device is present, so a GPU-feature build is still safe
+on a CPU-only machine. (Before this, the layer count was purely compile-time; the
+runtime flag now lets a GPU build be forced to CPU. Before *that*, the features
+compiled a GPU backend but the code hard-coded `n_gpu_layers(0)`, so they
+offloaded nothing.)
 
 The features fan out through a single chain so the app binary is the only place
 a backend is chosen: `meeting-app` (src-tauri) → `ipc-bridge` → {`summariser`,

@@ -246,12 +246,18 @@ impl Orchestrator {
             }
         };
 
+        // GPU offload is a runtime decision: only when BOTH the build has a GPU
+        // feature AND the `gpu_acceleration` setting is on (see
+        // `architecture/cross-cutting.md` — "GPU portability"). `resolve_gpu_layers`
+        // returns the compile-time ceiling when on, `0` (force CPU) when off.
+        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
         let runner_handle = runner::spawn_runner(
             streams,
             writer,
             self.event_tx.clone(),
             Arc::clone(&self.model_registry),
             meeting_id,
+            n_gpu_layers,
         );
 
         guard.capture = Some(capture);
@@ -591,6 +597,11 @@ impl Orchestrator {
         let registry = Arc::clone(&self.model_registry);
         let event_tx = self.event_tx.clone();
         let meeting_dir_for_blocking = meeting_dir.clone();
+        // Resolve the runtime GPU-offload count from the `gpu_acceleration`
+        // setting before entering the blocking closure (it cannot read
+        // `self.settings`). The offline re-transcribe honours the same GPU
+        // toggle as the live path.
+        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
 
         let segments: Vec<Segment> = tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
             // Decode pause-INCLUDING PCM.
@@ -607,7 +618,7 @@ impl Orchestrator {
                     context: format!("re_transcribe runtime build failed: {e}"),
                 })?;
 
-            let mut runtime = match rt.block_on(runner::build_asr_runtime_for_retranscribe(&registry))? {
+            let mut runtime = match rt.block_on(runner::build_asr_runtime_for_retranscribe(&registry, n_gpu_layers))? {
                 Some(r) => r,
                 None => {
                     return Err(AppError::ModelLoad {
@@ -1006,12 +1017,14 @@ impl Orchestrator {
             }
         };
 
+        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
         let runner_handle = runner::spawn_runner(
             streams,
             writer,
             self.event_tx.clone(),
             Arc::clone(&self.model_registry),
             meeting_id,
+            n_gpu_layers,
         );
         guard.runner = Some(runner_handle);
         // No AudioCaptureManager to store (guard.capture stays None).

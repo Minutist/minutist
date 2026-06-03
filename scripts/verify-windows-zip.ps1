@@ -2,8 +2,9 @@
 # Extract the portable zip to a clean folder (NOT target\release) and launch it,
 # to prove the artifact is self-contained: DLLs load and the Silero resource
 # resolves relative to the UNZIPPED exe, then kill it.
+param([string]$Zip = 'C:\Users\anl\meeting-app\dist-windows\meeting-app-windows-x64.zip')
 $ErrorActionPreference = 'Continue'
-$zip  = 'C:\Users\anl\meeting-app\dist-windows\meeting-app-windows-x64.zip'
+$zip  = $Zip
 $dest = 'C:\Users\anl\mapp-zip-smoke'
 if (-not (Test-Path $zip)) { Write-Host ("MISSING: " + $zip); exit 1 }
 if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }

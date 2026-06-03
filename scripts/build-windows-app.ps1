@@ -62,6 +62,13 @@ if (-not $vsPath) {
 Write-Host "==> MSVC env from $vsPath"
 $null = & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -SkipAutomaticLocation
 
+# Dedup PATH. VsDevShell can push PATH past cmd.exe's ~8191-char limit, which
+# truncates the vcvars batch CMake generates for nested ExternalProject custom
+# rules (the Vulkan vulkan-shaders-gen install step) and produces "cannot find
+# batch label VCEnd". Deduping the (often duplicate-heavy) PATH shrinks it.
+$env:PATH = (($env:PATH -split ';') | Where-Object { $_ -ne '' } | Select-Object -Unique) -join ';'
+Write-Host ("==> PATH length after dedup: " + $env:PATH.Length)
+
 Set-Location $build
 
 # GPU/feature builds: use the Ninja generator. llama.cpp's vulkan-shaders-gen

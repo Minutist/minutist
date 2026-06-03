@@ -61,22 +61,29 @@ needed; that decision is deferred until evidence demands it.
 
 ## Bundle topology
 
-**Aspirational — not yet wired.** The layout below is the intended
-packaged shape. It is *not* the current state: `src-tauri/tauri.conf.json`
-has no `bundle.resources` key today, so none of these `resources/`
-sub-trees are actually placed into a packaged build yet. Productionising
-the bundle (resource declarations, per-platform native-lib staging) is
-open work.
+**Partially wired.** `src-tauri/tauri.conf.json` now declares a
+`bundle.resources` entry shipping the Silero VAD ONNX model (see below); the
+native-lib sub-trees (`llama/`, `sherpa/`) and the `ui/` staging remain
+intended-but-not-yet-wired. Productionising the rest of the bundle
+(per-platform native-lib staging) is open work.
 
 ```
 meeting-app(.exe)                          Tauri binary (Rust core + webview host)
-├── resources/                             (intended; no bundle.resources key today)
+├── resources/
+│   └── _up_/resources/silero/             Silero VAD ONNX (wired via bundle.resources)
+│       └── silero_vad_v4.onnx             (~1.8 MB; the `_up_` segment is Tauri's
+│                                           parent-dir-traversal mangling of the
+│                                           "../resources/silero/..." config entry)
+├── resources/                             (intended; not yet wired)
 │   ├── llama/                             llama.cpp shared libs (per platform)
 │   ├── sherpa/                            sherpa-onnx shared libs
 │   └── ui/                                Built React bundle
-└── (no models bundled — downloaded on first run)
+└── (no LLM/ASR/diarizer models bundled — downloaded on first run)
 ```
 
-Models are not in the bundle. The installer is targeted at ~50-100 MB;
-the first-run flow downloads ~2-4 GB of model weights to the app data
-directory.
+The Silero VAD model is the one bundled model file (see
+`cross-cutting.md` "Model lifecycle — Exception: Silero VAD"): app-main resolves
+it at startup via `BaseDirectory::Resource` and plumbs the path to `vad-chunker`
+through `MEETING_APP_SILERO_PATH`. The large ASR / LLM / diarizer weights are
+**not** in the bundle. The installer is targeted at ~50-100 MB; the first-run
+flow downloads ~2-4 GB of model weights to the app data directory.

@@ -276,16 +276,31 @@ Owned by `model-registry`. The contract:
   responsible for tearing down its loaded model and reloading. The
   orchestrator coordinates this — there is no recording during a swap.
 
-**Exception: Silero VAD.** The Silero VAD ONNX file (~1.5 MB) lives in
+**Exception: Silero VAD.** The Silero VAD ONNX file (~1.8 MB) lives in
 the source tree under `resources/silero/` and is **not** managed by
-`model-registry`. `vad-chunker` resolves it at **build time** via
-`vad_chunker::default_model_path()`: it prefers the `MEETING_APP_SILERO_PATH`
-build-time env var (`option_env!`), falling back to a source-tree path
-relative to `CARGO_MANIFEST_DIR`. It is *not* wired into the Tauri
-bundle today (`tauri.conf.json` `bundle` has no `resources` key — see
-"Bundle topology" in `containers.md`), so a packaged installer would not
-ship it via the current config; productionising the packaged path is
-still open. The rationale for keeping it outside the registry: Silero is
+`model-registry`. It **is bundled as a Tauri resource**: `tauri.conf.json`
+`bundle.resources` ships `"../resources/silero/silero_vad_v4.onnx"`, which the
+bundler places under the package resource dir at
+`_up_/resources/silero/silero_vad_v4.onnx` (parent-dir traversal mangled to
+`_up_` by `tauri-utils::resources::resource_relpath`).
+
+Path plumbing: `app-main` resolves the bundled resource at startup (early in
+`setup()`, before the orchestrator is constructed and before any recording) via
+`app.path().resolve("../resources/silero/silero_vad_v4.onnx",
+BaseDirectory::Resource)` — `PathResolver::resolve` applies the same `_up_`
+mangling to its input, so resolving the config-relative pattern yields the
+placed file. If it resolves to an existing file, app-main exports its absolute
+path as the **runtime** env var `MEETING_APP_SILERO_PATH`; otherwise (a dev run
+with no bundle) it leaves the var unset.
+
+`vad-chunker::default_model_path()` reads, in order: (1) the **runtime**
+`MEETING_APP_SILERO_PATH` (app-main's injected bundled path); (2) the
+**build-time** `MEETING_APP_SILERO_PATH` (`option_env!`); (3) a source-tree path
+relative to `CARGO_MANIFEST_DIR` (so `cargo run` / `cargo test -p vad-chunker`
+work with no env var set). This keeps dev and test runs unchanged while letting
+an installed package find the bundled model.
+
+The rationale for keeping it outside the registry: Silero is
 small enough that downloading it on first run adds friction without
 value; it never changes per-user; and a single-file source asset avoids
 forcing every phase that uses VAD to also pull in `model-registry`. This

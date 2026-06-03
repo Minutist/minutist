@@ -519,10 +519,19 @@ impl VadChunker {
 /// Resolve the bundled Silero VAD model path.
 ///
 /// Priority:
-/// 1. `MEETING_APP_SILERO_PATH` environment variable (set at build time or runtime).
-/// 2. `{CARGO_MANIFEST_DIR}/../../resources/silero/silero_vad_v4.onnx` so that
-///    `cargo test -p vad-chunker` finds the file from the crate's directory.
+/// 1. `MEETING_APP_SILERO_PATH` **runtime** environment variable. `app-main`
+///    resolves the bundled Tauri resource at startup and injects its absolute
+///    path here (see `architecture/cross-cutting.md`, "Model lifecycle —
+///    Exception: Silero VAD"), so an installed package finds the model.
+/// 2. `MEETING_APP_SILERO_PATH` **build-time** env var (`option_env!`), kept so
+///    a build that bakes the path in still works.
+/// 3. `{CARGO_MANIFEST_DIR}/../../resources/silero/silero_vad_v4.onnx` so that
+///    `cargo run` / `cargo test -p vad-chunker` find the source-tree file with
+///    no env var set.
 pub fn default_model_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("MEETING_APP_SILERO_PATH") {
+        return std::path::PathBuf::from(p);
+    }
     if let Some(p) = option_env!("MEETING_APP_SILERO_PATH") {
         return std::path::PathBuf::from(p);
     }
@@ -897,5 +906,50 @@ mod tests {
             VadEvent::SegmentStart { start_ms } => Some(*start_ms),
             _ => None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8: runtime MEETING_APP_SILERO_PATH takes precedence over fallbacks
+    // -----------------------------------------------------------------------
+    // app-main injects the resolved bundled-resource path via this runtime env
+    // var (see architecture/cross-cutting.md "Model lifecycle"). When set,
+    // default_model_path() must return it verbatim; when unset, it must fall
+    // back to the source-tree path so dev/cargo-test runs work unchanged.
+    //
+    // MEETING_APP_SILERO_PATH is process-global and cargo runs tests in this
+    // binary on parallel threads, so other tests may call default_model_path()
+    // (via test_chunker) while this test holds the var set. To avoid handing a
+    // bogus path to a parallel chunker open, we set the var to the *real*
+    // source-tree path — the precedence assertion (returned verbatim) still
+    // holds, and a concurrent reader still loads a valid model. This is the
+    // only test that mutates the var; edition-2021 makes set_var safe.
+    #[test]
+    fn test_runtime_env_overrides_default_model_path() {
+        // Unset → source-tree fallback (the committed resources/ path).
+        std::env::remove_var("MEETING_APP_SILERO_PATH");
+        let fallback = default_model_path();
+        assert!(
+            fallback.ends_with("resources/silero/silero_vad_v4.onnx"),
+            "unset env must fall back to the source-tree path; got {}",
+            fallback.display()
+        );
+
+        // Set → returned verbatim, taking precedence over the option_env! +
+        // source-tree fallbacks. Use the canonicalised real model path so a
+        // parallel test_chunker() that reads the var mid-window still loads a
+        // valid model. The runtime value must differ from the bare fallback
+        // (canonical vs relative `..` path) to prove the runtime branch is the
+        // one returning it.
+        let runtime_path = std::fs::canonicalize(&fallback)
+            .expect("source-tree Silero model must exist for this test");
+        std::env::set_var("MEETING_APP_SILERO_PATH", &runtime_path);
+        assert_eq!(
+            default_model_path(),
+            runtime_path,
+            "runtime env var must take precedence and be returned verbatim"
+        );
+
+        // Restore: leave the process env clean for any other test ordering.
+        std::env::remove_var("MEETING_APP_SILERO_PATH");
     }
 }

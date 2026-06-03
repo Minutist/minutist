@@ -36,6 +36,9 @@
     "icon": [
       "icons/32x32.png",
       "icons/16x16.png"
+    ],
+    "resources": [
+      "../resources/silero/silero_vad_v4.onnx"
     ]
   },
   "plugins": {

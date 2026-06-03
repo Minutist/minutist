@@ -157,6 +157,71 @@ fn cleanup_old_logs(log_dir: &std::path::Path, max_days: u64) {
     }
 }
 
+/// Resolve the bundled Silero VAD ONNX model and export its absolute path as
+/// `MEETING_APP_SILERO_PATH` so `vad-chunker::default_model_path()` finds it in
+/// an installed package.
+///
+/// The model is shipped via the `bundle.resources` entry
+/// `"../resources/silero/silero_vad_v4.onnx"` in `tauri.conf.json`. Tauri places
+/// the file under the resource dir with parent-dir traversal mangled to `_up_`
+/// (`tauri-utils::resources::resource_relpath`), and `PathResolver::resolve`
+/// applies the SAME mangling to its input, so resolving the original
+/// config-relative pattern yields the placed path. We also try the
+/// already-mangled relpath as a fallback and pick whichever exists.
+///
+/// In a dev run (`cargo run`, no bundle) the resource does not resolve to an
+/// existing file; we then leave the env var unset and let `vad-chunker`'s
+/// source-tree fallback handle it. The var is set once here, early in `setup`,
+/// before the orchestrator is constructed (edition 2021 → `set_var` is safe).
+fn resolve_silero_model(app: &tauri::AppHandle) {
+    use tauri::path::BaseDirectory;
+
+    // Candidate inputs to `resolve(.., Resource)`. The first mirrors the
+    // `bundle.resources` config entry verbatim; the second is the mangled
+    // relpath the bundler actually writes — both should resolve to the same
+    // placed file, but we try both to be robust to resolver edge cases.
+    const CANDIDATES: [&str; 2] = [
+        "../resources/silero/silero_vad_v4.onnx",
+        "_up_/resources/silero/silero_vad_v4.onnx",
+    ];
+
+    for candidate in CANDIDATES {
+        match app.path().resolve(candidate, BaseDirectory::Resource) {
+            Ok(path) if path.is_file() => {
+                std::env::set_var("MEETING_APP_SILERO_PATH", &path);
+                tracing::info!(
+                    target: "app-main",
+                    path = %path.display(),
+                    "bundled Silero VAD model resolved; MEETING_APP_SILERO_PATH set"
+                );
+                return;
+            }
+            Ok(path) => {
+                tracing::debug!(
+                    target: "app-main",
+                    candidate,
+                    resolved = %path.display(),
+                    "Silero resource candidate did not resolve to an existing file"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "app-main",
+                    candidate,
+                    error = %e,
+                    "failed to resolve Silero resource candidate"
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        target: "app-main",
+        "no bundled Silero VAD model found (dev run); leaving MEETING_APP_SILERO_PATH unset \
+         so vad-chunker uses its source-tree fallback"
+    );
+}
+
 /// The Tauri runtime entry point.
 ///
 /// Accepts the non-blocking writer guard so it stays alive for the process
@@ -195,6 +260,15 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 app_data = %app_data_dir.display(),
                 "app-data directory resolved"
             );
+
+            // Resolve the bundled Silero VAD model and plumb its path to
+            // `vad-chunker` via `MEETING_APP_SILERO_PATH` (see
+            // architecture/cross-cutting.md "Model lifecycle — Exception:
+            // Silero VAD"). MUST run before the orchestrator is constructed and
+            // before any recording, because `vad-chunker::default_model_path()`
+            // reads this env var at chunker-open time. A no-op in a dev run with
+            // no bundle (the source-tree fallback handles that path).
+            resolve_silero_model(&app_handle);
 
             // Prune log files older than 7 days.
             cleanup_old_logs(&logs_dir, 7);

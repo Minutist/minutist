@@ -40,7 +40,7 @@ Write-Host "==> Syncing $src -> $build (including ui\dist; Node is absent on Win
 # node_modules/.git/.claude out. NOTE: `dist` is NOT excluded here (unlike the
 # test script) so the prebuilt ui\dist is mirrored and embedded by the app.
 $rcArgs = @($src, $build, '/MIR',
-    '/XD', 'target', '.git', '.claude', 'node_modules',
+    '/XD', 'target', '.git', '.claude', 'node_modules', 'dist-windows',
     '/NFL', '/NDL', '/NP', '/NJH', '/NJS', '/R:1', '/W:1')
 $null = & robocopy.exe @rcArgs
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed (exit $LASTEXITCODE)" }

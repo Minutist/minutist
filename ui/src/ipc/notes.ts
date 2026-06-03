@@ -18,7 +18,7 @@
 // `commands` from `./bindings` would bypass the shim, so a `vite dev` browser
 // with no Tauri backend hits an undefined `invoke` and the editor can't seed.
 import { commands, unwrap } from "./client";
-import type { NotesDoc as GeneratedNotesDoc } from "./bindings";
+import type { NotesDocument as GeneratedNotesDoc } from "./bindings";
 
 /** A persisted notes document as returned by `load_notes`. */
 export type NotesDoc = GeneratedNotesDoc;

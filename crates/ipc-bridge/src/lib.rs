@@ -19,7 +19,7 @@
 //! | `list_models` | `Vec<ModelStatus>` | 2 |
 //! | `ensure_model` | `()` | 2 |
 //! | `save_notes` | `()` | 3 |
-//! | `load_notes` | `Option<NotesDoc>` | 3 |
+//! | `load_notes` | `Option<NotesDocument>` | 3 |
 //! | `list_meetings` | `Vec<MeetingListEntry>` | 4 |
 //! | `open_meeting` | `MeetingState` | 4 |
 //! | `rename_meeting` | `()` | 4 |

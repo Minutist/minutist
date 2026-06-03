@@ -17,9 +17,9 @@ role when work is parallel.
 | `common` | architecture-owner | `crates/common/**` | This file too. Adding a type / trait is an architectural change. | Nothing — it's the leaf. |
 | `audio-capture` | audio-engineer | `crates/audio-capture/**` | This file too if changing the capture contract. | `common` |
 | `vad-chunker` | audio-engineer | `crates/vad-chunker/**` | Same | `common` |
-| `asr-runtime` | ml-runtime-engineer | `crates/asr-runtime/**` | Same | `common`, `model-registry`, `settings` |
-| `diarizer` | ml-runtime-engineer | `crates/diarizer/**` | Same | `common`, `model-registry` |
-| `summariser` | ml-runtime-engineer | `crates/summariser/**` | Same | `common`, `model-registry`, `settings`, `persistence` |
+| `asr-runtime` | ml-runtime-engineer | `crates/asr-runtime/**` | Same | `common` |
+| `diarizer` | ml-runtime-engineer | `crates/diarizer/**` | Same | `common` |
+| `summariser` | ml-runtime-engineer | `crates/summariser/**` | Same | `common` |
 | `model-registry` | ml-runtime-engineer | `crates/model-registry/**` | Same | `common`, `settings` |
 | `persistence` | data-engineer | `crates/persistence/**` | Same | `common` |
 | `settings` | data-engineer | `crates/settings/**` | Same | `common` |

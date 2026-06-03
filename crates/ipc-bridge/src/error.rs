@@ -3,11 +3,21 @@
 //! [`IpcError`] is the error type exposed on the Tauri command surface.  It
 //! derives `specta::Type` so tauri-specta can generate a TypeScript binding.
 //!
-//! `common::AppError` does not derive `specta::Type` (the `common` crate has
-//! no `specta` dependency by design).  The orphan rule prevents adding
-//! `impl specta::Type for AppError` here.  `IpcError` therefore re-encodes
-//! `AppError` into an equivalent, independently-typed struct that carries the
-//! same information and the same serde shape.
+//! `common::AppError` is the error type that crosses *crate* boundaries (it
+//! rides `AppEvent::ErrorOccurred` on the broadcast bus).  It *does* derive
+//! `specta::Type` — behind `common`'s optional `specta` feature, which
+//! `ipc-bridge` enables (see `crates/ipc-bridge/Cargo.toml`) — so it already
+//! reaches TypeScript via the events surface.  [`IpcError`] is a separate,
+//! command-surface error so the *command* return type and the *bus* error type
+//! can evolve independently; it is hand-mirrored to carry the **same
+//! discriminants and the same serde shape** as `AppError`, so the two generated
+//! TypeScript unions are byte-identical.
+//!
+//! Because the mirror is hand-maintained, two guards keep the shapes from
+//! drifting (see `tests/error_parity.rs`): the exhaustive `From<AppError> for
+//! IpcError` match below makes a new `AppError` variant a compile error here
+//! until a matching `IpcError` arm is added, and a serde-parity test asserts
+//! every variant serialises to the same tagged JSON through both types.
 //!
 //! Downstream code converts via `IpcError::from(app_error)` or the `?`
 //! operator on `AppResult<T>`.
@@ -51,6 +61,11 @@ pub enum IpcError {
 
 impl From<AppError> for IpcError {
     fn from(e: AppError) -> Self {
+        // Exhaustive on purpose — no catch-all `_` arm. Adding an `AppError`
+        // variant in `common` is a compile error here until a matching
+        // `IpcError` arm (and variant) is added, which is half the parity
+        // guard for FINDING #14 (the other half is the serde-shape test in
+        // `tests/error_parity.rs`). Do not collapse this into a `_` arm.
         match e {
             AppError::Io { context } => IpcError::Io { context },
             AppError::ModelLoad { model_id, context } => IpcError::ModelLoad { model_id, context },

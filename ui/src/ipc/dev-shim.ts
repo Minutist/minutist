@@ -27,7 +27,7 @@ import type {
   IpcError,
   MeetingId,
   MeetingMeta,
-  NotesDoc,
+  NotesDocument,
 } from "./bindings";
 import type { MeetingListEntry, MeetingState } from "./meetings";
 
@@ -358,7 +358,7 @@ export const devCommands = {
   },
   async loadNotes(
     _meetingId: MeetingId,
-  ): Promise<Result<NotesDoc | null, IpcError>> {
+  ): Promise<Result<NotesDocument | null, IpcError>> {
     return ok({ notes_json: DEV_NOTES_JSON, notes_markdown: DEV_NOTES_MD });
   },
   // --- Phase 4 meeting-list + open surface (FR-33) ------------------------

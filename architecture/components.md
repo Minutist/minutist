@@ -24,7 +24,7 @@ appears in:
 | `common` | 1 | (nothing in this workspace) |
 | `audio-capture` | 1 | `common` |
 | `vad-chunker` | 2 | `common` |
-| `asr-runtime` | 2 | `common`, `model-registry`, `settings` |
+| `asr-runtime` | 2 | `common` |
 | `diarizer` | 6 | `common` |
 | `summariser` | 5 | `common` |
 | `persistence` | 1 (minimal) → 4 (full) | `common` |
@@ -83,7 +83,9 @@ This adds no workspace dependency edge; `llama-cpp-2` is an external FFI dep.
 **Phase 4 precursors.** `MeetingListEntry` (meeting-list row, FR-33),
 `NotesDocument { notes_json, notes_markdown }` (the canonical wire-facing
 notes carrier — `String` fields because `serde_json::Value` has no
-`specta::Type`; `ipc-bridge`'s local `NotesDoc` collapses into this), and
+`specta::Type`; `ipc-bridge` uses this type directly — the former local
+`NotesDoc` mirror was collapsed into it so only one notes type reaches the TS
+bindings), and
 `MeetingState { meta, transcript, notes }` (the `open_meeting` restore
 payload). Re-transcribe reuses `AppEvent::TranscriptSegment` — no new event.
 The local index uses **libsql** (`default-features=false, features=["core"]`;
@@ -718,7 +720,7 @@ running Tauri app.
 
 **Phase 3 additions (12 commands total):** `save_notes`
 (`(meeting_id, notes_json, notes_markdown) -> ()`) and `load_notes`
-(`(meeting_id) -> Option<NotesDoc>`, `None` when no notes saved). Unlike the
+(`(meeting_id) -> Option<NotesDocument>`, `None` when no notes saved). Unlike the
 model/recording commands, these route **directly** to `persistence::NotesStore`
 — `persistence` is now a real `ipc-bridge` dependency (already granted in the
 table above) and the orchestrator is *not* involved: notes I/O is independent of
@@ -727,11 +729,12 @@ the live recording pipeline and may run concurrently with an active recording
 write/read runs on `spawn_blocking`. `IpcState` carries a `meetings_dir:
 PathBuf` (a clone of the same `{app-data}/meetings/` root the
 orchestrator/persistence use), resolved and injected by `app-main`. The opaque
-Tiptap document crosses the wire as a `String` (`NotesDoc { notes_json: String,
-notes_markdown: String }`) because a bare `serde_json::Value` does not derive
-`specta::Type`; `save_notes` parses the string to a `serde_json::Value` before
-handing it to `NotesStore` and `load_notes` re-serialises the loaded value back
-to a string.
+Tiptap document crosses the wire as a `String` (`common::NotesDocument {
+notes_json: String, notes_markdown: String }` — `ipc-bridge` returns the common
+type directly rather than a local mirror) because a bare `serde_json::Value`
+does not derive `specta::Type`; `save_notes` parses the string to a
+`serde_json::Value` before handing it to `NotesStore` and `load_notes`
+re-serialises the loaded value back to a string.
 
 **Phase 4 — `stop_recording` index upsert (FR-33, in-session visibility).**
 `Orchestrator::stop` finalises the meeting folder but deliberately never touches

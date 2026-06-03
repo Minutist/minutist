@@ -30,12 +30,10 @@ use std::path::Path;
 
 use meeting_app_common::{
     AppError, AppEvent, AudioDevice, MeetingId, MeetingListEntry, MeetingMeta, MeetingState,
-    ModelId, ModelStatus, RecordingState, Summariser,
+    ModelId, ModelStatus, NotesDocument, RecordingState, Summariser,
 };
 use persistence::{meeting_ops, NotesStore};
-use serde::{Deserialize, Serialize};
 use settings::Settings;
-use specta::Type;
 use summariser::{LlamaSummariser, SummariserConfig};
 use tauri::State;
 use tokio::sync::broadcast;
@@ -283,20 +281,18 @@ pub async fn update_settings(
 // Notes persistence (Phase 3)
 // ---------------------------------------------------------------------------
 
-/// A persisted notes document returned by [`load_notes`].
-///
-/// `notes_json` carries the Tiptap/ProseMirror document **as a `String`**, not
-/// a `serde_json::Value`: a bare `serde_json::Value` does not derive
-/// `specta::Type`, so it cannot cross the tauri-specta boundary directly. The
-/// webview owns the (de)serialisation of this opaque document; `persistence`
-/// stores it verbatim (the Phase-4 transcript-chip opacity guarantee). The
-/// `String`-over-the-wire choice keeps the IPC contract typed without forcing a
-/// Rust-side Tiptap model.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct NotesDoc {
-    pub notes_json: String,
-    pub notes_markdown: String,
-}
+// The notes wire type returned by [`load_notes`] is `common::NotesDocument`
+// (`notes_json` + `notes_markdown`, both `String`). It carries the
+// Tiptap/ProseMirror document as a `String`, not a `serde_json::Value`: a bare
+// `serde_json::Value` does not derive `specta::Type`, so it cannot cross the
+// tauri-specta boundary directly. The webview owns the (de)serialisation of this
+// opaque document; `persistence` stores it verbatim (the Phase-4 transcript-chip
+// opacity guarantee). The `String`-over-the-wire choice keeps the IPC contract
+// typed without forcing a Rust-side Tiptap model.
+//
+// `ipc-bridge` re-uses `common::NotesDocument` directly rather than mirroring a
+// local copy: a duplicate would emit a second, identical TypeScript type into
+// `bindings.ts` (the `NotesDoc`/`NotesDocument` divergence #19, removed here).
 
 /// Persist a meeting's notes (`notes.json` + `notes.md`).
 ///
@@ -331,13 +327,13 @@ pub async fn save_notes(
 ///
 /// Routes directly to `persistence::NotesStore`; the loaded opaque
 /// `serde_json::Value` is re-serialised back to a `String` for the wire (see
-/// [`NotesDoc`]).
+/// [`NotesDocument`]).
 #[tauri::command]
 #[specta::specta]
 pub async fn load_notes(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<Option<NotesDoc>, IpcError> {
+) -> Result<Option<NotesDocument>, IpcError> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || load_notes_inner(&meetings_dir, meeting_id))
         .await
@@ -373,7 +369,7 @@ fn save_notes_inner(
 fn load_notes_inner(
     meetings_dir: &std::path::Path,
     meeting_id: MeetingId,
-) -> Result<Option<NotesDoc>, AppError> {
+) -> Result<Option<NotesDocument>, AppError> {
     let loaded = NotesStore::load(meetings_dir, meeting_id)?;
     match loaded {
         None => Ok(None),
@@ -381,7 +377,7 @@ fn load_notes_inner(
             let notes_json = serde_json::to_string(&data.json).map_err(|e| AppError::Internal {
                 context: format!("failed to re-serialise loaded notes.json: {e}"),
             })?;
-            Ok(Some(NotesDoc {
+            Ok(Some(NotesDocument {
                 notes_json,
                 notes_markdown: data.markdown,
             }))

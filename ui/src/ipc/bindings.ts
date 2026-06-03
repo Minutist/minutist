@@ -181,9 +181,9 @@ async saveNotes(meetingId: MeetingId, notesJson: string, notesMarkdown: string) 
  * 
  * Routes directly to `persistence::NotesStore`; the loaded opaque
  * `serde_json::Value` is re-serialised back to a `String` for the wire (see
- * [`NotesDoc`]).
+ * [`NotesDocument`]).
  */
-async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDoc | null, IpcError>> {
+async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDocument | null, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("load_notes", { meetingId }) };
 } catch (e) {
@@ -564,18 +564,6 @@ export type ModelStatusState =
  * human-readable string suitable for surfacing in UI.
  */
 { state: "failed"; message: string }
-/**
- * A persisted notes document returned by [`load_notes`].
- * 
- * `notes_json` carries the Tiptap/ProseMirror document **as a `String`**, not
- * a `serde_json::Value`: a bare `serde_json::Value` does not derive
- * `specta::Type`, so it cannot cross the tauri-specta boundary directly. The
- * webview owns the (de)serialisation of this opaque document; `persistence`
- * stores it verbatim (the Phase-4 transcript-chip opacity guarantee). The
- * `String`-over-the-wire choice keeps the IPC contract typed without forcing a
- * Rust-side Tiptap model.
- */
-export type NotesDoc = { notes_json: string; notes_markdown: string }
 /**
  * The notes document as it crosses the IPC boundary.
  * 

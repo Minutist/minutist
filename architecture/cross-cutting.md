@@ -31,7 +31,8 @@ that.
 
 | Workload | Where it runs |
 |---|---|
-| Audio capture callback (cpal) | cpal's own thread; pushes frames into a bounded channel. |
+| Audio capture callback (cpal) | cpal's own thread; pushes frames into a bounded channel. With system-audio capture on (`settings.capture_system_audio`), a SECOND cpal callback (the render-endpoint loopback source) runs on its own thread and pushes into its own bounded ring — both RT callbacks keep the `try_lock`/drop-oldest discipline. |
+| Audio mixer (mic + loopback) | A `spawn`/`spawn_blocking` task draining the two per-source 16 kHz batch channels; SUMS sample-wise, clamps, meters, and forwards the single mixed stream. Only present when system-audio capture is on; mic-only otherwise. Never blocks the RT callbacks (those feed the upstream rings). |
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
 | Diarization | One-shot `spawn_blocking` task triggered on stop or user action. |
@@ -41,6 +42,17 @@ that.
 
 Bounded channels everywhere. Unbounded queues are not allowed — they
 hide back-pressure that the live pipeline needs to surface.
+
+**System/call audio capture + echo (AEC is future work).** When
+`settings.capture_system_audio` is on, the render-endpoint loopback is captured
+alongside the mic and summed into the single transcribed stream (see
+`components.md` — `audio-capture`). If the mic also picks the call audio up from
+the speakers, mixing the loopback in doubles that audio (an echo). v1 handles
+this only with the opt-in toggle (off by default; the UI advises turning it off
+when the mic hears the speakers). Acoustic echo cancellation — using the
+loopback as the reference signal to subtract the speaker bleed from the mic — is
+deliberately **deferred**; it would live in the mixer/capture path. Loopback is
+Windows-only (WASAPI) for now; other platforms fall back to mic-only.
 
 ## Error handling
 

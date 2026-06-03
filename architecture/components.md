@@ -138,6 +138,40 @@ first name-match. `resolve_device` parses the composite id (index authoritative,
 name-consistency-checked) and falls back to name matching for legacy bare-name
 ids persisted in `settings.input_device_id`.
 
+**System/call audio mixing (loopback source + mixer).** When the
+`settings.capture_system_audio` flag is on (off by default), `start` ALSO opens
+the default **render** endpoint in **loopback** mode (a second capture source)
+and SUMS it with the microphone into the SAME single `samples` stream, so a
+Teams-style call transcribes all participants — not just the user. The public
+`AudioStreams` / `AudioFrameBatch` shapes are unchanged, so the
+orchestrator/runner are untouched; downstream diarization separates the
+speakers. `AudioCaptureManager::start` takes a `capture_system_audio: bool`
+parameter (the orchestrator passes `settings.current().capture_system_audio`).
+
+- **Loopback source (`loopback.rs`, Windows-only).** Uses **cpal's transparent
+  WASAPI loopback**: building an INPUT stream on a render device automatically
+  sets `AUDCLNT_STREAMFLAGS_LOOPBACK`, so the existing `build_input_stream`
+  machinery (sample-format dispatch, mono downmix, the drop-oldest ring) is
+  reused with no extra dependency — **no `wasapi` crate is needed**. On
+  non-Windows (`cfg(not(windows))`) the source is a stub returning
+  `Error::LoopbackUnsupported`; enabling the toggle there (or any loopback-open
+  failure) logs a warning and falls back to mic-only — the recording is never
+  failed.
+- **Mixer (`mixer.rs`).** Each source resamples to 16 kHz mono independently and
+  feeds a bounded per-source batch channel; a mixer task drains both, SUMS
+  sample-wise, clamps to `[-1.0, 1.0]`, meters the mixed output, and forwards
+  `AudioFrameBatch`es into the public `samples` channel. The RT callbacks keep
+  the same `try_lock`/drop-oldest discipline (one ring per source). Sync: the
+  mixer emits the samples both sources have in common (`min(len)`) each tick and
+  holds the faster source's surplus for the next tick (small drift tolerated by
+  transcription); a source that has ENDED is zero-filled on the final flush so
+  the timeline keeps advancing. The mixing math (`sum_clamp` + `MixState`) is a
+  pure, unit-tested seam since the real capture devices cannot be driven in a
+  unit test.
+
+AEC is **future work** — see `cross-cutting.md` "Threading model"; v1 handles
+echo only via the opt-in toggle (off by default).
+
 ### `vad-chunker`
 **Crate:** `crates/vad-chunker`
 **Owns:** Silero VAD model lifecycle (via `vad-rs`), the smoothing
@@ -714,6 +748,15 @@ the flag has no effect (inference is always on CPU). The orchestrator reads it
 `n_gpu_layers`, and `ipc-bridge`'s `summarise_meeting` reads it to resolve the
 summariser `n_gpu_layers`. No new dependency edge. See `cross-cutting.md` —
 "GPU portability".
+
+**Field — `capture_system_audio: bool`.** Whether to capture the system/call
+(loopback) audio alongside the mic and MIX them into one transcribed stream, so
+a Teams-style call captures all participants. `#[serde(default)]`-defaults to
+`false` (opt-in and echo-safe; an older store deserialises to `false`). Added to
+the hand-written `Default` impl (`false`). The orchestrator reads it
+(`current().capture_system_audio`) and passes it into `AudioCaptureManager::start`,
+which opens the loopback source + mixer when on (Windows-only; mic-only fallback
+otherwise — see the `audio-capture` section). No new dependency edge.
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

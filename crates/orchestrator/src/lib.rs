@@ -221,7 +221,12 @@ impl Orchestrator {
             }
         };
 
-        let streams = match capture.start(32, 64) {
+        // When `capture_system_audio` is on, also capture + mix the system/call
+        // (loopback) audio so all participants are transcribed; mic-only
+        // otherwise. On non-Windows / loopback-open failure the capture layer
+        // falls back to mic-only (logged) rather than failing the recording.
+        let capture_system_audio = self.settings.current().capture_system_audio;
+        let streams = match capture.start(32, 64, capture_system_audio) {
             Ok(s) => s,
             Err(e) => {
                 guard.state = InternalState::Idle;

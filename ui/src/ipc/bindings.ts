@@ -690,7 +690,27 @@ onboarding_completed?: boolean;
  * default CPU-only build the flag has no effect (inference is always on
  * CPU). See `architecture/cross-cutting.md` — "GPU portability".
  */
-gpu_acceleration?: boolean }
+gpu_acceleration?: boolean; 
+/**
+ * Whether to capture and mix the system/call (loopback) audio alongside
+ * the microphone, so a Teams-style call transcribes all participants.
+ * 
+ * When `true`, `audio-capture` ALSO opens the default render endpoint in
+ * loopback mode, resamples it to 16 kHz mono, and SUMS it sample-wise with
+ * the mic into the single `samples` stream the orchestrator drains;
+ * downstream diarization separates the speakers. When `false` (the
+ * default), behaviour is mic-only as before.
+ * 
+ * `#[serde(default)]` defaults to `false` — opt-in and echo-safe (if the
+ * mic also picks the call audio up from the speakers, mixing the loopback
+ * in doubles it), and an older store written before this field existed
+ * deserialises to `false`. Loopback capture is currently Windows-only; on
+ * other platforms enabling this logs a warning and falls back to mic-only
+ * (never failing the recording). Echo cancellation using the loopback as
+ * the reference signal is future work — see `architecture/cross-cutting.md`
+ * — "Threading model".
+ */
+capture_system_audio?: boolean }
 /**
  * UI colour-scheme preference.
  */

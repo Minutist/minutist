@@ -28,6 +28,14 @@ pub enum Error {
     /// rubato resampler failed to initialise or process a frame.
     #[error("resampler error: {context}")]
     Resampler { context: String },
+
+    /// System/call (loopback) audio capture is not supported on this platform.
+    ///
+    /// Currently loopback is implemented for Windows (WASAPI) only. On other
+    /// platforms enabling `capture_system_audio` produces this; the caller logs
+    /// a warning and falls back to mic-only rather than failing the recording.
+    #[error("system-audio (loopback) capture unsupported: {context}")]
+    LoopbackUnsupported { context: String },
 }
 
 impl From<cpal::DevicesError> for Error {
@@ -88,6 +96,7 @@ impl From<Error> for AppError {
                 context: format!("audio device not found: {id}"),
             },
             Error::InvalidState { context } => AppError::InvalidInput { context },
+            Error::LoopbackUnsupported { context } => AppError::Unsupported { context },
             Error::Cpal { context } | Error::Resampler { context } => {
                 AppError::Internal { context }
             }

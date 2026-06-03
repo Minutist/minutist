@@ -5,6 +5,7 @@ import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
 import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
+import { readCaptureSystemAudio } from "../state/system-audio-settings";
 import { DevicePicker } from "./DevicePicker";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
@@ -45,6 +46,9 @@ export function MainWindow() {
     (s) => s.setDiarizationEnabled,
   );
   const setGpuAcceleration = useRecordingStore((s) => s.setGpuAcceleration);
+  const setCaptureSystemAudio = useRecordingStore(
+    (s) => s.setCaptureSystemAudio,
+  );
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
@@ -52,6 +56,7 @@ export function MainWindow() {
 
   const diarizationEnabled = readDiarizationEnabled(settings);
   const gpuAcceleration = readGpuAcceleration(settings);
+  const captureSystemAudio = readCaptureSystemAudio(settings);
 
   // The meeting-list is the entry surface (FR-33): shown when no meeting is
   // open and nothing is being recorded. Opening a meeting, or starting a
@@ -181,6 +186,29 @@ export function MainWindow() {
               onChange={(e) => void setGpuAcceleration(e.target.checked)}
             />
             <span>GPU acceleration</span>
+          </label>
+          {/*
+            System-audio (call / loopback) capture toggle (off by default). When
+            on, the call audio is captured alongside the mic and mixed into one
+            stream so all participants are transcribed. It is echo-prone: if the
+            mic also picks the call up from the speakers, the call audio is
+            doubled — so the tooltip advises turning it off in that case.
+            Loopback capture is currently Windows-only; elsewhere the backend
+            falls back to mic-only. Persists via `update_settings`. Disabled
+            until the settings snapshot has loaded so the round-trip never
+            clobbers settings with a partial object.
+          */}
+          <label
+            className="main-window__system-audio-toggle"
+            title="Capture the call / system audio and mix it with your microphone so all participants are transcribed. Turn this off if your microphone also picks up the call from your speakers (echo)."
+          >
+            <input
+              type="checkbox"
+              checked={captureSystemAudio}
+              disabled={settings === null}
+              onChange={(e) => void setCaptureSystemAudio(e.target.checked)}
+            />
+            <span>Capture call / system audio</span>
           </label>
           {inWorkspace && (
             <button

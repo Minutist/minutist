@@ -11,8 +11,10 @@
 
 mod device;
 pub mod error;
+mod loopback;
 mod manager;
 mod meter;
+mod mixer;
 mod resample;
 
 #[cfg(any(test, feature = "test-source"))]

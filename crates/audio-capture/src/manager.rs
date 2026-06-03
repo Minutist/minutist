@@ -56,8 +56,8 @@ pub struct AudioStreams {
 // Internal: raw frame from cpal callback → forwarder
 // ---------------------------------------------------------------------------
 
-struct RawFrame {
-    samples: Vec<f32>,
+pub(crate) struct RawFrame {
+    pub(crate) samples: Vec<f32>,
 }
 
 /// Shared state behind [`DropOldestChannel`].
@@ -81,7 +81,7 @@ struct ChannelInner {
 /// the consumer held a `Mutex` for the entire session and the callback's
 /// drop-oldest path deadlocked on that held lock (so it never dropped the
 /// oldest and risked blocking the RT thread).
-struct DropOldestChannel {
+pub(crate) struct DropOldestChannel {
     inner: Mutex<ChannelInner>,
     /// Signals the consumer that a frame is available or the channel closed.
     not_empty: Condvar,
@@ -89,7 +89,7 @@ struct DropOldestChannel {
 }
 
 impl DropOldestChannel {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         debug_assert!(capacity > 0, "channel capacity must be > 0");
         DropOldestChannel {
             inner: Mutex::new(ChannelInner {
@@ -106,7 +106,7 @@ impl DropOldestChannel {
     /// Never blocks: if the lock is momentarily contended (only possible while
     /// the consumer pops a single frame) the frame is dropped rather than
     /// stalling the RT thread.
-    fn push(&self, frame: RawFrame) {
+    pub(crate) fn push(&self, frame: RawFrame) {
         // `try_lock` keeps the RT thread from ever blocking on the consumer.
         let mut inner = match self.inner.try_lock() {
             Ok(guard) => guard,
@@ -142,7 +142,7 @@ impl DropOldestChannel {
     ///
     /// Returns `None` on timeout (caller re-checks its stop flag) or once the
     /// channel is closed and drained.
-    fn recv_timeout(&self, timeout: Duration) -> Option<RawFrame> {
+    pub(crate) fn recv_timeout(&self, timeout: Duration) -> Option<RawFrame> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(frame) = inner.queue.pop_front() {
@@ -163,7 +163,7 @@ impl DropOldestChannel {
     }
 
     /// Mark the channel closed and wake the consumer so it can drain and exit.
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         if let Ok(mut inner) = self.inner.lock() {
             inner.closed = true;
         }
@@ -182,19 +182,28 @@ enum StreamState {
     Paused,
 }
 
-/// Manages audio capture from a single input device.
+/// Live capture resources for one cpal source (mic OR loopback): the stream,
+/// its pause flag, and the cpal→forwarder channel closed on stop.
+struct SourceHandles {
+    stream: cpal::Stream,
+    paused: Arc<AtomicBool>,
+    raw_ch: Arc<DropOldestChannel>,
+}
+
+/// Manages audio capture from a single input device, optionally mixing in the
+/// system/call (loopback) audio.
 pub struct AudioCaptureManager {
     device: Option<cpal::Device>,
     audio_device: Option<AudioDevice>,
     state: StreamState,
-    /// cpal Stream kept alive for the duration of capture.
-    _stream: Option<cpal::Stream>,
-    /// Signals the cpal callback to stop emitting samples.
-    paused: Option<Arc<AtomicBool>>,
-    /// Signals the forwarder task to exit.
+    /// Microphone capture resources (the primary source, always present while
+    /// `Running`/`Paused`).
+    mic: Option<SourceHandles>,
+    /// System/call (loopback) capture resources — present only when
+    /// `capture_system_audio` was on AND loopback opened successfully.
+    loopback: Option<SourceHandles>,
+    /// Signals the forwarder/mixer task(s) to exit.
     stopped: Option<Arc<AtomicBool>>,
-    /// cpal→forwarder channel; closed on stop to wake the forwarder promptly.
-    raw_ch: Option<Arc<DropOldestChannel>>,
 }
 
 impl AudioCaptureManager {
@@ -224,10 +233,9 @@ impl AudioCaptureManager {
             device: Some(cpal_device),
             audio_device: Some(audio_device),
             state: StreamState::Idle,
-            _stream: None,
-            paused: None,
+            mic: None,
+            loopback: None,
             stopped: None,
-            raw_ch: None,
         })
     }
 
@@ -235,10 +243,16 @@ impl AudioCaptureManager {
     ///
     /// `sample_capacity` — bound on the `samples` tokio channel.
     /// `meter_capacity`  — bound on the `meter` tokio channel.
+    /// `capture_system_audio` — when `true`, ALSO capture the default render
+    /// endpoint in loopback mode and SUM it with the mic into the single
+    /// `samples` stream (the orchestrator stays unchanged). On platforms where
+    /// loopback is unsupported, or if opening loopback fails, capture falls back
+    /// to mic-only with a warning — the recording is never failed.
     pub fn start(
         &mut self,
         sample_capacity: usize,
         meter_capacity: usize,
+        capture_system_audio: bool,
     ) -> AppResult<AudioStreams> {
         if self.state != StreamState::Idle {
             return Err(Error::InvalidState {
@@ -260,119 +274,100 @@ impl AudioCaptureManager {
             sample_rate = in_rate,
             channels,
             format = ?config.sample_format(),
+            capture_system_audio,
             "starting capture stream"
         );
 
-        // --- Bounded ring channel: cpal callback → forwarder (capacity = 8) ---
-        let raw_ch = Arc::new(DropOldestChannel::new(8));
-        let raw_ch_cb = Arc::clone(&raw_ch);
-
-        // --- Pause/stop flags ---
-        let paused = Arc::new(AtomicBool::new(false));
-        let paused_cb = Arc::clone(&paused);
+        // The forwarder/mixer task(s) share one stop flag.
         let stopped = Arc::new(AtomicBool::new(false));
-        let stopped_fwd = Arc::clone(&stopped);
 
-        // --- Build the cpal stream ---
-        let stream = build_input_stream(
+        // --- Build the microphone cpal stream + its raw ring channel ---
+        let mic_raw_ch = Arc::new(DropOldestChannel::new(8));
+        let mic_paused = Arc::new(AtomicBool::new(false));
+        let mic_stream = build_input_stream(
             cpal_device,
             &config,
             channels,
             in_rate,
-            paused_cb,
-            raw_ch_cb,
+            Arc::clone(&mic_paused),
+            Arc::clone(&mic_raw_ch),
         )?;
-        stream.play().map_err(Error::from)?;
+        mic_stream.play().map_err(Error::from)?;
 
-        // --- Tokio output channels ---
+        // --- Try to open the loopback source when requested ---
+        // A failure (unsupported platform, no render device) degrades to
+        // mic-only with a warning; it never fails the recording.
+        let loopback_open = if capture_system_audio {
+            match crate::loopback::open_loopback() {
+                Ok(lb) => Some(lb),
+                Err(e) => {
+                    tracing::warn!(
+                        target = "audio-capture",
+                        "system-audio capture requested but loopback unavailable ({e}); \
+                         falling back to mic-only"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // --- Tokio output channels (the public surface, unchanged) ---
         let (sample_tx, sample_rx) = mpsc::channel::<AudioFrameBatch>(sample_capacity);
         let (meter_tx, meter_rx) = mpsc::channel::<AudioMeterFrame>(meter_capacity);
 
-        // --- spawn_blocking forwarder task ---
-        let rx_ch = Arc::clone(&raw_ch);
-        tokio::task::spawn_blocking(move || {
-            let mut resampler = match StreamResampler::new(in_rate) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(target = "audio-capture", "failed to create resampler: {e}");
-                    return;
-                }
-            };
-            // ~512 samples at 16 kHz ≈ 32 ms window → ~30 Hz meter emission
-            let mut meter = LevelMeter::new(512);
-            let mut out_clock_samples: u64 = 0; // 16 kHz samples emitted so far
+        match loopback_open {
+            // ---------- Mic + loopback: resample each, then mix ----------
+            Some(lb) => {
+                lb.stream.play().map_err(Error::from)?;
 
-            loop {
-                if stopped_fwd.load(Ordering::Relaxed) {
-                    break;
-                }
+                // Per-source resampled batch channels feeding the mixer. Bounded
+                // so a slow mixer back-pressures without unbounded growth; the
+                // RT callbacks remain protected by the upstream drop-oldest ring.
+                let (mic_batch_tx, mic_batch_rx) = mpsc::channel::<AudioFrameBatch>(32);
+                let (sys_batch_tx, sys_batch_rx) = mpsc::channel::<AudioFrameBatch>(32);
 
-                // Pop one frame (the lock is released inside `recv_timeout`
-                // before the expensive resample below, so the RT producer is
-                // never contended for long).
-                let frame = match rx_ch.recv_timeout(Duration::from_millis(50)) {
-                    Some(f) => f,
-                    None => continue,
-                };
+                spawn_resample_forwarder(
+                    Arc::clone(&mic_raw_ch),
+                    Arc::clone(&stopped),
+                    in_rate,
+                    mic_batch_tx,
+                    "mic",
+                );
+                spawn_resample_forwarder(
+                    Arc::clone(&lb.raw_ch),
+                    Arc::clone(&stopped),
+                    lb.in_rate,
+                    sys_batch_tx,
+                    "loopback",
+                );
+                spawn_mixer(mic_batch_rx, sys_batch_rx, sample_tx, meter_tx);
 
-                resampler.push(&frame.samples, &mut |chunk| {
-                    let start_ms = out_clock_samples * 1000 / crate::resample::TARGET_RATE as u64;
-                    out_clock_samples += chunk.len() as u64;
-                    let end_ms = out_clock_samples * 1000 / crate::resample::TARGET_RATE as u64;
-
-                    let batch = AudioFrameBatch {
-                        samples: chunk.to_vec(),
-                        start_ms,
-                        end_ms,
-                    };
-                    if sample_tx.blocking_send(batch).is_err() {
-                        tracing::warn!(
-                            target = "audio-capture",
-                            "sample channel closed; forwarder exiting"
-                        );
-                        return;
-                    }
-
-                    meter.push(chunk, |mf| {
-                        if meter_tx.blocking_send(mf).is_err() {
-                            tracing::warn!(target = "audio-capture", "meter channel closed");
-                        }
-                    });
+                self.loopback = Some(SourceHandles {
+                    stream: lb.stream,
+                    paused: lb.paused,
+                    raw_ch: lb.raw_ch,
                 });
             }
+            // ---------- Mic only: resample + meter straight to output ----------
+            None => {
+                spawn_mic_only_forwarder(
+                    Arc::clone(&mic_raw_ch),
+                    Arc::clone(&stopped),
+                    in_rate,
+                    sample_tx,
+                    meter_tx,
+                );
+            }
+        }
 
-            // Flush tail samples on stop.
-            resampler.finish(&mut |chunk| {
-                if !chunk.is_empty() {
-                    let start_ms = out_clock_samples * 1000 / crate::resample::TARGET_RATE as u64;
-                    out_clock_samples += chunk.len() as u64;
-                    let end_ms = out_clock_samples * 1000 / crate::resample::TARGET_RATE as u64;
-                    let batch = AudioFrameBatch {
-                        samples: chunk.to_vec(),
-                        start_ms,
-                        end_ms,
-                    };
-                    let _ = sample_tx.blocking_send(batch);
-                    meter.push(chunk, |mf| {
-                        let _ = meter_tx.blocking_send(mf);
-                    });
-                }
-            });
-            meter.flush(|mf| {
-                let _ = meter_tx.blocking_send(mf);
-            });
-
-            tracing::debug!(
-                target = "audio-capture",
-                out_samples = out_clock_samples,
-                "forwarder task exiting"
-            );
+        self.mic = Some(SourceHandles {
+            stream: mic_stream,
+            paused: mic_paused,
+            raw_ch: mic_raw_ch,
         });
-
-        self._stream = Some(stream);
-        self.paused = Some(paused);
         self.stopped = Some(stopped);
-        self.raw_ch = Some(raw_ch);
         self.state = StreamState::Running;
 
         Ok(AudioStreams {
@@ -393,11 +388,9 @@ impl AudioCaptureManager {
             }
         }
 
-        if let Some(p) = &self.paused {
-            p.store(true, Ordering::Relaxed);
-        }
-        if let Some(stream) = &self._stream {
-            stream.pause().map_err(Error::from)?;
+        for src in [self.mic.as_ref(), self.loopback.as_ref()].into_iter().flatten() {
+            src.paused.store(true, Ordering::Relaxed);
+            src.stream.pause().map_err(Error::from)?;
         }
         self.state = StreamState::Paused;
         tracing::info!(target = "audio-capture", "capture paused");
@@ -416,11 +409,9 @@ impl AudioCaptureManager {
             }
         }
 
-        if let Some(p) = &self.paused {
-            p.store(false, Ordering::Relaxed);
-        }
-        if let Some(stream) = &self._stream {
-            stream.play().map_err(Error::from)?;
+        for src in [self.mic.as_ref(), self.loopback.as_ref()].into_iter().flatten() {
+            src.paused.store(false, Ordering::Relaxed);
+            src.stream.play().map_err(Error::from)?;
         }
         self.state = StreamState::Running;
         tracing::info!(target = "audio-capture", "capture resumed");
@@ -436,21 +427,20 @@ impl AudioCaptureManager {
             .into());
         }
 
-        // Signal forwarder task to exit cleanly.
+        // Signal forwarder/mixer task(s) to exit cleanly.
         if let Some(stopped) = &self.stopped {
             stopped.store(true, Ordering::Relaxed);
         }
-        // Close the channel so the forwarder wakes immediately (rather than
-        // waiting out its recv timeout) and drains any tail.
-        if let Some(raw_ch) = &self.raw_ch {
-            raw_ch.close();
+        // Close each source's ring channel so its forwarder wakes immediately
+        // (rather than waiting out its recv timeout) and drains any tail.
+        for src in [self.mic.as_ref(), self.loopback.as_ref()].into_iter().flatten() {
+            src.raw_ch.close();
         }
 
-        // Drop the stream; cpal stops the callback.
-        self._stream = None;
-        self.paused = None;
+        // Drop the streams; cpal stops the callbacks.
+        self.mic = None;
+        self.loopback = None;
         self.stopped = None;
-        self.raw_ch = None;
         self.state = StreamState::Idle;
         tracing::info!(target = "audio-capture", "capture stopped");
         Ok(())
@@ -463,10 +453,221 @@ impl AudioCaptureManager {
 }
 
 // ---------------------------------------------------------------------------
+// Forwarder + mixer tasks
+// ---------------------------------------------------------------------------
+
+/// Mic-only forwarder: drain one source's raw ring, resample to 16 kHz mono,
+/// meter, and forward batches straight to the public output channels. This is
+/// the original single-source path (behaviour unchanged when
+/// `capture_system_audio` is off).
+fn spawn_mic_only_forwarder(
+    raw_ch: Arc<DropOldestChannel>,
+    stopped: Arc<AtomicBool>,
+    in_rate: u32,
+    sample_tx: mpsc::Sender<AudioFrameBatch>,
+    meter_tx: mpsc::Sender<AudioMeterFrame>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut resampler = match StreamResampler::new(in_rate) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(target = "audio-capture", "failed to create resampler: {e}");
+                return;
+            }
+        };
+        // ~512 samples at 16 kHz ≈ 32 ms window → ~30 Hz meter emission
+        let mut meter = LevelMeter::new(512);
+        let mut out_clock_samples: u64 = 0; // 16 kHz samples emitted so far
+
+        loop {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            let frame = match raw_ch.recv_timeout(Duration::from_millis(50)) {
+                Some(f) => f,
+                None => continue,
+            };
+            resampler.push(&frame.samples, &mut |chunk| {
+                let batch = batch_from(chunk, &mut out_clock_samples);
+                if sample_tx.blocking_send(batch).is_err() {
+                    tracing::warn!(
+                        target = "audio-capture",
+                        "sample channel closed; forwarder exiting"
+                    );
+                    return;
+                }
+                meter.push(chunk, |mf| {
+                    if meter_tx.blocking_send(mf).is_err() {
+                        tracing::warn!(target = "audio-capture", "meter channel closed");
+                    }
+                });
+            });
+        }
+
+        resampler.finish(&mut |chunk| {
+            if !chunk.is_empty() {
+                let batch = batch_from(chunk, &mut out_clock_samples);
+                let _ = sample_tx.blocking_send(batch);
+                meter.push(chunk, |mf| {
+                    let _ = meter_tx.blocking_send(mf);
+                });
+            }
+        });
+        meter.flush(|mf| {
+            let _ = meter_tx.blocking_send(mf);
+        });
+
+        tracing::debug!(
+            target = "audio-capture",
+            out_samples = out_clock_samples,
+            "mic-only forwarder task exiting"
+        );
+    });
+}
+
+/// Per-source forwarder used in mixed mode: drain one source's raw ring,
+/// resample to 16 kHz mono, and forward `AudioFrameBatch`es into an internal
+/// channel feeding the mixer. No metering here — the mixer meters the summed
+/// output so the level reflects what is actually recorded.
+fn spawn_resample_forwarder(
+    raw_ch: Arc<DropOldestChannel>,
+    stopped: Arc<AtomicBool>,
+    in_rate: u32,
+    batch_tx: mpsc::Sender<AudioFrameBatch>,
+    source: &'static str,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut resampler = match StreamResampler::new(in_rate) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    target = "audio-capture",
+                    "failed to create {source} resampler: {e}"
+                );
+                return;
+            }
+        };
+        // The per-source forwarder does not stamp timestamps (the mixer owns the
+        // output clock); a throwaway counter satisfies `batch_from`.
+        let mut clock: u64 = 0;
+
+        loop {
+            if stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            let frame = match raw_ch.recv_timeout(Duration::from_millis(50)) {
+                Some(f) => f,
+                None => continue,
+            };
+            resampler.push(&frame.samples, &mut |chunk| {
+                let batch = batch_from(chunk, &mut clock);
+                if batch_tx.blocking_send(batch).is_err() {
+                    tracing::warn!(
+                        target = "audio-capture",
+                        "{source} mixer channel closed; forwarder exiting"
+                    );
+                }
+            });
+        }
+
+        resampler.finish(&mut |chunk| {
+            if !chunk.is_empty() {
+                let batch = batch_from(chunk, &mut clock);
+                let _ = batch_tx.blocking_send(batch);
+            }
+        });
+        tracing::debug!(target = "audio-capture", "{source} resample forwarder exiting");
+    });
+}
+
+/// Mixer task: drain the mic + loopback batch channels, SUM sample-wise with
+/// clamp + zero-fill (per [`crate::mixer::MixState`]), meter the mixed output,
+/// and forward `AudioFrameBatch`es into the public `samples` channel.
+///
+/// Sync strategy: the mixer emits whatever both sources have in common
+/// (`min(len)`) on each tick, holding the surplus from the faster source for
+/// the next tick. A source that has fallen behind simply contributes its
+/// backlog later (small drift, tolerated by transcription); a source that has
+/// ENDED is zero-filled on the final flush so the timeline keeps advancing.
+fn spawn_mixer(
+    mut mic_rx: mpsc::Receiver<AudioFrameBatch>,
+    mut sys_rx: mpsc::Receiver<AudioFrameBatch>,
+    sample_tx: mpsc::Sender<AudioFrameBatch>,
+    meter_tx: mpsc::Sender<AudioMeterFrame>,
+) {
+    tokio::task::spawn(async move {
+        let mut state = crate::mixer::MixState::new();
+        let mut meter = LevelMeter::new(512);
+        let mut mic_open = true;
+        let mut sys_open = true;
+
+        // Drain until BOTH sources have ended and the channels are empty.
+        while mic_open || sys_open {
+            tokio::select! {
+                biased;
+                m = mic_rx.recv(), if mic_open => match m {
+                    Some(b) => state.push_mic(&b.samples),
+                    None => mic_open = false,
+                },
+                s = sys_rx.recv(), if sys_open => match s {
+                    Some(b) => state.push_sys(&b.samples),
+                    None => sys_open = false,
+                },
+            }
+
+            // Emit everything both sources have in common so far.
+            while let Some(batch) = state.drain_paired() {
+                meter_then_send(&mut meter, &batch.samples, &meter_tx);
+                if sample_tx.send(batch).await.is_err() {
+                    tracing::warn!(target = "audio-capture", "sample channel closed; mixer exiting");
+                    return;
+                }
+            }
+        }
+
+        // Both sources ended: flush any surplus, zero-filling the other source.
+        if let Some(batch) = state.drain_remaining() {
+            meter_then_send(&mut meter, &batch.samples, &meter_tx);
+            let _ = sample_tx.send(batch).await;
+        }
+        meter.flush(|mf| {
+            let _ = meter_tx.try_send(mf);
+        });
+        tracing::debug!(target = "audio-capture", "mixer task exiting");
+    });
+}
+
+/// Wrap a resampled run in an [`AudioFrameBatch`], advancing `clock` by its
+/// length and computing the start/end recording-clock offsets in ms.
+fn batch_from(chunk: &[f32], clock: &mut u64) -> AudioFrameBatch {
+    let start_ms = *clock * 1000 / crate::resample::TARGET_RATE as u64;
+    *clock += chunk.len() as u64;
+    let end_ms = *clock * 1000 / crate::resample::TARGET_RATE as u64;
+    AudioFrameBatch {
+        samples: chunk.to_vec(),
+        start_ms,
+        end_ms,
+    }
+}
+
+/// Push a mixed run through the meter, forwarding any emitted meter frames.
+fn meter_then_send(
+    meter: &mut LevelMeter,
+    samples: &[f32],
+    meter_tx: &mpsc::Sender<AudioMeterFrame>,
+) {
+    meter.push(samples, |mf| {
+        if meter_tx.try_send(mf).is_err() {
+            // Drop a meter frame under back-pressure (same policy as elsewhere).
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // cpal stream builder — dispatches on sample format
 // ---------------------------------------------------------------------------
 
-fn build_input_stream(
+pub(crate) fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     channels: usize,

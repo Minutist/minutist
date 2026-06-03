@@ -170,6 +170,26 @@ pub struct Settings {
     /// CPU). See `architecture/cross-cutting.md` — "GPU portability".
     #[serde(default = "default_gpu_acceleration")]
     pub gpu_acceleration: bool,
+
+    /// Whether to capture and mix the system/call (loopback) audio alongside
+    /// the microphone, so a Teams-style call transcribes all participants.
+    ///
+    /// When `true`, `audio-capture` ALSO opens the default render endpoint in
+    /// loopback mode, resamples it to 16 kHz mono, and SUMS it sample-wise with
+    /// the mic into the single `samples` stream the orchestrator drains;
+    /// downstream diarization separates the speakers. When `false` (the
+    /// default), behaviour is mic-only as before.
+    ///
+    /// `#[serde(default)]` defaults to `false` — opt-in and echo-safe (if the
+    /// mic also picks the call audio up from the speakers, mixing the loopback
+    /// in doubles it), and an older store written before this field existed
+    /// deserialises to `false`. Loopback capture is currently Windows-only; on
+    /// other platforms enabling this logs a warning and falls back to mic-only
+    /// (never failing the recording). Echo cancellation using the loopback as
+    /// the reference signal is future work — see `architecture/cross-cutting.md`
+    /// — "Threading model".
+    #[serde(default)]
+    pub capture_system_audio: bool,
 }
 
 impl Default for Settings {
@@ -185,6 +205,7 @@ impl Default for Settings {
             diarization_enabled: false,
             onboarding_completed: false,
             gpu_acceleration: default_gpu_acceleration(),
+            capture_system_audio: false,
         }
     }
 }
@@ -223,6 +244,7 @@ mod tests {
             diarization_enabled: true,
             onboarding_completed: true,
             gpu_acceleration: false,
+            capture_system_audio: true,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -430,6 +452,45 @@ mod tests {
         assert!(
             restored.gpu_acceleration,
             "missing gpu_acceleration must deserialise to true (GPU on by default)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1g. capture_system_audio: default + round-trip + missing-field
+    //     deserialisation (loopback call-audio mixing)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capture_system_audio_defaults_to_false() {
+        assert!(
+            !Settings::default().capture_system_audio,
+            "system-audio capture is opt-in and off by default (echo-safe)"
+        );
+    }
+
+    #[test]
+    fn capture_system_audio_round_trips() {
+        let original = Settings {
+            capture_system_audio: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(restored.capture_system_audio);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_capture_system_audio_field_defaults_to_false() {
+        // A settings store written before `capture_system_audio` existed must
+        // deserialise to `false` (mic-only, the prior behaviour).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            !restored.capture_system_audio,
+            "missing capture_system_audio must deserialise to false (mic-only default)"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

@@ -82,6 +82,13 @@ if ($Features) {
     Write-Host "==> CMAKE_GENERATOR=Ninja (feature build)"
 }
 
+# Stop any running instance first. A live process (e.g. a smoke test or a
+# left-open window) locks target\release\meeting-app.exe, so the relink fails
+# with "failed to remove ...meeting-app.exe: Access is denied (os error 5)".
+# WebView2 child processes exit with the parent.
+Get-Process -Name meeting-app -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 500
+
 # Build the app binary (release). CPU-default unless -Features given.
 $cargoArgs = @('build', '--release', '--bin', 'meeting-app')
 if ($Features) { $cargoArgs += @('--features', $Features) }

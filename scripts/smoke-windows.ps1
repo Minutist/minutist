@@ -2,8 +2,9 @@
 # Launch the built Windows app briefly, capture the startup log, then kill it.
 # A smoke test: confirms the assembled app boots (does not crash, reaches setup
 # complete, the webview's on-mount IPC is permitted by the capability ACL).
+param([string]$Exe = 'C:\Users\anl\meeting-app\target\release\meeting-app.exe')
 $ErrorActionPreference = 'Continue'
-$exe = 'C:\Users\anl\meeting-app\target\release\meeting-app.exe'
+$exe = $Exe
 if (-not (Test-Path $exe)) { Write-Host ("MISSING: " + $exe); exit 1 }
 Write-Host ("Launching " + $exe)
 $p = Start-Process $exe -PassThru

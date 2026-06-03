@@ -89,8 +89,21 @@ if ($Features) {
 Get-Process -Name meeting-app -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 
-# Build the app binary (release). CPU-default unless -Features given.
-$cargoArgs = @('build', '--release', '--bin', 'meeting-app')
+# Build the PRODUCTION app via the Tauri CLI (cargo-tauri), NOT a bare
+# `cargo build` -- the latter leaves Tauri's `dev` cfg on, so the webview loads
+# devUrl (http://localhost:5173) and shows "localhost refused to connect" with
+# no dev server. `tauri build` produces a prod binary that serves the embedded
+# frontend via the tauri:// protocol. --no-bundle: just the exe + DLLs in
+# target\release (run-from-folder finds adjacent DLLs), no installer -> sidesteps
+# the .dll-bundling gap. beforeBuildCommand is overridden to "" because Node is
+# absent on Windows and ui\dist is prebuilt in WSL + synced.
+# Write the beforeBuildCommand override to a temp config FILE and pass its path
+# to -c: inline JSON on the cargo command line gets its double-quotes stripped by
+# PowerShell's native-argument handling ("invalid value ... key must be a
+# string"). A file path has no quotes to mangle. ASCII, no BOM.
+$tauriOverride = Join-Path $env:TEMP 'mapp-tauri-override.json'
+[System.IO.File]::WriteAllText($tauriOverride, '{ "build": { "beforeBuildCommand": "" } }')
+$cargoArgs = @('tauri', 'build', '--no-bundle', '-c', $tauriOverride)
 if ($Features) { $cargoArgs += @('--features', $Features) }
 Write-Host ("==> cargo " + ($cargoArgs -join ' '))
 $ErrorActionPreference = 'Continue'

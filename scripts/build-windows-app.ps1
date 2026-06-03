@@ -64,6 +64,17 @@ $null = & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -SkipAutomat
 
 Set-Location $build
 
+# GPU/feature builds: use the Ninja generator. llama.cpp's vulkan-shaders-gen
+# nested ExternalProject fails under the MSBuild VS generator on Windows
+# ("could not load cache" / "cannot find batch label VCEnd"); Ninja sidesteps
+# the .vcxproj custom-build-rule machinery. Requires ninja + cl.exe on PATH
+# (the VsDevShell above provides cl.exe; ninja is in ~\.cargo\bin). The
+# CPU-default build keeps the VS generator (known-good), so this is gated.
+if ($Features) {
+    $env:CMAKE_GENERATOR = 'Ninja'
+    Write-Host "==> CMAKE_GENERATOR=Ninja (feature build)"
+}
+
 # Build the app binary (release). CPU-default unless -Features given.
 $cargoArgs = @('build', '--release', '--bin', 'meeting-app')
 if ($Features) { $cargoArgs += @('--features', $Features) }
@@ -84,8 +95,11 @@ Get-ChildItem "$rel\*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host ("    dll: {0}  ({1:N1} MB)" -f $_.Name, ($_.Length / 1MB))
 }
 
-# Stage the runnable artifact (exe + adjacent DLLs) and zip it.
-$stage = "$build\dist-windows\meeting-app"
+# Stage the runnable artifact (exe + adjacent DLLs) and zip it. A feature build
+# gets a suffix so the CPU and GPU artifacts coexist (e.g. ...-x64-vulkan.zip).
+$suffix = ''
+if ($Features) { $suffix = '-' + ($Features -replace '[, ]+', '-') }
+$stage = "$build\dist-windows\meeting-app$suffix"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item $exe $stage
@@ -98,7 +112,7 @@ if (Test-Path "$rel\_up_") {
     Write-Host "    bundled: _up_\resources (Silero VAD)"
 }
 
-$zip = "$build\dist-windows\meeting-app-windows-x64.zip"
+$zip = "$build\dist-windows\meeting-app-windows-x64$suffix.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "$stage\*" -DestinationPath $zip
 $zipMb = [math]::Round((Get-Item $zip).Length / 1MB, 1)

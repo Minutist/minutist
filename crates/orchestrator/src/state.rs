@@ -40,6 +40,20 @@ pub(crate) enum InternalState {
     Stopping {
         meeting_id: MeetingId,
     },
+    /// An offline operation (re-transcribe / re-diarize) is running. The
+    /// recorder is not live, but the slot is **claimed** so a concurrent
+    /// `start`, `re_transcribe`, or `rediarize` is rejected and cannot clobber
+    /// the same meeting's `transcript.json` (TIMELINE-DRIFT #5). Restored to
+    /// `Idle` when the op completes (including on error).
+    ///
+    /// `meeting_id` records which meeting holds the claim; it is surfaced via
+    /// the `Debug` derive in the release-path diagnostic log. It is otherwise
+    /// not read (the claim is a binary gate, not keyed on the id), hence the
+    /// `allow(dead_code)` — keeping the id documents the claim and aids tracing.
+    Offline {
+        #[allow(dead_code)]
+        meeting_id: MeetingId,
+    },
 }
 
 impl InternalState {
@@ -65,8 +79,49 @@ impl InternalState {
             InternalState::Stopping { meeting_id } => RecordingState::Stopping {
                 meeting_id: *meeting_id,
             },
+            // An offline op leaves the recorder idle from the webview's
+            // perspective (no live capture); the claim is internal-only. The
+            // public `RecordingState` (in `common`) has no Offline variant and
+            // must not gain one, so it maps to Idle.
+            InternalState::Offline { .. } => RecordingState::Idle,
         }
     }
+}
+
+/// Atomically claim the recorder for an offline operation (re-transcribe /
+/// re-diarize). Only valid from `Idle`; any live or already-offline state
+/// rejects with `AppError::InvalidInput` so two offline ops (or an offline op
+/// racing a `start`) cannot run concurrently and clobber the same meeting's
+/// `transcript.json` (TIMELINE-DRIFT #5).
+pub(crate) fn transition_offline_claim(
+    state: &mut InternalState,
+    meeting_id: MeetingId,
+) -> AppResult<()> {
+    match state {
+        InternalState::Idle => {
+            *state = InternalState::Offline { meeting_id };
+            Ok(())
+        }
+        _ => Err(AppError::InvalidInput {
+            context: "offline operation requires the recorder to be Idle".into(),
+        }),
+    }
+}
+
+/// Release an offline claim, returning the recorder to `Idle`.
+///
+/// Tolerant of a non-`Offline` state (logs and forces `Idle`) so a release in a
+/// cleanup/error path can never wedge the recorder: the worst case is a stray
+/// release, which still leaves the recorder usable.
+pub(crate) fn transition_offline_release(state: &mut InternalState) {
+    if !matches!(state, InternalState::Offline { .. }) {
+        tracing::warn!(
+            target: "orchestrator",
+            ?state,
+            "offline release called outside Offline state; forcing Idle"
+        );
+    }
+    *state = InternalState::Idle;
 }
 
 /// Validate and execute Idle → Recording.

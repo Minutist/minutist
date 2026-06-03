@@ -584,8 +584,9 @@ fn test_opus_pcm_round_trip_pause_including() {
     let pcm = reader::decode_opus_ogg_for_test(&buf).expect("decode");
     let decoded_secs = pcm.len() as f64 / SAMPLE_RATE as f64;
 
-    // 5 + ~0 + 5 = ~10 s. Generous ±0.5 s for the zero-padded final frame and
-    // Opus pre-skip (not subtracted at decode time).
+    // 5 + ~0 + 5 = ~10 s. Generous ±0.5 s for the zero-padded final frame.
+    // `read_audio_pcm`/`decode_opus_ogg` now trims the declared OpusHead
+    // pre-skip, so decoded sample 0 aligns with recorded sample 0.
     let diff = (decoded_secs - 10.0).abs();
     assert!(
         diff <= 0.5,
@@ -714,6 +715,132 @@ fn test_read_audio_pcm_includes_silent_gap_deterministic() {
         speech_peak > 0.1,
         "leading speech region must be non-silent (peak {speech_peak}); the encoder \
          may not have produced audio"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-pause lookahead drift (TIMELINE-DRIFT #2)
+// ---------------------------------------------------------------------------
+
+/// Multiple pauses must NOT accumulate uncompensated codec lookahead: the
+/// decoded duration of a recording with N injected pauses (each a known
+/// `PAUSE_FRAMES` of synthesised silence) must equal speech + the SUM of the
+/// injected pause silence, to within a single-frame tolerance — independent of
+/// the number of pauses.
+///
+/// Before the #2 fix, `resume()` called `encoder.reset_state()`, re-priming the
+/// codec at every resume and adding ~one lookahead's worth of uncompensated
+/// decoded samples per pause; with many pauses the decoded duration drifted
+/// well past the injected total. Driving the deterministic
+/// `resume_with_pause_frames` seam (no wall-clock) over several pauses, the
+/// decoded length now tracks the injected silence with no per-pause growth.
+#[test]
+fn test_multiple_pauses_do_not_accumulate_lookahead_drift() {
+    use crate::opus_encoder::{OggOpusEncoder, FRAME_SAMPLES};
+
+    // Three pauses, each 50 frames (1 s) of injected silence, with 1 s of
+    // speech between/around them. All spans are exact frame multiples.
+    const PAUSES: u64 = 3;
+    const PAUSE_FRAMES: u64 = 50; // 50 * 320 = 16_000 = 1 s
+    let speech_block = sine_samples(1.0); // 16_000 samples = exactly 50 frames
+
+    let mut buf = Vec::<u8>::new();
+    let mut enc = OggOpusEncoder::new(Cursor::new(&mut buf)).expect("encoder");
+
+    enc.push_samples(&speech_block).expect("initial speech");
+    for _ in 0..PAUSES {
+        enc.pause().expect("pause");
+        enc.resume_with_pause_frames(PAUSE_FRAMES)
+            .expect("resume with injected frames");
+        enc.push_samples(&speech_block).expect("post-pause speech");
+    }
+    enc.finalise().expect("finalise");
+
+    let pcm = reader::decode_opus_ogg_for_test(&buf).expect("decode");
+    let decoded = pcm.len() as u64;
+
+    // Expected (exact, in samples): (PAUSES + 1) speech blocks + PAUSES pause
+    // runs. The encoder appends exactly one zero-padded final frame in
+    // finalise, and frame quantisation can differ by at most one frame.
+    let speech_samples = (PAUSES + 1) * speech_block.len() as u64;
+    let pause_samples = PAUSES * PAUSE_FRAMES * FRAME_SAMPLES as u64;
+    let expected = speech_samples + pause_samples;
+
+    // Tolerance: a couple of frames covers the final padding frame and
+    // boundary quantisation, but is FAR tighter than the per-pause lookahead
+    // (~1280 samples × 3 pauses = 3840 samples) the old reset_state introduced.
+    let tol = (FRAME_SAMPLES as u64) * 3;
+    let drift = decoded.abs_diff(expected);
+    assert!(
+        drift <= tol,
+        "decoded {decoded} samples vs expected {expected} (drift {drift} > tol {tol}); \
+         per-pause lookahead drift detected (reset_state regression)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pre-skip trim (TIMELINE-DRIFT #1)
+// ---------------------------------------------------------------------------
+
+/// `parse_opus_head_pre_skip` reads the declared `pre_skip` from an `OpusHead`
+/// packet and scales it from the Opus 48 kHz internal rate to the 16 kHz output
+/// rate. The encoder writes `3840` (80 ms at 48 kHz) → 1280 samples at 16 kHz.
+#[test]
+fn test_parse_opus_head_pre_skip_scales_to_output_rate() {
+    // A minimal RFC 7845 §5.1 OpusHead with pre_skip = 3840 (matching the
+    // encoder). Bytes: magic(8) version(1) channels(1) pre_skip(2 LE) ...
+    let mut head = Vec::new();
+    head.extend_from_slice(b"OpusHead");
+    head.push(1); // version
+    head.push(1); // channels
+    head.extend_from_slice(&3840u16.to_le_bytes()); // pre_skip @48k
+    head.extend_from_slice(&16_000u32.to_le_bytes()); // input rate
+    head.extend_from_slice(&0u16.to_le_bytes()); // gain
+    head.push(0); // mapping family
+
+    let pre_skip_16k = reader::parse_opus_head_pre_skip_for_test(&head);
+    // 3840 * 16000 / 48000 = 1280 samples = 80 ms at 16 kHz.
+    assert_eq!(pre_skip_16k, 1280, "pre_skip must scale 48k→16k to 1280 samples");
+
+    // A short/malformed header degrades to no trim (0), never a panic.
+    assert_eq!(reader::parse_opus_head_pre_skip_for_test(b"OpusHea"), 0);
+    assert_eq!(reader::parse_opus_head_pre_skip_for_test(&[]), 0);
+}
+
+/// The pre-skip trim shifts decoded sample 0 to recorded sample 0: a stream
+/// whose first recorded frame is a loud known marker must decode with that
+/// marker at (or extremely near) the head of the buffer, not pushed back by the
+/// ~80 ms of priming silence the codec emits.
+///
+/// We encode a single non-silent frame followed by silence. Without the trim,
+/// the decoded buffer leads with ~1280 priming samples before the marker
+/// energy; with the trim, the marker energy appears within the first frame.
+#[test]
+fn test_decode_trims_pre_skip_so_sample_zero_is_recorded_sample_zero() {
+    use crate::opus_encoder::{OggOpusEncoder, FRAME_SAMPLES};
+
+    let mut buf = Vec::<u8>::new();
+    let mut enc = OggOpusEncoder::new(Cursor::new(&mut buf)).expect("encoder");
+
+    // One loud marker frame, then enough trailing audio that decode is stable.
+    let marker = vec![0.6f32; FRAME_SAMPLES];
+    enc.push_samples(&marker).expect("push marker");
+    enc.push_samples(&sine_samples(0.5)).expect("push tail");
+    enc.finalise().expect("finalise");
+
+    let pcm = reader::decode_opus_ogg_for_test(&buf).expect("decode");
+    assert!(pcm.len() > FRAME_SAMPLES * 2, "decoded buffer too short");
+
+    // With the pre-skip (1280 samples) trimmed, the marker energy must appear
+    // within the first frame's worth of samples. Without the trim, the first
+    // ~1280 samples would be near-zero priming and this would fail.
+    let head_peak = pcm[..FRAME_SAMPLES]
+        .iter()
+        .fold(0.0f32, |m, &s| m.max(s.abs()));
+    assert!(
+        head_peak > 0.1,
+        "marker energy must be at the head of the decoded buffer after pre-skip trim; \
+         peak in first frame was {head_peak} (pre-skip not trimmed?)"
     );
 }
 
@@ -1116,6 +1243,66 @@ async fn test_index_rebuild_from_disk() {
     let n2 = index.rebuild_from_disk(root).await.expect("rebuild 2");
     assert_eq!(n2, 2);
     assert_eq!(index.list_meetings().await.expect("list").len(), 2);
+}
+
+/// A concurrent reader must never observe a half-rebuilt table
+/// (TIMELINE-DRIFT #7): `rebuild_from_disk` wraps the DELETE + repopulate in a
+/// single transaction, so a `list_meetings` racing the rebuild sees either the
+/// old contents or the fully-rebuilt contents — never the transient empty
+/// table the un-transacted DELETE used to expose.
+///
+/// The index holds a single libsql connection; both the rebuild and the reads
+/// borrow `&index` and are driven concurrently via `tokio::join!`. The reader
+/// loops many times during the rebuild and asserts every snapshot has the full
+/// meeting count (or possibly more during the brief window before COMMIT — but
+/// never fewer, and never zero).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rebuild_from_disk_is_atomic_for_concurrent_readers() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    // Populate enough meetings that a rebuild does observable work.
+    const N: usize = 12;
+    for i in 0..N {
+        write_synthetic_meeting(
+            root,
+            &format!("Meeting {i:02}"),
+            &format!("2026-06-{:02}T09:00:00Z", (i % 27) + 1),
+            &[make_segment(0, 500, &format!("excerpt {i}"))],
+            None,
+            None,
+        );
+    }
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    // Seed the table so the table is non-empty BEFORE the racing rebuild; a
+    // non-atomic DELETE would momentarily drop this to zero.
+    let seeded = index.rebuild_from_disk(root).await.expect("seed");
+    assert_eq!(seeded, N);
+
+    let rebuild = async {
+        // A few rebuilds back-to-back to widen the race window.
+        for _ in 0..5 {
+            index.rebuild_from_disk(root).await.expect("concurrent rebuild");
+        }
+    };
+
+    let reader = async {
+        for _ in 0..200 {
+            let listed = index.list_meetings().await.expect("concurrent list");
+            assert!(
+                listed.len() >= N,
+                "reader observed a half-rebuilt table: {} rows (< {N}); the DELETE + \
+                 repopulate must be transactional",
+                listed.len()
+            );
+        }
+    };
+
+    tokio::join!(rebuild, reader);
+
+    // Final state is the full set, exactly once each.
+    assert_eq!(index.list_meetings().await.expect("final list").len(), N);
 }
 
 #[tokio::test]

@@ -184,6 +184,30 @@ pause-offset map (a list of pause intervals) — and it was **deferred out of
 Phase 4** (no audio player shipped this phase). Whatever phase adds audio
 playback owns the pause-offset map.
 
+**Offline reprocessing must reproduce the pause-excluding timeline.** Because
+`audio.opus` is pause-*including* but `Segment::start_ms` is pause-*excluding*,
+`re_transcribe` (which decodes `audio.opus`) MUST reconstruct the pause-excluding
+clock or every post-pause segment would be inflated by the pause durations
+(breaking the FR-22/23 cross-reference + the diarizer overlay that re-derive from
+those timestamps). Since no pause-interval map is persisted yet (see the deferred
+seek-to-anchor note above), `re_transcribe` reconstructs it heuristically: it
+treats a run of ≥ 4 s of near-silent (`|x| ≤ 0.02`) decoded samples — comfortably
+above the live accumulator's 3 s `MAX_GAP_MS` cap — as encoder pause padding and
+excludes it from the timeline (the offline clock advances only over kept audio,
+exactly as the live capture clock froze during the pause). Decode also trims the
+`OpusHead` pre-skip so decoded sample 0 == recorded sample 0. The
+`orchestrator/tests/timeline_coherence.rs` test asserts a paused meeting's
+re-transcribed post-pause segment lands on the pause-excluding clock (not inflated
+by the pause). Limitation: a ≥ 4 s run of genuinely-silent *input* would be
+misclassified; a persisted pause-interval map (a `common`/schema change) would
+make this exact rather than heuristic — tracked for a later phase.
+
+**Offline ops are serialized.** `re_transcribe` and `rediarize` are offline
+(require `Idle`) and now atomically CLAIM an internal `Offline` state under the
+orchestrator lock (rejecting a concurrent start / re-transcribe / re-diarize with
+`AppError::InvalidInput`) and release it on every exit path, so two offline ops
+can't race and clobber `transcript.json`.
+
 ## llama.cpp prefill batching
 
 Phase 0 Spike 2 found that `cparams.n_batch` is a **per-decode hard

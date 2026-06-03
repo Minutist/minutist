@@ -40,6 +40,14 @@ use crate::notes::NotesStore;
 /// smaller, but the decoder needs a buffer sized for the worst case.
 const MAX_FRAME_SAMPLES: usize = 5760;
 
+/// The Opus codec's fixed internal sample rate. The `OpusHead` `pre_skip` field
+/// is always expressed at this rate (RFC 7845 §5.1).
+const OPUS_INTERNAL_RATE_HZ: u64 = 48_000;
+
+/// The decoder's output sample rate (16 kHz mono — workspace standard). Used to
+/// scale the 48 kHz `pre_skip` count into output samples.
+const SAMPLE_RATE_OUT_HZ: u64 = 16_000;
+
 /// Read and deserialise `metadata.json` from a meeting folder.
 ///
 /// Blocking `std::fs` read; deserialises with `serde_json`.
@@ -133,6 +141,19 @@ pub fn read_meeting_state(meeting_dir: &Path) -> AppResult<MeetingState> {
 /// audio packet, appending the decoded samples. The silent frames written for
 /// pause gaps decode to genuine zero samples, so the returned buffer is
 /// pause-including.
+///
+/// # Pre-skip trimming
+///
+/// The encoder declares a `pre_skip` count in the `OpusHead` packet (RFC 7845
+/// §5.1) — the number of leading decoded samples that are codec lookahead /
+/// priming, not recorded audio. The Opus decoder emits these priming samples at
+/// the head of the stream, so decoded sample 0 is **not** recorded sample 0
+/// unless the pre-skip is trimmed. We read the actual `pre_skip` field from the
+/// `OpusHead` packet (rather than assuming the encoder's nominal value) and drop
+/// exactly that many leading decoded samples, so the returned buffer's sample 0
+/// aligns with recorded sample 0. Without this trim every decoded buffer is
+/// pre-skip-many samples offset and over-long, biasing the diarizer overlay and
+/// the offline re-transcribe timeline.
 fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
     let cursor = std::io::Cursor::new(data);
     let mut reader = PacketReader::new(cursor);
@@ -143,8 +164,11 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
     let mut pcm = Vec::<f32>::new();
     let mut frame_buf = vec![0.0f32; MAX_FRAME_SAMPLES];
 
-    // The first two packets are OpusHead and OpusTags — skip them.
+    // The first two packets are OpusHead and OpusTags. We parse `pre_skip` out
+    // of the OpusHead packet and skip OpusTags.
     let mut header_packets_seen = 0;
+    // Pre-skip samples (16 kHz) still to be trimmed off the head of the stream.
+    let mut pre_skip_remaining: u64 = 0;
 
     loop {
         let pkt = match reader.read_packet() {
@@ -154,6 +178,14 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
         };
 
         if header_packets_seen < 2 {
+            // Packet 0 is OpusHead; read its declared pre_skip (a 16-bit LE
+            // field at byte offset 10, after the 8-byte "OpusHead" magic,
+            // version, and channel-count bytes — RFC 7845 §5.1). The field is
+            // expressed at the Opus 48 kHz internal rate, so convert to the
+            // decoder's 16 kHz output rate.
+            if header_packets_seen == 0 {
+                pre_skip_remaining = parse_opus_head_pre_skip(&pkt.data);
+            }
             header_packets_seen += 1;
             continue;
         }
@@ -167,13 +199,43 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
             .decode_float(Some(input), output, false)
             .map_err(|e| format!("decode error: {e}"))?;
 
-        pcm.extend_from_slice(&frame_buf[..decoded]);
+        let mut frame = &frame_buf[..decoded];
+        if pre_skip_remaining > 0 {
+            let trim = (pre_skip_remaining as usize).min(frame.len());
+            pre_skip_remaining -= trim as u64;
+            frame = &frame[trim..];
+        }
+        pcm.extend_from_slice(frame);
     }
 
     Ok(pcm)
 }
 
+/// Parse the `pre_skip` field from an `OpusHead` packet and convert it from the
+/// Opus internal 48 kHz rate to the decoder's 16 kHz output rate.
+///
+/// RFC 7845 §5.1 layout: 8-byte magic `"OpusHead"`, 1-byte version, 1-byte
+/// channel count, then a little-endian `u16` `pre_skip` at byte offset 10. A
+/// malformed/short packet yields a `0` pre-skip (no trim) rather than failing
+/// the decode — `audio.opus` is the source of truth and a header we cannot
+/// parse should degrade to the prior behaviour, not error.
+fn parse_opus_head_pre_skip(head: &[u8]) -> u64 {
+    if head.len() < 12 || &head[..8] != b"OpusHead" {
+        return 0;
+    }
+    let pre_skip_48k = u16::from_le_bytes([head[10], head[11]]) as u64;
+    // The OpusHead pre_skip is always at the 48 kHz internal sample rate
+    // regardless of the decode rate (RFC 7845 §5.1). The decoder here outputs
+    // 16 kHz, so scale down by 48000/16000 = 3.
+    pre_skip_48k * SAMPLE_RATE_OUT_HZ / OPUS_INTERNAL_RATE_HZ
+}
+
 #[cfg(test)]
 pub(crate) fn decode_opus_ogg_for_test(data: &[u8]) -> Result<Vec<f32>, String> {
     decode_opus_ogg(data)
+}
+
+#[cfg(test)]
+pub(crate) fn parse_opus_head_pre_skip_for_test(head: &[u8]) -> u64 {
+    parse_opus_head_pre_skip(head)
 }

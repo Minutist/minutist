@@ -30,7 +30,7 @@
 use std::io::Write;
 use std::time::Instant;
 
-use audiopus::coder::{Encoder as OpusEncoder, GenericCtl};
+use audiopus::coder::Encoder as OpusEncoder;
 use audiopus::{Application, Bitrate, Channels, SampleRate};
 use ogg::{PacketWriteEndInfo, PacketWriter};
 
@@ -221,15 +221,30 @@ impl<W: Write> OggOpusEncoder<W> {
         self.finish_resume(pause_frames, elapsed.as_millis() as u64)
     }
 
-    /// Shared resume tail: leave the paused state, reset the encoder so post-gap
-    /// audio isn't contaminated by pre-pause residue, and synthesise
-    /// `pause_frames` zero-sample (silent) Opus frames so the decoded audio
-    /// includes the pause interval (option b). This is the single code path that
-    /// makes `read_audio_pcm` pause-INCLUDING; `resume()` drives it from the
-    /// measured wall-clock pause, the test seam from an injected frame count.
+    /// Shared resume tail: leave the paused state and synthesise `pause_frames`
+    /// zero-sample (silent) Opus frames so the decoded audio includes the pause
+    /// interval (option b). This is the single code path that makes
+    /// `read_audio_pcm` pause-INCLUDING; `resume()` drives it from the measured
+    /// wall-clock pause, the test seam from an injected frame count.
+    ///
+    /// # Why no `reset_state()` (TIMELINE-DRIFT #2)
+    ///
+    /// This previously called `encoder.reset_state()` here to keep post-gap
+    /// audio from being "contaminated by pre-pause residue". But `reset_state`
+    /// re-primes the encoder: the codec lookahead delay (the `pre_skip` priming
+    /// the decoder emits) is re-introduced at the head of the post-reset audio
+    /// and is **never compensated** — the `OpusHead` `pre_skip` field only
+    /// trims the priming at the *stream start*, once. So every pause added
+    /// roughly one lookahead's worth of uncompensated decoded samples, and the
+    /// decoded duration drifted further from wall-clock with each pause.
+    ///
+    /// Keeping the encoder state continuous across the pause avoids that: the
+    /// synthesised silent run flushes the encoder's short-term memory naturally
+    /// (it is genuine silence the codec encodes contiguously, with no new
+    /// priming gap), so the decoded duration gains no uncompensated lookahead
+    /// per pause while still carrying the full pause silence.
     fn finish_resume(&mut self, pause_frames: u64, pause_ms: u64) -> Result<()> {
         self.pause_state = PauseState::Recording;
-        self.encoder.reset_state()?;
 
         let silent = vec![0.0f32; FRAME_SAMPLES];
         for _ in 0..pause_frames {

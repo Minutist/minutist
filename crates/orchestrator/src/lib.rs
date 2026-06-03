@@ -57,8 +57,8 @@ use model_registry::ModelRegistry;
 use persistence::{MeetingIndex, MeetingWriter};
 use settings::SettingsHandle;
 use state::{
-    transition_idle, transition_pause, transition_resume, transition_start, transition_stop,
-    InternalState,
+    transition_idle, transition_offline_claim, transition_offline_release, transition_pause,
+    transition_resume, transition_start, transition_stop, InternalState,
 };
 use tokio::sync::{broadcast, Mutex};
 
@@ -565,8 +565,23 @@ impl Orchestrator {
     ///   available or fails to load (unlike the live path's best-effort skip, an
     ///   explicit user-triggered re-transcribe with no model is an error).
     pub async fn re_transcribe(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
-        self.ensure_idle_for_retranscribe().await?;
+        // Atomically CLAIM the recorder (not just check Idle) so a concurrent
+        // start / re_transcribe / rediarize is rejected and cannot clobber the
+        // same `transcript.json` (TIMELINE-DRIFT #5). Released on every exit.
+        self.claim_offline(meeting_id).await?;
+        let result = self.re_transcribe_claimed(index, meeting_id).await;
+        self.release_offline().await;
+        result
+    }
 
+    /// The re-transcribe body, run while the offline claim is held. Split out so
+    /// [`Self::re_transcribe`] can guarantee the claim is released on every exit
+    /// path (success and error).
+    async fn re_transcribe_claimed(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+    ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
         // Decode audio + run VAD + ASR on a blocking thread. Build the ASR
@@ -613,19 +628,28 @@ impl Orchestrator {
             .await
     }
 
-    /// Refuse a re-transcribe unless the recorder is `Idle`.
+    /// Atomically claim the recorder for an offline operation (re-transcribe /
+    /// re-diarize), under the state lock (TIMELINE-DRIFT #5).
     ///
-    /// Shared by [`Self::re_transcribe`] and the test-only
-    /// `re_transcribe_with_backend` so both honour the same offline-only
-    /// invariant.
-    async fn ensure_idle_for_retranscribe(&self) -> AppResult<()> {
-        let guard = self.inner.lock().await;
-        if !matches!(guard.state, InternalState::Idle) {
-            return Err(AppError::InvalidInput {
-                context: "re_transcribe requires the recorder to be Idle".into(),
-            });
-        }
-        Ok(())
+    /// Returns `AppError::InvalidInput` if the recorder is not `Idle` — i.e. a
+    /// live recording is in progress OR another offline op already holds the
+    /// claim. On success the state is `Offline { meeting_id }` until
+    /// [`Self::release_offline`] is called. This is the single seam both the
+    /// production offline ops and their test-only `*_with_*` variants go through,
+    /// so two concurrent offline ops (or an offline op racing a `start`) can no
+    /// longer both pass the gate and clobber the same `transcript.json`.
+    async fn claim_offline(&self, meeting_id: MeetingId) -> AppResult<()> {
+        let mut guard = self.inner.lock().await;
+        transition_offline_claim(&mut guard.state, meeting_id)
+    }
+
+    /// Release an offline claim, returning the recorder to `Idle`.
+    ///
+    /// Called on every exit path of an offline op (success and error) so a
+    /// failed op never wedges the recorder out of `Idle`.
+    async fn release_offline(&self) {
+        let mut guard = self.inner.lock().await;
+        transition_offline_release(&mut guard.state);
     }
 
     /// Rewrite `transcript.json` from the refreshed `segments` and refresh the
@@ -717,8 +741,21 @@ impl Orchestrator {
     ///   not available or fails to load.
     /// - `AppError::Inference` if sherpa diarization fails.
     pub async fn rediarize(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
-        self.ensure_idle_for_rediarize().await?;
+        // Atomic claim/release (TIMELINE-DRIFT #5): rediarize also rewrites
+        // `transcript.json`, so it must claim the slot just like re_transcribe.
+        self.claim_offline(meeting_id).await?;
+        let result = self.rediarize_claimed(index, meeting_id).await;
+        self.release_offline().await;
+        result
+    }
 
+    /// The re-diarize body, run while the offline claim is held (so the claim is
+    /// released on every exit path).
+    async fn rediarize_claimed(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+    ) -> AppResult<()> {
         // Build the production diarizer off the async worker threads (the model
         // load is heavy). It is then handed to the shared inner path as an owned
         // `Box<dyn Diarizer>`, exactly like the test seam supplies a StubDiarizer.
@@ -740,20 +777,6 @@ impl Orchestrator {
             })??;
 
         self.rediarize_inner(index, meeting_id, diarizer).await
-    }
-
-    /// Refuse a re-diarize unless the recorder is `Idle`.
-    ///
-    /// Shared by [`Self::rediarize`] and the test-only `rediarize_with_diarizer`
-    /// so both honour the same offline-only invariant.
-    async fn ensure_idle_for_rediarize(&self) -> AppResult<()> {
-        let guard = self.inner.lock().await;
-        if !matches!(guard.state, InternalState::Idle) {
-            return Err(AppError::InvalidInput {
-                context: "rediarize requires the recorder to be Idle".into(),
-            });
-        }
-        Ok(())
     }
 
     /// Shared diarization-and-persist core for the user-triggered re-diarize.
@@ -1089,8 +1112,23 @@ impl Orchestrator {
         meeting_id: MeetingId,
         backend: Box<dyn meeting_app_common::AsrBackend + Send>,
     ) -> AppResult<()> {
-        self.ensure_idle_for_retranscribe().await?;
+        // Same atomic claim/release as the production path (TIMELINE-DRIFT #5).
+        self.claim_offline(meeting_id).await?;
+        let result = self
+            .re_transcribe_with_backend_claimed(index, meeting_id, backend)
+            .await;
+        self.release_offline().await;
+        result
+    }
 
+    /// The `re_transcribe_with_backend` body, run while the offline claim is
+    /// held (so the claim is released on every exit path).
+    async fn re_transcribe_with_backend_claimed(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+    ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
         let event_tx = self.event_tx.clone();
@@ -1131,8 +1169,11 @@ impl Orchestrator {
         meeting_id: MeetingId,
         diarizer: Box<dyn Diarizer + Send>,
     ) -> AppResult<()> {
-        self.ensure_idle_for_rediarize().await?;
-        self.rediarize_inner(index, meeting_id, diarizer).await
+        // Same atomic claim/release as the production path (TIMELINE-DRIFT #5).
+        self.claim_offline(meeting_id).await?;
+        let result = self.rediarize_inner(index, meeting_id, diarizer).await;
+        self.release_offline().await;
+        result
     }
 
     /// Inject a `diarizer` for the next on-stop diarization pass, so a real

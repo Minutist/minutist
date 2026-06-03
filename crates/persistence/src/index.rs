@@ -147,24 +147,37 @@ impl MeetingIndex {
     /// warning — the index is a cache, so one bad folder must not abort the
     /// whole rebuild.
     ///
+    /// # Atomicity (TIMELINE-DRIFT #7)
+    ///
+    /// The DELETE + repopulate runs inside a single `BEGIN`/`COMMIT`
+    /// transaction, so a concurrent `list_meetings`/`search` on the shared
+    /// connection observes either the old table or the fully-rebuilt one, never
+    /// a half-cleared/half-populated intermediate. On any error the transaction
+    /// is rolled back, leaving the previous index contents intact.
+    ///
     /// Returns the number of meetings indexed.
     pub async fn rebuild_from_disk(&self, meetings_root: &Path) -> AppResult<usize> {
         Ok(self.rebuild_from_disk_inner(meetings_root).await?)
     }
 
     async fn rebuild_from_disk_inner(&self, meetings_root: &Path) -> Result<usize, Error> {
-        self.conn.execute("DELETE FROM meetings", ()).await?;
-
+        // Enumerate eligible folders BEFORE opening the transaction so the
+        // (blocking) directory read does not hold the write lock open longer
+        // than necessary. A missing root yields an empty index without ever
+        // touching the table.
         let dirs = match std::fs::read_dir(meetings_root) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No meetings root yet — an empty index is the correct result.
+                // Still run the clear in a transaction so a stale table is reset
+                // atomically.
+                self.rebuild_transaction(Vec::new()).await?;
                 return Ok(0);
             }
             Err(e) => return Err(Error::Io(e)),
         };
 
-        let mut indexed = 0usize;
+        let mut entries: Vec<MeetingListEntry> = Vec::new();
         for entry in dirs {
             let entry = entry.map_err(Error::Io)?;
             let path = entry.path();
@@ -176,10 +189,7 @@ impl MeetingIndex {
             }
 
             match entry_from_folder(&path).await {
-                Ok(list_entry) => {
-                    self.upsert_inner(&list_entry).await?;
-                    indexed += 1;
-                }
+                Ok(list_entry) => entries.push(list_entry),
                 Err(e) => {
                     tracing::warn!(
                         target: "persistence",
@@ -191,6 +201,9 @@ impl MeetingIndex {
             }
         }
 
+        let indexed = entries.len();
+        self.rebuild_transaction(entries).await?;
+
         tracing::info!(
             target: "persistence",
             root = %meetings_root.display(),
@@ -199,6 +212,43 @@ impl MeetingIndex {
         );
 
         Ok(indexed)
+    }
+
+    /// Atomically replace the `meetings` table contents with `entries`.
+    ///
+    /// Wraps `DELETE` + the per-entry `INSERT … ON CONFLICT` upserts in a single
+    /// transaction so concurrent readers on the shared connection never see a
+    /// half-rebuilt table. Rolls back (best-effort) on any error so a failed
+    /// rebuild leaves the prior contents intact.
+    async fn rebuild_transaction(&self, entries: Vec<MeetingListEntry>) -> Result<(), Error> {
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let result = async {
+            self.conn.execute("DELETE FROM meetings", ()).await?;
+            for entry in &entries {
+                self.upsert_inner(entry).await?;
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort rollback; the original error is what callers see.
+                if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                    tracing::warn!(
+                        target: "persistence",
+                        error = %rb,
+                        "index rebuild rollback failed after a rebuild error"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 }
 

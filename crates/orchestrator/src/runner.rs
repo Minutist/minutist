@@ -474,50 +474,17 @@ fn run_drain_loop(
                     }
                     drain_meter(&mut streams.meter, &event_tx);
 
-                    // End-of-stream VAD flush.
-                    if let Some(ref mut vad) = vad_opt {
-                        match vad.flush_end_of_stream() {
-                            Ok(events) => {
-                                for ev in events {
-                                    if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
-                                        acc.append(start_ms, end_ms, &samples);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "orchestrator",
-                                    "VAD flush_end_of_stream error: {e}"
-                                );
-                            }
-                        }
-                    }
-
-                    // Flush any remaining accumulator content before finalising.
-                    if !acc.is_empty() {
-                        let (samples, vad_segments) = acc.drain();
-                        let payload = FlushPayload { samples, vad_segments, meeting_id };
-                        dispatch_flush(&flush_queue, payload, &event_tx);
-                    }
-
-                    // Wait for the ASR worker to process any remaining flushes
-                    // so that transcript.json is fully written before finalise.
-                    // The runner signals the worker via flush_queue.close() (via
-                    // the Drop guard), so the worker will process all pending
-                    // items and exit. We wait up to 30 s for a slow backend.
-                    wait_for_asr_worker_drain(
+                    finalise_on_stop(
+                        meta,
+                        reply,
+                        &mut vad_opt,
+                        &mut acc,
                         &flush_queue,
                         &mut writer_cmd_rx,
-                        &mut writer,
+                        writer,
+                        &event_tx,
+                        meeting_id,
                     );
-
-                    // Drain any remaining transcript write commands.
-                    drain_writer_commands(&mut writer_cmd_rx, &mut writer);
-
-                    let unboxed = *meta;
-                    let result = writer.finalise(unboxed.clone()).map(|_| unboxed);
-                    let _ = reply.send(result);
-                    tracing::info!(target: "orchestrator", "runner: exiting cleanly");
                     return;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -551,11 +518,25 @@ fn run_drain_loop(
                     tracing::info!(
                         target: "orchestrator",
                         meeting_id = %meta.uuid.0,
-                        "runner: stop while writer paused; finalising"
+                        "runner: stop while writer paused; flushing and finalising"
                     );
-                    let unboxed = *meta;
-                    let result = writer.finalise(unboxed.clone()).map(|_| unboxed);
-                    let _ = reply.send(result);
+                    // No live samples to drain while paused, but the VAD may
+                    // still hold an in-progress segment from before the pause —
+                    // run the SAME end-of-stream flush + accumulator drain the
+                    // Recording-stop path uses so the last utterance is not lost
+                    // (TIMELINE-DRIFT #6).
+                    drain_meter(&mut streams.meter, &event_tx);
+                    finalise_on_stop(
+                        meta,
+                        reply,
+                        &mut vad_opt,
+                        &mut acc,
+                        &flush_queue,
+                        &mut writer_cmd_rx,
+                        writer,
+                        &event_tx,
+                        meeting_id,
+                    );
                     return;
                 }
                 None => {
@@ -1101,6 +1082,71 @@ fn drain_writer_commands(
     }
 }
 
+/// Run the end-of-stream finalisation shared by the Recording-stop and
+/// Paused-stop branches (TIMELINE-DRIFT #6).
+///
+/// Both stop paths must flush the VAD end-of-stream (so the last in-progress
+/// utterance is closed and dispatched) and drain the accumulator before
+/// finalising the writer. Previously only the Recording-stop branch did this;
+/// stopping while Paused finalised directly and silently lost the last
+/// utterance. This helper centralises the flush → accumulator-drain → ASR-worker
+/// wait → transcript-write-drain → `writer.finalise` sequence so the two
+/// branches cannot diverge again.
+///
+/// The caller is responsible for any sample/meter draining that is specific to
+/// its branch (the Recording branch drains the live sample stream first; the
+/// Paused branch has no pending samples to drain).
+#[allow(clippy::too_many_arguments)]
+fn finalise_on_stop(
+    meta: Box<MeetingMeta>,
+    reply: oneshot::Sender<AppResult<MeetingMeta>>,
+    vad_opt: &mut Option<VadChunker>,
+    acc: &mut Accumulator,
+    flush_queue: &FlushQueue,
+    writer_cmd_rx: &mut mpsc::Receiver<WriterCommand>,
+    mut writer: MeetingWriter,
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+) {
+    // End-of-stream VAD flush closes any in-progress segment.
+    if let Some(vad) = vad_opt {
+        match vad.flush_end_of_stream() {
+            Ok(events) => {
+                for ev in events {
+                    if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
+                        acc.append(start_ms, end_ms, &samples);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    "VAD flush_end_of_stream error: {e}"
+                );
+            }
+        }
+    }
+
+    // Flush any remaining accumulator content before finalising.
+    if !acc.is_empty() {
+        let (samples, vad_segments) = acc.drain();
+        let payload = FlushPayload { samples, vad_segments, meeting_id };
+        dispatch_flush(flush_queue, payload, event_tx);
+    }
+
+    // Wait for the ASR worker to process any remaining flushes so that
+    // transcript.json is fully written before finalise.
+    wait_for_asr_worker_drain(flush_queue, writer_cmd_rx, &mut writer);
+
+    // Drain any remaining transcript write commands.
+    drain_writer_commands(writer_cmd_rx, &mut writer);
+
+    let unboxed = *meta;
+    let result = writer.finalise(unboxed.clone()).map(|_| unboxed);
+    let _ = reply.send(result);
+    tracing::info!(target: "orchestrator", "runner: exiting cleanly");
+}
+
 /// Find a file in `dir` matching `predicate`. Returns `AppError::Internal` if
 /// the directory cannot be read or no matching file is found.
 fn find_file_in_dir(
@@ -1127,6 +1173,95 @@ fn find_file_in_dir(
 // Offline re-transcribe (Phase 4)
 // ---------------------------------------------------------------------------
 
+/// A contiguous non-pause region of the decoded PCM, tagged with where it sits
+/// on the pause-EXCLUDING clock (TIMELINE-DRIFT #4). `src_start..src_end` index
+/// the original (pause-INCLUDING) `pcm`; `excl_start_ms` is the region's start
+/// on the pause-excluding timeline (the cumulative duration of all kept audio
+/// before it).
+struct KeptRegion {
+    src_start: usize,
+    src_end: usize,
+    excl_start_ms: u64,
+}
+
+/// Amplitude at or below which a sample counts as "silent" for pause detection.
+/// The Opus encoder synthesises exact-zero frames for a pause; the lossy decode
+/// reconstructs them as very-low-amplitude samples (the existing persistence
+/// pause tests assert the pause region decodes to `< 0.02` peak), so a small
+/// epsilon reliably catches encoder pause padding without flagging speech.
+const PAUSE_SILENCE_EPS: f32 = 0.02;
+
+/// Minimum length of a near-silent run to be treated as a recording **pause**
+/// (and excluded from the pause-excluding timeline). Set comfortably above the
+/// live accumulator's `MAX_GAP_MS` (3 s) inter-utterance cap so only genuine
+/// user pauses — never a natural quiet gap the live capture clock would have
+/// counted — are skipped.
+const PAUSE_MIN_MS: u64 = 4000;
+
+/// Split `pcm` into the non-pause regions to feed the offline VAD, excluding
+/// encoder-synthesised pause padding from the timeline (TIMELINE-DRIFT #4).
+///
+/// A "pause" is a run of at least `PAUSE_MIN_MS` of near-silent
+/// (`|x| <= PAUSE_SILENCE_EPS`) samples. Each returned [`KeptRegion`] carries
+/// the source index range of kept audio plus its start offset on the
+/// pause-EXCLUDING clock, which advances only over kept audio. Short quiet gaps
+/// (below the threshold) are NOT split out — they remain part of a kept region,
+/// matching the live capture clock which counts them.
+fn pause_excluding_segments(pcm: &[f32]) -> Vec<KeptRegion> {
+    let pause_min_samples = (PAUSE_MIN_MS as usize * SAMPLE_RATE_HZ as usize) / 1000;
+
+    let mut regions: Vec<KeptRegion> = Vec::new();
+    let mut excl_start_ms: u64 = 0;
+    let mut region_start = 0usize; // start of the current kept region
+    let mut i = 0usize;
+
+    while i < pcm.len() {
+        // Measure a near-silent run starting at `i`.
+        if pcm[i].abs() <= PAUSE_SILENCE_EPS {
+            let run_start = i;
+            let mut j = i;
+            while j < pcm.len() && pcm[j].abs() <= PAUSE_SILENCE_EPS {
+                j += 1;
+            }
+            let run_len = j - run_start;
+
+            if run_len >= pause_min_samples {
+                // This silent run is a pause. Close the current kept region at
+                // `run_start` (it ends just before the pause) and skip the run.
+                if run_start > region_start {
+                    let kept_len = run_start - region_start;
+                    regions.push(KeptRegion {
+                        src_start: region_start,
+                        src_end: run_start,
+                        excl_start_ms,
+                    });
+                    excl_start_ms += (kept_len as u64 * 1000) / SAMPLE_RATE_HZ;
+                }
+                // The next kept region begins after the pause; its
+                // pause-excluding start is unchanged (the pause contributed no
+                // pause-excluding time), exactly as the live capture clock froze
+                // during the pause.
+                region_start = j;
+            }
+            // Else: a short quiet gap — keep it in the current region.
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Close the trailing kept region.
+    if pcm.len() > region_start {
+        regions.push(KeptRegion {
+            src_start: region_start,
+            src_end: pcm.len(),
+            excl_start_ms,
+        });
+    }
+
+    regions
+}
+
 /// Re-run transcription over a fully-decoded PCM buffer, reusing the live
 /// pipeline's batched-VAD [`Accumulator`] + ASR-dispatch machinery.
 ///
@@ -1148,8 +1283,34 @@ fn find_file_in_dir(
 ///   (same event the live path emits), so the webview's transcript pane
 ///   appends them live.
 ///
-/// Feeds the buffer to the VAD in `BATCH_SAMPLES`-sized batches (matching the
-/// live path's batch granularity) so VAD frame alignment behaves the same.
+/// # Pause-EXCLUDING timeline (TIMELINE-DRIFT #4)
+///
+/// `audio.opus` is recorded **pause-INCLUDING**: the encoder pads every pause
+/// with synthesised silence, so `read_audio_pcm` returns a buffer whose duration
+/// equals wall-clock recording time. The live transcript, however, is on the
+/// **pause-EXCLUDING** capture-sample clock (`Segment::start_ms` —
+/// `architecture/cross-cutting.md` "Notes paragraph-anchor clock"): the capture
+/// forwarder's sample clock does not advance while paused, so the live VAD never
+/// sees the pause silence and post-pause segments continue contiguously on the
+/// pause-excluding timeline.
+///
+/// To produce timestamps that match the live ones, the offline feeder must
+/// reproduce that pause-excluding clock. Pause boundaries are **not** persisted
+/// anywhere (`MeetingMeta` has no pause map), but the encoder-synthesised pause
+/// padding is recoverable from the audio itself: it is a contiguous run of
+/// near-silent samples far longer than any natural inter-utterance gap (a user
+/// pause is typically many seconds; the live accumulator never zero-pads more
+/// than `MAX_GAP_MS`). The feeder therefore detects long near-silent runs
+/// (`PAUSE_*` constants below), **skips** them, and feeds only the non-pause
+/// audio to the VAD with a clock that advances over kept audio only — exactly
+/// reconstructing the pause-excluding capture clock. Combined with the
+/// VAD-realignment fix (#3) this yields `Segment::start_ms` matching the live
+/// path within frame tolerance.
+///
+/// Natural quiet gaps (mic live, room quiet) are NOT skipped: they are below the
+/// `PAUSE_MIN_MS` length threshold, so they stay on the timeline just as the
+/// live capture clock counts them.
+///
 /// Returns all produced segments in start-time order.
 pub(crate) fn re_transcribe_buffer(
     pcm: &[f32],
@@ -1171,37 +1332,49 @@ pub(crate) fn re_transcribe_buffer(
     let mut acc = Accumulator::new();
     let mut produced: Vec<Segment> = Vec::new();
 
+    // Build the pause-excluding feed: the kept (non-pause) sample ranges, each
+    // tagged with its start offset on the pause-EXCLUDING clock.
+    let kept = pause_excluding_segments(pcm);
+
     // 1600 samples = 100 ms at 16 kHz — the same batch granularity the live
     // feeder uses, so VAD framing is identical to the live path.
     const BATCH_SAMPLES: usize = 1600;
-    let mut start_ms = 0u64;
-    for chunk in pcm.chunks(BATCH_SAMPLES) {
-        let duration_ms = (chunk.len() as u64 * 1000) / SAMPLE_RATE_HZ;
-        match vad.process_samples(chunk, start_ms) {
-            Ok(events) => {
-                for ev in events {
-                    if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
-                        acc.append(start_ms, end_ms, &samples);
+    for region in &kept {
+        let region_pcm = &pcm[region.src_start..region.src_end];
+        // `start_ms` runs on the pause-EXCLUDING clock: it begins at the
+        // region's excluding-offset and advances only over kept audio. At a
+        // region boundary (a skipped pause) it continues from where the
+        // previous region left off, so the VAD sees a contiguous pause-excluding
+        // timeline — matching the live capture clock.
+        let mut start_ms = region.excl_start_ms;
+        for chunk in region_pcm.chunks(BATCH_SAMPLES) {
+            let duration_ms = (chunk.len() as u64 * 1000) / SAMPLE_RATE_HZ;
+            match vad.process_samples(chunk, start_ms) {
+                Ok(events) => {
+                    for ev in events {
+                        if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
+                            acc.append(start_ms, end_ms, &samples);
+                        }
                     }
                 }
+                Err(e) => {
+                    tracing::warn!(target: "orchestrator", "re_transcribe VAD error: {e}");
+                }
             }
-            Err(e) => {
-                tracing::warn!(target: "orchestrator", "re_transcribe VAD error: {e}");
-            }
-        }
-        start_ms += duration_ms;
+            start_ms += duration_ms;
 
-        // Size-triggered flush, identical threshold to the live path.
-        if acc.duration_secs() >= FLUSH_MIN_SECS {
-            let (samples, vad_segments) = acc.drain();
-            transcribe_one_flush(
-                samples,
-                vad_segments,
-                backend,
-                event_tx,
-                meeting_id,
-                &mut produced,
-            )?;
+            // Size-triggered flush, identical threshold to the live path.
+            if acc.duration_secs() >= FLUSH_MIN_SECS {
+                let (samples, vad_segments) = acc.drain();
+                transcribe_one_flush(
+                    samples,
+                    vad_segments,
+                    backend,
+                    event_tx,
+                    meeting_id,
+                    &mut produced,
+                )?;
+            }
         }
     }
 
@@ -1676,5 +1849,76 @@ mod tests {
             "queue must remain at FLUSH_CHANNEL_CAP after drop-oldest; len={}",
             deque.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // pause_excluding_segments (TIMELINE-DRIFT #4)
+    // -----------------------------------------------------------------------
+
+    /// A buffer with no long silent run is one kept region spanning the whole
+    /// buffer, starting at excl_start_ms = 0.
+    #[test]
+    fn pause_excluding_no_pause_is_single_region() {
+        // 2 s of "speech" (non-silent) with a SHORT (1 s) quiet gap in the
+        // middle — below PAUSE_MIN_MS, so it must NOT split.
+        let mut pcm = vec![0.5f32; ms_to_samples(1000)];
+        pcm.extend(std::iter::repeat_n(0.0f32, ms_to_samples(1000))); // 1 s quiet < 4 s
+        pcm.extend(std::iter::repeat_n(0.5f32, ms_to_samples(1000)));
+
+        let regions = pause_excluding_segments(&pcm);
+        assert_eq!(regions.len(), 1, "short quiet gap must not split the buffer");
+        assert_eq!(regions[0].src_start, 0);
+        assert_eq!(regions[0].src_end, pcm.len());
+        assert_eq!(regions[0].excl_start_ms, 0);
+    }
+
+    /// A long near-silent run (a pause) splits the buffer into two kept regions,
+    /// and the second region's pause-EXCLUDING start equals the duration of the
+    /// FIRST region only — the pause contributes no pause-excluding time.
+    #[test]
+    fn pause_excluding_splits_on_long_silence_and_excludes_it() {
+        // 1 s speech, 6 s pause (> PAUSE_MIN_MS = 4 s), 2 s speech.
+        let speech_a = ms_to_samples(1000);
+        let pause = ms_to_samples(6000);
+        let speech_b = ms_to_samples(2000);
+
+        let mut pcm = vec![0.5f32; speech_a];
+        pcm.extend(std::iter::repeat_n(0.0f32, pause));
+        pcm.extend(std::iter::repeat_n(0.5f32, speech_b));
+
+        let regions = pause_excluding_segments(&pcm);
+        assert_eq!(regions.len(), 2, "long pause must split into two regions");
+
+        // Region 0: the first second of speech, starting at excl 0.
+        assert_eq!(regions[0].src_start, 0);
+        assert_eq!(regions[0].src_end, speech_a);
+        assert_eq!(regions[0].excl_start_ms, 0);
+
+        // Region 1: the post-pause speech. Its source start is AFTER the pause,
+        // but its pause-EXCLUDING start is only 1000 ms (the kept duration of
+        // region 0) — the 6 s pause is excluded from the timeline.
+        assert_eq!(regions[1].src_start, speech_a + pause);
+        assert_eq!(regions[1].src_end, pcm.len());
+        assert_eq!(
+            regions[1].excl_start_ms, 1000,
+            "post-pause region must start at the pause-EXCLUDING offset (1 s), \
+             not the pause-INCLUDING offset (7 s)"
+        );
+    }
+
+    /// Trailing/leading pause padding is excluded; a pause at the very start
+    /// shifts the first kept region's source start without consuming
+    /// pause-excluding time.
+    #[test]
+    fn pause_excluding_handles_leading_pause() {
+        let pause = ms_to_samples(5000);
+        let speech = ms_to_samples(1000);
+        let mut pcm = vec![0.0f32; pause];
+        pcm.extend(std::iter::repeat_n(0.5f32, speech));
+
+        let regions = pause_excluding_segments(&pcm);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].src_start, pause, "leading pause must be skipped");
+        assert_eq!(regions[0].excl_start_ms, 0);
     }
 }

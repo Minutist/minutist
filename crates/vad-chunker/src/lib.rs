@@ -300,14 +300,39 @@ impl VadChunker {
         samples: &[f32],
         start_ms: u64,
     ) -> AppResult<Vec<VadEvent>> {
-        // Align next_frame_start_ms to start_ms on the very first call.
-        // After that, next_frame_start_ms advances by FRAME_MS per frame and
-        // we ignore the caller-supplied start_ms (it must be consistent with
-        // previous calls; the orchestrator is responsible for continuity).
-        // On the first call ever, sample_buffer is empty and
-        // next_frame_start_ms == 0, so initialise it from start_ms.
-        if self.sample_buffer.is_empty() && self.next_frame_start_ms == 0 {
+        // Re-anchor the frame clock to the caller-supplied `start_ms` on EVERY
+        // call (TIMELINE-DRIFT #3).
+        //
+        // `start_ms` is the recording-clock offset of the first sample in
+        // `samples`. The chunker may hold a partial-frame remainder
+        // (`sample_buffer`) from the previous call; those `r` buffered samples
+        // are the contiguous tail that immediately precedes `samples`, so the
+        // first sample of the buffer sits `r` samples (in ms) before `start_ms`.
+        // The position the buffer's first sample SHOULD sit at, if this feed is
+        // contiguous with the last, is `next_frame_start_ms` (which the drain
+        // loop advanced as it consumed frames). Comparing the two detects a gap.
+        let buffered_ms = (self.sample_buffer.len() as u64 * 1000) / SAMPLE_RATE as u64;
+        let buffer_first_sample_ms = start_ms.saturating_sub(buffered_ms);
+
+        // A discontinuity (dropped capture frames) shows up as the new
+        // `start_ms` not lining up with where the internal clock expected the
+        // buffer's leading sample. When that happens, the partial-frame
+        // remainder and the pre-roll ring buffer hold STALE pre-gap audio whose
+        // timestamps no longer relate to the new region; carrying them forward
+        // would anchor the next segment's start to the pre-gap timeline (the
+        // exact desync this bug is about). Discard them so the new region
+        // starts cleanly on the caller's timeline. A tolerance of one frame
+        // absorbs ms-rounding of the partial remainder on a contiguous feed.
+        let gap = buffer_first_sample_ms.abs_diff(self.next_frame_start_ms) > FRAME_MS;
+        if gap {
+            self.sample_buffer.clear();
+            self.prefill.clear();
+            // The new region begins exactly at `start_ms` with an empty buffer.
             self.next_frame_start_ms = start_ms;
+        } else {
+            // Contiguous feed: re-derive the anchor from the caller's timeline
+            // so any sub-frame drift is corrected without perturbing framing.
+            self.next_frame_start_ms = buffer_first_sample_ms;
         }
 
         // Append new samples to the partial-frame buffer.
@@ -774,5 +799,103 @@ mod tests {
             count_ends(&events_b),
             "SegmentEnd count must match: one-call vs 240-sample chunks"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: caller start_ms is honoured on EVERY call (TIMELINE-DRIFT #3)
+    // -----------------------------------------------------------------------
+    // A dropped-frame gap in the fed samples must re-align the VAD timeline to
+    // the caller-supplied `start_ms`, not silently continue from the internal
+    // monotonic clock. We feed leading silence, then speech, but on the speech
+    // call we jump `start_ms` forward by a large gap (simulating capture frames
+    // the upstream dropped, exactly what the live runner can do). The emitted
+    // SegmentStart must reflect the post-gap timeline (near the jumped value),
+    // NOT the pre-gap monotonic position.
+    #[test]
+    fn test_start_ms_honoured_after_gap() {
+        let speech = load_fixture_wav();
+        // Real voiced audio from the fixture, frame-aligned.
+        const FIRST_VOICED_FRAME: usize = 19;
+        let off = FIRST_VOICED_FRAME * FRAME_SAMPLES;
+        // Feed exactly whole frames so there is no partial-frame remainder
+        // confounding the start_ms math.
+        let lead = &speech[..FRAME_SAMPLES * 10]; // 10 frames = 300 ms, mostly silence
+        let voiced = &speech[off..off + FRAME_SAMPLES * 20]; // 20 voiced frames
+
+        let mut chunker = test_chunker();
+
+        // First call: lead silence starting at t=0.
+        let _ = process_all(&mut chunker, lead, 0);
+
+        // Simulate a large gap: the next batch's first sample is at 100_000 ms
+        // (the capture clock jumped 100 s ahead because frames were dropped).
+        const GAP_START_MS: u64 = 100_000;
+        let mut events = process_all(&mut chunker, voiced, GAP_START_MS);
+        events.extend(chunker.flush_end_of_stream().expect("flush"));
+
+        let first_start = events.iter().find_map(|e| match e {
+            VadEvent::SegmentStart { start_ms } => Some(*start_ms),
+            _ => None,
+        });
+        let first_start = first_start.expect("a SegmentStart must be emitted for the voiced run");
+
+        // The start must be on the post-gap timeline: within the voiced region
+        // [GAP_START_MS, GAP_START_MS + 20 frames). It must NOT be near the
+        // pre-gap position (~300 ms) — that would prove start_ms was ignored.
+        let voiced_end_ms = GAP_START_MS + 20 * FRAME_MS;
+        // Pre-roll can place the start a few frames before GAP_START_MS.
+        let earliest_allowed = GAP_START_MS.saturating_sub(FRAME_MS * 10);
+        assert!(
+            first_start >= earliest_allowed && first_start <= voiced_end_ms,
+            "SegmentStart {first_start} ms is not on the post-gap timeline \
+             [{earliest_allowed}, {voiced_end_ms}] — caller start_ms was ignored after the gap"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: contiguous frame-aligned feed advances the clock correctly
+    // -----------------------------------------------------------------------
+    // When fed contiguous, frame-aligned batches with advancing start_ms, the
+    // emitted timestamps must match a single-call feed of the same audio —
+    // i.e. re-anchoring on every call does not perturb the no-gap case.
+    #[test]
+    fn test_contiguous_advancing_start_ms_matches_single_call() {
+        let speech = load_fixture_wav();
+        // Trim to a whole number of frames so batch boundaries are frame-aligned.
+        let frames = speech.len() / FRAME_SAMPLES;
+        let audio = &speech[..frames * FRAME_SAMPLES];
+
+        // Run A: one call at start_ms = 0.
+        let mut a = test_chunker();
+        let mut events_a = process_all(&mut a, audio, 0);
+        events_a.extend(a.flush_end_of_stream().expect("flush A"));
+
+        // Run B: 5-frame (150 ms) batches with advancing, contiguous start_ms.
+        let mut b = test_chunker();
+        let mut events_b: Vec<VadEvent> = Vec::new();
+        const BATCH_FRAMES: usize = 5;
+        let batch_samples = BATCH_FRAMES * FRAME_SAMPLES;
+        let mut start_ms = 0u64;
+        for chunk in audio.chunks(batch_samples) {
+            let mut evts = process_all(&mut b, chunk, start_ms);
+            events_b.append(&mut evts);
+            start_ms += (chunk.len() as u64 * 1000) / SAMPLE_RATE as u64;
+        }
+        events_b.extend(b.flush_end_of_stream().expect("flush B"));
+
+        let starts_a: Vec<u64> = events_a.iter().filter_map(seg_start).collect();
+        let starts_b: Vec<u64> = events_b.iter().filter_map(seg_start).collect();
+        assert_eq!(
+            starts_a, starts_b,
+            "contiguous advancing-start_ms feed must yield identical SegmentStart timestamps \
+             to a single-call feed"
+        );
+    }
+
+    fn seg_start(e: &VadEvent) -> Option<u64> {
+        match e {
+            VadEvent::SegmentStart { start_ms } => Some(*start_ms),
+            _ => None,
+        }
     }
 }

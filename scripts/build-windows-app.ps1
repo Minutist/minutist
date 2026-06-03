@@ -90,6 +90,13 @@ if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item $exe $stage
 Copy-Item "$rel\*.dll" $stage -ErrorAction SilentlyContinue
+# Bundled resources (the Silero VAD model) live under target\release\_up_\ at the
+# same relpath the app resolves via BaseDirectory::Resource; include the tree so
+# the portable zip is self-contained (otherwise VAD/ASR fails on a fresh unzip).
+if (Test-Path "$rel\_up_") {
+    Copy-Item "$rel\_up_" $stage -Recurse -Force
+    Write-Host "    bundled: _up_\resources (Silero VAD)"
+}
 
 $zip = "$build\dist-windows\meeting-app-windows-x64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }

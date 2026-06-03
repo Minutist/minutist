@@ -63,6 +63,13 @@ const fn default_gpu_acceleration() -> bool {
     true
 }
 
+/// Default for `capture_system_audio`: ON. Capturing the call audio is the point
+/// of a meeting-notes app, so it defaults on (opt-out); the UI advises turning
+/// it off when the mic also hears the call from the speakers (echo).
+const fn default_capture_system_audio() -> bool {
+    true
+}
+
 /// Default summary system prompt (FR-28).
 ///
 /// A model-agnostic instruction asking for a structured meeting summary:
@@ -177,18 +184,19 @@ pub struct Settings {
     /// When `true`, `audio-capture` ALSO opens the default render endpoint in
     /// loopback mode, resamples it to 16 kHz mono, and SUMS it sample-wise with
     /// the mic into the single `samples` stream the orchestrator drains;
-    /// downstream diarization separates the speakers. When `false` (the
-    /// default), behaviour is mic-only as before.
+    /// downstream diarization separates the speakers. When `false`, behaviour is
+    /// mic-only.
     ///
-    /// `#[serde(default)]` defaults to `false` — opt-in and echo-safe (if the
-    /// mic also picks the call audio up from the speakers, mixing the loopback
-    /// in doubles it), and an older store written before this field existed
-    /// deserialises to `false`. Loopback capture is currently Windows-only; on
-    /// other platforms enabling this logs a warning and falls back to mic-only
-    /// (never failing the recording). Echo cancellation using the loopback as
-    /// the reference signal is future work — see `architecture/cross-cutting.md`
-    /// — "Threading model".
-    #[serde(default)]
+    /// `#[serde(default = ...)]` defaults to `true` — capturing the call is the
+    /// point of a meeting-notes app, so it is opt-OUT; an older store written
+    /// before this field existed deserialises to `true`. If the mic also picks
+    /// the call audio up from the speakers, mixing the loopback in doubles it
+    /// (echo), so the UI advises turning it off in that case. Loopback capture is
+    /// currently Windows-only; on other platforms enabling this logs a warning
+    /// and falls back to mic-only (never failing the recording). Echo
+    /// cancellation using the loopback as the reference signal is future work —
+    /// see `architecture/cross-cutting.md` — "Threading model".
+    #[serde(default = "default_capture_system_audio")]
     pub capture_system_audio: bool,
 }
 
@@ -205,7 +213,7 @@ impl Default for Settings {
             diarization_enabled: false,
             onboarding_completed: false,
             gpu_acceleration: default_gpu_acceleration(),
-            capture_system_audio: false,
+            capture_system_audio: true,
         }
     }
 }
@@ -463,10 +471,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn capture_system_audio_defaults_to_false() {
+    fn capture_system_audio_defaults_to_true() {
         assert!(
-            !Settings::default().capture_system_audio,
-            "system-audio capture is opt-in and off by default (echo-safe)"
+            Settings::default().capture_system_audio,
+            "capturing the call is the point; system-audio capture is on by default (opt-out)"
         );
     }
 
@@ -483,14 +491,14 @@ mod tests {
     }
 
     #[test]
-    fn old_store_json_without_capture_system_audio_field_defaults_to_false() {
+    fn old_store_json_without_capture_system_audio_field_defaults_to_true() {
         // A settings store written before `capture_system_audio` existed must
-        // deserialise to `false` (mic-only, the prior behaviour).
+        // deserialise to `true` (on by default, opt-out).
         let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
         let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
         assert!(
-            !restored.capture_system_audio,
-            "missing capture_system_audio must deserialise to false (mic-only default)"
+            restored.capture_system_audio,
+            "missing capture_system_audio must deserialise to true (on by default)"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

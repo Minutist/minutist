@@ -83,11 +83,11 @@ describe("capture_system_audio toggle round-trip", () => {
     resetStore();
   });
 
-  it("defaults to off (false) when the field is absent or settings unloaded", () => {
-    // An older store / not-yet-loaded snapshot reads as off (matches the
-    // backend `#[serde(default)]` of false).
-    expect(readCaptureSystemAudio(BASE_SETTINGS)).toBe(false);
-    expect(readCaptureSystemAudio(null)).toBe(false);
+  it("defaults to on (true) when the field is absent or settings unloaded", () => {
+    // An older store / not-yet-loaded snapshot reads as on (matches the
+    // backend `#[serde(default = ...)]` of true). Only an explicit false is off.
+    expect(readCaptureSystemAudio(BASE_SETTINGS)).toBe(true);
+    expect(readCaptureSystemAudio(null)).toBe(true);
   });
 
   it("setCaptureSystemAudio persists via update_settings, preserving other fields", async () => {

@@ -48,7 +48,7 @@ hide back-pressure that the live pipeline needs to surface.
 alongside the mic and summed into the single transcribed stream (see
 `components.md` — `audio-capture`). If the mic also picks the call audio up from
 the speakers, mixing the loopback in doubles that audio (an echo). v1 handles
-this only with the opt-in toggle (off by default; the UI advises turning it off
+this only with the toggle (ON by default, opt-out; the UI advises turning it off
 when the mic hears the speakers). Acoustic echo cancellation — using the
 loopback as the reference signal to subtract the speaker bleed from the mic — is
 deliberately **deferred**; it would live in the mixer/capture path. Loopback is

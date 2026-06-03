@@ -139,7 +139,7 @@ name-consistency-checked) and falls back to name matching for legacy bare-name
 ids persisted in `settings.input_device_id`.
 
 **System/call audio mixing (loopback source + mixer).** When the
-`settings.capture_system_audio` flag is on (off by default), `start` ALSO opens
+`settings.capture_system_audio` flag is on (ON by default, opt-out), `start` ALSO opens
 the default **render** endpoint in **loopback** mode (a second capture source)
 and SUMS it with the microphone into the SAME single `samples` stream, so a
 Teams-style call transcribes all participants — not just the user. The public
@@ -170,7 +170,8 @@ parameter (the orchestrator passes `settings.current().capture_system_audio`).
   unit test.
 
 AEC is **future work** — see `cross-cutting.md` "Threading model"; v1 handles
-echo only via the opt-in toggle (off by default).
+echo only via the toggle (ON by default, opt-out — turn it off when the mic
+hears the call from the speakers).
 
 ### `vad-chunker`
 **Crate:** `crates/vad-chunker`

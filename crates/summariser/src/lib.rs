@@ -231,10 +231,17 @@ impl Summariser for LlamaSummariser {
 impl LlamaSummariser {
     /// Build the prompt from the GGUF's baked-in chat template.
     ///
-    /// Two messages: `system` = the user-configured prompt, `user` = the
-    /// rendered transcript + a blank line + the notes markdown. `add_ass=true`
-    /// leaves the assistant turn open for generation. Model-agnostic: a missing
-    /// or unusable template is a hard [`Error::Template`].
+    /// ONE `user` message: the system instructions, then the rendered
+    /// transcript + a blank line + the notes markdown. `add_ass=true` leaves the
+    /// assistant turn open for generation.
+    ///
+    /// The system prompt is folded INTO the user turn rather than sent as a
+    /// separate `system` message because several GGUF chat templates — notably
+    /// Gemma — have no `system` role, and llama.cpp's `apply_chat_template`
+    /// returns `ffi error -1` when one is supplied. Folding into the user turn
+    /// is universal: every chat template supports a `user` role, and the
+    /// instructions still reach the model. A missing/unusable template is a hard
+    /// [`Error::Template`].
     fn build_prompt(
         &self,
         transcript: &[Segment],
@@ -247,14 +254,13 @@ impl LlamaSummariser {
             .map_err(|e| Error::Template(e.to_string()))?;
 
         let user_content = render_user_content(transcript, notes_markdown);
+        let combined = format!("{system_prompt}\n\n{user_content}");
 
-        let system_msg = LlamaChatMessage::new("system".to_string(), system_prompt.to_string())
-            .map_err(|e| Error::Template(format!("system message: {e}")))?;
-        let user_msg = LlamaChatMessage::new("user".to_string(), user_content)
+        let user_msg = LlamaChatMessage::new("user".to_string(), combined)
             .map_err(|e| Error::Template(format!("user message: {e}")))?;
 
         self.model
-            .apply_chat_template(&template, &[system_msg, user_msg], true)
+            .apply_chat_template(&template, &[user_msg], true)
             .map_err(|e| Error::Template(format!("apply_chat_template: {e}")))
     }
 

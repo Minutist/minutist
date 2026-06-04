@@ -71,6 +71,7 @@ Common tasks are wrapped in the [`Makefile`](Makefile) — run `make` (or
 |---|---|
 | `make build` | debug build of the whole workspace |
 | `make test` | the full default suite — `cargo test --workspace` + the UI build + Vitest |
+| `make test-integration` | model-gated integration tests against REAL models + recordings (see below) |
 | `make clippy` / `make fmt` | lint / format |
 | `make bindings` | regenerate `ui/src/ipc/bindings.ts` from the Rust IPC surface |
 | `make render-arch` | re-render the C4 SVGs (needs Docker) |
@@ -82,6 +83,26 @@ lives elsewhere. Models download on first run; GPU feature flags and the
 single-portable-backend artefact policy are documented in
 [`architecture/cross-cutting.md`](architecture/cross-cutting.md) under "GPU
 portability".
+
+### Integration tests (real models + recordings)
+
+The model-dependent tests (ASR transcription, Gemma summarisation, sherpa
+diarization) are `#[ignore]`/env-gated so the default suite stays fast and
+model-free. To run them directly against real models — the suite that catches
+model-integration bugs (e.g. a chat template the bundled llama.cpp can't render)
+without a full app rebuild:
+
+```sh
+cp tests-local.env.example tests-local.env   # then point the paths at your models
+make test-integration                        # or -summary / -asr / -diarize
+make test-integration-summary ARGS=summarise_real_recording   # one test
+```
+
+`tests-local.env` holds the model paths and a recordings directory
+(`MEETING_APP_RECORDINGS_DIR`, used by the real-recording summary test); it is
+git-excluded (machine-specific). Models already downloaded by the app live under
+the app-data dir (`%APPDATA%/net.alelec.meeting-app/models` — reachable from WSL
+via `/mnt/c`).
 
 ## CI
 

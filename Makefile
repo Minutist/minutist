@@ -14,7 +14,15 @@ UI_DIR := ui
 .DEFAULT_GOAL := help
 .PHONY: help build build-release test test-rust test-ui ui-deps bindings \
         clippy fmt fmt-check render-arch clean clean-all \
-        windows-build windows-build-vulkan
+        windows-build windows-build-vulkan \
+        test-integration test-integration-summary test-integration-asr \
+        test-integration-diarize
+
+# Local integration-test config (real model + recording paths). Git-excluded;
+# copy tests-local.env.example to create it. Crates whose #[ignore]/env-gated
+# tests exercise real models.
+TEST_ENV  ?= tests-local.env
+INTEG_PKGS := -p summariser -p asr-runtime -p diarizer -p orchestrator -p ipc-bridge
 
 help: ## List the available targets
 	@grep -hE '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -35,6 +43,30 @@ test-rust: ## Rust workspace tests (model/GPU-gated tests skip without env vars)
 
 test-ui: ui-deps ## UI type-check + build + Vitest (matches CI)
 	cd $(UI_DIR) && npm run build && npm run test
+
+# --- Integration (real models + recordings; needs $(TEST_ENV)) -------------
+# Sources $(TEST_ENV) and runs the model-gated #[ignore] tests directly, so
+# model-integration bugs (e.g. an unrenderable chat template) surface in WSL
+# without a Windows rebuild. `cargo test ARGS=...` narrows to one test.
+test-integration: ## Run ALL model-gated integration tests (real models)
+	@test -f $(TEST_ENV) || { echo "Missing $(TEST_ENV) — copy tests-local.env.example and adjust"; exit 1; }
+	set -a; . ./$(TEST_ENV); set +a; \
+		$(CARGO) test $(INTEG_PKGS) $(ARGS) -- --include-ignored
+
+test-integration-summary: ## Gated summariser test (real Gemma LLM)
+	@test -f $(TEST_ENV) || { echo "Missing $(TEST_ENV)"; exit 1; }
+	set -a; . ./$(TEST_ENV); set +a; \
+		$(CARGO) test -p summariser $(ARGS) -- --include-ignored
+
+test-integration-asr: ## Gated ASR test (real Qwen3-ASR model)
+	@test -f $(TEST_ENV) || { echo "Missing $(TEST_ENV)"; exit 1; }
+	set -a; . ./$(TEST_ENV); set +a; \
+		$(CARGO) test -p asr-runtime $(ARGS) -- --include-ignored
+
+test-integration-diarize: ## Gated diarization tests (real ONNX models)
+	@test -f $(TEST_ENV) || { echo "Missing $(TEST_ENV)"; exit 1; }
+	set -a; . ./$(TEST_ENV); set +a; \
+		$(CARGO) test -p diarizer -p orchestrator $(ARGS) -- --include-ignored
 
 ui-deps: ## Install UI dependencies if node_modules is missing
 	cd $(UI_DIR) && [ -d node_modules ] || npm ci

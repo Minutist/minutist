@@ -925,4 +925,78 @@ mod tests {
             "summary must not contain a think block"
         );
     }
+
+    /// Real-recording summary: load an actual meeting's `transcript.json` from
+    /// `MEETING_APP_RECORDINGS_DIR` and summarise it with the real LLM. This
+    /// exercises the exact path that broke in the field (the Gemma chat-template
+    /// render → `apply_chat_template` ffi -1) on GENUINE data, not a synthetic
+    /// transcript — the regression guard for that bug. Skips cleanly when either
+    /// env var is unset or no recording has usable transcript text.
+    #[test]
+    #[ignore = "requires MEETING_APP_LLM_MODEL_PATH and MEETING_APP_RECORDINGS_DIR"]
+    fn summarise_real_recording_produces_markdown() {
+        let model_path = match std::env::var("MEETING_APP_LLM_MODEL_PATH") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+        let recordings_dir = match std::env::var("MEETING_APP_RECORDINGS_DIR") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return,
+        };
+
+        let transcript = match find_recording_transcript(&recordings_dir) {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "no recording with usable transcript text under {recordings_dir}; skipping"
+                );
+                return;
+            }
+        };
+
+        let summariser =
+            LlamaSummariser::open(PathBuf::from(&model_path), SummariserConfig::default())
+                .expect("model load must succeed with a valid path");
+        let summary = summariser
+            .summarise(
+                &transcript,
+                "",
+                "You are a meeting-notes assistant. Produce a concise markdown \
+                 summary with headings.",
+            )
+            .expect(
+                "summarise must succeed on a real recording \
+                 (regression: Gemma chat-template render)",
+            );
+
+        assert!(!summary.trim().is_empty(), "summary must be non-empty");
+        eprintln!(
+            "real-recording summary ({} segments) =>\n{summary}",
+            transcript.len()
+        );
+    }
+
+    /// Scan a recordings dir for the first (lexicographically) `transcript.json`
+    /// holding >= 3 non-empty segments, returning its parsed `Vec<Segment>`.
+    /// Used by the gated real-recording summary test.
+    fn find_recording_transcript(dir: &str) -> Option<Vec<Segment>> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path().join("transcript.json")))
+            .filter(|p| p.is_file())
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(segs) = serde_json::from_slice::<Vec<Segment>>(&bytes) else {
+                continue;
+            };
+            if segs.iter().filter(|s| !s.text.trim().is_empty()).count() >= 3 {
+                return Some(segs);
+            }
+        }
+        None
+    }
 }

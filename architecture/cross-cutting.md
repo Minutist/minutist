@@ -486,8 +486,15 @@ demonstrated.
   package's `vitest run` script) must pass on a machine with no model
   files, GPU, or microphone. Tests that need a real
   model, GPU, or native build are **gated behind env vars** (the Phase 2
-  `MEETING_APP_ASR_MODEL_PATH` pattern) with a no-op skip path, and are run
-  on demand via `scripts/run-tests-windows.ps1`.
+  `MEETING_APP_ASR_MODEL_PATH` pattern) with a no-op skip path. They are run on
+  demand either via `scripts/run-tests-windows.ps1` OR directly with
+  `make test-integration` (and `-summary`/`-asr`/`-diarize`), which sources a
+  git-excluded `tests-local.env` (copied from `tests-local.env.example`) holding
+  the real model paths + a `MEETING_APP_RECORDINGS_DIR`. Running these against
+  real models is how model-integration regressions (e.g. a chat template the
+  bundled llama.cpp cannot render) are caught without a full app rebuild — the
+  gated summariser test exercises `build_prompt`, and a real-recording variant
+  summarises an actual `transcript.json` from the recordings dir.
 - **Manual acceptance is additive, never a substitute.** Items that
   genuinely cannot be asserted in software (copy-paste-into-Word fidelity,
   the GPU portability matrix, clean-VM install) are recorded as

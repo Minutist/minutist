@@ -32,7 +32,7 @@ that.
 | Workload | Where it runs |
 |---|---|
 | Audio capture callback (cpal) | cpal's own thread; pushes frames into a bounded channel. With system-audio capture on (`settings.capture_system_audio`), a SECOND cpal callback (the render-endpoint loopback source) runs on its own thread and pushes into its own bounded ring — both RT callbacks keep the `try_lock`/drop-oldest discipline. |
-| Audio mixer (mic + loopback) | A `spawn`/`spawn_blocking` task draining the two per-source 16 kHz batch channels; SUMS sample-wise, clamps, meters, and forwards the single mixed stream. Only present when system-audio capture is on; mic-only otherwise. Never blocks the RT callbacks (those feed the upstream rings). |
+| Audio mixer (mic + loopback) | A `spawn`/`spawn_blocking` task draining the two per-source 16 kHz batch channels; SUMS sample-wise, clamps, meters, and forwards the single mixed stream. Only present when system-audio capture is on; mic-only otherwise. Never blocks the RT callbacks (those feed the upstream rings). **Starvation valve:** if one source is idle (e.g. loopback when nothing is playing through the speakers) the mixer must NOT wait to pair samples — past a ~30 ms skew (`mixer::MAX_SKEW_SAMPLES`) it zero-fills the idle source and emits the live one, else the mic is buffered forever (silent transcript + dead meter). The cap also sets the meter/mic-latency cadence on the idle-loopback path (~30 Hz). |
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
 | Diarization | One-shot `spawn_blocking` task triggered on stop or user action. |
@@ -137,18 +137,30 @@ rejected; the issue was reopened 2026-06-01) — and the audio encoder
 window is still a fixed 30 s everywhere. The pinned `llama-cpp-2 =0.1.146`
 already vendors a current llama.cpp (commit `e21cdc11`, build b8783,
 2026-04-13) that includes Qwen3-ASR mtmd audio, so there is no version lag
-to chase. All three sub-rules below (≥25 s shaping, silence preservation,
-`</asr_text>` early-stop) remain mandatory. They can only be revisited
-when #20914 actually merges incremental decode — a future-phase change,
-not v1.
+to chase. The silence-preservation and `</asr_text>` early-stop sub-rules
+below remain mandatory. The chunk-*sizing* rule was REVISED on 2026-06-04
+(see below) after a live test contradicted the Phase-0 ≥25 s guidance.
 
-The orchestrator must shape VAD chunks to ≥25 s before invoking
-`AsrBackend::transcribe_chunk`. The default strategy in Phase 2 is
-**batched-VAD**: collect VAD segments into a buffer until the buffer
-reaches 25-30 s of audio or a configurable maximum latency window has
-elapsed, then dispatch. The latency window default is the FR-7 budget
-(10 s post-utterance), which on long-utterance audio gracefully degrades
-to "transcribe-on-stop."
+**Chunk sizing — REVISED 2026-06-04 (supersedes the Phase-0 "≥25 s" rule).**
+The orchestrator must bound each `AsrBackend::transcribe_chunk` call to
+**roughly 5–13 s** of audio, NOT fill the 30 s window. Phase 0 reasoned that
+sub-30 s inputs hallucinate into the internal silence pad, so chunks should be
+shaped to ≥25 s. A live recording (2026-06-04) disproved that for the upper
+end: a ~26 s chunk drove Qwen3-ASR into a greedy-decode **repetition loop**
+(the same failure the silence-preservation rule guards against, but triggered
+by over-long input rather than compaction). Short chunks do NOT hallucinate
+into the pad in practice because the `</asr_text>` early-stop truncates any
+post-transcript continuation. So the binding rule is now an upper bound:
+- **VAD force-splits** any single speech segment at `VadConfig::max_segment_ms`
+  (10 s) — see `vad-chunker`.
+- The **batched-VAD accumulator** flushes at `FLUSH_MIN_SECS` (3 s) or after
+  `LATENCY_WINDOW_SECS` (2 s) of quiet, so a `transcribe_chunk` call receives at
+  most ~`FLUSH_MIN_SECS + max_segment_ms` ≈ 13 s — see `orchestrator::runner`.
+
+Residual: very short / low-content segments (breaths, single fillers) can still
+misfire — e.g. a spurious language switch (Qwen3-ASR auto-detects language per
+call and has no hint). A prompt-level language hint is the planned mitigation
+(tracked separately), not a chunk-sizing concern.
 
 **Preserve original-timeline silences.** Phase 0 Spike 3 found that
 concatenating VAD-trimmed utterances back-to-back into the batched

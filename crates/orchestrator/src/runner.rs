@@ -18,13 +18,21 @@
 //! `asr_runtime.transcribe_chunk()`, and re-splits the result proportionally
 //! across VAD sub-segments (Phase 2).
 //!
-//! ## Locked constants
+//! ## Flush-sizing constants
 //!
-//! - `FLUSH_MIN_SECS = 25.0` — minimum buffer duration before a size-triggered flush.
-//! - `LATENCY_WINDOW_SECS = 10.0` — wall-clock seconds of quiet after which a
-//!   non-empty buffer is flushed.
+//! These bound the audio handed to one `transcribe_chunk` call. Qwen3-ASR mtmd
+//! hallucinates and loops on over-long input (observed at ~26 s), so the batch
+//! must stay well under that. The bound is `FLUSH_MIN_SECS` plus at most one
+//! VAD segment (`VadConfig::max_segment_ms`, ~10 s), i.e. ~13 s.
+//!
+//! - `FLUSH_MIN_SECS = 3.0` — minimum buffer duration before a size-triggered flush.
+//! - `LATENCY_WINDOW_SECS = 2.0` — wall-clock seconds of quiet after which a
+//!   non-empty buffer is flushed (also the live-transcript latency after a pause).
 //! - `MAX_GAP_MS = 3000` — maximum inter-segment silence gap (zero-padded, not
 //!   compacted) inserted between VAD segments in the accumulator.
+//!
+//! Originally 25 s / 10 s (Phase 2), which fed the ASR ~25 s blobs and
+//! triggered the repetition loop; lowered here after that was observed live.
 //!
 //! ## Threading
 //!
@@ -54,8 +62,13 @@ use vad_chunker::{VadChunker, VadConfig, VadEvent};
 // Locked constants (Phase 2 — do NOT change without arch review)
 // ---------------------------------------------------------------------------
 
-const FLUSH_MIN_SECS: f32 = 25.0;
-const LATENCY_WINDOW_SECS: f32 = 10.0;
+// Bounded so a single `transcribe_chunk` never receives more than roughly
+// `FLUSH_MIN_SECS + VadConfig::max_segment_ms` (~13 s) of audio: Qwen3-ASR mtmd
+// hallucinates and enters a greedy-decode repetition loop on over-long input
+// (observed at ~26 s). The original 25 s batch produced exactly that. Smaller
+// batches also make live transcript appear promptly rather than at stop.
+const FLUSH_MIN_SECS: f32 = 3.0;
+const LATENCY_WINDOW_SECS: f32 = 2.0;
 const MAX_GAP_MS: u64 = 3000;
 const SAMPLE_RATE_HZ: u64 = 16_000;
 /// Minimum interval between `AppEvent::RecordingClock` emissions (~5 Hz).
@@ -1783,18 +1796,30 @@ mod tests {
     // Test 3: flush triggers on size
     // -----------------------------------------------------------------------
 
-    /// A 25 s+ buffer must be flagged as needing a flush.
+    /// A buffer at/over `FLUSH_MIN_SECS` must be flagged for a size-triggered
+    /// flush; one under it must not. Expressed relative to the constant so the
+    /// test stays honest if the threshold is retuned.
     #[test]
     fn accumulator_flush_triggers_on_size() {
-        let mut acc = Accumulator::new();
-        // Append a 26 s segment.
-        let samples = vec![0.0f32; ms_to_samples(26_000)];
-        acc.append(0, 26_000, &samples);
+        let flush_ms = (FLUSH_MIN_SECS * 1000.0) as u64;
+
+        let mut under = Accumulator::new();
+        let s = vec![0.0f32; ms_to_samples(flush_ms.saturating_sub(500))];
+        under.append(0, flush_ms.saturating_sub(500), &s);
         assert!(
-            acc.duration_secs() >= FLUSH_MIN_SECS,
-            "26 s buffer must meet flush_min_secs={}; got {} s",
-            FLUSH_MIN_SECS,
-            acc.duration_secs()
+            under.duration_secs() < FLUSH_MIN_SECS,
+            "sub-threshold buffer ({} s) should NOT trigger a size flush",
+            under.duration_secs()
+        );
+
+        let mut over = Accumulator::new();
+        let s = vec![0.0f32; ms_to_samples(flush_ms + 1000)];
+        over.append(0, flush_ms + 1000, &s);
+        assert!(
+            over.duration_secs() >= FLUSH_MIN_SECS,
+            "over-threshold buffer ({} s) must trigger a size flush at {} s",
+            over.duration_secs(),
+            FLUSH_MIN_SECS
         );
     }
 
@@ -1802,19 +1827,21 @@ mod tests {
     // Test 4: flush triggers on latency
     // -----------------------------------------------------------------------
 
-    /// After 10 s of quiet (last_vad_end_at sufficiently old), a non-empty
-    /// buffer should be flushed.
+    /// After `LATENCY_WINDOW_SECS` of quiet (last_vad_end_at sufficiently old),
+    /// a non-empty sub-threshold buffer should be flushed so the live transcript
+    /// is not held back.
     ///
-    /// We can't sleep 10 s in a unit test, so we set `last_vad_end_at` to
-    /// a time well in the past and check the elapsed condition directly.
+    /// We don't sleep in the test; we set `last_vad_end_at` to a time well past
+    /// the window and check the elapsed condition directly.
     #[test]
     fn accumulator_flush_triggers_on_latency() {
         let mut acc = Accumulator::new();
-        let seg = vec![0.0f32; ms_to_samples(2000)]; // 2 s — well below flush_min
-        acc.append(0, 2000, &seg);
+        let seg = vec![0.0f32; ms_to_samples(1000)]; // 1 s — below flush_min
+        acc.append(0, 1000, &seg);
 
-        // Simulate 11 s of elapsed time by setting last_vad_end_at to the past.
-        acc.last_vad_end_at = Some(Instant::now() - Duration::from_secs(11));
+        // Simulate elapsed time comfortably beyond the latency window.
+        acc.last_vad_end_at =
+            Some(Instant::now() - Duration::from_secs_f32(LATENCY_WINDOW_SECS + 2.0));
 
         let latency_window = Duration::from_secs_f32(LATENCY_WINDOW_SECS);
         let should_flush = !acc.is_empty()

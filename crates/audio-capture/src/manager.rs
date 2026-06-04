@@ -268,9 +268,13 @@ impl AudioCaptureManager {
         let config = device::preferred_config(cpal_device)?;
         let in_rate = config.sample_rate().0;
         let channels = config.channels() as usize;
+        let device_name = cpal_device
+            .name()
+            .unwrap_or_else(|_| "<unknown>".to_string());
 
         tracing::info!(
             target = "audio-capture",
+            device = %device_name,
             sample_rate = in_rate,
             channels,
             format = ?config.sample_format(),
@@ -320,6 +324,12 @@ impl AudioCaptureManager {
         match loopback_open {
             // ---------- Mic + loopback: resample each, then mix ----------
             Some(lb) => {
+                tracing::info!(
+                    target = "audio-capture",
+                    loopback_rate = lb.in_rate,
+                    "loopback opened; mixing microphone + system audio \
+                     (a starved/idle source is zero-filled so the mic keeps flowing)"
+                );
                 lb.stream.play().map_err(Error::from)?;
 
                 // Per-source resampled batch channels feeding the mixer. Bounded
@@ -617,6 +627,18 @@ fn spawn_mixer(
 
             // Emit everything both sources have in common so far.
             while let Some(batch) = state.drain_paired() {
+                meter_then_send(&mut meter, &batch.samples, &meter_tx);
+                if sample_tx.send(batch).await.is_err() {
+                    tracing::warn!(target = "audio-capture", "sample channel closed; mixer exiting");
+                    return;
+                }
+            }
+
+            // Starvation valve: if one source is idle (e.g. loopback with no
+            // system audio playing) the paired drain above emits nothing, so
+            // flush the live source's backlog beyond the skew cap rather than
+            // buffer it forever.
+            while let Some(batch) = state.drain_starved() {
                 meter_then_send(&mut meter, &batch.samples, &meter_tx);
                 if sample_tx.send(batch).await.is_err() {
                     tracing::warn!(target = "audio-capture", "sample channel closed; mixer exiting");

@@ -86,6 +86,12 @@ pub struct VadConfig {
     /// Frames of audio captured before the official segment start (pre-roll).
     /// Default: 5 (= 150 ms).
     pub prefill_frames: usize,
+    /// Maximum duration (ms) of a single speech segment before it is
+    /// force-split, continuing the speech seamlessly in a fresh segment.
+    /// Bounds the audio handed to the ASR: Qwen3-ASR mtmd hallucinates and
+    /// loops on over-long input, and a cap also keeps live transcription
+    /// flowing during a long monologue. Default: 10_000 (= 10 s).
+    pub max_segment_ms: u64,
 }
 
 impl Default for VadConfig {
@@ -95,6 +101,7 @@ impl Default for VadConfig {
             onset_frames: 3,
             hangover_frames: 24,
             prefill_frames: 5,
+            max_segment_ms: 10_000,
         }
     }
 }
@@ -242,6 +249,8 @@ pub struct VadChunker {
     /// `prefill_frames` complete frames.
     prefill: VecDeque<(u64, Vec<f32>)>,
     prefill_frames: usize,
+    /// Maximum segment duration (ms) before a force-split.
+    max_segment_ms: u64,
     /// The segment currently being recorded, if any.
     current_segment: Option<InProgressSegment>,
 }
@@ -279,6 +288,7 @@ impl VadChunker {
             next_frame_start_ms: 0,
             prefill: VecDeque::with_capacity(config.prefill_frames + 1),
             prefill_frames: config.prefill_frames,
+            max_segment_ms: config.max_segment_ms,
             current_segment: None,
         })
     }
@@ -472,6 +482,40 @@ impl VadChunker {
                     seg.samples.extend_from_slice(frame);
                     seg.last_voice_end_ms = frame_end_ms;
                 }
+
+                // Force-split an over-long segment so the ASR never sees more
+                // than `max_segment_ms` of audio (Qwen3-ASR mtmd hallucinates
+                // and loops on long input). The speech continues seamlessly in
+                // a fresh segment abutting the one just emitted — no gap, and no
+                // pre-roll (it is contiguous with the prior chunk).
+                let over_cap = self
+                    .current_segment
+                    .as_ref()
+                    .is_some_and(|s| frame_end_ms.saturating_sub(s.start_ms) >= self.max_segment_ms);
+                if over_cap {
+                    if let Some(seg) = self.current_segment.take() {
+                        tracing::debug!(
+                            target: "vad-chunker",
+                            start_ms = seg.start_ms,
+                            end_ms = seg.last_voice_end_ms,
+                            max_segment_ms = self.max_segment_ms,
+                            "force-splitting over-long speech segment"
+                        );
+                        events.push(VadEvent::SegmentEnd {
+                            start_ms: seg.start_ms,
+                            end_ms: seg.last_voice_end_ms,
+                            samples: seg.samples,
+                        });
+                        self.current_segment = Some(InProgressSegment {
+                            start_ms: frame_end_ms,
+                            samples: Vec::new(),
+                            last_voice_end_ms: frame_end_ms,
+                        });
+                        events.push(VadEvent::SegmentStart {
+                            start_ms: frame_end_ms,
+                        });
+                    }
+                }
             }
 
             SmootherDecision::Hangover => {
@@ -624,6 +668,48 @@ mod tests {
         assert!(
             starts >= 2,
             "expected at least two SegmentStarts (one per speech region); got {starts}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1b: a long continuous utterance is force-split at the duration cap
+    // -----------------------------------------------------------------------
+    // The fixture is ~5.8 s of continuous speech with no internal 720 ms
+    // silence → by default it is ONE segment. With a 2 s cap it must split into
+    // several bounded segments. This is the fix for Qwen3-ASR mtmd hallucinating
+    // and looping when handed an over-long (e.g. 26 s) chunk.
+    #[test]
+    fn test_force_split_caps_segment_duration() {
+        let speech = load_fixture_wav();
+        let config = VadConfig {
+            max_segment_ms: 2000,
+            ..VadConfig::default()
+        };
+        let path = default_model_path();
+        let mut chunker =
+            VadChunker::open(&path, config).expect("failed to load Silero VAD model");
+
+        let mut events = process_all(&mut chunker, &speech, 0);
+        events.extend(chunker.flush_end_of_stream().expect("flush failed"));
+
+        let durations: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                VadEvent::SegmentEnd { start_ms, end_ms, .. } => Some(end_ms - start_ms),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            durations.len() >= 2,
+            "expected the continuous utterance to force-split into >=2 segments \
+             with a 2 s cap; got {} segment(s)",
+            durations.len()
+        );
+        let longest = durations.iter().copied().max().unwrap_or(0);
+        assert!(
+            longest <= 3000,
+            "a segment ran {longest} ms but the cap was 2000 ms — force-split did not bound it",
         );
     }
 

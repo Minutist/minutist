@@ -21,6 +21,23 @@
 
 use crate::manager::AudioFrameBatch;
 
+/// Maximum lead (in 16 kHz samples) one source may hold over an *empty* other
+/// source before that other source is treated as starved (idle) and zero-filled
+/// mid-stream. 30 ms @ 16 kHz.
+///
+/// This is the steady-state safety valve the end-of-stream `drain_remaining`
+/// flush cannot provide: WASAPI loopback delivers ~no samples when no system
+/// audio is playing, so without this bound a silent loopback would buffer the
+/// microphone indefinitely and emit nothing — starving transcription AND the
+/// meter. Only triggers when the lagging source is genuinely empty; a merely
+/// slow source (both buffers non-empty) is still paired exactly by
+/// `drain_paired` with no silence injected.
+///
+/// 30 ms (≈ one VAD frame) so that, on the common idle-loopback path, the mixer
+/// emits ~30 batches/sec — driving the audio level meter at ~30 Hz and keeping
+/// mic latency low. A larger cap made the meter update in laggy ~10 Hz bursts.
+pub(crate) const MAX_SKEW_SAMPLES: usize = crate::resample::TARGET_RATE as usize * 30 / 1000;
+
 /// Sum two equal-length mono buffers sample-wise, clamping each result to
 /// `[-1.0, 1.0]`.
 ///
@@ -87,6 +104,28 @@ impl MixState {
         self.mic.drain(..n);
         self.sys.drain(..n);
         Some(self.emit(mixed))
+    }
+
+    /// Mid-stream starvation valve: when one source's buffer is empty and the
+    /// other has accumulated more than [`MAX_SKEW_SAMPLES`], drain that lead and
+    /// emit it with the starved source zero-filled, so an idle source (e.g.
+    /// loopback when nothing is playing) cannot block the live source forever.
+    ///
+    /// Returns `None` unless a source is genuinely starved beyond the cap — the
+    /// normal pairing in [`drain_paired`] handles everything else. Call this
+    /// after `drain_paired` has consumed the common prefix (so at most one
+    /// buffer is non-empty).
+    pub(crate) fn drain_starved(&mut self) -> Option<AudioFrameBatch> {
+        let lead = if self.sys.is_empty() && self.mic.len() > MAX_SKEW_SAMPLES {
+            std::mem::take(&mut self.mic)
+        } else if self.mic.is_empty() && self.sys.len() > MAX_SKEW_SAMPLES {
+            std::mem::take(&mut self.sys)
+        } else {
+            return None;
+        };
+        // The starved source contributes silence; clamp the survivor for parity
+        // with the paired path.
+        Some(self.emit(sum_clamp(&lead, &[])))
     }
 
     /// Flush any buffered surplus from either source at end-of-stream,
@@ -187,6 +226,54 @@ mod tests {
         let flushed = m.drain_remaining().expect("flushed mic tail");
         assert_eq!(flushed.samples, vec![0.2, 0.3], "mic tail zero-filled for sys");
         assert!(m.drain_remaining().is_none());
+    }
+
+    #[test]
+    fn drain_starved_flushes_mic_when_sys_idle_beyond_cap() {
+        // Regression: WASAPI loopback delivers nothing when no system audio
+        // plays, so `sys` stays empty. The mic must still be emitted (zero-fill
+        // sys) instead of buffering forever — the bug behind "mic not picked up
+        // with capture_system_audio on".
+        let mut m = MixState::new();
+        m.push_mic(&vec![0.3; MAX_SKEW_SAMPLES + 100]);
+        // Nothing on sys → drain_paired emits nothing.
+        assert!(m.drain_paired().is_none(), "no common prefix with empty sys");
+        let batch = m.drain_starved().expect("mic lead flushed past the cap");
+        assert_eq!(batch.samples.len(), MAX_SKEW_SAMPLES + 100);
+        assert!(batch.samples.iter().all(|&s| (s - 0.3).abs() < 1e-6));
+        assert!(m.drain_starved().is_none(), "buffer drained");
+    }
+
+    #[test]
+    fn drain_starved_holds_below_cap() {
+        // A small mic lead with idle sys is NOT force-flushed — bounded latency,
+        // gives the other source a chance to catch up first.
+        let mut m = MixState::new();
+        m.push_mic(&vec![0.3; MAX_SKEW_SAMPLES - 1]);
+        assert!(m.drain_starved().is_none(), "under cap → no forced flush");
+    }
+
+    #[test]
+    fn drain_starved_noop_when_both_sources_active() {
+        // Both non-empty → pairing handles it; the valve must not fire (no
+        // silence injected for a merely-slow source).
+        let mut m = MixState::new();
+        m.push_mic(&vec![0.3; MAX_SKEW_SAMPLES + 50]);
+        m.push_sys(&[0.1; 10]);
+        assert!(
+            m.drain_starved().is_none(),
+            "valve must not fire while both buffers hold samples",
+        );
+    }
+
+    #[test]
+    fn drain_starved_flushes_sys_when_mic_idle_beyond_cap() {
+        // Symmetric: a dead mic must not block call/loopback audio either.
+        let mut m = MixState::new();
+        m.push_sys(&vec![0.2; MAX_SKEW_SAMPLES + 5]);
+        let batch = m.drain_starved().expect("sys lead flushed past the cap");
+        assert_eq!(batch.samples.len(), MAX_SKEW_SAMPLES + 5);
+        assert!(batch.samples.iter().all(|&s| (s - 0.2).abs() < 1e-6));
     }
 
     #[test]

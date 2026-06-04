@@ -22,5 +22,6 @@ tracing = { workspace = true }
 sherpa-rs = { workspace = true }
 
 [dev-dependencies]
-# WAV decoding for the env-var-gated accuracy fixtures (`tests/accuracy.rs`).
+# WAV decoding for the env-var-gated fixtures (`tests/accuracy.rs`,
+# `tests/online_embedding.rs`).
 hound = { workspace = true }

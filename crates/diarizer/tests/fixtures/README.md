@@ -1,6 +1,8 @@
 # Diarizer accuracy fixtures (committed real speech)
 
-These fixtures back the env-var-gated accuracy test in `tests/accuracy.rs`.
+These fixtures back the env-var-gated tests in `tests/accuracy.rs` (offline
+diarizer) and `tests/online_embedding.rs` (live `OnlineDiarizer`, which consumes
+`speaker_a.wav`, `speaker_b.wav`, and `single_speaker_control.wav`).
 They are **real speech** (per `architecture/cross-cutting.md` "Automated-testing
 policy": synthetic speech-path audio must be real speech, not tones), assembled
 by concatenating two committed single-speaker clips. All are 16 kHz mono s16

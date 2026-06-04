@@ -35,13 +35,32 @@ that.
 | Audio mixer (mic + loopback) | A `spawn`/`spawn_blocking` task draining the two per-source 16 kHz batch channels; SUMS sample-wise, clamps, meters, and forwards the single mixed stream. Only present when system-audio capture is on; mic-only otherwise. Never blocks the RT callbacks (those feed the upstream rings). **Starvation valve:** if one source is idle (e.g. loopback when nothing is playing through the speakers) the mixer must NOT wait to pair samples — past a ~30 ms skew (`mixer::MAX_SKEW_SAMPLES`) it zero-fills the idle source and emits the live one, else the mic is buffered forever (silent transcript + dead meter). The cap also sets the meter/mic-latency cadence on the idle-loopback path (~30 Hz). |
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
-| Diarization | One-shot `spawn_blocking` task triggered on stop or user action. |
+| Diarization (offline) | One-shot `spawn_blocking` task triggered on stop or user action — the authoritative pass. |
+| Diarization (live, Phase A) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from `spawn_blocking` (like the offline pass); see the live-vs-offline note below. Not yet wired into the orchestrator (Phase B). |
 | Summarisation | One-shot `spawn_blocking` task triggered by user action. |
 | Persistence writes | `spawn_blocking` per write op for now; revisit if it shows up in profiling. |
 | Tauri command handlers | Tokio worker threads. Short-lived, dispatch to the above. |
 
 Bounded channels everywhere. Unbounded queues are not allowed — they
 hide back-pressure that the live pipeline needs to surface.
+
+**Live vs. offline diarization (Phase A).** There are two independent
+diarization paths. The offline `SherpaDiarizer` / `common::Diarizer`
+on-stop (and re-diarize) pass is the SOURCE OF TRUTH for the finished
+transcript. The live `OnlineDiarizer` (in `crates/diarizer`,
+`src/online`) is an ADDITIVE hint: it emits a sticky first-seen label
+("A"/"B"/…) per VAD segment as the segment closes and NEVER
+retroactively relabels — live labels are provisional and may disagree
+with the authoritative on-stop pass. Like the offline diarizer it is
+driven from `spawn_blocking`; its public `&self` methods
+(`assign_segment`, `speaker_count`) hold a single `Mutex` over the
+`(EmbeddingExtractor, OnlineClusterer)` pair because sherpa's
+`compute_speaker_embedding` is `&mut self` (the same `&self`-trait-over-
+`&mut`-engine pattern the offline `Mutex<Diarize>` uses). The clustering
+itself is a pure, FFI-free running-mean-centroid clusterer; only the
+embedding extraction crosses into sherpa. Phase A is the diarizer crate
+only — no orchestrator/UI wiring (Phase B) and no `common`-level online
+trait yet.
 
 **System/call audio capture + echo (AEC is future work).** When
 `settings.capture_system_audio` is on, the render-endpoint loopback is captured

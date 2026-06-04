@@ -237,8 +237,11 @@ boundary.
 **Inputs:** the full buffered audio + the segment array from ASR.
 **Outputs:** mutates segments in place, setting `speaker_id`.
 
-Post-hoc only. Not in the live pipeline; runs after the recording stops
-or as a user-triggered re-diarize.
+The offline `SherpaDiarizer` pass is post-hoc — it runs after the
+recording stops or as a user-triggered re-diarize. A SEPARATE, additive
+`OnlineDiarizer` runs live (Phase A — see "Phase A — live online
+labelling" below); it does not replace the offline pass, which stays
+authoritative for the finished transcript.
 
 **Binding pin (confirmed by Phase 0 Spike 4).** `sherpa-rs = 0.6.8`
 (Thewh1teagle, MIT) with the `download-binaries` feature for dev and
@@ -305,6 +308,48 @@ fixtures (`tests/fixtures/two_speakers_synth.wav` = two distinct real-speech
 speaker clips concatenated, with self-authored ground truth;
 `single_speaker_control.wav` = one real speaker repeated), asserting ≥ 80 %
 permutation-invariant segment accuracy and exactly one label on the control.
+
+**Phase A — live online labelling (additive).** The crate now ALSO exposes
+`OnlineDiarizer::open(embedding_onnx, OnlineDiarizerConfig)`,
+`OnlineDiarizer::assign_segment(&[f32] 16 kHz-mono, sample_rate) -> AppResult<String>`,
+and `speaker_count() -> AppResult<u32>`. It wraps ONLY the speaker-embedding
+model (no segmentation model — VAD upstream supplies the segment boundaries) via
+the sherpa `EmbeddingExtractor` (`sherpa_rs::speaker_id`), and delegates
+clustering to a pure, FFI-free `OnlineClusterer` (running-mean centroids, cosine
+similarity, configurable `similarity_threshold` + optional `max_speakers` cap,
+sticky first-seen A/B/C labels). `open` mirrors `SherpaDiarizer::open`'s loading
++ error mapping (`Error::ModelLoad` → `AppError::ModelLoad`); `assign_segment`
+reuses the 16 kHz guard, rejects an empty segment as `InvalidInput`, extracts the
+embedding (sherpa `eyre` err → `Error::Inference`), assigns a sticky cluster
+index, and maps it via `alpha_label`.
+
+The online-vs-offline contract: the offline `SherpaDiarizer` / `common::Diarizer`
+pass remains AUTHORITATIVE for the finished transcript; `OnlineDiarizer` is an
+additive live hint that emits a sticky label per VAD segment as the segment
+closes and NEVER retroactively relabels. The two are independent code paths
+sharing only the `alpha_label` first-seen A/B/C generator (now `pub(crate)`) and
+the 16 kHz `require_supported_sample_rate` guard.
+
+Why a pure clusterer rather than sherpa's `EmbeddingManager`: the manager has no
+running-mean centroids (one fixed vector per name, no update path) and is not
+FFI-test-isolable (every method crosses into `sherpa_rs_sys`), so the centroid
+update rule and clustering logic could not be exercised model-free — recorded
+here so the reviewer sees the decision.
+
+Phase A does NOT wire into the orchestrator (that is Phase B) and adds NO entry
+to the orchestrator's allowed-deps row. No `common`-level online trait is added
+in Phase A (no second impl, no cross-crate caller yet); the existing
+`common::Diarizer` trait is offline-only and unchanged. No new crate-dependency
+edge is introduced — `sherpa-rs` is already a `diarizer` dependency, and
+`EmbeddingExtractor` / `ExtractorConfig` live in `sherpa_rs::speaker_id` within
+the same crate. Tests: the pure `OnlineClusterer` is covered model-free in
+`src/online/clusterer.rs` (separation, stickiness, threshold split, centroid
+drift, lower-index tie-break, `max_speakers` force-join, dim-mismatch/degenerate
+rejection); the env-var-gated `tests/online_embedding.rs`
+(`MEETING_APP_DIARIZE_EMB_PATH` only — no segmentation model — skip-on-unset)
+runs `assign_segment` over committed real-speech fixtures, asserting distinct
+sticky labels for two speakers, label reuse on a speaker's repeat, one label for
+the single-speaker control, and `InvalidInput` for a non-16 kHz or empty buffer.
 
 ### `summariser`
 **Crate:** `crates/summariser`

@@ -1,10 +1,17 @@
-//! `diarizer` — opt-in offline speaker diarization.
+//! `diarizer` — speaker diarization, offline (authoritative) + live (additive).
 //!
-//! Implements [`meeting_app_common::Diarizer`] over a sherpa-onnx (via
-//! `sherpa-rs`) two-model pipeline: a **segmentation** model + a
-//! **speaker-embedding** model + clustering. It assigns `speaker_id` to the
-//! ASR `Segment`s of a finished recording (a post-pass, never on the live
-//! path). See `architecture/components.md` — `diarizer`, and the Phase-6 plan.
+//! The OFFLINE [`SherpaDiarizer`] implements [`meeting_app_common::Diarizer`]
+//! over a sherpa-onnx (via `sherpa-rs`) two-model pipeline: a **segmentation**
+//! model + a **speaker-embedding** model + clustering. It assigns `speaker_id`
+//! to the ASR `Segment`s of a finished recording (a post-pass) and is the
+//! AUTHORITATIVE labelling for the finished transcript.
+//!
+//! The LIVE [`OnlineDiarizer`] (module [`online`]) is an ADDITIVE hint: it
+//! labels one VAD segment at a time during recording (embedding + a pure online
+//! clusterer, no segmentation model), emitting sticky first-seen labels that may
+//! disagree with the on-stop pass and are never retroactively relabelled. See
+//! `architecture/components.md` — `diarizer`, `cross-cutting.md` — "Live vs.
+//! offline diarization", and the Phase-6 plan.
 //!
 //! Models (license-verified, settings-selected via `model-registry`):
 //! - segmentation: pyannote/segmentation-3.0 (MIT)
@@ -39,6 +46,10 @@ use sherpa_rs::diarize::{Diarize, DiarizeConfig, Segment as SherpaSegment};
 
 mod error;
 pub use error::Error;
+
+mod online;
+pub use online::clusterer::{ClusterAssignment, OnlineClusterer, OnlineClustererConfig};
+pub use online::{OnlineDiarizer, OnlineDiarizerConfig};
 
 /// Clustering knobs for the diarizer.
 ///
@@ -298,7 +309,10 @@ fn seconds_to_ms(seconds: f32) -> u64 {
 
 /// `0 → "A"`, `1 → "B"`, …, `25 → "Z"`, `26 → "AA"`, `27 → "AB"`, …
 /// (FR-12 anonymous-label convention; mirrors the Spike-4 relabeller).
-fn alpha_label(mut n: usize) -> String {
+///
+/// `pub(crate)` so both the offline overlay ([`overlay_speakers`]) and the
+/// online clusterer ([`crate::online`]) share the one A/B/C generator.
+pub(crate) fn alpha_label(mut n: usize) -> String {
     let mut out = String::new();
     loop {
         out.insert(0, (b'A' + (n % 26) as u8) as char);

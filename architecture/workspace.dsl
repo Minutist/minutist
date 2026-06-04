@@ -82,7 +82,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
 
                 asrRuntime = component "asr-runtime" "llama-cpp-2 (mtmd module) bound to Qwen3-ASR GGUF. Implements AsrBackend. Owns the ASR model lifecycle." "Rust crate: crates/asr-runtime"
 
-                diarizer = component "diarizer" "sherpa-onnx integration. Implements Diarizer. Post-hoc only in v1; runs on buffered audio after recording stops." "Rust crate: crates/diarizer"
+                diarizer = component "diarizer" "sherpa-onnx integration. Offline SherpaDiarizer (implements Diarizer) is the authoritative post-hoc pass on buffered audio after stop. Additive live OnlineDiarizer labels VAD segments during recording via embedding + a pure online clusterer (Phase A; not yet orchestrator-wired)." "Rust crate: crates/diarizer"
 
                 summariser = component "summariser" "llama-cpp-2 (text) for summary generation. Implements Summariser. Owns the text-LLM model lifecycle; also exposes the optional external-LLM dispatcher." "Rust crate: crates/summariser"
 

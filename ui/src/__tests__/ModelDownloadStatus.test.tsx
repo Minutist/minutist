@@ -65,6 +65,7 @@ describe("ModelDownloadStatus", () => {
         models: [],
         isAsrModelReady: false,
         downloadInProgress: {},
+        downloadErrors: {},
       });
     });
   });
@@ -130,6 +131,28 @@ describe("ModelDownloadStatus", () => {
 
     const { container } = render(<ModelDownloadStatus />);
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("shows the failure reason and a Retry button when a download errored", () => {
+    act(() => {
+      useModelsStore.setState({
+        models: [makeMissingModel()],
+        isAsrModelReady: false,
+        downloadInProgress: {},
+        downloadErrors: {
+          [ASR_MODEL_ID]: "Model download failed: sha256 mismatch for b.gguf",
+        },
+      });
+    });
+
+    render(<ModelDownloadStatus />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent("sha256 mismatch");
+    expect(
+      screen.getByRole("button", { name: "Retry Download" }),
+    ).toBeInTheDocument();
+    // No frozen progress bar while in the errored state.
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
 
   it("displays the model display_name", () => {

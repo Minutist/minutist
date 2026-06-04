@@ -14,6 +14,7 @@ export function ModelDownloadStatus() {
   const models = useModelsStore((s) => s.models);
   const isAsrModelReady = useModelsStore((s) => s.isAsrModelReady);
   const downloadInProgress = useModelsStore((s) => s.downloadInProgress);
+  const downloadErrors = useModelsStore((s) => s.downloadErrors);
   const ensureModel = useModelsStore((s) => s.ensureModel);
 
   // Only show when ASR model is not ready.
@@ -23,6 +24,7 @@ export function ModelDownloadStatus() {
   const asrModel = models.find((m) => m.id === ASR_MODEL_ID);
   const displayName = asrModel?.display_name ?? "ASR Model";
   const inProgress = downloadInProgress[ASR_MODEL_ID];
+  const downloadError = downloadErrors[ASR_MODEL_ID];
   const isDownloading =
     inProgress !== undefined ||
     asrModel?.status.state === "downloading";
@@ -59,12 +61,18 @@ export function ModelDownloadStatus() {
         </div>
       )}
 
+      {!isDownloading && downloadError && (
+        <p className="model-download-status__error" role="alert">
+          {downloadError}
+        </p>
+      )}
+
       {!isDownloading && (
         <button
           className="model-download-status__download-btn"
           onClick={() => void ensureModel(ASR_MODEL_ID)}
         >
-          Download Model
+          {downloadError ? "Retry Download" : "Download Model"}
         </button>
       )}
     </div>

@@ -11,6 +11,8 @@
 //! Test 6: two concurrent `ensure(same_id)` calls where the download fails;
 //!         BOTH callers observe the owner's real `AppError::ModelDownload`,
 //!         not a fabricated `ModelNotFound`.
+//! Test 7: a multi-file entry reports aggregate (not per-file) progress and a
+//!         terminal event that reaches the total.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use meeting_app_common::{
-    AppError, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, ModelStatusState,
+    AppError, AppEvent, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, ModelStatusState,
 };
 
 use crate::manifest::parse_manifest;
@@ -365,4 +367,144 @@ async fn in_flight_dedup_propagates_owner_error_on_failure() {
 
     // The wiremock expectation of exactly 1 request is verified on drop:
     // single-download coalescing is preserved despite the failure.
+}
+
+// -----------------------------------------------------------------------
+// Regression guard: the bundled manifest must pin immutable commit SHAs.
+//
+// The Qwen3-ASR entry originally used `/resolve/main/` — a moving ref. When
+// ggml-org re-uploaded the mmproj, its SHA-256 changed, so first-run hash
+// verification failed and the download froze at ~95% with no surfaced error.
+// Pinning a commit makes the bytes (and thus the recorded hash) immutable.
+// -----------------------------------------------------------------------
+
+#[test]
+fn bundled_manifest_pins_commit_revisions() {
+    const MANIFEST: &str = include_str!("../../../resources/models.json");
+    let entries = parse_manifest(MANIFEST.as_bytes()).expect("bundled manifest parses");
+    assert!(!entries.is_empty(), "bundled manifest is empty");
+
+    for entry in &entries {
+        for file in &entry.files {
+            // Only Hugging Face `resolve` URLs carry a revision segment.
+            if let Some(rest) = file.url.split("/resolve/").nth(1) {
+                let rev = rest.split('/').next().unwrap_or("");
+                assert!(
+                    rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{}: file {} must pin a 40-hex commit (not a moving ref like \
+                     `main`); got revision {rev:?}",
+                    entry.id.0,
+                    file.filename,
+                );
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Test 7: multi-file entry reports AGGREGATE progress, not per-file.
+//
+// A two-file model (mirroring the ASR gguf + mmproj pair) must drive a
+// single monotonic bar: every `ModelDownloadProgress` carries the aggregate
+// byte total (sum of both files, not either file's individual size), the
+// reported `bytes_done` never goes backwards (no reset between files), and a
+// terminal event lands exactly on the total so the UI's completion check
+// (`bytes_done >= bytes_total`) fires deterministically rather than relying
+// on a throttled per-chunk emit happening to coincide with the last byte.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn multi_file_entry_reports_aggregate_progress() {
+    let mock_server = MockServer::start().await;
+    let file_a = b"first file contents -- the gguf stand-in".to_vec();
+    let file_b = b"second file -- the mmproj stand-in".to_vec();
+    let grand_total = (file_a.len() + file_b.len()) as u64;
+
+    Mock::given(method("GET"))
+        .and(path("/a.gguf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(file_a.clone()))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/b.gguf"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(file_b.clone()))
+        .mount(&mock_server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entry = ModelManifestEntry {
+        id: ModelId("multi-file-model".into()),
+        kind: ModelKind::Asr,
+        display_name: "Multi".into(),
+        license: "apache-2.0".into(),
+        total_size_bytes: grand_total,
+        files: vec![
+            ModelFileEntry {
+                filename: "a.gguf".into(),
+                url: format!("{}/a.gguf", mock_server.uri()),
+                size: file_a.len() as u64,
+                sha256: sha256_hex(&file_a),
+            },
+            ModelFileEntry {
+                filename: "b.gguf".into(),
+                url: format!("{}/b.gguf", mock_server.uri()),
+                size: file_b.len() as u64,
+                sha256: sha256_hex(&file_b),
+            },
+        ],
+    };
+
+    let (tx, mut rx) = broadcast::channel(64);
+    let registry =
+        ModelRegistry::new(dir.path().to_path_buf(), vec![entry], tx).expect("registry");
+
+    registry
+        .ensure(&ModelId("multi-file-model".into()))
+        .await
+        .expect("ensure should succeed");
+
+    // Drain every progress event emitted during the download.
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::ModelDownloadProgress {
+            bytes_done,
+            bytes_total,
+            ..
+        } = ev
+        {
+            events.push((bytes_done, bytes_total));
+        }
+    }
+
+    assert!(!events.is_empty(), "no progress events were emitted");
+
+    // Every event reports the AGGREGATE total — never a single file's size.
+    for (done, total) in &events {
+        assert_eq!(
+            *total,
+            Some(grand_total),
+            "progress total must be the aggregate {grand_total}, got {total:?}"
+        );
+        assert!(
+            *done <= grand_total,
+            "bytes_done {done} exceeded the aggregate total {grand_total}"
+        );
+    }
+
+    // Monotonic non-decreasing — the bar must not reset between files.
+    for w in events.windows(2) {
+        assert!(
+            w[1].0 >= w[0].0,
+            "progress went backwards: {} -> {}",
+            w[0].0,
+            w[1].0
+        );
+    }
+
+    // A terminal event lands exactly on the total.
+    assert_eq!(
+        events.last().map(|(done, _)| *done),
+        Some(grand_total),
+        "final progress event must reach the aggregate total"
+    );
 }

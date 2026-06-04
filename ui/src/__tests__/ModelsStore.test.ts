@@ -70,6 +70,7 @@ describe("ModelsStore", () => {
       models: [],
       isAsrModelReady: false,
       downloadInProgress: {},
+      downloadErrors: {},
     });
   });
 
@@ -142,6 +143,55 @@ describe("ModelsStore", () => {
     expect(
       useModelsStore.getState().downloadInProgress[ASR_MODEL_ID],
     ).toBeUndefined();
+  });
+
+  it("ensureModel surfaces a download failure into downloadErrors and clears in-progress", async () => {
+    // Pre-populate an in-progress entry, as if bytes were streaming before the
+    // hash check failed.
+    useModelsStore.setState({
+      downloadInProgress: {
+        [ASR_MODEL_ID]: { bytes_done: 950000, bytes_total: 1000000 },
+      },
+    });
+
+    // The backend returns the failure to this caller (no separate error event).
+    vi.mocked(commands.ensureModel).mockReturnValueOnce(
+      Promise.resolve({
+        status: "error" as const,
+        error: { code: "model_download", context: "sha256 mismatch for b.gguf" },
+      }),
+    );
+
+    await useModelsStore.getState().ensureModel(ASR_MODEL_ID);
+
+    expect(useModelsStore.getState().downloadErrors[ASR_MODEL_ID]).toContain(
+      "sha256 mismatch",
+    );
+    // The frozen progress entry is cleared so the UI shows the error + retry.
+    expect(
+      useModelsStore.getState().downloadInProgress[ASR_MODEL_ID],
+    ).toBeUndefined();
+    // refreshModels (listModels) must NOT have run on the failure path.
+    expect(commands.listModels).not.toHaveBeenCalled();
+  });
+
+  it("ensureModel clears a prior error before re-attempting", async () => {
+    useModelsStore.setState({
+      downloadErrors: { [ASR_MODEL_ID]: "old failure" },
+    });
+    vi.mocked(commands.ensureModel).mockReturnValueOnce(
+      Promise.resolve({ status: "ok" as const, data: null }),
+    );
+    vi.mocked(commands.listModels).mockReturnValueOnce(
+      okModels([makeAvailableModel()]),
+    );
+
+    await useModelsStore.getState().ensureModel(ASR_MODEL_ID);
+
+    expect(
+      useModelsStore.getState().downloadErrors[ASR_MODEL_ID],
+    ).toBeUndefined();
+    expect(useModelsStore.getState().isAsrModelReady).toBe(true);
   });
 
   it("handleEvent handles unknown total (bytes_total null) by keeping bytes_done:0 in progress", () => {

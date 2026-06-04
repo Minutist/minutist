@@ -207,14 +207,33 @@ impl ModelRegistry {
     }
 
     /// Download all files for `entry` into `model_dir`.
+    ///
+    /// Progress is reported against the *aggregate* byte total of every file in
+    /// the entry (`base_offset` is the sum of fully-fetched prior files), so a
+    /// multi-file model (e.g. the ASR gguf + mmproj pair) advances a single
+    /// monotonic bar to 100% rather than resetting between files. A final
+    /// `bytes_done == grand_total` event is emitted on success so the webview's
+    /// completion check fires deterministically — the per-chunk emits are
+    /// throttled and the last one always lands short of the total.
     async fn download_entry(
         &self,
         entry: &ModelManifestEntry,
         model_dir: &Path,
     ) -> Result<(), Error> {
+        let grand_total: u64 = entry.files.iter().map(|f| f.size).sum();
+        let mut base_offset: u64 = 0;
         for file in &entry.files {
-            self.download_file(&entry.id, file, model_dir).await?;
+            self.download_file(&entry.id, file, model_dir, base_offset, grand_total)
+                .await?;
+            base_offset += file.size;
         }
+
+        // Terminal 100% event — guarantees the UI sees `bytes_done >= total`.
+        let _ = self.event_tx.send(AppEvent::ModelDownloadProgress {
+            model_id: entry.id.clone(),
+            bytes_done: grand_total,
+            bytes_total: Some(grand_total),
+        });
         Ok(())
     }
 
@@ -226,6 +245,8 @@ impl ModelRegistry {
         model_id: &ModelId,
         file: &ModelFileEntry,
         model_dir: &Path,
+        base_offset: u64,
+        grand_total: u64,
     ) -> Result<(), Error> {
         let dest = model_dir.join(&file.filename);
 
@@ -301,7 +322,14 @@ impl ModelRegistry {
             drop(fs_file);
             tokio::fs::remove_file(&dest).await.map_err(Error::Io)?;
             // Restart without a Range header.
-            return Box::pin(self.download_file_fresh(model_id, file, model_dir)).await;
+            return Box::pin(self.download_file_fresh(
+                model_id,
+                file,
+                model_dir,
+                base_offset,
+                grand_total,
+            ))
+            .await;
         }
 
         if !response.status().is_success() {
@@ -333,8 +361,8 @@ impl ModelRegistry {
                 last_emit = now;
                 let _ = self.event_tx.send(AppEvent::ModelDownloadProgress {
                     model_id: model_id.clone(),
-                    bytes_done,
-                    bytes_total: Some(file.size),
+                    bytes_done: base_offset + bytes_done,
+                    bytes_total: Some(grand_total),
                 });
             }
         }
@@ -369,6 +397,8 @@ impl ModelRegistry {
         model_id: &ModelId,
         file: &ModelFileEntry,
         model_dir: &Path,
+        base_offset: u64,
+        grand_total: u64,
     ) -> Result<(), Error> {
         let dest = model_dir.join(&file.filename);
         let mut fs_file = tokio::fs::File::create(&dest).await.map_err(Error::Io)?;
@@ -397,8 +427,8 @@ impl ModelRegistry {
                 last_emit = now;
                 let _ = self.event_tx.send(AppEvent::ModelDownloadProgress {
                     model_id: model_id.clone(),
-                    bytes_done,
-                    bytes_total: Some(file.size),
+                    bytes_done: base_offset + bytes_done,
+                    bytes_total: Some(grand_total),
                 });
             }
         }

@@ -303,6 +303,13 @@
   color: var(--ink);
 }
 
+.model-download-status__error {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  color: var(--accent);
+}
+
 .model-download-status__progress-track {
   height: 5px;
   background: var(--rule);

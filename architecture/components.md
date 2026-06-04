@@ -398,6 +398,17 @@ subscription sees its progress events too. (This refines `cross-cutting.md` "Mod
 lifecycle", which still frames the registry as handing out paths: that remains true
 for model *files*, but the registry additionally publishes download-progress events.)
 
+Progress is reported against an entry's **aggregate** byte total (the sum of every
+file in the manifest entry), not per-file: a multi-file model (e.g. the ASR
+`gguf` + `mmproj` pair) drives one monotonic 0→100% bar rather than resetting
+between files. A terminal `bytes_done == bytes_total` event is emitted once all
+files verify, so a consumer's completion check fires deterministically rather than
+depending on a throttled per-chunk emit coinciding with the last byte. Verification
+failures (e.g. a SHA-256 mismatch from a stale manifest) are returned to the
+`ensure` caller, not the broadcast bus — the webview surfaces them at that seam.
+Manifest file URLs MUST pin an immutable commit revision; a moving ref (`main`)
+drifts when the upstream repo is re-uploaded and silently breaks hash verification.
+
 ### `persistence`
 **Crate:** `crates/persistence`
 **Owns:** the per-meeting folder layout, the libsql index schema and

@@ -6,19 +6,19 @@
       "kind": "asr",
       "display_name": "Qwen3-ASR 0.6B (Q8_0)",
       "license": "apache-2.0",
-      "total_size_bytes": 1067876352,
+      "total_size_bytes": 1019141728,
       "files": [
         {
           "filename": "Qwen3-ASR-0.6B-Q8_0.gguf",
-          "url": "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main/Qwen3-ASR-0.6B-Q8_0.gguf",
-          "size": 844113152,
+          "url": "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/Qwen3-ASR-0.6B-Q8_0.gguf",
+          "size": 804749248,
           "sha256": "bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971"
         },
         {
           "filename": "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
-          "url": "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
-          "size": 223763200,
-          "sha256": "0138afe958883431cffc177cbb24b2ec2f2f56c2766d2cf7f02157d707b684ad"
+          "url": "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2/mmproj-Qwen3-ASR-0.6B-Q8_0.gguf",
+          "size": 214392480,
+          "sha256": "41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d"
         }
       ]
     },

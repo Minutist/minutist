@@ -6,7 +6,7 @@
  * (called by the global event bridge) and the async action methods.
  */
 import { create } from "zustand";
-import { commands, unwrap } from "../ipc/client";
+import { commands, unwrap, IpcCallError } from "../ipc/client";
 import type { ModelStatus } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
 
@@ -24,6 +24,13 @@ export type ModelsStore = {
    * the next `refreshModels` that shows a non-downloading state.
    */
   downloadInProgress: Record<string, { bytes_done: number; bytes_total: number }>;
+  /**
+   * Last download failure per model id (human-readable). Set when `ensureModel`
+   * rejects — e.g. a SHA-256 mismatch (stale manifest) or a network failure —
+   * so the UI can show the reason and a retry instead of a frozen progress bar.
+   * Cleared when a fresh `ensureModel` for that id is started.
+   */
+  downloadErrors: Record<string, string>;
 
   /** Refresh the model list from the backend. */
   refreshModels: () => Promise<void>;
@@ -43,6 +50,7 @@ export const useModelsStore = create<ModelsStore>((set, get) => ({
   models: [],
   isAsrModelReady: false,
   downloadInProgress: {},
+  downloadErrors: {},
 
   refreshModels: async () => {
     try {
@@ -58,14 +66,34 @@ export const useModelsStore = create<ModelsStore>((set, get) => ({
   },
 
   ensureModel: async (id: string) => {
+    // Clear any prior failure for this id before the new attempt.
+    set((s) => {
+      if (!(id in s.downloadErrors)) return {};
+      const next = { ...s.downloadErrors };
+      delete next[id];
+      return { downloadErrors: next };
+    });
     try {
       const result = await commands.ensureModel(id);
       unwrap(result);
       // Refresh to pick up the newly available model.
       await get().refreshModels();
-    } catch (_err) {
-      // Errors surface via backend error_occurred events; no local lastError
-      // needed here.
+    } catch (err) {
+      // `ensure_model` returns the failure to this caller and does NOT emit a
+      // separate error event, so the rejection must be surfaced here — a
+      // swallowed error leaves the progress bar frozen with no explanation.
+      const message =
+        err instanceof IpcCallError || err instanceof Error
+          ? err.message
+          : "Model download failed";
+      set((s) => {
+        const next = { ...s.downloadInProgress };
+        delete next[id];
+        return {
+          downloadInProgress: next,
+          downloadErrors: { ...s.downloadErrors, [id]: message },
+        };
+      });
     }
   },
 

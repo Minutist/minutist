@@ -236,12 +236,13 @@ impl LlamaSummariser {
     /// assistant turn open for generation.
     ///
     /// The system prompt is folded INTO the user turn rather than sent as a
-    /// separate `system` message because several GGUF chat templates — notably
-    /// Gemma — have no `system` role, and llama.cpp's `apply_chat_template`
-    /// returns `ffi error -1` when one is supplied. Folding into the user turn
-    /// is universal: every chat template supports a `user` role, and the
-    /// instructions still reach the model. A missing/unusable template is a hard
-    /// [`Error::Template`].
+    /// separate `system` message because several chat templates — notably Gemma
+    /// — have no `system` role. That alone is not enough, though: the bundled
+    /// llama.cpp cannot RENDER a chat template newer than itself (Gemma 4
+    /// postdates the vendored build), so `apply_chat_template` returns `ffi error
+    /// -1` even for a user-only message set. On that failure we fall back to the
+    /// [`gemma_turn_prompt`] hand-built format — the format our shipped
+    /// summariser LLM uses. Other models keep using their baked template.
     fn build_prompt(
         &self,
         transcript: &[Segment],
@@ -256,12 +257,28 @@ impl LlamaSummariser {
         let user_content = render_user_content(transcript, notes_markdown);
         let combined = format!("{system_prompt}\n\n{user_content}");
 
-        let user_msg = LlamaChatMessage::new("user".to_string(), combined)
+        let user_msg = LlamaChatMessage::new("user".to_string(), combined.clone())
             .map_err(|e| Error::Template(format!("user message: {e}")))?;
 
-        self.model
-            .apply_chat_template(&template, &[user_msg], true)
-            .map_err(|e| Error::Template(format!("apply_chat_template: {e}")))
+        match self.model.apply_chat_template(&template, &[user_msg], true) {
+            Ok(prompt) => Ok(prompt),
+            Err(e) => {
+                // The bundled llama.cpp cannot RENDER some newer chat templates
+                // (Gemma 4 postdates the vendored build) — `apply_chat_template`
+                // returns `ffi error -1` regardless of the message set, not just
+                // for a `system` role. Fall back to the Gemma turn format, which
+                // is what our shipped summariser LLM (gemma-4-E4B) uses. `<bos>`
+                // is emitted explicitly because `generate()` tokenises with
+                // `AddBos::Never`, and `str_to_token` parses special tokens
+                // (`llama_tokenize(..., special=true)`), so `<bos>` /
+                // `<start_of_turn>` / `<end_of_turn>` map to their token ids.
+                tracing::warn!(
+                    target: "summariser",
+                    "apply_chat_template failed ({e}); using the Gemma turn-format fallback"
+                );
+                Ok(gemma_turn_prompt(&combined))
+            }
+        }
     }
 
     /// Tokenise the prompt, chunked-prefill it, then greedily generate.
@@ -357,6 +374,16 @@ impl LlamaSummariser {
 // ---------------------------------------------------------------------------
 // Prompt rendering
 // ---------------------------------------------------------------------------
+
+/// Hand-built Gemma single-user-turn prompt, used as the fallback when
+/// `apply_chat_template` cannot render the GGUF's baked template (Gemma 4
+/// postdates the bundled llama.cpp). `<bos>` is included explicitly because
+/// `generate()` tokenises with `AddBos::Never`; `str_to_token` parses special
+/// tokens, so `<bos>` / `<start_of_turn>` / `<end_of_turn>` map to their ids.
+/// The trailing open `model` turn is where generation continues.
+fn gemma_turn_prompt(content: &str) -> String {
+    format!("<bos><start_of_turn>user\n{content}<end_of_turn>\n<start_of_turn>model\n")
+}
 
 /// Render the transcript + notes into the single `user` message body.
 ///
@@ -802,6 +829,19 @@ mod tests {
             Err(other) => panic!("expected AppError::ModelLoad, got {other:?}"),
             Ok(_) => panic!("expected Err, got Ok"),
         }
+    }
+
+    #[test]
+    fn gemma_turn_prompt_wraps_content_with_bos_and_open_model_turn() {
+        let p = gemma_turn_prompt("INSTRUCTIONS\n\nbody");
+        assert_eq!(
+            p,
+            "<bos><start_of_turn>user\nINSTRUCTIONS\n\nbody<end_of_turn>\n<start_of_turn>model\n"
+        );
+        // BOS is explicit (generate() uses AddBos::Never) and the assistant turn
+        // is left open for generation (ends after the `model` turn marker).
+        assert!(p.starts_with("<bos>"));
+        assert!(p.ends_with("<start_of_turn>model\n"));
     }
 
     // -----------------------------------------------------------------------

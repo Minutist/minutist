@@ -383,11 +383,15 @@ across Gemma 4 / Qwen / Granite. If the template is missing, fail the request
 explicitly (`AppError::InvalidInput`) rather than guessing. For Gemma 4 run
 with **thinking disabled** (do not inject the `<|think|>` token); if a future
 selected model emits a `<think>` block, strip it before persisting the summary.
-The system prompt is folded into a SINGLE `user` turn, NOT sent as a separate
-`system` message: several templates (notably Gemma) have no `system` role and
-`apply_chat_template` returns `ffi error -1` when one is supplied. Every template
-supports a `user` role, so folding keeps it model-agnostic and the instructions
-still reach the model.
+The system prompt is folded into a SINGLE `user` turn, NOT a separate `system`
+message (several templates, notably Gemma, have no `system` role). That alone is
+insufficient: the bundled llama.cpp cannot RENDER a template newer than itself
+(Gemma 4 postdates the vendored build), so `apply_chat_template` returns `ffi
+error -1` even for a user-only message set. On that failure the summariser falls
+back to a hand-built Gemma turn-format prompt (`<bos><start_of_turn>user …
+<end_of_turn>` then an open `model` turn) — the format the shipped LLM uses;
+other models keep their baked template. BOS is explicit because generation
+tokenises `AddBos::Never` and `str_to_token` parses special tokens.
 
 **Prefill must chunk by `n_batch`** — see `cross-cutting.md`, "llama.cpp
 prefill batching". Long transcripts exceed `n_batch` (default 512) and

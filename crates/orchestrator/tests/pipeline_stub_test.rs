@@ -162,7 +162,7 @@ async fn stub_backend_pipeline_emits_transcript_and_writes_transcript_json() {
     let stub = Box::new(StubAsrBackend::new("hello from stub asr"));
 
     let meeting_id = orch
-        .start_with_streams_and_backend(streams, stub)
+        .start_with_streams_and_backend(streams, stub, None)
         .await
         .expect("start_with_streams_and_backend");
 

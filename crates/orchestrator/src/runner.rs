@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use asr_runtime::{AsrRuntime, AsrRuntimeConfig};
 use audio_capture::{AudioFrameBatch, AudioStreams};
+use diarizer::{OnlineDiarizer, OnlineDiarizerConfig};
 use meeting_app_common::{
     AppError, AppEvent, AppResult, AsrBackend, AudioChunk, AudioMeterFrame, MeetingId, MeetingMeta,
     ModelId, ModelStatusState, Segment,
@@ -116,6 +117,11 @@ pub(crate) struct FlushPayload {
     pub(crate) samples: Vec<f32>,
     /// `(start_ms, end_ms)` for each VAD segment in this buffer.
     pub(crate) vad_segments: Vec<(u64, u64)>,
+    /// Live provisional speaker label for each VAD segment, in lockstep with
+    /// `vad_segments` (Phase B). `None` when no live diarizer is wired or the
+    /// per-segment `assign_segment` failed. The on-stop `SherpaDiarizer` pass
+    /// remains authoritative and overwrites these on stop.
+    pub(crate) speaker_ids: Vec<Option<String>>,
     pub(crate) meeting_id: MeetingId,
 }
 
@@ -219,6 +225,11 @@ impl FlushQueue {
 // Batched-VAD accumulator
 // ---------------------------------------------------------------------------
 
+/// What [`Accumulator::drain`] yields: the padded sample buffer, the per-segment
+/// `(start_ms, end_ms)` list, and the parallel live speaker-label column (Phase
+/// B). The three are index-aligned: `vad_segments.len() == speaker_ids.len()`.
+type DrainedFlush = (Vec<f32>, Vec<(u64, u64)>, Vec<Option<String>>);
+
 /// Accumulates VAD segments into a buffer that reconstructs the original
 /// recording-clock timeline by zero-padding inter-segment gaps (capped at
 /// `MAX_GAP_MS` to bound encoder budget on very long silences).
@@ -232,6 +243,12 @@ pub(crate) struct Accumulator {
     pub(crate) buffer_start_ms: Option<u64>,
     /// `(start_ms, end_ms)` of each VAD segment appended so far.
     pub(crate) vad_segments: Vec<(u64, u64)>,
+    /// Live provisional speaker label for each VAD segment, pushed in lockstep
+    /// with `vad_segments` (Phase B). INVARIANT: `speaker_ids.len() ==
+    /// vad_segments.len()` at all times. `None` when no live diarizer is wired
+    /// or the per-segment label failed; the label is assigned at SegmentEnd from
+    /// the original un-padded per-segment samples and never recomputed.
+    pub(crate) speaker_ids: Vec<Option<String>>,
     /// Wall-clock instant the most recent VAD segment ended.
     pub(crate) last_vad_end_at: Option<Instant>,
 }
@@ -242,12 +259,23 @@ impl Accumulator {
             samples: Vec::new(),
             buffer_start_ms: None,
             vad_segments: Vec::new(),
+            speaker_ids: Vec::new(),
             last_vad_end_at: None,
         }
     }
 
     /// Append a VAD segment, zero-padding the gap from the current buffer tail.
-    pub(crate) fn append(&mut self, start_ms: u64, end_ms: u64, seg_samples: &[f32]) {
+    ///
+    /// `label` is the live provisional speaker id for this VAD segment (Phase B),
+    /// pushed in lockstep with the segment so the `speaker_ids` column stays
+    /// 1:1 with `vad_segments`.
+    pub(crate) fn append(
+        &mut self,
+        start_ms: u64,
+        end_ms: u64,
+        seg_samples: &[f32],
+        label: Option<String>,
+    ) {
         let buffer_start = *self.buffer_start_ms.get_or_insert(start_ms);
 
         // How many samples should be at offset `start_ms` within the buffer.
@@ -264,6 +292,7 @@ impl Accumulator {
 
         self.samples.extend_from_slice(seg_samples);
         self.vad_segments.push((start_ms, end_ms));
+        self.speaker_ids.push(label);
         self.last_vad_end_at = Some(Instant::now());
     }
 
@@ -276,13 +305,18 @@ impl Accumulator {
         self.samples.is_empty()
     }
 
-    /// Drain the accumulator, returning samples and segment list. Resets state.
-    pub(crate) fn drain(&mut self) -> (Vec<f32>, Vec<(u64, u64)>) {
+    /// Drain the accumulator, returning samples, segment list, and the parallel
+    /// live speaker-label column (Phase B). Resets state.
+    ///
+    /// The returned `speaker_ids` is always the same length as `vad_segments`
+    /// (the two are pushed in lockstep by [`Self::append`]).
+    pub(crate) fn drain(&mut self) -> DrainedFlush {
         let samples = std::mem::take(&mut self.samples);
         let segments = std::mem::take(&mut self.vad_segments);
+        let speaker_ids = std::mem::take(&mut self.speaker_ids);
         self.buffer_start_ms = None;
         self.last_vad_end_at = None;
-        (samples, segments)
+        (samples, segments, speaker_ids)
     }
 }
 
@@ -308,6 +342,11 @@ pub(crate) struct RunnerHandle {
 /// `meeting_id`     — used when emitting `TranscriptSegment` events.
 /// `n_gpu_layers`   — runtime-resolved GPU-offload count (from the
 ///                    `gpu_acceleration` setting via [`resolve_gpu_layers`]).
+/// `online_diarizer` — optional live diarizer (Phase B). When `Some`, the drain
+///                    loop labels each VAD segment at SegmentEnd; when `None`
+///                    (setting off / model absent / build failed) every segment
+///                    is left unlabelled. Best-effort: never affects recording
+///                    or transcription. The on-stop pass stays authoritative.
 pub(crate) fn spawn_runner(
     streams: AudioStreams,
     writer: MeetingWriter,
@@ -315,6 +354,7 @@ pub(crate) fn spawn_runner(
     model_registry: Arc<ModelRegistry>,
     meeting_id: MeetingId,
     n_gpu_layers: u32,
+    online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
     spawn_runner_inner(
         streams,
@@ -324,10 +364,12 @@ pub(crate) fn spawn_runner(
         meeting_id,
         n_gpu_layers,
         None,
+        online_diarizer,
     )
 }
 
 /// Internal spawn function shared by production and test paths.
+#[allow(clippy::too_many_arguments)]
 fn spawn_runner_inner(
     streams: AudioStreams,
     writer: MeetingWriter,
@@ -336,6 +378,7 @@ fn spawn_runner_inner(
     meeting_id: MeetingId,
     n_gpu_layers: u32,
     prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
+    online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<RunnerCommand>(8);
 
@@ -371,6 +414,7 @@ fn spawn_runner_inner(
             flush_queue,
             writer_cmd_rx,
             meeting_id,
+            online_diarizer,
         );
     });
 
@@ -383,6 +427,11 @@ fn spawn_runner_inner(
 /// lazily initialising `AsrRuntime` from the model registry. This allows
 /// integration tests to inject a stub backend without a real model file.
 ///
+/// `online_diarizer` lets a test drive the Phase-B live-labelling path with a
+/// real `OnlineDiarizer` (env-gated positive case) or `None` (the always-on
+/// regression guard that proves transcription is unchanged when live
+/// diarization is off).
+///
 /// Available only under the `test-source` feature.
 #[cfg(any(test, feature = "test-source"))]
 pub(crate) fn spawn_runner_with_backend(
@@ -392,6 +441,7 @@ pub(crate) fn spawn_runner_with_backend(
     model_registry: Arc<ModelRegistry>,
     meeting_id: MeetingId,
     backend: Box<dyn AsrBackend + Send>,
+    online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
     // The prebuilt backend is used directly, so the lazy production-path
     // `n_gpu_layers` is moot here — pass the compile-time ceiling for parity.
@@ -403,13 +453,68 @@ pub(crate) fn spawn_runner_with_backend(
         meeting_id,
         asr_runtime::default_n_gpu_layers(),
         Some(backend),
+        online_diarizer,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Live diarization label (Phase B)
+// ---------------------------------------------------------------------------
+
+/// Compute the live provisional speaker label for one VAD segment's un-padded
+/// samples (Phase B).
+///
+/// Returns `None` when no live diarizer is wired (`online_diarizer == None`) or
+/// when `assign_segment` fails for this segment (FFI error, mutex poison, empty
+/// or invalid segment). A failure is logged at `warn` and degrades to `None` for
+/// THAT segment only — subsequent segments keep trying, and recording /
+/// transcription are never affected. The label MUST be computed here, at
+/// SegmentEnd, from the original un-padded per-segment slice: the accumulator's
+/// `MAX_GAP_MS` zero-pad cap makes per-segment sample boundaries unrecoverable
+/// from the flushed buffer downstream.
+fn live_segment_label(
+    online_diarizer: Option<&Arc<OnlineDiarizer>>,
+    samples: &[f32],
+) -> Option<String> {
+    let diarizer = online_diarizer?;
+    // Live diarization is strictly additive and runs INLINE on the runner's
+    // drain-loop thread (the one that also drains the sample channel and writes
+    // audio.opus). A panic in the sherpa FFI (or any unwinding panic in
+    // `assign_segment`) must therefore NOT escape this function and abort the
+    // drain loop — that would stop recording + transcription. `catch_unwind`
+    // contains it; the `Mutex` inside `OnlineDiarizer` poisons on a
+    // panic-while-locked, so any subsequent segment cleanly returns `Err` (and
+    // hence `None`) rather than re-panicking. Either way: no live label for the
+    // affected segment, recording unaffected. (`AssertUnwindSafe` is sound here
+    // because we discard the diarizer's state on a panic — we never observe a
+    // torn value; we only map the outcome to `Option<String>`.)
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        diarizer.assign_segment(samples, SAMPLE_RATE_HZ as u32)
+    }));
+    match outcome {
+        Ok(Ok(label)) => Some(label),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "orchestrator",
+                "live diarization assign_segment failed: {e}"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::error!(
+                target: "orchestrator",
+                "live diarization panicked; continuing without a live label"
+            );
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Blocking drain loop (runner)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_drain_loop(
     mut streams: AudioStreams,
     mut writer: MeetingWriter,
@@ -418,6 +523,7 @@ fn run_drain_loop(
     flush_queue: FlushQueue,
     mut writer_cmd_rx: mpsc::Receiver<WriterCommand>,
     meeting_id: MeetingId,
+    online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) {
     // Ensure the worker is signalled when this function exits for any reason.
     // `FlushQueueGuard` calls `close()` when dropped.
@@ -513,6 +619,7 @@ fn run_drain_loop(
                         writer,
                         &event_tx,
                         meeting_id,
+                        online_diarizer.as_ref(),
                     );
                     return;
                 }
@@ -565,6 +672,7 @@ fn run_drain_loop(
                         writer,
                         &event_tx,
                         meeting_id,
+                        online_diarizer.as_ref(),
                     );
                     return;
                 }
@@ -609,7 +717,11 @@ fn run_drain_loop(
                         Ok(events) => {
                             for ev in events {
                                 if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
-                                    acc.append(start_ms, end_ms, &samples);
+                                    // Live label from the still-un-padded
+                                    // per-segment slice (Phase B).
+                                    let label =
+                                        live_segment_label(online_diarizer.as_ref(), &samples);
+                                    acc.append(start_ms, end_ms, &samples, label);
                                 }
                             }
                         }
@@ -624,8 +736,13 @@ fn run_drain_loop(
 
                 // Size-triggered flush.
                 if acc.duration_secs() >= FLUSH_MIN_SECS {
-                    let (samples, vad_segments) = acc.drain();
-                    let payload = FlushPayload { samples, vad_segments, meeting_id };
+                    let (samples, vad_segments, speaker_ids) = acc.drain();
+                    let payload = FlushPayload {
+                        samples,
+                        vad_segments,
+                        speaker_ids,
+                        meeting_id,
+                    };
                     dispatch_flush(&flush_queue, payload, &event_tx);
                 }
             }
@@ -639,8 +756,13 @@ fn run_drain_loop(
 
                 if should_flush_latency {
                     tracing::debug!(target: "orchestrator", "runner: latency-window flush");
-                    let (samples, vad_segments) = acc.drain();
-                    let payload = FlushPayload { samples, vad_segments, meeting_id };
+                    let (samples, vad_segments, speaker_ids) = acc.drain();
+                    let payload = FlushPayload {
+                        samples,
+                        vad_segments,
+                        speaker_ids,
+                        meeting_id,
+                    };
                     dispatch_flush(&flush_queue, payload, &event_tx);
                 } else {
                     std::thread::sleep(POLL_INTERVAL);
@@ -660,7 +782,12 @@ fn run_drain_loop(
                                 for ev in events {
                                     if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev
                                     {
-                                        acc.append(start_ms, end_ms, &samples);
+                                        // Live label from the un-padded slice (Phase B).
+                                        let label = live_segment_label(
+                                            online_diarizer.as_ref(),
+                                            &samples,
+                                        );
+                                        acc.append(start_ms, end_ms, &samples, label);
                                     }
                                 }
                             }
@@ -673,8 +800,13 @@ fn run_drain_loop(
                         }
                     }
                     if !acc.is_empty() {
-                        let (samples, vad_segments) = acc.drain();
-                        let payload = FlushPayload { samples, vad_segments, meeting_id };
+                        let (samples, vad_segments, speaker_ids) = acc.drain();
+                        let payload = FlushPayload {
+                            samples,
+                            vad_segments,
+                            speaker_ids,
+                            meeting_id,
+                        };
                         dispatch_flush(&flush_queue, payload, &event_tx);
                     }
                     // Wait for the ASR worker to process any remaining flushes.
@@ -1077,8 +1209,12 @@ fn process_flush_with_backend(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Re-split proportionally across the VAD sub-segments.
-    let sub_segments = emit_segments_proportional(&combined_text, &payload.vad_segments);
+    // Re-split proportionally across the VAD sub-segments. Each emitted
+    // sub-Segment inherits the live speaker label of its originating VAD
+    // segment (Phase B) — the proportional re-split preserves one output
+    // Segment per input vad_segment in order, so the 1:1 label mapping holds.
+    let sub_segments =
+        emit_segments_proportional(&combined_text, &payload.vad_segments, &payload.speaker_ids);
 
     for seg in sub_segments {
         // Emit broadcast event.
@@ -1169,6 +1305,7 @@ fn finalise_on_stop(
     mut writer: MeetingWriter,
     event_tx: &broadcast::Sender<AppEvent>,
     meeting_id: MeetingId,
+    online_diarizer: Option<&Arc<OnlineDiarizer>>,
 ) {
     // End-of-stream VAD flush closes any in-progress segment.
     if let Some(vad) = vad_opt {
@@ -1176,7 +1313,10 @@ fn finalise_on_stop(
             Ok(events) => {
                 for ev in events {
                     if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
-                        acc.append(start_ms, end_ms, &samples);
+                        // Live label from the un-padded slice (Phase B); this
+                        // end-of-stream flush is a SegmentEnd site too.
+                        let label = live_segment_label(online_diarizer, &samples);
+                        acc.append(start_ms, end_ms, &samples, label);
                     }
                 }
             }
@@ -1191,8 +1331,13 @@ fn finalise_on_stop(
 
     // Flush any remaining accumulator content before finalising.
     if !acc.is_empty() {
-        let (samples, vad_segments) = acc.drain();
-        let payload = FlushPayload { samples, vad_segments, meeting_id };
+        let (samples, vad_segments, speaker_ids) = acc.drain();
+        let payload = FlushPayload {
+            samples,
+            vad_segments,
+            speaker_ids,
+            meeting_id,
+        };
         dispatch_flush(flush_queue, payload, event_tx);
     }
 
@@ -1415,7 +1560,10 @@ pub(crate) fn re_transcribe_buffer(
                 Ok(events) => {
                     for ev in events {
                         if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
-                            acc.append(start_ms, end_ms, &samples);
+                            // Offline re-transcribe is a distinct path: the
+                            // on-stop SherpaDiarizer pass owns labels here, so no
+                            // live label is assigned (Phase B).
+                            acc.append(start_ms, end_ms, &samples, None);
                         }
                     }
                 }
@@ -1427,10 +1575,11 @@ pub(crate) fn re_transcribe_buffer(
 
             // Size-triggered flush, identical threshold to the live path.
             if acc.duration_secs() >= FLUSH_MIN_SECS {
-                let (samples, vad_segments) = acc.drain();
+                let (samples, vad_segments, speaker_ids) = acc.drain();
                 transcribe_one_flush(
                     samples,
                     vad_segments,
+                    speaker_ids,
                     backend,
                     event_tx,
                     meeting_id,
@@ -1445,7 +1594,8 @@ pub(crate) fn re_transcribe_buffer(
         Ok(events) => {
             for ev in events {
                 if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
-                    acc.append(start_ms, end_ms, &samples);
+                    // Offline path: no live label (the on-stop pass owns it).
+                    acc.append(start_ms, end_ms, &samples, None);
                 }
             }
         }
@@ -1456,10 +1606,11 @@ pub(crate) fn re_transcribe_buffer(
 
     // Final flush of whatever remains in the accumulator.
     if !acc.is_empty() {
-        let (samples, vad_segments) = acc.drain();
+        let (samples, vad_segments, speaker_ids) = acc.drain();
         transcribe_one_flush(
             samples,
             vad_segments,
+            speaker_ids,
             backend,
             event_tx,
             meeting_id,
@@ -1479,6 +1630,7 @@ pub(crate) fn re_transcribe_buffer(
 fn transcribe_one_flush(
     samples: Vec<f32>,
     vad_segments: Vec<(u64, u64)>,
+    speaker_ids: Vec<Option<String>>,
     backend: &mut dyn AsrBackend,
     event_tx: &broadcast::Sender<AppEvent>,
     meeting_id: MeetingId,
@@ -1503,7 +1655,7 @@ fn transcribe_one_flush(
         .collect::<Vec<_>>()
         .join(" ");
 
-    let sub_segments = emit_segments_proportional(&combined_text, &vad_segments);
+    let sub_segments = emit_segments_proportional(&combined_text, &vad_segments, &speaker_ids);
 
     for seg in sub_segments {
         let _ = event_tx.send(AppEvent::TranscriptSegment {
@@ -1584,6 +1736,86 @@ pub(crate) async fn build_diarizer(
     Ok(diarizer)
 }
 
+/// Best-effort, local-only builder for the live [`OnlineDiarizer`] (Phase B).
+///
+/// Unlike [`build_diarizer`] (which `ensure()`s the models — an explicit
+/// operation may download), this is the LIVE path: it must NEVER download or
+/// block at record start. It resolves the embedding model purely from disk via
+/// the synchronous `Available`-check ([`ModelRegistry::list_models`] →
+/// `compute_status_sync`, a `std::fs` size-only check — the exact non-blocking,
+/// no-network precedent `init_asr_runtime` uses), wraps ONLY the embedding model
+/// (no segmentation model — VAD upstream supplies segment boundaries), and opens
+/// `OnlineDiarizer::open(emb_onnx, OnlineDiarizerConfig::default())`.
+///
+/// Returns `None` on EVERY non-happy path so a failure degrades to "no live
+/// label" without affecting recording/transcription:
+/// - embedding model not locally `Available` → `info` log, `None` (the explicit
+///   locked-constraint behaviour: no mid/at-start multi-GB download, no block);
+/// - the `.onnx` cannot be located, or `OnlineDiarizer::open` fails (corrupt
+///   model / sherpa load error) → `warn` log, `None`.
+///
+/// `list_models()` is synchronous, so this is a plain (non-async) fn; the heavy
+/// `EmbeddingExtractor::new` load inside `open` is the caller's responsibility to
+/// run off the async executor (the start path drives it on `spawn_blocking`,
+/// mirroring the on-stop diarizer build).
+pub(crate) fn build_online_diarizer(
+    model_registry: &ModelRegistry,
+) -> Option<Arc<OnlineDiarizer>> {
+    let emb_id = ModelId::from(DIARIZE_EMB_MODEL_ID);
+
+    // Local-only resolve: the embedding model must already be `Available`.
+    let local_dir = model_registry
+        .list_models()
+        .into_iter()
+        .find(|s| s.id == emb_id)
+        .and_then(|s| match s.status {
+            ModelStatusState::Available { local_dir } => Some(local_dir),
+            _ => None,
+        });
+
+    let local_dir = match local_dir {
+        Some(d) => d,
+        None => {
+            tracing::info!(
+                target: "orchestrator",
+                "live diarization: embedding model not downloaded; skipping (recording unaffected)"
+            );
+            return None;
+        }
+    };
+
+    let emb_onnx = match find_file_in_dir(std::path::Path::new(&local_dir), |name| {
+        name.ends_with(".onnx")
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                target: "orchestrator",
+                "live diarization: embedding .onnx not located ({e}); skipping"
+            );
+            return None;
+        }
+    };
+
+    match OnlineDiarizer::open(&emb_onnx, OnlineDiarizerConfig::default()) {
+        Ok(diarizer) => {
+            tracing::info!(
+                target: "orchestrator",
+                emb = %emb_onnx.display(),
+                "live online diarizer initialised"
+            );
+            Some(Arc::new(diarizer))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "orchestrator",
+                "live diarization: OnlineDiarizer::open failed ({e}); skipping"
+            );
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Proportional word allocation (Phase 2)
 // ---------------------------------------------------------------------------
@@ -1594,9 +1826,16 @@ pub(crate) async fn build_diarizer(
 /// Returns one `Segment` per VAD segment. If `text` is empty, each segment
 /// carries an empty text string (timestamps are preserved from the VAD layer).
 /// The last segment absorbs any word-count rounding remainder.
+///
+/// `speaker_ids` carries the live provisional speaker label for each VAD
+/// segment (Phase B), indexed in lockstep with `vad_segments`. The output
+/// `Segment` at index `i` inherits `speaker_ids[i]` via `.get(i)`, so a
+/// (theoretically impossible) shorter `speaker_ids` slice yields `None` for the
+/// missing tail rather than panicking on the worker thread.
 pub(crate) fn emit_segments_proportional(
     text: &str,
     vad_segments: &[(u64, u64)],
+    speaker_ids: &[Option<String>],
 ) -> Vec<Segment> {
     if vad_segments.is_empty() {
         return Vec::new();
@@ -1633,7 +1872,7 @@ pub(crate) fn emit_segments_proportional(
             start_ms: *start_ms,
             end_ms: *end_ms,
             text: seg_text,
-            speaker_id: None,
+            speaker_id: speaker_ids.get(i).cloned().flatten(),
             confidence: None,
             words: Vec::new(),
         });
@@ -1739,11 +1978,11 @@ mod tests {
 
         // Segment 1: 0 – 1000 ms (1 s).
         let seg1_samples = vec![0.5f32; ms_to_samples(1000)];
-        acc.append(0, 1000, &seg1_samples);
+        acc.append(0, 1000, &seg1_samples, None);
 
         // Segment 2: 2000 – 3000 ms (1 s). Gap = 1000 ms.
         let seg2_samples = vec![0.5f32; ms_to_samples(1000)];
-        acc.append(2000, 3000, &seg2_samples);
+        acc.append(2000, 3000, &seg2_samples, None);
 
         // Expected buffer: 3 s = 48_000 samples.
         let expected_len = ms_to_samples(3000);
@@ -1776,11 +2015,11 @@ mod tests {
         let mut acc = Accumulator::new();
 
         let seg1 = vec![0.5f32; ms_to_samples(1000)];
-        acc.append(0, 1000, &seg1);
+        acc.append(0, 1000, &seg1, None);
 
         // Segment 2 starts at 6000 ms — gap is 5000 ms, exceeds MAX_GAP_MS=3000 ms.
         let seg2 = vec![0.5f32; ms_to_samples(1000)];
-        acc.append(6000, 7000, &seg2);
+        acc.append(6000, 7000, &seg2, None);
 
         // Buffer should be: 1 s speech + 3 s capped silence + 1 s speech = 5 s.
         let expected_len = ms_to_samples(1000) + ms_to_samples(MAX_GAP_MS) + ms_to_samples(1000);
@@ -1805,7 +2044,7 @@ mod tests {
 
         let mut under = Accumulator::new();
         let s = vec![0.0f32; ms_to_samples(flush_ms.saturating_sub(500))];
-        under.append(0, flush_ms.saturating_sub(500), &s);
+        under.append(0, flush_ms.saturating_sub(500), &s, None);
         assert!(
             under.duration_secs() < FLUSH_MIN_SECS,
             "sub-threshold buffer ({} s) should NOT trigger a size flush",
@@ -1814,7 +2053,7 @@ mod tests {
 
         let mut over = Accumulator::new();
         let s = vec![0.0f32; ms_to_samples(flush_ms + 1000)];
-        over.append(0, flush_ms + 1000, &s);
+        over.append(0, flush_ms + 1000, &s, None);
         assert!(
             over.duration_secs() >= FLUSH_MIN_SECS,
             "over-threshold buffer ({} s) must trigger a size flush at {} s",
@@ -1837,7 +2076,7 @@ mod tests {
     fn accumulator_flush_triggers_on_latency() {
         let mut acc = Accumulator::new();
         let seg = vec![0.0f32; ms_to_samples(1000)]; // 1 s — below flush_min
-        acc.append(0, 1000, &seg);
+        acc.append(0, 1000, &seg, None);
 
         // Simulate elapsed time comfortably beyond the latency window.
         acc.last_vad_end_at =
@@ -1869,7 +2108,7 @@ mod tests {
         let text = "alpha beta gamma delta epsilon zeta";
         let word_count = text.split_whitespace().count(); // 6
 
-        let segments = emit_segments_proportional(text, &vad_segments);
+        let segments = emit_segments_proportional(text, &vad_segments, &[None, None, None]);
 
         assert_eq!(
             segments.len(),
@@ -1896,9 +2135,118 @@ mod tests {
     #[test]
     fn proportional_allocation_empty_text_preserves_segment_count() {
         let vad_segments = vec![(0u64, 1000u64), (1000, 2000)];
-        let segments = emit_segments_proportional("", &vad_segments);
+        let segments = emit_segments_proportional("", &vad_segments, &[None, None]);
         assert_eq!(segments.len(), 2);
         assert!(segments.iter().all(|s| s.text.is_empty()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: live speaker-label threading through the proportional re-split
+    // -----------------------------------------------------------------------
+
+    /// Each output `Segment.speaker_id` must equal the input live label at its
+    /// index, preserved positionally across the proportional TEXT re-split (the
+    /// re-split redistributes words but keeps one Segment per input vad_segment
+    /// in order).
+    #[test]
+    fn proportional_allocation_carries_live_labels_positionally() {
+        let vad_segments = vec![(0u64, 1000u64), (1000, 3000), (3000, 4000)];
+        let labels = vec![
+            Some("A".to_string()),
+            Some("B".to_string()),
+            Some("A".to_string()),
+        ];
+        let segments =
+            emit_segments_proportional("alpha beta gamma delta", &vad_segments, &labels);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(segments[1].speaker_id.as_deref(), Some("B"));
+        assert_eq!(segments[2].speaker_id.as_deref(), Some("A"));
+    }
+
+    /// Regression guard: all-None labels → all-None speaker_id (today's
+    /// behaviour, i.e. live diarization off / unwired).
+    #[test]
+    fn proportional_allocation_all_none_labels_yields_all_none() {
+        let vad_segments = vec![(0u64, 1000u64), (1000, 2000)];
+        let segments =
+            emit_segments_proportional("alpha beta", &vad_segments, &[None, None]);
+        assert_eq!(segments.len(), 2);
+        assert!(segments.iter().all(|s| s.speaker_id.is_none()));
+    }
+
+    /// A `speaker_ids` slice SHORTER than `vad_segments` must yield `None` for
+    /// the missing tail rather than panicking — exercises the `.get(i)` guard.
+    #[test]
+    fn proportional_allocation_short_labels_yields_none_tail_no_panic() {
+        let vad_segments = vec![(0u64, 1000u64), (1000, 2000), (2000, 3000)];
+        // Only one label supplied for three segments.
+        let labels = vec![Some("A".to_string())];
+        let segments = emit_segments_proportional("a b c", &vad_segments, &labels);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(segments[1].speaker_id, None);
+        assert_eq!(segments[2].speaker_id, None);
+    }
+
+    /// Mixed Some/None labels are preserved positionally.
+    #[test]
+    fn proportional_allocation_mixed_labels_preserved() {
+        let vad_segments = vec![(0u64, 1000u64), (1000, 2000), (2000, 3000)];
+        let labels = vec![Some("A".to_string()), None, Some("B".to_string())];
+        let segments = emit_segments_proportional("x y z", &vad_segments, &labels);
+        assert_eq!(segments[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(segments[1].speaker_id, None);
+        assert_eq!(segments[2].speaker_id.as_deref(), Some("B"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: Accumulator carries the speaker-label column in lockstep
+    // -----------------------------------------------------------------------
+
+    /// `append` pushes a label per segment; `drain` returns the label column in
+    /// lockstep with `vad_segments` (len equality invariant) and resets it.
+    #[test]
+    fn accumulator_carries_speaker_ids_in_lockstep_and_drains() {
+        let mut acc = Accumulator::new();
+        let s = vec![0.5f32; ms_to_samples(500)];
+        acc.append(0, 500, &s, Some("A".to_string()));
+        acc.append(500, 1000, &s, None);
+        acc.append(1000, 1500, &s, Some("B".to_string()));
+
+        assert_eq!(
+            acc.speaker_ids.len(),
+            acc.vad_segments.len(),
+            "speaker_ids must stay in lockstep with vad_segments"
+        );
+
+        let (_samples, vad_segments, speaker_ids) = acc.drain();
+        assert_eq!(vad_segments.len(), 3);
+        assert_eq!(speaker_ids.len(), vad_segments.len());
+        assert_eq!(speaker_ids[0].as_deref(), Some("A"));
+        assert_eq!(speaker_ids[1], None);
+        assert_eq!(speaker_ids[2].as_deref(), Some("B"));
+
+        // drain reset the label column.
+        assert!(acc.speaker_ids.is_empty(), "drain must reset speaker_ids");
+        assert!(acc.vad_segments.is_empty(), "drain must reset vad_segments");
+    }
+
+    /// The gap-capping path (large inter-segment gap) must not perturb the
+    /// label/segment 1:1 correspondence — the label is tied to the segment, not
+    /// to the zero-padded samples.
+    #[test]
+    fn accumulator_gap_cap_preserves_label_correspondence() {
+        let mut acc = Accumulator::new();
+        let seg = vec![0.5f32; ms_to_samples(1000)];
+        acc.append(0, 1000, &seg, Some("A".to_string()));
+        // 5 s gap → capped at MAX_GAP_MS; label still rides segment 2.
+        acc.append(6000, 7000, &seg, Some("B".to_string()));
+
+        let (_samples, vad_segments, speaker_ids) = acc.drain();
+        assert_eq!(speaker_ids.len(), vad_segments.len());
+        assert_eq!(speaker_ids[0].as_deref(), Some("A"));
+        assert_eq!(speaker_ids[1].as_deref(), Some("B"));
     }
 
     // -----------------------------------------------------------------------
@@ -1921,6 +2269,7 @@ mod tests {
             let payload = FlushPayload {
                 samples: vec![0.0f32; 100],
                 vad_segments: vec![(i as u64 * 1000, i as u64 * 1000 + 500)],
+                speaker_ids: vec![None],
                 meeting_id,
             };
             dispatch_flush(&flush_queue, payload, &event_tx);
@@ -1931,6 +2280,7 @@ mod tests {
         let newest_payload = FlushPayload {
             samples: vec![0.0f32; 100],
             vad_segments: vec![(newest_start_ms, newest_start_ms + 500)],
+            speaker_ids: vec![None],
             meeting_id,
         };
         dispatch_flush(&flush_queue, newest_payload, &event_tx);
@@ -2013,6 +2363,48 @@ mod tests {
             regions[1].excl_start_ms, 1000,
             "post-pause region must start at the pause-EXCLUDING offset (1 s), \
              not the pause-INCLUDING offset (7 s)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase B: build_online_diarizer — no-download/no-block guarantee
+    // -----------------------------------------------------------------------
+
+    /// `build_online_diarizer` must return `None` (not Err, no panic, no
+    /// network) when the embedding model is NOT `Available` in the registry —
+    /// proving the local-only/no-download start guarantee. The cache dir is an
+    /// empty tempdir, so the model is `Missing`.
+    #[test]
+    fn build_online_diarizer_returns_none_when_model_absent() {
+        use meeting_app_common::{ModelFileEntry, ModelKind, ModelManifestEntry};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
+
+        // Manifest entry for the embedding model the live path resolves, but no
+        // files are placed → status is Missing.
+        let entry = ModelManifestEntry {
+            id: ModelId::from(DIARIZE_EMB_MODEL_ID),
+            kind: ModelKind::Diarize,
+            display_name: "Embedding".into(),
+            files: vec![ModelFileEntry {
+                filename: "model.onnx".into(),
+                url: "http://example.com/model.onnx".into(),
+                size: 10,
+                sha256: "00".repeat(32),
+            }],
+            total_size_bytes: 10,
+            license: "apache-2.0".into(),
+        };
+
+        let registry = ModelRegistry::new(dir.path().to_path_buf(), vec![entry], event_tx)
+            .expect("registry");
+
+        // Must be None, and must not have downloaded anything or panicked.
+        let result = build_online_diarizer(&registry);
+        assert!(
+            result.is_none(),
+            "build_online_diarizer must return None when the embedding model is absent"
         );
     }
 

@@ -188,7 +188,7 @@ async fn backend_error_emits_error_occurred_and_pipeline_continues() {
     let stub = Box::new(FailingAsrBackend::fail_then_succeed(1, "ok after error"));
 
     let meeting_id = orch
-        .start_with_streams_and_backend(streams, stub)
+        .start_with_streams_and_backend(streams, stub, None)
         .await
         .expect("start_with_streams_and_backend");
 
@@ -287,7 +287,7 @@ async fn backend_panic_is_caught_emits_error_occurred_and_stop_succeeds() {
     let stub = Box::new(PanickingAsrBackend::panic_then_succeed(1, "ok after panic"));
 
     let meeting_id = orch
-        .start_with_streams_and_backend(streams, stub)
+        .start_with_streams_and_backend(streams, stub, None)
         .await
         .expect("start_with_streams_and_backend");
 

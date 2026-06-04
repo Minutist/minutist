@@ -82,3 +82,7 @@ required-features = ["test-source"]
 [[test]]
 name = "timeline_coherence"
 required-features = ["test-source"]
+
+[[test]]
+name = "live_diarization"
+required-features = ["test-source"]

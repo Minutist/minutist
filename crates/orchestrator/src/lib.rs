@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
+use diarizer::OnlineDiarizer;
 use meeting_app_common::{
     AppError, AppEvent, AppResult, AudioFormat, Diarizer, MeetingId, MeetingListEntry, MeetingMeta,
     ModelDescriptor, ModelId, ModelStatus, RecordingState, Segment,
@@ -256,6 +257,17 @@ impl Orchestrator {
         // `architecture/cross-cutting.md` — "GPU portability"). `resolve_gpu_layers`
         // returns the compile-time ceiling when on, `0` (force CPU) when off.
         let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+
+        // Live diarization (Phase B): build the additive `OnlineDiarizer` BEFORE
+        // spawning the runner, gated on the `diarization_enabled` setting AND the
+        // embedding model being locally `Available` (no download, no block — see
+        // `runner::build_online_diarizer`). The heavy `EmbeddingExtractor::new`
+        // load runs on `spawn_blocking` so it never stalls the async runtime,
+        // mirroring the on-stop diarizer build. Every failure mode degrades to
+        // `None` → no live label; recording/transcription proceed identically.
+        let online_diarizer =
+            self.build_live_diarizer(self.settings.current().diarization_enabled).await;
+
         let runner_handle = runner::spawn_runner(
             streams,
             writer,
@@ -263,6 +275,7 @@ impl Orchestrator {
             Arc::clone(&self.model_registry),
             meeting_id,
             n_gpu_layers,
+            online_diarizer,
         );
 
         guard.capture = Some(capture);
@@ -931,6 +944,40 @@ impl Orchestrator {
     // Private helpers
     // ------------------------------------------------------------------
 
+    /// Build the live [`OnlineDiarizer`] for a record session (Phase B),
+    /// best-effort.
+    ///
+    /// Returns `None` immediately (no `spawn_blocking`) when `enabled` is false
+    /// — the `diarization_enabled` setting gates entry, so the heavy model load
+    /// only runs when a real load is warranted. When enabled, the
+    /// local-only/no-download `runner::build_online_diarizer` resolver +
+    /// `OnlineDiarizer::open` run inside `spawn_blocking` (the `EmbeddingExtractor`
+    /// load is heavy) so the async runtime is never stalled at record start,
+    /// mirroring the on-stop diarizer build. Any failure (model absent, locate
+    /// fail, open fail, join fail) degrades to `None` → no live label; recording
+    /// proceeds identically.
+    async fn build_live_diarizer(&self, enabled: bool) -> Option<Arc<OnlineDiarizer>> {
+        if !enabled {
+            tracing::debug!(
+                target: "orchestrator",
+                "live diarization disabled (diarization_enabled = false); skipping"
+            );
+            return None;
+        }
+
+        let registry = Arc::clone(&self.model_registry);
+        match tokio::task::spawn_blocking(move || runner::build_online_diarizer(&registry)).await {
+            Ok(opt) => opt,
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    "live diarizer build join failed: {join_err}; skipping (recording unaffected)"
+                );
+                None
+            }
+        }
+    }
+
     fn emit(&self, event: AppEvent) {
         match self.event_tx.send(event) {
             Ok(n) => {
@@ -1023,6 +1070,10 @@ impl Orchestrator {
         };
 
         let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        // Phase B: build the live diarizer (gated on diarization_enabled +
+        // local model availability), exactly as the production `start()` path.
+        let online_diarizer =
+            self.build_live_diarizer(self.settings.current().diarization_enabled).await;
         let runner_handle = runner::spawn_runner(
             streams,
             writer,
@@ -1030,6 +1081,7 @@ impl Orchestrator {
             Arc::clone(&self.model_registry),
             meeting_id,
             n_gpu_layers,
+            online_diarizer,
         );
         guard.runner = Some(runner_handle);
         // No AudioCaptureManager to store (guard.capture stays None).
@@ -1053,11 +1105,17 @@ impl Orchestrator {
     /// canned `Segment`s) without needing a 1 GB model file. The pipeline
     /// wiring (VAD → Accumulator → flush dispatch → worker) runs for real.
     ///
+    /// `online_diarizer` lets a test drive the Phase-B live-labelling path with a
+    /// real `OnlineDiarizer` (env-gated positive case) or `None` (the always-on
+    /// regression guard proving transcription is unchanged when live diarization
+    /// is off).
+    ///
     /// Available only under the `test-source` feature.
     pub async fn start_with_streams_and_backend(
         &self,
         streams: audio_capture::AudioStreams,
         backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+        online_diarizer: Option<Arc<OnlineDiarizer>>,
     ) -> AppResult<MeetingId> {
         let mut guard = self.inner.lock().await;
         let (meeting_id, started_at_ms) = transition_start(&mut guard.state)?;
@@ -1088,6 +1146,7 @@ impl Orchestrator {
             Arc::clone(&self.model_registry),
             meeting_id,
             backend,
+            online_diarizer,
         );
         guard.runner = Some(runner_handle);
 

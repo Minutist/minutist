@@ -82,7 +82,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
 
                 asrRuntime = component "asr-runtime" "llama-cpp-2 (mtmd module) bound to Qwen3-ASR GGUF. Implements AsrBackend. Owns the ASR model lifecycle." "Rust crate: crates/asr-runtime"
 
-                diarizer = component "diarizer" "sherpa-onnx integration. Offline SherpaDiarizer (implements Diarizer) is the authoritative post-hoc pass on buffered audio after stop. Additive live OnlineDiarizer labels VAD segments during recording via embedding + a pure online clusterer (Phase A; not yet orchestrator-wired)." "Rust crate: crates/diarizer"
+                diarizer = component "diarizer" "sherpa-onnx integration. Offline SherpaDiarizer (implements Diarizer) is the authoritative post-hoc pass on buffered audio after stop. Additive live OnlineDiarizer labels VAD segments during recording via embedding + a pure online clusterer (orchestrator-wired in Phase B, best-effort, overwritten by the on-stop pass)." "Rust crate: crates/diarizer"
 
                 summariser = component "summariser" "llama-cpp-2 (text) for summary generation. Implements Summariser. Owns the text-LLM model lifecycle; also exposes the optional external-LLM dispatcher." "Rust crate: crates/summariser"
 
@@ -158,7 +158,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         meetingApp.core.orchestrator -> meetingApp.core.vadChunker "Feeds frames; consumes AudioChunks"
         meetingApp.core.orchestrator -> meetingApp.core.asrRuntime "Dispatches chunks via AsrBackend trait"
         meetingApp.core.orchestrator -> meetingApp.core.persistence "Streams audio + segments to disk"
-        meetingApp.core.orchestrator -> meetingApp.core.diarizer "On stop: assigns speakers via Diarizer trait"
+        meetingApp.core.orchestrator -> meetingApp.core.diarizer "On stop: assigns speakers via Diarizer trait (authoritative); during recording: live per-segment labels via OnlineDiarizer (additive)"
         meetingApp.core.orchestrator -> meetingApp.core.ipcBridge "Emits transcript / meter / state events"
 
         // Model lifecycle.

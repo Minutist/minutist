@@ -336,13 +336,15 @@ FFI-test-isolable (every method crosses into `sherpa_rs_sys`), so the centroid
 update rule and clustering logic could not be exercised model-free — recorded
 here so the reviewer sees the decision.
 
-Phase A does NOT wire into the orchestrator (that is Phase B) and adds NO entry
-to the orchestrator's allowed-deps row. No `common`-level online trait is added
-in Phase A (no second impl, no cross-crate caller yet); the existing
-`common::Diarizer` trait is offline-only and unchanged. No new crate-dependency
-edge is introduced — `sherpa-rs` is already a `diarizer` dependency, and
-`EmbeddingExtractor` / `ExtractorConfig` live in `sherpa_rs::speaker_id` within
-the same crate. Tests: the pure `OnlineClusterer` is covered model-free in
+Phase A delivered the diarizer-crate surface only; **Phase B** now wires
+`OnlineDiarizer` into the orchestrator (see the `orchestrator` "Phase B — live
+diarization wiring" note) WITHOUT adding a dependency edge or a `common`-level
+trait: the `orchestrator → diarizer` edge already exists (granted in Phase 6),
+`OnlineDiarizer` is re-exported from the `diarizer` crate, and the live path stays
+a concrete struct (no second `common` trait — the existing `common::Diarizer`
+trait is offline-only and unchanged). No new crate-dependency edge is introduced —
+`sherpa-rs` is already a `diarizer` dependency, and `EmbeddingExtractor` /
+`ExtractorConfig` live in `sherpa_rs::speaker_id` within the same crate. Tests: the pure `OnlineClusterer` is covered model-free in
 `src/online/clusterer.rs` (separation, stickiness, threshold split, centroid
 drift, lower-index tie-break, `max_speakers` force-join, dim-mismatch/degenerate
 rejection); the env-var-gated `tests/online_embedding.rs`
@@ -750,6 +752,43 @@ diarization tests: the **default-suite, model-free** `StubDiarizer` lib tests
 (`MEETING_APP_DIARIZE_SEG_PATH` + `MEETING_APP_DIARIZE_EMB_PATH`, skip-on-unset)
 that stages the two real sherpa models into the registry cache and re-diarizes a
 meeting whose audio is the S1 two-speaker fixture.
+
+**Phase B — live diarization wiring (additive).** At record start, gated on
+`diarization_enabled` AND the embedding model being locally `Available` (no
+download), the orchestrator builds an `Arc<OnlineDiarizer>` (embedding-only) via
+a local-only resolver (`runner::build_online_diarizer`, reusing
+`DIARIZE_EMB_MODEL_ID` — the SAME embedding model the on-stop `build_diarizer`
+uses, so live + offline share one model on disk). The resolver does a synchronous
+`Available`-check (`ModelRegistry::list_models` → `compute_status_sync`, a
+`std::fs` size-only check — the same non-blocking, no-network precedent
+`init_asr_runtime` uses) and NEVER calls `ensure()`; the heavy
+`EmbeddingExtractor::new` load runs inside a `spawn_blocking` so the async runtime
+is never stalled, mirroring the on-stop diarizer build. The resulting
+`Option<Arc<OnlineDiarizer>>` is threaded into the runner (`spawn_runner` →
+`run_drain_loop` → `finalise_on_stop`). `assign_segment` is called per VAD segment
+at SegmentEnd, on the runner's drain-loop thread, from the still-un-padded
+per-segment slice (the accumulator's `MAX_GAP_MS` zero-pad cap makes per-segment
+boundaries unrecoverable from the flushed buffer, so the label MUST be assigned
+here, not re-derived in the ASR worker). The label rides a parallel
+`Option<String>` column: `Accumulator.speaker_ids` → `FlushPayload.speaker_ids`
+→ `emit_segments_proportional` → `Segment.speaker_id` (indexed by the same
+enumerate `i`, defensively via `.get(i)`), so each re-split sub-Segment inherits
+its originating VAD segment's label. Best-effort and additive: setting off / model
+absent / open failure / per-segment `assign_segment` error all degrade to "no
+label" (logged) with recording and transcription unaffected — no `ensure()`, no
+download, no block, no `unwrap` on the diarizer path. The on-stop `SherpaDiarizer`
+pass remains AUTHORITATIVE: when `diarization_enabled` is true it rewrites the
+whole transcript on stop, overwriting the live labels. No dependency-table change
+(the `orchestrator → diarizer` edge already exists; `OnlineDiarizer` is re-exported
+from the `diarizer` crate). Tests: model-free default-suite unit tests cover the
+label threading through `emit_segments_proportional` (positional carry, all-None
+regression, short-slice `.get(i)` guard, mixed Some/None) and the `Accumulator`
+label column (lockstep len invariant, drain reset, gap-cap correspondence), plus
+`build_online_diarizer_returns_none_when_model_absent` (the no-download guarantee
+over an empty cache); the `live_diarization` integration test asserts the None-path
+yields all-None `speaker_id` (the "must not break transcription" regression guard),
+with an env-var-gated (`MEETING_APP_DIARIZE_EMB_PATH`) positive case asserting
+non-None live labels.
 
 ### `settings`
 **Crate:** `crates/settings`
@@ -1210,6 +1249,12 @@ left, transcript right).
   already present on `Segment` in `bindings.ts` — no regen). The chip is hidden
   entirely when `speaker_id` is `null`/absent (un-diarized). Editorial Ink:
   `--accent-tint` background, `--rule` hairline, `--stone` ink — tokens only.
+  As of Phase B (live diarization wiring) `speaker_id` can now be populated
+  during recording by the additive `OnlineDiarizer` (see the `orchestrator`
+  "Phase B — live diarization wiring" note), so the chip renders for live
+  segments too — no UI change is needed for that (live-label UI consumption is
+  Phase C). The on-stop `SherpaDiarizer` pass remains authoritative and rewrites
+  the labels on stop.
 - **`diarization_complete` re-read (`ui/src/state/meetings.ts`).** The meetings
   store gains a `handleEvent` (dispatched alongside the recording / models /
   summary stores from `useAppEventBridge`) that, on

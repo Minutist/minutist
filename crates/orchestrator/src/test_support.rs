@@ -90,6 +90,7 @@ impl FlushBackpressureHarness {
         let payload = FlushPayload {
             samples: vec![0.0f32; 480],
             vad_segments: vec![(start_ms, start_ms + 500)],
+            speaker_ids: vec![None],
             meeting_id: self.meeting_id,
         };
         dispatch_flush_pub(&self.flush_queue, payload, &self.event_tx);

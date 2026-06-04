@@ -36,7 +36,7 @@ that.
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
 | Diarization (offline) | One-shot `spawn_blocking` task triggered on stop or user action — the authoritative pass. |
-| Diarization (live, Phase A) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from `spawn_blocking` (like the offline pass); see the live-vs-offline note below. Not yet wired into the orchestrator (Phase B). |
+| Diarization (live, Phase B) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from the runner's drain-loop thread (`spawn_blocking`) at SegmentEnd — gated on the `diarization_enabled` setting AND the embedding model being locally `Available` (no download, no block at start; the heavy `EmbeddingExtractor` load is built on `spawn_blocking` before the runner spawns). Best-effort/additive: any failure degrades to "no label" without affecting recording/transcription. See the live-vs-offline note below. |
 | Summarisation | One-shot `spawn_blocking` task triggered by user action. |
 | Persistence writes | `spawn_blocking` per write op for now; revisit if it shows up in profiling. |
 | Tauri command handlers | Tokio worker threads. Short-lived, dispatch to the above. |
@@ -44,7 +44,7 @@ that.
 Bounded channels everywhere. Unbounded queues are not allowed — they
 hide back-pressure that the live pipeline needs to surface.
 
-**Live vs. offline diarization (Phase A).** There are two independent
+**Live vs. offline diarization (Phase B).** There are two independent
 diarization paths. The offline `SherpaDiarizer` / `common::Diarizer`
 on-stop (and re-diarize) pass is the SOURCE OF TRUTH for the finished
 transcript. The live `OnlineDiarizer` (in `crates/diarizer`,
@@ -58,9 +58,21 @@ driven from `spawn_blocking`; its public `&self` methods
 `compute_speaker_embedding` is `&mut self` (the same `&self`-trait-over-
 `&mut`-engine pattern the offline `Mutex<Diarize>` uses). The clustering
 itself is a pure, FFI-free running-mean-centroid clusterer; only the
-embedding extraction crosses into sherpa. Phase A is the diarizer crate
-only — no orchestrator/UI wiring (Phase B) and no `common`-level online
-trait yet.
+embedding extraction crosses into sherpa.
+
+As of **Phase B** the live path is wired into the orchestrator (see
+`components.md` — `orchestrator` "Phase B — live diarization wiring").
+The label is assigned per VAD segment at SegmentEnd on the runner's
+drain-loop thread and rides a parallel `speaker_ids` column
+(`Accumulator` → `FlushPayload` → `emit_segments_proportional` →
+`Segment.speaker_id`). Consequently live labels are now emitted on
+`AppEvent::TranscriptSegment` and persisted via `WriterCommand::WriteSegment`
+(into `transcript.json`) DURING recording. The on-stop pass remains
+authoritative: when `diarization_enabled` is true, the whole-transcript
+rewrite on stop overwrites the live labels with the offline result. The
+wiring adds no dependency edge (the `orchestrator → diarizer` edge pre-exists)
+and no `common`-level online trait (the live path is a concrete struct;
+the existing `common::Diarizer` trait stays offline-only).
 
 **System/call audio capture + echo (AEC is future work).** When
 `settings.capture_system_audio` is on, the render-endpoint loopback is captured

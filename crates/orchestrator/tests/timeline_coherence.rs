@@ -118,7 +118,7 @@ async fn paused_meeting_retranscribe_matches_live_pause_excluding_timeline() {
 
     let stub = Box::new(StubAsrBackend::new("coherence stub text"));
     let meeting_id = orch
-        .start_with_streams_and_backend(streams, stub)
+        .start_with_streams_and_backend(streams, stub, None)
         .await
         .expect("start_with_streams_and_backend");
 
@@ -348,7 +348,7 @@ async fn stop_while_paused_flushes_last_utterance() {
 
     let stub = Box::new(StubAsrBackend::new("paused-stop utterance"));
     let meeting_id = orch
-        .start_with_streams_and_backend(streams, stub)
+        .start_with_streams_and_backend(streams, stub, None)
         .await
         .expect("start");
 

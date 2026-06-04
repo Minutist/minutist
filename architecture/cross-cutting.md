@@ -292,7 +292,16 @@ Owned by `model-registry`. The contract:
   each as a per-model `ModelDownloadCard` (progress / retry / ready). Previously
   only the ASR model was provisioned and the LLM lazy-downloaded silently on the
   first summarise (multi-GB, no progress — read as a broken button). Downloads
-  remain skippable and continue in the background if the user proceeds.
+  remain skippable and continue in the background if the user proceeds. If the
+  LLM was skipped, the Summarise action's in-progress UI distinguishes the
+  one-time **model-download phase** (with %) from actual summarisation, so the
+  multi-GB wait is not mislabelled "Summarising…".
+- **Progress UX.** `ensureModel` enters the downloading state optimistically on
+  click (seeded at the model's known partial fraction) because resuming a large
+  partial spends seconds re-hashing before the first progress event — a lingering
+  button reads as a no-op. Relatedly, `ensure`'s validity check skips hashing an
+  absent/wrong-size file (size pre-check) rather than reading a multi-GB partial
+  in full only to fail.
 - Loaded models are owned by the consuming crate (`asr-runtime`,
   `summariser`, `diarizer`). The registry hands out paths, not loaded
   models — we don't want a model cache that two crates can hold

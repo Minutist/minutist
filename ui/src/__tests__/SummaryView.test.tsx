@@ -23,9 +23,16 @@ vi.mock("../ipc/summary", () => ({
 
 import { SummaryView, renderSummaryMarkdown } from "../shell/SummaryView";
 import { useSummaryStore } from "../state/summary";
+import { useModelsStore } from "../state/models";
 import { summariseMeeting, getSummary, saveSummary } from "../ipc/summary";
+import type { ModelStatus } from "../ipc/bindings";
 
 const MEETING = "meeting-0001";
+const LLM_ID = "gemma-4-e4b-it-q4_k_m";
+
+function llmModel(status: ModelStatus["status"]): ModelStatus {
+  return { id: LLM_ID, kind: "llm", display_name: "Gemma 4 E4B", status };
+}
 
 function resetStore() {
   act(() => {
@@ -34,6 +41,12 @@ function resetStore() {
       summarising: false,
       meetingId: null,
       lastError: null,
+    });
+    useModelsStore.setState({
+      models: [],
+      isAsrModelReady: true,
+      downloadInProgress: {},
+      downloadErrors: {},
     });
   });
 }
@@ -127,5 +140,49 @@ describe("SummaryView (FR-30)", () => {
     await waitFor(() =>
       expect(saveSummary).toHaveBeenCalledWith(MEETING, "revised summary"),
     );
+  });
+
+  it("shows the model-download phase (not 'Summarising') while the LLM is fetched", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    act(() => {
+      useSummaryStore.setState({ summarising: true, meetingId: MEETING });
+      useModelsStore.setState({
+        models: [
+          llmModel({ state: "missing", bytes_present: 0, bytes_total: 5_000_000 }),
+        ],
+        downloadInProgress: {
+          [LLM_ID]: { bytes_done: 2_500_000, bytes_total: 5_000_000 },
+        },
+      });
+    });
+
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+
+    expect(
+      screen.getByText(/Downloading the summarisation model/i),
+    ).toHaveTextContent("50%");
+    expect(
+      screen.getByRole("button", { name: "Downloading model…" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Generating summary/i)).not.toBeInTheDocument();
+  });
+
+  it("shows 'Summarising' once the LLM is available", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    act(() => {
+      useSummaryStore.setState({ summarising: true, meetingId: MEETING });
+      useModelsStore.setState({
+        models: [llmModel({ state: "available", local_dir: "/models/llm" })],
+      });
+    });
+
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+
+    expect(screen.getByText(/Generating summary/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Summarising…" }),
+    ).toBeInTheDocument();
   });
 });

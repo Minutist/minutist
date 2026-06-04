@@ -198,6 +198,14 @@ impl ModelRegistry {
     async fn all_files_valid(&self, entry: &ModelManifestEntry, model_dir: &Path) -> bool {
         for file in &entry.files {
             let path = model_dir.join(&file.filename);
+            // Cheap pre-check: an absent or wrong-size file is definitely not
+            // valid, so skip hashing it. This avoids reading a multi-GB *partial*
+            // download in full just to fail the hash — the slow part of the
+            // delay between clicking Download and the resume actually starting.
+            match tokio::fs::metadata(&path).await {
+                Ok(m) if m.len() == file.size => {}
+                _ => return false,
+            }
             match verify_file_hash(&path, &file.sha256).await {
                 Ok(true) => {}
                 _ => return false,

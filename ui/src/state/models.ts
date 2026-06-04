@@ -66,18 +66,38 @@ export const useModelsStore = create<ModelsStore>((set, get) => ({
   },
 
   ensureModel: async (id: string) => {
-    // Clear any prior failure for this id before the new attempt.
+    // Optimistically enter the downloading state IMMEDIATELY, seeded at the
+    // model's known partial fraction. The backend can spend several seconds
+    // re-hashing an existing partial file before the first real progress event
+    // fires; without this the Download button lingers and a click reads as
+    // "nothing happened". Real progress events overwrite this seed.
     set((s) => {
-      if (!(id in s.downloadErrors)) return {};
-      const next = { ...s.downloadErrors };
-      delete next[id];
-      return { downloadErrors: next };
+      const errs = { ...s.downloadErrors };
+      delete errs[id];
+      const st = s.models.find((m) => m.id === id)?.status;
+      const seed =
+        st?.state === "missing"
+          ? { bytes_done: st.bytes_present, bytes_total: st.bytes_total }
+          : st?.state === "downloading"
+            ? { bytes_done: st.bytes_done, bytes_total: st.bytes_total }
+            : { bytes_done: 0, bytes_total: 0 };
+      return {
+        downloadErrors: errs,
+        downloadInProgress: { ...s.downloadInProgress, [id]: seed },
+      };
     });
     try {
       const result = await commands.ensureModel(id);
       unwrap(result);
       // Refresh to pick up the newly available model.
       await get().refreshModels();
+      // Clear the optimistic entry — the terminal progress event usually does
+      // this already; backstop for the no-event / already-present fast paths.
+      set((s) => {
+        const next = { ...s.downloadInProgress };
+        delete next[id];
+        return { downloadInProgress: next };
+      });
     } catch (err) {
       // `ensure_model` returns the failure to this caller and does NOT emit a
       // separate error event, so the rejection must be surfaced here — a

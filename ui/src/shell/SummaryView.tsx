@@ -14,6 +14,7 @@
 import { useEffect, useMemo, useState } from "react";
 import MarkdownIt from "markdown-it";
 import { useSummaryStore } from "../state/summary";
+import { useModelsStore } from "../state/models";
 import type { MeetingId } from "../ipc/bindings";
 import "./SummaryView.css";
 
@@ -38,6 +39,25 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
   const read = useSummaryStore((s) => s.read);
   const summarise = useSummaryStore((s) => s.summarise);
   const save = useSummaryStore((s) => s.save);
+
+  // Summarisation needs the LLM; on first use the orchestrator downloads it
+  // (multi-GB) before any text is generated. Surface THAT phase distinctly so a
+  // long wait does not masquerade as "Summarising…" (which reads as broken).
+  const models = useModelsStore((s) => s.models);
+  const downloadInProgress = useModelsStore((s) => s.downloadInProgress);
+  const llm = models.find((m) => m.kind === "llm");
+  const llmReady = llm?.status.state === "available";
+  // Only claim the download phase with positive evidence: the LLM is known and
+  // not yet available. If the model list isn't loaded (llm undefined), fall back
+  // to the plain "Summarising…" state rather than mislabelling.
+  const downloadingModel = summarising && llm !== undefined && !llmReady;
+  let downloadPct: number | null = null;
+  const llmProgress = llm ? downloadInProgress[llm.id] : undefined;
+  if (llmProgress && llmProgress.bytes_total > 0) {
+    downloadPct = Math.round((100 * llmProgress.bytes_done) / llmProgress.bytes_total);
+  } else if (llm?.status.state === "downloading" && llm.status.bytes_total > 0) {
+    downloadPct = Math.round((100 * llm.status.bytes_done) / llm.status.bytes_total);
+  }
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -99,7 +119,9 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
                 disabled={summarising}
               >
                 {summarising
-                  ? "Summarising…"
+                  ? downloadingModel
+                    ? "Downloading model…"
+                    : "Summarising…"
                   : hasSummary
                     ? "Re-summarise"
                     : "Summarise"}
@@ -128,7 +150,11 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
       {summarising && !editing && (
         <p className="summary-view__status" role="status">
           <span className="summary-view__spinner" aria-hidden="true" />
-          Generating summary from the transcript and your notes…
+          {downloadingModel
+            ? `Downloading the summarisation model (one-time, ~5 GB)${
+                downloadPct !== null ? ` — ${downloadPct}%` : "…"
+              }`
+            : "Generating summary from the transcript and your notes…"}
         </p>
       )}
 

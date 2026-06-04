@@ -198,9 +198,12 @@ describe("onboarding step progression (Phase 7)", () => {
     expect(screen.getByText("Welcome to meeting-app")).toBeInTheDocument();
     expect(useOnboardingStore.getState().step).toBe("welcome");
 
-    // → model.
+    // → model. Both the speech and summarisation models are offered here
+    // (listModels is mocked empty, so the cards show their fallback names).
     act(() => fireEvent.click(screen.getByRole("button", { name: "Continue" })));
+    expect(screen.getByText("Models")).toBeInTheDocument();
     expect(screen.getByText("Speech model")).toBeInTheDocument();
+    expect(screen.getByText("Summarisation model")).toBeInTheDocument();
     expect(useOnboardingStore.getState().step).toBe("model");
 
     // → settings (final step: primary becomes Finish).

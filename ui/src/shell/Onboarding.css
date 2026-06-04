@@ -199,3 +199,11 @@
   cursor: not-allowed;
   opacity: 0.45;
 }
+
+/* Model step — stack the per-model download cards with breathing room. */
+.onboarding__models {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}

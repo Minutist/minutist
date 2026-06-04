@@ -82,7 +82,7 @@ describe("ModelDownloadStatus", () => {
     render(<ModelDownloadStatus />);
 
     expect(
-      screen.getByRole("button", { name: "Download Model" }),
+      screen.getByRole("button", { name: "Download" }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
@@ -102,7 +102,7 @@ describe("ModelDownloadStatus", () => {
 
     expect(screen.getByRole("progressbar")).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Download Model" }),
+      screen.queryByRole("button", { name: "Download" }),
     ).not.toBeInTheDocument();
   });
 

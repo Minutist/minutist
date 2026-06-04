@@ -287,6 +287,12 @@ Owned by `model-registry`. The contract:
   `qwen3-asr-0.6b-q8_0`).
 - `model-registry::ensure(model_id)` resolves to a local path; downloads
   if absent; verifies hash.
+- **First-run provisioning.** The onboarding wizard's model step offers BOTH
+  the ASR model and the summarisation LLM (`gemma-4-e4b-it-q4_k_m`) up front,
+  each as a per-model `ModelDownloadCard` (progress / retry / ready). Previously
+  only the ASR model was provisioned and the LLM lazy-downloaded silently on the
+  first summarise (multi-GB, no progress — read as a broken button). Downloads
+  remain skippable and continue in the background if the user proceeds.
 - Loaded models are owned by the consuming crate (`asr-runtime`,
   `summariser`, `diarizer`). The registry hands out paths, not loaded
   models — we don't want a model cache that two crates can hold

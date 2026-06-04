@@ -303,6 +303,20 @@
   color: var(--ink);
 }
 
+.model-download-status__size {
+  font-family: var(--font-text);
+  font-weight: 400;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+
+.model-download-status__ready {
+  font-family: var(--font-text);
+  font-weight: 400;
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
 .model-download-status__error {
   margin: 0;
   font-size: 0.8rem;

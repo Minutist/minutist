@@ -20,12 +20,15 @@
  * (the same path `diarization-settings` uses). This view never adds a Tauri
  * command nor hand-rolls a raw `invoke` (rule A9).
  */
-import { useModelsStore } from "../state/models";
 import { useRecordingStore } from "../state/recording";
 import { useOnboardingStore } from "../state/onboarding";
 import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readTheme } from "../state/onboarding-settings";
-import { ModelDownloadStatus } from "./ModelDownloadStatus";
+import {
+  ModelDownloadCard,
+  ASR_MODEL_ID,
+  LLM_MODEL_ID,
+} from "./ModelDownloadStatus";
 import type { Theme } from "../ipc/bindings";
 import "./Onboarding.css";
 
@@ -53,22 +56,22 @@ function WelcomeStep() {
 }
 
 function ModelStep() {
-  const isAsrModelReady = useModelsStore((s) => s.isAsrModelReady);
-
   return (
     <div className="onboarding__body">
-      <h1 className="onboarding__title">Speech model</h1>
+      <h1 className="onboarding__title">Models</h1>
       <p className="onboarding__lede">
-        Transcription runs on a local model. Download it now for the best first
-        experience, or skip and fetch it later from the main window.
+        Two local models do the work: speech recognition for the transcript, and
+        a language model for summaries. Download them now for the best first
+        experience, or skip and fetch them later from the main window.
       </p>
-      {/* Reuse the existing download surface — self-hides once ready. */}
-      <ModelDownloadStatus />
-      {isAsrModelReady && (
-        <p className="onboarding__prose onboarding__prose--ready">
-          The speech model is ready.
-        </p>
-      )}
+      {/* Per-model cards — each self-tracks progress / ready / retry. */}
+      <div className="onboarding__models">
+        <ModelDownloadCard modelId={ASR_MODEL_ID} fallbackName="Speech model" />
+        <ModelDownloadCard
+          modelId={LLM_MODEL_ID}
+          fallbackName="Summarisation model"
+        />
+      </div>
     </div>
   );
 }

@@ -61,6 +61,12 @@ const DEV_MODELS: ModelStatus[] = [
     display_name: "Qwen3-ASR 0.6B (Q8_0)",
     status: { state: "available", local_dir: "/dev/models/asr/qwen3-asr" },
   },
+  {
+    id: "gemma-4-e4b-it-q4_k_m",
+    kind: "llm",
+    display_name: "Gemma 4 E4B Instruct (Q4_K_M)",
+    status: { state: "available", local_dir: "/dev/models/llm/gemma-4-e4b" },
+  },
 ];
 
 const DEV_SETTINGS: Settings = {

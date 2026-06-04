@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { useCrossRefStore } from "../state/cross-ref";
 import { useActiveTranscript } from "../state/active-transcript";
 import { writeSegmentDrag } from "../editor/transcript-dnd";
+import { speakerColorIndex } from "./speaker-color";
 import type { Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
 
@@ -115,15 +116,29 @@ export function TranscriptPane() {
                 </span>
                 <span className="transcript-pane__text">
                   {/*
-                    Phase 6: a quiet "Speaker {id}" chip when diarization has
+                    Phase 6/C: a quiet "Speaker {id}" chip when diarization has
                     assigned this segment a speaker. Hidden entirely when
                     `speaker_id` is null/undefined (un-diarized). The id is the
                     diarizer's first-seen label (A / B / …); we surface it
-                    verbatim. Tokens only (oxblood/stone) — no hard-coded
-                    colours.
+                    verbatim. Phase C adds a per-speaker colour dot, with the
+                    palette slot resolved by the pure `speakerColorIndex` mapper
+                    and passed in via the `--dot-color` custom property — tokens
+                    only, no hard-coded colour in TSX.
                   */}
                   {seg.speaker_id != null && (
-                    <span className="transcript-pane__speaker">
+                    <span
+                      className="transcript-pane__speaker"
+                      style={{
+                        ["--dot-color" as string]: `var(--speaker-${speakerColorIndex(
+                          seg.speaker_id,
+                        )})`,
+                      }}
+                      aria-label={`Speaker ${seg.speaker_id}`}
+                    >
+                      <span
+                        className="transcript-pane__speaker-dot"
+                        aria-hidden="true"
+                      />
                       Speaker {seg.speaker_id}
                     </span>
                   )}

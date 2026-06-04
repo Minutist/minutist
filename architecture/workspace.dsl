@@ -59,7 +59,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
                 tags "Container" "Frontend"
 
                 editor       = component "Notes editor" "Tiptap WYSIWYG editor with markdown shortcuts. Owns paragraph-anchor timestamps." "Tiptap / @tiptap/react"
-                transcriptUi = component "Transcript pane" "Live-appending transcript view with optional speaker tags. Read-only; emits hover/click cross-reference events." "React"
+                transcriptUi = component "Transcript pane" "Live-appending transcript view. Per-segment speaker chip with a live colour dot (deterministic speaker_id -> palette slot) when diarization labels are present. Read-only; emits hover/click cross-reference events." "React"
                 meetingShell = component "Meeting shell" "Window chrome, start/stop/pause controls, audio meter, meeting-list view." "React"
                 ipcClient    = component "IPC client" "Typed wrapper around Tauri invoke + event APIs. Generated from Rust types via tauri-specta." "TypeScript / tauri-specta"
                 uiState      = component "UI state store" "Zustand store. Holds derived UI state; transient only, no persistence." "Zustand"

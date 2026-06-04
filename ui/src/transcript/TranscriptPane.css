@@ -94,18 +94,43 @@
  * Editorial Ink language (tokens only, no hard-coded colour).
  */
 .transcript-pane__speaker {
-  display: inline-block;
+  /* Phase C: flex row so the per-speaker dot and label stay vertically
+     centred. The chip itself keeps its neutral tint; the dot carries the
+     per-speaker colour. */
+  display: inline-flex;
+  align-items: center;
   margin-right: 0.5rem;
   padding: 0.05rem 0.4rem;
   border-radius: var(--radius);
   background: var(--accent-tint);
   border: 1px solid var(--rule);
-  color: var(--stone);
+  color: var(--ink-soft); /* AA contrast on the accent tint (was --stone) */
   font-size: 0.7rem;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.02em;
   vertical-align: baseline;
   white-space: nowrap;
+}
+
+/*
+ * Phase C per-speaker colour dot: a small filled disc preceding the label.
+ * The colour comes from the chip's inline `--dot-color` custom property
+ * (resolved to a --speaker-N palette token); if missing it falls back to the
+ * neutral --stone. The hairline border (mixed toward --ink) gives even the
+ * lightest hues a defined edge against the sheet. The dot is decorative —
+ * `aria-hidden` in markup — so the visible letter label carries the meaning.
+ */
+.transcript-pane__speaker-dot {
+  display: inline-block;
+  width: 0.5rem; /* ~8px disc */
+  height: 0.5rem;
+  margin-right: 0.35rem;
+  border-radius: 50%;
+  background: var(--dot-color, var(--stone)); /* per-speaker; stone fallback */
+  /* Hairline edge so the lightest hues still separate from the sheet. */
+  border: 1px solid color-mix(in srgb, var(--dot-color, var(--stone)) 55%, var(--ink));
+  vertical-align: baseline;
+  flex: none;
 }
 
 /* Subtle emphasis on the most-recent (last) segment. */

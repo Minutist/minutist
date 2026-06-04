@@ -74,6 +74,12 @@ import {
   readDiarizationEnabled,
   withDiarizationEnabled,
 } from "../state/diarization-settings";
+import {
+  speakerColorIndex,
+  SPEAKER_PALETTE_SIZE,
+} from "../transcript/speaker-color";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Segment, Settings } from "../ipc/bindings";
 import type { MeetingState } from "../state/meetings";
 import type { AppEvent } from "../ipc/app-event";
@@ -115,6 +121,48 @@ function resetStores() {
     useCrossRefStore.setState({ highlightedRange: null, scrollRequest: null });
   });
 }
+
+// ---------------------------------------------------------------------------
+// 0. speakerColorIndex pure mapping (Phase C)
+// ---------------------------------------------------------------------------
+
+describe("speakerColorIndex (Phase C)", () => {
+  it("maps single-letter labels by alpha ordinal: A->1, B->2, H->8", () => {
+    expect(speakerColorIndex("A")).toBe(1);
+    expect(speakerColorIndex("B")).toBe(2);
+    expect(speakerColorIndex("H")).toBe(8);
+  });
+
+  it("cycles past the palette size: I->1, J->2, and I matches A", () => {
+    expect(speakerColorIndex("I")).toBe(1); // 9th label wraps
+    expect(speakerColorIndex("J")).toBe(2);
+    expect(speakerColorIndex("I")).toBe(speakerColorIndex("A"));
+  });
+
+  it("is stable across repeated calls (documents the pure-fn contract)", () => {
+    expect(speakerColorIndex("C")).toBe(speakerColorIndex("C"));
+  });
+
+  it("falls back to a deterministic, in-range slot for non-alpha ids", () => {
+    expect(speakerColorIndex("spk_42")).toBe(speakerColorIndex("spk_42"));
+    const slot = speakerColorIndex("spk_42");
+    expect(slot).toBeGreaterThanOrEqual(1);
+    expect(slot).toBeLessThanOrEqual(SPEAKER_PALETTE_SIZE);
+  });
+
+  it("keeps SPEAKER_PALETTE_SIZE in sync with the --speaker-N tokens in BOTH themes", () => {
+    // vitest runs with cwd == the `ui` package root.
+    const themePath = resolve(process.cwd(), "src/styles/theme.css");
+    const css = readFileSync(themePath, "utf8");
+    const darkAt = css.indexOf('[data-theme="dark"]');
+    expect(darkAt).toBeGreaterThan(0); // both blocks must exist
+    const count = (s: string) => (s.match(/--speaker-\d+\s*:/g) ?? []).length;
+    // The mapper indexes --speaker-1..N; the light :root AND the dark override
+    // must each cover every slot, else a speaker has no colour in one theme.
+    expect(count(css.slice(0, darkAt))).toBe(SPEAKER_PALETTE_SIZE);
+    expect(count(css.slice(darkAt))).toBe(SPEAKER_PALETTE_SIZE);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // 1. Speaker chip rendering
@@ -160,6 +208,90 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     expect(screen.queryByText("Speaker A")).not.toBeInTheDocument();
     // Exactly one chip across two rows.
     expect(screen.getAllByText(/^Speaker /)).toHaveLength(1);
+  });
+
+  // --- Phase C: per-speaker colour dot ---------------------------------
+
+  it("renders a colour dot resolving to var(--speaker-1) for speaker A", () => {
+    act(() => {
+      useRecordingStore.setState({ transcript: [makeSegment(0, "hi", "A")] });
+    });
+    render(<TranscriptPane />);
+    const chip = screen.getByLabelText("Speaker A");
+    const dot = chip.querySelector(".transcript-pane__speaker-dot");
+    expect(dot).not.toBeNull();
+    expect(chip.style.getPropertyValue("--dot-color")).toBe(
+      "var(--speaker-1)",
+    );
+  });
+
+  it("keeps the same dot colour for id 'B' across the live -> on-stop relabel", () => {
+    // LIVE store path.
+    act(() => {
+      useRecordingStore.setState({ transcript: [makeSegment(0, "live", "B")] });
+    });
+    const live = render(<TranscriptPane />);
+    expect(
+      live.getByLabelText("Speaker B").style.getPropertyValue("--dot-color"),
+    ).toBe("var(--speaker-2)");
+    live.unmount();
+
+    // On-stop / saved-meeting path: same id "B" routed through the meetings
+    // store with a meeting open and recording idle (the saved-meeting branch).
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" }, transcript: [] });
+      useMeetingsStore.setState({
+        openMeetingId: "m-1",
+        openMeetingState: {
+          transcript: [makeSegment(0, "saved", "B")],
+        } as unknown as MeetingState,
+      });
+    });
+    const saved = render(<TranscriptPane />);
+    expect(
+      saved.getByLabelText("Speaker B").style.getPropertyValue("--dot-color"),
+    ).toBe("var(--speaker-2)");
+  });
+
+  it("renders no dot (and no chip) when speaker_id is null/absent", () => {
+    act(() => {
+      useRecordingStore.setState({
+        transcript: [makeSegment(0, "x", null), makeSegment(5_000, "y")],
+      });
+    });
+    const { container } = render(<TranscriptPane />);
+    expect(
+      container.querySelectorAll(".transcript-pane__speaker-dot"),
+    ).toHaveLength(0);
+    expect(screen.queryByText(/^Speaker /)).not.toBeInTheDocument();
+  });
+
+  it("renders exactly one dot for a mixed transcript, coloured var(--speaker-1)", () => {
+    act(() => {
+      useRecordingStore.setState({
+        transcript: [
+          makeSegment(0, "tagged", "A"),
+          makeSegment(5_000, "untagged", null),
+        ],
+      });
+    });
+    const { container } = render(<TranscriptPane />);
+    expect(
+      container.querySelectorAll(".transcript-pane__speaker-dot"),
+    ).toHaveLength(1);
+    expect(
+      screen.getByLabelText("Speaker A").style.getPropertyValue("--dot-color"),
+    ).toBe("var(--speaker-1)");
+  });
+
+  it("exposes the chip via aria-label and marks the dot aria-hidden", () => {
+    act(() => {
+      useRecordingStore.setState({ transcript: [makeSegment(0, "hi", "A")] });
+    });
+    render(<TranscriptPane />);
+    const chip = screen.getByLabelText("Speaker A");
+    const dot = chip.querySelector(".transcript-pane__speaker-dot");
+    expect(dot?.getAttribute("aria-hidden")).toBe("true");
   });
 });
 

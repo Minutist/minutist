@@ -32,6 +32,22 @@
   --accent-soft: #9e4a43; /* hover */
   --accent-tint: rgba(122, 46, 46, 0.14); /* ::selection wash */
 
+  /* --- Speaker palette (live diarization, Phase C) ---------------------- */
+  /* Muted ink/earth tones, NOT saturated primaries. Each reads on
+     --sheet-quiet as a small filled disc + carries a hairline border.
+     Index 1 == --accent so a single-speaker meeting stays on-brand.
+     Cycle by index for speakers beyond 8 (see mapping). The count of these
+     --speaker-N vars MUST equal SPEAKER_PALETTE_SIZE in
+     transcript/speaker-color.ts — a unit test asserts the two agree. */
+  --speaker-1: #7a2e2e; /* oxblood   (== --accent) */
+  --speaker-2: #3f5a5a; /* teal-slate */
+  --speaker-3: #8a6d2f; /* ochre */
+  --speaker-4: #454a73; /* indigo-slate */
+  --speaker-5: #5c5f33; /* olive */
+  --speaker-6: #6a3f5c; /* plum */
+  --speaker-7: #8a4a32; /* sienna */
+  --speaker-8: #4a5a66; /* stone-blue */
+
   /* --- Rules / dividers ------------------------------------------------- */
   --rule: #e4dccd; /* warm hairline dividers */
   --rule-strong: #d8cdb8;
@@ -76,4 +92,17 @@
   --rule: #322d24;
   --rule-strong: #423b2f;
   --shadow-sheet: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.4);
+
+  /* --- Speaker palette (dark parity) ------------------------------------ */
+  /* Lighter tunings of the light palette, matched to the dark transcript
+     background (#1b1813). Index 1 ~matches dark --accent (#c06a5f). Kept in
+     lockstep with the :root values exactly as every other token is. */
+  --speaker-1: #c87f73; /* oxblood   (~matches dark --accent #c06a5f, slightly lifted) */
+  --speaker-2: #7fa6a3; /* teal-slate */
+  --speaker-3: #c6a35c; /* ochre */
+  --speaker-4: #8e96c4; /* indigo-slate */
+  --speaker-5: #a3a766; /* olive */
+  --speaker-6: #b483a0; /* plum */
+  --speaker-7: #cf8e73; /* sienna */
+  --speaker-8: #8ba3b3; /* stone-blue */
 }

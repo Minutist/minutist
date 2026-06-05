@@ -28,12 +28,18 @@ use meeting_app_common::AppResult;
 
 use crate::Error;
 
-/// Default cosine-similarity threshold (0.5). Numerically coincides with
-/// sherpa's `DEFAULT_SIMILARITY_THRESHOLD`. NOTE: this is NOT the same quantity
-/// as the offline `DiarizerConfig::cluster_threshold`, which is an agglomerative
-/// *distance* (smaller => more speakers); this is a *similarity* (higher => more
-/// speakers). Same number, opposite orientation — don't read one as the other.
-const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.5;
+/// Default cosine-similarity threshold (0.25), chosen from a sweep against the
+/// zh-en embedding model on real + synthetic audio (2026-06-05): it is the
+/// LOWEST threshold that still keeps two genuinely distinct speakers apart
+/// (below it they merge), which maximises single-speaker merging — at 0.25 a
+/// real single-speaker recording resolves to 1, two distinct speakers to 2, a
+/// single-speaker control to 1. The old 0.5 badly over-split (a single speaker
+/// became 6 live labels). NOTE: this is a *similarity* (higher => more
+/// speakers), the OPPOSITE orientation to the offline
+/// `DiarizerConfig::cluster_threshold` (a *distance*). The greedy online path
+/// has little margin here; live labels are provisional and the authoritative
+/// on-stop `SherpaDiarizer` pass corrects them.
+const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.25;
 
 /// Configuration for the online sticky-label clusterer.
 #[derive(Debug, Clone)]

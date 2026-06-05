@@ -58,7 +58,13 @@ driven from `spawn_blocking`; its public `&self` methods
 `compute_speaker_embedding` is `&mut self` (the same `&self`-trait-over-
 `&mut`-engine pattern the offline `Mutex<Diarize>` uses). The clustering
 itself is a pure, FFI-free running-mean-centroid clusterer; only the
-embedding extraction crosses into sherpa.
+embedding extraction crosses into sherpa. Its cosine-SIMILARITY threshold
+(`OnlineClustererConfig::default` = 0.25) is the OPPOSITE orientation to the
+offline distance `cluster_threshold` (0.75) and was tuned by a separate sweep
+(2026-06-05) on the same real recording + fixtures: 0.25 is the lowest value
+that still separates two distinct speakers, maximising single-speaker merging.
+The greedy online path has little margin, so live labels stay provisional — the
+on-stop pass is the safety net.
 
 As of **Phase B** the live path is wired into the orchestrator (see
 `components.md` — `orchestrator` "Phase B — live diarization wiring").

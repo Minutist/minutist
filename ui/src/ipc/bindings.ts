@@ -538,7 +538,14 @@ export type ModelId = string
  * "Filesystem layout").
  */
 export type ModelKind = "asr" | "llm" | "diarize"
-export type ModelStatus = { id: ModelId; kind: ModelKind; display_name: string; status: ModelStatusState }
+export type ModelStatus = { id: ModelId; kind: ModelKind; display_name: string; status: ModelStatusState; 
+/**
+ * SPDX licence identifier of the underlying weights, copied verbatim
+ * from the manifest entry's `license` ("apache-2.0", "mit", etc.).
+ * Surfaced in the About dialog so the bundled-model list never drifts
+ * from `resources/models.json`.
+ */
+license: string }
 /**
  * Runtime state of one model on this user's machine.
  */
@@ -698,17 +705,18 @@ gpu_acceleration?: boolean;
  * When `true`, `audio-capture` ALSO opens the default render endpoint in
  * loopback mode, resamples it to 16 kHz mono, and SUMS it sample-wise with
  * the mic into the single `samples` stream the orchestrator drains;
- * downstream diarization separates the speakers. When `false` (the
- * default), behaviour is mic-only as before.
+ * downstream diarization separates the speakers. When `false`, behaviour is
+ * mic-only.
  * 
- * `#[serde(default)]` defaults to `false` — opt-in and echo-safe (if the
- * mic also picks the call audio up from the speakers, mixing the loopback
- * in doubles it), and an older store written before this field existed
- * deserialises to `false`. Loopback capture is currently Windows-only; on
- * other platforms enabling this logs a warning and falls back to mic-only
- * (never failing the recording). Echo cancellation using the loopback as
- * the reference signal is future work — see `architecture/cross-cutting.md`
- * — "Threading model".
+ * `#[serde(default = ...)]` defaults to `true` — capturing the call is the
+ * point of a meeting-notes app, so it is opt-OUT; an older store written
+ * before this field existed deserialises to `true`. If the mic also picks
+ * the call audio up from the speakers, mixing the loopback in doubles it
+ * (echo), so the UI advises turning it off in that case. Loopback capture is
+ * currently Windows-only; on other platforms enabling this logs a warning
+ * and falls back to mic-only (never failing the recording). Echo
+ * cancellation using the loopback as the reference signal is future work —
+ * see `architecture/cross-cutting.md` — "Threading model".
  */
 capture_system_audio?: boolean }
 /**

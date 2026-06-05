@@ -7,9 +7,12 @@
  * (per `architecture/cross-cutting.md` — Automated-testing policy), mirroring
  * the onboarding tests.
  *
- * Bundled-model licenses are rendered from the static `about-content` mirror
- * of `resources/models.json` (the `ModelStatus` binding has no `license`
- * field), so the model list is asserted directly rather than via a store mock.
+ * Bundled-model rows are derived from the models store (`useModelsStore`),
+ * whose `ModelStatus` entries carry `display_name` + `license` straight from
+ * `resources/models.json`. The store is seeded here with manifest-faithful
+ * fixtures and the rendered list is asserted against them — guarding against
+ * the drift that previously let a stale display name linger in a hand-kept
+ * mirror.
  *
  * This is a default-suite test: no model, GPU, or microphone.
  */
@@ -63,13 +66,55 @@ vi.mock("../ipc/notes", () => ({
 
 import { About } from "../shell/About";
 import { MainWindow } from "../shell/MainWindow";
-import {
-  APP_VERSION,
-  BUNDLED_MODELS,
-} from "../shell/about-content";
+import { APP_VERSION } from "../shell/about-content";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
+import { commands } from "../ipc/bindings";
+import type { ModelStatus } from "../ipc/bindings";
+
+/**
+ * Manifest-faithful fixtures, mirroring the four `resources/models.json`
+ * entries (id, kind, display_name, license). The diarization model carries
+ * its CURRENT display name + id — the assertions below use it to guard
+ * against the stale-mirror drift this refactor removed.
+ */
+const MANIFEST_MODELS: ModelStatus[] = [
+  {
+    id: "qwen3-asr-0.6b-q8_0",
+    kind: "asr",
+    display_name: "Qwen3-ASR 0.6B (Q8_0)",
+    status: { state: "available", local_dir: "/models/asr" },
+    license: "apache-2.0",
+  },
+  {
+    id: "gemma-4-e4b-it-q4_k_m",
+    kind: "llm",
+    display_name: "Gemma 4 E4B Instruct (Q4_K_M)",
+    status: { state: "available", local_dir: "/models/llm" },
+    license: "apache-2.0",
+  },
+  {
+    id: "pyannote-segmentation-3-0",
+    kind: "diarize",
+    display_name: "pyannote segmentation 3.0",
+    status: { state: "available", local_dir: "/models/pyannote" },
+    license: "mit",
+  },
+  {
+    id: "3dspeaker-campplus-zh-en-advanced",
+    kind: "diarize",
+    display_name: "3D-Speaker CAM++ (zh-en 16k common, advanced)",
+    status: { state: "available", local_dir: "/models/3dspeaker" },
+    license: "apache-2.0",
+  },
+];
+
+function seedModels(models: ModelStatus[] = MANIFEST_MODELS) {
+  act(() => {
+    useModelsStore.setState({ models });
+  });
+}
 
 function resetStores() {
   act(() => {
@@ -104,21 +149,19 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("About dialog content (Phase 7 S6)", () => {
-  it("lists all four bundled models with their correct SPDX licenses", () => {
+  it("lists the bundled models from the store with their SPDX licenses", () => {
+    seedModels();
     render(<About onClose={() => {}} />);
-
-    // The static mirror must carry exactly the four resources/models.json
-    // entries — guard against silent drift.
-    expect(BUNDLED_MODELS).toHaveLength(4);
 
     const dialog = screen.getByRole("dialog");
 
-    // Each model's display name and SPDX license is shown.
+    // Each model's display name (from the manifest-backed store) and its
+    // normalised SPDX license is shown.
     const expected: { name: string; spdx: string }[] = [
       { name: "Qwen3-ASR 0.6B (Q8_0)", spdx: "Apache-2.0" },
       { name: "Gemma 4 E4B Instruct (Q4_K_M)", spdx: "Apache-2.0" },
       { name: "pyannote segmentation 3.0", spdx: "MIT" },
-      { name: "3D-Speaker CAM++ (zh-cn 16k common)", spdx: "Apache-2.0" },
+      { name: "3D-Speaker CAM++ (zh-en 16k common, advanced)", spdx: "Apache-2.0" },
     ];
     for (const { name } of expected) {
       expect(screen.getByText(name)).toBeInTheDocument();
@@ -133,6 +176,20 @@ describe("About dialog content (Phase 7 S6)", () => {
         /full MIT and Apache-2\.0 license texts and the accompanying NOTICE/i,
       ),
     ).toBeInTheDocument();
+  });
+
+  it("renders the diarization model's CURRENT manifest name (no stale drift)", () => {
+    seedModels();
+    render(<About onClose={() => {}} />);
+
+    // The current manifest display name is rendered verbatim from the store...
+    expect(
+      screen.getByText("3D-Speaker CAM++ (zh-en 16k common, advanced)"),
+    ).toBeInTheDocument();
+    // ...and the previously-hardcoded stale name is gone for good.
+    expect(
+      screen.queryByText("3D-Speaker CAM++ (zh-cn 16k common)"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the app name, version, and the major OSS attributions", () => {
@@ -166,6 +223,13 @@ function within(container: HTMLElement, text: string): HTMLElement[] {
 
 describe("About affordance (Phase 7 S6)", () => {
   it("opening the About control shows the dialog; closing hides it", () => {
+    // MainWindow fires refreshModels() on mount; return the manifest models so
+    // the async refresh repopulates the store rather than clobbering the seed.
+    vi.mocked(commands.listModels).mockResolvedValue({
+      status: "ok",
+      data: MANIFEST_MODELS,
+    });
+    seedModels();
     render(<MainWindow />);
 
     // Closed by default.
@@ -175,8 +239,11 @@ describe("About affordance (Phase 7 S6)", () => {
     act(() =>
       fireEvent.click(screen.getByRole("button", { name: "About" })),
     );
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByText("Qwen3-ASR 0.6B (Q8_0)")).toBeInTheDocument();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toBeInTheDocument();
+    // Scope to the dialog: MainWindow also renders the model name elsewhere
+    // (model-status UI) now that the store is seeded.
+    expect(within(dialog, "Qwen3-ASR 0.6B (Q8_0)").length).toBeGreaterThanOrEqual(1);
 
     // Close via the Close button.
     act(() =>

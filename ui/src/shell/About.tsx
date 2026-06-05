@@ -2,26 +2,32 @@
  * About dialog (Phase 7, S6).
  *
  * Satisfies the acceptance item "About dialog lists the bundled-model SPDX
- * licenses + NOTICE/attribution". Presentational only: it reads the static
- * attribution data in `about-content.ts` (see that file for the sourcing
- * rationale — the `ModelStatus` binding carries no `license`, so a static
- * mirror of `resources/models.json` is the only UI-side source of truth). It
- * adds no Tauri command and issues no raw `invoke`.
+ * licenses + NOTICE/attribution". The bundled-model rows are derived from the
+ * models store (`useModelsStore().models`), whose `ModelStatus` entries carry
+ * `display_name` + `license` sourced verbatim from `resources/models.json`.
+ * This keeps the list in lockstep with the manifest — no hand-kept mirror to
+ * drift. The remaining attribution data (version, OSS components, NOTICE) is
+ * static (`about-content.ts`); it is not in the manifest. It adds no Tauri
+ * command and issues no raw `invoke`.
  *
  * Rendered in the Editorial Ink language: a centered paper sheet on the warm
  * desk field, reusing the same sheet treatment as the onboarding flow
  * (`--sheet`, `--shadow-sheet`, hairline edge), the single oxblood accent, and
  * `theme.css` tokens only — no hard-coded colour / type / radius.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import {
   APP_NAME,
   APP_VERSION,
-  BUNDLED_MODELS,
   OSS_COMPONENTS,
   NOTICE_LINE,
+  spdxDisplay,
 } from "./about-content";
+import { useModelsStore } from "../state/models";
 import "./About.css";
+
+/** Stable ordering for the bundled-model list: by kind, then id. */
+const KIND_ORDER: Record<string, number> = { asr: 0, llm: 1, diarize: 2 };
 
 export type AboutProps = {
   /** Called when the dialog should close (overlay click, Close button, Esc). */
@@ -30,6 +36,25 @@ export type AboutProps = {
 
 export function About({ onClose }: AboutProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
+  const models = useModelsStore((s) => s.models);
+
+  // Derive the bundled-model rows from the manifest-backed store. Sorted
+  // stably (kind, then id) so the list is deterministic across renders.
+  const bundledModels = useMemo(
+    () =>
+      [...models]
+        .sort((a, b) => {
+          const ka = KIND_ORDER[a.kind] ?? 99;
+          const kb = KIND_ORDER[b.kind] ?? 99;
+          return ka - kb || a.id.localeCompare(b.id);
+        })
+        .map((m) => ({
+          id: m.id,
+          displayName: m.display_name,
+          spdx: spdxDisplay(m.license),
+        })),
+    [models],
+  );
 
   // Move focus to the Close control on open and close on Escape — the minimum
   // dialog affordances; mirrors `role="dialog"` usage in the onboarding flow.
@@ -75,7 +100,7 @@ export function About({ onClose }: AboutProps) {
             Bundled models
           </h2>
           <ul className="about__list">
-            {BUNDLED_MODELS.map((model) => (
+            {bundledModels.map((model) => (
               <li key={model.id} className="about__row">
                 <span className="about__row-name">{model.displayName}</span>
                 <span className="about__row-license">{model.spdx}</span>

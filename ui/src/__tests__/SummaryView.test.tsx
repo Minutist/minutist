@@ -31,7 +31,13 @@ const MEETING = "meeting-0001";
 const LLM_ID = "gemma-4-e4b-it-q4_k_m";
 
 function llmModel(status: ModelStatus["status"]): ModelStatus {
-  return { id: LLM_ID, kind: "llm", display_name: "Gemma 4 E4B", status };
+  return {
+    id: LLM_ID,
+    kind: "llm",
+    display_name: "Gemma 4 E4B",
+    status,
+    license: "apache-2.0",
+  };
 }
 
 function resetStore() {

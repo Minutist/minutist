@@ -1321,10 +1321,15 @@ single source of truth), not in that store.
 An **About dialog** (`ui/src/shell/About.tsx` + `about-content.ts`, opened from a
 header button in `MainWindow`) satisfies the Phase 7 acceptance item by listing
 the bundled-model SPDX licenses + a NOTICE line and the major OSS attributions.
-The bundled-model licenses are STATIC (`about-content.ts`, mirroring
-`resources/models.json` exactly) because the generated `ModelStatus` binding
-carries no `license` field — the license metadata lives only in
-`resources/models.json` and never crosses IPC.
+The bundled-model rows are **DERIVED from the manifest** via the models store:
+`ModelStatus` now carries a `license` field (populated by `model-registry` from
+each `resources/models.json` entry and exposed over IPC), so `About.tsx` reads
+`id` / `display_name` / `license` straight from `useModelsStore` and renders an
+SPDX-normalised list — there is no hand-mirrored model list to drift (a model
+swap flows to About automatically). Only the OSS-component attributions, the app
+version, and the NOTICE line remain static in `about-content.ts` (they are not
+in the manifest). The `dev-shim` still hand-seeds models for `vite dev` visual
+QA, but that path never reaches the shipped dialog.
 
 ### Design system — "Editorial Ink" (light theme)
 

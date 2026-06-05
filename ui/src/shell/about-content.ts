@@ -2,15 +2,16 @@
  * Static attribution data for the About dialog (Phase 7, S6 acceptance:
  * "About dialog lists the bundled-model SPDX licenses + NOTICE/attribution").
  *
- * Sourcing note — bundled-model licenses are STATIC here, not read from the
- * models store. The generated `ModelStatus` binding (`ui/src/ipc/bindings.ts`)
- * carries only `{ id, kind, display_name, status }`; it has no `license`
- * field. The license metadata lives solely in `resources/models.json`
- * (each entry's `license`), which the webview never receives over IPC. So the
- * single available source of truth for licenses on the UI side is a static
- * mirror of that file — kept in step with it by hand. The `id`/`display_name`
- * values below match `resources/models.json` exactly so a drift is easy to
- * spot in review.
+ * Sourcing note — the bundled-model rows are NO LONGER mirrored here. The
+ * generated `ModelStatus` binding (`ui/src/ipc/bindings.ts`) now carries a
+ * `license` field (sourced verbatim from each `resources/models.json` entry),
+ * so `About.tsx` derives the model list (id + display_name + license) directly
+ * from the models store. `resources/models.json` is the single source of truth
+ * for that list; there is no hand-kept per-model mirror on the UI side.
+ *
+ * The constants below are NOT in the manifest and remain static here:
+ * the app version, the major OSS components the app is built on, and the
+ * NOTICE line.
  */
 
 /**
@@ -22,42 +23,20 @@
 export const APP_NAME = "meeting-app";
 export const APP_VERSION = "0.0.0";
 
-export type BundledModel = {
-  /** Matches `resources/models.json` `id`. */
-  id: string;
-  /** Matches `resources/models.json` `display_name`. */
-  displayName: string;
-  /** SPDX identifier (uppercased for display). */
-  spdx: string;
-};
-
 /**
- * Bundled / on-demand-downloaded models, mirroring `resources/models.json`.
- * SPDX identifiers are the canonical forms of that file's `license` values
- * (`apache-2.0` → `Apache-2.0`, `mit` → `MIT`).
+ * Normalise a lowercase SPDX-ish licence identifier (as carried by the model
+ * manifest, e.g. `apache-2.0`, `mit`) to its canonical SPDX display form
+ * (`Apache-2.0`, `MIT`). Unknown values fall back to the raw string so a new
+ * manifest licence still renders something rather than silently dropping.
  */
-export const BUNDLED_MODELS: BundledModel[] = [
-  {
-    id: "qwen3-asr-0.6b-q8_0",
-    displayName: "Qwen3-ASR 0.6B (Q8_0)",
-    spdx: "Apache-2.0",
-  },
-  {
-    id: "gemma-4-e4b-it-q4_k_m",
-    displayName: "Gemma 4 E4B Instruct (Q4_K_M)",
-    spdx: "Apache-2.0",
-  },
-  {
-    id: "pyannote-segmentation-3-0",
-    displayName: "pyannote segmentation 3.0",
-    spdx: "MIT",
-  },
-  {
-    id: "3dspeaker-campplus-zh-cn-16k-common",
-    displayName: "3D-Speaker CAM++ (zh-cn 16k common)",
-    spdx: "Apache-2.0",
-  },
-];
+export function spdxDisplay(license: string): string {
+  const known: Record<string, string> = {
+    "apache-2.0": "Apache-2.0",
+    mit: "MIT",
+    openrail: "OpenRAIL",
+  };
+  return known[license.toLowerCase()] ?? license;
+}
 
 export type OssComponent = {
   name: string;

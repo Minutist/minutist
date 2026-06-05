@@ -190,6 +190,7 @@ impl ModelRegistry {
             kind: entry.kind,
             display_name: entry.display_name.clone(),
             status,
+            license: entry.license.clone(),
         }
     }
 

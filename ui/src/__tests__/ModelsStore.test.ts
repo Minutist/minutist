@@ -56,6 +56,7 @@ function makeAvailableModel(): ModelStatus {
     kind: "asr",
     display_name: "Qwen3-ASR 0.6B",
     status: { state: "available", local_dir: "/path/to/model" },
+    license: "apache-2.0",
   };
 }
 
@@ -93,6 +94,7 @@ describe("ModelsStore", () => {
           kind: "asr",
           display_name: "Qwen3-ASR 0.6B",
           status: { state: "missing", bytes_present: 0, bytes_total: 1000000 },
+          license: "apache-2.0",
         },
       ]),
     );

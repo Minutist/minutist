@@ -54,18 +54,38 @@ const DEV_DEVICES: AudioDevice[] = [
   { id: "aggregate", name: "Aggregate Device (2ch)", is_default: false },
 ];
 
+// DEV-ONLY sample data mirroring resources/models.json — keep in step with the
+// manifest when models change. This is the one remaining hand-kept model list,
+// and it cannot affect the shipped About dialog (production derives its list
+// from the real `list_models` IPC); it only seeds the `vite dev` browser shim.
 const DEV_MODELS: ModelStatus[] = [
   {
     id: ASR_MODEL_ID,
     kind: "asr",
     display_name: "Qwen3-ASR 0.6B (Q8_0)",
     status: { state: "available", local_dir: "/dev/models/asr/qwen3-asr" },
+    license: "apache-2.0",
   },
   {
     id: "gemma-4-e4b-it-q4_k_m",
     kind: "llm",
     display_name: "Gemma 4 E4B Instruct (Q4_K_M)",
     status: { state: "available", local_dir: "/dev/models/llm/gemma-4-e4b" },
+    license: "apache-2.0",
+  },
+  {
+    id: "pyannote-segmentation-3-0",
+    kind: "diarize",
+    display_name: "pyannote segmentation 3.0",
+    status: { state: "available", local_dir: "/dev/models/diarize/pyannote" },
+    license: "mit",
+  },
+  {
+    id: "3dspeaker-campplus-zh-en-advanced",
+    kind: "diarize",
+    display_name: "3D-Speaker CAM++ (zh-en 16k common, advanced)",
+    status: { state: "available", local_dir: "/dev/models/diarize/3dspeaker" },
+    license: "apache-2.0",
   },
 ];
 

@@ -230,6 +230,11 @@ pub struct ModelStatus {
     pub kind: ModelKind,
     pub display_name: String,
     pub status: ModelStatusState,
+    /// SPDX licence identifier of the underlying weights, copied verbatim
+    /// from the manifest entry's `license` ("apache-2.0", "mit", etc.).
+    /// Surfaced in the About dialog so the bundled-model list never drifts
+    /// from `resources/models.json`.
+    pub license: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +670,7 @@ mod tests {
                 bytes_done: 1024 * 1024,
                 bytes_total: 805 * 1024 * 1024,
             },
+            license: "apache-2.0".to_string(),
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("\"state\":\"downloading\""));

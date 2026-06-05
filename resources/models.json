@@ -53,17 +53,17 @@
       ]
     },
     {
-      "id": "3dspeaker-campplus-zh-cn-16k-common",
+      "id": "3dspeaker-campplus-zh-en-advanced",
       "kind": "diarize",
-      "display_name": "3D-Speaker CAM++ (zh-cn 16k common)",
+      "display_name": "3D-Speaker CAM++ (zh-en 16k common, advanced)",
       "license": "apache-2.0",
-      "total_size_bytes": 28281138,
+      "total_size_bytes": 28281164,
       "files": [
         {
-          "filename": "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
-          "url": "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx",
-          "size": 28281138,
-          "sha256": "f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11"
+          "filename": "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+          "url": "https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+          "size": 28281164,
+          "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2"
         }
       ]
     }

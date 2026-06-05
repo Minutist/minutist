@@ -4,7 +4,7 @@
 //! bundled `resources/models.json`:
 //!
 //! - `DIARIZE_SEG_MODEL_ID = "pyannote-segmentation-3-0"`
-//! - `DIARIZE_EMB_MODEL_ID = "3dspeaker-campplus-zh-cn-16k-common"`
+//! - `DIARIZE_EMB_MODEL_ID = "3dspeaker-campplus-zh-en-advanced"`
 //!
 //! With no guard, renaming or dropping either manifest entry (or flipping its
 //! `kind`) would silently break both the on-stop diarization pass and the
@@ -31,7 +31,7 @@ use meeting_app_common::{ModelId, ModelKind};
 /// const, update these too — the assertion below cross-checks them against the
 /// bundled manifest.
 const DIARIZE_SEG_MODEL_ID: &str = "pyannote-segmentation-3-0";
-const DIARIZE_EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-cn-16k-common";
+const DIARIZE_EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-en-advanced";
 
 /// Both bundled diarize model ids must exist in `resources/models.json` as
 /// entries whose `kind` is `Diarize`.

@@ -15,8 +15,14 @@
 //!
 //! Models (license-verified, settings-selected via `model-registry`):
 //! - segmentation: pyannote/segmentation-3.0 (MIT)
-//! - embedding: 3D-Speaker CAM++ zh-cn 16k-common (Apache-2.0, in-house corpus,
-//!   NOT VoxCeleb — the clean commercial-redistribution path).
+//! - embedding: 3D-Speaker CAM++ zh-en 16k-common ADVANCED (Apache-2.0, the
+//!   "common" corpus, NOT VoxCeleb — the clean commercial-redistribution path).
+//!   The zh-en model replaced the Mandarin-only zh-cn one (2026-06-05): on
+//!   English audio the zh-cn model's embedding space was too compressed —
+//!   distinct speakers and one speaker's natural variation overlapped, so a
+//!   single-speaker recording over-split into 3-4 "speakers". The zh-en model
+//!   separates them, opening a usable `cluster_threshold` window (see
+//!   `DiarizerConfig::default`).
 //!
 //! ## Pipeline (Phase 6 Stream S1)
 //!
@@ -71,8 +77,13 @@ impl Default for DiarizerConfig {
     fn default() -> Self {
         Self {
             num_clusters: None,
-            // Conservative default: avoid over-splitting a single speaker.
-            cluster_threshold: 0.5,
+            // 0.75 chosen from a threshold sweep against the zh-en embedding
+            // model (see below): on real data a 175 s single-speaker recording
+            // collapses to 1 speaker by 0.70, while two genuinely distinct
+            // speakers stay separated until ~0.80 — 0.75 sits in that window. At
+            // the old 0.5 (with the Mandarin model) the same recording
+            // over-split into 3-4 speakers. Higher => fewer speakers.
+            cluster_threshold: 0.75,
         }
     }
 }

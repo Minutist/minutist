@@ -1695,7 +1695,7 @@ pub(crate) async fn build_asr_runtime_for_retranscribe(
 pub(crate) const DIARIZE_SEG_MODEL_ID: &str = "pyannote-segmentation-3-0";
 /// Manifest id of the bundled speaker-embedding model (3D-Speaker CAM++ zh-cn
 /// 16k-common, Apache-2.0).
-pub(crate) const DIARIZE_EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-cn-16k-common";
+pub(crate) const DIARIZE_EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-en-advanced";
 
 /// Lazily build the production `SherpaDiarizer`, mirroring
 /// [`build_asr_runtime_for_retranscribe`].

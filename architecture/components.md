@@ -266,8 +266,12 @@ model-registry resolution lives in the orchestrator's `runner::build_diarizer`,
 which ensures both model dirs and passes the resolved `&Path`s into
 `SherpaDiarizer::open`. Bundled models
 (settings-selectable via `model-registry`): **segmentation =
-pyannote/segmentation-3.0 (MIT)**; **embedding = 3D-Speaker CAM++ zh-cn
-16k-common (Apache-2.0, Alibaba in-house corpus — NOT VoxCeleb)**. This corrects
+pyannote/segmentation-3.0 (MIT)**; **embedding = 3D-Speaker CAM++ zh-en
+16k-common ADVANCED (Apache-2.0, "common" corpus — NOT VoxCeleb)**. (The zh-en
+model replaced the Mandarin-only zh-cn one on 2026-06-05: the zh-cn embedding
+under-separated English voices, over-splitting a single speaker into 3-4; the
+zh-en model opens a usable `cluster_threshold` window — default raised 0.5→0.75.)
+This corrects
 Spike-4's TitaNet, which is VoxCeleb-trained and not cleanly redistributable in
 a paid product; ERes2NetV2 (same license) is the
 swap-in accuracy upgrade. The orchestrator owns the lifecycle: it builds the
@@ -694,7 +698,7 @@ diarizer lifecycle (per the `diarizer` section above): `diarizer = { path =
 (`runner::build_diarizer`, mirroring `build_asr_runtime_for_retranscribe`)
 resolves the two diarize model directories via `model-registry`
 (`ModelRegistry::ensure` for `pyannote-segmentation-3-0` +
-`3dspeaker-campplus-zh-cn-16k-common`), locates each `.onnx`, and opens
+`3dspeaker-campplus-zh-en-advanced`), locates each `.onnx`, and opens
 `SherpaDiarizer::open(seg, emb, DiarizerConfig::default())` — so the
 `model-registry` edge stays inside the orchestrator and `diarizer` need not
 depend on `persistence` (the orchestrator sources audio through

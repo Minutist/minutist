@@ -39,7 +39,7 @@ use tokio::sync::broadcast;
 // ---------------------------------------------------------------------------
 
 const SEG_MODEL_ID: &str = "pyannote-segmentation-3-0";
-const EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-cn-16k-common";
+const EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-en-advanced";
 
 fn diarize_model_env_vars() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     // Treat an EMPTY value as unset (skip) so `VAR=""` does not stage an empty

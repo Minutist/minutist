@@ -70,6 +70,15 @@ const fn default_capture_system_audio() -> bool {
     true
 }
 
+/// Default ASR language hint. "English" forces the English assistant-turn
+/// prefix, fixing the spurious-Chinese auto-detect bug for the primary user.
+/// The sentinel "auto" restores auto-detect (no prefix; byte-identical to the
+/// pre-feature behaviour). An older store written before this field existed
+/// deserialises to "English" via #[serde(default = ...)].
+fn default_transcription_language() -> String {
+    "English".to_string()
+}
+
 /// Default summary system prompt (FR-28).
 ///
 /// A model-agnostic instruction asking for a structured meeting summary:
@@ -198,6 +207,14 @@ pub struct Settings {
     /// see `architecture/cross-cutting.md` — "Threading model".
     #[serde(default = "default_capture_system_audio")]
     pub capture_system_audio: bool,
+
+    /// ASR language hint (Qwen3-ASR). A full English language name (e.g.
+    /// "English", "Spanish", "Japanese") forces that language via the
+    /// assistant-turn prefix; the sentinel "auto" disables forcing (auto-detect,
+    /// the pre-feature behaviour). Defaults to "English" (fixes the spurious-
+    /// Chinese bug). An older store deserialises to "English" via the default fn.
+    #[serde(default = "default_transcription_language")]
+    pub transcription_language: String,
 }
 
 impl Default for Settings {
@@ -214,6 +231,7 @@ impl Default for Settings {
             onboarding_completed: false,
             gpu_acceleration: default_gpu_acceleration(),
             capture_system_audio: true,
+            transcription_language: default_transcription_language(),
         }
     }
 }
@@ -253,9 +271,11 @@ mod tests {
             onboarding_completed: true,
             gpu_acceleration: false,
             capture_system_audio: true,
+            transcription_language: "Japanese".to_string(),
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.transcription_language, "Japanese");
         assert_eq!(original, restored);
     }
 
@@ -499,6 +519,46 @@ mod tests {
         assert!(
             restored.capture_system_audio,
             "missing capture_system_audio must deserialise to true (on by default)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1h. transcription_language: default + round-trip + missing-field
+    //     deserialisation (ASR language hint)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transcription_language_defaults_to_english() {
+        assert_eq!(
+            Settings::default().transcription_language,
+            "English",
+            "the ASR language hint defaults to English (fixes the spurious-Chinese bug)"
+        );
+    }
+
+    #[test]
+    fn transcription_language_round_trips() {
+        let original = Settings {
+            transcription_language: "Spanish".to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.transcription_language, "Spanish");
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_transcription_language_field_defaults_to_english() {
+        // A settings store written before `transcription_language` existed must
+        // deserialise to "English" (the default fn).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert_eq!(
+            restored.transcription_language, "English",
+            "missing transcription_language must deserialise to English (the default)"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

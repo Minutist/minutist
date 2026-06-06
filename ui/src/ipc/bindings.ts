@@ -718,7 +718,15 @@ gpu_acceleration?: boolean;
  * cancellation using the loopback as the reference signal is future work —
  * see `architecture/cross-cutting.md` — "Threading model".
  */
-capture_system_audio?: boolean }
+capture_system_audio?: boolean; 
+/**
+ * ASR language hint (Qwen3-ASR). A full English language name (e.g.
+ * "English", "Spanish", "Japanese") forces that language via the
+ * assistant-turn prefix; the sentinel "auto" disables forcing (auto-detect,
+ * the pre-feature behaviour). Defaults to "English" (fixes the spurious-
+ * Chinese bug). An older store deserialises to "English" via the default fn.
+ */
+transcription_language?: string }
 /**
  * UI colour-scheme preference.
  */

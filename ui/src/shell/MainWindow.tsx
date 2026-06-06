@@ -7,6 +7,7 @@ import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
 import { DevicePicker } from "./DevicePicker";
+import { LanguagePicker } from "./LanguagePicker";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
@@ -153,6 +154,14 @@ export function MainWindow() {
             <AudioMeter />
           </div>
           <DevicePicker />
+          {/*
+            ASR transcription-language hint (defaults to English, which fixes the
+            spurious-Chinese auto-detect bug). "Auto-detect" disables forcing.
+            Persists via `update_settings`; self-disables until the settings
+            snapshot has loaded so the round-trip never clobbers settings with a
+            partial object.
+          */}
+          <LanguagePicker />
           {/*
             Phase 6 — diarization-enabled toggle (off by default). When on, the
             orchestrator runs speaker diarization on stop. Persists via

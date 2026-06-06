@@ -104,6 +104,9 @@ const DEV_SETTINGS: Settings = {
   // app for visual QA; the onboarding flow itself renders in the shim by
   // starting from a non-completed settings snapshot (see Onboarding.tsx note).
   onboarding_completed: true,
+  // ASR language hint. Seeded "English" (the schema default) so the language
+  // picker renders selected under `vite dev`.
+  transcription_language: "English",
 };
 
 /**

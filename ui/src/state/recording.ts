@@ -19,6 +19,7 @@ import { withDiarizationEnabled } from "./diarization-settings";
 import { withGpuAcceleration } from "./gpu-acceleration-settings";
 import { withCaptureSystemAudio } from "./system-audio-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
+import { withTranscriptionLanguage } from "./transcription-language-settings";
 import type { Theme } from "../ipc/bindings";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
@@ -82,6 +83,13 @@ export type RecordingStore = {
    * call from the speakers (echo).
    */
   setCaptureSystemAudio: (enabled: boolean) => Promise<void>;
+  /**
+   * Set the ASR transcription-language hint, persisting via
+   * `commands.updateSettings` so the choice survives an app restart — the same
+   * round-trip-through-settings pattern as `setTheme`. A full English name
+   * forces that language; the sentinel "auto" disables forcing (auto-detect).
+   */
+  setTranscriptionLanguage: (language: string) => Promise<void>;
   /**
    * Set the UI colour-scheme preference, persisting via `commands.updateSettings`
    * (the same round-trip-through-settings pattern as `setSelectedDevice`). Used
@@ -254,6 +262,26 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withCaptureSystemAudio(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setTranscriptionLanguage: async (language) => {
+    // Persist via `update_settings` so the choice survives an app restart, the
+    // same round-trip-through-settings pattern `setTheme` uses. The sentinel
+    // "auto" reaches the store/Rust unchanged (the resolver maps it to None).
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withTranscriptionLanguage(current, language);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

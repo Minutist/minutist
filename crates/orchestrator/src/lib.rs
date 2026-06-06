@@ -258,6 +258,14 @@ impl Orchestrator {
         // returns the compile-time ceiling when on, `0` (force CPU) when off.
         let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
 
+        // Resolve the ASR language hint from the `transcription_language`
+        // setting (see `runner::resolve_transcription_language`): a full English
+        // name forces that language via the assistant-turn prefix; the `"auto"`
+        // sentinel resolves to `None` (auto-detect, byte-identical to the
+        // pre-feature behaviour).
+        let language =
+            runner::resolve_transcription_language(&self.settings.current().transcription_language);
+
         // Live diarization (Phase B): build the additive `OnlineDiarizer` BEFORE
         // spawning the runner, gated on the `diarization_enabled` setting AND the
         // embedding model being locally `Available` (no download, no block — see
@@ -275,6 +283,7 @@ impl Orchestrator {
             Arc::clone(&self.model_registry),
             meeting_id,
             n_gpu_layers,
+            language,
             online_diarizer,
         );
 
@@ -620,6 +629,11 @@ impl Orchestrator {
         // `self.settings`). The offline re-transcribe honours the same GPU
         // toggle as the live path.
         let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        // Resolve the ASR language hint before entering the blocking closure (it
+        // cannot read `self.settings`). The offline re-transcribe honours the
+        // same `transcription_language` setting as the live path.
+        let language =
+            runner::resolve_transcription_language(&self.settings.current().transcription_language);
 
         let segments: Vec<Segment> = tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
             // Decode pause-INCLUDING PCM.
@@ -636,7 +650,7 @@ impl Orchestrator {
                     context: format!("re_transcribe runtime build failed: {e}"),
                 })?;
 
-            let mut runtime = match rt.block_on(runner::build_asr_runtime_for_retranscribe(&registry, n_gpu_layers))? {
+            let mut runtime = match rt.block_on(runner::build_asr_runtime_for_retranscribe(&registry, n_gpu_layers, language))? {
                 Some(r) => r,
                 None => {
                     return Err(AppError::ModelLoad {
@@ -1070,6 +1084,10 @@ impl Orchestrator {
         };
 
         let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        // Resolve the ASR language hint, exactly as the production `start()`
+        // path (this test-source path is production-equivalent).
+        let language =
+            runner::resolve_transcription_language(&self.settings.current().transcription_language);
         // Phase B: build the live diarizer (gated on diarization_enabled +
         // local model availability), exactly as the production `start()` path.
         let online_diarizer =
@@ -1081,6 +1099,7 @@ impl Orchestrator {
             Arc::clone(&self.model_registry),
             meeting_id,
             n_gpu_layers,
+            language,
             online_diarizer,
         );
         guard.runner = Some(runner_handle);

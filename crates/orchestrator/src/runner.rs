@@ -342,11 +342,19 @@ pub(crate) struct RunnerHandle {
 /// `meeting_id`     — used when emitting `TranscriptSegment` events.
 /// `n_gpu_layers`   — runtime-resolved GPU-offload count (from the
 ///                    `gpu_acceleration` setting via [`resolve_gpu_layers`]).
+/// `language`       — runtime-resolved ASR language hint (from the
+///                    `transcription_language` setting via
+///                    [`resolve_transcription_language`]); `None` = auto-detect.
 /// `online_diarizer` — optional live diarizer (Phase B). When `Some`, the drain
 ///                    loop labels each VAD segment at SegmentEnd; when `None`
 ///                    (setting off / model absent / build failed) every segment
 ///                    is left unlabelled. Best-effort: never affects recording
 ///                    or transcription. The on-stop pass stays authoritative.
+// Wiring boundary: it hands the runner its channels, handles, and the
+// start-resolved scalar config (n_gpu_layers, language, live diarizer). The
+// arguments are heterogeneous (not a cohesive value object), so a params struct
+// would add indirection without clarity; the >7 count is inherent to wiring.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_runner(
     streams: AudioStreams,
     writer: MeetingWriter,
@@ -354,6 +362,7 @@ pub(crate) fn spawn_runner(
     model_registry: Arc<ModelRegistry>,
     meeting_id: MeetingId,
     n_gpu_layers: u32,
+    language: Option<String>,
     online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
     spawn_runner_inner(
@@ -363,6 +372,7 @@ pub(crate) fn spawn_runner(
         model_registry,
         meeting_id,
         n_gpu_layers,
+        language,
         None,
         online_diarizer,
     )
@@ -377,6 +387,7 @@ fn spawn_runner_inner(
     model_registry: Arc<ModelRegistry>,
     meeting_id: MeetingId,
     n_gpu_layers: u32,
+    language: Option<String>,
     prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
     online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
@@ -399,6 +410,7 @@ fn spawn_runner_inner(
             prebuilt_backend,
             asr_registry,
             n_gpu_layers,
+            language,
             asr_event_tx,
             writer_cmd_tx,
         );
@@ -445,6 +457,8 @@ pub(crate) fn spawn_runner_with_backend(
 ) -> RunnerHandle {
     // The prebuilt backend is used directly, so the lazy production-path
     // `n_gpu_layers` is moot here — pass the compile-time ceiling for parity.
+    // The prebuilt backend also makes `config.language` moot; `None` (no
+    // prefix) is the safe moot value — no behaviour change.
     spawn_runner_inner(
         streams,
         writer,
@@ -452,6 +466,7 @@ pub(crate) fn spawn_runner_with_backend(
         model_registry,
         meeting_id,
         asr_runtime::default_n_gpu_layers(),
+        None,
         Some(backend),
         online_diarizer,
     )
@@ -917,6 +932,10 @@ fn dispatch_flush_inner(
 /// `gpu_acceleration` setting via [`resolve_gpu_layers`]) applied to the lazily
 /// built production `AsrRuntime`.
 ///
+/// `language`: the runtime-resolved ASR language hint (from the
+/// `transcription_language` setting via [`resolve_transcription_language`]);
+/// `None` = auto-detect. Passed by value into the one-shot `init_asr_runtime`.
+///
 /// One flush is in-flight at a time: the worker pops one payload, processes
 /// it fully, then waits for the next notification.
 fn run_asr_worker(
@@ -924,6 +943,7 @@ fn run_asr_worker(
     prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
     model_registry: Arc<ModelRegistry>,
     n_gpu_layers: u32,
+    language: Option<String>,
     event_tx: broadcast::Sender<AppEvent>,
     writer_cmd_tx: mpsc::Sender<WriterCommand>,
 ) {
@@ -1026,7 +1046,14 @@ fn run_asr_worker(
         } else {
             // Lazy-initialise AsrRuntime on the first flush (production path).
             if lazy_runtime.is_none() {
-                let result = rt.block_on(init_asr_runtime(&model_registry, n_gpu_layers));
+                // `init_asr_runtime` runs at most once (lazy init), but the
+                // borrow checker can't see that across the loop, so clone the
+                // owned hint into the one-shot call.
+                let result = rt.block_on(init_asr_runtime(
+                    &model_registry,
+                    n_gpu_layers,
+                    language.clone(),
+                ));
                 match result {
                     Ok(Some(runtime)) => {
                         lazy_runtime = Some(runtime);
@@ -1113,17 +1140,39 @@ pub(crate) fn resolve_gpu_layers(enabled: bool) -> u32 {
     }
 }
 
+/// Resolve the ASR language hint from the `transcription_language` setting.
+///
+/// Mirrors [`resolve_gpu_layers`]: a pure, model-free mapping from the settings
+/// String to the `AsrRuntimeConfig.language: Option<String>` the runtime
+/// consumes. The reserved sentinel `"auto"` (case-insensitive), the empty
+/// string, and whitespace-only all map to `None` → no prefix → auto-detect
+/// (byte-identical to the pre-feature behaviour). Any other value is a full
+/// English language name, trimmed and forwarded verbatim → prefix-force.
+pub(crate) fn resolve_transcription_language(setting: &str) -> Option<String> {
+    let t = setting.trim();
+    if t.is_empty() || t.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 /// Lazily initialise `AsrRuntime` on the first flush.
 ///
 /// `n_gpu_layers` is the runtime-resolved GPU-offload count (see
 /// [`resolve_gpu_layers`]); it is set on the `AsrRuntimeConfig` so the model and
 /// the mtmd encoder honour the `gpu_acceleration` setting.
 ///
+/// `language` is the runtime-resolved ASR language hint (see
+/// [`resolve_transcription_language`]); it is set on the `AsrRuntimeConfig` so
+/// the prompt forces that language (`None` = auto-detect, no prefix).
+///
 /// Returns `Ok(None)` if the model is not yet available (caller should skip
 /// the flush). Returns `Ok(Some(runtime))` when initialisation succeeded.
 async fn init_asr_runtime(
     model_registry: &ModelRegistry,
     n_gpu_layers: u32,
+    language: Option<String>,
 ) -> AppResult<Option<AsrRuntime>> {
     let model_id = ModelId::from(ASR_MODEL_ID);
 
@@ -1158,6 +1207,7 @@ async fn init_asr_runtime(
 
     let config = AsrRuntimeConfig {
         n_gpu_layers,
+        language,
         ..AsrRuntimeConfig::default()
     };
     match AsrRuntime::new(&gguf_path, &mmproj_path, config) {
@@ -1677,12 +1727,15 @@ fn transcribe_one_flush(
 /// toggle as the live path. Returns `Ok(None)` when the model is not available
 /// (the caller surfaces this as an error, since an explicit user-triggered
 /// re-transcribe with no model is a failure, unlike the live path's best-effort
-/// skip).
+/// skip). `language` is the runtime-resolved ASR language hint (see
+/// [`resolve_transcription_language`]), so an offline re-transcribe honours the
+/// same language setting as the live path (`None` = auto-detect).
 pub(crate) async fn build_asr_runtime_for_retranscribe(
     model_registry: &ModelRegistry,
     n_gpu_layers: u32,
+    language: Option<String>,
 ) -> AppResult<Option<AsrRuntime>> {
-    init_asr_runtime(model_registry, n_gpu_layers).await
+    init_asr_runtime(model_registry, n_gpu_layers, language).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,6 +2017,39 @@ mod tests {
         } else {
             assert_eq!(on, 0, "a default CPU-only build stays on CPU even when on");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_transcription_language — the ASR language-hint wiring (pure)
+    // -----------------------------------------------------------------------
+
+    /// A real language name resolves to `Some(name)` (prefix-force), trimmed.
+    /// The `"auto"` sentinel (case-insensitive), the empty string, and
+    /// whitespace-only resolve to `None` (auto-detect, no prefix).
+    #[test]
+    fn resolve_transcription_language_maps_names_and_sentinel() {
+        assert_eq!(
+            resolve_transcription_language("English"),
+            Some("English".to_string())
+        );
+        assert_eq!(
+            resolve_transcription_language("Spanish"),
+            Some("Spanish".to_string())
+        );
+
+        // The reserved sentinel maps to None, case-insensitively.
+        assert_eq!(resolve_transcription_language("auto"), None);
+        assert_eq!(resolve_transcription_language("Auto"), None);
+
+        // Empty / whitespace-only also map to None.
+        assert_eq!(resolve_transcription_language(""), None);
+        assert_eq!(resolve_transcription_language("   "), None);
+
+        // A name is trimmed before forwarding.
+        assert_eq!(
+            resolve_transcription_language("  English "),
+            Some("English".to_string())
+        );
     }
 
     // -----------------------------------------------------------------------

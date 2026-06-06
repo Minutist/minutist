@@ -221,6 +221,20 @@ and only then dispatch.
 in addition to EOG — Qwen3-ASR doesn't always emit EOG for sub-window
 audio. See `cross-cutting.md` — ASR chunking constraint.
 
+**Language hint — `AsrRuntimeConfig.language: Option<String>`.** Optional
+forcing language (full English name, e.g. `Some("English")`). `None` =
+auto-detect (the pre-feature behaviour). When `Some(name)`, the prompt
+prefix-forces the language via an assistant-turn prefill appended AFTER
+`apply_chat_template` (never inside the user message): the rendered prompt
+ends with `language <name><asr_text>`, exactly the wrapper Qwen3-ASR emits
+itself, so the model only generates the transcript. `None` produces the
+byte-identical pre-feature prompt — the locked "Auto-detect MUST be
+byte-identical" guarantee. The hint rides on `AsrRuntimeConfig` only; the
+`AsrBackend` trait and the `common` dependency table are unchanged. The
+orchestrator resolves it from `settings.transcription_language` at start
+(via `resolve_transcription_language`, mirroring `resolve_gpu_layers`).
+`Default` is `None` (auto-detect), so the no-arg/test path is unchanged.
+
 **Implementation pattern (Phase 2).** `LlamaBackend` is a process-wide
 `OnceLock` singleton; `LlamaModel` + `MtmdContext` are loaded once in
 `AsrRuntime::new`; a fresh `LlamaContext` is allocated per
@@ -866,6 +880,26 @@ the hand-written `Default` impl (`false`). The orchestrator reads it
 (`current().capture_system_audio`) and passes it into `AudioCaptureManager::start`,
 which opens the loopback source + mixer when on (Windows-only; mic-only fallback
 otherwise — see the `audio-capture` section). No new dependency edge.
+
+**Field — `transcription_language: String`.** ASR language hint (Qwen3-ASR).
+`#[serde(default = ...)]`-defaults to `"English"` (forces English, fixing the
+spurious-Chinese auto-detect bug for the primary user); an older store written
+before the field existed deserialises to `"English"`. Added to the hand-written
+`Default` impl (`"English"`). It is a `String`, not an enum, deliberately: the
+supported set (30 languages + dialects) belongs to `asr-runtime`, not the
+settings schema, so a String keeps `settings` decoupled from the ASR language
+table and lets `"auto"` be a reserved sentinel rather than a schema variant. The
+value is NOT validated against the language table — the UI dropdown constrains it
+to valid names, and an unrecognised name simply rides into the prompt prefix and
+degrades gracefully (the model treats it as context); only `"auto"`/empty is
+special-cased (→ no prefix). The
+orchestrator reads it (`current().transcription_language`) and resolves it via
+`resolve_transcription_language` to `AsrRuntimeConfig.language: Option<String>`:
+the sentinel `"auto"` (case-insensitive), empty, and whitespace-only → `None`
+(auto-detect, no prefix = pre-feature behaviour); any other value → the full
+English name, trimmed and forwarded verbatim → prefix-force. The same resolver
+feeds the live, offline-re-transcribe, and test-source start paths. No new
+dependency edge. See the `asr-runtime` "Language hint" note above.
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

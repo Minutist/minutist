@@ -193,6 +193,16 @@ pub struct AsrRuntimeConfig {
     /// orchestrator) sets this at **runtime** from the `gpu_acceleration`
     /// setting, passing `0` to force CPU even in a GPU build.
     pub n_gpu_layers: u32,
+    /// Forcing language full-English-name (e.g. `Some("English")`,
+    /// `Some("Spanish")`); `None` = auto-detect, no prefix = pre-feature
+    /// behaviour.
+    ///
+    /// When `Some(name)`, [`build_prompt`] appends `language <name><asr_text>`
+    /// to the assistant-turn opening (prefix-force). When `None`, the prompt is
+    /// byte-identical to the pre-feature auto-detect prompt. `Default` is `None`
+    /// (auto-detect), so the no-arg/test path is unchanged; the orchestrator sets
+    /// the real value at start, exactly like `n_gpu_layers`.
+    pub language: Option<String>,
 }
 
 impl Default for AsrRuntimeConfig {
@@ -204,6 +214,7 @@ impl Default for AsrRuntimeConfig {
             n_batch: 512,
             max_tokens: 256,
             n_gpu_layers: default_n_gpu_layers(),
+            language: None,
         }
     }
 }
@@ -357,7 +368,9 @@ impl AsrBackend for AsrRuntime {
             &chunk.samples,
         )?;
 
-        let text = strip_asr_wrapper(&result);
+        // `forced` (language prefix-forced) changes the generated text shape, so
+        // the wrapper parse must know which mode produced `result`.
+        let text = strip_asr_wrapper(&result, self.config.language.is_some());
 
         tracing::debug!(
             target = "asr-runtime",
@@ -409,7 +422,7 @@ fn transcribe_inner(
 
     // --- Step 3: apply chat template with <__media__> user message ---
     let media_marker = mtmd_default_marker();
-    let prompt_text = build_prompt(model, media_marker)?;
+    let prompt_text = build_prompt(model, media_marker, config.language.as_deref())?;
 
     let input_text = MtmdInputText {
         text: prompt_text,
@@ -477,7 +490,18 @@ fn transcribe_inner(
 /// Uses the GGUF-embedded template (`model.chat_template(None)` + `apply_chat_template`)
 /// with a single user message containing the `<__media__>` marker. The model's
 /// template embeds BOS itself, so the tokenizer step uses `add_special=false`.
-fn build_prompt(model: &LlamaModel, media_marker: &str) -> AppResult<String> {
+///
+/// When `language` is `Some(name)`, the language hint is forced via an
+/// assistant-turn prefill appended AFTER `apply_chat_template` (never inside the
+/// user message): the rendered string ends with the assistant-turn opening, and
+/// [`apply_language_prefix`] appends `language <name><asr_text>` to it so the
+/// model only GENERATES the transcript. When `language` is `None`, the prompt is
+/// byte-identical to the pre-feature auto-detect prompt (no prefix).
+fn build_prompt(
+    model: &LlamaModel,
+    media_marker: &str,
+    language: Option<&str>,
+) -> AppResult<String> {
     let msg = LlamaChatMessage::new("user".to_string(), media_marker.to_string())
         .map_err(|e| AppError::from(Error::Tokenize(format!("LlamaChatMessage::new: {e}"))))?;
 
@@ -489,7 +513,22 @@ fn build_prompt(model: &LlamaModel, media_marker: &str) -> AppResult<String> {
         .apply_chat_template(&template, &[msg], true)
         .map_err(|e| AppError::from(Error::Tokenize(format!("apply_chat_template: {e}"))))?;
 
-    Ok(rendered)
+    Ok(apply_language_prefix(rendered, language))
+}
+
+/// Append the Qwen3-ASR language-force prefix to an already-rendered prompt.
+///
+/// Pure (no model) so it is unit-tested on its own. The forced string is exactly
+/// `language <Name><asr_text>` (single space after `language`, no space before
+/// `<asr_text>`), matching the wrapper Qwen3-ASR emits itself and the open-side
+/// parse in [`strip_asr_wrapper`] (`find("<asr_text>")`).
+///
+/// `None` returns `rendered` unchanged — the byte-identical auto-detect guard.
+fn apply_language_prefix(rendered: String, language: Option<&str>) -> String {
+    match language {
+        Some(name) => format!("{rendered}language {name}<asr_text>"),
+        None => rendered,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,28 +537,37 @@ fn build_prompt(model: &LlamaModel, media_marker: &str) -> AppResult<String> {
 
 /// Strip the Qwen3-ASR `language English<asr_text>...</asr_text>` wrapper.
 ///
-/// Returns the inner transcript text. Handles:
-/// - Full wrapper: `language English<asr_text>hello world</asr_text>` → `hello world`
-/// - Open tag only (EOG before close): `language English<asr_text>hello world` → `hello world`
-/// - Language prefix without tag: `language English hello world` → `hello world`
-/// - No wrapper at all: returned as-is.
-fn strip_asr_wrapper(s: &str) -> String {
-    let mut out = s.trim().to_string();
+/// `forced` says whether the language was prefix-FORCED. The generated text
+/// differs by mode, so the open-side parse MUST differ:
+/// - **Auto-detect** (`forced = false`): the model emits the full open wrapper
+///   (`language English<asr_text>…`), so strip it. `language English<asr_text>hello
+///   world</asr_text>` → `hello world`; tagless `language English hello world` →
+///   `hello world`.
+/// - **Forced** (`forced = true`): the open wrapper is in the PROMPT (prefilled),
+///   so the model generates ONLY the transcript + close tag. There is no open
+///   wrapper to strip — doing so would corrupt a transcript that legitimately
+///   starts with or contains "language …". So only the close tag is removed.
+///
+/// Either way the trailing `</asr_text>` is truncated.
+fn strip_asr_wrapper(s: &str, forced: bool) -> String {
+    let mut out = s.trim();
 
-    // Strip content up through <asr_text> open tag if present.
-    if let Some(open) = out.find("<asr_text>") {
-        out = out[open + "<asr_text>".len()..].to_string();
-    } else if let Some(open) = out.find("language ") {
-        // Some checkpoints emit "language English" without the tag.
-        let after = &out[open + "language ".len()..];
-        if let Some(sp) = after.find(char::is_whitespace) {
-            out = after[sp..].trim_start().to_string();
+    if !forced {
+        // Auto-detect: remove the model-emitted open wrapper. Anchor the tagless
+        // fallback to the START (`strip_prefix`), never a mid-transcript "language".
+        if let Some(open) = out.find("<asr_text>") {
+            out = &out[open + "<asr_text>".len()..];
+        } else if let Some(rest) = out.strip_prefix("language ") {
+            // Tagless checkpoint: "language <Name> <transcript>" — drop one name token.
+            if let Some(sp) = rest.find(char::is_whitespace) {
+                out = rest[sp..].trim_start();
+            }
         }
     }
 
-    // Strip trailing </asr_text> close tag if present.
+    // Both modes: truncate at the close tag if present.
     if let Some(close) = out.find("</asr_text>") {
-        out.truncate(close);
+        out = &out[..close];
     }
 
     out.trim().to_string()
@@ -537,33 +585,98 @@ mod tests {
     // Unit tests — always run, no model required
     // -----------------------------------------------------------------------
 
+    // Auto-detect path (forced = false): the model emits the full open wrapper.
     #[test]
     fn strip_wrapper_full() {
         let raw = "language English<asr_text>hello world</asr_text>";
-        assert_eq!(strip_asr_wrapper(raw), "hello world");
+        assert_eq!(strip_asr_wrapper(raw, false), "hello world");
     }
 
     #[test]
     fn strip_wrapper_open_only() {
         let raw = "language English<asr_text>hello world";
-        assert_eq!(strip_asr_wrapper(raw), "hello world");
+        assert_eq!(strip_asr_wrapper(raw, false), "hello world");
     }
 
     #[test]
     fn strip_wrapper_language_prefix_only() {
         let raw = "language English hello world";
-        assert_eq!(strip_asr_wrapper(raw), "hello world");
+        assert_eq!(strip_asr_wrapper(raw, false), "hello world");
     }
 
     #[test]
     fn strip_wrapper_no_wrapper() {
         let raw = "just a transcript";
-        assert_eq!(strip_asr_wrapper(raw), "just a transcript");
+        assert_eq!(strip_asr_wrapper(raw, false), "just a transcript");
     }
 
     #[test]
     fn strip_wrapper_empty() {
-        assert_eq!(strip_asr_wrapper(""), "");
+        assert_eq!(strip_asr_wrapper("", false), "");
+    }
+
+    /// Auto path must NOT mistake a mid-transcript "language" for the tagless
+    /// wrapper — the open-tag branch handles the real wrapper, and the tagless
+    /// fallback is start-anchored.
+    #[test]
+    fn strip_wrapper_auto_preserves_mid_transcript_language_word() {
+        let raw = "language English<asr_text>the programming language Rust is great</asr_text>";
+        assert_eq!(
+            strip_asr_wrapper(raw, false),
+            "the programming language Rust is great"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_language_prefix — the pure prefix-force helper (no model)
+    // -----------------------------------------------------------------------
+
+    /// `Some(name)` appends exactly `language <Name><asr_text>` to the rendered
+    /// prompt (single space after `language`, no space before `<asr_text>`).
+    #[test]
+    fn apply_language_prefix_some() {
+        assert_eq!(
+            apply_language_prefix("PREFIX".to_string(), Some("English")),
+            "PREFIXlanguage English<asr_text>"
+        );
+        // Spot-check a non-English name to prove the name is interpolated verbatim.
+        assert_eq!(
+            apply_language_prefix("PREFIX".to_string(), Some("Spanish")),
+            "PREFIXlanguage Spanish<asr_text>"
+        );
+    }
+
+    /// `None` returns the rendered string unchanged — the byte-identical
+    /// auto-detect guard at the helper level.
+    #[test]
+    fn apply_language_prefix_none_is_identity() {
+        assert_eq!(
+            apply_language_prefix("PREFIX".to_string(), None),
+            "PREFIX"
+        );
+    }
+
+    /// Forced path (forced = true): the prefill is in the PROMPT, so the
+    /// generated `text` is just the transcript (+ close tag). Only the close tag
+    /// is stripped; the open-wrapper parse is skipped so a transcript that
+    /// contains — or even STARTS with — "language …" is never corrupted.
+    #[test]
+    fn strip_wrapper_forced_only_strips_close_tag() {
+        assert_eq!(strip_asr_wrapper("hello world</asr_text>", true), "hello world");
+        // EOG before the close tag (sub-window audio).
+        assert_eq!(strip_asr_wrapper("hello world", true), "hello world");
+        // Regression guard (the review-found bug): a transcript that legitimately
+        // contains "language X" must survive intact under the forced default.
+        assert_eq!(
+            strip_asr_wrapper("the programming language Rust is great</asr_text>", true),
+            "the programming language Rust is great"
+        );
+        // ...even when it STARTS with "language" (start-anchored stripping would
+        // still have eaten this; the forced flag prevents it entirely).
+        assert_eq!(
+            strip_asr_wrapper("language models are reshaping search</asr_text>", true),
+            "language models are reshaping search"
+        );
     }
 
     #[test]
@@ -699,16 +812,35 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn gated_runtime() -> Option<AsrRuntime> {
+        gated_runtime_with_language(None)
+    }
+
+    /// Build a gated `AsrRuntime` threading `language` into the config so the
+    /// regression guard can exercise both the forced and auto-detect paths
+    /// against the real model.
+    fn gated_runtime_with_language(language: Option<String>) -> Option<AsrRuntime> {
         let model_path = std::env::var("MEETING_APP_ASR_MODEL_PATH").ok()?;
         let mmproj_path = std::env::var("MEETING_APP_ASR_MMPROJ_PATH").ok()?;
+        let config = AsrRuntimeConfig {
+            language,
+            ..AsrRuntimeConfig::default()
+        };
         Some(
             AsrRuntime::new(
                 Path::new(&model_path),
                 Path::new(&mmproj_path),
-                AsrRuntimeConfig::default(),
+                config,
             )
             .expect("model load must succeed with valid paths"),
         )
+    }
+
+    /// `true` if `c` is a CJK / Japanese / Korean codepoint: CJK Unified
+    /// (U+4E00..=U+9FFF), Hiragana/Katakana (U+3040..=U+30FF), or Hangul
+    /// syllables (U+AC00..=U+D7AF). Used by the spurious-Chinese regression guard.
+    fn is_cjk(c: char) -> bool {
+        matches!(c as u32,
+            0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF)
     }
 
     fn load_librispeech_0() -> AudioChunk {
@@ -839,6 +971,61 @@ mod tests {
             word_count < 50,
             "word count {word_count} suggests early-stop did not fire; text: {:?}",
             text
+        );
+    }
+
+    /// (gated) — THE spurious-Chinese regression guard. With forcing on
+    /// (`language: Some("English")`), the English librispeech fixture must yield
+    /// a non-empty transcript containing NO CJK codepoints.
+    #[test]
+    #[ignore = "requires MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH"]
+    fn forced_english_output_has_no_cjk() {
+        let mut runtime = match gated_runtime_with_language(Some("English".to_string())) {
+            Some(r) => r,
+            None => return,
+        };
+        let chunk = load_librispeech_0();
+        let segments = runtime
+            .transcribe_chunk(&chunk)
+            .expect("transcription must succeed");
+
+        assert_eq!(segments.len(), 1, "must return exactly one segment");
+        let text = &segments[0].text;
+        assert!(
+            !text.trim().is_empty(),
+            "forced-English transcript must be non-empty; got: {text:?}"
+        );
+        assert!(
+            !text.chars().any(is_cjk),
+            "forced English must not yield CJK codepoints; transcript: {text:?}"
+        );
+    }
+
+    /// (gated) — auto-detect (`language: None`) must not be regressed: the
+    /// English fixture still transcribes within the existing 5% WER bound.
+    /// Pairs with the byte-identical unit guard so both the prompt-build and the
+    /// end-to-end auto path are protected.
+    #[test]
+    #[ignore = "requires MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH"]
+    fn auto_detect_unchanged() {
+        let mut runtime = match gated_runtime_with_language(None) {
+            Some(r) => r,
+            None => return,
+        };
+        let chunk = load_librispeech_0();
+        let segments = runtime
+            .transcribe_chunk(&chunk)
+            .expect("transcription must succeed");
+
+        assert_eq!(segments.len(), 1);
+        let reference =
+            "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL";
+        let wer = word_error_rate(reference, &segments[0].text);
+        assert!(
+            wer <= 0.05,
+            "auto-detect WER {:.2}% exceeds 5% threshold; transcript: {:?}",
+            wer * 100.0,
+            segments[0].text
         );
     }
 }

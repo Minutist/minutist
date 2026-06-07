@@ -95,6 +95,17 @@ export function TranscriptPane() {
               highlightedRange !== null &&
               idx >= highlightedRange.startIndex &&
               idx < highlightedRange.endIndex;
+            // Group consecutive rows by speaker: the labelled chip shows only
+            // when the speaker changes from the previous row. Continuation rows
+            // keep just the colour dot, so the per-speaker colour persists on
+            // every diarized row without the "Speaker X" label repeating.
+            const prevSpeaker = idx > 0 ? transcript[idx - 1].speaker_id : null;
+            const speakerChanged =
+              seg.speaker_id != null && seg.speaker_id !== prevSpeaker;
+            const dotColor =
+              seg.speaker_id != null
+                ? `var(--speaker-${speakerColorIndex(seg.speaker_id)})`
+                : undefined;
             return (
               <li
                 key={idx}
@@ -117,22 +128,17 @@ export function TranscriptPane() {
                 <span className="transcript-pane__text">
                   {/*
                     Phase 6/C: a quiet "Speaker {id}" chip when diarization has
-                    assigned this segment a speaker. Hidden entirely when
-                    `speaker_id` is null/undefined (un-diarized). The id is the
-                    diarizer's first-seen label (A / B / …); we surface it
-                    verbatim. Phase C adds a per-speaker colour dot, with the
-                    palette slot resolved by the pure `speakerColorIndex` mapper
-                    and passed in via the `--dot-color` custom property — tokens
-                    only, no hard-coded colour in TSX.
+                    assigned this segment a speaker, shown only at the start of a
+                    speaker's run (see `speakerChanged`). The id is the diarizer's
+                    first-seen label (A / B / …), surfaced verbatim. The
+                    per-speaker colour dot's palette slot is resolved by the pure
+                    `speakerColorIndex` mapper and passed via the `--dot-color`
+                    custom property — tokens only, no hard-coded colour in TSX.
                   */}
-                  {seg.speaker_id != null && (
+                  {speakerChanged && (
                     <span
                       className="transcript-pane__speaker"
-                      style={{
-                        ["--dot-color" as string]: `var(--speaker-${speakerColorIndex(
-                          seg.speaker_id,
-                        )})`,
-                      }}
+                      style={{ ["--dot-color" as string]: dotColor }}
                       aria-label={`Speaker ${seg.speaker_id}`}
                     >
                       <span
@@ -140,6 +146,23 @@ export function TranscriptPane() {
                         aria-hidden="true"
                       />
                       Speaker {seg.speaker_id}
+                    </span>
+                  )}
+                  {/*
+                    Continuation row (same speaker as the row above): the colour
+                    dot alone, no repeated label. Decorative — the run's leading
+                    chip carries the accessible name.
+                  */}
+                  {seg.speaker_id != null && !speakerChanged && (
+                    <span
+                      className="transcript-pane__speaker transcript-pane__speaker--cont"
+                      style={{ ["--dot-color" as string]: dotColor }}
+                      aria-hidden="true"
+                    >
+                      <span
+                        className="transcript-pane__speaker-dot"
+                        aria-hidden="true"
+                      />
                     </span>
                   )}
                   {seg.text}

@@ -1,0 +1,168 @@
+/*
+ * Editorial Ink — Settings drawer.
+ *
+ * A right-anchored paper panel on a dimmed warm-desk field. Holds the capture /
+ * processing configuration moved out of the top bar. Reuses the sheet surface,
+ * hairline edge, and single oxblood accent; `theme.css` tokens only.
+ */
+
+.settings-drawer-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(28, 26, 23, 0.32);
+}
+
+.settings-drawer {
+  width: 100%;
+  max-width: 22rem;
+  height: 100%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
+  padding: 1.5rem 1.5rem 2rem;
+  background: var(--sheet);
+  border-left: 1px solid var(--rule);
+  box-shadow: var(--shadow-sheet);
+  color: var(--ink);
+  font-family: var(--font-text);
+  /* Slide in from the right edge. */
+  animation: settings-drawer-in var(--reveal-duration) var(--reveal-ease);
+}
+
+@keyframes settings-drawer-in {
+  from {
+    transform: translateX(1.5rem);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* --- Head --------------------------------------------------------------- */
+
+.settings-drawer__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 0.85rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.settings-drawer__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 540;
+  font-size: 1.35rem;
+  letter-spacing: 0.005em;
+  color: var(--ink);
+  font-variation-settings: "opsz" 32, "SOFT" 24, "WONK" 0;
+}
+
+.settings-drawer__close {
+  font-family: var(--font-text);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.3rem 0.85rem;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.settings-drawer__close:hover {
+  color: var(--ink);
+  border-color: var(--stone-faint);
+}
+
+/* --- Groups ------------------------------------------------------------- */
+
+.settings-drawer__group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.95rem;
+}
+
+.settings-drawer__group-title {
+  margin: 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+/*
+ * Device + language pickers: relayout the shared `.device-picker` /
+ * `.language-picker` blocks as a stacked label-over-control field that fills
+ * the drawer width (their inline top-bar form was a tight horizontal row).
+ */
+.settings-drawer .device-picker,
+.settings-drawer .language-picker {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.35rem;
+}
+
+.settings-drawer .device-picker label,
+.settings-drawer .language-picker label {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+.settings-drawer .device-picker select,
+.settings-drawer .language-picker select {
+  width: 100%;
+  max-width: none;
+  font-family: var(--font-text);
+  font-size: 0.92rem;
+  color: var(--ink-soft);
+  background: var(--sheet-quiet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+}
+
+.settings-drawer .device-picker select:hover,
+.settings-drawer .language-picker select:hover {
+  border-color: var(--stone-faint);
+}
+
+/* --- Toggles ------------------------------------------------------------ */
+
+.settings-drawer__toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  font-size: 0.92rem;
+  line-height: 1.4;
+  color: var(--ink-soft);
+  cursor: pointer;
+  user-select: none;
+}
+
+.settings-drawer__toggle input {
+  /* The single oxblood accent drives the native checkbox tick. */
+  accent-color: var(--accent);
+  margin-top: 0.15rem;
+  cursor: pointer;
+  flex: none;
+}
+
+.settings-drawer__toggle input:disabled {
+  cursor: default;
+}
+
+.settings-drawer__toggle:hover {
+  color: var(--ink);
+}

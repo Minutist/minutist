@@ -3,17 +3,13 @@ import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
-import { readDiarizationEnabled } from "../state/diarization-settings";
-import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
-import { readCaptureSystemAudio } from "../state/system-audio-settings";
-import { DevicePicker } from "./DevicePicker";
-import { LanguagePicker } from "./LanguagePicker";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
 import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
+import { SettingsDrawer } from "./SettingsDrawer";
 import { About } from "./About";
 import { Editor } from "../editor/Editor";
 import { TranscriptPane } from "../transcript/TranscriptPane";
@@ -42,22 +38,10 @@ export function MainWindow() {
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const lastError = useRecordingStore((s) => s.lastError);
   const recordingState = useRecordingStore((s) => s.state);
-  const settings = useRecordingStore((s) => s.settings);
-  const setDiarizationEnabled = useRecordingStore(
-    (s) => s.setDiarizationEnabled,
-  );
-  const setGpuAcceleration = useRecordingStore((s) => s.setGpuAcceleration);
-  const setCaptureSystemAudio = useRecordingStore(
-    (s) => s.setCaptureSystemAudio,
-  );
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
   const reDiarize = useMeetingsStore((s) => s.rediarize);
-
-  const diarizationEnabled = readDiarizationEnabled(settings);
-  const gpuAcceleration = readGpuAcceleration(settings);
-  const captureSystemAudio = readCaptureSystemAudio(settings);
 
   // The meeting-list is the entry surface (FR-33): shown when no meeting is
   // open and nothing is being recorded. Opening a meeting, or starting a
@@ -73,11 +57,15 @@ export function MainWindow() {
 
   const transcriptPanelRef = usePanelRef();
   const [transcriptCollapsed, setTranscriptCollapsed] = useState(false);
-  // The summary panel is hidden by default; the header toggle reveals it (FR-30).
+  // The summary is hidden by default; the header toggle reveals it (FR-30) as a
+  // reading-width overlay sheet rather than a cramped third pane.
   const [summaryOpen, setSummaryOpen] = useState(false);
   // The About dialog (Phase 7, S6) is hidden by default; a header affordance
   // opens it. Presentational overlay; closing returns to the prior surface.
   const [aboutOpen, setAboutOpen] = useState(false);
+  // The Settings drawer holds the capture / processing configuration that used
+  // to crowd the top bar (device, language, diarize-on-stop, GPU, system audio).
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     // Load persisted settings first so `selectedDeviceId` reflects the
@@ -87,6 +75,17 @@ export function MainWindow() {
     void refreshDevices();
     void refreshModels();
   }, [refreshDevices, refreshSettings, refreshModels]);
+
+  // Close the summary overlay on Escape — parity with the About dialog and the
+  // Settings drawer.
+  useEffect(() => {
+    if (!summaryOpen) return;
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") setSummaryOpen(false);
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [summaryOpen]);
 
   function toggleTranscript() {
     const handle = transcriptPanelRef.current;
@@ -153,72 +152,6 @@ export function MainWindow() {
           <div className="main-window__meter" aria-label="Audio level">
             <AudioMeter />
           </div>
-          <DevicePicker />
-          {/*
-            ASR transcription-language hint (defaults to English, which fixes the
-            spurious-Chinese auto-detect bug). "Auto-detect" disables forcing.
-            Persists via `update_settings`; self-disables until the settings
-            snapshot has loaded so the round-trip never clobbers settings with a
-            partial object.
-          */}
-          <LanguagePicker />
-          {/*
-            Phase 6 — diarization-enabled toggle (off by default). When on, the
-            orchestrator runs speaker diarization on stop. Persists via
-            `update_settings` so the choice survives an app restart. Disabled
-            until the settings snapshot has loaded so the round-trip never
-            clobbers settings with a partial object.
-          */}
-          <label className="main-window__diarize-toggle">
-            <input
-              type="checkbox"
-              checked={diarizationEnabled}
-              disabled={settings === null}
-              onChange={(e) => void setDiarizationEnabled(e.target.checked)}
-            />
-            <span>Diarize on stop</span>
-          </label>
-          {/*
-            Runtime GPU-acceleration toggle (on by default). When off, inference
-            runs on CPU (`n_gpu_layers = 0`) even in a GPU-feature build — the
-            escape hatch for weak GPUs / driver trouble. In a default CPU-only
-            build the flag has no effect. Persists via `update_settings` so the
-            choice survives an app restart. Disabled until the settings snapshot
-            has loaded so the round-trip never clobbers settings with a partial
-            object. See `architecture/cross-cutting.md` — "GPU portability".
-          */}
-          <label className="main-window__gpu-toggle">
-            <input
-              type="checkbox"
-              checked={gpuAcceleration}
-              disabled={settings === null}
-              onChange={(e) => void setGpuAcceleration(e.target.checked)}
-            />
-            <span>GPU acceleration</span>
-          </label>
-          {/*
-            System-audio (call / loopback) capture toggle (off by default). When
-            on, the call audio is captured alongside the mic and mixed into one
-            stream so all participants are transcribed. It is echo-prone: if the
-            mic also picks the call up from the speakers, the call audio is
-            doubled — so the tooltip advises turning it off in that case.
-            Loopback capture is currently Windows-only; elsewhere the backend
-            falls back to mic-only. Persists via `update_settings`. Disabled
-            until the settings snapshot has loaded so the round-trip never
-            clobbers settings with a partial object.
-          */}
-          <label
-            className="main-window__system-audio-toggle"
-            title="Capture the call / system audio and mix it with your microphone so all participants are transcribed. Turn this off if your microphone also picks up the call from your speakers (echo)."
-          >
-            <input
-              type="checkbox"
-              checked={captureSystemAudio}
-              disabled={settings === null}
-              onChange={(e) => void setCaptureSystemAudio(e.target.checked)}
-            />
-            <span>Capture call / system audio</span>
-          </label>
           {inWorkspace && (
             <button
               type="button"
@@ -239,6 +172,21 @@ export function MainWindow() {
               {summaryOpen ? "Hide summary" : "Summary"}
             </button>
           )}
+          {/*
+            Settings — opens the drawer holding the capture / processing
+            configuration (device, language, diarize-on-stop, GPU, system audio)
+            that used to crowd the bar. Adds no command; the drawer's controls
+            route through the existing settings seams.
+          */}
+          <button
+            type="button"
+            className="main-window__toggle-transcript"
+            aria-haspopup="dialog"
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen(true)}
+          >
+            Settings
+          </button>
           {/*
             Phase 7 (S6) — About affordance. Always available (product info, not
             workspace-scoped). Opens the About dialog listing bundled-model SPDX
@@ -296,29 +244,38 @@ export function MainWindow() {
           >
             <TranscriptPane />
           </Panel>
-
-          {summaryOpen && activeMeetingId !== null && (
-            <>
-              <Separator className="main-window__resize-handle">
-                <span
-                  className="main-window__resize-grip"
-                  aria-hidden="true"
-                />
-              </Separator>
-              <Panel
-                id="summary"
-                className="main-window__pane main-window__pane--summary"
-                minSize="20%"
-                defaultSize="35%"
-              >
-                <SummaryView meetingId={activeMeetingId} />
-              </Panel>
-            </>
-          )}
         </Group>
       ) : (
         <MeetingList />
       )}
+
+      {/*
+        Summary (FR-30) as a reading-width overlay sheet rather than a third
+        body pane: a serif summary column does not fit alongside notes +
+        transcript at a comfortable measure. Scrim click / the header toggle
+        dismiss it; the SummaryView owns its own Summarise / Edit actions.
+      */}
+      {summaryOpen && activeMeetingId !== null && (
+        <div
+          className="summary-overlay"
+          onClick={() => setSummaryOpen(false)}
+        >
+          <div
+            className="summary-overlay__sheet ink-reveal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Meeting summary"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <SummaryView meetingId={activeMeetingId} />
+          </div>
+        </div>
+      )}
+
+      <SettingsDrawer
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      />
 
       {aboutOpen && <About onClose={() => setAboutOpen(false)} />}
     </div>

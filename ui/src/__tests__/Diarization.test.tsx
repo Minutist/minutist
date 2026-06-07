@@ -210,6 +210,31 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     expect(screen.getAllByText(/^Speaker /)).toHaveLength(1);
   });
 
+  it("groups consecutive same-speaker rows: the labelled chip shows once per run, continuation rows keep only the dot", () => {
+    act(() => {
+      useRecordingStore.setState({
+        transcript: [
+          makeSegment(0, "first", "A"),
+          makeSegment(5_000, "second", "A"),
+          makeSegment(10_000, "third", "B"),
+        ],
+      });
+    });
+    const { container } = render(<TranscriptPane />);
+    // Two labelled chips total (A once at its run start, B once), not three.
+    expect(screen.getAllByText(/^Speaker /)).toHaveLength(2);
+    expect(screen.getByText("Speaker A")).toBeInTheDocument();
+    expect(screen.getByText("Speaker B")).toBeInTheDocument();
+    // A colour dot on every diarized row (2× A + 1× B = 3).
+    expect(
+      container.querySelectorAll(".transcript-pane__speaker-dot"),
+    ).toHaveLength(3);
+    // Exactly one continuation (dot-only) marker — the second "A" row.
+    expect(
+      container.querySelectorAll(".transcript-pane__speaker--cont"),
+    ).toHaveLength(1);
+  });
+
   // --- Phase C: per-speaker colour dot ---------------------------------
 
   it("renders a colour dot resolving to var(--speaker-1) for speaker A", () => {

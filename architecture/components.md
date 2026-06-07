@@ -1095,8 +1095,8 @@ than packages.
 | Component | Lives in | Owns |
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
-| Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Per-segment speaker chip carries a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). |
-| Meeting shell | `ui/src/shell/` | Window chrome, start/stop/pause, audio meter, meeting list. |
+| Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
+| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the Settings drawer (`SettingsDrawer.tsx` — input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture); and the reading-width summary overlay. The capture/processing settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. All drawer controls route through the existing settings seams; no new command. |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 

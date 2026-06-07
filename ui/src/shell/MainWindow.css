@@ -19,7 +19,10 @@
 
 .main-window__topbar {
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  /* minmax(0, 1fr) lets the side tracks shrink below their content's
+     min-content so a wide controls cluster never forces horizontal overflow;
+     the controls wrap instead (see below). */
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   gap: 1.25rem;
   padding: 0.6rem 1.25rem;
@@ -30,6 +33,7 @@
 
 .main-window__brand {
   justify-self: start;
+  min-width: 0;
 }
 
 .main-window__wordmark {
@@ -38,6 +42,7 @@
   font-size: 1.05rem;
   letter-spacing: 0.01em;
   color: var(--ink);
+  white-space: nowrap;
   /* A touch of Fraunces optical-size + soft character on the wordmark. */
   font-variation-settings: "opsz" 28, "SOFT" 30, "WONK" 0;
 }
@@ -50,7 +55,10 @@
   justify-self: end;
   display: flex;
   align-items: center;
-  gap: 0.85rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem 0.85rem;
+  min-width: 0;
 }
 
 /* --- Recording status (focal) ------------------------------------------- */
@@ -242,38 +250,6 @@
   border-color: var(--rule-strong);
 }
 
-/* --- Header settings toggles (diarization, GPU acceleration) ------------ */
-
-.main-window__diarize-toggle,
-.main-window__gpu-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.4rem;
-  font-family: var(--font-text);
-  font-size: 0.78rem;
-  letter-spacing: 0.02em;
-  color: var(--stone);
-  cursor: pointer;
-  user-select: none;
-}
-
-.main-window__diarize-toggle input,
-.main-window__gpu-toggle input {
-  /* The single oxblood accent drives the native checkbox tick. */
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-
-.main-window__diarize-toggle input:disabled,
-.main-window__gpu-toggle input:disabled {
-  cursor: default;
-}
-
-.main-window__diarize-toggle:hover,
-.main-window__gpu-toggle:hover {
-  color: var(--ink-soft);
-}
-
 /* --- Chrome strip (model download + errors) ----------------------------- */
 
 .main-window__chrome:not(:empty) {
@@ -394,11 +370,6 @@
   background: transparent;
 }
 
-/* Summary — a third optional column; the sheet treatment lives in SummaryView.css. */
-.main-window__pane--summary {
-  background: transparent;
-}
-
 /* Hairline divider with a subtle, centred grip. */
 .main-window__resize-handle {
   position: relative;
@@ -426,13 +397,16 @@
   height: 34px;
   border-radius: 999px;
   background: var(--rule-strong);
-  opacity: 0;
+  /* Faintly visible at rest so the divider is discoverable as draggable;
+     deepens on hover / active drag. */
+  opacity: 0.5;
   transition: opacity 120ms ease, background 120ms ease;
 }
 
 .main-window__resize-handle:hover .main-window__resize-grip,
 .main-window__resize-handle[data-resize-handle-active] .main-window__resize-grip {
   opacity: 1;
+  background: var(--accent);
 }
 
 .main-window__resize-handle:hover::before,
@@ -446,4 +420,48 @@
 }
 .main-window__panes.ink-reveal {
   animation-delay: 160ms;
+}
+
+/* --- Summary overlay ---------------------------------------------------- */
+/*
+ * The summary opens as a centered reading-width sheet on a dimmed warm-desk
+ * field (FR-30), reusing the About / onboarding sheet idiom. The SummaryView
+ * inside owns its own header + actions; this wrapper supplies the scrim, the
+ * paper surface, and a comfortable reading measure.
+ */
+.summary-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1.5rem;
+  background: rgba(28, 26, 23, 0.32);
+  box-sizing: border-box;
+}
+
+.summary-overlay__sheet {
+  width: 100%;
+  max-width: 46rem;
+  max-height: 86vh;
+  overflow-y: auto;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+  padding: 2rem 2.5rem 2.5rem;
+  box-sizing: border-box;
+}
+
+/*
+ * Inside the overlay the SummaryView drops its pane chrome (the recessed
+ * full-height scrolling column it uses as a body pane): the overlay sheet
+ * already supplies the paper surface, padding, and scroll.
+ */
+.summary-overlay__sheet .summary-view {
+  height: auto;
+  overflow: visible;
+  padding: 0;
+  background: transparent;
 }

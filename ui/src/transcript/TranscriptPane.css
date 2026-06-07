@@ -113,6 +113,17 @@
 }
 
 /*
+ * Continuation row (same speaker as the row above): just the colour dot, no
+ * tinted chip / border / label. Keeps the per-speaker colour on every row while
+ * the leading chip of the run carries the name.
+ */
+.transcript-pane__speaker--cont {
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+/*
  * Phase C per-speaker colour dot: a small filled disc preceding the label.
  * The colour comes from the chip's inline `--dot-color` custom property
  * (resolved to a --speaker-N palette token); if missing it falls back to the

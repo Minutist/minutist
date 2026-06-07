@@ -22,6 +22,9 @@
   padding: 2.25rem 1.5rem 4rem;
   display: flex;
   justify-content: center;
+  /* Let the sheet's height be driven by its content + min-height (fill, then
+     grow + scroll) rather than being force-stretched to the field height. */
+  align-items: flex-start;
 }
 
 /* The page. */
@@ -30,6 +33,10 @@
   /* Reading column + a left gutter for the anchor marginalia, so the
      marginalia sits OUTSIDE the text measure and never shifts it. */
   max-width: calc(var(--reading-measure) + 6.5rem);
+  /* Fill the column height so a short note reads as a full page on the desk
+     rather than a small card floating above empty space; a long note grows
+     past this and the field scrolls. */
+  min-height: 100%;
   background: var(--sheet);
   border: 1px solid var(--rule);
   border-radius: var(--radius);

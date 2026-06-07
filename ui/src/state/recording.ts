@@ -17,6 +17,7 @@ import type { AppEvent } from "../ipc/app-event";
 import { useModelsStore } from "./models";
 import { withDiarizationEnabled } from "./diarization-settings";
 import { withGpuAcceleration } from "./gpu-acceleration-settings";
+import { withPreferLargeAsrModel } from "./large-asr-model-settings";
 import { withCaptureSystemAudio } from "./system-audio-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
 import { withTranscriptionLanguage } from "./transcription-language-settings";
@@ -74,6 +75,13 @@ export type RecordingStore = {
    * inference runs on CPU even in a GPU-feature build.
    */
   setGpuAcceleration: (enabled: boolean) => Promise<void>;
+  /**
+   * Opt the Qwen ASR branch into the larger 1.7B GPU tier (off by default),
+   * persisting via `commands.updateSettings` — the same round-trip-through-
+   * settings pattern as `setGpuAcceleration`. Only affects languages that route
+   * to Qwen; the Parakeet branch ignores it.
+   */
+  setPreferLargeAsrModel: (enabled: boolean) => Promise<void>;
   /**
    * Toggle the system-audio (call / loopback) capture setting (off by default),
    * persisting via `commands.updateSettings` so the choice survives an app
@@ -243,6 +251,22 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withGpuAcceleration(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setPreferLargeAsrModel: async (enabled) => {
+    // Persist via `update_settings`, the same pattern as `setGpuAcceleration`.
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    const next = withPreferLargeAsrModel(current, enabled);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

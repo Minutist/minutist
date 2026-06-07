@@ -23,6 +23,60 @@
       ]
     },
     {
+      "id": "parakeet-tdt-0.6b-v3-int8",
+      "kind": "asr",
+      "display_name": "Parakeet TDT 0.6B v3 (int8)",
+      "license": "cc-by-4.0",
+      "total_size_bytes": 670478772,
+      "files": [
+        {
+          "filename": "encoder.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/2bda32ec70b097a55adaa07d9a7173915b43cc78/encoder.int8.onnx",
+          "size": 652184281,
+          "sha256": "acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247"
+        },
+        {
+          "filename": "decoder.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/2bda32ec70b097a55adaa07d9a7173915b43cc78/decoder.int8.onnx",
+          "size": 11845275,
+          "sha256": "179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e"
+        },
+        {
+          "filename": "joiner.int8.onnx",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/2bda32ec70b097a55adaa07d9a7173915b43cc78/joiner.int8.onnx",
+          "size": 6355277,
+          "sha256": "3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3"
+        },
+        {
+          "filename": "tokens.txt",
+          "url": "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/2bda32ec70b097a55adaa07d9a7173915b43cc78/tokens.txt",
+          "size": 93939,
+          "sha256": "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"
+        }
+      ]
+    },
+    {
+      "id": "qwen3-asr-1.7b-q8_0",
+      "kind": "asr",
+      "display_name": "Qwen3-ASR 1.7B (Q8_0)",
+      "license": "apache-2.0",
+      "total_size_bytes": 2520744288,
+      "files": [
+        {
+          "filename": "Qwen3-ASR-1.7B-Q8_0.gguf",
+          "url": "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/36a678687ba7d07a74ca70ccb0e36902e005fb80/Qwen3-ASR-1.7B-Q8_0.gguf",
+          "size": 2165034944,
+          "sha256": "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57"
+        },
+        {
+          "filename": "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+          "url": "https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/36a678687ba7d07a74ca70ccb0e36902e005fb80/mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+          "size": 355709344,
+          "sha256": "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d"
+        }
+      ]
+    },
+    {
       "id": "gemma-4-e4b-it-q4_k_m",
       "kind": "llm",
       "display_name": "Gemma 4 E4B Instruct (Q4_K_M)",

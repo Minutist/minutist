@@ -70,6 +70,13 @@ const fn default_capture_system_audio() -> bool {
     true
 }
 
+/// Default for `prefer_large_asr_model`: OFF. The larger Qwen3-ASR-1.7B tier is
+/// opt-in (bigger download, GPU-class footprint); the 0.6B CPU model is the
+/// default. See `architecture/cross-cutting.md` — "ASR engine routing".
+const fn default_prefer_large_asr_model() -> bool {
+    false
+}
+
 /// Default ASR language hint. "English" forces the English assistant-turn
 /// prefix, fixing the spurious-Chinese auto-detect bug for the primary user.
 /// The sentinel "auto" restores auto-detect (no prefix; byte-identical to the
@@ -215,6 +222,15 @@ pub struct Settings {
     /// Chinese bug). An older store deserialises to "English" via the default fn.
     #[serde(default = "default_transcription_language")]
     pub transcription_language: String,
+
+    /// Opt into the larger Qwen3-ASR-1.7B tier for the Qwen branch (broader +
+    /// better-multilingual accuracy) instead of the 0.6B CPU default. Only
+    /// affects languages that route to Qwen (the Parakeet branch ignores it);
+    /// see `common::asr_engine_for_language`. Off by default — it is a larger
+    /// download with a GPU-class footprint. An older store deserialises to
+    /// `false`. See `architecture/cross-cutting.md` — "ASR engine routing".
+    #[serde(default = "default_prefer_large_asr_model")]
+    pub prefer_large_asr_model: bool,
 }
 
 impl Default for Settings {
@@ -232,6 +248,7 @@ impl Default for Settings {
             gpu_acceleration: default_gpu_acceleration(),
             capture_system_audio: true,
             transcription_language: default_transcription_language(),
+            prefer_large_asr_model: default_prefer_large_asr_model(),
         }
     }
 }
@@ -272,6 +289,7 @@ mod tests {
             gpu_acceleration: false,
             capture_system_audio: true,
             transcription_language: "Japanese".to_string(),
+            prefer_large_asr_model: true,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");

@@ -18,6 +18,7 @@ role when work is parallel.
 | `audio-capture` | audio-engineer | `crates/audio-capture/**` | This file too if changing the capture contract. | `common` |
 | `vad-chunker` | audio-engineer | `crates/vad-chunker/**` | Same | `common` |
 | `asr-runtime` | ml-runtime-engineer | `crates/asr-runtime/**` | Same | `common` |
+| `asr-parakeet` | ml-runtime-engineer | `crates/asr-parakeet/**` | Same | `common` |
 | `diarizer` | ml-runtime-engineer | `crates/diarizer/**` | Same | `common` |
 | `summariser` | ml-runtime-engineer | `crates/summariser/**` | Same | `common` |
 | `model-registry` | ml-runtime-engineer | `crates/model-registry/**` | Same | `common`, `settings` |

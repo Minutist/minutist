@@ -26,6 +26,7 @@ import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readTheme } from "../state/onboarding-settings";
 import {
   ModelDownloadCard,
+  PARAKEET_MODEL_ID,
   ASR_MODEL_ID,
   LLM_MODEL_ID,
 } from "./ModelDownloadStatus";
@@ -60,13 +61,22 @@ function ModelStep() {
     <div className="onboarding__body">
       <h1 className="onboarding__title">Models</h1>
       <p className="onboarding__lede">
-        Two local models do the work: speech recognition for the transcript, and
-        a language model for summaries. Download them now for the best first
-        experience, or skip and fetch them later from the main window.
+        Local models do the work: a speech model for the transcript and a
+        language model for summaries. Parakeet handles English and European
+        languages with word-level timings; add the multilingual model if you
+        record in Chinese, Japanese, Korean, or Arabic. Download what you need
+        now, or fetch it later from the main window.
       </p>
       {/* Per-model cards — each self-tracks progress / ready / retry. */}
       <div className="onboarding__models">
-        <ModelDownloadCard modelId={ASR_MODEL_ID} fallbackName="Speech model" />
+        <ModelDownloadCard
+          modelId={PARAKEET_MODEL_ID}
+          fallbackName="Speech model — English & European"
+        />
+        <ModelDownloadCard
+          modelId={ASR_MODEL_ID}
+          fallbackName="Speech model — other languages"
+        />
         <ModelDownloadCard
           modelId={LLM_MODEL_ID}
           fallbackName="Summarisation model"

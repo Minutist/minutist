@@ -220,6 +220,31 @@ Alternative strategies (pad-to-30s-per-call, post-filter hallucinated
 tail) are documented in Spike 1's README as fallbacks if batched-VAD's
 latency profile is unacceptable.
 
+## ASR engine routing
+
+There are two ASR backends behind `common::AsrBackend` (Phase 8): `asr-parakeet`
+(sherpa-onnx Parakeet TDT v3 — English + 24 EU languages, per-word timestamps,
+CPU) and `asr-runtime` (llama-cpp-2 Qwen3-ASR — 52 languages/dialects, no
+timestamps; 0.6B CPU default + optional 1.7B GPU tier).
+
+The engine is chosen **deterministically from the user's `transcription_language`
+setting**, never by inspecting the audio (the language isn't known before
+transcription). The mapping is a pure function in `common`
+(`asr_engine_for_language`) so the orchestrator and the UI agree:
+
+- language ∈ Parakeet's set (English + the 24 EU locales) → **Parakeet** (primary
+  — better English/EU accuracy + timestamps);
+- language ∈ Qwen-only (Chinese, Japanese, Korean, Arabic, …) → **Qwen**;
+- `Auto-detect` (the `""`/`"auto"` sentinel) → **Qwen** (broadest coverage is the
+  safe default when the language is unknown).
+
+Within the Qwen branch, the 1.7B tier is used only when the user opts into the
+GPU model (a `settings` flag), else the 0.6B. The orchestrator resolves the
+engine once at recording start (and at re-transcribe) in
+`runner::build_asr_backend`, mirroring how it already resolves the language hint
+and GPU layers. `model-registry` only fetches the model(s) for the selected
+engine; pulling all three is opt-in (disk).
+
 ## Notes paragraph-anchor clock
 
 Phase 3 binding rule (stress-test correction A4). Notes paragraph anchors

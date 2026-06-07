@@ -67,6 +67,20 @@ const DEV_MODELS: ModelStatus[] = [
     license: "apache-2.0",
   },
   {
+    id: "parakeet-tdt-0.6b-v3-int8",
+    kind: "asr",
+    display_name: "Parakeet TDT 0.6B v3 (int8)",
+    status: { state: "available", local_dir: "/dev/models/asr/parakeet-tdt-0.6b-v3" },
+    license: "cc-by-4.0",
+  },
+  {
+    id: "qwen3-asr-1.7b-q8_0",
+    kind: "asr",
+    display_name: "Qwen3-ASR 1.7B (Q8_0)",
+    status: { state: "available", local_dir: "/dev/models/asr/qwen3-asr-1.7b" },
+    license: "apache-2.0",
+  },
+  {
     id: "gemma-4-e4b-it-q4_k_m",
     kind: "llm",
     display_name: "Gemma 4 E4B Instruct (Q4_K_M)",
@@ -107,6 +121,8 @@ const DEV_SETTINGS: Settings = {
   // ASR language hint. Seeded "English" (the schema default) so the language
   // picker renders selected under `vite dev`.
   transcription_language: "English",
+  // Phase 8 hybrid-ASR GPU tier opt-in (off by default).
+  prefer_large_asr_model: false,
 };
 
 /**

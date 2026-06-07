@@ -266,6 +266,16 @@ impl Orchestrator {
         let language =
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
 
+        // Hybrid ASR (Phase 8): pick the engine from the transcription-language
+        // setting — Parakeet for the languages it covers, else a Qwen tier
+        // (1.7B when `prefer_large_asr_model` is set, else 0.6B). The `language`
+        // hint above only affects the Qwen tiers. See
+        // `common::asr_engine_for_language`.
+        let engine = meeting_app_common::asr_engine_for_language(
+            &self.settings.current().transcription_language,
+            self.settings.current().prefer_large_asr_model,
+        );
+
         // Live diarization (Phase B): build the additive `OnlineDiarizer` BEFORE
         // spawning the runner, gated on the `diarization_enabled` setting AND the
         // embedding model being locally `Available` (no download, no block — see
@@ -284,6 +294,7 @@ impl Orchestrator {
             meeting_id,
             n_gpu_layers,
             language,
+            engine,
             online_diarizer,
         );
 
@@ -634,15 +645,23 @@ impl Orchestrator {
         // same `transcription_language` setting as the live path.
         let language =
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
+        // Hybrid ASR (Phase 8): same engine routing as the live path, so a
+        // re-transcribe of an English/EU meeting uses Parakeet (timestamps) and
+        // others use the resolved Qwen tier.
+        let engine = meeting_app_common::asr_engine_for_language(
+            &self.settings.current().transcription_language,
+            self.settings.current().prefer_large_asr_model,
+        );
+        let missing_model_id = runner::engine_model_id(engine);
 
         let segments: Vec<Segment> = tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
             // Decode pause-INCLUDING PCM.
             let pcm = persistence::read_audio_pcm(&meeting_dir_for_blocking)?;
 
-            // Build the production AsrRuntime. `init_asr_runtime` is async; drive
-            // it on a current-thread runtime inside this blocking context (the
-            // same approach the ASR worker uses). Model resolution itself is the
-            // only async step.
+            // Build the production ASR backend for the routed engine.
+            // `init_asr_backend` is async; drive it on a current-thread runtime
+            // inside this blocking context (the same approach the ASR worker
+            // uses). Model resolution itself is the only async step.
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -650,17 +669,17 @@ impl Orchestrator {
                     context: format!("re_transcribe runtime build failed: {e}"),
                 })?;
 
-            let mut runtime = match rt.block_on(runner::build_asr_runtime_for_retranscribe(&registry, n_gpu_layers, language))? {
+            let mut runtime = match rt.block_on(runner::build_asr_backend_for_retranscribe(&registry, engine, n_gpu_layers, language))? {
                 Some(r) => r,
                 None => {
                     return Err(AppError::ModelLoad {
-                        model_id: "qwen3-asr-0.6b-q8_0".into(),
+                        model_id: missing_model_id.into(),
                         context: "ASR model not available; cannot re-transcribe".into(),
                     });
                 }
             };
 
-            runner::re_transcribe_buffer(&pcm, &mut runtime, &event_tx, meeting_id)
+            runner::re_transcribe_buffer(&pcm, runtime.as_mut(), &event_tx, meeting_id)
         })
         .await
         .map_err(|e| AppError::Internal {
@@ -1088,6 +1107,11 @@ impl Orchestrator {
         // path (this test-source path is production-equivalent).
         let language =
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
+        // Hybrid ASR (Phase 8): same engine routing as the production `start()`.
+        let engine = meeting_app_common::asr_engine_for_language(
+            &self.settings.current().transcription_language,
+            self.settings.current().prefer_large_asr_model,
+        );
         // Phase B: build the live diarizer (gated on diarization_enabled +
         // local model availability), exactly as the production `start()` path.
         let online_diarizer =
@@ -1100,6 +1124,7 @@ impl Orchestrator {
             meeting_id,
             n_gpu_layers,
             language,
+            engine,
             online_diarizer,
         );
         guard.runner = Some(runner_handle);

@@ -8,6 +8,7 @@ members = [
     "crates/persistence",
     "crates/model-registry",
     "crates/asr-runtime",
+    "crates/asr-parakeet",
     "crates/summariser",
     "crates/diarizer",
     "crates/orchestrator",

@@ -51,8 +51,8 @@ use asr_runtime::{AsrRuntime, AsrRuntimeConfig};
 use audio_capture::{AudioFrameBatch, AudioStreams};
 use diarizer::{OnlineDiarizer, OnlineDiarizerConfig};
 use meeting_app_common::{
-    AppError, AppEvent, AppResult, AsrBackend, AudioChunk, AudioMeterFrame, MeetingId, MeetingMeta,
-    ModelId, ModelStatusState, Segment,
+    AppError, AppEvent, AppResult, AsrBackend, AsrEngine, AudioChunk, AudioMeterFrame, MeetingId,
+    MeetingMeta, ModelId, ModelStatusState, Segment,
 };
 use model_registry::ModelRegistry;
 use persistence::MeetingWriter;
@@ -77,8 +77,6 @@ const SAMPLE_RATE_HZ: u64 = 16_000;
 const RECORDING_CLOCK_MIN_INTERVAL_MS: u64 = 200;
 /// Poll interval when no audio is arriving (latency-window check).
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Hardcoded ASR model ID (Phase 2 LOCKED CHOICE).
-const ASR_MODEL_ID: &str = "qwen3-asr-0.6b-q8_0";
 /// Flush dispatch queue capacity. Drop-oldest when this is exceeded.
 const FLUSH_CHANNEL_CAP: usize = 4;
 
@@ -363,6 +361,7 @@ pub(crate) fn spawn_runner(
     meeting_id: MeetingId,
     n_gpu_layers: u32,
     language: Option<String>,
+    engine: AsrEngine,
     online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
     spawn_runner_inner(
@@ -373,6 +372,7 @@ pub(crate) fn spawn_runner(
         meeting_id,
         n_gpu_layers,
         language,
+        engine,
         None,
         online_diarizer,
     )
@@ -388,6 +388,7 @@ fn spawn_runner_inner(
     meeting_id: MeetingId,
     n_gpu_layers: u32,
     language: Option<String>,
+    engine: AsrEngine,
     prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
     online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
@@ -411,6 +412,7 @@ fn spawn_runner_inner(
             asr_registry,
             n_gpu_layers,
             language,
+            engine,
             asr_event_tx,
             writer_cmd_tx,
         );
@@ -456,9 +458,9 @@ pub(crate) fn spawn_runner_with_backend(
     online_diarizer: Option<Arc<OnlineDiarizer>>,
 ) -> RunnerHandle {
     // The prebuilt backend is used directly, so the lazy production-path
-    // `n_gpu_layers` is moot here — pass the compile-time ceiling for parity.
-    // The prebuilt backend also makes `config.language` moot; `None` (no
-    // prefix) is the safe moot value — no behaviour change.
+    // `n_gpu_layers`, `language`, and `engine` are all moot here — the init path
+    // is never reached. Pass the compile-time GPU ceiling for parity, `None`
+    // language (no prefix), and the CPU-default engine as the moot value.
     spawn_runner_inner(
         streams,
         writer,
@@ -467,6 +469,7 @@ pub(crate) fn spawn_runner_with_backend(
         meeting_id,
         asr_runtime::default_n_gpu_layers(),
         None,
+        AsrEngine::Qwen06B,
         Some(backend),
         online_diarizer,
     )
@@ -934,16 +937,18 @@ fn dispatch_flush_inner(
 ///
 /// `language`: the runtime-resolved ASR language hint (from the
 /// `transcription_language` setting via [`resolve_transcription_language`]);
-/// `None` = auto-detect. Passed by value into the one-shot `init_asr_runtime`.
+/// `None` = auto-detect. Passed by value into the one-shot `init_asr_backend`.
 ///
 /// One flush is in-flight at a time: the worker pops one payload, processes
 /// it fully, then waits for the next notification.
+#[allow(clippy::too_many_arguments)]
 fn run_asr_worker(
     flush_queue: FlushQueue,
     prebuilt_backend: Option<Box<dyn AsrBackend + Send>>,
     model_registry: Arc<ModelRegistry>,
     n_gpu_layers: u32,
     language: Option<String>,
+    engine: AsrEngine,
     event_tx: broadcast::Sender<AppEvent>,
     writer_cmd_tx: mpsc::Sender<WriterCommand>,
 ) {
@@ -971,9 +976,10 @@ fn run_asr_worker(
         }
     };
 
-    // Production path: lazily-initialised AsrRuntime wrapped in an Option.
+    // Production path: lazily-initialised ASR backend (Parakeet or a Qwen tier,
+    // chosen by `engine`) wrapped in an Option.
     // Test path: the prebuilt backend is used directly.
-    let mut lazy_runtime: Option<AsrRuntime> = None;
+    let mut lazy_runtime: Option<Box<dyn AsrBackend + Send>> = None;
 
     // Determine which backend to use: either the prebuilt one (test) or a lazy
     // production one. We use a closure-style dispatch below to avoid lifetimes
@@ -1044,13 +1050,16 @@ fn run_asr_worker(
         let backend: &mut dyn AsrBackend = if let Some(ref mut pb) = prebuilt {
             pb.as_mut()
         } else {
-            // Lazy-initialise AsrRuntime on the first flush (production path).
+            // Lazy-initialise the ASR backend on the first flush (production
+            // path). The engine (Parakeet vs a Qwen tier) was resolved at start
+            // from the transcription-language setting.
             if lazy_runtime.is_none() {
-                // `init_asr_runtime` runs at most once (lazy init), but the
+                // `init_asr_backend` runs at most once (lazy init), but the
                 // borrow checker can't see that across the loop, so clone the
                 // owned hint into the one-shot call.
-                let result = rt.block_on(init_asr_runtime(
+                let result = rt.block_on(init_asr_backend(
                     &model_registry,
+                    engine,
                     n_gpu_layers,
                     language.clone(),
                 ));
@@ -1063,13 +1072,13 @@ fn run_asr_worker(
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(target: "orchestrator", "ASR runtime init failed: {e}");
+                        tracing::warn!(target: "orchestrator", "ASR backend init failed: {e}");
                         let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
                         continue;
                     }
                 }
             }
-            lazy_runtime.as_mut().expect("just initialised")
+            lazy_runtime.as_mut().expect("just initialised").as_mut()
         };
 
         // Wrap the per-flush call in `catch_unwind` so a panic inside
@@ -1157,71 +1166,124 @@ pub(crate) fn resolve_transcription_language(setting: &str) -> Option<String> {
     }
 }
 
-/// Lazily initialise `AsrRuntime` on the first flush.
+/// Map the resolved [`AsrEngine`] to its `resources/models.json` model id.
+pub(crate) fn engine_model_id(engine: AsrEngine) -> &'static str {
+    match engine {
+        AsrEngine::ParakeetEuV3 => "parakeet-tdt-0.6b-v3-int8",
+        AsrEngine::Qwen06B => "qwen3-asr-0.6b-q8_0",
+        AsrEngine::Qwen17B => "qwen3-asr-1.7b-q8_0",
+    }
+}
+
+/// Lazily initialise the ASR backend chosen by `engine` on the first flush.
 ///
-/// `n_gpu_layers` is the runtime-resolved GPU-offload count (see
-/// [`resolve_gpu_layers`]); it is set on the `AsrRuntimeConfig` so the model and
-/// the mtmd encoder honour the `gpu_acceleration` setting.
+/// `engine` is resolved at recording start from the `transcription_language`
+/// setting (and the GPU-model opt-in) via [`common::asr_engine_for_language`]:
+/// Parakeet (`asr-parakeet`, sherpa-onnx) for the languages it covers, else a
+/// Qwen tier (`asr-runtime`, llama-cpp-2 mtmd).
 ///
-/// `language` is the runtime-resolved ASR language hint (see
-/// [`resolve_transcription_language`]); it is set on the `AsrRuntimeConfig` so
-/// the prompt forces that language (`None` = auto-detect, no prefix).
+/// `n_gpu_layers` + `language` only affect the Qwen path — Parakeet is
+/// multilingual auto-detect and runs on the ONNX-Runtime CPU EP.
 ///
-/// Returns `Ok(None)` if the model is not yet available (caller should skip
-/// the flush). Returns `Ok(Some(runtime))` when initialisation succeeded.
-async fn init_asr_runtime(
+/// Returns `Ok(None)` if the selected model is not yet available (caller should
+/// skip the flush). Returns `Ok(Some(backend))` when initialisation succeeded.
+async fn init_asr_backend(
     model_registry: &ModelRegistry,
+    engine: AsrEngine,
     n_gpu_layers: u32,
     language: Option<String>,
-) -> AppResult<Option<AsrRuntime>> {
-    let model_id = ModelId::from(ASR_MODEL_ID);
+) -> AppResult<Option<Box<dyn AsrBackend + Send>>> {
+    // Is a given model id locally `Available` (downloaded + hash-verified)? A
+    // synchronous, no-network check — the live path must never download or block.
+    let is_available = |id: &ModelId| -> bool {
+        model_registry
+            .list_models()
+            .into_iter()
+            .find(|s| &s.id == id)
+            .map(|s| matches!(s.status, ModelStatusState::Available { .. }))
+            .unwrap_or(false)
+    };
 
-    // Fast path: check whether the model is available.
-    let model_available = model_registry
-        .list_models()
-        .into_iter()
-        .find(|s| s.id == model_id)
-        .map(|s| matches!(s.status, ModelStatusState::Available { .. }))
-        .unwrap_or(false);
-
-    if !model_available {
-        tracing::debug!(
-            target: "orchestrator",
-            "ASR model {} not available; skipping flush",
-            ASR_MODEL_ID
-        );
-        return Ok(None);
-    }
+    // Resolve the effective engine. The routed engine is preferred, but if its
+    // model isn't downloaded yet we fall back to any available ASR engine rather
+    // than silently producing no transcript (e.g. a fresh English install whose
+    // onboarding fetched only the Qwen model still transcribes via Qwen until
+    // Parakeet is downloaded). Preference keeps the broad Qwen-0.6B as the safety
+    // net, then Parakeet, then the GPU Qwen.
+    let routed_id = ModelId::from(engine_model_id(engine));
+    let (engine, model_id) = if is_available(&routed_id) {
+        (engine, routed_id)
+    } else {
+        let fallback = [AsrEngine::Qwen06B, AsrEngine::ParakeetEuV3, AsrEngine::Qwen17B]
+            .into_iter()
+            .filter(|&e| e != engine)
+            .find(|&e| is_available(&ModelId::from(engine_model_id(e))));
+        match fallback {
+            Some(fb) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    "routed ASR model {} not downloaded; falling back to {}",
+                    routed_id.0,
+                    engine_model_id(fb)
+                );
+                (fb, ModelId::from(engine_model_id(fb)))
+            }
+            None => {
+                tracing::debug!(
+                    target: "orchestrator",
+                    "no ASR model available (routed {}); skipping flush",
+                    routed_id.0
+                );
+                return Ok(None);
+            }
+        }
+    };
 
     let model_dir = model_registry.ensure(&model_id).await.map_err(|e| {
         tracing::warn!(target: "orchestrator", "model ensure failed: {e}");
         e
     })?;
 
-    // Locate gguf and mmproj files. The convention is the first .gguf file
-    // in the model dir. Mmproj is the file whose name contains "mmproj".
-    let gguf_path = find_file_in_dir(&model_dir, |name| {
-        name.ends_with(".gguf") && !name.contains("mmproj")
-    })?;
-    let mmproj_path = find_file_in_dir(&model_dir, |name| name.contains("mmproj"))?;
-
-    let config = AsrRuntimeConfig {
-        n_gpu_layers,
-        language,
-        ..AsrRuntimeConfig::default()
-    };
-    match AsrRuntime::new(&gguf_path, &mmproj_path, config) {
-        Ok(runtime) => {
+    match engine {
+        AsrEngine::ParakeetEuV3 => {
+            // sherpa-onnx offline transducer; reads the 4 model files by name.
+            let backend = asr_parakeet::ParakeetBackend::new(
+                asr_parakeet::ParakeetConfig::new(model_dir.clone()),
+            )?;
             tracing::info!(
                 target: "orchestrator",
-                "ASR runtime initialised from {}",
+                "Parakeet ASR initialised from {}",
                 model_dir.display()
             );
-            Ok(Some(runtime))
+            Ok(Some(Box::new(backend)))
         }
-        Err(e) => {
-            tracing::warn!(target: "orchestrator", "ASR runtime init failed: {e}");
-            Err(e)
+        AsrEngine::Qwen06B | AsrEngine::Qwen17B => {
+            // llama-cpp-2 mtmd. The convention is the first .gguf file in the
+            // model dir; mmproj is the file whose name contains "mmproj".
+            let gguf_path = find_file_in_dir(&model_dir, |name| {
+                name.ends_with(".gguf") && !name.contains("mmproj")
+            })?;
+            let mmproj_path = find_file_in_dir(&model_dir, |name| name.contains("mmproj"))?;
+
+            let config = AsrRuntimeConfig {
+                n_gpu_layers,
+                language,
+                ..AsrRuntimeConfig::default()
+            };
+            match AsrRuntime::new(&gguf_path, &mmproj_path, config) {
+                Ok(runtime) => {
+                    tracing::info!(
+                        target: "orchestrator",
+                        "Qwen ASR runtime initialised from {}",
+                        model_dir.display()
+                    );
+                    Ok(Some(Box::new(runtime)))
+                }
+                Err(e) => {
+                    tracing::warn!(target: "orchestrator", "ASR runtime init failed: {e}");
+                    Err(e)
+                }
+            }
         }
     }
 }
@@ -1718,24 +1780,22 @@ fn transcribe_one_flush(
     Ok(())
 }
 
-/// Resolve and construct the production `AsrRuntime` for the re-transcribe path.
+/// Resolve and construct the production ASR backend for the re-transcribe path.
 ///
-/// Reuses the live-path model-resolution logic ([`init_asr_runtime`]): the ASR
-/// model must already be `Available` in the registry. `n_gpu_layers` is the
-/// runtime-resolved GPU-offload count (from the `gpu_acceleration` setting via
-/// [`resolve_gpu_layers`]), so an offline re-transcribe honours the same GPU
-/// toggle as the live path. Returns `Ok(None)` when the model is not available
-/// (the caller surfaces this as an error, since an explicit user-triggered
-/// re-transcribe with no model is a failure, unlike the live path's best-effort
-/// skip). `language` is the runtime-resolved ASR language hint (see
-/// [`resolve_transcription_language`]), so an offline re-transcribe honours the
-/// same language setting as the live path (`None` = auto-detect).
-pub(crate) async fn build_asr_runtime_for_retranscribe(
+/// Reuses the live-path engine routing + model-resolution logic
+/// ([`init_asr_backend`]): the model for the chosen `engine` must already be
+/// `Available` in the registry. `n_gpu_layers` + `language` only affect the Qwen
+/// tiers (Parakeet ignores them). Returns `Ok(None)` when the model is not
+/// available (the caller surfaces this as an error, since an explicit
+/// user-triggered re-transcribe with no model is a failure, unlike the live
+/// path's best-effort skip).
+pub(crate) async fn build_asr_backend_for_retranscribe(
     model_registry: &ModelRegistry,
+    engine: AsrEngine,
     n_gpu_layers: u32,
     language: Option<String>,
-) -> AppResult<Option<AsrRuntime>> {
-    init_asr_runtime(model_registry, n_gpu_layers, language).await
+) -> AppResult<Option<Box<dyn AsrBackend + Send>>> {
+    init_asr_backend(model_registry, engine, n_gpu_layers, language).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,7 +1811,7 @@ pub(crate) const DIARIZE_SEG_MODEL_ID: &str = "pyannote-segmentation-3-0";
 pub(crate) const DIARIZE_EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-en-advanced";
 
 /// Lazily build the production `SherpaDiarizer`, mirroring
-/// [`build_asr_runtime_for_retranscribe`].
+/// [`build_asr_backend_for_retranscribe`].
 ///
 /// Resolves both diarize model directories via `ModelRegistry::ensure`
 /// (downloading + hash-verifying when absent), locates the single `.onnx` file
@@ -1796,7 +1856,7 @@ pub(crate) async fn build_diarizer(
 /// block at record start. It resolves the embedding model purely from disk via
 /// the synchronous `Available`-check ([`ModelRegistry::list_models`] →
 /// `compute_status_sync`, a `std::fs` size-only check — the exact non-blocking,
-/// no-network precedent `init_asr_runtime` uses), wraps ONLY the embedding model
+/// no-network precedent `init_asr_backend` uses), wraps ONLY the embedding model
 /// (no segmentation model — VAD upstream supplies segment boundaries), and opens
 /// `OnlineDiarizer::open(emb_onnx, OnlineDiarizerConfig::default())`.
 ///

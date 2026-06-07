@@ -135,6 +135,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "asr-parakeet"
+version = "0.0.0"
+dependencies = [
+ "meeting-app-common",
+ "sherpa-rs",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "asr-runtime"
 version = "0.0.0"
 dependencies = [
@@ -3187,6 +3197,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 name = "orchestrator"
 version = "0.0.0"
 dependencies = [
+ "asr-parakeet",
  "asr-runtime",
  "audio-capture",
  "audiopus",

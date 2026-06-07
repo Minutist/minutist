@@ -726,7 +726,16 @@ capture_system_audio?: boolean;
  * the pre-feature behaviour). Defaults to "English" (fixes the spurious-
  * Chinese bug). An older store deserialises to "English" via the default fn.
  */
-transcription_language?: string }
+transcription_language?: string; 
+/**
+ * Opt into the larger Qwen3-ASR-1.7B tier for the Qwen branch (broader +
+ * better-multilingual accuracy) instead of the 0.6B CPU default. Only
+ * affects languages that route to Qwen (the Parakeet branch ignores it);
+ * see `common::asr_engine_for_language`. Off by default — it is a larger
+ * download with a GPU-class footprint. An older store deserialises to
+ * `false`. See `architecture/cross-cutting.md` — "ASR engine routing".
+ */
+prefer_large_asr_model?: boolean }
 /**
  * UI colour-scheme preference.
  */

@@ -495,6 +495,65 @@ pub trait AsrBackend: Send {
     fn transcribe_chunk(&mut self, chunk: &AudioChunk) -> AppResult<Vec<Segment>>;
 }
 
+/// Which ASR backend transcribes a recording (Phase 8 — hybrid ASR).
+///
+/// Two backends implement [`AsrBackend`]: `asr-parakeet` (sherpa-onnx Parakeet
+/// TDT v3 — English + 24 EU languages, per-word timestamps) and `asr-runtime`
+/// (llama-cpp-2 Qwen3-ASR — 52 languages/dialects, no timestamps; a 0.6B CPU
+/// default and an optional 1.7B GPU tier). The orchestrator builds the chosen
+/// one behind `Box<dyn AsrBackend>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AsrEngine {
+    /// Parakeet TDT 0.6B v3 via sherpa-onnx. Primary for the languages it covers.
+    ParakeetEuV3,
+    /// Qwen3-ASR 0.6B via llama-cpp-2 mtmd. Broad-language CPU default / fallback.
+    Qwen06B,
+    /// Qwen3-ASR 1.7B via llama-cpp-2 mtmd. Opt-in GPU tier (broader + better
+    /// multilingual accuracy).
+    Qwen17B,
+}
+
+/// The languages NVIDIA Parakeet TDT 0.6B v3 covers (English + 24 European
+/// locales), as full English names matched case-insensitively against the
+/// `transcription_language` setting. Anything outside this set — Chinese,
+/// Japanese, Korean, Arabic, etc. — routes to Qwen instead. Keep this in step
+/// with the model card; see `architecture/cross-cutting.md` — "ASR engine
+/// routing".
+pub const PARAKEET_LANGUAGES: &[&str] = &[
+    "Bulgarian", "Croatian", "Czech", "Danish", "Dutch", "English", "Estonian",
+    "Finnish", "French", "German", "Greek", "Hungarian", "Italian", "Latvian",
+    "Lithuanian", "Maltese", "Polish", "Portuguese", "Romanian", "Russian",
+    "Slovak", "Slovenian", "Spanish", "Swedish", "Ukrainian",
+];
+
+/// Choose the ASR engine deterministically from the user's transcription-language
+/// setting (never by inspecting the audio — the language isn't known before
+/// transcription). Pure so the orchestrator and any future UI surface agree.
+///
+/// - language in [`PARAKEET_LANGUAGES`] → [`AsrEngine::ParakeetEuV3`] (better
+///   English/EU accuracy + timestamps);
+/// - the `""` / `"auto"` sentinel (auto-detect) → Qwen (broadest coverage is the
+///   safe default when the language is unknown);
+/// - any other named language (Chinese, Japanese, …) → Qwen.
+///
+/// Within the Qwen branch, `prefer_gpu_qwen` selects the 1.7B GPU tier over the
+/// 0.6B CPU default.
+pub fn asr_engine_for_language(transcription_language: &str, prefer_gpu_qwen: bool) -> AsrEngine {
+    let lang = transcription_language.trim();
+    let is_auto = lang.is_empty() || lang.eq_ignore_ascii_case("auto");
+    if !is_auto
+        && PARAKEET_LANGUAGES
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case(lang))
+    {
+        AsrEngine::ParakeetEuV3
+    } else if prefer_gpu_qwen {
+        AsrEngine::Qwen17B
+    } else {
+        AsrEngine::Qwen06B
+    }
+}
+
 /// Synchronous diarizer. Implementations live in `diarizer` (production).
 ///
 /// Post-hoc only in v1: runs after the recording stops or as a
@@ -544,6 +603,42 @@ pub trait Summariser: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asr_routing_picker_languages_map_to_expected_engine() {
+        // The languages the LanguagePicker offers today, and where each routes.
+        let cpu = false;
+        for lang in ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Dutch"] {
+            assert_eq!(asr_engine_for_language(lang, cpu), AsrEngine::ParakeetEuV3, "{lang} should use Parakeet");
+        }
+        for lang in ["Chinese", "Japanese", "Korean", "Arabic"] {
+            assert_eq!(asr_engine_for_language(lang, cpu), AsrEngine::Qwen06B, "{lang} should use Qwen");
+        }
+    }
+
+    #[test]
+    fn asr_routing_auto_detect_and_empty_route_to_qwen() {
+        for sentinel in ["", "auto", "Auto", "AUTO", "  "] {
+            assert_eq!(asr_engine_for_language(sentinel, false), AsrEngine::Qwen06B);
+        }
+    }
+
+    #[test]
+    fn asr_routing_is_case_and_whitespace_insensitive() {
+        assert_eq!(asr_engine_for_language("  english ", false), AsrEngine::ParakeetEuV3);
+        assert_eq!(asr_engine_for_language("FRENCH", false), AsrEngine::ParakeetEuV3);
+    }
+
+    #[test]
+    fn asr_routing_gpu_flag_only_affects_the_qwen_branch() {
+        // Parakeet languages ignore the GPU-Qwen preference.
+        assert_eq!(asr_engine_for_language("English", true), AsrEngine::ParakeetEuV3);
+        // Qwen languages honour it: 1.7B when opted in, else 0.6B.
+        assert_eq!(asr_engine_for_language("Chinese", true), AsrEngine::Qwen17B);
+        assert_eq!(asr_engine_for_language("Chinese", false), AsrEngine::Qwen06B);
+        // Auto-detect + GPU opt-in -> the bigger Qwen.
+        assert_eq!(asr_engine_for_language("auto", true), AsrEngine::Qwen17B);
+    }
 
     #[test]
     fn segment_round_trips_through_json() {

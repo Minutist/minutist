@@ -80,7 +80,9 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
 
                 vadChunker = component "vad-chunker" "Silero VAD via vad-rs, plus the smoothing wrapper. Converts a frame stream into silence-bounded AudioChunks with start_ms / end_ms." "Rust crate: crates/vad-chunker"
 
-                asrRuntime = component "asr-runtime" "llama-cpp-2 (mtmd module) bound to Qwen3-ASR GGUF. Implements AsrBackend. Owns the ASR model lifecycle." "Rust crate: crates/asr-runtime"
+                asrRuntime = component "asr-runtime" "llama-cpp-2 (mtmd module) bound to Qwen3-ASR GGUF (0.6B CPU default + optional 1.7B GPU tier). Implements AsrBackend. Owns the Qwen ASR model lifecycle." "Rust crate: crates/asr-runtime"
+
+                asrParakeet = component "asr-parakeet" "sherpa-onnx offline-transducer bound to Parakeet TDT 0.6B v3 (English + 24 EU langs). Implements AsrBackend with per-word timestamps. Primary engine for its languages; orchestrator routes by transcription language." "Rust crate: crates/asr-parakeet"
 
                 diarizer = component "diarizer" "sherpa-onnx integration. Offline SherpaDiarizer (implements Diarizer) is the authoritative post-hoc pass on buffered audio after stop. Additive live OnlineDiarizer labels VAD segments during recording via embedding + a pure online clusterer (orchestrator-wired in Phase B, best-effort, overwritten by the on-stop pass)." "Rust crate: crates/diarizer"
 
@@ -134,7 +136,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         meetingApp.webview -> meetingApp.core "Tauri commands + events (typed via tauri-specta)"
         meetingApp.core -> microphone "Captures audio frames"
         meetingApp.core -> meetingApp.llamaNative "ASR + LLM inference" "FFI via llama-cpp-2"
-        meetingApp.core -> meetingApp.sherpaNative "Diarization" "FFI via sherpa-rs"
+        meetingApp.core -> meetingApp.sherpaNative "Diarization + Parakeet ASR" "FFI via sherpa-rs"
         meetingApp.core -> meetingApp.sqliteDb "Reads/writes meeting index" "libsql"
         meetingApp.core -> meetingApp.meetingFs "Reads/writes per-meeting files" "std::fs"
         meetingApp.core -> modelHost "Reads / downloads model files"
@@ -156,13 +158,15 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         meetingApp.core.audioCapture -> microphone "Captures audio" "cpal"
         meetingApp.core.orchestrator -> meetingApp.core.audioCapture "Starts/stops capture; consumes frames"
         meetingApp.core.orchestrator -> meetingApp.core.vadChunker "Feeds frames; consumes AudioChunks"
-        meetingApp.core.orchestrator -> meetingApp.core.asrRuntime "Dispatches chunks via AsrBackend trait"
+        meetingApp.core.orchestrator -> meetingApp.core.asrRuntime "Dispatches chunks via AsrBackend trait (Qwen tiers; non-Parakeet languages)"
+        meetingApp.core.orchestrator -> meetingApp.core.asrParakeet "Dispatches chunks via AsrBackend trait (Parakeet languages; primary)"
         meetingApp.core.orchestrator -> meetingApp.core.persistence "Streams audio + segments to disk"
         meetingApp.core.orchestrator -> meetingApp.core.diarizer "On stop: assigns speakers via Diarizer trait (authoritative); during recording: live per-segment labels via OnlineDiarizer (additive)"
         meetingApp.core.orchestrator -> meetingApp.core.ipcBridge "Emits transcript / meter / state events"
 
         // Model lifecycle.
         meetingApp.core.asrRuntime  -> meetingApp.core.modelRegistry "Resolves + loads ASR model"
+        meetingApp.core.asrParakeet -> meetingApp.core.modelRegistry "Resolves + loads Parakeet ONNX model"
         meetingApp.core.modelRegistry -> modelHost "Reads / downloads model files"
 
         // FFI boundaries.

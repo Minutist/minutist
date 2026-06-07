@@ -25,12 +25,13 @@ appears in:
 | `audio-capture` | 1 | `common` |
 | `vad-chunker` | 2 | `common` |
 | `asr-runtime` | 2 | `common` |
+| `asr-parakeet` | 8 | `common` |
 | `diarizer` | 6 | `common` |
 | `summariser` | 5 | `common` |
 | `persistence` | 1 (minimal) → 4 (full) | `common` |
 | `model-registry` | 2 | `common`, `settings` |
 | `settings` | 1 | `common` |
-| `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `diarizer`, `persistence`, `model-registry`, `settings` |
+| `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings` |
 
@@ -242,6 +243,47 @@ orchestrator resolves it from `settings.transcription_language` at start
 The `</asr_text>` early-stop checks the full concatenated detokenised
 string, not per-token, so the tag is caught even when it spans a token
 boundary.
+
+**GPU-tier sibling (Phase 8).** `asr-runtime` also drives **Qwen3-ASR-1.7B**
+(same mtmd path, official `ggml-org` GGUF + mmproj) as an optional
+higher-accuracy / better-multilingual tier, selected only when the user opts
+into the GPU model (see `settings`); the 0.6B remains the CPU default. Both
+share the same `#21847` long-audio limitation, so the batched-VAD chunking is
+mandatory for either.
+
+### `asr-parakeet`
+**Crate:** `crates/asr-parakeet`
+**Owns:** the sherpa-onnx offline-transducer binding, the Parakeet TDT 0.6B v3
+model, and token→word/segment timestamp aggregation.
+
+**Implements:** `AsrBackend` from `common` (the same trait as `asr-runtime`).
+**Inputs:** an `AudioChunk`. **Outputs:** `Vec<Segment>` for that chunk, **with
+per-word `start_ms`/`end_ms` populated** — the token-level timestamps the mtmd
+path cannot produce.
+
+**Why a separate crate.** Keeps the single-domain rule: `asr-runtime` is the
+llama-cpp-2/Qwen domain; `asr-parakeet` is the sherpa-onnx/Parakeet domain.
+sherpa-onnx already enters the workspace via `diarizer`; this is its second
+consumer (FFI via `sherpa-rs`, the same `=0.6.8` pin). The two ASR backends are
+interchangeable behind `Box<dyn AsrBackend + Send>`; the orchestrator selects
+one per the resolved transcription language (`runner::build_asr_backend`).
+
+**Timestamps (binding gap, confirmed by the Phase-8 spike).** sherpa-rs 0.6.8
+`TransducerRecognizer::transcribe()` returns only the text and drops the
+per-token timestamps the C result carries
+(`SherpaOnnxGetOfflineStreamResult` → `timestamps` + `tokens`, as used by
+`OfflineRecognizerResult`). This crate enables the `sherpa-rs` `sys` feature and
+reads the full result directly, then groups Parakeet's sub-word tokens into
+words on the leading-space boundary to fill `Segment.words`.
+
+**Language scope + routing.** Parakeet TDT v3 covers 25 European languages
+(English + EU). Languages outside that set route to the Qwen `asr-runtime` tiers
+instead; `Auto-detect` routes to Qwen (broadest). The pure mapping lives in
+`common` (`asr_engine_for_language`) so the UI and the orchestrator agree. See
+`cross-cutting.md` — "ASR engine routing".
+
+**License:** CC-BY-4.0 — attribution is shipped in the About dialog (distinct
+from the Apache-2.0 Qwen models).
 
 ### `diarizer`
 **Crate:** `crates/diarizer`

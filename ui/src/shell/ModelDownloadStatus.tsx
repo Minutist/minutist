@@ -13,6 +13,11 @@ import { useModelsStore } from "../state/models";
  * self-hides once the ASR model is ready (the first-run prompt disappears).
  */
 
+// Primary speech model — Parakeet TDT v3 (English + 24 EU languages, with word
+// timings). The default English experience routes here.
+export const PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3-int8";
+// Broad-language speech model — Qwen3-ASR 0.6B (52 languages/dialects, incl.
+// Chinese/Japanese/Korean/Arabic). Used for languages Parakeet doesn't cover.
 export const ASR_MODEL_ID = "qwen3-asr-0.6b-q8_0";
 export const LLM_MODEL_ID = "gemma-4-e4b-it-q4_k_m";
 

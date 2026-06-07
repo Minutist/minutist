@@ -166,3 +166,29 @@
 .settings-drawer__toggle:hover {
   color: var(--ink);
 }
+
+/* --- Footer (About) ----------------------------------------------------- */
+
+.settings-drawer__footer {
+  /* Push to the bottom of the drawer column. */
+  margin-top: auto;
+  padding-top: 1rem;
+  border-top: 1px solid var(--rule);
+}
+
+.settings-drawer__about {
+  font-family: var(--font-text);
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.35rem 0.85rem;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.settings-drawer__about:hover {
+  color: var(--ink);
+  border-color: var(--stone-faint);
+}

@@ -235,9 +235,15 @@ describe("About affordance (Phase 7 S6)", () => {
     // Closed by default.
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 
-    // Open via the header affordance.
+    // Open via the Settings drawer's About affordance (the header About button
+    // moved into the drawer footer to keep the masthead a single row).
     act(() =>
-      fireEvent.click(screen.getByRole("button", { name: "About" })),
+      fireEvent.click(screen.getByRole("button", { name: "Settings" })),
+    );
+    act(() =>
+      fireEvent.click(
+        screen.getByRole("button", { name: "About meeting-app" }),
+      ),
     );
     const dialog = screen.getByRole("dialog");
     expect(dialog).toBeInTheDocument();

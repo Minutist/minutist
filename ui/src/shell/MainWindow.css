@@ -18,21 +18,27 @@
 /* --- Top bar ------------------------------------------------------------ */
 
 .main-window__topbar {
-  display: grid;
-  /* minmax(0, 1fr) lets the side tracks shrink below their content's
-     min-content so a wide controls cluster never forces horizontal overflow;
-     the controls wrap instead (see below). */
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  /* A single coherent row: lead group (wordmark + status) on the left, actions
+     on the right, via space-between. flex-wrap is a safety net for very narrow
+     windows only; at normal widths everything sits on one vertically-centred
+     row (the old centre-anchored grid starved the right cluster and made it
+     wrap raggedly to a second row). */
+  display: flex;
   align-items: center;
-  gap: 1.25rem;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
   padding: 0.6rem 1.25rem;
   background: var(--bg);
   border-bottom: 1px solid var(--rule);
   flex: 0 0 auto;
 }
 
-.main-window__brand {
-  justify-self: start;
+/* Lead — wordmark + recording status, grouped left. */
+.main-window__lead {
+  display: flex;
+  align-items: center;
+  gap: 1.1rem;
   min-width: 0;
 }
 
@@ -47,18 +53,25 @@
   font-variation-settings: "opsz" 28, "SOFT" 30, "WONK" 0;
 }
 
-.main-window__status {
-  justify-self: center;
-}
-
 .main-window__controls {
-  justify-self: end;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   justify-content: flex-end;
-  gap: 0.5rem 0.85rem;
+  gap: 0.5rem 0.7rem;
   min-width: 0;
+}
+
+/* Re-processing actions (re-transcribe / re-diarize) — rare, so quieter than
+   the other header toggles: no resting border, revealed on hover. */
+.main-window__reprocess {
+  color: var(--stone);
+  border-color: transparent;
+}
+
+.main-window__reprocess:hover {
+  border-color: var(--rule-strong);
+  color: var(--ink-soft);
 }
 
 /* --- Recording status (focal) ------------------------------------------- */

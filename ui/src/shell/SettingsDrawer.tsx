@@ -19,6 +19,7 @@ import { useEffect, useRef } from "react";
 import { useRecordingStore } from "../state/recording";
 import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
+import { readPreferLargeAsrModel } from "../state/large-asr-model-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
@@ -29,21 +30,27 @@ export type SettingsDrawerProps = {
   open: boolean;
   /** Called when the drawer should close (scrim click, Close button, Esc). */
   onClose: () => void;
+  /** Open the About dialog (the affordance lives in this drawer's footer). */
+  onAbout: () => void;
 };
 
-export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
+export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const settings = useRecordingStore((s) => s.settings);
   const setDiarizationEnabled = useRecordingStore(
     (s) => s.setDiarizationEnabled,
   );
   const setGpuAcceleration = useRecordingStore((s) => s.setGpuAcceleration);
+  const setPreferLargeAsrModel = useRecordingStore(
+    (s) => s.setPreferLargeAsrModel,
+  );
   const setCaptureSystemAudio = useRecordingStore(
     (s) => s.setCaptureSystemAudio,
   );
 
   const diarizationEnabled = readDiarizationEnabled(settings);
   const gpuAcceleration = readGpuAcceleration(settings);
+  const preferLargeAsrModel = readPreferLargeAsrModel(settings);
   const captureSystemAudio = readCaptureSystemAudio(settings);
 
   // Focus the close control on open, and close on Escape — the minimum dialog
@@ -126,7 +133,30 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
             />
             <span>GPU acceleration</span>
           </label>
+          <label
+            className="settings-drawer__toggle"
+            title="Use the larger Qwen3-ASR-1.7B model for languages handled by Qwen (Chinese, Japanese, Korean, Arabic, …). A larger download, best with a GPU. English and European languages use Parakeet regardless of this setting."
+          >
+            <input
+              type="checkbox"
+              checked={preferLargeAsrModel}
+              disabled={settings === null}
+              onChange={(e) => void setPreferLargeAsrModel(e.target.checked)}
+            />
+            <span>Higher-accuracy speech model (GPU)</span>
+          </label>
         </section>
+
+        <footer className="settings-drawer__footer">
+          <button
+            type="button"
+            className="settings-drawer__about"
+            aria-haspopup="dialog"
+            onClick={onAbout}
+          >
+            About meeting-app
+          </button>
+        </footer>
       </aside>
     </div>
   );

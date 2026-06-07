@@ -3,16 +3,17 @@
  *
  * A quiet index of ruled paper rows in the Editorial Ink language: each row is
  * a meeting showing its title (Fraunces), a stone meta line (date · duration ·
- * speaker count), and a transcript excerpt set in reading italic. Hovering a row
- * reveals its actions: open / rename / delete / re-transcribe / re-diarize /
- * summarise.
+ * speaker count), and a transcript excerpt set in reading italic. Opening is the
+ * row's primary action — the title is a single click, the text area a
+ * double-click, plus an explicit Open button; quiet Rename / Delete management
+ * actions reveal on hover. Re-processing (re-transcribe / re-diarize / re-
+ * summarise) is rare and lives in the opened-meeting view, not here.
  *
  * The view consumes `theme.css` tokens only (no hard-coded colour/type) and
  * renders in the DEV shim with sample meetings for visual QA.
  */
 import { useEffect, useState } from "react";
 import { useMeetingsStore } from "../state/meetings";
-import { useSummaryStore } from "../state/summary";
 import type { MeetingListEntry } from "../state/meetings";
 import "./MeetingList.css";
 
@@ -47,9 +48,6 @@ type MeetingRowProps = {
   onOpen: () => void;
   onRename: (title: string) => void;
   onDelete: () => void;
-  onReTranscribe: () => void;
-  onReDiarize: () => void;
-  onSummarise: () => void;
 };
 
 function MeetingRow(props: MeetingRowProps) {
@@ -69,7 +67,15 @@ function MeetingRow(props: MeetingRowProps) {
 
   return (
     <li className="meeting-list__row">
-      <div className="meeting-list__main">
+      {/* Double-click anywhere in the meeting's text opens it (the row's
+          primary action); the title is also a single-click open. Bound to the
+          main area (not the whole row) so double-clicking the quiet management
+          actions doesn't also open. */}
+      <div
+        className="meeting-list__main"
+        onDoubleClick={props.onOpen}
+        title="Double-click to open"
+      >
         {renaming ? (
           <input
             className="meeting-list__title-input"
@@ -133,27 +139,6 @@ function MeetingRow(props: MeetingRowProps) {
         </button>
         <button
           type="button"
-          className="meeting-list__action"
-          onClick={props.onReTranscribe}
-        >
-          Re-transcribe
-        </button>
-        <button
-          type="button"
-          className="meeting-list__action"
-          onClick={props.onReDiarize}
-        >
-          Re-diarize
-        </button>
-        <button
-          type="button"
-          className="meeting-list__action"
-          onClick={props.onSummarise}
-        >
-          Summarise
-        </button>
-        <button
-          type="button"
           className="meeting-list__action meeting-list__action--danger"
           onClick={props.onDelete}
         >
@@ -171,12 +156,6 @@ export function MeetingList() {
   const open = useMeetingsStore((s) => s.open);
   const rename = useMeetingsStore((s) => s.rename);
   const remove = useMeetingsStore((s) => s.remove);
-  const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
-  // Phase 6: re-run speaker diarization for the row's meeting via the seam.
-  const reDiarize = useMeetingsStore((s) => s.rediarize);
-  // Phase 5: the row Summarise action runs the real summariser via the summary
-  // store (`summarise_meeting`), superseding the Phase-4 `re_summarise` stub.
-  const summarise = useSummaryStore((s) => s.summarise);
 
   useEffect(() => {
     void refresh();
@@ -206,9 +185,6 @@ export function MeetingList() {
               onOpen={() => void open(meeting.id)}
               onRename={(title) => void rename(meeting.id, title)}
               onDelete={() => void remove(meeting.id)}
-              onReTranscribe={() => void reTranscribe(meeting.id)}
-              onReDiarize={() => void reDiarize(meeting.id)}
-              onSummarise={() => void summarise(meeting.id)}
             />
           ))}
         </ol>

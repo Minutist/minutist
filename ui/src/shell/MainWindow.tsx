@@ -42,6 +42,9 @@ export function MainWindow() {
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
   const reDiarize = useMeetingsStore((s) => s.rediarize);
+  // Re-processing (re-transcribe / re-diarize) is a rare action that lives in
+  // the opened-meeting view, not on the meeting list — see MeetingList.
+  const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
 
   // The meeting-list is the entry surface (FR-33): shown when no meeting is
   // open and nothing is being recorded. Opening a meeting, or starting a
@@ -109,11 +112,13 @@ export function MainWindow() {
         quieter.
       */}
       <header className="main-window__topbar ink-reveal">
-        <div className="main-window__brand">
+        {/*
+          Lead group — wordmark + recording status, left-aligned together so the
+          masthead reads as a single coherent row (brand/status left, actions
+          right) instead of a centre-anchored grid whose right cluster wraps.
+        */}
+        <div className="main-window__lead">
           <span className="main-window__wordmark">meeting-app</span>
-        </div>
-
-        <div className="main-window__status">
           <RecordingStatus />
         </div>
 
@@ -142,8 +147,19 @@ export function MainWindow() {
           {openMeetingId !== null && recordingState.kind === "idle" && (
             <button
               type="button"
-              className="main-window__toggle-transcript"
+              className="main-window__toggle-transcript main-window__reprocess"
+              onClick={() => void reTranscribe(openMeetingId)}
+              title="Re-run speech recognition on this recording (rare; e.g. after changing the language or model)."
+            >
+              Re-transcribe
+            </button>
+          )}
+          {openMeetingId !== null && recordingState.kind === "idle" && (
+            <button
+              type="button"
+              className="main-window__toggle-transcript main-window__reprocess"
               onClick={() => void reDiarize(openMeetingId)}
+              title="Re-run speaker diarization on this recording (rare)."
             >
               Re-diarize
             </button>
@@ -178,6 +194,13 @@ export function MainWindow() {
             that used to crowd the bar. Adds no command; the drawer's controls
             route through the existing settings seams.
           */}
+          {/*
+            Settings — opens the drawer holding the capture / processing
+            configuration (device, language, diarize-on-stop, GPU, system audio)
+            + the About affordance (product info, rarely opened, so it lives in
+            the drawer rather than crowding the bar). Adds no command; the
+            drawer's controls route through the existing settings seams.
+          */}
           <button
             type="button"
             className="main-window__toggle-transcript"
@@ -186,20 +209,6 @@ export function MainWindow() {
             onClick={() => setSettingsOpen(true)}
           >
             Settings
-          </button>
-          {/*
-            Phase 7 (S6) — About affordance. Always available (product info, not
-            workspace-scoped). Opens the About dialog listing bundled-model SPDX
-            licenses + NOTICE/attribution. Quiet control, same idiom as the
-            other header toggles.
-          */}
-          <button
-            type="button"
-            className="main-window__toggle-transcript"
-            aria-haspopup="dialog"
-            onClick={() => setAboutOpen(true)}
-          >
-            About
           </button>
         </div>
       </header>
@@ -275,6 +284,10 @@ export function MainWindow() {
       <SettingsDrawer
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
+        onAbout={() => {
+          setSettingsOpen(false);
+          setAboutOpen(true);
+        }}
       />
 
       {aboutOpen && <About onClose={() => setAboutOpen(false)} />}

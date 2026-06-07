@@ -164,37 +164,29 @@ describe("MeetingList view (FR-33)", () => {
     );
   });
 
-  it("Re-transcribe fires re_transcribe for the row's meeting", async () => {
+  it("double-clicking a meeting opens it (no need to find the Open button)", async () => {
     await renderList();
-    const buttons = screen.getAllByRole("button", { name: "Re-transcribe" });
+    // Double-click anywhere in the meeting's text (the title element bubbles to
+    // the row's main area, which carries onDoubleClick).
     act(() => {
-      fireEvent.click(buttons[0]);
+      fireEvent.dblClick(screen.getByText("Quick standup"));
     });
     await waitFor(() =>
-      expect(meetingsIpc.reTranscribe).toHaveBeenCalledWith("meeting-0001"),
+      expect(meetingsIpc.openMeeting).toHaveBeenCalledWith("meeting-0002"),
     );
   });
 
-  it("Re-diarize fires the rediarize seam for the row's meeting (Phase 6)", async () => {
+  it("does not surface re-processing actions on the list (open is the primary action; re-processing lives in the opened meeting)", async () => {
     await renderList();
-    const buttons = screen.getAllByRole("button", { name: "Re-diarize" });
-    act(() => {
-      fireEvent.click(buttons[1]);
-    });
-    await waitFor(() =>
-      expect(meetingsIpc.rediarize).toHaveBeenCalledWith("meeting-0002"),
-    );
-  });
-
-  it("Summarise fires summarise_meeting for the row's meeting", async () => {
-    await renderList();
-    const buttons = screen.getAllByRole("button", { name: "Summarise" });
-    act(() => {
-      fireEvent.click(buttons[0]);
-    });
-    await waitFor(() =>
-      expect(summaryIpc.summariseMeeting).toHaveBeenCalledWith("meeting-0001"),
-    );
+    expect(
+      screen.queryByRole("button", { name: "Re-transcribe" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Re-diarize" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Summarise" }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows an empty-state message when there are no meetings", async () => {

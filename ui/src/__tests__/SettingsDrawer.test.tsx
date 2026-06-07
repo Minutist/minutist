@@ -36,13 +36,13 @@ describe("SettingsDrawer", () => {
 
   it("renders nothing when closed", () => {
     const { container } = render(
-      <SettingsDrawer open={false} onClose={() => {}} />,
+      <SettingsDrawer open={false} onClose={() => {}} onAbout={() => {}} />,
     );
     expect(container).toBeEmptyDOMElement();
   });
 
   it("surfaces the capture + processing controls when open", () => {
-    render(<SettingsDrawer open onClose={() => {}} />);
+    render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
     expect(screen.getByLabelText("Input device")).toBeInTheDocument();
     expect(screen.getByLabelText("Transcription language")).toBeInTheDocument();
     expect(screen.getByText("Diarize speakers on stop")).toBeInTheDocument();
@@ -52,7 +52,7 @@ describe("SettingsDrawer", () => {
 
   it("calls onClose on the Done button and on Escape", () => {
     const onClose = vi.fn();
-    render(<SettingsDrawer open onClose={onClose} />);
+    render(<SettingsDrawer open onClose={onClose} onAbout={() => {}} />);
     fireEvent.click(screen.getByRole("button", { name: "Close settings" }));
     expect(onClose).toHaveBeenCalledTimes(1);
     fireEvent.keyDown(document, { key: "Escape" });
@@ -61,7 +61,7 @@ describe("SettingsDrawer", () => {
 
   it("dismisses on a scrim click but not on a click inside the panel", () => {
     const onClose = vi.fn();
-    const { container } = render(<SettingsDrawer open onClose={onClose} />);
+    const { container } = render(<SettingsDrawer open onClose={onClose} onAbout={() => {}} />);
     // Click inside the dialog panel — stopPropagation keeps it open.
     fireEvent.click(screen.getByRole("dialog"));
     expect(onClose).not.toHaveBeenCalled();

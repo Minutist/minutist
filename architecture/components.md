@@ -1138,7 +1138,7 @@ than packages.
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
 | Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
-| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the Settings drawer (`SettingsDrawer.tsx` — input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture); and the reading-width summary overlay. The capture/processing settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. All drawer controls route through the existing settings seams; no new command. |
+| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture). The summary is a workspace column, not an overlay. The capture/processing settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. All drawer controls route through the existing settings seams; no new command. |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 
@@ -1194,11 +1194,23 @@ left, transcript right).
   document with internal `data-anchor-ms` attributes stripped — so paste into
   Word retains formatting (FR-17). The editor overrides copy/cut via ProseMirror
   `editorProps.handleDOMEvents`.
-- **`MainWindow` (`ui/src/shell/`)** is now a collapsible AND resizable two-pane
-  layout via `react-resizable-panels` (FR-21): notes editor primary, transcript
-  pane secondary. A header toggle collapses/expands the transcript via the
-  panel's imperative handle; a `Separator` provides drag-resize. The Phase 2
-  two-column flex layout is replaced.
+- **`MainWindow` (`ui/src/shell/`)** is a resizable, show/hide multi-column
+  layout via `react-resizable-panels` (FR-21/FR-30): up to three columns —
+  notes editor (primary), transcript, and the summary reading column. A
+  segmented header toggle ("Visible panes") shows or hides each column by
+  INCLUDING/EXCLUDING its `Panel` from the Group (a single `Separator` is
+  interleaved between each pair of visible panes), rather than collapsing to
+  zero width — this avoids stacked separators around a hidden middle pane and
+  keeps one drag handle between any two columns. Percentage `minSize`s sum to
+  well under 100 %, so the columns squeeze to fit and the workspace never
+  scrolls horizontally. The last visible pane cannot be hidden. Per-mode
+  defaults: the live transcript is hidden by default in both modes (a scrolling
+  transcript distracts from note-taking; it is one click away on the toggle) — a
+  finished opened meeting → notes + summary; a live recording → notes only. The
+  Group has no `autoSaveId`, so showing/hiding a column re-derives the layout
+  from each pane's `defaultSize` — a width the user dragged to is intentionally
+  not preserved across a toggle (the squeeze-to-fit model wins over sticky
+  widths). The Phase 2 two-column flex layout is replaced.
 - **`RecordingStore` additions.** Gains `recordingClockMs: number | null`,
   updated by a new `recording_clock` event case and cleared to `null` on any
   transition out of `recording` (idle/stopping/paused). This is the sole
@@ -1295,12 +1307,16 @@ left, transcript right).
   surface in the Editorial Ink language that renders the meeting's `summary.md`
   markdown (via `markdown-it`, `html: false`) as a paper sheet, exposes a
   Summarise action with an in-progress affordance while the LLM runs, and lets
-  the user edit the raw markdown and persist it. It is an optional third
-  workspace pane in `MainWindow` — revealed by a header "Summary" toggle when a
-  meeting is open or recording; the meeting it summarises is the open meeting
-  else the live recording's `meeting_id`. The meeting-list row's Summarise
-  action (renamed from the Phase-4 "Re-summarise" stub button) also runs the
-  real summariser through the summary store.
+  the user edit the raw markdown and persist it. It is a workspace **column**
+  (not a popup overlay): one of the up-to-three show/hide panes `MainWindow`
+  lays out (notes / transcript / summary). The summary column is offered only
+  for a FINISHED opened meeting (idle + a saved meeting open) — there is no
+  summary mid-recording — and a finished meeting **defaults to notes + summary,
+  with the transcript hidden** (the summary is what you reach for after a
+  meeting). The meeting it summarises is the open meeting else the live
+  recording's `meeting_id`. The meeting-list row's Summarise action (renamed
+  from the Phase-4 "Re-summarise" stub button) also runs the real summariser
+  through the summary store.
 - **Summary store (`ui/src/state/summary.ts`).** Transient UI state only
   (`summaryMarkdown`, `summarising`, `meetingId`, `lastError`) routed through the
   `ui/src/ipc/summary.ts` seam; `summary.md` on disk is authoritative. Its

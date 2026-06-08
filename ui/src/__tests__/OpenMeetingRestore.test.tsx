@@ -16,7 +16,14 @@
  *   - the transcript pane renders the restored segments (their text shows).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, act, cleanup, waitFor } from "@testing-library/react";
+import {
+  render,
+  screen,
+  act,
+  cleanup,
+  waitFor,
+  fireEvent,
+} from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -164,6 +171,12 @@ describe("opening a saved meeting restores notes + transcript (U1)", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.getByText("A restored body paragraph.")).toBeInTheDocument();
+
+    // A finished, opened meeting defaults to notes + summary (transcript
+    // hidden); reveal the transcript column via the pane-visibility toggle.
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Transcript" }));
+    });
 
     // The transcript pane rendered the restored segments (NOT the empty live
     // store, which has zero segments).

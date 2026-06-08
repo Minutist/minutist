@@ -243,9 +243,9 @@
   border-color: var(--stone-faint);
 }
 
-/* --- Transcript toggle -------------------------------------------------- */
+/* --- Header buttons (Meetings / re-process / Settings) ------------------ */
 
-.main-window__toggle-transcript {
+.main-window__header-btn {
   font-family: var(--font-text);
   font-size: 0.78rem;
   letter-spacing: 0.02em;
@@ -258,9 +258,50 @@
   transition: color 120ms ease, border-color 120ms ease;
 }
 
-.main-window__toggle-transcript:hover {
+.main-window__header-btn:hover {
   color: var(--ink-soft);
   border-color: var(--rule-strong);
+}
+
+/* --- Pane-visibility toggle (segmented) --------------------------------- */
+/*
+ * A single segmented control for showing/hiding the workspace columns. A
+ * pressed segment (`aria-pressed="true"`) = the pane is visible, carried in the
+ * sanctioned oxblood "active" tint; an unpressed segment is quiet stone.
+ */
+.main-window__view-toggle {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--sheet);
+}
+
+.main-window__view-seg {
+  font-family: var(--font-text);
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+  color: var(--stone);
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--rule);
+  padding: 0.3rem 0.72rem;
+  cursor: pointer;
+  transition: color 120ms ease, background 120ms ease;
+}
+
+.main-window__view-seg:first-child {
+  border-left: none;
+}
+
+.main-window__view-seg:hover {
+  color: var(--ink-soft);
+}
+
+.main-window__view-seg[aria-pressed="true"] {
+  color: var(--ink);
+  background: var(--accent-tint);
 }
 
 /* --- Chrome strip (model download + errors) ----------------------------- */
@@ -362,7 +403,10 @@
 .main-window__panes {
   flex: 1;
   min-height: 0;
-  padding: 1.25rem;
+  /* Full-bleed columns: the panes fill the workspace edge-to-edge (each pane
+     supplies its own internal breathing room), so the notes sheet is no longer
+     a small card floating in a wide desk margin. */
+  padding: 0;
   gap: 0;
 }
 
@@ -380,6 +424,12 @@
 
 /* Transcript — quiet, recessed column. */
 .main-window__pane--transcript {
+  background: transparent;
+}
+
+/* Summary — a reading column (FR-30); the SummaryView supplies its own surface
+   (recessed `--sheet-quiet`, header, and actions). */
+.main-window__pane--summary {
   background: transparent;
 }
 
@@ -433,48 +483,4 @@
 }
 .main-window__panes.ink-reveal {
   animation-delay: 160ms;
-}
-
-/* --- Summary overlay ---------------------------------------------------- */
-/*
- * The summary opens as a centered reading-width sheet on a dimmed warm-desk
- * field (FR-30), reusing the About / onboarding sheet idiom. The SummaryView
- * inside owns its own header + actions; this wrapper supplies the scrim, the
- * paper surface, and a comfortable reading measure.
- */
-.summary-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 2rem 1.5rem;
-  background: rgba(28, 26, 23, 0.32);
-  box-sizing: border-box;
-}
-
-.summary-overlay__sheet {
-  width: 100%;
-  max-width: 46rem;
-  max-height: 86vh;
-  overflow-y: auto;
-  background: var(--sheet);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-sheet);
-  padding: 2rem 2.5rem 2.5rem;
-  box-sizing: border-box;
-}
-
-/*
- * Inside the overlay the SummaryView drops its pane chrome (the recessed
- * full-height scrolling column it uses as a body pane): the overlay sheet
- * already supplies the paper surface, padding, and scroll.
- */
-.summary-overlay__sheet .summary-view {
-  height: auto;
-  overflow: visible;
-  padding: 0;
-  background: transparent;
 }

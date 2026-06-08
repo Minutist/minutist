@@ -34,12 +34,30 @@ export type SummaryStore = {
   /** Last error surfaced by a summary IPC call. */
   lastError: string | null;
 
+  /**
+   * In-progress raw-markdown edit, held in the store (not in the SummaryView's
+   * local state) so it survives the summary pane being hidden/unmounted — the
+   * pane is conditionally rendered, so a mount-local draft would be silently
+   * lost when the user toggles the column off. `editing` is the edit-mode flag,
+   * `editDraft` the working text, and `editMeetingId` scopes the draft to its
+   * meeting (a draft for meeting A is not shown when meeting B is open).
+   */
+  editing: boolean;
+  editDraft: string;
+  editMeetingId: MeetingId | null;
+
   /** Load the persisted summary for a meeting (on open / view mount). */
   read: (meetingId: MeetingId) => Promise<void>;
   /** Kick off summarisation for a meeting; enters the in-progress state. */
   summarise: (meetingId: MeetingId) => Promise<void>;
   /** Persist an edited summary (FR-30). */
   save: (meetingId: MeetingId, summaryMarkdown: string) => Promise<void>;
+  /** Enter edit mode for a meeting, seeding the draft (scoped to that meeting). */
+  beginEdit: (meetingId: MeetingId, initial: string) => void;
+  /** Update the in-progress draft text. */
+  setDraft: (text: string) => void;
+  /** Leave edit mode, discarding the draft (used on cancel and after save). */
+  endEdit: () => void;
   /** Clear the loaded summary (e.g. when returning to the meeting list). */
   clear: () => void;
   /** Dispatcher called by the global event listener. */
@@ -55,6 +73,9 @@ export const useSummaryStore = create<SummaryStore>((set, get) => ({
   summarising: false,
   meetingId: null,
   lastError: null,
+  editing: false,
+  editDraft: "",
+  editMeetingId: null,
 
   read: async (meetingId) => {
     set({ meetingId });
@@ -92,8 +113,27 @@ export const useSummaryStore = create<SummaryStore>((set, get) => ({
     }
   },
 
+  beginEdit: (meetingId, initial) => {
+    set({ editing: true, editDraft: initial, editMeetingId: meetingId });
+  },
+
+  setDraft: (text) => {
+    set({ editDraft: text });
+  },
+
+  endEdit: () => {
+    set({ editing: false, editDraft: "", editMeetingId: null });
+  },
+
   clear: () => {
-    set({ summaryMarkdown: null, summarising: false, meetingId: null });
+    set({
+      summaryMarkdown: null,
+      summarising: false,
+      meetingId: null,
+      editing: false,
+      editDraft: "",
+      editMeetingId: null,
+    });
   },
 
   handleEvent: (event) => {

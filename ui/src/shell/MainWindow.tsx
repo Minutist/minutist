@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { Group, Panel, Separator, usePanelRef } from "react-resizable-panels";
+import { useEffect, useLayoutEffect, useState } from "react";
+import type { ReactNode } from "react";
+import { Group, Panel, Separator } from "react-resizable-panels";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
@@ -19,20 +20,53 @@ import "./MainWindow.css";
  * Root shell component.
  *
  * Layout:
- *   Header  — title + controls (model download, device picker, transport,
- *             audio meter, error banner).
- *   Body    — a horizontal `react-resizable-panels` Group with two panels:
- *               • Notes editor (primary) — the main view.
- *               • Transcript pane (secondary) — collapsible AND resizable.
+ *   Header  — wordmark + recording status; transport, audio meter, the
+ *             pane-visibility toggle, and Settings.
+ *   Body    — a horizontal `react-resizable-panels` Group of up to three
+ *             columns the user can show/hide and drag-resize (FR-21/FR-30):
+ *               • Notes editor (primary).
+ *               • Transcript pane.
+ *               • Summary view — a reading column (NOT a popup overlay).
  *
- * The transcript panel is `collapsible`; a toolbar button toggles it via the
- * panel's imperative `collapse()` / `expand()` handle, and the `Separator`
- * between the panels lets the user drag to resize (FR-21).
+ * Panes are shown/hidden by INCLUDING/EXCLUDING their `Panel` from the Group
+ * (with a `Separator` between each pair of visible panes), rather than
+ * collapsing to zero width — this keeps a single drag handle between any two
+ * visible panes and avoids stacked separators around a hidden middle pane. The
+ * percentage min-sizes sum to well under 100 %, so the columns squeeze to fit
+ * and the workspace never scrolls horizontally.
+ *
+ * Per-mode defaults: the live transcript is hidden by default in both modes (a
+ * scrolling transcript distracts from note-taking; it is one click away on the
+ * toggle). A FINISHED opened meeting defaults to notes + summary (the summary is
+ * what you reach for after a meeting); a LIVE recording defaults to notes only.
  *
  * The global event bridge (`useAppEventBridge`) is mounted one level up in
  * `App.tsx` so it cannot be accidentally unmounted when this component
  * re-renders.
  */
+/**
+ * Interleave resize separators between the visible panes. `slots` carries one
+ * entry per pane (a falsy entry = a hidden pane); the result is the visible
+ * panels with a single `Separator` between each adjacent pair — so there is
+ * exactly one drag handle between any two columns and none stranded beside a
+ * hidden pane.
+ */
+function buildPanes(slots: ReactNode[]): ReactNode[] {
+  const panels = slots.filter(Boolean);
+  const out: ReactNode[] = [];
+  panels.forEach((panel, i) => {
+    if (i > 0) {
+      out.push(
+        <Separator key={`sep-${i}`} className="main-window__resize-handle">
+          <span className="main-window__resize-grip" aria-hidden="true" />
+        </Separator>,
+      );
+    }
+    out.push(panel);
+  });
+  return out;
+}
+
 export function MainWindow() {
   const refreshDevices = useRecordingStore((s) => s.refreshDevices);
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
@@ -58,11 +92,20 @@ export function MainWindow() {
     openMeetingId ??
     (recordingState.kind !== "idle" ? recordingState.meeting_id : null);
 
-  const transcriptPanelRef = usePanelRef();
-  const [transcriptCollapsed, setTranscriptCollapsed] = useState(false);
-  // The summary is hidden by default; the header toggle reveals it (FR-30) as a
-  // reading-width overlay sheet rather than a cramped third pane.
-  const [summaryOpen, setSummaryOpen] = useState(false);
+  // A finished, opened meeting: idle and viewing a saved meeting. Only then is a
+  // summary meaningful (you cannot summarise a recording mid-flight), so the
+  // summary column is offered only in this mode.
+  const isFinishedMeeting =
+    openMeetingId !== null && recordingState.kind === "idle";
+  const showSummaryPane = isFinishedMeeting;
+
+  // Pane visibility (FR-21/FR-30). Panes are included/excluded from the Group
+  // rather than collapsed to zero width. Reset to the per-mode default whenever
+  // the workspace is (re-)entered or the mode flips (see the effect below).
+  const [notesShown, setNotesShown] = useState(true);
+  const [transcriptShown, setTranscriptShown] = useState(true);
+  const [summaryShown, setSummaryShown] = useState(true);
+
   // The About dialog (Phase 7, S6) is hidden by default; a header affordance
   // opens it. Presentational overlay; closing returns to the prior surface.
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -79,27 +122,37 @@ export function MainWindow() {
     void refreshModels();
   }, [refreshDevices, refreshSettings, refreshModels]);
 
-  // Close the summary overlay on Escape — parity with the About dialog and the
-  // Settings drawer.
-  useEffect(() => {
-    if (!summaryOpen) return;
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") setSummaryOpen(false);
-    }
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [summaryOpen]);
+  // Reset pane visibility to the per-mode default. The deps are deliberately
+  // [inWorkspace, showSummaryPane] only: this fires on entering the workspace
+  // and on the finished-meeting↔live-recording mode flip, but NOT on benign
+  // re-renders within a mode (e.g. pause/resume), so a transcript the user
+  // revealed stays open. (Do NOT add `openMeetingId` here — it would re-default
+  // the panes on every meeting switch, which already happens for free via the
+  // meeting list remounting the workspace.) The live transcript is HIDDEN by
+  // default in both modes — a scrolling transcript distracts from note-taking —
+  // and is one click away on the toggle. Finished: notes + summary. Recording:
+  // notes only. A LAYOUT effect so the corrected visibility commits before paint
+  // (the workspace never flashes the all-panes initial state for a frame).
+  useLayoutEffect(() => {
+    if (!inWorkspace) return;
+    setNotesShown(true);
+    setTranscriptShown(false);
+    setSummaryShown(true); // only rendered when showSummaryPane (finished meeting)
+  }, [inWorkspace, showSummaryPane]);
 
-  function toggleTranscript() {
-    const handle = transcriptPanelRef.current;
-    if (!handle) return;
-    if (handle.isCollapsed()) {
-      handle.expand();
-      setTranscriptCollapsed(false);
-    } else {
-      handle.collapse();
-      setTranscriptCollapsed(true);
-    }
+  // How many panes are currently visible — used to forbid hiding the last one.
+  const visibleCount =
+    (notesShown ? 1 : 0) +
+    (transcriptShown ? 1 : 0) +
+    (showSummaryPane && summaryShown ? 1 : 0);
+
+  function togglePane(
+    shown: boolean,
+    setShown: (next: boolean) => void,
+  ) {
+    // Never hide the last visible pane — the workspace must show something.
+    if (shown && visibleCount <= 1) return;
+    setShown(!shown);
   }
 
   return (
@@ -131,7 +184,7 @@ export function MainWindow() {
           {inWorkspace && openMeetingId !== null && recordingState.kind === "idle" && (
             <button
               type="button"
-              className="main-window__toggle-transcript"
+              className="main-window__header-btn"
               onClick={closeMeeting}
             >
               Meetings
@@ -147,7 +200,7 @@ export function MainWindow() {
           {openMeetingId !== null && recordingState.kind === "idle" && (
             <button
               type="button"
-              className="main-window__toggle-transcript main-window__reprocess"
+              className="main-window__header-btn main-window__reprocess"
               onClick={() => void reTranscribe(openMeetingId)}
               title="Re-run speech recognition on this recording (rare; e.g. after changing the language or model)."
             >
@@ -157,7 +210,7 @@ export function MainWindow() {
           {openMeetingId !== null && recordingState.kind === "idle" && (
             <button
               type="button"
-              className="main-window__toggle-transcript main-window__reprocess"
+              className="main-window__header-btn main-window__reprocess"
               onClick={() => void reDiarize(openMeetingId)}
               title="Re-run speaker diarization on this recording (rare)."
             >
@@ -168,42 +221,56 @@ export function MainWindow() {
           <div className="main-window__meter" aria-label="Audio level">
             <AudioMeter />
           </div>
-          {inWorkspace && (
-            <button
-              type="button"
-              className="main-window__toggle-transcript"
-              aria-pressed={transcriptCollapsed}
-              onClick={toggleTranscript}
-            >
-              {transcriptCollapsed ? "Show transcript" : "Hide transcript"}
-            </button>
-          )}
-          {inWorkspace && activeMeetingId !== null && (
-            <button
-              type="button"
-              className="main-window__toggle-transcript"
-              aria-pressed={summaryOpen}
-              onClick={() => setSummaryOpen((open) => !open)}
-            >
-              {summaryOpen ? "Hide summary" : "Summary"}
-            </button>
-          )}
           {/*
-            Settings — opens the drawer holding the capture / processing
-            configuration (device, language, diarize-on-stop, GPU, system audio)
-            that used to crowd the bar. Adds no command; the drawer's controls
-            route through the existing settings seams.
+            Pane-visibility toggle (FR-21/FR-30): a segmented control that shows
+            or hides each column. A pressed segment = the pane is visible. The
+            Summary segment appears only for a finished, opened meeting; the last
+            visible pane cannot be hidden (see `togglePane`).
           */}
+          {inWorkspace && (
+            <div
+              className="main-window__view-toggle"
+              role="group"
+              aria-label="Visible panes"
+            >
+              <button
+                type="button"
+                className="main-window__view-seg"
+                aria-pressed={notesShown}
+                onClick={() => togglePane(notesShown, setNotesShown)}
+              >
+                Notes
+              </button>
+              <button
+                type="button"
+                className="main-window__view-seg"
+                aria-pressed={transcriptShown}
+                onClick={() => togglePane(transcriptShown, setTranscriptShown)}
+              >
+                Transcript
+              </button>
+              {showSummaryPane && (
+                <button
+                  type="button"
+                  className="main-window__view-seg"
+                  aria-pressed={summaryShown}
+                  onClick={() => togglePane(summaryShown, setSummaryShown)}
+                >
+                  Summary
+                </button>
+              )}
+            </div>
+          )}
           {/*
-            Settings — opens the drawer holding the capture / processing
-            configuration (device, language, diarize-on-stop, GPU, system audio)
-            + the About affordance (product info, rarely opened, so it lives in
-            the drawer rather than crowding the bar). Adds no command; the
-            drawer's controls route through the existing settings seams.
+            Settings — opens the drawer holding the appearance / capture /
+            processing configuration (theme, ruled paper, device, language,
+            diarize-on-stop, GPU, system audio) + the About affordance. Adds no
+            command; the drawer's controls route through the existing settings
+            seams.
           */}
           <button
             type="button"
-            className="main-window__toggle-transcript"
+            className="main-window__header-btn"
             aria-haspopup="dialog"
             aria-expanded={settingsOpen}
             onClick={() => setSettingsOpen(true)}
@@ -229,56 +296,44 @@ export function MainWindow() {
 
       {inWorkspace ? (
         <Group orientation="horizontal" className="main-window__panes ink-reveal">
-          <Panel
-            id="notes"
-            className="main-window__pane main-window__pane--notes"
-            minSize="20%"
-          >
-            <Editor />
-          </Panel>
-
-          <Separator className="main-window__resize-handle">
-            <span className="main-window__resize-grip" aria-hidden="true" />
-          </Separator>
-
-          <Panel
-            id="transcript"
-            panelRef={transcriptPanelRef}
-            className="main-window__pane main-window__pane--transcript"
-            collapsible
-            collapsedSize="0%"
-            minSize="15%"
-            defaultSize="35%"
-            onResize={(size) => setTranscriptCollapsed(size.asPercentage <= 0)}
-          >
-            <TranscriptPane />
-          </Panel>
+          {buildPanes([
+            notesShown && (
+              <Panel
+                key="notes"
+                id="notes"
+                className="main-window__pane main-window__pane--notes"
+                minSize="22%"
+                defaultSize={showSummaryPane ? "46%" : "62%"}
+              >
+                <Editor />
+              </Panel>
+            ),
+            transcriptShown && (
+              <Panel
+                key="transcript"
+                id="transcript"
+                className="main-window__pane main-window__pane--transcript"
+                minSize="16%"
+                defaultSize="34%"
+              >
+                <TranscriptPane />
+              </Panel>
+            ),
+            showSummaryPane && summaryShown && activeMeetingId !== null && (
+              <Panel
+                key="summary"
+                id="summary"
+                className="main-window__pane main-window__pane--summary"
+                minSize="20%"
+                defaultSize="40%"
+              >
+                <SummaryView meetingId={activeMeetingId} />
+              </Panel>
+            ),
+          ])}
         </Group>
       ) : (
         <MeetingList />
-      )}
-
-      {/*
-        Summary (FR-30) as a reading-width overlay sheet rather than a third
-        body pane: a serif summary column does not fit alongside notes +
-        transcript at a comfortable measure. Scrim click / the header toggle
-        dismiss it; the SummaryView owns its own Summarise / Edit actions.
-      */}
-      {summaryOpen && activeMeetingId !== null && (
-        <div
-          className="summary-overlay"
-          onClick={() => setSummaryOpen(false)}
-        >
-          <div
-            className="summary-overlay__sheet ink-reveal"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Meeting summary"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <SummaryView meetingId={activeMeetingId} />
-          </div>
-        </div>
       )}
 
       <SettingsDrawer

@@ -11,7 +11,7 @@
  * seam); the component holds only local editor draft state. It consumes
  * `theme.css` tokens only and renders in the DEV shim with sample summary data.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo } from "react";
 import MarkdownIt from "markdown-it";
 import { useSummaryStore } from "../state/summary";
 import { useModelsStore } from "../state/models";
@@ -39,6 +39,15 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
   const read = useSummaryStore((s) => s.read);
   const summarise = useSummaryStore((s) => s.summarise);
   const save = useSummaryStore((s) => s.save);
+  // Edit state lives in the store (not local useState) so an in-progress draft
+  // survives this pane being hidden/unmounted; `editMeetingId` scopes it to its
+  // meeting so a draft for one meeting is not shown when another is open.
+  const editingFlag = useSummaryStore((s) => s.editing);
+  const editDraft = useSummaryStore((s) => s.editDraft);
+  const editMeetingId = useSummaryStore((s) => s.editMeetingId);
+  const beginEditAction = useSummaryStore((s) => s.beginEdit);
+  const setDraft = useSummaryStore((s) => s.setDraft);
+  const endEdit = useSummaryStore((s) => s.endEdit);
 
   // Summarisation needs the LLM; on first use the orchestrator downloads it
   // (multi-GB) before any text is generated. Surface THAT phase distinctly so a
@@ -59,8 +68,8 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
     downloadPct = Math.round((100 * llm.status.bytes_done) / llm.status.bytes_total);
   }
 
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState("");
+  // Edit mode applies only when the stored draft belongs to THIS meeting.
+  const editing = editingFlag && editMeetingId === meetingId;
 
   // Load the persisted summary when the open meeting changes.
   useEffect(() => {
@@ -73,17 +82,18 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
   );
 
   function beginEdit() {
-    setDraft(summaryMarkdown ?? "");
-    setEditing(true);
+    beginEditAction(meetingId, summaryMarkdown ?? "");
   }
 
   function cancelEdit() {
-    setEditing(false);
+    endEdit();
   }
 
   function commitEdit() {
-    setEditing(false);
-    void save(meetingId, draft);
+    // Read the live draft from the store (not the render closure) so the save
+    // captures the latest keystroke regardless of render timing.
+    void save(meetingId, useSummaryStore.getState().editDraft);
+    endEdit();
   }
 
   const hasSummary = summaryMarkdown !== null && summaryMarkdown.trim() !== "";
@@ -162,7 +172,7 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
         <textarea
           className="summary-view__editor"
           aria-label="Edit summary markdown"
-          value={draft}
+          value={editDraft}
           onChange={(e) => setDraft(e.target.value)}
           autoFocus
         />

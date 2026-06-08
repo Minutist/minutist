@@ -47,6 +47,9 @@ function resetStore() {
       summarising: false,
       meetingId: null,
       lastError: null,
+      editing: false,
+      editDraft: "",
+      editMeetingId: null,
     });
     useModelsStore.setState({
       models: [],
@@ -146,6 +149,57 @@ describe("SummaryView (FR-30)", () => {
     await waitFor(() =>
       expect(saveSummary).toHaveBeenCalledWith(MEETING, "revised summary"),
     );
+  });
+
+  it("keeps an in-progress edit draft when the pane is hidden and reshown", async () => {
+    // Regression for the summary-pane unmount data-loss path: the draft lives in
+    // the store, so hiding the column (which unmounts SummaryView) and reshowing
+    // it must restore the in-progress edit rather than discard it.
+    vi.mocked(getSummary).mockResolvedValue("original summary");
+    const view = render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() =>
+      expect(screen.getByText("original summary")).toBeInTheDocument(),
+    );
+
+    act(() => fireEvent.click(screen.getByRole("button", { name: "Edit" })));
+    act(() =>
+      fireEvent.change(screen.getByLabelText("Edit summary markdown"), {
+        target: { value: "work in progress" },
+      }),
+    );
+
+    // Hide the pane → unmount.
+    act(() => view.unmount());
+
+    // Reshow the pane → remount; the draft survives in the store.
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalled());
+    const restored = screen.getByLabelText(
+      "Edit summary markdown",
+    ) as HTMLTextAreaElement;
+    expect(restored.value).toBe("work in progress");
+  });
+
+  it("scopes the edit draft to its meeting (a draft for A is not shown for B)", async () => {
+    // beginEdit stores editMeetingId; a different open meeting must not inherit
+    // the draft / edit mode.
+    vi.mocked(getSummary).mockResolvedValue("summary A");
+    const view = render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() =>
+      expect(screen.getByText("summary A")).toBeInTheDocument(),
+    );
+    act(() => fireEvent.click(screen.getByRole("button", { name: "Edit" })));
+    act(() => view.unmount());
+
+    // Open a different meeting: no textarea (not in edit mode for meeting B).
+    vi.mocked(getSummary).mockResolvedValue("summary B");
+    render(<SummaryView meetingId="meeting-0002" />);
+    await waitFor(() =>
+      expect(screen.getByText("summary B")).toBeInTheDocument(),
+    );
+    expect(
+      screen.queryByLabelText("Edit summary markdown"),
+    ).not.toBeInTheDocument();
   });
 
   it("shows the model-download phase (not 'Summarising') while the LLM is fetched", async () => {

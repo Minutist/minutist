@@ -52,9 +52,18 @@
   --rule: #e4dccd; /* warm hairline dividers */
   --rule-strong: #d8cdb8;
 
+  /* Binder / writing-paper rules on the notes sheet. The vertical MARGIN rule
+     is a pale oxblood line (the classic ledger margin) dividing the timestamp
+     gutter from the writing column; it is structural and always shown. The
+     horizontal LINE rule is a faint warm stone — on-brand (NOT schoolbook
+     blue) — painted behind the text when `notes_paper_rules` is on. */
+  --rule-margin: rgba(122, 46, 46, 0.32); /* pale oxblood ledger margin */
+  --rule-line: rgba(111, 104, 92, 0.16); /* faint warm writing-paper line */
+
   /* --- Elevation -------------------------------------------------------- */
   --shadow-sheet: 0 1px 2px rgba(28, 26, 23, 0.04),
     0 8px 24px rgba(28, 26, 23, 0.06); /* page lift */
+  --scrim: rgba(28, 26, 23, 0.32); /* dimmed field behind drawers / dialogs */
 
   /* --- Geometry --------------------------------------------------------- */
   --radius: 4px; /* restrained; this is paper, not bubbles */
@@ -66,6 +75,17 @@
 
   /* Reading column measure (notes sheet). */
   --reading-measure: 70ch;
+
+  /* --- Notes sheet geometry (binder paper) ----------------------------- */
+  /* The left gutter holds the anchor-timestamp marginalia; the pale-oxblood
+     margin rule sits at its right edge; the writing column starts one
+     `--notes-text-pad` to the right of the rule. `--notes-leading` is the
+     baseline pitch the body line-height and the horizontal rules share so the
+     two align. */
+  --notes-gutter: 3.5rem; /* timestamp column width */
+  --notes-text-pad: 1.4rem; /* gap between the margin rule and the text */
+  --notes-leading: 1.85rem; /* body line-height == ruled-line pitch */
+  --notes-rule-offset: -0.5rem; /* nudge ruled lines down to the text baseline */
 
   /* Motion timing for the orchestrated load reveal + hovers. */
   --reveal-duration: 520ms;
@@ -91,7 +111,10 @@
   --accent-tint: rgba(192, 106, 95, 0.18);
   --rule: #322d24;
   --rule-strong: #423b2f;
+  --rule-margin: rgba(192, 106, 95, 0.36); /* pale oxblood ledger margin (dark) */
+  --rule-line: rgba(155, 148, 134, 0.15); /* faint warm writing-paper line (dark) */
   --shadow-sheet: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.4);
+  --scrim: rgba(0, 0, 0, 0.5); /* darker dimmed field on the dark theme */
 
   /* --- Speaker palette (dark parity) ------------------------------------ */
   /* Lighter tunings of the light palette, matched to the dark transcript

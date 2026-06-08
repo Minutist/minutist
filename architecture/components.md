@@ -1426,22 +1426,30 @@ A warm-paper, document-centric **light** theme applied across the webview.
   `@fontsource-variable/newsreader` (reading body + UI chrome). Italic faces of
   both back blockquotes / emphasis. These are the only two UI font families;
   woff2 files ship as build assets so the app renders offline.
-- **Two-pane sheet/transcript treatment.** The notes editor (`ui/src/editor/`)
-  renders as a centered reading column on a `--sheet` page that lifts off the
-  field with `--shadow-sheet` + a hairline edge. The transcript pane
-  (`ui/src/transcript/`) is the quiet, recessed `--sheet-quiet` secondary
-  column. The collapsible + resizable `react-resizable-panels` structure,
-  panel `id`s (`notes` / `transcript`), and the transcript collapse toggle are
-  unchanged. The top bar (`ui/src/shell/`) is calm and hairline-ruled: wordmark
-  left, recording status focal (oxblood dot, gentle pulse only while recording,
-  plus a tabular elapsed clock in `RecordingStatus.tsx`), grouped transport +
-  slim meter + device affordance right.
+- **Notes sheet (binder paper) + columns.** The notes editor (`ui/src/editor/`)
+  renders as a sheet of binder paper that **fills its pane** (no floating card /
+  desk margin): a narrow left timestamp gutter, a structural pale-oxblood
+  vertical **margin rule** (`--rule-margin`) dividing the gutter from the
+  writing column, and — when the `notes_paper_rules` setting is on (default) —
+  faint horizontal writing-paper rules (`--rule-line`) pitched to the body
+  leading (`--notes-leading`), with headings/lists taking whole-leading space so
+  the body re-aligns. The class `notes-editor--ruled` toggles the horizontal
+  rules; the margin rule is always shown. The transcript pane
+  (`ui/src/transcript/`) and summary view (`ui/src/shell/SummaryView.tsx`) are
+  the quiet, recessed `--sheet-quiet` columns. The resizable show/hide
+  `react-resizable-panels` structure and panel `id`s (`notes` / `transcript` /
+  `summary`) are described under "Phase 4/5 additions". The top bar
+  (`ui/src/shell/`) is calm and hairline-ruled: wordmark left, recording status
+  focal (oxblood dot, gentle pulse only while recording, plus a tabular elapsed
+  clock in `RecordingStatus.tsx`), grouped transport + slim meter + the
+  segmented pane-visibility toggle right.
 - **Margin-anchor marginalia.** `ui/src/editor/anchor-marginalia.ts` is a
   **presentation-only** ProseMirror decoration extension: it renders each
   anchored paragraph's `data-anchor-ms` value as a quiet timestamp in the sheet's
-  left-margin gutter (editorial side-note). It adds no node attributes and
-  dispatches no transactions, so it cannot interfere with `ParagraphAnchor`'s
-  stamping logic and never shifts the text column.
+  left gutter, right-aligned flush against the oxblood margin rule (editorial
+  side-note). It adds no node attributes and dispatches no transactions, so it
+  cannot interfere with `ParagraphAnchor`'s stamping logic and never shifts the
+  text column.
 - **Dev render shim (DEV-only).** `ui/src/ipc/dev-shim.ts` (sample data) +
   `ui/src/ipc/dev-shim-guard.ts` (`shouldUseDevShim`) let the full app render
   under `vite dev` in a plain browser with no Tauri backend, for visual QA. The

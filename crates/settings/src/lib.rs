@@ -77,6 +77,16 @@ const fn default_prefer_large_asr_model() -> bool {
     false
 }
 
+/// Default for `notes_paper_rules`: ON. The notes editor renders faint
+/// horizontal "writing paper" rules behind the text by default; users disable
+/// them in the Appearance settings. The oxblood *vertical* margin rule that
+/// divides the timestamp gutter from the writing column is structural and
+/// always shown — only the horizontal rules are governed by this flag. An older
+/// store written before this field existed deserialises to `true`.
+const fn default_notes_paper_rules() -> bool {
+    true
+}
+
 /// Default ASR language hint. "English" forces the English assistant-turn
 /// prefix, fixing the spurious-Chinese auto-detect bug for the primary user.
 /// The sentinel "auto" restores auto-detect (no prefix; byte-identical to the
@@ -231,6 +241,16 @@ pub struct Settings {
     /// `false`. See `architecture/cross-cutting.md` — "ASR engine routing".
     #[serde(default = "default_prefer_large_asr_model")]
     pub prefer_large_asr_model: bool,
+
+    /// Whether the notes editor renders faint horizontal "writing paper" rules
+    /// behind the text. Presentation-only: the webview reads this and toggles a
+    /// class on the editor surface. The oxblood *vertical* margin rule that
+    /// divides the timestamp gutter from the writing column is structural and is
+    /// always shown regardless of this flag. `#[serde(default = ...)]` defaults
+    /// to `true`; an older store written before this field existed deserialises
+    /// to `true`.
+    #[serde(default = "default_notes_paper_rules")]
+    pub notes_paper_rules: bool,
 }
 
 impl Default for Settings {
@@ -249,6 +269,7 @@ impl Default for Settings {
             capture_system_audio: true,
             transcription_language: default_transcription_language(),
             prefer_large_asr_model: default_prefer_large_asr_model(),
+            notes_paper_rules: default_notes_paper_rules(),
         }
     }
 }
@@ -290,6 +311,7 @@ mod tests {
             capture_system_audio: true,
             transcription_language: "Japanese".to_string(),
             prefer_large_asr_model: true,
+            notes_paper_rules: false,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -577,6 +599,45 @@ mod tests {
         assert_eq!(
             restored.transcription_language, "English",
             "missing transcription_language must deserialise to English (the default)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1i. notes_paper_rules: default + round-trip + missing-field
+    //     deserialisation (notes-editor writing-paper rules)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn notes_paper_rules_defaults_to_true() {
+        assert!(
+            Settings::default().notes_paper_rules,
+            "the notes editor shows writing-paper rules by default (Appearance can disable)"
+        );
+    }
+
+    #[test]
+    fn notes_paper_rules_round_trips() {
+        let original = Settings {
+            notes_paper_rules: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(!restored.notes_paper_rules);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_notes_paper_rules_field_defaults_to_true() {
+        // A settings store written before `notes_paper_rules` existed must
+        // deserialise to `true` (rules on by default).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            restored.notes_paper_rules,
+            "missing notes_paper_rules must deserialise to true (on by default)"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

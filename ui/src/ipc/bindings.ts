@@ -735,7 +735,17 @@ transcription_language?: string;
  * download with a GPU-class footprint. An older store deserialises to
  * `false`. See `architecture/cross-cutting.md` — "ASR engine routing".
  */
-prefer_large_asr_model?: boolean }
+prefer_large_asr_model?: boolean; 
+/**
+ * Whether the notes editor renders faint horizontal "writing paper" rules
+ * behind the text. Presentation-only: the webview reads this and toggles a
+ * class on the editor surface. The oxblood *vertical* margin rule that
+ * divides the timestamp gutter from the writing column is structural and is
+ * always shown regardless of this flag. `#[serde(default = ...)]` defaults
+ * to `true`; an older store written before this field existed deserialises
+ * to `true`.
+ */
+notes_paper_rules?: boolean }
 /**
  * UI colour-scheme preference.
  */

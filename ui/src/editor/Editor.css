@@ -14,35 +14,62 @@
   min-height: 0;
 }
 
-/* Scroll field = the warm desk the page sits on. */
+/* Scroll field — the notes sheet fills it edge-to-edge (binder paper in its
+   column), so it carries no padding of its own and does not centre a floating
+   card. The breathing room lives in the sheet's own padding, matching the
+   transcript column's restraint. */
 .notes-editor__field {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 2.25rem 1.5rem 4rem;
-  display: flex;
-  justify-content: center;
-  /* Let the sheet's height be driven by its content + min-height (fill, then
-     grow + scroll) rather than being force-stretched to the field height. */
-  align-items: flex-start;
+  padding: 0;
 }
 
-/* The page. */
+/* The page — a sheet of binder paper that fills the pane. No floating-card lift
+   or border: the resize separator divides it from the transcript, and the
+   `--sheet` surface IS the paper. The margin rule + ruled lines are painted on
+   THIS element (not the inner text block) so they span the full page height,
+   not just the typed text — a short note still reads as a full ruled sheet.
+   `min-height: 100%` fills a tall pane; a long note grows past it and scrolls. */
 .notes-editor__sheet {
+  position: relative;
   width: 100%;
-  /* Reading column + a left gutter for the anchor marginalia, so the
-     marginalia sits OUTSIDE the text measure and never shifts it. */
-  max-width: calc(var(--reading-measure) + 6.5rem);
-  /* Fill the column height so a short note reads as a full page on the desk
-     rather than a small card floating above empty space; a long note grows
-     past this and the field scrolls. */
   min-height: 100%;
   background: var(--sheet);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-sheet);
-  padding: 3rem 3rem 3rem calc(3rem + 5rem);
   box-sizing: border-box;
+}
+
+/* The oxblood ledger margin rule — structural, always shown — dividing the
+   timestamp gutter from the writing column. Spans the full sheet height. */
+.notes-editor__sheet::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: var(--notes-gutter);
+  width: 1px;
+  background: var(--rule-margin);
+  pointer-events: none;
+}
+
+/* Faint horizontal writing-paper rules (the `notes_paper_rules` setting; on by
+   default). A repeating gradient pitched to `--notes-leading` so consecutive
+   body lines rest on the rules; headings/lists span whole multiples of the
+   leading (set below) so the body re-aligns after them. Painted on the sheet so
+   the rules cross the full page (like real binder paper) — faintly behind the
+   gutter timestamps too. The text block (capped at the reading measure) sits
+   over them; the blank paper to the right of the measure keeps the rules. The
+   `background-position` nudges the painted rule down to sit just under each text
+   baseline rather than at the top of the line box. */
+.notes-editor--ruled .notes-editor__sheet {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent calc(var(--notes-leading) - 1px),
+    var(--rule-line) calc(var(--notes-leading) - 1px),
+    var(--rule-line) var(--notes-leading)
+  );
+  background-position: 0 var(--notes-rule-offset);
 }
 
 .notes-editor .tiptap,
@@ -51,9 +78,70 @@
   outline: none;
   font-family: var(--font-text);
   font-size: 17px;
-  line-height: 1.7;
+  line-height: var(--notes-leading);
   color: var(--ink);
   font-variation-settings: "opsz" 16;
+  box-sizing: border-box;
+  /* Left-aligned writing column: a narrow timestamp gutter, then the text. The
+     reading measure caps the line length on a wide pane (the binder margin to
+     the right stays blank ruled paper). One leading of top padding so the first
+     text line lands on the grid the sheet's ruled lines share. */
+  max-width: calc(
+    var(--notes-gutter) + var(--notes-text-pad) + var(--reading-measure) + 2.25rem
+  );
+  padding: var(--notes-leading) 2.25rem 3rem
+    calc(var(--notes-gutter) + var(--notes-text-pad));
+}
+
+/*
+ * Baseline grid for ruled mode: body lines sit on the rules; paragraphs and
+ * lists drop their extra spacing (an empty line advances exactly one rule, as
+ * on real lined paper), and headings take a whole number of leadings so the
+ * body re-aligns beneath them. Non-ruled mode keeps the comfortable default
+ * spacing defined above.
+ */
+.notes-editor--ruled .notes-editor__content p,
+.notes-editor--ruled .notes-editor__content ul,
+.notes-editor--ruled .notes-editor__content ol,
+.notes-editor--ruled .notes-editor__content li,
+.notes-editor--ruled .notes-editor__content blockquote {
+  margin: 0;
+}
+
+.notes-editor--ruled .notes-editor__content h1 {
+  line-height: calc(2 * var(--notes-leading));
+  margin: var(--notes-leading) 0 0;
+}
+
+.notes-editor--ruled .notes-editor__content h2,
+.notes-editor--ruled .notes-editor__content h3 {
+  line-height: var(--notes-leading);
+  margin: var(--notes-leading) 0 0;
+}
+
+.notes-editor--ruled .notes-editor__content hr {
+  margin: var(--notes-leading) 0;
+}
+
+.notes-editor--ruled .notes-editor__content > :first-child {
+  margin-top: 0;
+}
+
+/*
+ * Non-prose blocks (code, tables, dragged-in transcript chips) cannot sit on a
+ * single-leading grid — their height is content-driven. In ruled mode they get
+ * leading-multiple margins so the surrounding prose stays aligned, and an
+ * opaque surface so the rules do not bleed through and read as misaligned
+ * behind them (they become quiet cards floating on the ruled page).
+ */
+.notes-editor--ruled .notes-editor__content pre,
+.notes-editor--ruled .notes-editor__content table,
+.notes-editor--ruled .notes-editor__content .transcript-chip {
+  margin: var(--notes-leading) 0;
+}
+
+.notes-editor--ruled .notes-editor__content table {
+  background: var(--sheet);
 }
 
 /* --- Headings (Fraunces, with optical-size + soft character) ------------- */
@@ -255,11 +343,13 @@
  */
 .notes-editor__anchor-mark {
   position: absolute;
-  left: -4.5rem;
-  width: 3.75rem;
+  /* Sit in the gutter, right-aligned so the timestamp ends flush against the
+     oxblood margin rule (its right edge lands at x = --notes-gutter). */
+  left: calc(-1 * (var(--notes-text-pad) + 2.9rem));
+  width: 2.9rem;
   text-align: right;
   font-size: 0.7rem;
-  line-height: 1.7;
+  line-height: var(--notes-leading);
   color: var(--stone);
   user-select: none;
   pointer-events: none;

@@ -21,6 +21,7 @@ import { withPreferLargeAsrModel } from "./large-asr-model-settings";
 import { withCaptureSystemAudio } from "./system-audio-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
 import { withTranscriptionLanguage } from "./transcription-language-settings";
+import { withNotesPaperRules } from "./notes-paper-settings";
 import type { Theme } from "../ipc/bindings";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
@@ -104,6 +105,13 @@ export type RecordingStore = {
    * by the Phase-7 onboarding quick-settings step.
    */
   setTheme: (theme: Theme) => Promise<void>;
+  /**
+   * Toggle the notes-editor writing-paper rules (on by default), persisting via
+   * `commands.updateSettings` — the same round-trip-through-settings pattern as
+   * `setGpuAcceleration`. Presentation-only; the editor reads the field back and
+   * toggles a class. The structural oxblood margin rule is unaffected.
+   */
+  setNotesPaperRules: (enabled: boolean) => Promise<void>;
   /**
    * Mark the first-run onboarding flow complete (Phase 7), persisting
    * `onboarding_completed = true` via `commands.updateSettings`. The shell gate
@@ -324,6 +332,24 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withTheme(current, theme);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setNotesPaperRules: async (enabled) => {
+    // Persist via `update_settings` (same round-trip as `setGpuAcceleration`).
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withNotesPaperRules(current, enabled);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

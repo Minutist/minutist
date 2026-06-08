@@ -27,6 +27,7 @@ import { handleSegmentDrop } from "./transcript-dnd";
 import { scrollToNearestAnchor } from "./scroll-to-anchor";
 import { shouldUseDevShim } from "../ipc/dev-shim-guard";
 import { loadNotes } from "../ipc/notes";
+import { readNotesPaperRules } from "../state/notes-paper-settings";
 import "./Editor.css";
 
 /**
@@ -197,12 +198,18 @@ export function Editor() {
     };
   }, [editor]);
 
+  // Writing-paper rules (on by default; `notes_paper_rules` Appearance setting).
+  // Presentation-only — toggles the faint horizontal rules behind the text. The
+  // oxblood margin rule that divides the timestamp gutter is structural and
+  // shown regardless.
+  const paperRules = readNotesPaperRules(settings);
+
   return (
-    <div className="notes-editor">
+    <div className={`notes-editor${paperRules ? " notes-editor--ruled" : ""}`}>
       {/*
-        The scroll field is the warm desk; the inner `__sheet` is the page —
-        a centered reading column with a page lift + hairline edge so the notes
-        read like writing on a fine sheet of paper.
+        The scroll field holds a single sheet of binder paper that fills the
+        pane: a narrow timestamp gutter on the left, an oxblood margin rule, then
+        the writing column (optionally over faint writing-paper rules).
       */}
       <div className="notes-editor__field">
         <div className="notes-editor__sheet">

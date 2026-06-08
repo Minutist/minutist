@@ -12,7 +12,7 @@
   z-index: 50;
   display: flex;
   justify-content: flex-end;
-  background: rgba(28, 26, 23, 0.32);
+  background: var(--scrim);
 }
 
 .settings-drawer {
@@ -99,12 +99,14 @@
 }
 
 /*
- * Device + language pickers: relayout the shared `.device-picker` /
- * `.language-picker` blocks as a stacked label-over-control field that fills
- * the drawer width (their inline top-bar form was a tight horizontal row).
+ * Stacked label-over-control fields: the device / language pickers and the
+ * Appearance colour-theme select share one layout (label above a full-width
+ * control that fills the drawer; the pickers' inline top-bar form was a tight
+ * horizontal row).
  */
 .settings-drawer .device-picker,
-.settings-drawer .language-picker {
+.settings-drawer .language-picker,
+.settings-drawer__field {
   display: flex;
   flex-direction: column;
   align-items: stretch;
@@ -112,7 +114,8 @@
 }
 
 .settings-drawer .device-picker label,
-.settings-drawer .language-picker label {
+.settings-drawer .language-picker label,
+.settings-drawer__field label {
   font-size: 0.72rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -120,7 +123,8 @@
 }
 
 .settings-drawer .device-picker select,
-.settings-drawer .language-picker select {
+.settings-drawer .language-picker select,
+.settings-drawer__field select {
   width: 100%;
   max-width: none;
   font-family: var(--font-text);
@@ -134,7 +138,8 @@
 }
 
 .settings-drawer .device-picker select:hover,
-.settings-drawer .language-picker select:hover {
+.settings-drawer .language-picker select:hover,
+.settings-drawer__field select:hover {
   border-color: var(--stone-faint);
 }
 

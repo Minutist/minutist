@@ -39,17 +39,42 @@ export function App() {
   }, [refreshSettings, refreshModels]);
 
   // Reflect the persisted colour-scheme preference onto the document root so
-  // the `theme.css` `:root[data-theme="dark"]` overrides apply. `"system"`
-  // (and the unresolved state) clears the attribute, falling back to the
-  // light-first `:root` defaults. UI-only; adds no command.
+  // the `theme.css` `:root[data-theme="dark"]` overrides apply. `"dark"` /
+  // `"light"` are explicit; `"system"` follows the OS `prefers-color-scheme`
+  // (and tracks live changes to it). The light-first `:root` defaults apply
+  // whenever the attribute is absent. UI-only; adds no command.
   const theme = readTheme(settings);
   useEffect(() => {
     const root = document.documentElement;
+    const apply = (dark: boolean) => {
+      if (dark) root.setAttribute("data-theme", "dark");
+      else root.removeAttribute("data-theme");
+    };
+
     if (theme === "dark") {
-      root.setAttribute("data-theme", "dark");
-    } else {
-      root.removeAttribute("data-theme");
+      apply(true);
+      return;
     }
+    if (theme === "light") {
+      apply(false);
+      return;
+    }
+
+    // "system": resolve from the OS preference and track live changes. Guard
+    // `matchMedia` for environments that lack it (jsdom in unit tests) — there,
+    // fall back to the light-first default.
+    const media =
+      typeof window !== "undefined" && typeof window.matchMedia === "function"
+        ? window.matchMedia("(prefers-color-scheme: dark)")
+        : null;
+    if (!media) {
+      apply(false);
+      return;
+    }
+    apply(media.matches);
+    const onChange = (e: MediaQueryListEvent) => apply(e.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
   }, [theme]);
 
   // Hold the UI neutral until settings resolve so a returning user is never

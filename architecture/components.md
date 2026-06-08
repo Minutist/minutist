@@ -1138,7 +1138,7 @@ than packages.
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
 | Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
-| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture). The summary is a workspace column, not an overlay. The capture/processing settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. All drawer controls route through the existing settings seams; no new command. |
+| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. All drawer controls route through the existing settings seams; no new command. |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 
@@ -1466,6 +1466,11 @@ A warm-paper, document-centric **light** theme applied across the webview.
   side-note). It adds no node attributes and dispatches no transactions, so it
   cannot interfere with `ParagraphAnchor`'s stamping logic and never shifts the
   text column.
+- **Appearance settings.** The Settings drawer's Appearance group exposes the
+  colour-theme control (System / Light / Dark — `settings.theme`, applied to the
+  document root in `App.tsx`; "System" follows `prefers-color-scheme`) and the
+  writing-paper-rules toggle (`settings.notes_paper_rules`). Both are
+  presentation-only and round-trip through the existing `update_settings` seam.
 - **Dev render shim (DEV-only).** `ui/src/ipc/dev-shim.ts` (sample data) +
   `ui/src/ipc/dev-shim-guard.ts` (`shouldUseDevShim`) let the full app render
   under `vite dev` in a plain browser with no Tauri backend, for visual QA. The

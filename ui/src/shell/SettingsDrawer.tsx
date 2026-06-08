@@ -21,6 +21,9 @@ import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
 import { readPreferLargeAsrModel } from "../state/large-asr-model-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
+import { readNotesPaperRules } from "../state/notes-paper-settings";
+import { readTheme } from "../state/onboarding-settings";
+import type { Theme } from "../ipc/bindings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
 import "./SettingsDrawer.css";
@@ -47,11 +50,15 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
   const setCaptureSystemAudio = useRecordingStore(
     (s) => s.setCaptureSystemAudio,
   );
+  const setTheme = useRecordingStore((s) => s.setTheme);
+  const setNotesPaperRules = useRecordingStore((s) => s.setNotesPaperRules);
 
   const diarizationEnabled = readDiarizationEnabled(settings);
   const gpuAcceleration = readGpuAcceleration(settings);
   const preferLargeAsrModel = readPreferLargeAsrModel(settings);
   const captureSystemAudio = readCaptureSystemAudio(settings);
+  const theme = readTheme(settings);
+  const notesPaperRules = readNotesPaperRules(settings);
 
   // Focus the close control on open, and close on Escape — the minimum dialog
   // affordances; mirrors the About dialog.
@@ -94,6 +101,35 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             Done
           </button>
         </header>
+
+        <section className="settings-drawer__group" aria-label="Appearance">
+          <h3 className="settings-drawer__group-title">Appearance</h3>
+          <div className="settings-drawer__field">
+            <label htmlFor="settings-theme">Colour theme</label>
+            <select
+              id="settings-theme"
+              value={theme}
+              disabled={settings === null}
+              onChange={(e) => void setTheme(e.target.value as Theme)}
+            >
+              <option value="system">Match system</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </div>
+          <label
+            className="settings-drawer__toggle"
+            title="Show faint horizontal writing-paper rules behind the notes. The oxblood margin rule that separates the timestamp gutter from the text is always shown."
+          >
+            <input
+              type="checkbox"
+              checked={notesPaperRules}
+              disabled={settings === null}
+              onChange={(e) => void setNotesPaperRules(e.target.checked)}
+            />
+            <span>Ruled writing paper</span>
+          </label>
+        </section>
 
         <section className="settings-drawer__group" aria-label="Capture">
           <h3 className="settings-drawer__group-title">Capture</h3>

@@ -41,13 +41,30 @@ describe("SettingsDrawer", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("surfaces the capture + processing controls when open", () => {
+  it("surfaces the appearance + capture + processing controls when open", () => {
     render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
+    // Appearance: colour theme + writing-paper rules.
+    expect(screen.getByLabelText("Colour theme")).toBeInTheDocument();
+    expect(screen.getByText("Ruled writing paper")).toBeInTheDocument();
+    // Capture + processing.
     expect(screen.getByLabelText("Input device")).toBeInTheDocument();
     expect(screen.getByLabelText("Transcription language")).toBeInTheDocument();
     expect(screen.getByText("Diarize speakers on stop")).toBeInTheDocument();
     expect(screen.getByText("GPU acceleration")).toBeInTheDocument();
     expect(screen.getByText("Capture call / system audio")).toBeInTheDocument();
+  });
+
+  it("reflects the persisted appearance defaults (system theme, ruled paper on)", () => {
+    render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
+    // BASE_SETTINGS omits both fields → the schema defaults apply: theme falls
+    // back to "system" and the writing-paper rules read as on.
+    const theme = screen.getByLabelText("Colour theme") as HTMLSelectElement;
+    expect(theme.value).toBe("system");
+    const ruled = screen
+      .getByText("Ruled writing paper")
+      .closest("label")!
+      .querySelector("input") as HTMLInputElement;
+    expect(ruled.checked).toBe(true);
   });
 
   it("calls onClose on the Done button and on Escape", () => {

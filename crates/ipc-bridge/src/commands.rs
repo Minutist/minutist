@@ -181,26 +181,43 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
         }
     }
 
-    // Decoupled on-stop diarization (FR-11): the meeting is now indexed and
-    // visible, so run the diarization pass in the BACKGROUND rather than inline
-    // in `stop()`. A slow or hung pass can therefore no longer wedge the stop
-    // flow or hide the meeting (the original failure mode). Reuses
-    // `Orchestrator::rediarize`, which — with its length-relative timeout —
-    // rewrites the transcript + metadata, refreshes the index row, and emits
-    // `AppEvent::DiarizationComplete` when done. Gated on the user's
-    // `diarization_enabled` setting; fire-and-forget, errors are logged (the
-    // recording is safely on disk and can be re-diarized manually).
-    if state.orchestrator.diarization_enabled() {
+    // Decoupled background post-processing: the meeting is already indexed and
+    // visible, so any heavy passes run OFF the stop path (a slow/hung pass can
+    // never wedge stop or hide the meeting). Up to two passes run, in order, in
+    // one fire-and-forget task:
+    //   1. Re-transcribe (FR — ASR repair): if the live transcript fell behind
+    //      (drop-oldest loss during recording, or a stop-drain timeout), re-run
+    //      ASR over the COMPLETE `audio.opus` — the authoritative transcript,
+    //      since the audio is captured in full regardless of live-ASR speed.
+    //   2. Diarize (FR-11): if enabled, run AFTER any re-transcribe so it labels
+    //      the repaired transcript (`rediarize` carries its own length-relative
+    //      timeout). Emits `AppEvent::DiarizationComplete` when done.
+    // Both claim the offline slot internally and run sequentially; errors are
+    // logged (the recording is safely on disk).
+    let needs_retranscribe = state.orchestrator.take_transcript_incomplete();
+    let needs_diarize = state.orchestrator.diarization_enabled();
+    if needs_retranscribe || needs_diarize {
         let orchestrator = std::sync::Arc::clone(&state.orchestrator);
         let index = std::sync::Arc::clone(&state.index);
         let meeting_id = meta.uuid;
         tokio::spawn(async move {
-            if let Err(e) = orchestrator.rediarize(&index, meeting_id).await {
-                tracing::warn!(
-                    target: "ipc-bridge",
-                    meeting_id = %meeting_id.0,
-                    "background on-stop diarization failed: {e}; meeting left un-diarized"
-                );
+            if needs_retranscribe {
+                if let Err(e) = orchestrator.re_transcribe(&index, meeting_id).await {
+                    tracing::warn!(
+                        target: "ipc-bridge",
+                        meeting_id = %meeting_id.0,
+                        "background re-transcribe after stop failed: {e}; keeping the live transcript"
+                    );
+                }
+            }
+            if needs_diarize {
+                if let Err(e) = orchestrator.rediarize(&index, meeting_id).await {
+                    tracing::warn!(
+                        target: "ipc-bridge",
+                        meeting_id = %meeting_id.0,
+                        "background on-stop diarization failed: {e}; meeting left un-diarized"
+                    );
+                }
             }
         });
     }

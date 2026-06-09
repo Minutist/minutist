@@ -153,6 +153,13 @@ pub(crate) struct FlushQueue {
     /// `wait_all_processed` returns immediately rather than blocking until
     /// timeout — a dead worker will never decrement `in_flight`.
     pub(crate) worker_exited: Arc<AtomicBool>,
+    /// Set to `true` when the live transcript became incomplete: either the
+    /// drop-oldest queue discarded a pending flush (mid-recording loss) or the
+    /// stop-time drain timed out (tail loss). Surfaced via `RunnerHandle` so
+    /// `ipc-bridge` can, after stop, run a background re-transcribe of the
+    /// complete `audio.opus` — the authoritative repair, since the audio is
+    /// captured in full regardless of ASR speed.
+    pub(crate) incomplete: Arc<AtomicBool>,
 }
 
 impl FlushQueue {
@@ -163,6 +170,7 @@ impl FlushQueue {
             closed: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             worker_exited: Arc::new(AtomicBool::new(false)),
+            incomplete: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -174,6 +182,7 @@ impl FlushQueue {
             closed: Arc::clone(&self.closed),
             in_flight: Arc::clone(&self.in_flight),
             worker_exited: Arc::clone(&self.worker_exited),
+            incomplete: Arc::clone(&self.incomplete),
         }
     }
 
@@ -325,6 +334,11 @@ impl Accumulator {
 /// Live handle to the drain runner.
 pub(crate) struct RunnerHandle {
     pub(crate) cmd_tx: mpsc::Sender<RunnerCommand>,
+    /// Shares `FlushQueue::incomplete`: set during the recording if the live
+    /// transcript lost any audio (drop-oldest) or could not finish draining at
+    /// stop. `Orchestrator::stop` reads it after finalise so `ipc-bridge` can
+    /// trigger a background re-transcribe of the complete audio.
+    pub(crate) transcript_incomplete: Arc<AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +411,9 @@ fn spawn_runner_inner(
     // Bounded drop-oldest flush queue: runner (producer) → ASR worker (consumer).
     let flush_queue = FlushQueue::new();
     let worker_flush_queue = flush_queue.consumer_clone();
+    // Surfaced to the orchestrator via the handle so a behind/incomplete live
+    // transcript can be repaired by a background re-transcribe after stop.
+    let transcript_incomplete = Arc::clone(&flush_queue.incomplete);
 
     // Channel for ASR worker → runner to write transcript segments.
     // Bounded at FLUSH_CHANNEL_CAP * max_segments_per_flush; a rough bound is fine.
@@ -432,7 +449,10 @@ fn spawn_runner_inner(
         );
     });
 
-    RunnerHandle { cmd_tx }
+    RunnerHandle {
+        cmd_tx,
+        transcript_incomplete,
+    }
 }
 
 /// Spawn the drain runner with a pre-built ASR backend (test-only path).
@@ -898,6 +918,10 @@ fn dispatch_flush_inner(
     if deque.len() >= FLUSH_CHANNEL_CAP {
         // Drop the OLDEST pending flush (the front of the queue).
         let _dropped = deque.pop_front();
+        // Mark the live transcript incomplete so ipc-bridge runs a background
+        // re-transcribe of the complete audio after stop (the dropped flush's
+        // audio survives in audio.opus; only its transcript was lost).
+        flush_queue.incomplete.store(true, Ordering::Release);
         tracing::warn!(
             target: "orchestrator",
             "ASR flush queue full (backpressure); dropping oldest pending flush \
@@ -1364,9 +1388,14 @@ fn wait_for_asr_worker_drain(
     let poll_interval = Duration::from_millis(20);
     let drained = flush_queue.wait_all_processed(timeout, poll_interval);
     if !drained {
+        // Tail loss: the remaining queued/in-flight audio could not be
+        // transcribed in time. Mark incomplete so ipc-bridge re-transcribes the
+        // complete audio in the background (the audio itself is fully captured).
+        flush_queue.incomplete.store(true, Ordering::Release);
         tracing::warn!(
             target: "orchestrator",
-            "ASR worker did not drain within 30 s; finalising without waiting further"
+            "ASR worker did not drain within 30 s; finalising now — a background \
+             re-transcribe of the complete audio will repair the transcript"
         );
     }
     // Drain any writer commands that arrived while we were waiting.
@@ -2421,6 +2450,12 @@ mod tests {
             dispatch_flush(&flush_queue, payload, &event_tx);
         }
 
+        // No drop yet → the live transcript is still complete.
+        assert!(
+            !flush_queue.incomplete.load(std::sync::atomic::Ordering::Acquire),
+            "incomplete must be false before any drop"
+        );
+
         // Queue is now full (4 entries). Dispatching one more should drop index 0.
         let newest_start_ms = FLUSH_CHANNEL_CAP as u64 * 1000;
         let newest_payload = FlushPayload {
@@ -2454,6 +2489,13 @@ mod tests {
             FLUSH_CHANNEL_CAP,
             "queue must remain at FLUSH_CHANNEL_CAP after drop-oldest; len={}",
             deque.len()
+        );
+
+        // The drop must flag the transcript incomplete so ipc-bridge runs a
+        // background re-transcribe of the complete audio after stop.
+        assert!(
+            flush_queue.incomplete.load(std::sync::atomic::Ordering::Acquire),
+            "dropping a pending flush must set incomplete"
         );
     }
 

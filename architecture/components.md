@@ -730,6 +730,13 @@ segment. Unlike the live path's best-effort skip when no model is present, an
 explicit user-triggered re-transcribe with no available model is an error
 (`AppError::ModelLoad`). The orchestrator does not own a `MeetingIndex`; the
 index handle is passed in by `ipc-bridge` (which owns it in `IpcState`).
+Besides the user-triggered command, `ipc-bridge` also spawns this as a
+**background pass after `stop()`** when the live transcript fell behind
+(`take_transcript_incomplete()` — set by the runner on a drop-oldest flush or a
+stop-drain timeout), repairing both mid-recording drops AND a truncated tail from
+the complete audio; that background invocation logs and swallows errors (e.g. a
+missing model) rather than surfacing them, since the live transcript is already
+on disk.
 
 **Test seam — `re_transcribe_with_backend(&MeetingIndex, MeetingId, Box<dyn
 AsrBackend + Send>)`.** A `#[cfg(any(test, feature = "test-source"))]`-gated
@@ -1018,14 +1025,19 @@ turn a successful stop into an error. This keeps the orchestrator decoupled from
 the index: the index handle lives in `ipc-bridge` (`IpcState`), so the upsert
 lives at the command boundary, not in the orchestrator.
 
-**Decoupled on-stop diarization + self-healing list (drift fix).** After the
-upsert, if `orchestrator.diarization_enabled()` is set, `stop_recording`
-**spawns `Orchestrator::rediarize` as a background task** (`tokio::spawn` with
-cloned `Arc<Orchestrator>` + `Arc<MeetingIndex>` handles) instead of awaiting
-diarization inline — so a slow or hung pass can neither wedge the stop response
-nor hide the meeting; the pass refreshes the index row and emits
-`DiarizationComplete` when it finishes (errors logged, fire-and-forget). And
-because a derived cache can always drift from disk, `list_meetings` first calls
+**Decoupled background post-processing + self-healing list (drift + truncation
+fix).** After the upsert, `stop_recording` runs up to two heavy passes OFF the
+stop path, in order, in one fire-and-forget `tokio::spawn` (cloned
+`Arc<Orchestrator>` + `Arc<MeetingIndex>`), so neither can wedge the stop
+response or hide the meeting: (1) if `orchestrator.take_transcript_incomplete()`
+is true — the live ASR dropped audio (drop-oldest flush queue) or its stop-drain
+timed out — `re_transcribe` re-runs ASR over the complete `audio.opus`, the
+authoritative transcript (the audio is captured in full regardless of live-ASR
+speed); (2) if `orchestrator.diarization_enabled()`, `rediarize` runs AFTER any
+re-transcribe so it labels the repaired transcript — each with its own
+length-relative timeout. Both refresh the index row and emit their events on
+completion (errors logged). And because a derived cache can always drift from
+disk, `list_meetings` first calls
 `MeetingIndex::reconcile_orphans(meetings_dir)` — a cheap `readdir` + set-diff
 that lazily indexes any meeting folder present on disk but missing from the cache
 (e.g. the process killed between finalise and the stop-time upsert) — so a

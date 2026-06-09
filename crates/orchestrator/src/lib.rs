@@ -45,6 +45,7 @@ pub mod test_support;
 mod tests;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +80,12 @@ pub struct Orchestrator {
     inner: Mutex<OrchestratorInner>,
     /// Broadcast channel for `AppEvent`. Capacity 256 (~8 s of meter at 30 Hz).
     event_tx: broadcast::Sender<AppEvent>,
+    /// Whether the most recent recording's live transcript was incomplete (the
+    /// drop-oldest flush queue lost audio, or the stop-time drain timed out).
+    /// `stop()` copies the runner's flag here; `ipc-bridge` reads it via
+    /// `take_transcript_incomplete()` to decide whether to run a background
+    /// re-transcribe of the complete `audio.opus`.
+    last_transcript_incomplete: Arc<AtomicBool>,
 }
 
 struct OrchestratorInner {
@@ -139,6 +146,7 @@ impl Orchestrator {
                 started_at: None,
             }),
             event_tx,
+            last_transcript_incomplete: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -441,11 +449,24 @@ impl Orchestrator {
                     context: "runner command channel closed before stop could be sent".into(),
                 })?;
 
-            reply_rx.await.map_err(|_| AppError::Internal {
+            let finalised = reply_rx.await.map_err(|_| AppError::Internal {
                 context: "runner reply channel closed before finalise completed".into(),
-            })??
+            })??;
+
+            // Record whether the live transcript fell behind (drop-oldest loss
+            // or a stop-drain timeout). The runner sets this before sending the
+            // reply, so it is visible now. `ipc-bridge` reads it via
+            // `take_transcript_incomplete()` to trigger a background re-transcribe.
+            self.last_transcript_incomplete.store(
+                handle.transcript_incomplete.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+
+            finalised
         } else {
             // No runner (e.g. test path with no real audio device).
+            self.last_transcript_incomplete
+                .store(false, Ordering::Release);
             meta
         };
 
@@ -489,6 +510,16 @@ impl Orchestrator {
     /// settings read, but the *execution* is decoupled from `stop()`.
     pub fn diarization_enabled(&self) -> bool {
         self.settings.current().diarization_enabled
+    }
+
+    /// Take (read + reset) whether the most recent `stop()`'s live transcript
+    /// was incomplete — the drop-oldest flush queue lost audio during recording,
+    /// or the stop-time ASR drain timed out. `ipc-bridge` calls this once after
+    /// `stop()`; when true it runs a background re-transcribe of the complete
+    /// `audio.opus` (the authoritative repair, since the audio is fully captured
+    /// regardless of live-ASR speed). Read-and-reset so it is consumed once.
+    pub fn take_transcript_incomplete(&self) -> bool {
+        self.last_transcript_incomplete.swap(false, Ordering::AcqRel)
     }
 
     /// Return a snapshot of the current recording state.

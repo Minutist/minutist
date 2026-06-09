@@ -56,6 +56,9 @@ async function callCommand<K extends CommandName>(
 export const commands: Commands = {
   listDevices: () => callCommand("listDevices", []),
   startRecording: (deviceId) => callCommand("startRecording", [deviceId]),
+  // Live-test UX T2: pre-warm the ASR model so the first record is not a cold
+  // ~29 s load. Best-effort; the DEV shim no-ops it.
+  prewarmAsr: () => callCommand("prewarmAsr", []),
   pauseRecording: () => callCommand("pauseRecording", []),
   resumeRecording: () => callCommand("resumeRecording", []),
   stopRecording: () => callCommand("stopRecording", []),

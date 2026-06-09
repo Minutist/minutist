@@ -47,6 +47,18 @@ export type RecordingStore = {
   settings: Settings | null;
   meter: { peak: number; rms: number };
   lastError: string | null;
+  /**
+   * Client-only optimistic transient (live-test UX T1): `true` from the moment
+   * `start()` is invoked until the backend confirms the recording has begun (the
+   * `state_changed` → `recording` event) or `start()` fails. It exists because
+   * the FIRST record may lazy-load the ASR model (~29 s) with no other feedback,
+   * so the UI would otherwise look dead. While `true` the Start control is
+   * disabled (a second press is impossible) and a "Preparing transcription
+   * model…" status is shown. NOT part of the Rust `RecordingState` — the backend
+   * has no "preparing" state; this is purely a UI affordance over the gap between
+   * the start request and the `recording` confirmation.
+   */
+  preparing: boolean;
   /** Live transcript for the current recording session. Cleared when a new recording starts. */
   transcript: Segment[];
   /**
@@ -67,6 +79,14 @@ export type RecordingStore = {
   // actions
   refreshDevices: () => Promise<void>;
   refreshSettings: () => Promise<void>;
+  /**
+   * Pre-load the routed ASR model so the FIRST record is not a cold ~29 s load
+   * (live-test UX T2). Fire-and-forget when the recording/meeting workspace
+   * opens; idempotent and best-effort backend-side (a not-yet-downloaded model
+   * warms nothing). app-main also prewarms on startup; this is the in-session
+   * trigger for when the window opens after a settings change.
+   */
+  prewarmAsr: () => Promise<void>;
   start: () => Promise<void>;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
@@ -174,6 +194,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   settings: null,
   meter: { peak: 0, rms: 0 },
   lastError: null,
+  preparing: false,
   transcript: [],
   recordingClockMs: null,
 
@@ -200,18 +221,46 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
+  prewarmAsr: async () => {
+    // Best-effort: a prewarm failure is non-fatal (the backend keeps the lazy
+    // load as the fallback), so swallow errors rather than surfacing lastError.
+    try {
+      await commands.prewarmAsr();
+    } catch {
+      // ignore — prewarm is an optimisation, not a required step.
+    }
+  },
+
   start: async () => {
+    // Guard against a double-press / start-while-busy (live-test UX T1a): only a
+    // genuinely idle recorder may start. A second press while Recording would
+    // otherwise re-call `startRecording`, which the orchestrator rejects with
+    // "start called when not idle" (surfaced as `lastError`). The `preparing`
+    // flag covers the window between this call and the `recording` confirmation.
+    if (get().state.kind !== "idle" || get().preparing) {
+      return;
+    }
     // Guard: ASR model must be ready before recording can start.
     if (!useModelsStore.getState().isAsrModelReady) {
       set({ lastError: "ASR model not yet downloaded" });
       return;
     }
+    // Optimistic transient (T1a/T1c): disable the control immediately and show
+    // "Preparing transcription model…" while the backend opens capture and (on
+    // the first record) lazy-loads the ASR model. Cleared on the `recording`
+    // state event (see `handleEvent`) or on error below.
+    set({ preparing: true, lastError: null });
     try {
       const result = await commands.startRecording(get().selectedDeviceId);
       unwrap(result);
       set({ lastError: null });
     } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
+      // The start failed before any `recording` event will arrive, so clear the
+      // optimistic flag here (the event path won't).
+      set({
+        preparing: false,
+        lastError: err instanceof Error ? err.message : String(err),
+      });
     }
   },
 
@@ -511,10 +560,15 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         // (idle/stopping/paused) so notes anchors stop stamping once
         // capture is no longer advancing; the next `recording_clock`
         // event re-populates it while recording or after resume.
+        //
+        // Any backend state change also resolves the optimistic `preparing`
+        // transient (T1): once `recording` arrives the model is loaded and
+        // capture is live; any other terminal state (e.g. an error path that
+        // left the recorder idle) likewise ends the preparing window.
         if (event.state.kind === "recording") {
-          set({ state: event.state, transcript: [] });
+          set({ state: event.state, transcript: [], preparing: false });
         } else {
-          set({ state: event.state, recordingClockMs: null });
+          set({ state: event.state, recordingClockMs: null, preparing: false });
         }
         break;
       case "audio_meter":

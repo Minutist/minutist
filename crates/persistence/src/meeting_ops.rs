@@ -84,17 +84,14 @@ pub async fn delete_meeting(
     Ok(())
 }
 
-/// Build a `MeetingListEntry` from a meeting folder's metadata + transcript.
+/// Build a `MeetingListEntry` from a meeting folder's metadata + excerpt.
 ///
-/// Shares the same projection as `rebuild_from_disk` (metadata fields + first
-/// transcript segment as excerpt). Kept here (rather than reused from `index`)
-/// because the index module's variant runs on `spawn_blocking`; this one is a
-/// direct call in an already-async path.
+/// Shares the same projection as `rebuild_from_disk` and reuses the excerpt
+/// derivation (`crate::index::derive_excerpt`): a one-line `summary.md` blurb
+/// once a summary exists, else the first transcript segment (live-test UX T6).
 fn list_entry_from(folder: &Path) -> Result<meeting_app_common::MeetingListEntry, Error> {
     let meta = reader::read_metadata_inner(folder)?;
-    let excerpt = reader::read_transcript_inner(folder)
-        .ok()
-        .and_then(|segs| segs.first().map(|s| truncate_excerpt(&s.text)));
+    let excerpt = crate::index::derive_excerpt(folder);
 
     Ok(meeting_app_common::MeetingListEntry {
         id: meta.uuid,
@@ -104,14 +101,4 @@ fn list_entry_from(folder: &Path) -> Result<meeting_app_common::MeetingListEntry
         speaker_count: meta.speaker_count,
         excerpt,
     })
-}
-
-fn truncate_excerpt(text: &str) -> String {
-    const MAX: usize = 120;
-    if text.chars().count() <= MAX {
-        text.to_string()
-    } else {
-        let truncated: String = text.chars().take(MAX).collect();
-        format!("{truncated}…")
-    }
 }

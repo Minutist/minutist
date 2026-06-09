@@ -371,6 +371,10 @@ export const devCommands = {
   ): Promise<Result<MeetingId, IpcError>> {
     return ok(DEV_MEETING_ID);
   },
+  async prewarmAsr(): Promise<Result<null, IpcError>> {
+    // No-op in the dev shim: there is no real ASR model to warm.
+    return ok(null);
+  },
   async pauseRecording(): Promise<Result<null, IpcError>> {
     return ok(null);
   },

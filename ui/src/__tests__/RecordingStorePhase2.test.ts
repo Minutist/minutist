@@ -61,6 +61,7 @@ describe("recording store — Phase 2 extensions", () => {
       settings: null,
       meter: { peak: 0, rms: 0 },
       lastError: null,
+      preparing: false,
       transcript: [],
     });
     useModelsStore.setState({
@@ -181,5 +182,67 @@ describe("recording store — Phase 2 extensions", () => {
     useRecordingStore.getState().handleEvent(event);
 
     expect(useRecordingStore.getState().transcript).toHaveLength(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // Live-test UX T1: double-press guard + the `preparing` optimistic transient.
+  // -------------------------------------------------------------------------
+
+  it("start sets the optimistic `preparing` flag before the recording event arrives", async () => {
+    useModelsStore.setState({ isAsrModelReady: true });
+    vi.mocked(commands.startRecording).mockResolvedValueOnce({
+      status: "ok",
+      data: "m-prep",
+    });
+
+    await useRecordingStore.getState().start();
+
+    // The backend has not yet emitted `recording`, so the UI is still preparing.
+    expect(useRecordingStore.getState().preparing).toBe(true);
+    expect(commands.startRecording).toHaveBeenCalledOnce();
+
+    // The `recording` state event resolves the preparing transient.
+    useRecordingStore.getState().handleEvent({
+      kind: "state_changed",
+      state: { kind: "recording", meeting_id: "m-prep", started_at_ms: 0 },
+    });
+    expect(useRecordingStore.getState().preparing).toBe(false);
+  });
+
+  it("start is a no-op while already preparing (double-press guard)", async () => {
+    useModelsStore.setState({ isAsrModelReady: true });
+    // Already preparing (a start is in flight).
+    useRecordingStore.setState({ preparing: true });
+
+    await useRecordingStore.getState().start();
+
+    expect(commands.startRecording).not.toHaveBeenCalled();
+  });
+
+  it("start is a no-op while not idle (double-press while recording)", async () => {
+    useModelsStore.setState({ isAsrModelReady: true });
+    useRecordingStore.setState({
+      state: { kind: "recording", meeting_id: "m1", started_at_ms: 0 },
+      preparing: false,
+    });
+
+    await useRecordingStore.getState().start();
+
+    // A second press while Recording must NOT re-invoke startRecording (the
+    // orchestrator would reject it with "start called when not idle").
+    expect(commands.startRecording).not.toHaveBeenCalled();
+  });
+
+  it("start clears `preparing` and surfaces lastError when startRecording rejects", async () => {
+    useModelsStore.setState({ isAsrModelReady: true });
+    vi.mocked(commands.startRecording).mockResolvedValueOnce({
+      status: "error",
+      error: { code: "internal", context: "device busy" },
+    });
+
+    await useRecordingStore.getState().start();
+
+    expect(useRecordingStore.getState().preparing).toBe(false);
+    expect(useRecordingStore.getState().lastError).not.toBeNull();
   });
 });

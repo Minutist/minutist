@@ -15,6 +15,7 @@
 import { useEffect, useState } from "react";
 import { useMeetingsStore } from "../state/meetings";
 import type { MeetingListEntry } from "../state/meetings";
+import { OperationIndicator } from "./OperationIndicator";
 import "./MeetingList.css";
 
 /** Format an RFC3339 start timestamp as a quiet, readable date. */
@@ -117,6 +118,11 @@ function MeetingRow(props: MeetingRowProps) {
         {meeting.excerpt ? (
           <p className="meeting-list__excerpt">{meeting.excerpt}</p>
         ) : null}
+
+        {/* Live-test UX T3/T4: a non-blocking per-row indicator for any
+            background pass (re-transcribe / re-identify-speakers / summarise)
+            running on this meeting. Self-hides when nothing is in flight. */}
+        <OperationIndicator meetingId={meeting.id} />
       </div>
 
       <div className="meeting-list__actions">

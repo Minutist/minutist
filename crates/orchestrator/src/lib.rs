@@ -46,15 +46,15 @@ mod tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
 use diarizer::OnlineDiarizer;
 use meeting_app_common::{
-    AppError, AppEvent, AppResult, AudioFormat, Diarizer, MeetingId, MeetingListEntry, MeetingMeta,
-    ModelDescriptor, ModelId, ModelStatus, RecordingState, Segment,
+    AppError, AppEvent, AppResult, AsrBackend, AsrEngine, AudioFormat, Diarizer, MeetingId,
+    MeetingListEntry, MeetingMeta, ModelDescriptor, ModelId, ModelStatus, RecordingState, Segment,
 };
 use model_registry::ModelRegistry;
 use persistence::{MeetingIndex, MeetingWriter};
@@ -86,6 +86,18 @@ pub struct Orchestrator {
     /// `take_transcript_incomplete()` to decide whether to run a background
     /// re-transcribe of the complete `audio.opus`.
     last_transcript_incomplete: Arc<AtomicBool>,
+    /// Process-held prewarmed ASR backend (live-test UX T2). [`Self::prewarm_asr`]
+    /// resolves the routed engine and loads the backend on `spawn_blocking`,
+    /// storing the `(engine, backend)` pair here so the FIRST `start()` hands it
+    /// to the runner instead of paying the cold ~29 s model load at record time.
+    /// `start()` takes it (leaving `None`) only when the cached engine matches the
+    /// session's engine; a mismatch (the user changed the transcription language)
+    /// or an empty cache falls back to the existing lazy worker-init path, so the
+    /// lazy path is never regressed. A `std::sync::Mutex` because the held value
+    /// (`Box<dyn AsrBackend + Send>`) is `Send` but not `Sync`, and every access
+    /// is a brief, non-awaiting take/insert.
+    #[allow(clippy::type_complexity)]
+    prewarmed_asr: Arc<StdMutex<Option<(AsrEngine, Box<dyn AsrBackend + Send>)>>>,
 }
 
 struct OrchestratorInner {
@@ -147,6 +159,7 @@ impl Orchestrator {
             }),
             event_tx,
             last_transcript_incomplete: Arc::new(AtomicBool::new(false)),
+            prewarmed_asr: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -182,6 +195,113 @@ impl Orchestrator {
     /// `ipc-bridge`).
     pub async fn ensure_model_path(&self, model_id: &ModelId) -> AppResult<PathBuf> {
         self.model_registry.ensure(model_id).await
+    }
+
+    /// Pre-load the routed ASR backend into a process-held cache so the FIRST
+    /// `start()` does not pay the cold model load (~29 s for the Parakeet model)
+    /// at record time (live-test UX T2).
+    ///
+    /// Resolves the engine from `settings.transcription_language` (+ the GPU-model
+    /// opt-in) exactly as `start()` does, then — when the routed (or a fallback)
+    /// model is locally `Available` — builds the backend on `spawn_blocking` (the
+    /// heavy GGUF / sherpa load is synchronous) and stores the `(engine, backend)`
+    /// pair. `start()` consumes it when its engine matches; otherwise it falls
+    /// back to the existing lazy worker-init path, so the lazy path is never
+    /// regressed.
+    ///
+    /// **Idempotent + non-blocking-at-start.** Calling it again for an
+    /// already-cached engine is a no-op; if the model is not downloaded it warms
+    /// nothing and returns `Ok(())` (no download, no block — the prewarm must
+    /// never stall a fresh install). Wired from `app-main`'s `setup` after the
+    /// event bus is up. A build failure is logged and swallowed (the lazy path
+    /// remains the safety net), so prewarm can never fail a startup.
+    pub async fn prewarm_asr(&self) {
+        let engine = meeting_app_common::asr_engine_for_language(
+            &self.settings.current().transcription_language,
+            self.settings.current().prefer_large_asr_model,
+        );
+
+        // Idempotent: skip if we already hold a backend for this engine.
+        {
+            let guard = self.prewarmed_asr.lock().expect("prewarm mutex poisoned");
+            if guard.as_ref().map(|(e, _)| *e == engine).unwrap_or(false) {
+                return;
+            }
+        }
+
+        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        let language =
+            runner::resolve_transcription_language(&self.settings.current().transcription_language);
+        let registry = Arc::clone(&self.model_registry);
+
+        // Build off the async executor (the model load is heavy + synchronous).
+        // Drive the async `init_asr_backend` on a current-thread runtime inside
+        // the blocking closure, exactly as the re-transcribe path does.
+        let built = tokio::task::spawn_blocking(move || -> Option<(AsrEngine, Box<dyn AsrBackend + Send>)> {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(target: "orchestrator", "prewarm runtime build failed: {e}");
+                    return None;
+                }
+            };
+            match rt.block_on(runner::build_asr_backend_for_retranscribe(
+                &registry,
+                engine,
+                n_gpu_layers,
+                language,
+            )) {
+                Ok(Some(backend)) => Some((engine, backend)),
+                Ok(None) => {
+                    tracing::info!(
+                        target: "orchestrator",
+                        "ASR prewarm skipped: routed model not downloaded yet"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(target: "orchestrator", "ASR prewarm build failed: {e}");
+                    None
+                }
+            }
+        })
+        .await;
+
+        match built {
+            Ok(Some(pair)) => {
+                let mut guard = self.prewarmed_asr.lock().expect("prewarm mutex poisoned");
+                *guard = Some(pair);
+                tracing::info!(target: "orchestrator", "ASR backend prewarmed");
+            }
+            Ok(None) => {}
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    "ASR prewarm join failed: {join_err}; the lazy path remains the fallback"
+                );
+            }
+        }
+    }
+
+    /// Take the prewarmed backend if it matches `engine` (live-test UX T2).
+    ///
+    /// Returns the held backend (leaving the cache empty) only on an engine
+    /// match; a mismatch leaves the cached backend in place for a later matching
+    /// `start()` and returns `None` so the caller uses the lazy path.
+    fn take_prewarmed_asr(&self, engine: AsrEngine) -> Option<Box<dyn AsrBackend + Send>> {
+        let mut guard = self.prewarmed_asr.lock().expect("prewarm mutex poisoned");
+        match guard.take() {
+            Some((cached_engine, backend)) if cached_engine == engine => Some(backend),
+            // Mismatch: put it back; a later start() for that engine can use it.
+            Some(pair) => {
+                *guard = Some(pair);
+                None
+            }
+            None => None,
+        }
     }
 
     // ------------------------------------------------------------------
@@ -283,6 +403,17 @@ impl Orchestrator {
         let online_diarizer =
             self.build_live_diarizer(self.settings.current().diarization_enabled).await;
 
+        // Live-test UX T2: hand the runner the prewarmed backend if one was
+        // warmed for this session's engine; else `None` → the worker lazy-inits
+        // it on the first flush (the pre-existing path, never regressed).
+        let prewarmed_backend = self.take_prewarmed_asr(engine);
+        if prewarmed_backend.is_some() {
+            tracing::info!(
+                target: "orchestrator",
+                "using prewarmed ASR backend for this recording"
+            );
+        }
+
         let runner_handle = runner::spawn_runner(
             streams,
             writer,
@@ -293,6 +424,7 @@ impl Orchestrator {
             language,
             engine,
             online_diarizer,
+            prewarmed_backend,
         );
 
         guard.capture = Some(capture);
@@ -466,6 +598,16 @@ impl Orchestrator {
             }
             self.emit(AppEvent::StateChanged {
                 state: RecordingState::Finalising { meeting_id },
+            });
+            // Live-test UX T4(c): the finalise drain (ASR-backlog drain + the
+            // transcript/metadata/audio writes) is opaque, so emit an
+            // INDETERMINATE progress event for it. The terminal
+            // `AppEvent::MeetingFinalised` below clears the per-row indicator.
+            self.emit(AppEvent::OperationProgress {
+                meeting_id,
+                op: meeting_app_common::OperationKind::Finalise,
+                fraction: None,
+                label: "Finalising…".to_string(),
             });
 
             let finalised = reply_rx.await.map_err(|_| AppError::Internal {
@@ -1020,6 +1162,19 @@ impl Orchestrator {
         })??;
         let budget = diarize_timeout(duration_ms);
 
+        // Live-test UX T4(c): the sherpa diarization compute is one opaque FFI
+        // call with no progress callback, so emit a single INDETERMINATE
+        // (`fraction = None`) progress event before it runs. The terminal
+        // `AppEvent::DiarizationComplete` (emitted by `finalise_diarization`)
+        // clears the per-row indicator. Labelled with the user-facing
+        // "Identifying speakers…" wording (T5 — internal name unchanged).
+        self.emit(AppEvent::OperationProgress {
+            meeting_id,
+            op: meeting_app_common::OperationKind::Rediarize,
+            fraction: None,
+            label: "Identifying speakers…".to_string(),
+        });
+
         // Bound the (uninterruptible) sherpa `compute`: a pathologically slow or
         // hung diarization on a long recording must not block forever (the
         // original on-stop hang). On timeout we return BEFORE
@@ -1398,6 +1553,8 @@ impl Orchestrator {
         // local model availability), exactly as the production `start()` path.
         let online_diarizer =
             self.build_live_diarizer(self.settings.current().diarization_enabled).await;
+        // The test-source path uses the lazy worker-init path; prewarm is a
+        // production-startup concern, so no prewarmed backend is threaded here.
         let runner_handle = runner::spawn_runner(
             streams,
             writer,
@@ -1408,6 +1565,7 @@ impl Orchestrator {
             language,
             engine,
             online_diarizer,
+            None,
         );
         guard.runner = Some(runner_handle);
         // No AudioCaptureManager to store (guard.capture stays None).

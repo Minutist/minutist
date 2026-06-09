@@ -408,6 +408,67 @@ value; it never changes per-user; and a single-file source asset avoids
 forcing every phase that uses VAD to also pull in `model-registry`. This
 is the only model file that bypasses the registry.
 
+## ASR prewarm (live-test UX)
+
+The FIRST record lazy-loads the routed ASR backend (the cold Parakeet/Qwen model
+load is ~29 s) on the ASR-worker thread's first flush, which looks dead and makes
+the live transcript fall behind (forcing the post-stop re-transcribe). To remove
+that cold path the orchestrator exposes `prewarm_asr()`: it resolves the engine
+from `settings.transcription_language` (+ the GPU-model opt-in) exactly as
+`start()` does, builds the backend on `spawn_blocking`, and holds the
+`(engine, backend)` pair in a process cache (`Mutex<Option<(AsrEngine, Box<dyn
+AsrBackend + Send>)>>`). The first `start()` whose engine matches **takes** the
+cached backend and hands it to the runner as the prebuilt backend; a mismatch
+(the user changed the language) or an empty cache falls back to the existing lazy
+worker-init path, which is never regressed. Prewarm is **idempotent** and
+**non-blocking-at-start** (no download — a not-yet-downloaded model warms
+nothing) and **best-effort** (a build failure is logged and swallowed). It is
+triggered twice for redundancy: once from `app-main`'s `setup` (via
+`tauri::async_runtime::spawn`) after the event bus is up, and once from the
+webview (`prewarm_asr` command) when the recording/meeting workspace opens. While
+the first start is in flight the webview shows a "Preparing transcription model…"
+status and disables the Start control (a double-press is then impossible) — see
+"Operation progress" below.
+
+## Operation progress
+
+Long-running per-meeting operations emit `AppEvent::OperationProgress {
+meeting_id, op: OperationKind, fraction: Option<f32>, label: String }` (rides the
+existing `AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
+registration — no second registration). The webview renders a NON-BLOCKING
+per-meeting-row indicator: a determinate bar when `fraction` is `Some` (0..=1), an
+indeterminate spinner when `None`. The terminal event for the op clears the
+indicator. Producers + determinism:
+
+- **`ReTranscribe` (determinate)** — `orchestrator::runner::re_transcribe_buffer`
+  emits per accumulator flush, `fraction = kept-samples-fed / total-kept-samples`
+  (a pure `re_transcribe_fraction`, unit-tested). Cleared by `TranscriptReady`.
+- **`Summarise` (determinate)** — `ipc-bridge::summarise_meeting` drives the
+  concrete `LlamaSummariser::summarise_with_progress`, whose generation loop
+  reports `(tokens_generated, max_tokens)`; the callback emits a throttled (~5 Hz)
+  `fraction = tokens / max_tokens`. (The `common::Summariser` trait is unchanged —
+  the progress method is concrete on `LlamaSummariser`, which `ipc-bridge` holds.)
+  Cleared by `SummaryReady`.
+- **`Rediarize` (indeterminate)** — the sherpa diarization `compute` is one opaque
+  FFI call with no progress callback, so `fraction = None`. Cleared by
+  `DiarizationComplete`.
+- **`Finalise` (indeterminate)** — the post-stop drain is opaque, `fraction =
+  None`. Cleared by `MeetingFinalised`.
+
+## Finalise returns to the meeting list (live-test UX)
+
+On stop the meeting is finalised + index-upserted immediately (the orchestrator
+emits `MeetingFinalised` and returns to `Idle` the instant the recording is on
+disk); the heavy background passes (re-transcribe if the live transcript fell
+behind, then re-diarize) run AFTER, under the `Offline` claim (public
+`Finalising`). The recording window must **not** stay open for those: the webview
+returns to the home meeting-list as soon as the recorder leaves the live states
+(`recording`/`paused`/`stopping`) — it does NOT gate the window-close on the
+offline claim releasing (`Idle`). The background passes surface only as the
+non-blocking per-row "Operation progress" indicator above, which the meeting-list
+store refreshes on the terminal `MeetingFinalised` / `TranscriptReady` /
+`DiarizationComplete` / `SummaryReady` events.
+
 ## Agent chat loop (Phase 9)
 
 The built-in chat agent (`chat-agent` crate, driven by `ipc-bridge`) runs a

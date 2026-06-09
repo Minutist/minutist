@@ -129,6 +129,20 @@ The recorder-lifecycle additions `RecordingState::Finalising` and the
 their producers in the `orchestrator`/`ipc-bridge` "Responsive stop" and
 re-transcribe notes below.
 
+**Operation-progress event (live-test UX).** `AppEvent::OperationProgress {
+meeting_id, op: OperationKind, fraction: Option<f32>, label: String }` (plus the
+`OperationKind { ReTranscribe, Summarise, Rediarize, Finalise }` enum) rides the
+existing `AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
+registration — no second registration. Producers: the orchestrator's
+`runner::re_transcribe_buffer` emits a DETERMINATE fraction (kept-samples
+processed / total) per accumulator flush; `ipc-bridge`'s `summarise_meeting` emits
+a DETERMINATE fraction (tokens generated / `max_tokens`) threaded through
+`LlamaSummariser::summarise_with_progress`; the re-diarize and finalise-drain
+paths emit INDETERMINATE (`fraction = None`, one opaque sherpa/drain compute with
+no progress callback). The webview clears the per-row indicator on the terminal
+`TranscriptReady` / `SummaryReady` / `DiarizationComplete`. See
+`architecture/cross-cutting.md` — "Operation progress".
+
 **Phase 7 — shared LlamaBackend (feature-gated).** Behind the optional
 `llama-backend` feature (`dep:llama-cpp-2`, OFF by default so the default
 `common` build stays pure), `common` exposes

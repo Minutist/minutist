@@ -134,7 +134,8 @@ function SettingsStep() {
           <span>
             Identify speakers after recording
             <span className="onboarding__hint">
-              Runs speaker diarization when a recording stops. Off by default.
+              Identifies who spoke each line when a recording stops. Off by
+              default.
             </span>
           </span>
         </label>

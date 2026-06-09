@@ -182,7 +182,7 @@ describe("MeetingList view (FR-33)", () => {
       screen.queryByRole("button", { name: "Re-transcribe" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Re-diarize" }),
+      screen.queryByRole("button", { name: "Re-identify speakers" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Summarise" }),

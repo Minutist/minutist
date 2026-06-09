@@ -362,6 +362,12 @@ pub(crate) struct RunnerHandle {
 ///                    (setting off / model absent / build failed) every segment
 ///                    is left unlabelled. Best-effort: never affects recording
 ///                    or transcription. The on-stop pass stays authoritative.
+/// `prewarmed_backend` — optional process-held ASR backend warmed by
+///                    [`Orchestrator::prewarm_asr`] (live-test UX T2). When
+///                    `Some`, it is handed to the ASR worker directly so the
+///                    first record skips the cold model load; when `None`, the
+///                    worker lazy-inits the backend on the first flush (the
+///                    pre-existing path, never regressed).
 // Wiring boundary: it hands the runner its channels, handles, and the
 // start-resolved scalar config (n_gpu_layers, language, live diarizer). The
 // arguments are heterogeneous (not a cohesive value object), so a params struct
@@ -377,6 +383,7 @@ pub(crate) fn spawn_runner(
     language: Option<String>,
     engine: AsrEngine,
     online_diarizer: Option<Arc<OnlineDiarizer>>,
+    prewarmed_backend: Option<Box<dyn AsrBackend + Send>>,
 ) -> RunnerHandle {
     spawn_runner_inner(
         streams,
@@ -387,7 +394,7 @@ pub(crate) fn spawn_runner(
         n_gpu_layers,
         language,
         engine,
-        None,
+        prewarmed_backend,
         online_diarizer,
     )
 }
@@ -1738,6 +1745,16 @@ pub(crate) fn re_transcribe_buffer(
     // tagged with its start offset on the pause-EXCLUDING clock.
     let kept = pause_excluding_segments(pcm);
 
+    // Live-test UX T4(a): determinate progress = kept samples FED to the VAD so
+    // far / total kept samples. Counted on the kept feed (not raw `pcm`) so the
+    // skipped pause padding does not stall the bar; emitted per accumulator flush
+    // (the natural cadence at which produced segments stream out).
+    let total_kept_samples: usize = kept.iter().map(|r| r.src_end - r.src_start).sum();
+    let mut samples_fed: usize = 0;
+    // Emit a 0.0 start so the UI shows the bar immediately rather than waiting
+    // for the first flush (which can be seconds of inference away).
+    emit_retranscribe_progress(event_tx, meeting_id, samples_fed, total_kept_samples);
+
     // 1600 samples = 100 ms at 16 kHz — the same batch granularity the live
     // feeder uses, so VAD framing is identical to the live path.
     const BATCH_SAMPLES: usize = 1600;
@@ -1768,6 +1785,7 @@ pub(crate) fn re_transcribe_buffer(
                 }
             }
             start_ms += duration_ms;
+            samples_fed += chunk.len();
 
             // Size-triggered flush, identical threshold to the live path.
             if acc.duration_secs() >= FLUSH_MIN_SECS {
@@ -1781,6 +1799,12 @@ pub(crate) fn re_transcribe_buffer(
                     meeting_id,
                     &mut produced,
                 )?;
+                emit_retranscribe_progress(
+                    event_tx,
+                    meeting_id,
+                    samples_fed,
+                    total_kept_samples,
+                );
             }
         }
 
@@ -1843,7 +1867,37 @@ pub(crate) fn re_transcribe_buffer(
         )?;
     }
 
+    // Terminal 1.0 so the bar visibly completes; the subsequent
+    // `AppEvent::TranscriptReady` clears the per-row indicator.
+    emit_retranscribe_progress(event_tx, meeting_id, total_kept_samples, total_kept_samples);
+
     Ok(produced)
+}
+
+/// Determinate progress fraction for an offline re-transcribe: kept samples fed
+/// to the VAD so far / total kept samples (live-test UX T4(a)). Pure +
+/// unit-tested. Clamped to `0.0..=1.0`; a zero total (empty/all-pause audio)
+/// reports `1.0` (nothing to do is "done").
+pub(crate) fn re_transcribe_fraction(samples_fed: usize, total_kept_samples: usize) -> f32 {
+    if total_kept_samples == 0 {
+        return 1.0;
+    }
+    (samples_fed as f32 / total_kept_samples as f32).clamp(0.0, 1.0)
+}
+
+/// Emit a determinate `AppEvent::OperationProgress` for the re-transcribe op.
+fn emit_retranscribe_progress(
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+    samples_fed: usize,
+    total_kept_samples: usize,
+) {
+    let _ = event_tx.send(AppEvent::OperationProgress {
+        meeting_id,
+        op: meeting_app_common::OperationKind::ReTranscribe,
+        fraction: Some(re_transcribe_fraction(samples_fed, total_kept_samples)),
+        label: "Re-transcribing…".to_string(),
+    });
 }
 
 /// Transcribe a single accumulator flush synchronously and append the produced
@@ -2223,6 +2277,31 @@ mod tests {
             resolve_transcription_language("  English "),
             Some("English".to_string())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // re_transcribe_fraction — the determinate progress mapping (pure, T4(a))
+    // -----------------------------------------------------------------------
+
+    /// The re-transcribe progress fraction is `samples_fed / total_kept_samples`,
+    /// clamped to `0.0..=1.0`; a zero total reports `1.0` (nothing to do is done);
+    /// an over-count clamps to `1.0`.
+    #[test]
+    fn re_transcribe_fraction_maps_fed_over_total() {
+        assert_eq!(re_transcribe_fraction(0, 1000), 0.0, "start is 0.0");
+        assert_eq!(re_transcribe_fraction(500, 1000), 0.5, "halfway is 0.5");
+        assert_eq!(re_transcribe_fraction(1000, 1000), 1.0, "complete is 1.0");
+
+        // Zero total (empty / all-pause audio) → 1.0 (done).
+        assert_eq!(re_transcribe_fraction(0, 0), 1.0);
+        assert_eq!(re_transcribe_fraction(10, 0), 1.0);
+
+        // Over-count (a final-flush tick past the total) clamps to 1.0.
+        assert_eq!(re_transcribe_fraction(1500, 1000), 1.0);
+
+        // Quarter, three-quarters — within tolerance.
+        assert!((re_transcribe_fraction(250, 1000) - 0.25).abs() < 1e-6);
+        assert!((re_transcribe_fraction(750, 1000) - 0.75).abs() < 1e-6);
     }
 
     // -----------------------------------------------------------------------

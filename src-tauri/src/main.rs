@@ -417,6 +417,19 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // Spawn the event forwarder so orchestrator events reach the webview.
             spawn_event_forwarder(orchestrator.clone(), app_handle.clone());
 
+            // Live-test UX T2: pre-warm the routed ASR model in the background so
+            // the FIRST record does not pay the cold ~29 s model load at record
+            // time. Best-effort + non-blocking-at-start (no download; a
+            // not-yet-downloaded model warms nothing), so it can never delay
+            // startup or fail it. `tauri::async_runtime::spawn` (NOT a bare
+            // `tokio::spawn`) — `setup` runs with no entered Tokio runtime.
+            {
+                let prewarm_orchestrator = orchestrator.clone();
+                tauri::async_runtime::spawn(async move {
+                    prewarm_orchestrator.prewarm_asr().await;
+                });
+            }
+
             // Wire the auto-updater (Phase 7): a guarded startup check + the
             // apply-on-accept listener. A no-op when `plugins.updater` is
             // unconfigured (the committed default), so dev/unsigned builds are

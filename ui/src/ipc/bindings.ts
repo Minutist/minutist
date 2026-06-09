@@ -38,6 +38,26 @@ async startRecording(deviceId: string | null) : Promise<Result<MeetingId, IpcErr
 }
 },
 /**
+ * Pre-load the routed ASR model so the first record is not a cold ~29 s load
+ * (live-test UX T2).
+ * 
+ * Routes to `Orchestrator::prewarm_asr`, which resolves the engine from the
+ * `transcription_language` setting and builds the backend on `spawn_blocking`
+ * into a process-held cache the first `start()` consumes. Idempotent and
+ * non-blocking-at-start (no download; a not-yet-downloaded model warms nothing).
+ * The webview calls this when the recording/meeting workspace opens so the model
+ * is ready before the user presses Start. Returns `()` even on a build failure —
+ * the lazy worker-init path remains the fallback, so prewarm is best-effort.
+ */
+async prewarmAsr() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prewarm_asr") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Pause the current recording.
  */
 async pauseRecording() : Promise<Result<null, IpcError>> {
@@ -544,6 +564,16 @@ export type AppEvent =
  */
 { kind: "transcript_ready"; meeting_id: MeetingId } | 
 /**
+ * A long-running per-meeting operation made progress. The webview renders a
+ * per-meeting-row indicator: a determinate bar when `fraction` is `Some`
+ * (0.0..=1.0), an indeterminate spinner when `None`. Emitted throttled by
+ * the producing op; a terminal `DiarizationComplete` / `TranscriptReady` /
+ * `SummaryReady` clears the indicator. Rides the existing `AppEventPayload`
+ * tag machinery — no second event registration. See
+ * `architecture/cross-cutting.md` — "Operation progress".
+ */
+{ kind: "operation_progress"; meeting_id: MeetingId; op: OperationKind; fraction: number | null; label: string } | 
+/**
  * Model download progress, used by the first-run flow.
  */
 { kind: "model_download_progress"; model_id: ModelId; bytes_done: number; bytes_total: number | null } | 
@@ -854,6 +884,31 @@ export type ModelStatusState =
  * This is the canonical wire-facing notes carrier; `ipc-bridge` re-uses it.
  */
 export type NotesDocument = { notes_json: string; notes_markdown: string }
+/**
+ * Which long-running operation an [`AppEvent::OperationProgress`] event reports.
+ * 
+ * Determinate (a `fraction` is available): `ReTranscribe` (samples processed /
+ * total kept samples) and `Summarise` (tokens generated / max tokens).
+ * Indeterminate (`fraction = None`, one opaque FFI compute call):
+ * `Rediarize` and the `Finalise` drain.
+ */
+export type OperationKind = 
+/**
+ * Offline re-transcribe over the full `audio.opus` (determinate).
+ */
+"re_transcribe" | 
+/**
+ * LLM summary generation (determinate; tokens / max-tokens).
+ */
+"summarise" | 
+/**
+ * Speaker (re-)identification — internally "diarization" (indeterminate).
+ */
+"rediarize" | 
+/**
+ * The post-stop finalise drain (indeterminate).
+ */
+"finalise"
 /**
  * Top-level state of the recording pipeline. Emitted to the webview on
  * transitions via `AppEvent::StateChanged`.

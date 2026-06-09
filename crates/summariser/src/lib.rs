@@ -214,6 +214,30 @@ impl LlamaSummariser {
         &self.config
     }
 
+    /// Like [`Summariser::summarise`] but reports generation progress through
+    /// `on_progress` (live-test UX T4(b)).
+    ///
+    /// The callback is invoked after each generated token with `(tokens_generated,
+    /// max_tokens)` so the caller can render a determinate bar
+    /// (`tokens_generated / max_tokens`); `ipc-bridge` maps this onto
+    /// `AppEvent::OperationProgress`. It is throttled by the caller, not here — a
+    /// per-token callback is cheap (an atomic/Instant check + maybe a broadcast
+    /// send). Prefill (no token output yet) is not reported; the caller emits a
+    /// 0.0 start before calling. Kept a concrete method (not on the `common`
+    /// `Summariser` trait) so the trait — and its other impls — are unchanged;
+    /// `ipc-bridge` holds the concrete `Arc<LlamaSummariser>`.
+    pub fn summarise_with_progress(
+        &self,
+        transcript: &[Segment],
+        notes_markdown: &str,
+        system_prompt: &str,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> AppResult<String> {
+        let prompt = self.build_prompt(transcript, notes_markdown, system_prompt)?;
+        let raw = self.generate_with_progress(&prompt, &mut on_progress)?;
+        Ok(strip_think_block(&raw))
+    }
+
     /// Borrow the loaded [`LlamaModel`] for the chat engine (Phase 9, D5).
     ///
     /// The substrate seam: `ipc-bridge` holds the concrete
@@ -301,6 +325,20 @@ impl LlamaSummariser {
 
     /// Tokenise the prompt, chunked-prefill it, then greedily generate.
     fn generate(&self, prompt: &str) -> Result<String, Error> {
+        // No-op progress callback: the no-progress path is unchanged.
+        self.generate_with_progress(prompt, &mut |_, _| {})
+    }
+
+    /// [`Self::generate`] with a per-token progress callback (live-test UX
+    /// T4(b)). The callback receives `(tokens_generated, max_tokens)` after each
+    /// generated token. Everything else (tokenisation, chunked prefill, greedy
+    /// sampling, EOG stop, incremental detokenisation) is identical to
+    /// [`Self::generate`].
+    fn generate_with_progress(
+        &self,
+        prompt: &str,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<String, Error> {
         let backend = get_or_init_backend()?;
 
         let n_ctx = NonZeroU32::new(self.config.n_ctx).ok_or_else(|| {
@@ -360,11 +398,14 @@ impl LlamaSummariser {
         let mut text = String::new();
         let mut n_past = tokens.len() as i32;
 
-        for _ in 0..self.config.max_tokens {
+        for i in 0..self.config.max_tokens {
             let token = sampler.sample(&llama_ctx, -1);
             sampler.accept(token);
 
             if self.model.is_eog_token(token) {
+                // EOG: jump the bar to 100 % so a short summary still completes
+                // the bar rather than leaving it stuck mid-way.
+                on_progress(self.config.max_tokens, self.config.max_tokens);
                 break;
             }
 
@@ -373,6 +414,9 @@ impl LlamaSummariser {
                 .token_to_piece(token, &mut decoder, true, None)
                 .map_err(|e| Error::Inference(format!("token_to_piece: {e}")))?;
             text.push_str(&piece);
+
+            // Report progress AFTER appending this token (`i + 1` generated).
+            on_progress(i + 1, self.config.max_tokens);
 
             batch.clear();
             batch

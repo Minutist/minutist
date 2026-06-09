@@ -4,12 +4,13 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (27 total)
+//! ## Commands (28 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
 //! | `list_devices` | `Vec<AudioDevice>` | 1 |
 //! | `start_recording` | `MeetingId` | 1 |
+//! | `prewarm_asr` | `()` | live-test UX |
 //! | `pause_recording` | `()` | 1 |
 //! | `resume_recording` | `()` | 1 |
 //! | `stop_recording` | `MeetingMeta` | 1 |
@@ -332,6 +333,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
         .commands(collect_commands![
             commands::list_devices,
             commands::start_recording,
+            commands::prewarm_asr,
             commands::pause_recording,
             commands::resume_recording,
             commands::stop_recording,
@@ -402,6 +404,7 @@ mod tests {
         let expected = [
             "list_devices",
             "start_recording",
+            "prewarm_asr",
             "pause_recording",
             "resume_recording",
             "stop_recording",
@@ -431,8 +434,8 @@ mod tests {
 
         assert_eq!(
             expected.len(),
-            27,
-            "command ledger must be 27 (Phase 10's 26 + cancel_chat_turn, P9 review-fix)"
+            28,
+            "command ledger must be 28 (27 + prewarm_asr, live-test UX T2)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

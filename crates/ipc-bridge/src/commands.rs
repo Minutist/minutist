@@ -120,6 +120,23 @@ pub async fn start_recording(
         .map_err(IpcError::from)
 }
 
+/// Pre-load the routed ASR model so the first record is not a cold ~29 s load
+/// (live-test UX T2).
+///
+/// Routes to `Orchestrator::prewarm_asr`, which resolves the engine from the
+/// `transcription_language` setting and builds the backend on `spawn_blocking`
+/// into a process-held cache the first `start()` consumes. Idempotent and
+/// non-blocking-at-start (no download; a not-yet-downloaded model warms nothing).
+/// The webview calls this when the recording/meeting workspace opens so the model
+/// is ready before the user presses Start. Returns `()` even on a build failure —
+/// the lazy worker-init path remains the fallback, so prewarm is best-effort.
+#[tauri::command]
+#[specta::specta]
+pub async fn prewarm_asr(state: State<'_, IpcState>) -> Result<(), IpcError> {
+    state.orchestrator.prewarm_asr().await;
+    Ok(())
+}
+
 /// Pause the current recording.
 #[tauri::command]
 #[specta::specta]
@@ -686,15 +703,25 @@ pub async fn summarise_meeting(
     // prompt for the selected `summary_preset`.
     let system_prompt = settings.effective_summary_prompt();
 
+    // Live-test UX T4(b): emit a 0.0 DETERMINATE start so the per-row indicator
+    // shows immediately while the LLM prefills (which is several seconds of no
+    // token output). The generation loop then drives the bar via the progress
+    // callback below.
+    emit_summarise_progress(&state.event_tx, meeting_id, 0.0);
+
     // Heavy, synchronous summarise work on a blocking thread (the held model's
     // `summarise` builds a fresh `LlamaContext` and decodes). The held handle is
-    // cloned into the closure; no GGUF reload.
+    // cloned into the closure; no GGUF reload. The held substrate is the concrete
+    // `LlamaSummariser`, so we drive `summarise_with_progress` directly (the
+    // `common::Summariser` trait is unchanged — see `summariser`).
+    let event_tx = state.event_tx.clone();
     let summary_md = tokio::task::spawn_blocking(move || {
-        summarise_meeting_inner(
+        summarise_meeting_with_progress(
             &meetings_dir,
             meeting_id,
             summariser.as_ref(),
             &system_prompt,
+            &event_tx,
         )
     })
     .await
@@ -703,7 +730,46 @@ pub async fn summarise_meeting(
     })?
     .map_err(IpcError::from)?;
 
-    // Emit SummaryReady so the webview re-reads `summary.md`.
+    // Live-test UX T6: refresh the meeting-list index row so its excerpt becomes
+    // the summary blurb now that `summary.md` exists (the persistence excerpt
+    // derivation prefers the summary blurb over the first transcript segment). A
+    // failure is logged and swallowed — the index is a derived cache the next
+    // startup rebuild reconciles, so a failed refresh must not fail the summary.
+    let meetings_dir_for_entry = state.meetings_dir.clone();
+    match tokio::task::spawn_blocking(move || {
+        meeting_list_entry_for_meta_with_summary(&meetings_dir_for_entry, meeting_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(entry))) => {
+            if let Err(e) = state.index.upsert(&entry).await {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "index excerpt refresh after summarise failed: {e}; \
+                     reconciled on next startup"
+                );
+            }
+        }
+        Ok(Ok(None)) => {
+            // Metadata unreadable (the meeting folder was deleted mid-summarise);
+            // nothing to upsert.
+        }
+        Ok(Err(e)) => tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "building index entry after summarise failed: {e}; reconciled on next startup"
+        ),
+        Err(join_err) => tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "index entry build after summarise join failed: {join_err}; \
+             reconciled on next startup"
+        ),
+    }
+
+    // Emit SummaryReady so the webview re-reads `summary.md` (this also clears
+    // the per-row progress indicator and refreshes the list excerpt).
     emit_summary_ready(&state.event_tx, meeting_id);
 
     tracing::info!(
@@ -714,6 +780,111 @@ pub async fn summarise_meeting(
     );
 
     Ok(())
+}
+
+/// Build the [`MeetingListEntry`] for a meeting from its metadata, deriving the
+/// excerpt from `summary.md` (the T6 blurb) when one exists, else the first
+/// transcript segment — via `persistence::summary_blurb` + `read_transcript`.
+///
+/// Returns `Ok(None)` when the metadata cannot be read (the folder is gone).
+/// Blocking `std::fs` reads; the caller drives it on `spawn_blocking`.
+fn meeting_list_entry_for_meta_with_summary(
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+) -> Result<Option<MeetingListEntry>, AppError> {
+    let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
+    let meta = match persistence::read_metadata(&meeting_dir) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+
+    // Prefer the summary blurb; fall back to the first transcript segment.
+    let excerpt = persistence::read_summary(&meeting_dir)
+        .ok()
+        .flatten()
+        .and_then(|md| persistence::summary_blurb(&md))
+        .or_else(|| {
+            persistence::read_transcript(&meeting_dir)
+                .ok()
+                .and_then(|segs| segs.first().map(|s| s.text.clone()))
+        });
+
+    Ok(Some(MeetingListEntry {
+        id: meta.uuid,
+        title: meta.title,
+        started_at: meta.started_at,
+        duration_ms: meta.duration_ms,
+        speaker_count: meta.speaker_count,
+        excerpt,
+    }))
+}
+
+/// Production summarise body that streams DETERMINATE `OperationProgress` events
+/// (live-test UX T4(b)).
+///
+/// Mirrors [`summarise_meeting_inner`] (read transcript + notes → summarise →
+/// write `summary.md`) but drives the concrete [`LlamaSummariser`]'s
+/// `summarise_with_progress` so the generation loop reports `(tokens_generated,
+/// max_tokens)`; the callback emits a throttled (~5 Hz) determinate
+/// `AppEvent::OperationProgress`. Synchronous — the caller drives it on
+/// `spawn_blocking`. (`summarise_meeting_inner` keeps the trait-based
+/// `&dyn Summariser` seam for the stub unit tests, which assert the read/write
+/// wiring without progress.)
+fn summarise_meeting_with_progress(
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+    summariser: &LlamaSummariser,
+    system_prompt: &str,
+    event_tx: &broadcast::Sender<AppEvent>,
+) -> Result<String, AppError> {
+    let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
+
+    let transcript = persistence::read_transcript(&meeting_dir)?;
+    let notes_markdown = persistence::read_meeting_state(&meeting_dir)?
+        .notes
+        .map(|n| n.notes_markdown)
+        .unwrap_or_default();
+
+    // Throttle the per-token callback to ~5 Hz so a fast GPU run does not flood
+    // the broadcast bus (the meter already runs at ~30 Hz on the same channel).
+    let mut last_emit = std::time::Instant::now();
+    let summary_md = summariser.summarise_with_progress(
+        &transcript,
+        &notes_markdown,
+        system_prompt,
+        |generated, max_tokens| {
+            let now = std::time::Instant::now();
+            // Always emit the final (generated == max_tokens) tick; throttle the rest.
+            let done = generated >= max_tokens;
+            if done || now.duration_since(last_emit) >= std::time::Duration::from_millis(200) {
+                last_emit = now;
+                let fraction = if max_tokens == 0 {
+                    1.0
+                } else {
+                    (generated as f32 / max_tokens as f32).clamp(0.0, 1.0)
+                };
+                emit_summarise_progress(event_tx, meeting_id, fraction);
+            }
+        },
+    )?;
+
+    persistence::write_summary(&meeting_dir, &summary_md)?;
+
+    Ok(summary_md)
+}
+
+/// Emit a DETERMINATE `AppEvent::OperationProgress` for the summarise op.
+fn emit_summarise_progress(
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+    fraction: f32,
+) {
+    let _ = event_tx.send(AppEvent::OperationProgress {
+        meeting_id,
+        op: meeting_app_common::OperationKind::Summarise,
+        fraction: Some(fraction.clamp(0.0, 1.0)),
+        label: "Summarising…".to_string(),
+    });
 }
 
 /// Read a meeting's persisted summary markdown, or `None` when none exists.
@@ -772,6 +943,12 @@ pub async fn save_summary(
 /// Synchronous (blocking `std::fs` + sync `Summariser::summarise`) — the caller
 /// drives it on `spawn_blocking`. Takes `&dyn Summariser` so a stub can be
 /// injected in tests.
+///
+/// `#[cfg(test)]`: the production command path now drives the concrete
+/// [`summarise_meeting_with_progress`] (which streams `OperationProgress`, T4(b));
+/// this trait-based seam is retained only for the stub unit tests that assert the
+/// read → summarise → write wiring without a model or progress events.
+#[cfg(test)]
 fn summarise_meeting_inner(
     meetings_dir: &Path,
     meeting_id: MeetingId,
@@ -1750,8 +1927,8 @@ mod tests {
     // event wiring is exercised in CI without a ~3 GB GGUF — mirroring the
     // orchestrator's re_transcribe stub-backend seam.
     // -----------------------------------------------------------------------
-
-    use meeting_app_common::Summariser;
+    // `Summariser` is brought in via `use super::*` (the module-level
+    // `#[cfg(test)]` import); no separate `use` needed here.
 
     /// A `common::Summariser` that returns a fixed markdown, recording the
     /// transcript length, notes markdown, and system prompt it was handed so the

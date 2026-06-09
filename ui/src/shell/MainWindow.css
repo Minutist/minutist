@@ -119,6 +119,27 @@
   color: var(--accent);
 }
 
+/* First-record feedback (live-test UX T1c): a gently-pulsing dot + accented
+   label while the ASR model loads, so the "Preparing transcription model…"
+   state reads as active work rather than a dead button. */
+.recording-status[data-state="preparing"] .recording-status__dot {
+  background: var(--accent);
+  animation: rec-pulse 1.8s ease-in-out infinite;
+}
+
+.recording-status[data-state="preparing"] .recording-status__label {
+  color: var(--accent);
+  /* The label is a sentence, not an all-caps status word. */
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recording-status[data-state="preparing"] .recording-status__dot {
+    animation: none;
+  }
+}
+
 .recording-status__elapsed {
   font-size: 1.05rem;
   color: var(--ink);

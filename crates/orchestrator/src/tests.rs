@@ -127,6 +127,9 @@ async fn state_machine_happy_path_emits_state_changed_events() {
             }
             Ok(AppEvent::MeetingFinalised { .. }) => {}
             Ok(AppEvent::AudioMeter { .. }) => {}
+            // The finalise drain emits an indeterminate OperationProgress (T4(c));
+            // it rides the same bus and is not part of the state sequence.
+            Ok(AppEvent::OperationProgress { .. }) => {}
             Ok(other) => panic!("unexpected event: {other:?}"),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
                 // Brief yield to allow any in-flight events to arrive.

@@ -539,6 +539,26 @@ pub enum RecordingState {
 // IPC events
 // ---------------------------------------------------------------------------
 
+/// Which long-running operation an [`AppEvent::OperationProgress`] event reports.
+///
+/// Determinate (a `fraction` is available): `ReTranscribe` (samples processed /
+/// total kept samples) and `Summarise` (tokens generated / max tokens).
+/// Indeterminate (`fraction = None`, one opaque FFI compute call):
+/// `Rediarize` and the `Finalise` drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum OperationKind {
+    /// Offline re-transcribe over the full `audio.opus` (determinate).
+    ReTranscribe,
+    /// LLM summary generation (determinate; tokens / max-tokens).
+    Summarise,
+    /// Speaker (re-)identification — internally "diarization" (indeterminate).
+    Rediarize,
+    /// The post-stop finalise drain (indeterminate).
+    Finalise,
+}
+
 /// Events emitted from the Rust core to the webview via tauri-specta.
 ///
 /// Adding a variant requires updating `ipc-bridge` (encoder), the webview
@@ -591,6 +611,24 @@ pub enum AppEvent {
     /// re-transcribe and the background post-stop repair, so a repaired
     /// transcript surfaces without a manual refresh even when diarization is off.
     TranscriptReady { meeting_id: MeetingId },
+    /// A long-running per-meeting operation made progress. The webview renders a
+    /// per-meeting-row indicator: a determinate bar when `fraction` is `Some`
+    /// (0.0..=1.0), an indeterminate spinner when `None`. Emitted throttled by
+    /// the producing op; a terminal `DiarizationComplete` / `TranscriptReady` /
+    /// `SummaryReady` clears the indicator. Rides the existing `AppEventPayload`
+    /// tag machinery — no second event registration. See
+    /// `architecture/cross-cutting.md` — "Operation progress".
+    OperationProgress {
+        meeting_id: MeetingId,
+        op: OperationKind,
+        /// `Some(f)` with `0.0 <= f <= 1.0` for a determinate bar; `None` for an
+        /// indeterminate spinner (the op is one opaque FFI call with no progress
+        /// callback, e.g. sherpa re-diarization).
+        fraction: Option<f32>,
+        /// A short human-readable label for the in-flight op (e.g.
+        /// "Re-transcribing…", "Summarising…", "Identifying speakers…").
+        label: String,
+    },
     /// Model download progress, used by the first-run flow.
     ModelDownloadProgress {
         model_id: ModelId,

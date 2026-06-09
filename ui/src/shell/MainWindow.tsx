@@ -71,6 +71,7 @@ function buildPanes(slots: ReactNode[]): ReactNode[] {
 export function MainWindow() {
   const refreshDevices = useRecordingStore((s) => s.refreshDevices);
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
+  const prewarmAsr = useRecordingStore((s) => s.prewarmAsr);
   const lastError = useRecordingStore((s) => s.lastError);
   const recordingState = useRecordingStore((s) => s.state);
   const refreshModels = useModelsStore((s) => s.refreshModels);
@@ -81,17 +82,27 @@ export function MainWindow() {
   // the opened-meeting view, not on the meeting list — see MeetingList.
   const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
 
+  // The recorder is actively capturing (or in the brief stopping handoff). Live-
+  // test UX T3: `finalising` is deliberately EXCLUDED — once the meeting is
+  // finalised the heavy background passes (re-transcribe / re-identify-speakers)
+  // run in the background and must NOT keep the recording window open. They
+  // surface as a non-blocking per-row indicator on the meeting list instead.
+  const isLiveRecording =
+    recordingState.kind === "recording" ||
+    recordingState.kind === "paused" ||
+    recordingState.kind === "stopping";
+
   // The meeting-list is the entry surface (FR-33): shown when no meeting is
-  // open and nothing is being recorded. Opening a meeting, or starting a
-  // recording, switches to the editor/transcript workspace.
-  const inWorkspace = openMeetingId !== null || recordingState.kind !== "idle";
+  // open and the recorder is not actively capturing. Opening a meeting, or
+  // starting a recording, switches to the editor/transcript workspace; on stop
+  // we return to the list as soon as the meeting finalises (T3).
+  const inWorkspace = openMeetingId !== null || isLiveRecording;
 
   // The meeting the workspace is operating on: the opened saved meeting, else
   // the live recording's meeting (recording / paused / stopping carry the id).
   // This is the meeting the summary view summarises.
   const activeMeetingId =
-    openMeetingId ??
-    (recordingState.kind !== "idle" ? recordingState.meeting_id : null);
+    openMeetingId ?? (isLiveRecording ? recordingState.meeting_id : null);
 
   // A finished, opened meeting: idle and viewing a saved meeting. Only then is a
   // summary meaningful (you cannot summarise a recording mid-flight), so the
@@ -130,7 +141,10 @@ export function MainWindow() {
     void refreshSettings();
     void refreshDevices();
     void refreshModels();
-  }, [refreshDevices, refreshSettings, refreshModels]);
+    // Live-test UX T2: pre-warm the ASR model when the workspace opens so the
+    // first record is not a cold ~29 s load. Fire-and-forget + idempotent.
+    void prewarmAsr();
+  }, [refreshDevices, refreshSettings, refreshModels, prewarmAsr]);
 
   // Reset pane visibility to the per-mode default. The deps are deliberately
   // [inWorkspace, showSummaryPane] only: this fires on entering the workspace
@@ -224,9 +238,9 @@ export function MainWindow() {
               type="button"
               className="main-window__header-btn main-window__reprocess"
               onClick={() => void reDiarize(openMeetingId)}
-              title="Re-run speaker diarization on this recording (rare)."
+              title="Re-run speaker identification on this recording (rare)."
             >
-              Re-diarize
+              Re-identify speakers
             </button>
           )}
           <MeetingControls />

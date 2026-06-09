@@ -152,6 +152,14 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
       void get().refresh();
       return;
     }
+    if (event.kind === "summary_ready") {
+      // Live-test UX T6: a summary was written, so the meeting-list excerpt is
+      // now the summary blurb (the backend refreshed the index row). Refresh the
+      // list so the row shows the blurb without a manual reload. (The summary
+      // PANE re-read is the summary store's job; this only touches the list.)
+      void get().refresh();
+      return;
+    }
     if (event.kind !== "diarization_complete" && event.kind !== "transcript_ready")
       return;
     // A background/offline pass rewrote THIS meeting's `transcript.json`:

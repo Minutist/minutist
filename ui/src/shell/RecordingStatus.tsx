@@ -39,11 +39,16 @@ function startedAtMs(state: RecordingState): number | null {
  */
 export function RecordingStatus() {
   const state = useRecordingStore((s) => s.state);
+  const preparing = useRecordingStore((s) => s.preparing);
   const kind = state.kind;
   const isRecording = kind === "recording";
   const isPaused = kind === "paused";
   const isStopping = kind === "stopping";
   const isFinalising = kind === "finalising";
+  // The optimistic transient (T1c): the recorder is still `idle` on the backend
+  // while the first record lazy-loads the ASR model, so show a distinct
+  // "Preparing transcription model…" status only when idle + preparing.
+  const isPreparing = preparing && kind === "idle";
 
   const start = startedAtMs(state);
   const [now, setNow] = useState(() => Date.now());
@@ -60,7 +65,11 @@ export function RecordingStatus() {
 
   let label: string;
   let elapsed: string | null = null;
-  if (isRecording && start !== null) {
+  if (isPreparing) {
+    // First-record feedback: the ASR model is loading (~29 s cold) before the
+    // backend transitions to `recording`. Without this the UI looks dead.
+    label = "Preparing transcription model…";
+  } else if (isRecording && start !== null) {
     label = "Recording";
     elapsed = formatElapsed(now - start);
   } else if (isPaused) {
@@ -81,7 +90,7 @@ export function RecordingStatus() {
   return (
     <div
       className="recording-status"
-      data-state={kind}
+      data-state={isPreparing ? "preparing" : kind}
       role="status"
       aria-live="polite"
     >

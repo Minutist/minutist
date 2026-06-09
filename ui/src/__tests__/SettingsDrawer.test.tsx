@@ -49,7 +49,9 @@ describe("SettingsDrawer", () => {
     // Capture + processing.
     expect(screen.getByLabelText("Input device")).toBeInTheDocument();
     expect(screen.getByLabelText("Transcription language")).toBeInTheDocument();
-    expect(screen.getByText("Diarize speakers on stop")).toBeInTheDocument();
+    // Live-test UX T5: the diarization toggle is relabelled "Identify speakers"
+    // (the wire name `diarization_enabled` is unchanged).
+    expect(screen.getByText("Identify speakers")).toBeInTheDocument();
     expect(screen.getByText("GPU acceleration")).toBeInTheDocument();
     expect(screen.getByText("Capture call / system audio")).toBeInTheDocument();
   });

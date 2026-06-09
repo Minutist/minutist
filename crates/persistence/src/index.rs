@@ -347,9 +347,7 @@ async fn entry_from_folder(folder: &Path) -> Result<MeetingListEntry, Error> {
 /// Synchronous core of [`entry_from_folder`], suitable for `spawn_blocking`.
 fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> {
     let meta = reader::read_metadata_inner(folder)?;
-    let excerpt = reader::read_transcript_inner(folder)
-        .ok()
-        .and_then(|segs| segs.first().map(|s| truncate_excerpt(&s.text)));
+    let excerpt = derive_excerpt(folder);
 
     Ok(MeetingListEntry {
         id: meta.uuid,
@@ -359,6 +357,24 @@ fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> 
         speaker_count: meta.speaker_count,
         excerpt,
     })
+}
+
+/// Derive the meeting-list excerpt for a folder (live-test UX T6).
+///
+/// Prefer a one-line blurb derived from `summary.md` once a summary exists
+/// (the summary's opening overview, via [`crate::summary::summary_blurb`]); fall
+/// back to the first transcript segment otherwise (the prior behaviour). Shared
+/// by the rebuild/reconcile path here and by `meeting_ops` so a restart keeps the
+/// summary blurb a finished meeting shows.
+pub(crate) fn derive_excerpt(folder: &Path) -> Option<String> {
+    if let Ok(Some(md)) = crate::summary::read_summary(folder) {
+        if let Some(blurb) = crate::summary::summary_blurb(&md) {
+            return Some(blurb);
+        }
+    }
+    reader::read_transcript_inner(folder)
+        .ok()
+        .and_then(|segs| segs.first().map(|s| truncate_excerpt(&s.text)))
 }
 
 /// Truncate a transcript snippet to a bounded preview length (120 chars,

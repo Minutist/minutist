@@ -152,14 +152,17 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
 
         <section className="settings-drawer__group" aria-label="Processing">
           <h3 className="settings-drawer__group-title">Processing</h3>
-          <label className="settings-drawer__toggle">
+          <label
+            className="settings-drawer__toggle"
+            title="When a recording stops, identify who spoke each line and label them Speaker A / B / C."
+          >
             <input
               type="checkbox"
               checked={diarizationEnabled}
               disabled={settings === null}
               onChange={(e) => void setDiarizationEnabled(e.target.checked)}
             />
-            <span>Diarize speakers on stop</span>
+            <span>Identify speakers</span>
           </label>
           <label className="settings-drawer__toggle">
             <input

@@ -318,9 +318,12 @@ mod tests {
         ChatStore::save(&root, id, &session).expect("re-save");
 
         // Still exactly one session for the meeting, with the updated content.
+        // `sample_session` carries 4 messages (the user turn + the CQ1
+        // assistant-tool_calls / tool-result / final assistant turn); the
+        // overwrite pushes one more user message, so the re-saved session holds 5.
         let sessions = ChatStore::list(&root, id).expect("list");
         assert_eq!(sessions.len(), 1, "re-save must overwrite, not append a file");
-        assert_eq!(sessions[0].messages.len(), 4);
+        assert_eq!(sessions[0].messages.len(), 5);
         assert_eq!(sessions[0].updated_at, "2026-06-10T10:05:00Z");
     }
 

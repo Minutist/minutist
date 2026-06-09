@@ -1,0 +1,604 @@
+//! Behavioural tests for the v1 tool layer.
+//!
+//! Uses tempdir meeting fixtures + a `StubSummariser`. The orchestrator-backed
+//! tools (relisten / retranscribe / rediarize) are driven through the
+//! orchestrator's `test-source` seam where a real model would otherwise be
+//! required; the read/compute + metadata-write tools run directly against
+//! tempdir fixtures.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use agent_tools::{ToolContext, ToolRegistry};
+use meeting_app_common::{
+    AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, Segment, Summariser,
+};
+use orchestrator::test_support::test_orchestrator;
+use orchestrator::Orchestrator;
+use persistence::MeetingIndex;
+use tempfile::TempDir;
+use tokio::sync::broadcast;
+
+// ---------------------------------------------------------------------------
+// Test substrate
+// ---------------------------------------------------------------------------
+
+/// A `Summariser` stub that echoes the transcript length + the instruction it
+/// was handed, so a test can assert `resummarise` plumbed the instruction
+/// through as the system prompt.
+struct StubSummariser;
+
+impl Summariser for StubSummariser {
+    fn summarise(
+        &self,
+        transcript: &[Segment],
+        _notes_markdown: &str,
+        system_prompt: &str,
+    ) -> AppResult<String> {
+        Ok(format!(
+            "STUB SUMMARY ({} segments) :: prompt={system_prompt}",
+            transcript.len()
+        ))
+    }
+}
+
+/// Build a `ToolContext` over a tempdir-backed meetings root + in-memory index +
+/// a test orchestrator. Returns the context plus the `TempDir` guard (kept alive
+/// by the caller) and the meetings root path.
+async fn make_ctx() -> (TempDir, std::path::PathBuf, ToolContext) {
+    let tempdir = TempDir::new().expect("tempdir");
+    let meetings_dir = tempdir.path().join("meetings");
+    std::fs::create_dir_all(&meetings_dir).expect("meetings dir");
+
+    let index = Arc::new(MeetingIndex::open(":memory:").await.expect("index"));
+    let orchestrator: Arc<Orchestrator> =
+        Arc::new(test_orchestrator(meetings_dir.clone()));
+    let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
+    let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
+
+    let ctx = ToolContext::new(
+        orchestrator,
+        index,
+        meetings_dir.clone(),
+        summariser,
+        event_tx,
+        None,
+    );
+    (tempdir, meetings_dir, ctx)
+}
+
+/// Seed a meeting folder on disk with metadata + transcript, index it, and
+/// return its id. `segments` carry whatever speaker labels the test wants.
+async fn seed_meeting(
+    meetings_dir: &Path,
+    index: &MeetingIndex,
+    title: &str,
+    segments: Vec<Segment>,
+    speaker_names: BTreeMap<String, String>,
+) -> MeetingId {
+    let id = MeetingId::new();
+    persistence::MeetingFolder::create(meetings_dir, id).expect("folder");
+    let dir = meetings_dir.join(id.0.to_string());
+
+    let meta = MeetingMeta {
+        uuid: id,
+        title: title.to_string(),
+        started_at: "2026-06-10T09:00:00Z".to_string(),
+        ended_at: Some("2026-06-10T09:30:00Z".to_string()),
+        duration_ms: 1_800_000,
+        speaker_count: speaker_names.len() as u32,
+        audio_format: AudioFormat {
+            codec: "opus".to_string(),
+            sample_rate: 16_000,
+            channels: 1,
+            bitrate_kbps: Some(32),
+        },
+        asr_model: None,
+        llm_model: None,
+        diarizer: None,
+        speaker_names,
+        app_version: "0.0.0".to_string(),
+    };
+    persistence::write_metadata(&dir, &meta).expect("write metadata");
+    if !segments.is_empty() {
+        persistence::write_transcript(&dir, &segments).expect("write transcript");
+    }
+
+    // Index it so list/search tools see it.
+    let entry = meeting_app_common::MeetingListEntry {
+        id,
+        title: title.to_string(),
+        started_at: meta.started_at.clone(),
+        duration_ms: meta.duration_ms,
+        speaker_count: meta.speaker_count,
+        excerpt: segments_excerpt(meetings_dir, id),
+    };
+    index.upsert(&entry).await.expect("index upsert");
+    id
+}
+
+fn segments_excerpt(meetings_dir: &Path, id: MeetingId) -> Option<String> {
+    let dir = meetings_dir.join(id.0.to_string());
+    persistence::read_transcript(&dir)
+        .ok()
+        .and_then(|s| s.first().map(|seg| seg.text.clone()))
+}
+
+fn seg(start_ms: u64, end_ms: u64, text: &str, speaker: Option<&str>) -> Segment {
+    Segment {
+        start_ms,
+        end_ms,
+        text: text.to_string(),
+        speaker_id: speaker.map(|s| s.to_string()),
+        confidence: None,
+        words: vec![],
+    }
+}
+
+fn names(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Registry shape: is_write / expose_over_mcp / dispatch
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn registry_v1_has_the_documented_tool_set() {
+    let reg = ToolRegistry::v1(false);
+    let names: Vec<&str> = reg.descriptors().iter().map(|d| d.name).collect();
+    let expected = [
+        "list_meetings",
+        "search_meetings",
+        "get_meeting",
+        "get_transcript",
+        "get_transcript_slice",
+        "get_summary",
+        "get_notes",
+        "get_metadata",
+        "get_recording_state",
+        "search_within_transcript",
+        "relisten_section",
+        "resummarise",
+        "speaker_talk_time",
+        "set_speaker_name",
+        "rename_meeting",
+        "retranscribe_meeting",
+        "rediarize_meeting",
+    ];
+    assert_eq!(reg.len(), expected.len(), "v1 tool count");
+    for name in expected {
+        assert!(reg.get(name).is_some(), "{name} must be registered");
+    }
+    assert!(names.contains(&"list_meetings"));
+}
+
+#[tokio::test]
+async fn write_flags_are_set_correctly() {
+    let reg = ToolRegistry::v1(false);
+    let writes = [
+        "set_speaker_name",
+        "rename_meeting",
+        "retranscribe_meeting",
+        "rediarize_meeting",
+    ];
+    for name in writes {
+        assert!(
+            reg.get(name).unwrap().is_write(),
+            "{name} must be is_write()"
+        );
+    }
+    // A representative read tool must NOT be a write.
+    assert!(!reg.get("get_transcript").unwrap().is_write());
+    assert!(!reg.get("relisten_section").unwrap().is_write());
+    assert!(!reg.get("resummarise").unwrap().is_write());
+}
+
+#[tokio::test]
+async fn mcp_exposure_default_safe_with_allowlist() {
+    let reg = ToolRegistry::v1(false);
+    let mcp: Vec<&str> = reg.mcp_tool_descriptors().iter().map(|d| d.name).collect();
+
+    // All reads/compute are exposed.
+    for name in [
+        "list_meetings",
+        "get_transcript",
+        "relisten_section",
+        "resummarise",
+        "speaker_talk_time",
+    ] {
+        assert!(mcp.contains(&name), "{name} should be exposed over MCP");
+    }
+    // Allowlisted writes are exposed.
+    assert!(mcp.contains(&"set_speaker_name"));
+    assert!(mcp.contains(&"rename_meeting"));
+    // Heavy writes are internal-only.
+    assert!(!mcp.contains(&"retranscribe_meeting"));
+    assert!(!mcp.contains(&"rediarize_meeting"));
+}
+
+#[tokio::test]
+async fn dispatch_unknown_tool_is_invalid_input() {
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let err = reg
+        .dispatch(&ctx, "no_such_tool", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, meeting_app_common::AppError::InvalidInput { .. }));
+}
+
+#[tokio::test]
+async fn dispatch_missing_required_arg_is_invalid_input() {
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    // search_meetings requires `query`; an empty object must be rejected by the
+    // schema validation path (`query` is not the meeting_id default exception).
+    let err = reg
+        .dispatch(&ctx, "search_meetings", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, meeting_app_common::AppError::InvalidInput { .. }));
+}
+
+#[tokio::test]
+async fn dispatch_missing_meeting_without_default_is_invalid_input() {
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    // get_transcript needs a meeting; with no `meeting_id` arg and no
+    // default_meeting in the context, resolve_meeting rejects it.
+    let err = reg
+        .dispatch(&ctx, "get_transcript", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, meeting_app_common::AppError::InvalidInput { .. }));
+}
+
+#[tokio::test]
+async fn default_meeting_resolves_when_meeting_id_omitted() {
+    let (_t, root, mut ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "Scoped",
+        vec![seg(0, 1000, "scoped meeting body", None)],
+        BTreeMap::new(),
+    )
+    .await;
+    // Scope the session to this meeting (mirrors the internal-UI wiring).
+    ctx.default_meeting = Some(id);
+
+    // get_transcript with NO meeting_id arg resolves via default_meeting.
+    let out = reg
+        .dispatch(&ctx, "get_transcript", serde_json::json!({}))
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["text"], "scoped meeting body");
+}
+
+// ---------------------------------------------------------------------------
+// Read tools + overlay
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_and_search_meetings_via_dispatch() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    seed_meeting(&root, &ctx.index, "Launch sync", vec![seg(0, 1000, "kickoff", None)], BTreeMap::new()).await;
+    seed_meeting(&root, &ctx.index, "Retro", vec![seg(0, 1000, "retrospective", None)], BTreeMap::new()).await;
+
+    let out = reg.dispatch(&ctx, "list_meetings", serde_json::json!({})).await.unwrap();
+    let arr = out.data.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+
+    let out = reg
+        .dispatch(&ctx, "search_meetings", serde_json::json!({ "query": "Retro" }))
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["title"], "Retro");
+}
+
+#[tokio::test]
+async fn get_transcript_applies_speaker_overlay() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "Standup",
+        vec![
+            seg(0, 1000, "hi", Some("A")),
+            seg(1000, 2000, "hello", Some("B")),
+            seg(2000, 3000, "unnamed", Some("C")),
+        ],
+        names(&[("A", "Alice"), ("B", "Bob")]),
+    )
+    .await;
+
+    let out = reg
+        .dispatch(&ctx, "get_transcript", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    assert_eq!(arr[0]["speaker_id"], "Alice", "A → Alice");
+    assert_eq!(arr[1]["speaker_id"], "Bob", "B → Bob");
+    assert_eq!(arr[2]["speaker_id"], "C", "unmapped label stays as the raw label");
+
+    // The on-disk transcript must be UNTOUCHED (overlay is presentation-only).
+    let dir = root.join(id.0.to_string());
+    let on_disk = persistence::read_transcript(&dir).unwrap();
+    assert_eq!(on_disk[0].speaker_id.as_deref(), Some("A"));
+}
+
+#[tokio::test]
+async fn get_transcript_slice_filters_by_overlap() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "M",
+        vec![
+            seg(0, 1000, "a", None),
+            seg(1000, 2000, "b", None),
+            seg(5000, 6000, "c", None),
+        ],
+        BTreeMap::new(),
+    )
+    .await;
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "get_transcript_slice",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "start_ms": 1500, "end_ms": 5500 }),
+        )
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    // Overlaps [1500, 5500): segment b (1000-2000) and c (5000-6000); a (0-1000) excluded.
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["text"], "b");
+    assert_eq!(arr[1]["text"], "c");
+}
+
+#[tokio::test]
+async fn search_within_transcript_is_case_insensitive() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "M",
+        vec![
+            seg(0, 1000, "The Budget was approved", Some("A")),
+            seg(1000, 2000, "lunch plans", None),
+        ],
+        names(&[("A", "Alice")]),
+    )
+    .await;
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "search_within_transcript",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "query": "budget" }),
+        )
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["speaker_id"], "Alice", "overlay applied to results");
+    assert!(arr[0]["text"].as_str().unwrap().contains("Budget"));
+}
+
+#[tokio::test]
+async fn get_notes_returns_null_when_absent() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+    let out = reg
+        .dispatch(&ctx, "get_notes", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .await
+        .unwrap();
+    assert!(out.data.is_null());
+}
+
+#[tokio::test]
+async fn get_notes_round_trips_saved_notes() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+    let doc = serde_json::json!({ "type": "doc", "content": [] });
+    persistence::NotesStore::save(&root, id, &doc, "# Notes\n").expect("save notes");
+
+    let out = reg
+        .dispatch(&ctx, "get_notes", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .await
+        .unwrap();
+    assert_eq!(out.data["markdown"], "# Notes\n");
+    assert_eq!(out.data["json"], doc);
+}
+
+#[tokio::test]
+async fn get_recording_state_reports_idle() {
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let out = reg.dispatch(&ctx, "get_recording_state", serde_json::json!({})).await.unwrap();
+    assert_eq!(out.data["kind"], "idle");
+}
+
+#[tokio::test]
+async fn speaker_talk_time_aggregates_with_overlay() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "M",
+        vec![
+            seg(0, 1000, "x", Some("A")),     // A: 1000ms, 1 turn
+            seg(1000, 3000, "y", Some("A")),  // A: +2000ms, 2 turns
+            seg(3000, 3500, "z", Some("B")),  // B: 500ms, 1 turn
+        ],
+        names(&[("A", "Alice")]),
+    )
+    .await;
+
+    let out = reg
+        .dispatch(&ctx, "speaker_talk_time", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    // Sorted by raw speaker_id: A then B.
+    assert_eq!(arr[0]["speaker_id"], "A");
+    assert_eq!(arr[0]["display_name"], "Alice");
+    assert_eq!(arr[0]["total_ms"], 3000);
+    assert_eq!(arr[0]["turn_count"], 2);
+    assert_eq!(arr[1]["speaker_id"], "B");
+    assert_eq!(arr[1]["display_name"], "B");
+    assert_eq!(arr[1]["total_ms"], 500);
+}
+
+#[tokio::test]
+async fn resummarise_threads_instruction_through_as_prompt() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "M",
+        vec![seg(0, 1000, "one", None), seg(1000, 2000, "two", None)],
+        BTreeMap::new(),
+    )
+    .await;
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "resummarise",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "instruction": "as bullet points" }),
+        )
+        .await
+        .unwrap();
+    let text = out.data["text"].as_str().unwrap();
+    assert!(text.contains("2 segments"), "transcript handed to summariser");
+    assert!(text.contains("prompt=as bullet points"), "instruction used as system prompt");
+
+    // resummarise must NOT write summary.md.
+    let dir = root.join(id.0.to_string());
+    assert!(persistence::read_summary(&dir).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Write tools (metadata)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_speaker_name_round_trips_through_metadata() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![seg(0, 1000, "x", Some("A"))], BTreeMap::new()).await;
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "set_speaker_name",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "speaker_id": "A", "name": "Alice" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.data["speaker_names"]["A"], "Alice");
+
+    // Reflected in get_metadata.
+    let meta = reg
+        .dispatch(&ctx, "get_metadata", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .await
+        .unwrap();
+    assert_eq!(meta.data["speaker_names"]["A"], "Alice");
+
+    // And in the read-time overlay.
+    let tr = reg
+        .dispatch(&ctx, "get_transcript", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .await
+        .unwrap();
+    assert_eq!(tr.data.as_array().unwrap()[0]["speaker_id"], "Alice");
+}
+
+#[tokio::test]
+async fn concurrent_set_speaker_name_does_not_drop_a_write() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = Arc::new(ToolRegistry::v1(false));
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+
+    // Two concurrent set_speaker_name calls inserting DIFFERENT labels. Without
+    // the per-meeting metadata mutex this is a read-modify-write race where one
+    // insert clobbers the other (last-writer-wins drops a name).
+    let ctx_a = ctx.clone();
+    let ctx_b = ctx.clone();
+    let reg_a = Arc::clone(&reg);
+    let reg_b = Arc::clone(&reg);
+    let id_s = id.0.to_string();
+    let id_s2 = id_s.clone();
+    let h1 = tokio::spawn(async move {
+        reg_a
+            .dispatch(
+                &ctx_a,
+                "set_speaker_name",
+                serde_json::json!({ "meeting_id": id_s, "speaker_id": "A", "name": "Alice" }),
+            )
+            .await
+    });
+    let h2 = tokio::spawn(async move {
+        reg_b
+            .dispatch(
+                &ctx_b,
+                "set_speaker_name",
+                serde_json::json!({ "meeting_id": id_s2, "speaker_id": "B", "name": "Bob" }),
+            )
+            .await
+    });
+    h1.await.unwrap().unwrap();
+    h2.await.unwrap().unwrap();
+
+    let dir = root.join(id.0.to_string());
+    let meta = persistence::read_metadata(&dir).unwrap();
+    assert_eq!(meta.speaker_names.get("A").map(String::as_str), Some("Alice"));
+    assert_eq!(
+        meta.speaker_names.get("B").map(String::as_str),
+        Some("Bob"),
+        "both names must survive — no dropped write"
+    );
+}
+
+#[tokio::test]
+async fn rename_meeting_updates_title_and_index() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "Old title", vec![seg(0, 1000, "x", None)], BTreeMap::new()).await;
+
+    reg.dispatch(
+        &ctx,
+        "rename_meeting",
+        serde_json::json!({ "meeting_id": id.0.to_string(), "title": "New title" }),
+    )
+    .await
+    .unwrap();
+
+    let dir = root.join(id.0.to_string());
+    assert_eq!(persistence::read_metadata(&dir).unwrap().title, "New title");
+
+    // Index row reflects the new title.
+    let found = ctx.index.search("New title").await.unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].title, "New title");
+}

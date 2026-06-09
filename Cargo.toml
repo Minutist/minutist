@@ -12,6 +12,7 @@ members = [
     "crates/summariser",
     "crates/diarizer",
     "crates/orchestrator",
+    "crates/agent-tools",
     "crates/ipc-bridge",
     "src-tauri",
     "spikes/asr",
@@ -39,6 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 
 # Phase 1 additions
+async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 cpal = "0.16"
 rubato = "0.16"

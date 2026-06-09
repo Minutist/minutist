@@ -790,6 +790,113 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Re-run ASR over a bounded audio window and return what was actually said
+    /// there (Phase 9 — backs the `agent-tools` `relisten_section` tool).
+    ///
+    /// This is a **read-only** compute op: it never rewrites `transcript.json`
+    /// and never takes the offline claim, so it is safe to run during a live
+    /// recording (at a transient second-ASR-model memory cost — the backend is
+    /// built fresh and dropped after the call). The heavy decode + inference run
+    /// on `spawn_blocking`.
+    ///
+    /// `start_ms`/`end_ms` are **transcript timestamps** (the pause-EXCLUDING
+    /// `Segment` clock — the only timeline an agent reading a transcript has).
+    /// The mapping onto the pause-INCLUDING decoded PCM is documented in
+    /// [`pcm_window_for_excluding_range`].
+    ///
+    /// Resolution of the ASR backend stays inside the orchestrator (it owns the
+    /// `model-registry` edge); `agent-tools` never reaches `model-registry`.
+    ///
+    /// # Errors
+    ///
+    /// - `AppError::InvalidInput` if `end_ms <= start_ms`.
+    /// - `AppError::ModelLoad` if the routed ASR model is not available.
+    /// - `AppError::Inference` if the slice transcription fails.
+    pub async fn transcribe_pcm_window(
+        &self,
+        meeting_id: MeetingId,
+        start_ms: u64,
+        end_ms: u64,
+        language: Option<String>,
+    ) -> AppResult<Vec<Segment>> {
+        if end_ms <= start_ms {
+            return Err(AppError::InvalidInput {
+                context: format!("relisten window end_ms ({end_ms}) must exceed start_ms ({start_ms})"),
+            });
+        }
+
+        // Re-listen is defined only over FINALISED audio. Reject the meeting that
+        // is currently being recorded/finalised (W2): its `audio.opus` is still
+        // being appended, so a full-file decode can hit a truncated OGG page and
+        // the window may fall past what has been flushed.
+        let active = match self.state().await {
+            RecordingState::Recording { meeting_id, .. }
+            | RecordingState::Paused { meeting_id, .. }
+            | RecordingState::Stopping { meeting_id }
+            | RecordingState::Finalising { meeting_id } => Some(meeting_id),
+            RecordingState::Idle => None,
+        };
+        if active == Some(meeting_id) {
+            return Err(AppError::InvalidInput {
+                context: "cannot re-listen to a meeting that is still recording or finalising; \
+                          finish it first"
+                    .into(),
+            });
+        }
+
+        // Resolve GPU layers + engine + language hint before entering the
+        // blocking closure (it cannot read `self.settings`), mirroring
+        // `re_transcribe_claimed`. An explicit caller-supplied `language`
+        // overrides the setting-derived hint (the agent may force a re-listen in
+        // a known language); the setting-derived engine routing is unchanged.
+        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        let setting_language =
+            runner::resolve_transcription_language(&self.settings.current().transcription_language);
+        let effective_language = language.or(setting_language);
+        let engine = meeting_app_common::asr_engine_for_language(
+            &self.settings.current().transcription_language,
+            self.settings.current().prefer_large_asr_model,
+        );
+        let missing_model_id = runner::engine_model_id(engine);
+        let registry = Arc::clone(&self.model_registry);
+
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
+            let pcm = persistence::read_audio_pcm(&meeting_dir)?;
+
+            // Build the production ASR backend for the routed engine on a
+            // current-thread runtime (model resolution is the only async step),
+            // exactly as `re_transcribe_claimed` does.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| AppError::Internal {
+                    context: format!("transcribe_pcm_window runtime build failed: {e}"),
+                })?;
+            let mut backend = match rt.block_on(runner::build_asr_backend_for_retranscribe(
+                &registry,
+                engine,
+                n_gpu_layers,
+                effective_language,
+            ))? {
+                Some(b) => b,
+                None => {
+                    return Err(AppError::ModelLoad {
+                        model_id: missing_model_id.into(),
+                        context: "ASR model not available; cannot re-listen to the section".into(),
+                    });
+                }
+            };
+
+            transcribe_pcm_window_blocking(&pcm, backend.as_mut(), start_ms, end_ms)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("transcribe_pcm_window spawn_blocking join failed: {e}"),
+        })?
+    }
+
     /// Re-run speaker diarization for a previously-recorded meeting offline
     /// (FR-11 user action).
     ///
@@ -981,6 +1088,14 @@ impl Orchestrator {
             let mut meta = persistence::read_metadata(&meeting_dir_for_write)?;
             meta.speaker_count = speaker_count;
             meta.diarizer = Some(descriptor);
+            // Phase 9 (§4.4): a (re-)diarization pass can re-letter speakers, so
+            // any user-set `speaker_names` keyed on the OLD letters is now
+            // potentially wrong. Clear it in this same metadata write (no second
+            // write) so the map can never silently mis-label a re-lettered
+            // speaker. The chat tool's description states this; an MCP client
+            // cannot re-map the way the UI could, so clearing is the only safe
+            // cross-consumer behaviour. See `cross-cutting.md` "Agent chat loop".
+            meta.speaker_names.clear();
             persistence::write_metadata(&meeting_dir_for_write, &meta)
         })
         .await
@@ -1101,6 +1216,45 @@ async fn run_diarization_blocking(
     .map_err(|e| AppError::Internal {
         context: format!("diarization spawn_blocking join failed: {e}"),
     })?
+}
+
+/// Slice the decoded `pcm` to the requested pause-EXCLUDING window, run the
+/// `backend` over the slice, and re-map the chunk-relative timestamps back onto
+/// the meeting timeline (Phase 9 — the body of
+/// [`Orchestrator::transcribe_pcm_window`], factored out so the test seam can
+/// drive it with a stub backend).
+///
+/// The pause-clock mapping (and its clamp-at-pause decision) lives in
+/// [`runner::pcm_window_for_excluding_range`]. The backend stamps each returned
+/// segment at the start of the chunk it is handed (`AudioChunk::start_ms`, with
+/// word offsets absolutized from it), so we set the chunk's `start_ms` to the
+/// requested `start_ms` and the returned segments land on the meeting timeline
+/// directly.
+fn transcribe_pcm_window_blocking(
+    pcm: &[f32],
+    backend: &mut dyn meeting_app_common::AsrBackend,
+    start_ms: u64,
+    end_ms: u64,
+) -> AppResult<Vec<Segment>> {
+    let range = runner::pcm_window_for_excluding_range(pcm, start_ms, end_ms).ok_or_else(|| {
+        AppError::InvalidInput {
+            context: format!(
+                "relisten window [{start_ms}, {end_ms}) ms is outside the recorded audio"
+            ),
+        }
+    })?;
+
+    // The clamp may shorten the window (a window straddling a pause stops at the
+    // kept-region boundary); the chunk's `end_ms` reflects the actual slice.
+    let slice_len_ms = (range.len() as u64 * 1000) / 16_000;
+    let chunk = meeting_app_common::AudioChunk {
+        samples: pcm[range].to_vec(),
+        sample_rate: 16_000,
+        start_ms,
+        end_ms: start_ms + slice_len_ms,
+    };
+
+    backend.transcribe_chunk(&chunk)
 }
 
 /// Length-relative timeout budget for a diarization pass.
@@ -1392,5 +1546,41 @@ impl Orchestrator {
     /// Available only under the `test-source` feature (or in `#[cfg(test)]`).
     pub fn settings_handle_for_test(&self) -> &SettingsHandle {
         &self.settings
+    }
+
+    /// `transcribe_pcm_window` driven by a caller-supplied [`AsrBackend`] stub,
+    /// mirroring [`Self::re_transcribe_with_backend`] for the relisten path.
+    ///
+    /// Decodes the meeting's `audio.opus` to pause-INCLUDING PCM, applies the
+    /// SAME pause-clock window mapping ([`runner::pcm_window_for_excluding_range`])
+    /// the production path uses, and runs the injected `backend` over the slice —
+    /// without a ~1 GB ASR model. Read-only (no claim, no transcript rewrite),
+    /// exactly like the production method.
+    ///
+    /// Available only under the `test-source` feature.
+    pub async fn transcribe_pcm_window_with_backend(
+        &self,
+        meeting_id: MeetingId,
+        start_ms: u64,
+        end_ms: u64,
+        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+    ) -> AppResult<Vec<Segment>> {
+        if end_ms <= start_ms {
+            return Err(AppError::InvalidInput {
+                context: format!(
+                    "relisten window end_ms ({end_ms}) must exceed start_ms ({start_ms})"
+                ),
+            });
+        }
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+        tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
+            let pcm = persistence::read_audio_pcm(&meeting_dir)?;
+            let mut backend = backend;
+            transcribe_pcm_window_blocking(&pcm, backend.as_mut(), start_ms, end_ms)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("transcribe_pcm_window_with_backend spawn_blocking join failed: {e}"),
+        })?
     }
 }

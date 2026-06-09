@@ -32,6 +32,7 @@ appears in:
 | `model-registry` | 2 | `common`, `settings` |
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
+| `agent-tools` | 9 | `common`, `persistence`, `orchestrator` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings` |
 
@@ -936,6 +937,103 @@ over an empty cache); the `live_diarization` integration test asserts the None-p
 yields all-None `speaker_id` (the "must not break transcription" regression guard),
 with an env-var-gated (`MEETING_APP_DIARIZE_EMB_PATH`) positive case asserting
 non-None live labels.
+
+**Phase 9 — `Orchestrator::transcribe_pcm_window(MeetingId, start_ms, end_ms,
+language) -> AppResult<Vec<Segment>>`.** Backs the `agent-tools`
+`relisten_section` tool. A **read-only** compute op — it does NOT rewrite
+`transcript.json` and does NOT take the offline claim, so it is safe during a
+live recording (at a transient second-ASR-model memory cost; the backend is
+built fresh inside `spawn_blocking` and dropped after the call). `start_ms`/`end_ms`
+are **transcript-clock (pause-EXCLUDING)** timestamps — the only timeline an
+agent reading a transcript has. The pause-clock conversion onto the
+pause-INCLUDING decoded PCM lives in `runner::pcm_window_for_excluding_range`,
+which walks the `pause_excluding_segments` kept regions and **clamps a window
+that straddles a pause to the kept region containing its start** (the documented
+W1 decision — re-transcribed timestamps cannot be cleanly re-mapped back across a
+pause concatenation seam; `pause_excluding_segments` stays `pub(crate)`). ASR
+backend resolution reuses the live/re-transcribe engine routing via
+`runner::build_asr_backend_for_retranscribe`, keeping the `model-registry` edge
+inside the orchestrator — `agent-tools` never reaches `model-registry`. A
+`#[cfg(any(test, feature = "test-source"))]` sibling
+`transcribe_pcm_window_with_backend` injects an `AsrBackend` stub (mirroring
+`re_transcribe_with_backend`) so the window-mapping + read-only behaviour are
+covered model-free; the `runner::pcm_window_for_excluding_range` mapping has
+gating unit tests over a synthetic PCM with a known mid-window pause.
+
+**Phase 9 — rediarize clears `speaker_names` (§4.4).** The shared
+`finalise_diarization` metadata write now also clears
+`MeetingMeta.speaker_names` (in the same `write_metadata` it already performs —
+no second write). A (re-)diarization pass can re-letter speakers, so a
+user-set name map keyed on the OLD letters would silently mis-label; clearing is
+the only safe cross-consumer behaviour (an MCP client cannot re-map the way the
+UI could). See `cross-cutting.md` "Agent chat loop".
+
+### `agent-tools`
+**Crate:** `crates/agent-tools` (Phase 9)
+**Owns:** the shared tool layer — one `Tool` trait + one `ToolRegistry`, the
+single place a chat-agent / MCP tool is defined. Both consumers (the Phase-9
+internal chat agent and the Phase-10 MCP server) drive the SAME registry, so the
+"internal agent and an external MCP client use the same tools" constraint is
+satisfied by there being exactly one definition site per tool. Edges: `common`,
+`persistence`, `orchestrator`.
+
+**Deliberately NOT edges.** No `summariser` edge — the one LLM-using tool
+(`resummarise`) drives an `Arc<dyn common::Summariser>` held in `ToolContext`,
+constructed by `ipc-bridge`/`app-main` (which own the `summariser` edge; the
+bundled impl is `Send + Sync` per SP0). No `model-registry` edge —
+`relisten_section` resolves and builds its ASR backend through
+`Orchestrator::transcribe_pcm_window`, never by calling `model-registry`. No
+`tauri`/`specta` — `serde_json::Value` results cross the IPC boundary as a
+`String` in `ipc-bridge`'s event envelope, not here; the `AppError → McpError`
+mapping is Phase 10's concern and lives in `mcp-server` (keeps `rmcp` out of this
+crate).
+
+**The `Tool` trait** (`Send + Sync`, async `execute`): `name() -> &'static str`
+(stable snake_case wire name), `description()`, `input_schema() ->
+serde_json::Value` (JSON Schema 2020-12, object root, **no regex `pattern`** — the
+vendored llama.cpp schema→GBNF converter rejects PCRE shorthands), `is_write() ->
+bool`, `expose_over_mcp() -> bool` (default `!is_write()`), and the async
+`execute(&ToolContext, args) -> AppResult<ToolOutput>`. `execute` is async because
+the backing ops are async (the orchestrator's offline ops, libsql index queries);
+tool bodies still push CPU/fs/inference work onto `spawn_blocking`.
+
+**`ToolContext`** (Clone): `Arc<Orchestrator>`, `Arc<MeetingIndex>`,
+`meetings_dir: PathBuf`, `Arc<dyn Summariser>`, the shared
+`broadcast::Sender<AppEvent>`, an optional `default_meeting` (the internal-UI
+session scope; MCP leaves it `None` so an MCP caller passes `meeting_id`
+explicitly), and a per-meeting metadata-write mutex map.
+
+**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 17 v1
+tools in insertion order (Phase 9 passes `false`; the Phase-10
+`send_to_internal_agent` add honours the flag). `descriptors()` /
+`mcp_tool_descriptors()` are pure name/description/schema projections (single
+source of truth); `mcp_tool_descriptors()` honours `expose_over_mcp()`.
+`dispatch(ctx, name, args)` is the one routing path: unknown name →
+`InvalidInput`; shallow arg-shape validation against the schema → `InvalidInput`;
+then `execute`.
+
+**v1 tools.** Read/compute: `list_meetings`, `search_meetings`, `get_meeting`,
+`get_transcript`, `get_transcript_slice`, `get_summary`, `get_notes`,
+`get_metadata`, `get_recording_state`, `search_within_transcript`,
+`relisten_section`, `resummarise`, `speaker_talk_time`. Writes:
+`set_speaker_name`, `rename_meeting` (both MCP-allowlisted — reversible, low
+blast radius), `retranscribe_meeting`, `rediarize_meeting` (internal-only — heavy;
+holding the offline claim via MCP would block the user's ability to record).
+
+**Speaker-name overlay.** `get_transcript`, `get_meeting`,
+`search_within_transcript`, and `speaker_talk_time` apply the
+`MeetingMeta.speaker_names` map at read time, rewriting a segment's `speaker_id`
+label (`"A"`) to its display name (`"Alice"`) where one is set. Presentation-only
+— the on-disk transcript is never mutated. `set_speaker_name` writes the map via
+`persistence::write_metadata`; `rediarize_meeting` resets it (orchestrator §4.4).
+
+**Write serialization (§4).** `persistence` stays the sole writer under
+`meetings/`. `retranscribe_meeting`/`rediarize_meeting` inherit the orchestrator's
+offline claim for free (`InvalidInput` when busy). `set_speaker_name` and
+`rename_meeting` are read-modify-writes of `metadata.json` that bypass that
+claim, so they take a `ToolContext`-owned **per-meeting async mutex** across the
+read-modify-write — the one tool-layer-owned write lock. `relisten_section` and
+`resummarise` are read-only-with-compute (write nothing).
 
 ### `settings`
 **Crate:** `crates/settings`

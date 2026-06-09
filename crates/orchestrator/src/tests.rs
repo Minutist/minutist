@@ -488,6 +488,15 @@ mod diarization {
         let before = persistence::read_transcript(&meeting_dir).expect("read transcript");
         assert!(before.iter().all(|s| s.speaker_id.is_none()));
 
+        // Seed a user-set speaker_names map (mapping the OLD letters). A
+        // re-diarization can re-letter speakers, so the map must be cleared by
+        // the rediarize metadata write (Phase 9 §4.4).
+        {
+            let mut meta = persistence::read_metadata(&meeting_dir).expect("read metadata");
+            meta.speaker_names.insert("A".to_string(), "Alice".to_string());
+            persistence::write_metadata(&meeting_dir, &meta).expect("seed speaker_names");
+        }
+
         let index = MeetingIndex::open(":memory:").await.expect("open index");
         index.rebuild_from_disk(&root).await.expect("seed index");
 
@@ -503,10 +512,16 @@ mod diarization {
         assert_eq!(after[1].speaker_id.as_deref(), Some("B"));
         assert_eq!(after[2].speaker_id.as_deref(), Some("A"));
 
-        // 2. metadata.json speaker_count updated + diarizer descriptor set.
+        // 2. metadata.json speaker_count updated + diarizer descriptor set, and
+        //    the seeded speaker_names map cleared (§4.4 — re-lettering
+        //    invalidates the old map).
         let meta = persistence::read_metadata(&meeting_dir).expect("read metadata");
         assert_eq!(meta.speaker_count, 2);
         assert!(meta.diarizer.is_some(), "diarizer descriptor must be recorded");
+        assert!(
+            meta.speaker_names.is_empty(),
+            "rediarize must clear speaker_names (re-lettering invalidates the map)"
+        );
 
         // 3. index row speaker_count refreshed.
         let rows = index.list_meetings().await.expect("list");

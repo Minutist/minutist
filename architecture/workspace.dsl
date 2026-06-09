@@ -94,6 +94,8 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
 
                 orchestrator = component "meeting-orchestrator" "The live recording state machine. Wires audio-capture → vad-chunker → asr-runtime → persistence, emits typed events for the UI. The only crate that depends on multiple other components." "Rust crate: crates/orchestrator"
 
+                agentTools = component "agent-tools" "Shared tool layer. One Tool trait + ToolRegistry; the single place a tool is defined; driven by both the chat agent and (Phase 10) the MCP server." "Rust crate: crates/agent-tools"
+
                 settings = component "settings" "Settings schema, validation, change notifications. Persists via tauri-plugin-store." "Rust crate: crates/settings"
 
                 ipcBridge = component "ipc-bridge" "Tauri command + event surface. tauri-specta generates the TypeScript bindings consumed by the webview's IPC client. The only crate that knows about Tauri APIs." "Rust crate: crates/ipc-bridge"
@@ -151,6 +153,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // keep the diagram readable; the dependency rule is enforced by the
         // workspace conventions, not by every edge here.
         meetingApp.core.orchestrator -> meetingApp.core.common "Uses interface types"
+        meetingApp.core.agentTools   -> meetingApp.core.common "Uses interface types"
         meetingApp.core.appMain      -> meetingApp.core.common "Uses interface types"
         meetingApp.core.ipcBridge    -> meetingApp.core.common "Uses interface types"
 
@@ -187,6 +190,14 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         meetingApp.core.settings    -> meetingApp.meetingFs "Persists user preferences" "tauri-plugin-store"
         meetingApp.core.orchestrator -> meetingApp.core.settings "Reads runtime config"
         meetingApp.core.asrRuntime   -> meetingApp.core.settings "Reads model selection"
+
+        // Shared tool layer (Phase 9). One Tool trait + ToolRegistry, driven by
+        // both the chat agent and (Phase 10) the MCP server. Reads meeting
+        // artefacts through persistence; runs re-transcribe / rediarize /
+        // transcribe_pcm_window through the orchestrator (which keeps the
+        // model-registry edge — agent-tools has none).
+        meetingApp.core.agentTools -> meetingApp.core.persistence "Reads meeting artefacts; writes via existing writers"
+        meetingApp.core.agentTools -> meetingApp.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
         meetingApp.core.ipcBridge -> meetingApp.core.orchestrator "Invokes commands; subscribes to events"

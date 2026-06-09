@@ -637,3 +637,73 @@ async fn re_transcribe_with_stub_backend_rewrites_transcript_over_fixture() {
         row.excerpt
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. transcribe_pcm_window_with_backend over the fixture, stub ASR
+//    (DEFAULT suite — no model env vars; Phase 9 `relisten_section` backing)
+// ---------------------------------------------------------------------------
+
+/// `Orchestrator::transcribe_pcm_window` (driven via the `*_with_backend`
+/// test seam) re-runs ASR over a bounded window and returns the segments WITHOUT
+/// rewriting `transcript.json` — proving it is a read-only compute op. It also
+/// does NOT take the offline claim (it runs without any `Idle` gate handshake).
+///
+/// This ALWAYS runs (no env gate): the stub backend stands in for the ASR model,
+/// and the real Silero VAD is not on this path (the window is fed to the backend
+/// as one chunk).
+#[tokio::test(flavor = "multi_thread")]
+async fn transcribe_pcm_window_returns_segments_without_rewriting_transcript() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let orch = test_orchestrator(root.clone());
+
+    // ~2 s of real speech so the decoded PCM has content to slice.
+    let clip = load_fixture_wav();
+    let mut samples = Vec::with_capacity(clip.len() * 2);
+    for _ in 0..2 {
+        samples.extend_from_slice(&clip);
+    }
+    let meeting_id = build_meeting_with_audio(&root, "Relisten window", &samples);
+    let meeting_dir = root.join(meeting_id.0.to_string());
+
+    // transcript.json starts empty; the window re-listen must NOT change it.
+    let before = persistence::read_transcript(&meeting_dir).expect("read transcript before");
+    assert!(before.is_empty(), "transcript.json must start empty");
+
+    // A window inside the recording (no pause present → single kept region).
+    let stub = Box::new(StubAsrBackend::new("relisten text"));
+    let segments = orch
+        .transcribe_pcm_window_with_backend(meeting_id, 200, 800, stub)
+        .await
+        .expect("transcribe_pcm_window_with_backend must succeed");
+
+    assert!(
+        !segments.is_empty(),
+        "the window must transcribe to at least one segment"
+    );
+    assert!(
+        segments.iter().all(|s| s.text.contains("relisten")),
+        "returned segments must carry the stub text; got: {segments:?}"
+    );
+    // The returned segments sit on the requested window (the chunk start was
+    // 200 ms), proving the timestamps are mapped onto the meeting timeline.
+    assert!(
+        segments.first().map(|s| s.start_ms).unwrap_or(0) >= 200,
+        "segment start must be at/after the requested window start"
+    );
+
+    // Read-only: transcript.json untouched (still empty).
+    let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
+    assert!(
+        after.is_empty(),
+        "transcribe_pcm_window must NOT rewrite transcript.json"
+    );
+
+    // The recorder is still Idle (no claim taken / released cycle wedged it).
+    assert!(matches!(
+        orch.state().await,
+        meeting_app_common::RecordingState::Idle
+    ));
+}

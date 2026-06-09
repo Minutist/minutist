@@ -1610,6 +1610,60 @@ fn pause_excluding_segments(pcm: &[f32]) -> Vec<KeptRegion> {
     regions
 }
 
+/// Map a pause-EXCLUDING window `[start_ms, end_ms)` (transcript-clock
+/// timestamps) onto a single slice of the pause-INCLUDING decoded `pcm`
+/// (Phase 9 — backs `Orchestrator::transcribe_pcm_window`).
+///
+/// `Segment::start_ms`/`end_ms` live on the pause-EXCLUDING capture clock, but
+/// `read_audio_pcm` returns the pause-INCLUDING buffer. To slice the right
+/// audio for a re-listen we walk the [`pause_excluding_segments`] kept regions
+/// (the same pause model the offline re-transcribe uses) and translate the
+/// requested excluding interval back into PCM sample indices.
+///
+/// **Straddling a pause (W1 decision — clamp, do NOT concatenate).** A
+/// pause-excluding window can span a skipped pause, which on the
+/// pause-INCLUDING clock maps to two disjoint PCM ranges separated by the
+/// pause's synthesised silence. Concatenating them would seam two non-adjacent
+/// audio spans and make the re-transcribed timestamps impossible to map cleanly
+/// back onto the meeting timeline. v1 therefore **clamps to the single kept
+/// region that contains `start_ms`** and slices within it up to `end_ms` (or the
+/// region end, whichever is first). The tool's `description` states this caveat.
+/// Returns `None` when `start_ms` falls past the last kept region's
+/// excluding-clock extent (an out-of-range request).
+pub(crate) fn pcm_window_for_excluding_range(
+    pcm: &[f32],
+    start_ms: u64,
+    end_ms: u64,
+) -> Option<std::ops::Range<usize>> {
+    let regions = pause_excluding_segments(pcm);
+
+    for region in &regions {
+        let region_kept_samples = region.src_end - region.src_start;
+        let region_excl_len_ms =
+            (region_kept_samples as u64 * 1000) / SAMPLE_RATE_HZ;
+        let region_excl_end_ms = region.excl_start_ms + region_excl_len_ms;
+
+        // The first region whose excluding-clock extent contains `start_ms`.
+        if start_ms < region_excl_end_ms {
+            // Offset of `start_ms` within this region, in pause-excluding ms.
+            let into_region_ms = start_ms.saturating_sub(region.excl_start_ms);
+            let start_off = (into_region_ms as usize * SAMPLE_RATE_HZ as usize) / 1000;
+            // Clamp `end_ms` to this region (W1 clamp decision).
+            let clamped_end_ms = end_ms.min(region_excl_end_ms);
+            let end_into_region_ms = clamped_end_ms.saturating_sub(region.excl_start_ms);
+            let end_off = (end_into_region_ms as usize * SAMPLE_RATE_HZ as usize) / 1000;
+
+            let lo = region.src_start + start_off.min(region_kept_samples);
+            let hi = region.src_start + end_off.min(region_kept_samples);
+            if hi <= lo {
+                return None;
+            }
+            return Some(lo..hi);
+        }
+    }
+    None
+}
+
 /// Re-run transcription over a fully-decoded PCM buffer, reusing the live
 /// pipeline's batched-VAD [`Accumulator`] + ASR-dispatch machinery.
 ///
@@ -2624,6 +2678,73 @@ mod tests {
             result.is_none(),
             "build_online_diarizer must return None when the embedding model is absent"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // pcm_window_for_excluding_range (W1, Phase 9 — gating)
+    // -----------------------------------------------------------------------
+
+    /// A window wholly inside a single kept region maps to the matching PCM
+    /// sample range on the pause-INCLUDING clock (no pause present).
+    #[test]
+    fn pcm_window_maps_within_single_region() {
+        let pcm = vec![0.5f32; ms_to_samples(5000)]; // 5 s, no pause
+        // Excluding window [1000, 2000) ms.
+        let range = pcm_window_for_excluding_range(&pcm, 1000, 2000).expect("range");
+        assert_eq!(range.start, ms_to_samples(1000));
+        assert_eq!(range.end, ms_to_samples(2000));
+    }
+
+    /// W1 GATING: a window whose START lands in the POST-pause region must map
+    /// onto the pause-INCLUDING samples AFTER the skipped pause, not the
+    /// pause-excluding offset — proving the clock conversion, not a passthrough.
+    #[test]
+    fn pcm_window_maps_post_pause_window_onto_including_clock() {
+        // 1 s speech, 6 s pause (> 4 s threshold), 3 s speech.
+        let speech_a = ms_to_samples(1000);
+        let pause = ms_to_samples(6000);
+        let speech_b = ms_to_samples(3000);
+        let mut pcm = vec![0.5f32; speech_a];
+        pcm.extend(std::iter::repeat_n(0.0f32, pause));
+        pcm.extend(std::iter::repeat_n(0.5f32, speech_b));
+
+        // The post-pause region starts at pause-EXCLUDING 1000 ms. A window
+        // [1500, 2500) ms (excluding clock) is 500..1500 ms INTO the post-pause
+        // region, i.e. pause-INCLUDING samples [speech_a + pause + 500ms,
+        // speech_a + pause + 1500ms).
+        let range = pcm_window_for_excluding_range(&pcm, 1500, 2500).expect("range");
+        assert_eq!(range.start, speech_a + pause + ms_to_samples(500));
+        assert_eq!(range.end, speech_a + pause + ms_to_samples(1500));
+        // Confirm the slice is over the post-pause SPEECH (non-silent), proving
+        // the pause was skipped rather than sliced.
+        assert!(pcm[range.start..range.end].iter().all(|s| s.abs() > 0.1));
+    }
+
+    /// W1 GATING: a window that STRADDLES a pause is clamped to the kept region
+    /// containing its start (the documented v1 clamp decision — no concatenation
+    /// across the pause seam).
+    #[test]
+    fn pcm_window_straddling_a_pause_clamps_to_first_region() {
+        let speech_a = ms_to_samples(2000); // pause-excl [0, 2000)
+        let pause = ms_to_samples(6000);
+        let speech_b = ms_to_samples(2000); // pause-excl [2000, 4000)
+        let mut pcm = vec![0.5f32; speech_a];
+        pcm.extend(std::iter::repeat_n(0.0f32, pause));
+        pcm.extend(std::iter::repeat_n(0.5f32, speech_b));
+
+        // Window [1000, 3000) ms straddles the pause (region 0 ends at excl
+        // 2000). It must clamp to region 0: [1000ms .. 2000ms] of region 0,
+        // i.e. PCM samples [1000ms, 2000ms) — never crossing into region 1.
+        let range = pcm_window_for_excluding_range(&pcm, 1000, 3000).expect("range");
+        assert_eq!(range.start, ms_to_samples(1000));
+        assert_eq!(range.end, speech_a, "must clamp at the first region's end");
+    }
+
+    /// A window past the end of all kept audio yields `None` (out of range).
+    #[test]
+    fn pcm_window_out_of_range_is_none() {
+        let pcm = vec![0.5f32; ms_to_samples(1000)];
+        assert!(pcm_window_for_excluding_range(&pcm, 5000, 6000).is_none());
     }
 
     /// Trailing/leading pause padding is excluded; a pause at the very start

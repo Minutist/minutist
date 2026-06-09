@@ -1,0 +1,33 @@
+[package]
+name = "agent-tools"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Phase 9: the shared tool layer. One `Tool` trait + one `ToolRegistry`; the
+# single place a chat-agent / MCP tool is defined. Edges: common, persistence,
+# orchestrator (NO summariser edge — `resummarise` drives an
+# `Arc<dyn Summariser>` held in `ToolContext`; NO model-registry edge —
+# `relisten_section` resolves its ASR backend through
+# `Orchestrator::transcribe_pcm_window`).
+
+[dependencies]
+meeting-app-common = { path = "../common" }
+persistence = { path = "../persistence" }
+orchestrator = { path = "../orchestrator" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+# Drives the orchestrator-backed tools (relisten/retranscribe/rediarize) with
+# injected stub backends + tempdir meeting fixtures, no real model.
+orchestrator = { path = "../orchestrator", features = ["test-source"] }
+model-registry = { path = "../model-registry" }
+settings = { path = "../settings" }

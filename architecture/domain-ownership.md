@@ -25,6 +25,7 @@ role when work is parallel.
 | `persistence` | data-engineer | `crates/persistence/**` | Same | `common` |
 | `settings` | data-engineer | `crates/settings/**` | Same | `common` |
 | `orchestrator` | systems-engineer | `crates/orchestrator/**` | Same | `common` + all live-pipeline crates per table in `components.md` |
+| `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator` |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |

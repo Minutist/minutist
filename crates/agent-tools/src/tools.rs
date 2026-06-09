@@ -1,0 +1,802 @@
+//! The v1 tool catalogue (Phase 9 §2.2).
+//!
+//! Each tool is one zero-sized struct implementing [`crate::Tool`]. Read/compute
+//! tools call the `persistence` readers (on `spawn_blocking`) or the
+//! orchestrator; write tools route through an existing persistence/orchestrator
+//! writer — no tool opens a file under `meetings/` for writing itself
+//! (`persistence` is the sole writer; §4).
+//!
+//! # The speaker-name overlay
+//!
+//! `get_transcript` and `get_meeting` apply the [`apply_speaker_overlay`]
+//! read-time mapping: a `Segment.speaker_id` of `"A"` is rewritten to the
+//! display name from `MeetingMeta.speaker_names["A"]` when one is set, so the
+//! agent sees "Alice" not "A". The on-disk transcript is untouched (overlay is
+//! presentation-only).
+
+use std::collections::BTreeMap;
+
+use async_trait::async_trait;
+use meeting_app_common::{
+    AppError, AppResult, MeetingId, MeetingMeta, RecordingState, Segment,
+};
+use serde_json::json;
+
+use crate::{require_str, require_u64, resolve_meeting, Tool, ToolContext, ToolOutput};
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Apply the `speaker_names` overlay to a transcript: rewrite each segment's
+/// `speaker_id` label to its configured display name where one exists. Labels
+/// without a configured name are left as-is. Presentation-only — the on-disk
+/// transcript is never mutated.
+pub(crate) fn apply_speaker_overlay(
+    segments: &mut [Segment],
+    speaker_names: &BTreeMap<String, String>,
+) {
+    if speaker_names.is_empty() {
+        return;
+    }
+    for seg in segments.iter_mut() {
+        if let Some(label) = &seg.speaker_id {
+            if let Some(name) = speaker_names.get(label) {
+                seg.speaker_id = Some(name.clone());
+            }
+        }
+    }
+}
+
+/// Read a meeting's metadata on a blocking thread.
+async fn read_metadata(ctx: &ToolContext, id: MeetingId) -> AppResult<MeetingMeta> {
+    let dir = ctx.meeting_dir(id);
+    spawn_blocking_io(move || persistence::read_metadata(&dir)).await
+}
+
+/// Read a meeting's transcript on a blocking thread.
+async fn read_transcript(ctx: &ToolContext, id: MeetingId) -> AppResult<Vec<Segment>> {
+    let dir = ctx.meeting_dir(id);
+    spawn_blocking_io(move || persistence::read_transcript(&dir)).await
+}
+
+/// Drive a blocking `persistence` read on `spawn_blocking`, mapping a join
+/// failure to `AppError::Internal`.
+async fn spawn_blocking_io<T, F>(f: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("agent-tools blocking read join failed: {e}"),
+        })?
+}
+
+/// JSON-schema object root with the given properties + required list. Avoids
+/// regex `pattern` (the GBNF converter rejects PCRE shorthands).
+fn schema_obj(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+/// The `{meeting_id: string}` schema shared by the single-meeting tools.
+fn meeting_id_schema() -> serde_json::Value {
+    schema_obj(
+        json!({ "meeting_id": { "type": "string", "description": "Meeting UUID" } }),
+        &["meeting_id"],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// list_meetings
+// ---------------------------------------------------------------------------
+
+pub struct ListMeetings;
+
+#[async_trait]
+impl Tool for ListMeetings {
+    fn name(&self) -> &'static str {
+        "list_meetings"
+    }
+    fn description(&self) -> &'static str {
+        "List all meetings, newest first."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(json!({}), &[])
+    }
+    async fn execute(&self, ctx: &ToolContext, _args: serde_json::Value) -> AppResult<ToolOutput> {
+        let entries = ctx.index.list_meetings().await?;
+        let n = entries.len();
+        let data = serde_json::to_value(&entries).map_err(serialise_err)?;
+        Ok(ToolOutput::new(data, format!("{n} meeting(s)")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// search_meetings
+// ---------------------------------------------------------------------------
+
+pub struct SearchMeetings;
+
+#[async_trait]
+impl Tool for SearchMeetings {
+    fn name(&self) -> &'static str {
+        "search_meetings"
+    }
+    fn description(&self) -> &'static str {
+        "Find meetings whose title or list-excerpt contains the query (does not search transcript bodies; use search_within_transcript for that)."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({ "query": { "type": "string", "description": "Substring to match against title/excerpt" } }),
+            &["query"],
+        )
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let query = require_str(&args, "query")?;
+        let entries = ctx.index.search(query).await?;
+        let n = entries.len();
+        let data = serde_json::to_value(&entries).map_err(serialise_err)?;
+        Ok(ToolOutput::new(data, format!("{n} match(es) for {query:?}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_meeting
+// ---------------------------------------------------------------------------
+
+pub struct GetMeeting;
+
+#[async_trait]
+impl Tool for GetMeeting {
+    fn name(&self) -> &'static str {
+        "get_meeting"
+    }
+    fn description(&self) -> &'static str {
+        "Full meeting state: metadata (with speaker names overlaid), transcript, notes, and the stored summary if present."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let dir = ctx.meeting_dir(id);
+        let (mut state, summary) = spawn_blocking_io(move || {
+            let state = persistence::read_meeting_state(&dir)?;
+            let summary = persistence::read_summary(&dir)?;
+            Ok((state, summary))
+        })
+        .await?;
+
+        // Overlay speaker names onto the transcript (presentation only).
+        apply_speaker_overlay(&mut state.transcript, &state.meta.speaker_names);
+
+        let n_segments = state.transcript.len();
+        let data = json!({
+            "meta": serde_json::to_value(&state.meta).map_err(serialise_err)?,
+            "transcript": serde_json::to_value(&state.transcript).map_err(serialise_err)?,
+            "notes": serde_json::to_value(&state.notes).map_err(serialise_err)?,
+            "summary": summary,
+        });
+        Ok(ToolOutput::new(
+            data,
+            format!("{} — {n_segments} segment(s)", state.meta.title),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_transcript
+// ---------------------------------------------------------------------------
+
+pub struct GetTranscript;
+
+#[async_trait]
+impl Tool for GetTranscript {
+    fn name(&self) -> &'static str {
+        "get_transcript"
+    }
+    fn description(&self) -> &'static str {
+        "Full transcript segments for a meeting, with speaker names overlaid and per-word timestamps when available."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let meta = read_metadata(ctx, id).await?;
+        let mut transcript = read_transcript(ctx, id).await?;
+        apply_speaker_overlay(&mut transcript, &meta.speaker_names);
+        let n = transcript.len();
+        let data = serde_json::to_value(&transcript).map_err(serialise_err)?;
+        Ok(ToolOutput::new(data, format!("{n} segment(s)")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_transcript_slice
+// ---------------------------------------------------------------------------
+
+pub struct GetTranscriptSlice;
+
+#[async_trait]
+impl Tool for GetTranscriptSlice {
+    fn name(&self) -> &'static str {
+        "get_transcript_slice"
+    }
+    fn description(&self) -> &'static str {
+        "Transcript segments overlapping the [start_ms, end_ms) time window (transcript-clock milliseconds), speaker names overlaid."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "start_ms": { "type": "integer", "minimum": 0, "description": "Window start (ms)" },
+                "end_ms": { "type": "integer", "minimum": 0, "description": "Window end (ms)" },
+            }),
+            &["meeting_id", "start_ms", "end_ms"],
+        )
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let start = require_u64(&args, "start_ms")?;
+        let end = require_u64(&args, "end_ms")?;
+        if end <= start {
+            return Err(AppError::InvalidInput {
+                context: format!("end_ms ({end}) must exceed start_ms ({start})"),
+            });
+        }
+        let meta = read_metadata(ctx, id).await?;
+        let mut transcript = read_transcript(ctx, id).await?;
+        apply_speaker_overlay(&mut transcript, &meta.speaker_names);
+        transcript.retain(|s| s.start_ms < end && s.end_ms > start);
+        let n = transcript.len();
+        let data = serde_json::to_value(&transcript).map_err(serialise_err)?;
+        Ok(ToolOutput::new(
+            data,
+            format!("{n} segment(s) in [{start}, {end}) ms"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_summary
+// ---------------------------------------------------------------------------
+
+pub struct GetSummary;
+
+#[async_trait]
+impl Tool for GetSummary {
+    fn name(&self) -> &'static str {
+        "get_summary"
+    }
+    fn description(&self) -> &'static str {
+        "The stored summary markdown for a meeting (null when the meeting has not been summarised)."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let dir = ctx.meeting_dir(id);
+        let summary = spawn_blocking_io(move || persistence::read_summary(&dir)).await?;
+        let label = if summary.is_some() {
+            "summary present"
+        } else {
+            "no summary yet"
+        };
+        Ok(ToolOutput::new(json!({ "summary": summary }), label))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_notes
+// ---------------------------------------------------------------------------
+
+pub struct GetNotes;
+
+#[async_trait]
+impl Tool for GetNotes {
+    fn name(&self) -> &'static str {
+        "get_notes"
+    }
+    fn description(&self) -> &'static str {
+        "The user's hand-typed notes for a meeting (markdown + opaque editor JSON), or null when no notes were taken."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let root = ctx.meetings_dir.clone();
+        // NotesStore::load takes (root, meeting_id) and returns Option.
+        let notes = spawn_blocking_io(move || persistence::NotesStore::load(&root, id)).await?;
+        let data = match notes {
+            Some(n) => {
+                json!({ "markdown": n.markdown, "json": n.json })
+            }
+            None => serde_json::Value::Null,
+        };
+        let label = if data.is_null() {
+            "no notes"
+        } else {
+            "notes loaded"
+        };
+        Ok(ToolOutput::new(data, label))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_metadata
+// ---------------------------------------------------------------------------
+
+pub struct GetMetadata;
+
+#[async_trait]
+impl Tool for GetMetadata {
+    fn name(&self) -> &'static str {
+        "get_metadata"
+    }
+    fn description(&self) -> &'static str {
+        "Meeting metadata, including any configured speaker_names map."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let meta = read_metadata(ctx, id).await?;
+        let title = meta.title.clone();
+        let data = serde_json::to_value(&meta).map_err(serialise_err)?;
+        Ok(ToolOutput::new(data, title))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_recording_state
+// ---------------------------------------------------------------------------
+
+pub struct GetRecordingState;
+
+#[async_trait]
+impl Tool for GetRecordingState {
+    fn name(&self) -> &'static str {
+        "get_recording_state"
+    }
+    fn description(&self) -> &'static str {
+        "The recorder's current state (Idle / Recording / Paused / Stopping / Finalising). A busy recorder reports Finalising, never an internal Offline state."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(json!({}), &[])
+    }
+    async fn execute(&self, ctx: &ToolContext, _args: serde_json::Value) -> AppResult<ToolOutput> {
+        let state: RecordingState = ctx.orchestrator.state().await;
+        let label = recording_state_label(&state);
+        let data = serde_json::to_value(&state).map_err(serialise_err)?;
+        Ok(ToolOutput::new(data, label))
+    }
+}
+
+fn recording_state_label(state: &RecordingState) -> &'static str {
+    match state {
+        RecordingState::Idle => "idle",
+        RecordingState::Recording { .. } => "recording",
+        RecordingState::Paused { .. } => "paused",
+        RecordingState::Stopping { .. } => "stopping",
+        RecordingState::Finalising { .. } => "finalising",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// search_within_transcript
+// ---------------------------------------------------------------------------
+
+pub struct SearchWithinTranscript;
+
+#[async_trait]
+impl Tool for SearchWithinTranscript {
+    fn name(&self) -> &'static str {
+        "search_within_transcript"
+    }
+    fn description(&self) -> &'static str {
+        "Find a phrase in one meeting's transcript body (case-insensitive). Returns matching segments with timestamps and speaker."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "query": { "type": "string", "description": "Phrase to find (case-insensitive)" },
+            }),
+            &["meeting_id", "query"],
+        )
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let query = require_str(&args, "query")?.to_string();
+        let meta = read_metadata(ctx, id).await?;
+        let mut transcript = read_transcript(ctx, id).await?;
+        apply_speaker_overlay(&mut transcript, &meta.speaker_names);
+
+        let needle = query.to_lowercase();
+        let hits: Vec<serde_json::Value> = transcript
+            .iter()
+            .filter(|s| s.text.to_lowercase().contains(&needle))
+            .map(|s| {
+                json!({
+                    "start_ms": s.start_ms,
+                    "end_ms": s.end_ms,
+                    "speaker_id": s.speaker_id,
+                    "text": s.text,
+                    "words": s.words,
+                })
+            })
+            .collect();
+        let n = hits.len();
+        Ok(ToolOutput::new(
+            json!(hits),
+            format!("{n} match(es) for {query:?}"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// relisten_section
+// ---------------------------------------------------------------------------
+
+pub struct RelistenSection;
+
+#[async_trait]
+impl Tool for RelistenSection {
+    fn name(&self) -> &'static str {
+        "relisten_section"
+    }
+    fn description(&self) -> &'static str {
+        "Re-run ASR over an audio span and return what was actually said there. \
+         start_ms/end_ms are transcript-clock timestamps; a window that straddles a \
+         recording pause is clamped to the section before the pause. Read-only — \
+         it does not modify the stored transcript."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "start_ms": { "type": "integer", "minimum": 0, "description": "Span start (transcript-clock ms)" },
+                "end_ms": { "type": "integer", "minimum": 0, "description": "Span end (transcript-clock ms)" },
+                "language": { "type": "string", "description": "Optional language hint (full English name, e.g. \"English\")" },
+            }),
+            &["meeting_id", "start_ms", "end_ms"],
+        )
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let start = require_u64(&args, "start_ms")?;
+        let end = require_u64(&args, "end_ms")?;
+        let language = args
+            .get("language")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let segments = ctx
+            .orchestrator
+            .transcribe_pcm_window(id, start, end, language)
+            .await?;
+        let n = segments.len();
+        let data = serde_json::to_value(&segments).map_err(serialise_err)?;
+        Ok(ToolOutput::new(
+            data,
+            format!("re-listened [{start}, {end}) ms → {n} segment(s)"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// resummarise
+// ---------------------------------------------------------------------------
+
+pub struct Resummarise;
+
+#[async_trait]
+impl Tool for Resummarise {
+    fn name(&self) -> &'static str {
+        "resummarise"
+    }
+    fn description(&self) -> &'static str {
+        "Summarise or re-frame this meeting a different way following the given instruction. \
+         Returns the new text only; it does NOT overwrite the stored summary."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "instruction": { "type": "string", "description": "How to summarise/re-frame (used as the summariser system prompt)" },
+            }),
+            &["meeting_id", "instruction"],
+        )
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let instruction = require_str(&args, "instruction")?.to_string();
+
+        // Read transcript + notes markdown on a blocking thread.
+        let dir = ctx.meeting_dir(id);
+        let (transcript, notes_markdown) = spawn_blocking_io(move || {
+            let transcript = persistence::read_transcript(&dir)?;
+            let notes_markdown = persistence::read_meeting_state(&dir)?
+                .notes
+                .map(|n| n.notes_markdown)
+                .unwrap_or_default();
+            Ok((transcript, notes_markdown))
+        })
+        .await?;
+
+        // Run the held summariser on a blocking thread (sync inference must not
+        // run in an async handler). The instruction is the system prompt.
+        let summariser = ctx.summariser.clone();
+        let text = tokio::task::spawn_blocking(move || {
+            summariser.summarise(&transcript, &notes_markdown, &instruction)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("resummarise spawn_blocking join failed: {e}"),
+        })??;
+
+        Ok(ToolOutput::new(
+            json!({ "text": text }),
+            "re-summarised (not saved)",
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// set_speaker_name (WRITE — MCP allowlisted)
+// ---------------------------------------------------------------------------
+
+pub struct SetSpeakerName;
+
+#[async_trait]
+impl Tool for SetSpeakerName {
+    fn name(&self) -> &'static str {
+        "set_speaker_name"
+    }
+    fn description(&self) -> &'static str {
+        "Name an identified speaker (maps a diarizer label such as \"A\" to a display name). \
+         Note: re-running diarization resets all speaker names."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "speaker_id": { "type": "string", "description": "Diarizer speaker label, e.g. \"A\"" },
+                "name": { "type": "string", "description": "Display name for the speaker" },
+            }),
+            &["meeting_id", "speaker_id", "name"],
+        )
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    /// Allowlisted for MCP exposure (reversible, low blast radius — §4.3).
+    fn expose_over_mcp(&self) -> bool {
+        true
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let speaker_id = require_str(&args, "speaker_id")?.to_string();
+        let name = require_str(&args, "name")?.to_string();
+
+        // Hold the per-meeting metadata mutex across the whole read-modify-write
+        // so a concurrent set_speaker_name / rename_meeting cannot drop a write
+        // (§4.2 class 2). The lock guards the *section*, not the disk file.
+        let lock = ctx.metadata_lock(id).await;
+        let _guard = lock.lock().await;
+
+        let dir = ctx.meeting_dir(id);
+        let speaker_names: BTreeMap<String, String> =
+            spawn_blocking_io(move || -> AppResult<BTreeMap<String, String>> {
+                let mut meta = persistence::read_metadata(&dir)?;
+                meta.speaker_names.insert(speaker_id, name);
+                persistence::write_metadata(&dir, &meta)?;
+                Ok(meta.speaker_names)
+            })
+            .await?;
+
+        let data = json!({ "speaker_names": speaker_names });
+        Ok(ToolOutput::new(data, "speaker name set"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rename_meeting (WRITE — MCP allowlisted)
+// ---------------------------------------------------------------------------
+
+pub struct RenameMeeting;
+
+#[async_trait]
+impl Tool for RenameMeeting {
+    fn name(&self) -> &'static str {
+        "rename_meeting"
+    }
+    fn description(&self) -> &'static str {
+        "Change a meeting's title."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "title": { "type": "string", "description": "New title" },
+            }),
+            &["meeting_id", "title"],
+        )
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    /// Allowlisted for MCP exposure (reversible, low blast radius — §4.3).
+    fn expose_over_mcp(&self) -> bool {
+        true
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let title = require_str(&args, "title")?.to_string();
+
+        // rename_meeting also touches metadata.json (title) + upserts the index,
+        // so it takes the SAME per-meeting metadata mutex as set_speaker_name (a
+        // rename racing a set_speaker_name would otherwise lose a write — §4.2
+        // class 3).
+        let lock = ctx.metadata_lock(id).await;
+        let _guard = lock.lock().await;
+
+        persistence::meeting_ops::rename_meeting(&ctx.meetings_dir, &ctx.index, id, &title).await?;
+        Ok(ToolOutput::new(json!({ "ok": true }), format!("renamed to {title:?}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// retranscribe_meeting (WRITE — internal-only)
+// ---------------------------------------------------------------------------
+
+pub struct RetranscribeMeeting;
+
+#[async_trait]
+impl Tool for RetranscribeMeeting {
+    fn name(&self) -> &'static str {
+        "retranscribe_meeting"
+    }
+    fn description(&self) -> &'static str {
+        "Re-run full ASR over the recording, replacing the stored transcript. \
+         Fails if a recording or another offline pass is in progress."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    /// Internal-only (heavy; holding the offline claim via MCP would block the
+    /// user's ability to record — §4.3). `expose_over_mcp` therefore stays
+    /// `false` (the `is_write` default).
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        // Inherits the orchestrator's offline claim: InvalidInput when busy.
+        ctx.orchestrator.re_transcribe(&ctx.index, id).await?;
+        Ok(ToolOutput::new(json!({ "ok": true }), "re-transcribed"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rediarize_meeting (WRITE — internal-only)
+// ---------------------------------------------------------------------------
+
+pub struct RediarizeMeeting;
+
+#[async_trait]
+impl Tool for RediarizeMeeting {
+    fn name(&self) -> &'static str {
+        "rediarize_meeting"
+    }
+    fn description(&self) -> &'static str {
+        "Re-run speaker diarization, re-assigning speaker labels. This RESETS any \
+         configured speaker names (re-lettering can change who each label is). \
+         Fails if a recording or another offline pass is in progress."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    /// Internal-only (heavy; holding the offline claim via MCP would block the
+    /// user's ability to record — §4.3). `expose_over_mcp` stays `false`.
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        // Inherits the orchestrator's offline claim. The rediarize path clears
+        // `speaker_names` in its metadata write (orchestrator §4.4).
+        ctx.orchestrator.rediarize(&ctx.index, id).await?;
+        Ok(ToolOutput::new(
+            json!({ "ok": true }),
+            "re-diarized (speaker names reset)",
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// speaker_talk_time
+// ---------------------------------------------------------------------------
+
+pub struct SpeakerTalkTime;
+
+#[async_trait]
+impl Tool for SpeakerTalkTime {
+    fn name(&self) -> &'static str {
+        "speaker_talk_time"
+    }
+    fn description(&self) -> &'static str {
+        "Per-speaker total talking time and turn count, with display names overlaid."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let meta = read_metadata(ctx, id).await?;
+        let transcript = read_transcript(ctx, id).await?;
+
+        let stats = aggregate_talk_time(&transcript, &meta.speaker_names);
+        let n = stats.len();
+        Ok(ToolOutput::new(
+            json!(stats),
+            format!("{n} speaker(s)"),
+        ))
+    }
+}
+
+/// Aggregate per-speaker talking time + turn count from `transcript`, overlaying
+/// the configured `speaker_names` onto the `display_name` field. The raw
+/// `speaker_id` (the diarizer label) is preserved; un-diarized segments
+/// (`speaker_id: None`) aggregate under a `"unknown"` bucket. Results are sorted
+/// by `speaker_id` for a stable order.
+fn aggregate_talk_time(
+    transcript: &[Segment],
+    speaker_names: &BTreeMap<String, String>,
+) -> Vec<serde_json::Value> {
+    // (total_ms, turn_count) per raw label.
+    let mut by_speaker: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for seg in transcript {
+        let label = seg.speaker_id.clone().unwrap_or_else(|| "unknown".to_string());
+        let dur = seg.end_ms.saturating_sub(seg.start_ms);
+        let entry = by_speaker.entry(label).or_insert((0, 0));
+        entry.0 += dur;
+        entry.1 += 1;
+    }
+    by_speaker
+        .into_iter()
+        .map(|(label, (total_ms, turn_count))| {
+            let display_name = speaker_names.get(&label).cloned().unwrap_or_else(|| label.clone());
+            json!({
+                "speaker_id": label,
+                "display_name": display_name,
+                "total_ms": total_ms,
+                "turn_count": turn_count,
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Error mapping
+// ---------------------------------------------------------------------------
+
+/// Map a `serde_json` serialisation failure to `AppError::Internal`. The
+/// payloads here are app-internal types that always serialise, so this only
+/// fires on a genuine bug.
+fn serialise_err(e: serde_json::Error) -> AppError {
+    AppError::Internal {
+        context: format!("tool result serialisation failed: {e}"),
+    }
+}

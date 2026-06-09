@@ -34,8 +34,9 @@ appears in:
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
 | `agent-tools` | 9 | `common`, `persistence`, `orchestrator` |
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
+| `mcp-server` | 10 | `common`, `agent-tools` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools` |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server` |
 
 Any PR adding an edge not in this table requires an architecture-doc
 update in the same commit.
@@ -1046,15 +1047,25 @@ tool bodies still push CPU/fs/inference work onto `spawn_blocking`.
 `meetings_dir: PathBuf`, `Arc<dyn Summariser>`, the shared
 `broadcast::Sender<AppEvent>`, an optional `default_meeting` (the internal-UI
 session scope; MCP leaves it `None` so an MCP caller passes `meeting_id`
-explicitly), and a per-meeting metadata-write mutex map.
+explicitly), a per-meeting metadata-write mutex map, and (Phase 10) an optional
+inter-agent bridge SENDER (`mpsc::Sender<(InterAgentRequest, oneshot)>`, set via
+`with_inter_agent_bridge` for the MCP registry context only; `None` for the
+internal agent so it cannot message itself). The bridge uses only `common` types
++ tokio channels — no `chat-agent` edge.
 
-**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 17 v1
-tools in insertion order (Phase 9 passes `false`; the Phase-10
-`send_to_internal_agent` add honours the flag). `descriptors()` /
+**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 17 base v1
+tools in insertion order; `ipc-bridge` passes `false` (the internal agent must
+not message itself) and `app-main` passes `true` for the MCP registry instance,
+which APPENDS `send_to_internal_agent` (18 tools). `descriptors()` /
 `mcp_tool_descriptors()` are pure name/description/schema projections (single
 source of truth); `mcp_tool_descriptors()` honours `expose_over_mcp()`.
-`dispatch(ctx, name, args)` is the one routing path: unknown name →
-`InvalidInput`; shallow arg-shape validation against the schema → `InvalidInput`;
+**`mcp_tool_descriptors_gated(allow_writes)`** (Phase 10) composes the
+`mcp_write_tools` setting (D3) on TOP of `expose_over_mcp()`: with it off, write
+tools are dropped (reads + the inter-agent tool only); with it on, the reversible
+writes join; `retranscribe`/`rediarize` are never `expose_over_mcp` and so never
+appear regardless. `mcp_call_allowed(name, allow_writes)` mirrors that gate on
+`tools/call` (defence in depth). `dispatch(ctx, name, args)` is the one routing
+path: unknown name → `InvalidInput`; shallow arg-shape validation → `InvalidInput`;
 then `execute`.
 
 **v1 tools.** Read/compute: `list_meetings`, `search_meetings`, `get_meeting`,
@@ -1064,6 +1075,9 @@ then `execute`.
 `set_speaker_name`, `rename_meeting` (both MCP-allowlisted — reversible, low
 blast radius), `retranscribe_meeting`, `rediarize_meeting` (internal-only — heavy;
 holding the offline claim via MCP would block the user's ability to record).
+MCP-only (Phase 10, `v1(true)`): `send_to_internal_agent` — forwards one message
+to the internal chat agent over the bridge channel and returns its reply (body in
+`agent-tools`; chat-engine driver in `ipc-bridge::inter_agent`).
 
 **Speaker-name overlay.** `get_transcript`, `get_meeting`,
 `search_within_transcript`, and `speaker_talk_time` apply the
@@ -1153,6 +1167,51 @@ oldest non-pinned turns until the re-tokenised windowed prompt fits `prompt +
 max_tokens + reserve <= n_ctx`, and reports a hard floor (`HARD_FLOOR_REJECT`)
 when a single turn is genuinely too large (the driver rejects it as
 `AppError::InvalidInput`).
+
+### `mcp-server`
+**Crate:** `crates/mcp-server` (Phase 10)
+**Owns:** the in-process Streamable HTTP MCP server that exposes the Phase-9
+`agent-tools` registry to external agents over loopback. It is a SECOND consumer
+of that registry and adds **no tools of its own** — it projects
+`ToolRegistry::mcp_tool_descriptors_gated(allow_writes)` onto MCP `tools/list`
+and `ToolRegistry::dispatch` onto `tools/call`. Any tool logic, schema, or name
+living here rather than in `agent-tools` is a reviewer finding. Edges: `common`,
+`agent-tools` (+ the external `rmcp` SDK 1.7 and its `hyper`/`hyper-util`/
+`http`/`http-body-util`/`tower-service`/`tokio-util` leaf crates — the
+`AppError → McpError` mapping is the **only** place rmcp error types are
+constructed). SDK: `rmcp` 1.7 (`server`, `macros`,
+`transport-streamable-http-server`, `schemars`); rmcp's own hyper-based
+`StreamableHttpService` serves the single `/mcp` endpoint — **no `axum`** (Gate-A
+SP1: `cargo tree -d` showed no `http`/`hyper`/`tower` skew against Tauri 2.11,
+which already resolves the same majors).
+
+**Deliberately NOT edges.** No `tauri`/`specta` (the listener is spawned by
+`app-main` via `tauri::async_runtime::spawn`; `mcp-server` takes the registry +
+context + a shutdown receiver + bind/token config and serves until shutdown). No
+`chat-agent` edge — the inter-agent bridge tool (`send_to_internal_agent`)
+reaches the chat engine through a `common`-typed channel held on the
+`agent_tools::ToolContext` (the SENDER), whose receiver + the single chat turn
+live in `ipc-bridge`. No direct `persistence`/`orchestrator` edge — it drives the
+`ToolRegistry`, whose `ToolContext` carries those handles (built by `app-main`).
+
+**`serve(registry, ctx, config, shutdown)`** binds `config.bind_addr`
+(`127.0.0.1:{mcp_port}`), wraps rmcp's `StreamableHttpService` in a thin
+bearer-check hyper service (401 before rmcp sees the request — the session id is
+never the credential), and serves until the `watch` shutdown flips. Host + Origin
+validation are rmcp-native (`StreamableHttpServerConfig`: the loopback
+`allowed_hosts` default, kept; `allowed_origins` set to the loopback origins so a
+cross-origin browser request is a 403). The write-tool exposure gate
+(`allow_writes` = `settings.mcp_write_tools`, D3) is applied at projection AND on
+call (`mcp_call_allowed`). See `cross-cutting.md` — "MCP transport".
+
+**The inter-agent tool placement.** `send_to_internal_agent` is DEFINED in
+`agent-tools` (registered only on `ToolRegistry::v1(true)`, the MCP registry) so
+the single-tool-definition rule holds, but its BODY only `try_send`s an
+`InterAgentRequest` over the bridge channel + awaits the reply (with a timeout).
+The chat-engine driver that services the channel lives in
+`ipc-bridge::inter_agent` (using the INTERNAL `v1(false)` registry so the agent
+cannot message itself). This keeps `agent-tools` free of a `chat-agent` edge and
+`mcp-server` free of both.
 
 ### `settings`
 **Crate:** `crates/settings`
@@ -1549,6 +1608,18 @@ constructs `IpcState` with it plus the lazily-initialised held-model cell
 load the GGUF at startup. This adds the `agent-tools` (the registry is built here)
 + `chat-agent` (transitively via `ipc-bridge`) dependency rows above.
 
+**Phase 10 wiring (MCP).** Gated on `settings.mcp_enabled` (off by default), from
+`setup()`: `app-main` spawns `ipc_bridge::spawn_inter_agent_driver` (owns the
+inter-agent receiver + the internal `v1(false)` chat turn) to get the bridge
+SENDER, builds the MCP `ToolRegistry::v1(true)` + a `ToolContext` carrying that
+sender, resolves the bearer token (generate-on-first-enable, persisted to
+`{app-data}/mcp_token` with `0600`; OS-keychain hardening is a documented
+follow-up), and `tauri::async_runtime::spawn`s `mcp_server::serve` on
+`127.0.0.1:{mcp_port}`. On the bound addr it fills `IpcState.mcp_info` (URL +
+token, read by `get_mcp_server_info`) and emits `AppEvent::McpServerListening` on
+the shared bus. Toggling the setting at runtime is a documented restart-required
+for v1. Adds the `mcp-server` dependency row above.
+
 ## Webview components
 
 The webview is small enough that ownership maps to directories rather
@@ -1558,7 +1629,7 @@ than packages.
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
 | Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
-| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. All drawer controls route through the existing settings seams; no new command. |
+| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one Phase-10 read command `get_mcp_server_info`. |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 

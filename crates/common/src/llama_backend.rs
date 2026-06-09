@@ -37,7 +37,9 @@ pub fn shared_llama_backend() -> AppResult<&'static LlamaBackend> {
         context: format!("llama.cpp backend init failed: {e}"),
     })?;
     let _ = BACKEND.set(backend);
-    Ok(BACKEND.get().expect("backend was just set under the init lock"))
+    Ok(BACKEND
+        .get()
+        .expect("backend was just set under the init lock"))
 }
 
 #[cfg(test)]

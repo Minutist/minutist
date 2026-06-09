@@ -14,6 +14,7 @@ members = [
     "crates/orchestrator",
     "crates/agent-tools",
     "crates/chat-agent",
+    "crates/mcp-server",
     "crates/ipc-bridge",
     "src-tauri",
     "spikes/asr",
@@ -113,3 +114,28 @@ libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 # sherpa-onnx libs; default features (tts etc.) disabled. The static-bundle
 # feature is a Phase-7 concern. Pinned EXACT; bumping is a coordinated change.
 sherpa-rs = { version = "=0.6.8", default-features = false, features = ["download-binaries"] }
+
+# Phase 10 additions
+# rmcp — the official Rust MCP SDK (modelcontextprotocol/rust-sdk). Used by the
+# `mcp-server` crate to expose the agent-tools registry over Streamable HTTP.
+# Pin a 1.x line (NOT the stale 0.x examples). Hard floor 1.4.0 for the
+# `Host`-header DNS-rebinding fix (GHSA-89vp-x53w-74fx); we use 1.7. The
+# `transport-streamable-http-server` feature pulls rmcp's own hyper-based server
+# transport (server-side-http + tower + the LocalSessionManager) — NO axum
+# needed: Gate-A SP1 confirmed standalone serving, and `cargo tree -d` shows no
+# http/hyper/tower/tokio skew against Tauri 2.11's stack (rmcp wants http 1.x,
+# hyper 1.x, tower 0.5 — the same majors the existing tree already resolves).
+# `macros` is unused by the hand-written dynamic ServerHandler but harmless;
+# `schemars` lets rmcp's tool-schema layer coexist (we pass the agent-tools
+# JSON Schema through verbatim as a serde_json::Value).
+rmcp = { version = "1.7", default-features = false, features = [
+    "server", "macros", "transport-streamable-http-server", "schemars",
+] }
+# High-entropy bearer-token generation (app-main). CSPRNG-backed random bytes
+# via `OsRng`; 256-bit token hex-encoded.
+rand = "0.8"
+hex = "0.4"
+# `mcp-server` validates the Authorization / Origin / Host headers off the raw
+# `http::HeaderMap` rmcp surfaces; `http` is the shared header/types crate the
+# whole hyper stack already uses (no new major).
+http = "1"

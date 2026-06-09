@@ -29,9 +29,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chat_agent::{ChatEngine, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
-use chat_agent::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
 use agent_tools::{ToolDescriptor, ToolOutput};
+use chat_agent::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
+use chat_agent::{ChatEngine, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
 use meeting_app_common::{AppError, AppEvent, AppResult, ChatSessionId};
 
 /// The max number of tool-call iterations one turn may take before the driver
@@ -186,8 +186,7 @@ where
                             let message = e.to_string();
                             // Feed the error back so the model can recover on the
                             // next iteration rather than crashing the turn.
-                            let content =
-                                serde_json::json!({ "error": message }).to_string();
+                            let content = serde_json::json!({ "error": message }).to_string();
                             (false, message, content)
                         }
                     };
@@ -455,7 +454,9 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!ev.iter().any(|e| matches!(e, AppEvent::ChatToolCall { .. })));
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, AppEvent::ChatToolCall { .. })));
         // The assistant message was appended to the history.
         assert_eq!(history.last().unwrap().role, Role::Assistant);
     }
@@ -463,7 +464,10 @@ mod tests {
     #[test]
     fn tool_call_turn_dispatches_then_loops_to_final() {
         let engine = ScriptedEngine::new(vec![
-            (vec![], TurnOutcome::ToolCalls(vec![tool_call("get_transcript", "{}")])),
+            (
+                vec![],
+                TurnOutcome::ToolCalls(vec![tool_call("get_transcript", "{}")]),
+            ),
             (
                 vec!["the ".into(), "answer".into()],
                 TurnOutcome::Final("the answer".to_string()),
@@ -498,11 +502,17 @@ mod tests {
 
         assert_eq!(result.final_text, "the answer");
         assert_eq!(result.tool_iterations, 1);
-        assert_eq!(dispatched.get(), 1, "the tool must have been dispatched once");
+        assert_eq!(
+            dispatched.get(),
+            1,
+            "the tool must have been dispatched once"
+        );
 
         let ev = events.borrow();
         assert_eq!(
-            ev.iter().filter(|e| matches!(e, AppEvent::ChatToolCall { .. })).count(),
+            ev.iter()
+                .filter(|e| matches!(e, AppEvent::ChatToolCall { .. }))
+                .count(),
             1
         );
         let result_ok = ev.iter().find_map(|e| match e {
@@ -511,18 +521,24 @@ mod tests {
         });
         assert_eq!(result_ok, Some((true, "0 segments".to_string())));
         assert_eq!(
-            ev.iter().filter(|e| matches!(e, AppEvent::ChatTurnComplete { .. })).count(),
+            ev.iter()
+                .filter(|e| matches!(e, AppEvent::ChatTurnComplete { .. }))
+                .count(),
             1
         );
         // A Tool message was appended carrying the dispatch payload.
-        assert!(history.iter().any(|m| m.role == Role::Tool
-            && m.content.contains("segments")));
+        assert!(history
+            .iter()
+            .any(|m| m.role == Role::Tool && m.content.contains("segments")));
     }
 
     #[test]
     fn tool_error_is_fed_back_and_turn_can_still_finish() {
         let engine = ScriptedEngine::new(vec![
-            (vec![], TurnOutcome::ToolCalls(vec![tool_call("get_transcript", "{}")])),
+            (
+                vec![],
+                TurnOutcome::ToolCalls(vec![tool_call("get_transcript", "{}")]),
+            ),
             (vec![], TurnOutcome::Final("recovered".to_string())),
         ]);
         let mut history = base_history();
@@ -549,10 +565,17 @@ mod tests {
 
         assert_eq!(result.final_text, "recovered");
         let ev = events.borrow();
-        let errored = ev.iter().any(|e| matches!(e, AppEvent::ChatToolResult { ok: false, .. }));
-        assert!(errored, "the failed dispatch must emit ChatToolResult ok=false");
+        let errored = ev
+            .iter()
+            .any(|e| matches!(e, AppEvent::ChatToolResult { ok: false, .. }));
+        assert!(
+            errored,
+            "the failed dispatch must emit ChatToolResult ok=false"
+        );
         // The error content was fed back as a Tool message.
-        assert!(history.iter().any(|m| m.role == Role::Tool && m.content.contains("error")));
+        assert!(history
+            .iter()
+            .any(|m| m.role == Role::Tool && m.content.contains("error")));
     }
 
     #[test]
@@ -567,7 +590,10 @@ mod tests {
                 _cfg: &SamplerConfig,
                 _token_cb: &mut dyn FnMut(&str),
             ) -> AppResult<TurnOutcome> {
-                Ok(TurnOutcome::ToolCalls(vec![tool_call("get_transcript", "{}")]))
+                Ok(TurnOutcome::ToolCalls(vec![tool_call(
+                    "get_transcript",
+                    "{}",
+                )]))
             }
         }
 
@@ -648,8 +674,14 @@ mod tests {
         assert_eq!(with_per_turn_seed(&greedy, 1, 0).seed, greedy.seed);
         // Non-greedy: a non-zero seed is injected (not the default 0).
         let sampling = SamplerConfig::default();
-        assert_eq!(sampling.seed, 0, "precondition: default seed is the fixed-0 trap");
+        assert_eq!(
+            sampling.seed, 0,
+            "precondition: default seed is the fixed-0 trap"
+        );
         let injected = with_per_turn_seed(&sampling, 1, 0);
-        assert_ne!(injected.seed, 0, "non-greedy turns must get a non-zero seed");
+        assert_ne!(
+            injected.seed, 0,
+            "non-greedy turns must get a non-zero seed"
+        );
     }
 }

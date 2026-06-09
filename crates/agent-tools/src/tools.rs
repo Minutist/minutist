@@ -15,12 +15,14 @@
 //! presentation-only).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use meeting_app_common::{
-    AppError, AppResult, MeetingId, MeetingMeta, RecordingState, Segment,
+    AppError, AppResult, InterAgentRequest, MeetingId, MeetingMeta, RecordingState, Segment,
 };
 use serde_json::json;
+use tokio::sync::oneshot;
 
 use crate::{require_str, require_u64, resolve_meeting, Tool, ToolContext, ToolOutput};
 
@@ -143,7 +145,10 @@ impl Tool for SearchMeetings {
         let entries = ctx.index.search(query).await?;
         let n = entries.len();
         let data = serde_json::to_value(&entries).map_err(serialise_err)?;
-        Ok(ToolOutput::new(data, format!("{n} match(es) for {query:?}")))
+        Ok(ToolOutput::new(
+            data,
+            format!("{n} match(es) for {query:?}"),
+        ))
     }
 }
 
@@ -653,7 +658,10 @@ impl Tool for RenameMeeting {
         let _guard = lock.lock().await;
 
         persistence::meeting_ops::rename_meeting(&ctx.meetings_dir, &ctx.index, id, &title).await?;
-        Ok(ToolOutput::new(json!({ "ok": true }), format!("renamed to {title:?}")))
+        Ok(ToolOutput::new(
+            json!({ "ok": true }),
+            format!("renamed to {title:?}"),
+        ))
     }
 }
 
@@ -749,10 +757,7 @@ impl Tool for SpeakerTalkTime {
 
         let stats = aggregate_talk_time(&transcript, &meta.speaker_names);
         let n = stats.len();
-        Ok(ToolOutput::new(
-            json!(stats),
-            format!("{n} speaker(s)"),
-        ))
+        Ok(ToolOutput::new(json!(stats), format!("{n} speaker(s)")))
     }
 }
 
@@ -768,7 +773,10 @@ fn aggregate_talk_time(
     // (total_ms, turn_count) per raw label.
     let mut by_speaker: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for seg in transcript {
-        let label = seg.speaker_id.clone().unwrap_or_else(|| "unknown".to_string());
+        let label = seg
+            .speaker_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         let dur = seg.end_ms.saturating_sub(seg.start_ms);
         let entry = by_speaker.entry(label).or_insert((0, 0));
         entry.0 += dur;
@@ -777,7 +785,10 @@ fn aggregate_talk_time(
     by_speaker
         .into_iter()
         .map(|(label, (total_ms, turn_count))| {
-            let display_name = speaker_names.get(&label).cloned().unwrap_or_else(|| label.clone());
+            let display_name = speaker_names
+                .get(&label)
+                .cloned()
+                .unwrap_or_else(|| label.clone());
             json!({
                 "speaker_id": label,
                 "display_name": display_name,
@@ -786,6 +797,135 @@ fn aggregate_talk_time(
             })
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// send_to_internal_agent (MCP-only — Phase 10 §3)
+// ---------------------------------------------------------------------------
+
+/// How long the bridge waits for the internal agent's reply before giving up.
+///
+/// A wedged internal turn must not pin an MCP connection forever (§3 / W4). The
+/// timeout surfaces as `InvalidInput { "internal agent timed out" }`. Sized for
+/// a multi-tool chat turn on a CPU model (the held LLM can be slow); the MCP
+/// client sees a clean error rather than a hang.
+const INTER_AGENT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// `send_to_internal_agent` — the one MCP-only tool (Phase 10 §3). Registered
+/// only on the MCP registry (`ToolRegistry::v1(true)`); absent from the internal
+/// chat agent's registry so the agent cannot message itself.
+///
+/// v1 is a SYNCHRONOUS request/reply: the call sends one [`InterAgentRequest`]
+/// to the `ipc-bridge` driver task, which runs ONE chat turn on the held model
+/// via the SAME `run_chat_turn` driver the UI uses, and returns the assistant's
+/// final text. The tool itself holds no chat engine — it only forwards over the
+/// bridge channel on the [`ToolContext`], which is what keeps `agent-tools` free
+/// of a `chat-agent` edge.
+pub struct SendToInternalAgent;
+
+#[async_trait]
+impl Tool for SendToInternalAgent {
+    fn name(&self) -> &'static str {
+        "send_to_internal_agent"
+    }
+    fn description(&self) -> &'static str {
+        "Send a message to this app's internal meeting-notes chat agent and get its reply. \
+         Optionally scope it to a meeting (meeting_id) and/or continue an existing \
+         conversation (session_id). Runs one synchronous turn of the internal agent."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        // `message` is required; `meeting_id` / `session_id` are optional scoping
+        // hints. No regex `pattern` (the GBNF converter rejects PCRE shorthands).
+        json!({
+            "type": "object",
+            "properties": {
+                "message": { "type": "string", "description": "The message to send to the internal agent" },
+                "meeting_id": { "type": "string", "description": "Optional meeting UUID to scope the conversation to" },
+                "session_id": { "type": "string", "description": "Optional existing chat session id to continue" },
+            },
+            "required": ["message"],
+            "additionalProperties": false,
+        })
+    }
+    /// Not a write: it does not itself mutate disk/index/state (the turn it
+    /// triggers may, through other tools, but those go through the internal
+    /// agent's own write-serialization). Exposed over MCP regardless of the
+    /// `mcp_write_tools` gate (it is read-like to the MCP surface).
+    fn is_write(&self) -> bool {
+        false
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let bridge = ctx
+            .inter_agent_bridge()
+            .ok_or_else(|| AppError::InvalidInput {
+                context: "send_to_internal_agent is not available in this context".into(),
+            })?;
+
+        let message = require_str(&args, "message")?.to_string();
+        // Optional scoping. A malformed id surfaces as InvalidInput.
+        let meeting_id = match args.get("meeting_id").and_then(|v| v.as_str()) {
+            Some(s) => Some(crate::parse_meeting_id(s)?),
+            None => None,
+        };
+        let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
+            Some(s) => Some(parse_session_id(s)?),
+            None => None,
+        };
+
+        let request = InterAgentRequest {
+            session_id,
+            meeting_id,
+            message,
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        // try_send (NOT send): a full queue means the internal agent is busy;
+        // return promptly rather than blocking the HTTP request thread (§3 / W4).
+        bridge.try_send((request, reply_tx)).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => AppError::InvalidInput {
+                context: "internal agent busy".into(),
+            },
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => AppError::Internal {
+                context: "internal agent bridge is closed".into(),
+            },
+        })?;
+
+        // Await the reply with a timeout so a wedged turn cannot pin the
+        // connection forever (§3 / W4).
+        let reply = match tokio::time::timeout(INTER_AGENT_TIMEOUT, reply_rx).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(_recv_err)) => {
+                // The driver dropped the oneshot without replying (it panicked
+                // or shut down mid-turn).
+                return Err(AppError::Internal {
+                    context: "internal agent dropped the request without replying".into(),
+                });
+            }
+            Err(_elapsed) => {
+                return Err(AppError::InvalidInput {
+                    context: "internal agent timed out".into(),
+                });
+            }
+        };
+
+        let summary = format!("internal agent replied ({} chars)", reply.reply.len());
+        let data = json!({
+            "reply": reply.reply,
+            "session_id": reply.session_id,
+        });
+        Ok(ToolOutput::new(data, summary))
+    }
+}
+
+/// Parse a `ChatSessionId` from its hyphenated-UUID wire string. `InvalidInput`
+/// on a malformed id (mirrors [`crate::parse_meeting_id`]).
+fn parse_session_id(s: &str) -> AppResult<meeting_app_common::ChatSessionId> {
+    serde_json::from_str::<meeting_app_common::ChatSessionId>(&format!("\"{s}\"")).map_err(|_| {
+        AppError::InvalidInput {
+            context: format!("invalid session_id: {s}"),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------

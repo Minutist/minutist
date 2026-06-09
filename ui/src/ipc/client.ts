@@ -107,6 +107,9 @@ export const commands: Commands = {
     callCommand("listChatSessions", [meetingId]),
   deleteChatSession: (meetingId, sessionId) =>
     callCommand("deleteChatSession", [meetingId, sessionId]),
+  // Phase 10: the live MCP endpoint (URL + bearer token) for the Settings → MCP
+  // pane. The token is sensitive and crosses the boundary only on this read.
+  getMcpServerInfo: () => callCommand("getMcpServerInfo", []),
 };
 
 // Re-export types that callers commonly need. `AppEvent` is the generated

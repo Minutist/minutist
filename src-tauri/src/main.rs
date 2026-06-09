@@ -222,6 +222,59 @@ fn resolve_silero_model(app: &tauri::AppHandle) {
     );
 }
 
+/// Resolve the MCP bearer token (Phase 10 §4.2): read the persisted token, or
+/// generate + persist a fresh 256-bit CSPRNG one on first enable.
+///
+/// **Storage.** v1 stores the token in `{app-data}/mcp_token` with
+/// owner-only permissions on Unix (`0o600`). A documented follow-up hardens this
+/// to the OS keychain (e.g. the `keyring` crate); Tauri 2 ships no built-in
+/// keychain API, and pulling a cross-platform keychain dependency (with its own
+/// platform build concerns) is deferred so it can be reviewed on its own. The
+/// token is high-entropy regardless of the at-rest store, and the loopback bind
+/// + Host/Origin checks are the primary controls. The token is NEVER logged.
+fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
+    let token_path = app_data_dir.join("mcp_token");
+
+    // Reuse an existing token (so a saved external MCP client config stays valid
+    // across runs). A blank/whitespace file is treated as absent.
+    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    // Generate a fresh 256-bit token, hex-encoded.
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let token = hex::encode(bytes);
+
+    // Persist it with owner-only permissions where the platform supports it.
+    if let Err(e) = std::fs::write(&token_path, &token) {
+        tracing::warn!(
+            target: "app-main",
+            "failed to persist MCP token to {:?}: {e}; using a per-run token",
+            token_path
+        );
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
+            {
+                tracing::warn!(
+                    target: "app-main",
+                    "failed to set 0600 on MCP token file: {e}"
+                );
+            }
+        }
+        tracing::info!(target: "app-main", "generated a new MCP bearer token");
+    }
+    token
+}
+
 /// The Tauri runtime entry point.
 ///
 /// Accepts the non-blocking writer guard so it stays alive for the process
@@ -349,22 +402,168 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             updater::start(&app_handle, updater_event_tx);
 
             // Build the chat tool registry once (Phase 9). `v1(false)` omits the
-            // Phase-10 inter-agent bridge tool. The held LLM substrate is loaded
-            // lazily on first chat/summarise use (see `IpcState::ensure_summariser`).
+            // Phase-10 inter-agent bridge tool (the internal agent must not be
+            // able to message itself). The held LLM substrate is loaded lazily on
+            // first chat/summarise use (see `IpcState::ensure_summariser`).
             let tool_registry = Arc::new(agent_tools::ToolRegistry::v1(false));
+
+            // The shared single-in-flight-turn guard (Phase 9), shared with the
+            // Phase-10 inter-agent driver so an external turn and a human turn
+            // cannot run on one session at once.
+            let chat_in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+
+            // The held-summariser cell, shared by the chat command + the
+            // inter-agent driver (both load the SAME model once).
+            let summariser_cell = Arc::new(tokio::sync::OnceCell::new());
+
+            // The MCP server info slot (URL + token), filled below when the MCP
+            // server is enabled + bound. `get_mcp_server_info` reads it.
+            let mcp_info: Arc<std::sync::Mutex<Option<ipc_bridge::McpServerInfo>>> =
+                Arc::new(std::sync::Mutex::new(None));
 
             // Register the IPC state so command handlers can access it.
             app.manage(IpcState {
                 orchestrator: orchestrator.clone(),
-                settings: settings_handle,
-                meetings_dir: notes_meetings_dir,
+                settings: settings_handle.clone(),
+                meetings_dir: notes_meetings_dir.clone(),
                 index_db_path,
-                index,
-                event_tx: ipc_event_tx,
-                summariser: Arc::new(tokio::sync::OnceCell::new()),
+                index: index.clone(),
+                event_tx: ipc_event_tx.clone(),
+                summariser: summariser_cell.clone(),
                 tool_registry,
-                chat_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                chat_in_flight: chat_in_flight.clone(),
+                mcp_info: mcp_info.clone(),
             });
+
+            // --- Phase 10: the MCP server + the inter-agent bridge ------------
+            //
+            // Gated on `settings.mcp_enabled` (off by default). When enabled,
+            // spawn the loopback Streamable HTTP server from `setup()` via
+            // `tauri::async_runtime::spawn` (NOT a bare `tokio::spawn` — `setup`
+            // runs on the main thread with no entered tokio runtime; a bare spawn
+            // panics — see cross-cutting "Async runtime"). Toggling the setting at
+            // runtime is a documented restart-required for v1.
+            {
+                let settings_now = settings_handle.current();
+                if settings_now.mcp_enabled {
+                    // The inter-agent driver owns the receiver + the chat turn
+                    // (keeping the chat dependency in `ipc-bridge`, not
+                    // `mcp-server`); it hands back the SENDER for the bridge tool.
+                    let chat_handles = ipc_bridge::ChatHandles {
+                        orchestrator: orchestrator.clone(),
+                        index: index.clone(),
+                        meetings_dir: notes_meetings_dir.clone(),
+                        event_tx: ipc_event_tx.clone(),
+                        settings: settings_handle.clone(),
+                        summariser: summariser_cell.clone(),
+                    };
+                    let bridge_tx =
+                        ipc_bridge::spawn_inter_agent_driver(chat_handles, chat_in_flight.clone());
+
+                    // The MCP registry is `v1(true)` — includes
+                    // `send_to_internal_agent` — and its context carries the
+                    // bridge sender. Separate from the UI's `v1(false)` registry.
+                    let mcp_registry = Arc::new(agent_tools::ToolRegistry::v1(true));
+
+                    // The bearer token: resolve from the on-disk token file, or
+                    // generate + persist a fresh 256-bit one on first enable.
+                    let token = resolve_mcp_token(&app_data_dir);
+                    let port = settings_now.mcp_port;
+                    let allow_writes = settings_now.mcp_write_tools;
+
+                    // The MCP ToolContext needs the held summariser. Build it
+                    // lazily inside the spawned task (so a slow first model load
+                    // does not block setup); resolve it via the chat handles.
+                    let mcp_handles = ipc_bridge::ChatHandles {
+                        orchestrator: orchestrator.clone(),
+                        index: index.clone(),
+                        meetings_dir: notes_meetings_dir.clone(),
+                        event_tx: ipc_event_tx.clone(),
+                        settings: settings_handle.clone(),
+                        summariser: summariser_cell.clone(),
+                    };
+                    let mcp_event_tx = ipc_event_tx.clone();
+                    // A second clone of the bus for the listening-event emit
+                    // (the existing forwarder relays it to the webview).
+                    let listening_event_tx = ipc_event_tx.clone();
+                    let mcp_info_for_task = mcp_info.clone();
+
+                    tauri::async_runtime::spawn(async move {
+                        // Build the ToolContext for MCP dispatch. The summariser
+                        // backs `resummarise`; load it (downloads on first use).
+                        let summariser = match mcp_handles.ensure_summariser().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "app-main",
+                                    "MCP server not started: held summariser load failed: {e}"
+                                );
+                                return;
+                            }
+                        };
+                        let ctx = Arc::new(
+                            agent_tools::ToolContext::new(
+                                mcp_handles.orchestrator.clone(),
+                                mcp_handles.index.clone(),
+                                mcp_handles.meetings_dir.clone(),
+                                summariser as Arc<dyn meeting_app_common::Summariser>,
+                                mcp_event_tx,
+                                None, // MCP callers pass meeting_id explicitly
+                            )
+                            .with_inter_agent_bridge(bridge_tx),
+                        );
+
+                        // A never-firing shutdown receiver for v1: the listener
+                        // lives for the process. (A future settings-toggle path
+                        // would flip this watch instead of restart-required.)
+                        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                        // Keep the sender alive for the process so the watch is
+                        // not seen as "dropped" (which would trigger shutdown).
+                        std::mem::forget(_shutdown_tx);
+
+                        let bind_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                        match mcp_server::serve(
+                            mcp_registry,
+                            ctx,
+                            mcp_server::McpServerConfig {
+                                bind_addr,
+                                bearer_token: token.clone(),
+                                allow_writes,
+                            },
+                            shutdown_rx,
+                        )
+                        .await
+                        {
+                            Ok(bound) => {
+                                let url = format!("http://{bound}{}", mcp_server::MCP_PATH);
+                                // Surface the live endpoint to the Settings pane.
+                                *mcp_info_for_task.lock().expect("mcp_info poisoned") =
+                                    Some(ipc_bridge::McpServerInfo {
+                                        url: url.clone(),
+                                        token,
+                                    });
+                                // Emit the listening event on the shared bus; the
+                                // event forwarder relays it to the webview so the
+                                // MCP pane refreshes. The token is NOT carried on
+                                // the event (revealed only via get_mcp_server_info).
+                                let _ = listening_event_tx
+                                    .send(meeting_app_common::AppEvent::McpServerListening { url });
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "app-main",
+                                    "MCP server failed to start: {e}"
+                                );
+                            }
+                        }
+                    });
+                } else {
+                    tracing::info!(
+                        target: "app-main",
+                        "MCP server disabled (settings.mcp_enabled = false)"
+                    );
+                }
+            }
 
             // Build the tray icon.
             build_tray(app)?;

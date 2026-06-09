@@ -34,14 +34,41 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use meeting_app_common::{AppError, AppResult, AppEvent, MeetingId, Summariser};
+use meeting_app_common::{
+    AppError, AppEvent, AppResult, InterAgentReply, InterAgentRequest, MeetingId, Summariser,
+};
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 mod tools;
 
 pub use tools::*;
+
+// ---------------------------------------------------------------------------
+// Inter-agent bridge (Phase 10) — the channel ends only; the chat-engine
+// driver lives in `ipc-bridge`.
+// ---------------------------------------------------------------------------
+
+/// One inter-agent message: an [`InterAgentRequest`] plus the oneshot the driver
+/// replies on. The bridge tool `send_to_internal_agent` builds this and `try_send`s
+/// it onto the [`InterAgentBridge`] channel; the `ipc-bridge` driver task owns the
+/// receiver, runs ONE chat turn on the held model via the SAME `run_chat_turn`
+/// driver the UI uses, and sends the [`InterAgentReply`] back on the oneshot.
+///
+/// Keeping the *channel ends* (not a chat-engine handle) on the
+/// [`ToolContext`] is what lets `agent-tools` stay free of a `chat-agent` edge:
+/// the tool only knows `common` types + tokio channels (both already allowed
+/// here), and the single place a chat turn runs stays in `ipc-bridge`.
+pub type InterAgentEnvelope = (
+    InterAgentRequest,
+    oneshot::Sender<AppResult<InterAgentReply>>,
+);
+
+/// The bounded sender end the bridge tool holds (cross-cutting forbids unbounded
+/// channels). A full queue → `InvalidInput { "internal agent busy" }` rather than
+/// blocking the HTTP request thread.
+pub type InterAgentBridge = mpsc::Sender<InterAgentEnvelope>;
 
 // ---------------------------------------------------------------------------
 // Tool trait
@@ -127,6 +154,12 @@ pub struct ToolContext {
     /// mutex for their read-modify-write of `metadata.json`, so two concurrent
     /// metadata writes cannot drop a write (last-writer-wins).
     metadata_locks: Arc<Mutex<HashMap<MeetingId, Arc<Mutex<()>>>>>,
+    /// The inter-agent bridge sender (Phase 10), present ONLY for the MCP
+    /// registry instance (`v1(true)`). `send_to_internal_agent` reads it here;
+    /// `None` for the internal chat agent's context (it must not message
+    /// itself). Held here so the bridge tool needs no `chat-agent` edge — the
+    /// receiver + the chat turn live in `ipc-bridge`.
+    inter_agent: Option<InterAgentBridge>,
 }
 
 impl ToolContext {
@@ -147,7 +180,23 @@ impl ToolContext {
             event_tx,
             default_meeting,
             metadata_locks: Arc::new(Mutex::new(HashMap::new())),
+            inter_agent: None,
         }
+    }
+
+    /// Attach the Phase-10 inter-agent bridge sender (the MCP-registry context
+    /// only). The internal chat agent's context leaves this unset, so the
+    /// internal agent cannot message itself (a trivial infinite-loop foot-gun).
+    pub fn with_inter_agent_bridge(mut self, bridge: InterAgentBridge) -> Self {
+        self.inter_agent = Some(bridge);
+        self
+    }
+
+    /// The inter-agent bridge sender, when this context was built for the MCP
+    /// registry. `send_to_internal_agent` reads it; `None` raises
+    /// `InvalidInput` (the tool is unavailable in this scope).
+    pub(crate) fn inter_agent_bridge(&self) -> Option<&InterAgentBridge> {
+        self.inter_agent.as_ref()
     }
 
     /// The `{meetings_dir}/{meeting_id}/` folder path for `id`.
@@ -217,10 +266,14 @@ impl ToolRegistry {
     /// Build the v1 registry.
     ///
     /// `include_inter_agent_bridge` is the Phase-10 `send_to_internal_agent`
-    /// flag — Phase 9 passes `false` (the inter-agent tool body is Phase 10), so
-    /// the flag is currently a no-op reserved for the Phase-10 add.
+    /// flag — `ipc-bridge` passes `false` (the internal agent must not be able
+    /// to message itself); `app-main` passes `true` for the registry instance
+    /// handed to `mcp-server`. The tool's *body* reaches the chat engine through
+    /// the bridge channel on [`ToolContext`] (see
+    /// [`ToolContext::with_inter_agent_bridge`]), so this crate keeps no
+    /// `chat-agent` edge.
     pub fn v1(include_inter_agent_bridge: bool) -> Self {
-        let tools: Vec<Arc<dyn Tool>> = vec![
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             // Read / compute.
             Arc::new(tools::ListMeetings),
             Arc::new(tools::SearchMeetings),
@@ -243,14 +296,9 @@ impl ToolRegistry {
         ];
 
         if include_inter_agent_bridge {
-            // Phase 10 registers `send_to_internal_agent` here. Phase 9 ships
-            // nothing for the flag; documented so the Phase-10 add is a pure
-            // append with no signature change.
-            tracing::debug!(
-                target: "agent-tools",
-                "include_inter_agent_bridge=true requested, but the inter-agent \
-                 tool is a Phase-10 addition; ignoring in v1"
-            );
+            // Phase 10: the MCP-only inter-agent tool. Appended last so the
+            // read/write ordering above is unchanged.
+            tools.push(Arc::new(tools::SendToInternalAgent));
         }
 
         let by_name = tools
@@ -265,7 +313,10 @@ impl ToolRegistry {
     /// All tool descriptors (name/description/schema), insertion order. For the
     /// LLM system prompt + GBNF grammar.
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
-        self.tools.iter().map(|t| descriptor_of(t.as_ref())).collect()
+        self.tools
+            .iter()
+            .map(|t| descriptor_of(t.as_ref()))
+            .collect()
     }
 
     /// The descriptors a Phase-10 MCP `tools/list` exposes (honours
@@ -276,6 +327,42 @@ impl ToolRegistry {
             .filter(|t| t.expose_over_mcp())
             .map(|t| descriptor_of(t.as_ref()))
             .collect()
+    }
+
+    /// The Phase-10 MCP `tools/list` projection, with the `mcp_write_tools`
+    /// setting (D3) applied ON TOP of [`Tool::expose_over_mcp`].
+    ///
+    /// `allow_writes` is `settings.mcp_write_tools`. The two layers compose:
+    /// - a tool is a candidate only if `expose_over_mcp()` is `true` (reads +
+    ///   compute + the two reversible writes + the inter-agent tool; never
+    ///   `retranscribe`/`rediarize`/any destructive tool — those return `false`
+    ///   on the trait and so are unreachable regardless of `allow_writes`);
+    /// - when `allow_writes` is `false`, write tools are additionally dropped,
+    ///   so the surface is read/compute + the inter-agent tool only.
+    ///
+    /// The single source of truth for what a tool *is* (its `is_write` /
+    /// `expose_over_mcp`) stays on the [`Tool`] impl; this method only composes
+    /// the user-toggleable gate with it, so the policy lives in one place.
+    pub fn mcp_tool_descriptors_gated(&self, allow_writes: bool) -> Vec<ToolDescriptor> {
+        self.tools
+            .iter()
+            .filter(|t| t.expose_over_mcp())
+            .filter(|t| allow_writes || !t.is_write())
+            .map(|t| descriptor_of(t.as_ref()))
+            .collect()
+    }
+
+    /// Whether a tool of the given wire name may be *called* over MCP under the
+    /// `allow_writes` gate. The server consults this in `tools/call` so a client
+    /// cannot invoke a write tool that is absent from its gated `tools/list`
+    /// (defence in depth — the gate is enforced on call, not only on listing).
+    /// Returns `false` for an unknown name, a non-`expose_over_mcp` tool, or a
+    /// write tool when `allow_writes` is `false`.
+    pub fn mcp_call_allowed(&self, name: &str, allow_writes: bool) -> bool {
+        match self.get(name) {
+            Some(tool) => tool.expose_over_mcp() && (allow_writes || !tool.is_write()),
+            None => false,
+        }
     }
 
     /// Number of registered tools.
@@ -385,10 +472,7 @@ pub(crate) fn parse_meeting_id(s: &str) -> AppResult<MeetingId> {
 /// Resolve the effective meeting id for a tool call: the explicit `meeting_id`
 /// argument when present, else the context's `default_meeting` (the internal-UI
 /// session scope). `InvalidInput` when neither is available.
-pub(crate) fn resolve_meeting(
-    ctx: &ToolContext,
-    args: &serde_json::Value,
-) -> AppResult<MeetingId> {
+pub(crate) fn resolve_meeting(ctx: &ToolContext, args: &serde_json::Value) -> AppResult<MeetingId> {
     if let Some(v) = args.get("meeting_id") {
         let s = v.as_str().ok_or_else(|| AppError::InvalidInput {
             context: "meeting_id must be a string".into(),
@@ -401,10 +485,7 @@ pub(crate) fn resolve_meeting(
 }
 
 /// Read a required string argument. `InvalidInput` when absent or not a string.
-pub(crate) fn require_str<'a>(
-    args: &'a serde_json::Value,
-    field: &str,
-) -> AppResult<&'a str> {
+pub(crate) fn require_str<'a>(args: &'a serde_json::Value, field: &str) -> AppResult<&'a str> {
     args.get(field)
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::InvalidInput {

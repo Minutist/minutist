@@ -77,6 +77,15 @@ const fn default_prefer_large_asr_model() -> bool {
     false
 }
 
+/// Default MCP server port (Phase 10 — D1). A FIXED loopback port: only one app
+/// instance/window runs, so a fixed default avoids the ephemeral-port friction
+/// of a per-run URL change in an external MCP client's config. User-editable in
+/// the MCP settings pane. An older store written before this field existed
+/// deserialises to 8765 via `#[serde(default = ...)]`.
+const fn default_mcp_port() -> u16 {
+    8765
+}
+
 /// Default for `notes_paper_rules`: ON. The notes editor renders faint
 /// horizontal "writing paper" rules behind the text by default; users disable
 /// them in the Appearance settings. The oxblood *vertical* margin rule that
@@ -349,6 +358,36 @@ pub struct Settings {
     /// behaviour); an older store deserialises to `Default`.
     #[serde(default)]
     pub summary_preset: SummaryPreset,
+
+    /// Whether the in-process MCP server is started (Phase 10). Opt-in, **off by
+    /// default**, mirroring `external-ollama` / `capture_system_audio`. When
+    /// `true`, `app-main` binds the loopback Streamable HTTP MCP endpoint at
+    /// startup so an external MCP client can reach the shared tool layer. Toggling at runtime is a documented
+    /// restart-required for v1. `#[serde(default)]` defaults to `false`; an older
+    /// store written before this field existed deserialises to `false`. See
+    /// `architecture/cross-cutting.md` — "MCP transport".
+    #[serde(default)]
+    pub mcp_enabled: bool,
+
+    /// The loopback TCP port the MCP server binds (Phase 10 — D1). A FIXED
+    /// default (8765): only one app instance runs, so a stable port keeps an
+    /// external MCP client's saved URL valid across runs. User-editable.
+    /// `#[serde(default = ...)]` defaults to 8765; an older store deserialises to
+    /// 8765. See `architecture/cross-cutting.md` — "MCP transport".
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
+
+    /// Whether write tools are exposed over MCP (Phase 10 — D3). **Off by
+    /// default = read-only over MCP.** Consulted at registry-projection time by
+    /// the MCP server: with it OFF, `tools/list` is read/compute tools + the
+    /// inter-agent tool only; with it ON, the reversible writes
+    /// (`set_speaker_name`, `rename_meeting`) join. `retranscribe_meeting` /
+    /// `rediarize_meeting` / any destructive tool stay internal-only regardless
+    /// (they are never `expose_over_mcp`). `#[serde(default)]` defaults to
+    /// `false`; an older store deserialises to `false`. See
+    /// `architecture/cross-cutting.md` — "MCP transport".
+    #[serde(default)]
+    pub mcp_write_tools: bool,
 }
 
 impl Settings {
@@ -387,6 +426,9 @@ impl Default for Settings {
             notes_paper_rules: default_notes_paper_rules(),
             chat_system_prompt: default_chat_system_prompt(),
             summary_preset: SummaryPreset::default(),
+            mcp_enabled: false,
+            mcp_port: default_mcp_port(),
+            mcp_write_tools: false,
         }
     }
 }
@@ -431,6 +473,9 @@ mod tests {
             notes_paper_rules: false,
             chat_system_prompt: "Be a terse assistant.".to_string(),
             summary_preset: SummaryPreset::ActionItems,
+            mcp_enabled: true,
+            mcp_port: 9999,
+            mcp_write_tools: true,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -905,6 +950,61 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // 1l. MCP fields: defaults + round-trip + missing-field deserialisation
+    //     (Phase 10 — D1/D3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mcp_fields_default_to_off_and_fixed_port() {
+        let s = Settings::default();
+        assert!(!s.mcp_enabled, "the MCP server is opt-in, off by default");
+        assert_eq!(s.mcp_port, 8765, "the fixed default MCP port is 8765 (D1)");
+        assert!(
+            !s.mcp_write_tools,
+            "MCP is read-only by default; write exposure is opt-in (D3)"
+        );
+    }
+
+    #[test]
+    fn mcp_fields_round_trip() {
+        let original = Settings {
+            mcp_enabled: true,
+            mcp_port: 7000,
+            mcp_write_tools: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(restored.mcp_enabled);
+        assert_eq!(restored.mcp_port, 7000);
+        assert!(restored.mcp_write_tools);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_mcp_fields_defaults() {
+        // A settings store written before the Phase-10 MCP fields existed must
+        // deserialise to the safe defaults (server off, fixed port 8765,
+        // read-only).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            !restored.mcp_enabled,
+            "missing mcp_enabled must deserialise to false (off by default)"
+        );
+        assert_eq!(
+            restored.mcp_port, 8765,
+            "missing mcp_port must deserialise to the fixed default (8765)"
+        );
+        assert!(
+            !restored.mcp_write_tools,
+            "missing mcp_write_tools must deserialise to false (read-only over MCP)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
     // 2. Default construction — no file → returns defaults
     // -----------------------------------------------------------------------
 
@@ -970,7 +1070,10 @@ mod tests {
         );
 
         // A second, unrelated update is also reflected (not just the first).
-        handle.update(|s| s.theme = Theme::Light).await.expect("update");
+        handle
+            .update(|s| s.theme = Theme::Light)
+            .await
+            .expect("update");
         assert_eq!(handle.current().theme, Theme::Light);
         assert!(handle.current().diarization_enabled, "prior field retained");
     }
@@ -1040,10 +1143,14 @@ mod tests {
         let h1 = handle.clone();
         let h2 = handle.clone();
         let t1 = tokio::spawn(async move {
-            h1.update(|s| s.diarization_enabled = true).await.expect("update1");
+            h1.update(|s| s.diarization_enabled = true)
+                .await
+                .expect("update1");
         });
         let t2 = tokio::spawn(async move {
-            h2.update(|s| s.theme = Theme::Light).await.expect("update2");
+            h2.update(|s| s.theme = Theme::Light)
+                .await
+                .expect("update2");
         });
         t1.await.expect("join1");
         t2.await.expect("join2");

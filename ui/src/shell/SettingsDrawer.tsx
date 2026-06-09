@@ -26,6 +26,7 @@ import { readTheme } from "../state/onboarding-settings";
 import type { Theme } from "../ipc/bindings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
+import { McpSettingsPane } from "./McpSettingsPane";
 import "./SettingsDrawer.css";
 
 export type SettingsDrawerProps = {
@@ -182,6 +183,8 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             <span>Higher-accuracy speech model (GPU)</span>
           </label>
         </section>
+
+        <McpSettingsPane />
 
         <footer className="settings-drawer__footer">
           <button

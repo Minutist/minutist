@@ -1,0 +1,52 @@
+[package]
+name = "mcp-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Phase 10: the in-process Streamable HTTP MCP server. A SECOND consumer of the
+# Phase-9 `agent-tools` registry — it adds NO tools, projecting
+# `ToolRegistry::mcp_tool_descriptors()` onto `tools/list` and
+# `ToolRegistry::dispatch()` onto `tools/call`. Edges: common, agent-tools (+
+# the rmcp SDK and its hyper/tower/http leaf externals). Deliberately NO
+# tauri/specta concern (the listener is spawned by app-main via
+# tauri::async_runtime::spawn), NO direct persistence/orchestrator edge (it
+# drives the ToolRegistry, whose ToolContext carries those handles, built by
+# app-main and injected). The AppError -> McpError mapping lives here — the one
+# place rmcp types are allowed.
+
+[dependencies]
+meeting-app-common = { path = "../common" }
+agent-tools = { path = "../agent-tools" }
+rmcp = { workspace = true }
+# rmcp's StreamableHttpService is a `tower_service::Service<Request<Body>>`; we
+# serve it over loopback with hyper's own server (NO axum — Gate-A SP1). rmcp
+# itself only enables hyper's client feature, so mcp-server brings the server
+# halves of the SAME hyper/hyper-util/http-body-util/bytes already in the lock.
+http = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
+http-body-util = "0.1"
+bytes = "1"
+tower-service = "0.3"
+# rmcp's StreamableHttpServerConfig.cancellation_token is a
+# tokio_util::sync::CancellationToken (not re-exported); needed for graceful
+# shutdown. Same 0.7 line already in the lock (rmcp + tauri both pull it).
+tokio-util = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util"] }
+# A real `ToolContext` for the focused HTTP integration test (mirrors the
+# agent-tools test harness): the orchestrator's `test-source` seam + an
+# in-memory index + a stub summariser, so the listener binds + the bearer/Origin
+# wrapper runs without a real model. The raw-socket client avoids a heavy HTTP
+# client dependency.
+orchestrator = { path = "../orchestrator", features = ["test-source"] }
+persistence = { path = "../persistence" }
+tempfile = "3"

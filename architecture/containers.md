@@ -7,7 +7,7 @@
 | Container | Tech | Lifetime | Responsibility |
 |---|---|---|---|
 | **Webview UI** | React 19 + TypeScript + Tiptap, inside a Tauri webview | Per-window | Notes editor, transcript pane, meeting controls, audio meter, meeting-list view. No business logic. |
-| **Rust core** | Tauri 2 main process | Per app instance | All native subsystems — audio, ASR, diarization, summarisation, persistence, settings. Exposes a typed command + event surface. |
+| **Rust core** | Tauri 2 main process | Per app instance | All native subsystems — audio, ASR, diarization, summarisation, persistence, settings. Exposes a typed command + event surface to the webview, and (Phase 10, settings-gated/off-by-default) an in-process **Streamable HTTP MCP server** on loopback (`127.0.0.1:{mcp_port}/mcp`, bearer + Host/Origin) projecting the `agent-tools` registry to external agents. |
 | **llama.cpp** | Bundled native lib, Vulkan / Metal / CPU | Loaded per model | ASR (Qwen3-ASR via the mtmd module) and summary-LLM inference. |
 | **sherpa-onnx** | Bundled native lib, ONNX Runtime | Loaded on demand | Diarization (pyannote/segmentation-3.0 segmentation + 3D-Speaker CAM++ speaker embeddings + clustering). |
 | **libsql index** | SQLite file at `{app-data}/index.db` | Per app instance, persistent | Fast list / search over per-meeting metadata. |
@@ -41,17 +41,30 @@ mic ─▶ Rust core ─▶ webview              (audio meter; transcript events
                                             run summary, open meeting)
        Rust core ◀▶ llama.cpp             (ASR + summary inference, FFI)
        Rust core ◀▶ sherpa-onnx           (diarization inference, FFI)
+
+External MCP client ─▶ Rust core      (Streamable HTTP, loopback,
+                                       bearer; tools/list+call)
 ```
 
 The webview never reaches a native lib or the filesystem directly. All
 its writes go through the Rust core's IPC surface, and all its reads
-come back as typed events.
+come back as typed events. An **external MCP client** reaches the Rust core's
+MCP server directly over loopback Streamable HTTP — never the filesystem or a
+native lib directly; it sees only the `agent-tools` registry the internal agent
+uses (read tools, the gated reversible writes, and `send_to_internal_agent`).
 
 ## Process model
 
 Single process. Tauri runs the Rust core; the webview runs in an
 embedded webview engine (WebView2 / WebKit / WebKitGTK) hosted by the
 same process. No worker subprocesses in v1.
+
+The Phase-10 MCP HTTP listener is **not** a subprocess: it is a tokio task in the
+same Rust-core process (spawned from `setup()` via `tauri::async_runtime::spawn`),
+which is exactly the "move work to a dedicated tokio task pool" mitigation below
+— and it must be in-process to honour the single-writer rule (`persistence` is the
+sole opener of `index.db` + the meeting folders; a second process would violate
+it). There are no external helper processes.
 
 If profiling shows the ASR or summarisation workload starves the UI
 thread, the first mitigation is to move that work to a dedicated tokio

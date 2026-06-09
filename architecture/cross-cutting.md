@@ -488,6 +488,79 @@ constraints are binding on them):
   A single in-flight turn per session is enforced via
   `IpcState::chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`.
 
+## MCP transport (Phase 10)
+
+The `mcp-server` crate exposes the Phase-9 `agent-tools` registry to external
+agents over an in-process **Streamable HTTP** MCP server (`rmcp` 1.7, MCP spec
+revision 2025-11-25). Binding controls:
+
+- **Single source of truth for tools.** A tool is defined in exactly one place —
+  `agent-tools`. `mcp-server` projects `ToolRegistry::mcp_tool_descriptors_gated`
+  onto `tools/list` and `ToolRegistry::dispatch` onto `tools/call`. Any tool
+  logic / schema / name in `mcp-server` is a reviewer finding. The one rmcp-typed thing in `mcp-server` is the
+  `AppError → McpError` mapping (real `AppError` variants only — there is no
+  `ContextOverflow`; overflow + "recorder busy" surface as `InvalidInput`).
+
+- **Settings-gated, off by default.** `settings.mcp_enabled` (default `false`)
+  gates the listener, spawned once at startup from `app-main`'s `setup()` via
+  `tauri::async_runtime::spawn`. `settings.mcp_port` is a FIXED default loopback
+  port (8765, D1 — one instance runs, so a stable port keeps a saved client
+  URL valid). Toggling at runtime is restart-required for v1.
+
+- **In-process, not a subprocess.** The listener shares the same
+  `Arc<Orchestrator>` / `Arc<MeetingIndex>` / `meetings_dir` / held model / registry
+  as the rest of the core, so a second process never opens `index.db` or the
+  meeting folders — honouring the Filesystem single-writer rule below. Tool
+  dispatch is the SAME async `ToolRegistry::dispatch` the chat loop uses.
+
+- **Loopback + bearer + Host/Origin (the security model).** The server binds
+  `127.0.0.1:{mcp_port}` only (never `0.0.0.0`). Every request must carry
+  `Authorization: Bearer <token>` (a ≥256-bit CSPRNG token; a thin wrapper service
+  returns 401 before rmcp sees the request — the `Mcp-Session-Id` is routing state
+  only, never the credential). rmcp's `StreamableHttpServerConfig` enforces the
+  `Host` allowlist (loopback default, `rmcp >= 1.4.0` — GHSA-89vp-x53w-74fx,
+  DNS-rebinding) and the `Origin` allowlist (set to the loopback origins → 403 on
+  a cross-origin browser request). Cautionary precedent: CVE-2025-49596 (MCP
+  Inspector RCE) was a localhost MCP service with no auth + browser-reachable —
+  exactly what bearer + Host/Origin + loopback prevent. The token is stored at
+  `{app-data}/mcp_token` (`0600` on Unix); OS-keychain hardening is a documented
+  follow-up. The token is never logged and never on the event bus — it is revealed
+  only via the `get_mcp_server_info` command on explicit user request.
+
+- **The destructive-write exposure policy (a binding control).** The `Tool`
+  trait's `expose_over_mcp()` (default `!is_write()`) is the server-side gate.
+  `set_speaker_name` / `rename_meeting` are MCP-allowlisted (reversible, low blast
+  radius); `retranscribe_meeting` / `rediarize_meeting` are internal-only (heavy;
+  holding the offline claim via MCP would block the user's recording); no
+  destructive tool (`delete_meeting`, notes mutation, summary overwrite) is in the
+  v1 registry at all. ON TOP of that, `settings.mcp_write_tools` (D3, default
+  `false`) gates the reversible writes: off ⇒ read/compute + the inter-agent tool
+  only; on ⇒ the two reversible writes join. The gate is enforced at projection
+  AND on call (`mcp_call_allowed`). NOTE: read-only ≠ zero-cost — even with writes
+  off, an external agent holding the token can invoke unbounded-cost COMPUTE tools
+  (`relisten_section` runs ASR; `resummarise` runs the LLM) repeatedly. The v1
+  threat model trusts the bearer holder; a per-client rate/concurrency cap on the
+  heavy compute tools is a documented follow-up.
+
+- **The inter-agent bridge.** `send_to_internal_agent` (MCP-only, in the
+  `v1(true)` registry) reaches the internal chat agent through a `common`-typed
+  bounded channel on the `ToolContext` (the SENDER), whose receiver + the single
+  chat turn live in `ipc-bridge::inter_agent` (driving the INTERNAL `v1(false)`
+  registry so the agent cannot message itself). This keeps `mcp-server` free of a
+  `chat-agent` edge and the single chat-turn site in `ipc-bridge`. v1 is a
+  synchronous request/reply (bounded mpsc(16) `try_send` → "busy"; per-request
+  timeout → "timed out"; single-in-flight-per-session → "session busy").
+
+- **Threading model row.** *MCP HTTP listener → tokio task spawned from `setup`
+  via `tauri::async_runtime::spawn`; rmcp's own hyper-based `StreamableHttpService`
+  serves the single `/mcp` endpoint (no `axum`); tool dispatch is the same async
+  `ToolRegistry::dispatch` the chat loop uses.*
+
+External MCP clients reach the loopback Streamable HTTP endpoint directly.
+Account-based connectivity — a hosted proxy that fronts this endpoint, enabling
+Claude web alongside Desktop, plus cross-device meeting sync and calendar
+integration — is the planned direction and is out of scope here.
+
 ## Configuration
 
 Single source: the `settings` crate, backed by a `serde_json` + `std::fs`

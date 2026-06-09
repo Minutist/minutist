@@ -29,6 +29,7 @@ import type {
   IpcError,
   MeetingId,
   MeetingMeta,
+  McpServerInfo,
   NotesDocument,
 } from "./bindings";
 import type { MeetingListEntry, MeetingState } from "./meetings";
@@ -128,6 +129,12 @@ const DEV_SETTINGS: Settings = {
   // Notes-editor writing-paper rules (on by default) — seeded on so the ruled
   // sheet renders under `vite dev` for visual QA.
   notes_paper_rules: true,
+  // Phase 10 MCP server. Seeded enabled (production default is OFF) so the MCP
+  // pane renders as active under `vite dev` for visual QA; the fixed default
+  // port + read-only exposure mirror the production defaults.
+  mcp_enabled: true,
+  mcp_port: 8765,
+  mcp_write_tools: false,
 };
 
 /**
@@ -509,6 +516,15 @@ export const devCommands = {
     _sessionId: ChatSessionId,
   ): Promise<Result<null, IpcError>> {
     return ok(null);
+  },
+  // Phase 10: a sample live MCP endpoint so the MCP pane renders the URL +
+  // (masked) token under `vite dev`. The token is a placeholder, not a real
+  // secret.
+  async getMcpServerInfo(): Promise<Result<McpServerInfo | null, IpcError>> {
+    return ok({
+      url: "http://127.0.0.1:8765/mcp",
+      token: "dev0000000000000000000000000000000000000000000000000000000000cafe",
+    });
   },
 };
 

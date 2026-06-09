@@ -52,8 +52,7 @@ async fn make_ctx() -> (TempDir, std::path::PathBuf, ToolContext) {
     std::fs::create_dir_all(&meetings_dir).expect("meetings dir");
 
     let index = Arc::new(MeetingIndex::open(":memory:").await.expect("index"));
-    let orchestrator: Arc<Orchestrator> =
-        Arc::new(test_orchestrator(meetings_dir.clone()));
+    let orchestrator: Arc<Orchestrator> = Arc::new(test_orchestrator(meetings_dir.clone()));
     let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
     let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
 
@@ -178,6 +177,63 @@ async fn registry_v1_has_the_documented_tool_set() {
 }
 
 #[tokio::test]
+async fn v1_true_adds_inter_agent_tool_only() {
+    // The MCP registry (`v1(true)`) is the v1(false) set PLUS exactly one tool:
+    // send_to_internal_agent. It is not a write.
+    let base = ToolRegistry::v1(false);
+    let mcp = ToolRegistry::v1(true);
+    assert_eq!(mcp.len(), base.len() + 1, "v1(true) adds exactly one tool");
+    assert!(
+        mcp.get("send_to_internal_agent").is_some(),
+        "v1(true) must register send_to_internal_agent"
+    );
+    assert!(
+        base.get("send_to_internal_agent").is_none(),
+        "v1(false) must NOT register send_to_internal_agent (no self-messaging)"
+    );
+    assert!(
+        !mcp.get("send_to_internal_agent").unwrap().is_write(),
+        "send_to_internal_agent is not a write"
+    );
+}
+
+#[tokio::test]
+async fn mcp_write_gate_projection() {
+    let reg = ToolRegistry::v1(true);
+
+    // Gate OFF: reads + the inter-agent tool, NO writes (not even the reversible
+    // ones), and never the heavy ops.
+    let off: Vec<&str> = reg
+        .mcp_tool_descriptors_gated(false)
+        .iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(off.contains(&"list_meetings"));
+    assert!(off.contains(&"send_to_internal_agent"));
+    assert!(!off.contains(&"set_speaker_name"));
+    assert!(!off.contains(&"rename_meeting"));
+    assert!(!off.contains(&"retranscribe_meeting"));
+    assert!(!off.contains(&"rediarize_meeting"));
+
+    // Gate ON: the reversible writes join; the heavy ops STILL never appear.
+    let on: Vec<&str> = reg
+        .mcp_tool_descriptors_gated(true)
+        .iter()
+        .map(|d| d.name)
+        .collect();
+    assert!(on.contains(&"set_speaker_name"));
+    assert!(on.contains(&"rename_meeting"));
+    assert!(!on.contains(&"retranscribe_meeting"));
+    assert!(!on.contains(&"rediarize_meeting"));
+
+    // mcp_call_allowed mirrors the listing under each gate.
+    assert!(!reg.mcp_call_allowed("set_speaker_name", false));
+    assert!(reg.mcp_call_allowed("set_speaker_name", true));
+    assert!(!reg.mcp_call_allowed("retranscribe_meeting", true));
+    assert!(!reg.mcp_call_allowed("unknown_tool", true));
+}
+
+#[tokio::test]
 async fn write_flags_are_set_correctly() {
     let reg = ToolRegistry::v1(false);
     let writes = [
@@ -229,7 +285,10 @@ async fn dispatch_unknown_tool_is_invalid_input() {
         .dispatch(&ctx, "no_such_tool", serde_json::json!({}))
         .await
         .unwrap_err();
-    assert!(matches!(err, meeting_app_common::AppError::InvalidInput { .. }));
+    assert!(matches!(
+        err,
+        meeting_app_common::AppError::InvalidInput { .. }
+    ));
 }
 
 #[tokio::test]
@@ -242,7 +301,10 @@ async fn dispatch_missing_required_arg_is_invalid_input() {
         .dispatch(&ctx, "search_meetings", serde_json::json!({}))
         .await
         .unwrap_err();
-    assert!(matches!(err, meeting_app_common::AppError::InvalidInput { .. }));
+    assert!(matches!(
+        err,
+        meeting_app_common::AppError::InvalidInput { .. }
+    ));
 }
 
 #[tokio::test]
@@ -255,7 +317,10 @@ async fn dispatch_missing_meeting_without_default_is_invalid_input() {
         .dispatch(&ctx, "get_transcript", serde_json::json!({}))
         .await
         .unwrap_err();
-    assert!(matches!(err, meeting_app_common::AppError::InvalidInput { .. }));
+    assert!(matches!(
+        err,
+        meeting_app_common::AppError::InvalidInput { .. }
+    ));
 }
 
 #[tokio::test]
@@ -291,15 +356,36 @@ async fn default_meeting_resolves_when_meeting_id_omitted() {
 async fn list_and_search_meetings_via_dispatch() {
     let (_t, root, ctx) = make_ctx().await;
     let reg = ToolRegistry::v1(false);
-    seed_meeting(&root, &ctx.index, "Launch sync", vec![seg(0, 1000, "kickoff", None)], BTreeMap::new()).await;
-    seed_meeting(&root, &ctx.index, "Retro", vec![seg(0, 1000, "retrospective", None)], BTreeMap::new()).await;
+    seed_meeting(
+        &root,
+        &ctx.index,
+        "Launch sync",
+        vec![seg(0, 1000, "kickoff", None)],
+        BTreeMap::new(),
+    )
+    .await;
+    seed_meeting(
+        &root,
+        &ctx.index,
+        "Retro",
+        vec![seg(0, 1000, "retrospective", None)],
+        BTreeMap::new(),
+    )
+    .await;
 
-    let out = reg.dispatch(&ctx, "list_meetings", serde_json::json!({})).await.unwrap();
+    let out = reg
+        .dispatch(&ctx, "list_meetings", serde_json::json!({}))
+        .await
+        .unwrap();
     let arr = out.data.as_array().unwrap();
     assert_eq!(arr.len(), 2);
 
     let out = reg
-        .dispatch(&ctx, "search_meetings", serde_json::json!({ "query": "Retro" }))
+        .dispatch(
+            &ctx,
+            "search_meetings",
+            serde_json::json!({ "query": "Retro" }),
+        )
         .await
         .unwrap();
     let arr = out.data.as_array().unwrap();
@@ -325,13 +411,20 @@ async fn get_transcript_applies_speaker_overlay() {
     .await;
 
     let out = reg
-        .dispatch(&ctx, "get_transcript", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .dispatch(
+            &ctx,
+            "get_transcript",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
         .await
         .unwrap();
     let arr = out.data.as_array().unwrap();
     assert_eq!(arr[0]["speaker_id"], "Alice", "A → Alice");
     assert_eq!(arr[1]["speaker_id"], "Bob", "B → Bob");
-    assert_eq!(arr[2]["speaker_id"], "C", "unmapped label stays as the raw label");
+    assert_eq!(
+        arr[2]["speaker_id"], "C",
+        "unmapped label stays as the raw label"
+    );
 
     // The on-disk transcript must be UNTOUCHED (overlay is presentation-only).
     let dir = root.join(id.0.to_string());
@@ -407,7 +500,11 @@ async fn get_notes_returns_null_when_absent() {
     let reg = ToolRegistry::v1(false);
     let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
     let out = reg
-        .dispatch(&ctx, "get_notes", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .dispatch(
+            &ctx,
+            "get_notes",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
         .await
         .unwrap();
     assert!(out.data.is_null());
@@ -422,7 +519,11 @@ async fn get_notes_round_trips_saved_notes() {
     persistence::NotesStore::save(&root, id, &doc, "# Notes\n").expect("save notes");
 
     let out = reg
-        .dispatch(&ctx, "get_notes", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .dispatch(
+            &ctx,
+            "get_notes",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
         .await
         .unwrap();
     assert_eq!(out.data["markdown"], "# Notes\n");
@@ -433,7 +534,10 @@ async fn get_notes_round_trips_saved_notes() {
 async fn get_recording_state_reports_idle() {
     let (_t, _root, ctx) = make_ctx().await;
     let reg = ToolRegistry::v1(false);
-    let out = reg.dispatch(&ctx, "get_recording_state", serde_json::json!({})).await.unwrap();
+    let out = reg
+        .dispatch(&ctx, "get_recording_state", serde_json::json!({}))
+        .await
+        .unwrap();
     assert_eq!(out.data["kind"], "idle");
 }
 
@@ -446,16 +550,20 @@ async fn speaker_talk_time_aggregates_with_overlay() {
         &ctx.index,
         "M",
         vec![
-            seg(0, 1000, "x", Some("A")),     // A: 1000ms, 1 turn
-            seg(1000, 3000, "y", Some("A")),  // A: +2000ms, 2 turns
-            seg(3000, 3500, "z", Some("B")),  // B: 500ms, 1 turn
+            seg(0, 1000, "x", Some("A")),    // A: 1000ms, 1 turn
+            seg(1000, 3000, "y", Some("A")), // A: +2000ms, 2 turns
+            seg(3000, 3500, "z", Some("B")), // B: 500ms, 1 turn
         ],
         names(&[("A", "Alice")]),
     )
     .await;
 
     let out = reg
-        .dispatch(&ctx, "speaker_talk_time", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .dispatch(
+            &ctx,
+            "speaker_talk_time",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
         .await
         .unwrap();
     let arr = out.data.as_array().unwrap();
@@ -491,8 +599,14 @@ async fn resummarise_threads_instruction_through_as_prompt() {
         .await
         .unwrap();
     let text = out.data["text"].as_str().unwrap();
-    assert!(text.contains("2 segments"), "transcript handed to summariser");
-    assert!(text.contains("prompt=as bullet points"), "instruction used as system prompt");
+    assert!(
+        text.contains("2 segments"),
+        "transcript handed to summariser"
+    );
+    assert!(
+        text.contains("prompt=as bullet points"),
+        "instruction used as system prompt"
+    );
 
     // resummarise must NOT write summary.md.
     let dir = root.join(id.0.to_string());
@@ -507,7 +621,14 @@ async fn resummarise_threads_instruction_through_as_prompt() {
 async fn set_speaker_name_round_trips_through_metadata() {
     let (_t, root, ctx) = make_ctx().await;
     let reg = ToolRegistry::v1(false);
-    let id = seed_meeting(&root, &ctx.index, "M", vec![seg(0, 1000, "x", Some("A"))], BTreeMap::new()).await;
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "M",
+        vec![seg(0, 1000, "x", Some("A"))],
+        BTreeMap::new(),
+    )
+    .await;
 
     let out = reg
         .dispatch(
@@ -521,14 +642,22 @@ async fn set_speaker_name_round_trips_through_metadata() {
 
     // Reflected in get_metadata.
     let meta = reg
-        .dispatch(&ctx, "get_metadata", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .dispatch(
+            &ctx,
+            "get_metadata",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
         .await
         .unwrap();
     assert_eq!(meta.data["speaker_names"]["A"], "Alice");
 
     // And in the read-time overlay.
     let tr = reg
-        .dispatch(&ctx, "get_transcript", serde_json::json!({ "meeting_id": id.0.to_string() }))
+        .dispatch(
+            &ctx,
+            "get_transcript",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
         .await
         .unwrap();
     assert_eq!(tr.data.as_array().unwrap()[0]["speaker_id"], "Alice");
@@ -572,7 +701,10 @@ async fn concurrent_set_speaker_name_does_not_drop_a_write() {
 
     let dir = root.join(id.0.to_string());
     let meta = persistence::read_metadata(&dir).unwrap();
-    assert_eq!(meta.speaker_names.get("A").map(String::as_str), Some("Alice"));
+    assert_eq!(
+        meta.speaker_names.get("A").map(String::as_str),
+        Some("Alice")
+    );
     assert_eq!(
         meta.speaker_names.get("B").map(String::as_str),
         Some("Bob"),
@@ -584,7 +716,14 @@ async fn concurrent_set_speaker_name_does_not_drop_a_write() {
 async fn rename_meeting_updates_title_and_index() {
     let (_t, root, ctx) = make_ctx().await;
     let reg = ToolRegistry::v1(false);
-    let id = seed_meeting(&root, &ctx.index, "Old title", vec![seg(0, 1000, "x", None)], BTreeMap::new()).await;
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "Old title",
+        vec![seg(0, 1000, "x", None)],
+        BTreeMap::new(),
+    )
+    .await;
 
     reg.dispatch(
         &ctx,
@@ -601,4 +740,70 @@ async fn rename_meeting_updates_title_and_index() {
     let found = ctx.index.search("New title").await.unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].title, "New title");
+}
+
+// ---------------------------------------------------------------------------
+// send_to_internal_agent (the MCP-only inter-agent bridge tool) — error paths
+//
+// The happy path (a real reply) needs the chat engine, which lives in
+// ipc-bridge; here we cover the bridge tool's OWN failure handling against a
+// stub channel, with no chat turn: unavailable-when-no-bridge, busy-on-full,
+// and timed-out-when-no-reply.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn send_to_internal_agent_unavailable_without_bridge() {
+    // The default context (UI path) has no bridge → the tool is unavailable.
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(true);
+    let err = reg
+        .dispatch(
+            &ctx,
+            "send_to_internal_agent",
+            serde_json::json!({ "message": "hi" }),
+        )
+        .await
+        .expect_err("no bridge → error");
+    match err {
+        meeting_app_common::AppError::InvalidInput { context } => {
+            assert!(context.contains("not available"), "got: {context}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn send_to_internal_agent_busy_on_full_queue() {
+    let (_t, _root, ctx) = make_ctx().await;
+    // A depth-1 bridge channel with NO receiver draining it: the first send
+    // fills it, so the tool's try_send sees a full queue → "internal agent busy".
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    // Pre-fill the single slot so the tool's try_send fails as "Full".
+    let (pre_reply_tx, _pre_reply_rx) = tokio::sync::oneshot::channel();
+    tx.try_send((
+        meeting_app_common::InterAgentRequest {
+            session_id: None,
+            meeting_id: None,
+            message: "prefill".into(),
+        },
+        pre_reply_tx,
+    ))
+    .expect("prefill the queue");
+
+    let ctx = ctx.with_inter_agent_bridge(tx);
+    let reg = ToolRegistry::v1(true);
+    let err = reg
+        .dispatch(
+            &ctx,
+            "send_to_internal_agent",
+            serde_json::json!({ "message": "hi" }),
+        )
+        .await
+        .expect_err("full queue → busy");
+    match err {
+        meeting_app_common::AppError::InvalidInput { context } => {
+            assert!(context.contains("busy"), "got: {context}");
+        }
+        other => panic!("expected InvalidInput busy, got {other:?}"),
+    }
 }

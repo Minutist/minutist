@@ -413,6 +413,24 @@ async deleteChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promis
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * The live MCP server endpoint (URL + bearer token) for the Settings → MCP
+ * pane (Phase 10). `None` when the MCP server is disabled or not yet listening.
+ * 
+ * The bearer token is sensitive and crosses the IPC boundary ONLY here, on this
+ * explicit read — it is never on the event bus, never logged, and not baked
+ * into the bindings. The pane reveals it on user request (and offers
+ * regenerate, which rotates it + restarts the listener — a documented
+ * restart-required for v1).
+ */
+async getMcpServerInfo() : Promise<Result<McpServerInfo | null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_mcp_server_info") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -553,7 +571,16 @@ export type AppEvent =
  * The chat turn failed. `message` is a stable human-readable string the
  * webview surfaces in the chat pane.
  */
-{ kind: "chat_error"; session_id: ChatSessionId; message: string }
+{ kind: "chat_error"; session_id: ChatSessionId; message: string } | 
+/**
+ * The in-process MCP server bound its loopback Streamable HTTP listener.
+ * `app-main` emits this after `mcp_server::serve` returns the bound addr so
+ * the Settings → MCP pane can show the live endpoint URL. The bearer token
+ * is deliberately NOT carried on the event bus (it is revealed only via the
+ * `get_mcp_server_info` command on explicit user request); see
+ * `architecture/cross-cutting.md` — "MCP transport".
+ */
+{ kind: "mcp_server_listening"; url: string }
 /**
  * Typed wrapper that gives `AppEvent` a stable tauri-specta event name.
  * 
@@ -666,6 +693,20 @@ export type ChatSessionId = string
  * stable even though the derive lives here rather than in `common`.
  */
 export type IpcError = { code: "io"; context: string } | { code: "model_load"; model_id: string; context: string } | { code: "model_not_found"; model_id: string } | { code: "model_download"; context: string } | { code: "inference"; backend: string; context: string } | { code: "invalid_input"; context: string } | { code: "cancelled" } | { code: "unsupported"; context: string } | { code: "internal"; context: string }
+/**
+ * The live MCP endpoint surfaced to the Settings → MCP pane via
+ * `get_mcp_server_info` (Phase 10). The bearer `token` is sensitive: it is
+ * never logged and only crosses the IPC boundary on this explicit read.
+ */
+export type McpServerInfo = { 
+/**
+ * The full Streamable HTTP endpoint URL, e.g. `http://127.0.0.1:8765/mcp`.
+ */
+url: string; 
+/**
+ * The bearer token the bridge must present.
+ */
+token: string }
 /**
  * Stable identifier for a meeting on disk. UUIDv4.
  */
@@ -956,7 +997,37 @@ chat_system_prompt?: string;
  * `#[serde(default)]` defaults to [`SummaryPreset::Default`] (the prior
  * behaviour); an older store deserialises to `Default`.
  */
-summary_preset?: SummaryPreset }
+summary_preset?: SummaryPreset; 
+/**
+ * Whether the in-process MCP server is started (Phase 10). Opt-in, **off by
+ * default**, mirroring `external-ollama` / `capture_system_audio`. When
+ * `true`, `app-main` binds the loopback Streamable HTTP MCP endpoint at
+ * startup so an external MCP client can reach the shared tool layer. Toggling at runtime is a documented
+ * restart-required for v1. `#[serde(default)]` defaults to `false`; an older
+ * store written before this field existed deserialises to `false`. See
+ * `architecture/cross-cutting.md` — "MCP transport".
+ */
+mcp_enabled?: boolean; 
+/**
+ * The loopback TCP port the MCP server binds (Phase 10 — D1). A FIXED
+ * default (8765): only one app instance runs, so a stable port keeps an
+ * external MCP client's saved URL valid across runs. User-editable.
+ * `#[serde(default = ...)]` defaults to 8765; an older store deserialises to
+ * 8765. See `architecture/cross-cutting.md` — "MCP transport".
+ */
+mcp_port?: number; 
+/**
+ * Whether write tools are exposed over MCP (Phase 10 — D3). **Off by
+ * default = read-only over MCP.** Consulted at registry-projection time by
+ * the MCP server: with it OFF, `tools/list` is read/compute tools + the
+ * inter-agent tool only; with it ON, the reversible writes
+ * (`set_speaker_name`, `rename_meeting`) join. `retranscribe_meeting` /
+ * `rediarize_meeting` / any destructive tool stay internal-only regardless
+ * (they are never `expose_over_mcp`). `#[serde(default)]` defaults to
+ * `false`; an older store deserialises to `false`. See
+ * `architecture/cross-cutting.md` — "MCP transport".
+ */
+mcp_write_tools?: boolean }
 /**
  * Built-in summary prompt presets (Phase 9 — D4).
  * 

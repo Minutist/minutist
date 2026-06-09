@@ -80,6 +80,27 @@ impl From<AppError> for IpcError {
     }
 }
 
+impl From<IpcError> for AppError {
+    /// Convert back to the shared boundary error. Exhaustive (no catch-all),
+    /// like the forward `From<AppError>`, so a new variant is a compile error
+    /// here too. Used by the Phase-10 inter-agent driver, which reuses the chat
+    /// helpers (`load_or_new_session` / `persist_session`, both `IpcError`-typed)
+    /// but ultimately returns `AppResult` over the bridge oneshot.
+    fn from(e: IpcError) -> AppError {
+        match e {
+            IpcError::Io { context } => AppError::Io { context },
+            IpcError::ModelLoad { model_id, context } => AppError::ModelLoad { model_id, context },
+            IpcError::ModelNotFound { model_id } => AppError::ModelNotFound { model_id },
+            IpcError::ModelDownload { context } => AppError::ModelDownload { context },
+            IpcError::Inference { backend, context } => AppError::Inference { backend, context },
+            IpcError::InvalidInput { context } => AppError::InvalidInput { context },
+            IpcError::Cancelled => AppError::Cancelled,
+            IpcError::Unsupported { context } => AppError::Unsupported { context },
+            IpcError::Internal { context } => AppError::Internal { context },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-crate Error (thiserror) — for errors that originate inside ipc-bridge
 // ---------------------------------------------------------------------------

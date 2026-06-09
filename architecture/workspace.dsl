@@ -41,6 +41,9 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
             tags "External"
         }
 
+        mcpClient = softwareSystem "External MCP client" "Connects over Streamable HTTP (loopback). Reads meetings + messages the internal agent over the agent-tools registry. Optional; requires the MCP server to be enabled." {
+            tags "External" "Optional"
+        }
         externalLlm = softwareSystem "External LLM (Ollama / LM Studio)" "Optional user-configured local LLM backend reachable over loopback HTTP. Default disabled." {
             tags "External" "Optional"
         }
@@ -98,6 +101,8 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
 
                 chatAgent = component "chat-agent" "Stateless, OpenAI-compatible, tool-calling chat TURN engine over the bundled local LLM. Reuses the summariser model substrate + the agent-tools descriptors; the driver (ipc-bridge) owns history + the loop + tool dispatch." "Rust crate: crates/chat-agent"
 
+                mcpServer = component "mcp-server" "In-process Streamable HTTP MCP server (loopback). Projects the agent-tools registry onto tools/list / tools/call; bearer + Host/Origin auth. Settings-gated, off by default." "Rust crate: crates/mcp-server"
+
                 settings = component "settings" "Settings schema, validation, change notifications. Persists via tauri-plugin-store." "Rust crate: crates/settings"
 
                 ipcBridge = component "ipc-bridge" "Tauri command + event surface. tauri-specta generates the TypeScript bindings consumed by the webview's IPC client. The only crate that knows about Tauri APIs." "Rust crate: crates/ipc-bridge"
@@ -131,6 +136,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         meetingApp -> modelHost "Reads GGUF + ONNX model files"
         meetingApp -> updateServer "Fetches signed updates" "HTTPS"
         meetingApp -> externalLlm "Optional: dispatches summary requests" "HTTP / loopback"
+        mcpClient -> meetingApp "Reads meetings + messages the internal agent over MCP" "Streamable HTTP / loopback"
 
         // ----------------------------------------------------------------
         // Relationships — Container (Level 2)
@@ -146,6 +152,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         meetingApp.core -> modelHost "Reads / downloads model files"
         meetingApp.core -> updateServer "Polls + applies signed updates"
         meetingApp.core -> externalLlm "Optional summary dispatch" "HTTP"
+        mcpClient -> meetingApp.core "tools/list + tools/call (bearer + Host/Origin)" "Streamable HTTP / loopback"
 
         // ----------------------------------------------------------------
         // Relationships — Component (Level 3) — INSIDE the Rust core
@@ -209,6 +216,14 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // dispatch.
         meetingApp.core.chatAgent -> meetingApp.core.summariser "Reuses the loaded model substrate (LlamaSummariser::model)"
         meetingApp.core.chatAgent -> meetingApp.core.agentTools "Reads tool descriptors for the prompt + grammar"
+
+        // MCP server (Phase 10). A SECOND consumer of the agent-tools registry —
+        // projects it onto tools/list / tools/call; no chat-agent edge (the
+        // inter-agent bridge tool reaches the chat engine via a common-typed
+        // channel whose driver lives in ipc-bridge). app-main spawns the listener.
+        meetingApp.core.mcpServer -> meetingApp.core.common "Uses interface types"
+        meetingApp.core.mcpServer -> meetingApp.core.agentTools "Projects the registry; dispatches tools/call"
+        meetingApp.core.appMain   -> meetingApp.core.mcpServer  "Spawns the listener via tauri::async_runtime::spawn (settings-gated)"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
         meetingApp.core.ipcBridge -> meetingApp.core.orchestrator "Invokes commands; subscribes to events"

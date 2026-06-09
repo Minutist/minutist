@@ -43,7 +43,9 @@ use summariser::{LlamaSummariser, SummariserConfig};
 use tauri::State;
 use tokio::sync::broadcast;
 
-use crate::chat::{engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX};
+use crate::chat::{
+    engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX,
+};
 use crate::{error::IpcError, IpcState};
 
 /// The bundled default LLM model id used when `settings.llm_model_id` is unset.
@@ -271,8 +273,11 @@ fn post_stop_passes(needs_retranscribe: bool, needs_diarize: bool) -> Vec<PostSt
 /// prevent the diarize pass (or vice versa). `run_pass` is a closure (rather than
 /// a direct `Orchestrator` call) so a stub can drive the gating/ordering/error
 /// tolerance in tests without models or audio.
-async fn run_post_stop_passes<F, Fut>(passes: &[PostStopPass], meeting_id: MeetingId, mut run_pass: F)
-where
+async fn run_post_stop_passes<F, Fut>(
+    passes: &[PostStopPass],
+    meeting_id: MeetingId,
+    mut run_pass: F,
+) where
     F: FnMut(PostStopPass) -> Fut,
     Fut: std::future::Future<Output = Result<(), AppError>>,
 {
@@ -331,9 +336,7 @@ fn meeting_list_entry_for_meta(meetings_dir: &Path, meta: &MeetingMeta) -> Meeti
 /// Return a snapshot of the current recording state.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_recording_state(
-    state: State<'_, IpcState>,
-) -> Result<RecordingState, IpcError> {
+pub async fn get_recording_state(state: State<'_, IpcState>) -> Result<RecordingState, IpcError> {
     Ok(state.orchestrator.state().await)
 }
 
@@ -361,10 +364,7 @@ pub async fn list_models(state: State<'_, IpcState>) -> Result<Vec<ModelStatus>,
 /// invariant that `ipc-bridge` does not depend directly on `model-registry`.
 #[tauri::command]
 #[specta::specta]
-pub async fn ensure_model(
-    model_id: ModelId,
-    state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+pub async fn ensure_model(model_id: ModelId, state: State<'_, IpcState>) -> Result<(), IpcError> {
     state
         .orchestrator
         .ensure_model(&model_id)
@@ -690,7 +690,12 @@ pub async fn summarise_meeting(
     // `summarise` builds a fresh `LlamaContext` and decodes). The held handle is
     // cloned into the closure; no GGUF reload.
     let summary_md = tokio::task::spawn_blocking(move || {
-        summarise_meeting_inner(&meetings_dir, meeting_id, summariser.as_ref(), &system_prompt)
+        summarise_meeting_inner(
+            &meetings_dir,
+            meeting_id,
+            summariser.as_ref(),
+            &system_prompt,
+        )
     })
     .await
     .map_err(|e| AppError::Internal {
@@ -946,7 +951,10 @@ pub async fn send_chat_message(
 
     // Single in-flight turn per session.
     {
-        let mut in_flight = state.chat_in_flight.lock().expect("chat_in_flight poisoned");
+        let mut in_flight = state
+            .chat_in_flight
+            .lock()
+            .expect("chat_in_flight poisoned");
         if !in_flight.insert(sid) {
             return Err(AppError::InvalidInput {
                 context: "session busy: a turn is already running".into(),
@@ -978,7 +986,11 @@ pub async fn send_chat_message(
     let summariser = match state.ensure_summariser().await {
         Ok(s) => s,
         Err(e) => {
-            state.chat_in_flight.lock().expect("chat_in_flight poisoned").remove(&sid);
+            state
+                .chat_in_flight
+                .lock()
+                .expect("chat_in_flight poisoned")
+                .remove(&sid);
             return Err(e);
         }
     };
@@ -1038,10 +1050,29 @@ pub async fn send_chat_message(
                 tracing::warn!(target: "ipc-bridge", "chat turn task join failed: {join_err}");
             }
         }
-        in_flight.lock().expect("chat_in_flight poisoned").remove(&sid);
+        in_flight
+            .lock()
+            .expect("chat_in_flight poisoned")
+            .remove(&sid);
     });
 
     Ok(sid)
+}
+
+/// The live MCP server endpoint (URL + bearer token) for the Settings → MCP
+/// pane (Phase 10). `None` when the MCP server is disabled or not yet listening.
+///
+/// The bearer token is sensitive and crosses the IPC boundary ONLY here, on this
+/// explicit read — it is never on the event bus, never logged, and not baked
+/// into the bindings. The pane reveals it on user request (and offers
+/// regenerate, which rotates it + restarts the listener — a documented
+/// restart-required for v1).
+#[tauri::command]
+#[specta::specta]
+pub async fn get_mcp_server_info(
+    state: State<'_, IpcState>,
+) -> Result<Option<crate::McpServerInfo>, IpcError> {
+    Ok(state.mcp_info.lock().expect("mcp_info poisoned").clone())
 }
 
 /// Get one chat session for a meeting, or `None` when it does not exist.
@@ -1105,7 +1136,7 @@ pub async fn delete_chat_session(
 /// session with a fresh id is returned (and `session_id`, if it was supplied but
 /// not found, is honoured so the webview's chosen id is kept). Blocking reads on
 /// `spawn_blocking`.
-async fn load_or_new_session(
+pub(crate) async fn load_or_new_session(
     meetings_dir: &std::path::Path,
     meeting_id: Option<MeetingId>,
     session_id: Option<ChatSessionId>,
@@ -1144,7 +1175,7 @@ async fn load_or_new_session(
 /// entirely (it lived only in the in-memory `session`, which was never on disk).
 /// A meeting-less session is not persisted (no folder to write into); the streamed
 /// events already delivered the reply to the webview.
-async fn persist_session(
+pub(crate) async fn persist_session(
     meetings_dir: &std::path::Path,
     meeting_id: Option<MeetingId>,
     mut session: ChatSession,
@@ -1155,8 +1186,7 @@ async fn persist_session(
     session.updated_at = chrono::Utc::now().to_rfc3339();
     let session_id = session.id;
     let dir = meetings_dir.to_path_buf();
-    let result =
-        tokio::task::spawn_blocking(move || ChatStore::save(&dir, mid, &session)).await;
+    let result = tokio::task::spawn_blocking(move || ChatStore::save(&dir, mid, &session)).await;
 
     match result {
         Ok(Ok(())) => {}
@@ -1182,7 +1212,7 @@ async fn persist_session(
 /// messages this turn produced (the assistant final + each tool result) so the
 /// caller can persist them. Returns those wire messages.
 #[allow(clippy::too_many_arguments)]
-fn run_chat_turn_on_held_model(
+pub(crate) fn run_chat_turn_on_held_model(
     summariser: &LlamaSummariser,
     registry: &agent_tools::ToolRegistry,
     ctx: &ToolContext,
@@ -1216,11 +1246,10 @@ fn run_chat_turn_on_held_model(
 
     // The dispatch closure: re-enter async for the registry dispatch only.
     let dispatch = |call: &chat_agent::ToolCall| -> AppResult<ToolOutput> {
-        let args: serde_json::Value = serde_json::from_str(&call.arguments_json).map_err(|e| {
-            AppError::InvalidInput {
+        let args: serde_json::Value =
+            serde_json::from_str(&call.arguments_json).map_err(|e| AppError::InvalidInput {
                 context: format!("tool {} arguments are not valid JSON: {e}", call.name),
-            }
-        })?;
+            })?;
         handle.block_on(registry.dispatch(ctx, &call.name, args))
     };
 
@@ -1454,8 +1483,12 @@ mod tests {
     fn open_meeting_returns_meeting_state_matching_disk() {
         let tempdir = TempDir::new().expect("tempdir");
         let root = tempdir.path();
-        let meeting_id =
-            write_synthetic_meeting(root, "Launch sync", "2026-06-02T10:00:00Z", Some("hello world"));
+        let meeting_id = write_synthetic_meeting(
+            root,
+            "Launch sync",
+            "2026-06-02T10:00:00Z",
+            Some("hello world"),
+        );
 
         let state = open_meeting_inner(root, meeting_id).expect("open_meeting");
 
@@ -1471,7 +1504,8 @@ mod tests {
     fn open_meeting_errors_for_missing_meeting() {
         let tempdir = TempDir::new().expect("tempdir");
         let missing = MeetingId::new();
-        let err = open_meeting_inner(tempdir.path(), missing).expect_err("missing meeting must error");
+        let err =
+            open_meeting_inner(tempdir.path(), missing).expect_err("missing meeting must error");
         assert!(matches!(err, AppError::Io { .. }));
     }
 
@@ -1541,7 +1575,11 @@ mod tests {
 
         // list_meetings now returns the meeting in the SAME session.
         let rows = index.list_meetings().await.expect("list after upsert");
-        assert_eq!(rows.len(), 1, "stopped meeting must be visible without a rebuild");
+        assert_eq!(
+            rows.len(),
+            1,
+            "stopped meeting must be visible without a rebuild"
+        );
         assert_eq!(rows[0].id, meeting_id);
         assert_eq!(rows[0].title, "In-session meeting");
         assert_eq!(
@@ -1693,8 +1731,12 @@ mod tests {
     async fn summarise_emits_summary_ready_for_meeting() {
         let tempdir = TempDir::new().expect("tempdir");
         let root = tempdir.path();
-        let meeting_id =
-            write_synthetic_meeting(root, "Standup", "2026-06-02T16:00:00Z", Some("status update"));
+        let meeting_id = write_synthetic_meeting(
+            root,
+            "Standup",
+            "2026-06-02T16:00:00Z",
+            Some("status update"),
+        );
 
         let (event_tx, mut event_rx) = broadcast::channel::<AppEvent>(8);
         let stub = StubSummariser::new("## Summary\n\nStandup notes.\n");
@@ -1807,7 +1849,11 @@ mod tests {
     /// build, so a CPU build is unaffected by the flag. Pure, no model.
     #[test]
     fn resolve_summariser_gpu_layers_off_forces_cpu() {
-        assert_eq!(resolve_summariser_gpu_layers(false), 0, "GPU off must force CPU");
+        assert_eq!(
+            resolve_summariser_gpu_layers(false),
+            0,
+            "GPU off must force CPU"
+        );
 
         let on = resolve_summariser_gpu_layers(true);
         assert_eq!(
@@ -1821,7 +1867,11 @@ mod tests {
             feature = "cuda",
             feature = "rocm"
         )) {
-            assert_eq!(on, u32::MAX, "a GPU-feature build offloads all layers when on");
+            assert_eq!(
+                on,
+                u32::MAX,
+                "a GPU-feature build offloads all layers when on"
+            );
         } else {
             assert_eq!(on, 0, "a default CPU-only build stays on CPU even when on");
         }
@@ -1912,7 +1962,10 @@ mod tests {
     #[test]
     fn post_stop_passes_gates_and_orders() {
         assert_eq!(post_stop_passes(false, false), vec![]);
-        assert_eq!(post_stop_passes(true, false), vec![PostStopPass::ReTranscribe]);
+        assert_eq!(
+            post_stop_passes(true, false),
+            vec![PostStopPass::ReTranscribe]
+        );
         assert_eq!(post_stop_passes(false, true), vec![PostStopPass::Rediarize]);
         assert_eq!(
             post_stop_passes(true, true),
@@ -1955,8 +2008,12 @@ mod tests {
     #[tokio::test]
     async fn run_post_stop_passes_failure_does_not_abort_later_passes() {
         for first_err in [
-            AppError::InvalidInput { context: "busy".into() },
-            AppError::Internal { context: "boom".into() },
+            AppError::InvalidInput {
+                context: "busy".into(),
+            },
+            AppError::Internal {
+                context: "boom".into(),
+            },
         ] {
             let passes = post_stop_passes(true, true);
             let mut calls: Vec<PostStopPass> = Vec::new();
@@ -1965,7 +2022,9 @@ mod tests {
             run_post_stop_passes(&passes, MeetingId::new(), |pass| {
                 calls.push(pass);
                 let result = match pass {
-                    PostStopPass::ReTranscribe => Err(first_err.take().expect("one re-transcribe call")),
+                    PostStopPass::ReTranscribe => {
+                        Err(first_err.take().expect("one re-transcribe call"))
+                    }
                     PostStopPass::Rediarize => Ok(()),
                 };
                 async move { result }
@@ -2069,7 +2128,10 @@ mod tests {
             .iter()
             .find(|m| m.role == ChatRole::Tool)
             .expect("a tool message must be persisted");
-        assert!(tool.content.contains("decisions"), "full tool payload persisted");
+        assert!(
+            tool.content.contains("decisions"),
+            "full tool payload persisted"
+        );
         assert_eq!(tool.tool_name.as_deref(), Some("get_summary"));
         assert_eq!(loaded.messages.len(), 3);
     }

@@ -1,0 +1,232 @@
+//! The inter-agent bridge driver (Phase 10 §3).
+//!
+//! The Phase-10 MCP tool `send_to_internal_agent` (defined in `agent-tools`,
+//! registered on the MCP registry `v1(true)`) sends an
+//! [`InterAgentRequest`] over a bounded channel; THIS task owns the receiver,
+//! runs ONE chat turn on the held model via the SAME [`run_chat_turn`] driver
+//! the UI uses, and replies with the assistant's final text.
+//!
+//! [`run_chat_turn`]: crate::chat::run_chat_turn
+//!
+//! Keeping the receiver + the chat turn here (not in `mcp-server`) is what lets
+//! `mcp-server` stay free of a `chat-agent` edge: `mcp-server` holds only the
+//! channel SENDER (via the `agent-tools` `ToolContext`), and the single place a
+//! chat turn runs stays in `ipc-bridge`.
+//!
+//! # The internal registry (no self-messaging)
+//!
+//! The driver dispatches tools through an INTERNAL registry built with
+//! `ToolRegistry::v1(false)` — so the internal agent it drives does NOT itself
+//! get `send_to_internal_agent`, closing the trivial infinite-loop foot-gun.
+//!
+//! # Concurrency (W4)
+//!
+//! - The bridge channel is bounded (the tool `try_send`s — a full queue surfaces
+//!   to the external caller as "internal agent busy").
+//! - Single in-flight turn per session: a request for a session whose turn is
+//!   already running (e.g. a human mid-conversation in the UI) is rejected with
+//!   `InvalidInput { "session busy" }` rather than interleaving.
+//! - The `None`-session bridge maps to ONE dedicated persisted session, so N
+//!   external agents serialise onto it (most get "session busy") — documented
+//!   single-threaded v1 scope.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
+use agent_tools::{InterAgentEnvelope, ToolContext, ToolRegistry};
+use meeting_app_common::{
+    AppError, AppResult, ChatMessage, ChatRole, ChatSession, ChatSessionId, InterAgentReply,
+    MeetingId, Summariser,
+};
+use tokio::sync::mpsc;
+
+use crate::chat_runtime::ChatHandles;
+use crate::commands::{load_or_new_session, persist_session, run_chat_turn_on_held_model};
+
+/// The bounded depth of the inter-agent bridge channel (§3 — bounded; the tool
+/// `try_send`s, so a full queue is "busy", never a block).
+pub const INTER_AGENT_QUEUE_DEPTH: usize = 16;
+
+/// A stable session id for the `None`-meeting MCP bridge session (the single
+/// dedicated conversation an external agent talks to when it names no meeting).
+/// Derived from a fixed namespace UUID so it round-trips across runs and N
+/// external agents converge on the SAME session (and thus serialise — §3 / W4).
+fn bridge_session_id() -> ChatSessionId {
+    // A fixed v4-shaped UUID literal (constant). Not security-sensitive — it is
+    // a routing key for the un-scoped bridge session.
+    serde_json::from_str::<ChatSessionId>("\"00000000-0000-4000-8000-00000000c0de\"")
+        .expect("the fixed bridge session UUID is valid")
+}
+
+/// Spawn the inter-agent driver task. Returns the channel SENDER for `app-main`
+/// to hand to `mcp-server`'s `ToolContext` (via
+/// `ToolContext::with_inter_agent_bridge`). The task runs until the sender is
+/// dropped (app shutdown).
+///
+/// `handles` carries the same held-model + persistence handles the chat command
+/// uses; `chat_in_flight` is the SHARED single-in-flight guard (the same set the
+/// UI's `send_chat_message` uses), so an external turn and a human turn cannot
+/// run on one session at once.
+pub fn spawn_inter_agent_driver(
+    handles: ChatHandles,
+    chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>,
+) -> mpsc::Sender<InterAgentEnvelope> {
+    let (tx, mut rx) = mpsc::channel::<InterAgentEnvelope>(INTER_AGENT_QUEUE_DEPTH);
+
+    // The INTERNAL registry: no inter-agent tool, so the agent cannot message
+    // itself. Built once and shared across turns.
+    let registry = Arc::new(ToolRegistry::v1(false));
+
+    tauri::async_runtime::spawn(async move {
+        tracing::info!(target: "ipc-bridge", "inter-agent bridge driver started");
+        while let Some((request, reply_tx)) = rx.recv().await {
+            let result = handle_request(&handles, &registry, &chat_in_flight, request).await;
+            // The external caller may have given up (timeout) and dropped the
+            // receiver; that is fine — ignore the send error.
+            let _ = reply_tx.send(result);
+        }
+        tracing::info!(target: "ipc-bridge", "inter-agent bridge driver stopped (sender dropped)");
+    });
+
+    tx
+}
+
+/// Handle one inter-agent request: resolve the session, guard single-in-flight,
+/// run ONE chat turn on the held model, persist, and return the reply text.
+async fn handle_request(
+    handles: &ChatHandles,
+    registry: &Arc<ToolRegistry>,
+    chat_in_flight: &Arc<Mutex<HashSet<ChatSessionId>>>,
+    request: meeting_app_common::InterAgentRequest,
+) -> AppResult<InterAgentReply> {
+    let meetings_dir = handles.meetings_dir.clone();
+    let meeting_id: Option<MeetingId> = request.meeting_id;
+    // A None-meeting request routes to the single dedicated bridge session;
+    // otherwise the named session (or a fresh one) for the named meeting.
+    let session_id = request.session_id.unwrap_or_else(bridge_session_id);
+
+    let mut session = load_or_new_session(&meetings_dir, meeting_id, Some(session_id))
+        .await
+        .map_err(AppError::from)?;
+    let sid = session.id;
+
+    // Single in-flight turn per session (shared guard with the UI path).
+    {
+        let mut in_flight = chat_in_flight.lock().expect("chat_in_flight poisoned");
+        if !in_flight.insert(sid) {
+            return Err(AppError::InvalidInput {
+                context: "session busy".into(),
+            });
+        }
+    }
+
+    // Always release the guard, even on an early error.
+    let outcome = run_one_turn(handles, registry, &mut session, meeting_id, request.message).await;
+    chat_in_flight
+        .lock()
+        .expect("chat_in_flight poisoned")
+        .remove(&sid);
+
+    let reply_text = outcome?;
+    Ok(InterAgentReply {
+        session_id: sid,
+        reply: reply_text,
+    })
+}
+
+/// Build the per-turn context, run the turn on `spawn_blocking`, persist the
+/// session, and return the assistant's final text. Mirrors the UI's
+/// `send_chat_message` turn body, minus the streaming-to-webview detail (the
+/// chat `AppEvent`s still fire on the shared bus, so an open UI session sees the
+/// turn live when `meeting_id` matches).
+async fn run_one_turn(
+    handles: &ChatHandles,
+    registry: &Arc<ToolRegistry>,
+    session: &mut ChatSession,
+    meeting_id: Option<MeetingId>,
+    message: String,
+) -> AppResult<String> {
+    if message.trim().is_empty() {
+        return Err(AppError::InvalidInput {
+            context: "inter-agent message must not be empty".into(),
+        });
+    }
+
+    let sid = session.id;
+    let turn_id = session
+        .messages
+        .iter()
+        .map(|m| m.turn_id)
+        .max()
+        .map_or(0, |t| t + 1);
+
+    // Append the user message up front so it is durable even if the turn errors.
+    session.messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: message,
+        tool_name: None,
+        turn_id,
+    });
+
+    // Ensure the held model is loaded (downloads on first use).
+    let summariser = handles.ensure_summariser().await?;
+
+    // The internal-agent context drives the INTERNAL registry; default_meeting
+    // scopes meeting_id omission to the addressed meeting.
+    let ctx = ToolContext::new(
+        Arc::clone(&handles.orchestrator),
+        Arc::clone(&handles.index),
+        handles.meetings_dir.clone(),
+        summariser.clone() as Arc<dyn Summariser>,
+        handles.event_tx.clone(),
+        meeting_id,
+    );
+
+    let system_prompt = handles.settings.current().chat_system_prompt.clone();
+    let registry = Arc::clone(registry);
+    let event_tx = handles.event_tx.clone();
+    let handle = tokio::runtime::Handle::current();
+
+    // Run the turn synchronously (the external caller's tools/call blocks on it,
+    // capped by the tool's timeout). The turn task OWNS `session` while running.
+    let session_for_turn = session.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let produced = run_chat_turn_on_held_model(
+            &summariser,
+            &registry,
+            &ctx,
+            &handle,
+            sid,
+            turn_id,
+            &system_prompt,
+            &session_for_turn,
+            &event_tx,
+        );
+        (session_for_turn, produced)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("inter-agent turn task join failed: {e}"),
+    })?;
+
+    let (mut completed, produced) = join;
+    let produced = produced?;
+    // Extract the assistant's final text (the last Assistant message produced).
+    let final_text = produced
+        .iter()
+        .rev()
+        .find(|m| m.role == ChatRole::Assistant)
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+
+    completed.messages.extend(produced);
+    // Persist the whole session (only when meeting-scoped; the None-meeting
+    // bridge session is in-memory only, matching the UI path).
+    persist_session(&handles.meetings_dir, meeting_id, completed).await;
+
+    Ok(final_text)
+}
+
+/// Convenience re-export so app-main need not name the `agent_tools` envelope
+/// type when wiring the bridge.
+pub use agent_tools::InterAgentBridge;

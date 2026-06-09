@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (25 total)
+//! ## Commands (26 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -33,6 +33,7 @@
 //! | `get_chat_session` | `Option<ChatSession>` | 9 |
 //! | `list_chat_sessions` | `Vec<ChatSession>` | 9 |
 //! | `delete_chat_session` | `()` | 9 |
+//! | `get_mcp_server_info` | `Option<McpServerInfo>` | 10 |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
@@ -97,9 +98,11 @@
 //! All log calls use `target: "ipc-bridge"`.
 
 pub mod chat;
+pub mod chat_runtime;
 pub mod commands;
 pub mod error;
 pub mod events;
+pub mod inter_agent;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,8 +116,10 @@ use summariser::LlamaSummariser;
 use tauri_specta::{collect_commands, collect_events, Builder};
 use tokio::sync::{broadcast, OnceCell};
 
+pub use chat_runtime::ChatHandles;
 pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
+pub use inter_agent::spawn_inter_agent_driver;
 
 // ---------------------------------------------------------------------------
 // IpcState — Tauri managed state
@@ -176,9 +181,28 @@ pub struct IpcState {
     /// this set has a turn currently running; `send_chat_message` rejects a
     /// concurrent turn for the same session (§6 — single in-flight turn). A
     /// `std::sync::Mutex<HashSet>` (not async) because every access is a brief,
-    /// non-awaiting insert/remove.
+    /// non-awaiting insert/remove. SHARED with the Phase-10 inter-agent driver
+    /// (so an external turn and a human turn cannot run on one session at once).
     pub chat_in_flight:
         Arc<std::sync::Mutex<std::collections::HashSet<meeting_app_common::ChatSessionId>>>,
+    /// The live MCP server endpoint, set by `app-main` after `mcp_server::serve`
+    /// binds (Phase 10). `None` when the MCP server is disabled or not yet
+    /// listening. The `get_mcp_server_info` command reads it to reveal the URL +
+    /// bearer token for the user to paste into an external MCP client's config. The
+    /// token is held here (not on the event bus) and revealed only on explicit
+    /// user request.
+    pub mcp_info: Arc<std::sync::Mutex<Option<McpServerInfo>>>,
+}
+
+/// The live MCP endpoint surfaced to the Settings → MCP pane via
+/// `get_mcp_server_info` (Phase 10). The bearer `token` is sensitive: it is
+/// never logged and only crosses the IPC boundary on this explicit read.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, specta::Type)]
+pub struct McpServerInfo {
+    /// The full Streamable HTTP endpoint URL, e.g. `http://127.0.0.1:8765/mcp`.
+    pub url: String,
+    /// The bearer token the bridge must present.
+    pub token: String,
 }
 
 impl IpcState {
@@ -194,30 +218,23 @@ impl IpcState {
     /// process — toggling the setting takes effect on the next start). Subsequent
     /// calls return the cached `Arc` without reloading.
     pub async fn ensure_summariser(&self) -> Result<Arc<LlamaSummariser>, IpcError> {
-        let handle = self
-            .summariser
-            .get_or_try_init(|| async {
-                let settings = self.settings.current();
-                let model_id = commands::resolve_llm_model_id(&settings);
-                let model_dir = self.orchestrator.ensure_model_path(&model_id).await?;
-                let n_gpu_layers =
-                    commands::resolve_summariser_gpu_layers(settings.gpu_acceleration);
-                let summariser = tokio::task::spawn_blocking(move || {
-                    commands::open_summariser_in_dir(&model_dir, n_gpu_layers)
-                })
-                .await
-                .map_err(|e| meeting_app_common::AppError::Internal {
-                    context: format!("summariser load task join failed: {e}"),
-                })??;
-                tracing::info!(
-                    target: "ipc-bridge",
-                    "held LLM summariser loaded (shared by summarise + chat)"
-                );
-                Ok::<_, meeting_app_common::AppError>(Arc::new(summariser))
-            })
-            .await
-            .map_err(IpcError::from)?;
-        Ok(Arc::clone(handle))
+        self.chat_handles().ensure_summariser().await
+    }
+
+    /// Bundle the chat-runtime handles (held model + persistence + settings +
+    /// event bus) into a [`ChatHandles`]. Both the UI chat path (via
+    /// [`Self::ensure_summariser`]) and the Phase-10 inter-agent driver use this
+    /// so the held-model load logic lives in one place and both share the SAME
+    /// lazily-loaded model.
+    pub fn chat_handles(&self) -> ChatHandles {
+        ChatHandles {
+            orchestrator: Arc::clone(&self.orchestrator),
+            index: Arc::clone(&self.index),
+            meetings_dir: self.meetings_dir.clone(),
+            event_tx: self.event_tx.clone(),
+            settings: self.settings.clone(),
+            summariser: Arc::clone(&self.summariser),
+        }
     }
 }
 
@@ -326,6 +343,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::get_chat_session,
             commands::list_chat_sessions,
             commands::delete_chat_session,
+            commands::get_mcp_server_info,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -348,10 +366,11 @@ mod tests {
     /// as a string literal in the `invoke` call.
     ///
     /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
-    /// (P5 removes `re_summarise` and adds `summarise_meeting` / `get_summary`
-    /// / `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`: 20 + 1 = 21;
-    /// P9 adds `send_chat_message` / `get_chat_session` / `list_chat_sessions` /
-    /// `delete_chat_session`: 21 + 4 = 25).
+    /// → P10 26 (P5 removes `re_summarise` and adds `summarise_meeting` /
+    /// `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`:
+    /// 20 + 1 = 21; P9 adds `send_chat_message` / `get_chat_session` /
+    /// `list_chat_sessions` / `delete_chat_session`: 21 + 4 = 25; P10 adds
+    /// `get_mcp_server_info`: 25 + 1 = 26).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -392,9 +411,14 @@ mod tests {
             "get_chat_session",
             "list_chat_sessions",
             "delete_chat_session",
+            "get_mcp_server_info",
         ];
 
-        assert_eq!(expected.len(), 25, "command ledger must be 25 in Phase 9");
+        assert_eq!(
+            expected.len(),
+            26,
+            "command ledger must be 26 after Phase 10 (Phase 9's 25 + get_mcp_server_info)"
+        );
 
         // `re_summarise` was removed in Phase 5 (no caller once
         // `summarise_meeting` landed); assert it is gone from the surface.

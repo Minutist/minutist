@@ -26,6 +26,11 @@ import {
   withSummaryPreset,
   withSummarySystemPrompt,
 } from "./summary-preset-settings";
+import {
+  withMcpEnabled,
+  withMcpPort,
+  withMcpWriteTools,
+} from "./mcp-settings";
 import type { Theme, SummaryPreset } from "../ipc/bindings";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
@@ -137,6 +142,27 @@ export type RecordingStore = {
    * `Settings::effective_summary_prompt`).
    */
   setSummarySystemPrompt: (prompt: string) => Promise<void>;
+  /**
+   * Toggle the in-process MCP server (Phase 10 — off by default), persisting via
+   * `commands.updateSettings`. The listener is spawned once at startup gated on
+   * this flag, so toggling at runtime is a documented restart-required for v1
+   * (the UI advises a restart). Same round-trip-through-settings pattern as
+   * `setDiarizationEnabled`.
+   */
+  setMcpEnabled: (enabled: boolean) => Promise<void>;
+  /**
+   * Set the MCP server's fixed loopback port (Phase 10 — D1, default 8765),
+   * persisting via `commands.updateSettings`. Restart-required like
+   * `setMcpEnabled`.
+   */
+  setMcpPort: (port: number) => Promise<void>;
+  /**
+   * Toggle MCP write-tool exposure (Phase 10 — D3, off by default = read-only
+   * over MCP), persisting via `commands.updateSettings`. With it on, the
+   * reversible writes (set speaker name / rename meeting) join `tools/list`;
+   * heavy/destructive ops never do. Restart-required like `setMcpEnabled`.
+   */
+  setMcpWriteTools: (enabled: boolean) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -421,6 +447,52 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withSummarySystemPrompt(current, prompt);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setMcpEnabled: async (enabled) => {
+    // Persist via `update_settings` (same round-trip as `setDiarizationEnabled`).
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    const next = withMcpEnabled(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setMcpPort: async (port) => {
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    const next = withMcpPort(current, port);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setMcpWriteTools: async (enabled) => {
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    const next = withMcpWriteTools(current, enabled);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

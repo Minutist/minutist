@@ -243,10 +243,7 @@ pub enum ModelStatusState {
     /// A download is in progress. The webview tracks granular progress
     /// via `AppEvent::ModelDownloadProgress` events; this state is the
     /// snapshot at query time.
-    Downloading {
-        bytes_done: u64,
-        bytes_total: u64,
-    },
+    Downloading { bytes_done: u64, bytes_total: u64 },
     /// A previous download or hash check failed. `message` is a stable
     /// human-readable string suitable for surfacing in UI.
     Failed { message: String },
@@ -295,10 +292,7 @@ pub struct MeetingMeta {
     /// `#[serde(default, skip_serializing_if = …)]` so existing `metadata.json`
     /// (written before the field existed) still deserialises and the wire shape
     /// only grows when the map is non-empty.
-    #[serde(
-        default,
-        skip_serializing_if = "std::collections::BTreeMap::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub speaker_names: std::collections::BTreeMap<String, String>,
     pub app_version: String,
 }
@@ -635,6 +629,15 @@ pub enum AppEvent {
         session_id: ChatSessionId,
         message: String,
     },
+
+    // --- MCP server (Phase 10) -------------------------------------------
+    /// The in-process MCP server bound its loopback Streamable HTTP listener.
+    /// `app-main` emits this after `mcp_server::serve` returns the bound addr so
+    /// the Settings → MCP pane can show the live endpoint URL. The bearer token
+    /// is deliberately NOT carried on the event bus (it is revealed only via the
+    /// `get_mcp_server_info` command on explicit user request); see
+    /// `architecture/cross-cutting.md` — "MCP transport".
+    McpServerListening { url: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -729,10 +732,31 @@ pub enum AsrEngine {
 /// with the model card; see `architecture/cross-cutting.md` — "ASR engine
 /// routing".
 pub const PARAKEET_LANGUAGES: &[&str] = &[
-    "Bulgarian", "Croatian", "Czech", "Danish", "Dutch", "English", "Estonian",
-    "Finnish", "French", "German", "Greek", "Hungarian", "Italian", "Latvian",
-    "Lithuanian", "Maltese", "Polish", "Portuguese", "Romanian", "Russian",
-    "Slovak", "Slovenian", "Spanish", "Swedish", "Ukrainian",
+    "Bulgarian",
+    "Croatian",
+    "Czech",
+    "Danish",
+    "Dutch",
+    "English",
+    "Estonian",
+    "Finnish",
+    "French",
+    "German",
+    "Greek",
+    "Hungarian",
+    "Italian",
+    "Latvian",
+    "Lithuanian",
+    "Maltese",
+    "Polish",
+    "Portuguese",
+    "Romanian",
+    "Russian",
+    "Slovak",
+    "Slovenian",
+    "Spanish",
+    "Swedish",
+    "Ukrainian",
 ];
 
 /// Choose the ASR engine deterministically from the user's transcription-language
@@ -825,11 +849,28 @@ mod tests {
     fn asr_routing_picker_languages_map_to_expected_engine() {
         // The languages the LanguagePicker offers today, and where each routes.
         let cpu = false;
-        for lang in ["English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Dutch"] {
-            assert_eq!(asr_engine_for_language(lang, cpu), AsrEngine::ParakeetEuV3, "{lang} should use Parakeet");
+        for lang in [
+            "English",
+            "Spanish",
+            "French",
+            "German",
+            "Italian",
+            "Portuguese",
+            "Russian",
+            "Dutch",
+        ] {
+            assert_eq!(
+                asr_engine_for_language(lang, cpu),
+                AsrEngine::ParakeetEuV3,
+                "{lang} should use Parakeet"
+            );
         }
         for lang in ["Chinese", "Japanese", "Korean", "Arabic"] {
-            assert_eq!(asr_engine_for_language(lang, cpu), AsrEngine::Qwen06B, "{lang} should use Qwen");
+            assert_eq!(
+                asr_engine_for_language(lang, cpu),
+                AsrEngine::Qwen06B,
+                "{lang} should use Qwen"
+            );
         }
     }
 
@@ -842,17 +883,29 @@ mod tests {
 
     #[test]
     fn asr_routing_is_case_and_whitespace_insensitive() {
-        assert_eq!(asr_engine_for_language("  english ", false), AsrEngine::ParakeetEuV3);
-        assert_eq!(asr_engine_for_language("FRENCH", false), AsrEngine::ParakeetEuV3);
+        assert_eq!(
+            asr_engine_for_language("  english ", false),
+            AsrEngine::ParakeetEuV3
+        );
+        assert_eq!(
+            asr_engine_for_language("FRENCH", false),
+            AsrEngine::ParakeetEuV3
+        );
     }
 
     #[test]
     fn asr_routing_gpu_flag_only_affects_the_qwen_branch() {
         // Parakeet languages ignore the GPU-Qwen preference.
-        assert_eq!(asr_engine_for_language("English", true), AsrEngine::ParakeetEuV3);
+        assert_eq!(
+            asr_engine_for_language("English", true),
+            AsrEngine::ParakeetEuV3
+        );
         // Qwen languages honour it: 1.7B when opted in, else 0.6B.
         assert_eq!(asr_engine_for_language("Chinese", true), AsrEngine::Qwen17B);
-        assert_eq!(asr_engine_for_language("Chinese", false), AsrEngine::Qwen06B);
+        assert_eq!(
+            asr_engine_for_language("Chinese", false),
+            AsrEngine::Qwen06B
+        );
         // Auto-detect + GPU opt-in -> the bigger Qwen.
         assert_eq!(asr_engine_for_language("auto", true), AsrEngine::Qwen17B);
     }
@@ -1167,12 +1220,17 @@ mod tests {
 
         // A populated map round-trips.
         let mut meta = restored;
-        meta.speaker_names.insert("A".to_string(), "Alice".to_string());
-        meta.speaker_names.insert("B".to_string(), "Bob".to_string());
+        meta.speaker_names
+            .insert("A".to_string(), "Alice".to_string());
+        meta.speaker_names
+            .insert("B".to_string(), "Bob".to_string());
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("speaker_names"));
         let back: MeetingMeta = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.speaker_names.get("A").map(String::as_str), Some("Alice"));
+        assert_eq!(
+            back.speaker_names.get("A").map(String::as_str),
+            Some("Alice")
+        );
         assert_eq!(back.speaker_names.get("B").map(String::as_str), Some("Bob"));
     }
 
@@ -1283,7 +1341,10 @@ mod tests {
         assert_eq!(back, session);
         assert_eq!(back.messages.len(), 4);
         assert!(back.messages[0].tool_name.is_none());
-        assert_eq!(back.messages[2].tool_name.as_deref(), Some("get_transcript"));
+        assert_eq!(
+            back.messages[2].tool_name.as_deref(),
+            Some("get_transcript")
+        );
 
         // Absent meeting_id / title are omitted from the wire shape.
         let untitled = ChatSession {
@@ -1295,7 +1356,10 @@ mod tests {
             updated_at: "2026-06-10T10:00:00Z".to_string(),
         };
         let json = serde_json::to_string(&untitled).unwrap();
-        assert!(!json.contains("meeting_id"), "absent meeting_id must be omitted");
+        assert!(
+            !json.contains("meeting_id"),
+            "absent meeting_id must be omitted"
+        );
         assert!(!json.contains("title"), "absent title must be omitted");
         let back: ChatSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, untitled);

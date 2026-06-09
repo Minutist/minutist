@@ -202,6 +202,14 @@ any other size). The bundled ONNX is resolved at build time via
 `option_env!("MEETING_APP_SILERO_PATH")` falling back to
 `{CARGO_MANIFEST_DIR}/../../resources/silero/silero_vad_v4.onnx`.
 
+`VadChunker::reset()` restores the chunker to its just-opened state (Silero RNN
+hidden state, smoother, partial-frame buffer, pre-roll ring, frame clock, and
+any in-progress segment) **without reloading the model**. It is used at a hard
+region boundary where the next audio is independent rather than a continuation —
+the offline re-transcribe calls it at each detected recording **pause** (see
+`orchestrator` — re_transcribe) so a post-pause utterance onsets afresh instead
+of merging with the pre-pause one across the skipped silence.
+
 ### `asr-runtime`
 **Crate:** `crates/asr-runtime`
 **Owns:** llama-cpp-2 mtmd binding, the Qwen3-ASR model, the prompt /
@@ -724,7 +732,14 @@ proportional re-split (`emit_segments_proportional`) and the same `AsrRuntime`
 resolution path (`init_asr_runtime` → model-registry `ensure`) the live worker
 uses (`runner::re_transcribe_buffer`). The 30 s encoder-window constraint and the
 silence-preservation rule therefore hold identically; the accumulator code is not
-re-implemented. Differences from the live path: no flush queue / ASR-worker
+re-implemented. To reconstruct the pause-EXCLUDING clock it splits the decoded
+PCM into the non-pause regions (a run of ≥`PAUSE_MIN_MS` near-silence is a pause)
+and feeds only those, advancing the clock over kept audio only. At each region
+(pause) boundary it **flushes and `reset()`s the `VadChunker`** so the pre-pause
+utterance is closed there — the skipped silence would have closed it via hangover
+in the live path — instead of merging with the post-pause utterance across the
+join (the live path splits at the pause; the offline path must match it).
+Differences from the live path: no flush queue / ASR-worker
 thread — the work runs synchronously on one `spawn_blocking` thread, one
 accumulator flush at a time, so segments can be collected in order. As segments
 are produced it emits `AppEvent::TranscriptSegment` (the same event the live path

@@ -179,22 +179,33 @@ async fn paused_meeting_retranscribe_matches_live_pause_excluding_timeline() {
     );
 
     // ----- COHERENCE ASSERTION (the #4 contract: pause-EXCLUDING timeline) -----
-    // We do NOT require identical segment COUNTS between the two passes: the live
-    // path's streaming batched-VAD accumulates contiguous utterances into one
-    // flush, while the offline path re-runs VAD over decoded regions and may
-    // split the same speech differently — a legitimate streaming-vs-batch
-    // segmentation difference, not a timeline bug. What #4 is about is the
-    // TIMELINE: a pause-INCLUDING offline decode would shift every post-pause
-    // segment LATER by ~PAUSE_WALL_MS. The discriminating guard is that the first
-    // post-pause segment stays near `block_a_ms` (< block_a_ms + PAUSE_WALL_MS) —
-    // checked on BOTH passes and required to agree within tolerance. (If #4
-    // regresses, the offline post-pause start jumps to >= block_a_ms +
-    // PAUSE_WALL_MS and this fails.) The tolerance covers Opus lossy-decode
-    // boundary jitter + frame quantisation.
+    // We deliberately do NOT require per-segment correspondence between the two
+    // passes, for TWO independent reasons:
+    //
+    //  1. Streaming-vs-batch VAD: the live path accumulates contiguous
+    //     utterances differently from the offline VAD re-run over decoded
+    //     regions, so segment COUNTS and split points legitimately differ.
+    //  2. Pre-pause trailing silence: the live capture clock counted block_a's
+    //     trailing silence (it was captured BEFORE `pause()` was pressed), so
+    //     live places block_b's onset at ~block_a_ms. The offline pause detector
+    //     CANNOT tell that trailing silence from the synthesised pause padding —
+    //     it skips the whole near-silent run — so it places block_b's onset a
+    //     few hundred ms EARLIER, just below block_a_ms. That offset is inherent
+    //     to offline reconstruction (the pause boundary is not persisted), not a
+    //     bug, so the per-segment `live ≈ offline` correspondence the earlier
+    //     version asserted was wrong and made this test flaky.
+    //
+    // What #4 is actually about is the TOTAL TIMELINE SPAN: a pause-INCLUDING
+    // offline decode would run the VAD over the full pause-INCLUDING buffer and
+    // shift the whole post-pause tail LATER by ~PAUSE_WALL_MS. The robust
+    // discriminator is therefore the span and the post-pause placement, not a
+    // single segment's start. TOL covers Opus lossy-decode boundary jitter +
+    // frame quantisation.
     const TOL_MS: u64 = 300;
+    let block_b_ms = (block_b.len() as u64 * 1000) / SAMPLE_RATE;
 
-    // Both passes place the pre-pause (block_a) segment near the start — the
-    // pre-skip trim (#1) keeps it from being offset by ~80 ms.
+    // (a) Pre-pause: both passes place block_a's segment near 0 (the pre-skip
+    // trim #1 keeps it un-offset) and agree within tolerance.
     let live_first = live.first().unwrap().start_ms;
     let offline_first = offline.first().unwrap().start_ms;
     assert!(
@@ -207,28 +218,39 @@ async fn paused_meeting_retranscribe_matches_live_pause_excluding_timeline() {
         "pre-pause segment start diverged: live {live_first} vs offline {offline_first} (> {TOL_MS} ms)"
     );
 
-    // The offline post-pause segment must be on the pause-EXCLUDING clock — the
-    // #4 regression guard. A pause-INCLUDING decode would put it at/after
-    // block_a_ms + PAUSE_WALL_MS instead of just after block_a_ms.
-    let offline_post_pause = offline
-        .iter()
-        .find(|s| s.start_ms >= block_a_ms)
-        .expect("a post-pause offline segment must exist")
-        .start_ms;
+    // (b) #4 core — the offline timeline stays on the pause-EXCLUDING clock. The
+    // total pause-EXCLUDING audio is at most block_a + block_b; a pause-INCLUDING
+    // decode would push the tail past block_a + PAUSE_WALL_MS + block_b. Assert
+    // the LAST offline segment ENDS before the pause-EXCLUDING ceiling (with
+    // tolerance) — a #4 regression inflates this by ~PAUSE_WALL_MS and fails.
+    let excl_ceiling_ms = block_a_ms + block_b_ms;
+    let offline_last_end = offline.iter().map(|s| s.end_ms).max().unwrap();
     assert!(
-        offline_post_pause < block_a_ms + PAUSE_WALL_MS,
-        "offline post-pause start {offline_post_pause} is pause-INCLUDING — the pause was NOT \
-         excluded (expected < {block_a_ms} + {PAUSE_WALL_MS}); live={:?} offline={:?}",
-        live.iter().map(|s| s.start_ms).collect::<Vec<_>>(),
-        offline.iter().map(|s| s.start_ms).collect::<Vec<_>>(),
+        offline_last_end <= excl_ceiling_ms + TOL_MS,
+        "offline timeline left the pause-EXCLUDING clock: last segment ends at {offline_last_end} ms, \
+         past the pause-EXCLUDING ceiling {excl_ceiling_ms} ms (a pause-INCLUDING decode would push it \
+         toward ~{} ms); live={:?} offline={:?}",
+        excl_ceiling_ms + PAUSE_WALL_MS,
+        live.iter().map(|s| (s.start_ms, s.end_ms)).collect::<Vec<_>>(),
+        offline.iter().map(|s| (s.start_ms, s.end_ms)).collect::<Vec<_>>(),
     );
-    // ...and it must agree with the live post-pause segment within tolerance
-    // (both on the pause-EXCLUDING clock).
+
+    // (c) Post-pause content WAS transcribed and sits on the pause-EXCLUDING
+    // clock — an offline segment must start after block_a's utterance but BELOW
+    // where a pause-INCLUDING decode would place block_b's onset
+    // (block_a_ms + PAUSE_WALL_MS). This also guards the region-boundary VAD
+    // flush (runner::re_transcribe_buffer): without it the pre- and post-pause
+    // utterances MERGE into one segment whose only post-block_a member sits past
+    // this floor, failing here.
+    let pause_including_floor = block_a_ms + PAUSE_WALL_MS;
     assert!(
-        offline_post_pause.abs_diff(live_post_pause.start_ms) <= TOL_MS,
-        "post-pause segment start diverged between passes: live {} vs offline {offline_post_pause} \
-         (> {TOL_MS} ms) — offline timeline left the pause-EXCLUDING clock",
-        live_post_pause.start_ms,
+        offline
+            .iter()
+            .any(|s| s.start_ms > offline_first + 1000 && s.start_ms < pause_including_floor),
+        "offline must transcribe post-pause content on the pause-EXCLUDING clock (a segment starting \
+         between {} and {pause_including_floor} ms); offline starts were {:?}",
+        offline_first + 1000,
+        offline.iter().map(|s| s.start_ms).collect::<Vec<_>>(),
     );
 }
 

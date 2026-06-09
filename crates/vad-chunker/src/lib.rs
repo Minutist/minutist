@@ -169,6 +169,15 @@ impl VadSmoother {
         }
     }
 
+    /// Reset the onset/hangover/in-speech state to the just-constructed
+    /// condition, keeping the configured thresholds. Used by
+    /// [`VadChunker::reset`] at a hard region boundary.
+    fn reset(&mut self) {
+        self.onset_counter = 0;
+        self.hangover_counter = 0;
+        self.in_speech = false;
+    }
+
     /// Feed one frame's raw VAD probability. Returns the smoother decision.
     fn update(&mut self, prob: f32) -> SmootherDecision {
         let is_voice = prob > self.threshold;
@@ -403,6 +412,30 @@ impl VadChunker {
         }
 
         Ok(events)
+    }
+
+    /// Reset all in-progress chunking state to the just-opened condition,
+    /// **without reloading the model**: the Silero RNN hidden state
+    /// (`Vad::reset`), the smoother's onset/hangover/in-speech state, the
+    /// partial-frame buffer, the pre-roll ring, the frame clock, and any
+    /// in-progress segment are all cleared.
+    ///
+    /// This does **not** close or emit the in-progress segment — call
+    /// [`flush_end_of_stream`](VadChunker::flush_end_of_stream) first if its
+    /// `SegmentEnd` is wanted. Use `reset` when the next audio fed is a NEW,
+    /// independent region rather than a continuation: the offline re-transcribe
+    /// crosses a detected recording **pause** (≥ `PAUSE_MIN_MS` of skipped
+    /// silence) this way, so the post-pause region's onset detection starts
+    /// clean instead of continuing the pre-pause segment across the gap. The
+    /// post-pause clock is re-anchored from the next `process_samples`
+    /// `start_ms` (the gap path in `process_samples`).
+    pub fn reset(&mut self) {
+        self.vad.reset();
+        self.smoother.reset();
+        self.sample_buffer.clear();
+        self.prefill.clear();
+        self.next_frame_start_ms = 0;
+        self.current_segment = None;
     }
 
     // -----------------------------------------------------------------------
@@ -840,6 +873,74 @@ mod tests {
         assert!(
             ends >= 1,
             "flush_end_of_stream must emit SegmentEnd for in-progress segment; got {ends}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4b: reset() splits two otherwise-merging contiguous regions
+    // -----------------------------------------------------------------------
+    // Two VOICED blocks (fixture silence trimmed off both ends) fed back-to-back
+    // on a CONTIGUOUS clock have a speech-to-speech join with no silence between:
+    // the VAD never closes the first block and the second never onsets afresh
+    // (one SegmentStart). This is exactly the offline re-transcribe pause-boundary
+    // case (`runner::re_transcribe_buffer`): `pause_excluding_segments` skips the
+    // ≥PAUSE_MIN_MS silent run — which includes the pre-pause trailing silence —
+    // so the kept regions abut speech-to-speech. Calling `reset()` between the
+    // blocks (after a boundary flush) makes the second block onset a NEW segment,
+    // matching the live path which split at the pause.
+    #[test]
+    fn test_reset_splits_contiguous_regions() {
+        // Trim near-silence from both ends so the block begins and ends on voiced
+        // audio, then take ~2 s (short enough to stay under the segment-duration
+        // force-split cap, so any split is attributable to reset, not the cap).
+        fn voiced_core(samples: &[f32]) -> &[f32] {
+            const EPS: f32 = 0.02;
+            let start = samples.iter().position(|s| s.abs() > EPS).unwrap_or(0);
+            let end = samples
+                .iter()
+                .rposition(|s| s.abs() > EPS)
+                .map(|i| i + 1)
+                .unwrap_or(samples.len());
+            &samples[start..end]
+        }
+
+        let speech = load_fixture_wav();
+        let voiced = voiced_core(&speech);
+        let two_secs = SAMPLE_RATE as usize * 2;
+        let block = &voiced[..voiced.len().min(two_secs)];
+        let block_ms = (block.len() as u64 * 1000) / SAMPLE_RATE as u64;
+
+        // WITHOUT reset: feed both blocks contiguously — the speech-to-speech join
+        // merges them into ONE segment (one onset).
+        let mut merged = test_chunker();
+        let mut ev = process_all(&mut merged, block, 0);
+        ev.extend(process_all(&mut merged, block, block_ms));
+        ev.extend(merged.flush_end_of_stream().expect("flush"));
+        let starts_without_reset = ev
+            .iter()
+            .filter(|e| matches!(e, VadEvent::SegmentStart { .. }))
+            .count();
+
+        // WITH a boundary flush + reset between the blocks — the second onsets fresh.
+        let mut split = test_chunker();
+        let mut ev2 = process_all(&mut split, block, 0);
+        ev2.extend(split.flush_end_of_stream().expect("flush A"));
+        split.reset();
+        ev2.extend(process_all(&mut split, block, block_ms));
+        ev2.extend(split.flush_end_of_stream().expect("flush B"));
+        let starts_with_reset = ev2
+            .iter()
+            .filter(|e| matches!(e, VadEvent::SegmentStart { .. }))
+            .count();
+
+        assert_eq!(
+            starts_without_reset, 1,
+            "two voiced blocks abutting speech-to-speech must MERGE without a reset; \
+             got {starts_without_reset} starts"
+        );
+        assert!(
+            starts_with_reset >= 2,
+            "after reset the second region must onset a fresh segment; got {starts_with_reset} starts"
         );
     }
 

@@ -1687,7 +1687,8 @@ pub(crate) fn re_transcribe_buffer(
     // 1600 samples = 100 ms at 16 kHz — the same batch granularity the live
     // feeder uses, so VAD framing is identical to the live path.
     const BATCH_SAMPLES: usize = 1600;
-    for region in &kept {
+    let n_regions = kept.len();
+    for (region_idx, region) in kept.iter().enumerate() {
         let region_pcm = &pcm[region.src_start..region.src_end];
         // `start_ms` runs on the pause-EXCLUDING clock: it begins at the
         // region's excluding-offset and advances only over kept audio. At a
@@ -1727,6 +1728,35 @@ pub(crate) fn re_transcribe_buffer(
                     &mut produced,
                 )?;
             }
+        }
+
+        // Pause boundary (between kept regions): close any in-progress VAD
+        // segment here and reset the chunker before the next region. The
+        // skipped ≥`PAUSE_MIN_MS` silence WOULD have closed the segment in the
+        // live path (its hangover fires on ≥720 ms of silence); because the
+        // offline feeder skips that silence to reconstruct the pause-EXCLUDING
+        // clock, it must close the segment explicitly — otherwise the VAD,
+        // seeing the pre-pause region's last speech sample immediately followed
+        // by the post-pause region's first, MERGES the two utterances into one
+        // segment with the pre-pause start time (TIMELINE-DRIFT #4: the offline
+        // segmentation must match the live path's, which splits at the pause).
+        if region_idx + 1 < n_regions {
+            match vad.flush_end_of_stream() {
+                Ok(events) => {
+                    for ev in events {
+                        if let VadEvent::SegmentEnd { start_ms, end_ms, samples } = ev {
+                            acc.append(start_ms, end_ms, &samples, None);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "orchestrator",
+                        "re_transcribe region-boundary flush error: {e}"
+                    );
+                }
+            }
+            vad.reset();
         }
     }
 

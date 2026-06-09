@@ -1076,6 +1076,15 @@ meeting can never stay hidden within a session, even without a restart. Reconcil
 is best-effort (a failure logs and serves the cache as-is) and never deletes
 (removals are reconciled by the next startup `rebuild_from_disk`).
 
+The pass selection (gating + ordering — re-transcribe before diarize) is a pure
+`post_stop_passes(needs_retranscribe, needs_diarize) -> Vec<PostStopPass>`, and
+the execution (each pass tolerant of its own error — `InvalidInput`/busy logged
+at info, anything else at warn — never aborting the remaining passes) is
+`run_post_stop_passes`, which takes the per-pass call as a closure. Both are
+extracted from the `#[tauri::command]` body so the orchestration is unit-tested
+without a Tauri runtime or a real orchestrator (a recording stub injects per-pass
+results).
+
 **Responsive stop — `Finalising` state + `MeetingFinalised` event.** The
 in-session drain/finalise (transcribing the live backlog, writing the meeting
 files) runs on the runner's own thread, but `stop()` used to keep the UI in

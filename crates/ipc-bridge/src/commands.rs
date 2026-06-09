@@ -198,54 +198,106 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
     // busy with another op) is NOT auto-retried — the user-triggered re-transcribe
     // action is the recovery path. (Only the meeting INDEX self-heals, via
     // `reconcile_orphans` on `list_meetings`.)
-    let needs_retranscribe = state.orchestrator.take_transcript_incomplete();
-    let needs_diarize = state.orchestrator.diarization_enabled();
-    if needs_retranscribe || needs_diarize {
+    //
+    // The gating/ordering ([`post_stop_passes`]) and per-pass error tolerance
+    // ([`run_post_stop_passes`]) are extracted so they are unit-testable without
+    // a Tauri runtime or a real orchestrator.
+    let passes = post_stop_passes(
+        state.orchestrator.take_transcript_incomplete(),
+        state.orchestrator.diarization_enabled(),
+    );
+    if !passes.is_empty() {
         let orchestrator = std::sync::Arc::clone(&state.orchestrator);
         let index = std::sync::Arc::clone(&state.index);
         let meeting_id = meta.uuid;
         tokio::spawn(async move {
-            if needs_retranscribe {
-                if let Err(e) = orchestrator.re_transcribe(&index, meeting_id).await {
-                    // InvalidInput == the offline slot is held by another op (e.g.
-                    // the user started a new recording) — a skip, not a failure.
-                    if matches!(e, AppError::InvalidInput { .. }) {
-                        tracing::info!(
-                            target: "ipc-bridge",
-                            meeting_id = %meeting_id.0,
-                            "background re-transcribe skipped: recorder busy with another op"
-                        );
-                    } else {
-                        tracing::warn!(
-                            target: "ipc-bridge",
-                            meeting_id = %meeting_id.0,
-                            "background re-transcribe after stop failed: {e}; keeping the live \
-                             transcript (not auto-retried — use the re-transcribe action)"
-                        );
+            run_post_stop_passes(&passes, meeting_id, |pass| {
+                let orchestrator = std::sync::Arc::clone(&orchestrator);
+                let index = std::sync::Arc::clone(&index);
+                async move {
+                    match pass {
+                        PostStopPass::ReTranscribe => {
+                            orchestrator.re_transcribe(&index, meeting_id).await
+                        }
+                        PostStopPass::Rediarize => orchestrator.rediarize(&index, meeting_id).await,
                     }
                 }
-            }
-            if needs_diarize {
-                if let Err(e) = orchestrator.rediarize(&index, meeting_id).await {
-                    if matches!(e, AppError::InvalidInput { .. }) {
-                        tracing::info!(
-                            target: "ipc-bridge",
-                            meeting_id = %meeting_id.0,
-                            "background diarization skipped: recorder busy with another op"
-                        );
-                    } else {
-                        tracing::warn!(
-                            target: "ipc-bridge",
-                            meeting_id = %meeting_id.0,
-                            "background on-stop diarization failed: {e}; meeting left un-diarized"
-                        );
-                    }
-                }
-            }
+            })
+            .await;
         });
     }
 
     Ok(meta)
+}
+
+/// A background pass `stop_recording` may run after a stop, off the stop path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostStopPass {
+    /// Re-run ASR over the complete `audio.opus` (the live transcript fell behind).
+    ReTranscribe,
+    /// Run speaker diarization (`settings.diarization_enabled`).
+    Rediarize,
+}
+
+/// The ordered post-stop passes to run, derived from the two gating flags.
+///
+/// Re-transcribe always precedes diarize so diarization labels the **repaired**
+/// transcript rather than a truncated one. An empty result means no background
+/// task is spawned. Pure + unit-tested so the gating/ordering the review flagged
+/// (Step 5) is verified without a Tauri runtime.
+fn post_stop_passes(needs_retranscribe: bool, needs_diarize: bool) -> Vec<PostStopPass> {
+    let mut passes = Vec::with_capacity(2);
+    if needs_retranscribe {
+        passes.push(PostStopPass::ReTranscribe);
+    }
+    if needs_diarize {
+        passes.push(PostStopPass::Rediarize);
+    }
+    passes
+}
+
+/// Run the planned post-stop `passes` in order, invoking `run_pass` for each.
+///
+/// Each pass's error is caught and logged — `AppError::InvalidInput` (the offline
+/// slot is held by another op, e.g. the user started a new recording) at info as
+/// a skip, anything else at warn — and **never aborts the remaining passes**: the
+/// recording is already safely persisted, so a failed re-transcribe must not
+/// prevent the diarize pass (or vice versa). `run_pass` is a closure (rather than
+/// a direct `Orchestrator` call) so a stub can drive the gating/ordering/error
+/// tolerance in tests without models or audio.
+async fn run_post_stop_passes<F, Fut>(passes: &[PostStopPass], meeting_id: MeetingId, mut run_pass: F)
+where
+    F: FnMut(PostStopPass) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AppError>>,
+{
+    for &pass in passes {
+        if let Err(e) = run_pass(pass).await {
+            let busy = matches!(e, AppError::InvalidInput { .. });
+            match (pass, busy) {
+                (PostStopPass::ReTranscribe, true) => tracing::info!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "background re-transcribe skipped: recorder busy with another op"
+                ),
+                (PostStopPass::ReTranscribe, false) => tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "background re-transcribe after stop failed: {e}; keeping the live \
+                     transcript (not auto-retried — use the re-transcribe action)"
+                ),
+                (PostStopPass::Rediarize, true) => tracing::info!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "background diarization skipped: recorder busy with another op"
+                ),
+                (PostStopPass::Rediarize, false) => tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "background on-stop diarization failed: {e}; meeting left un-diarized"
+                ),
+            }
+        }
+    }
 }
 
 /// Build the [`MeetingListEntry`] for a just-stopped meeting from its
@@ -1467,5 +1519,84 @@ mod tests {
             .expect("read summary")
             .expect("summary.md must exist after summarise");
         assert_eq!(loaded, summary, "persisted summary must match returned");
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-stop background orchestration (review Step 5): gating + ordering +
+    // per-pass error tolerance, verified WITHOUT a Tauri runtime or a real
+    // orchestrator. `post_stop_passes` is pure; `run_post_stop_passes` is driven
+    // by a recording closure that injects per-pass results.
+    // -----------------------------------------------------------------------
+
+    /// Gating + ordering: no flags → no passes; each flag adds its pass; both →
+    /// re-transcribe BEFORE diarize (so diarize labels the repaired transcript).
+    #[test]
+    fn post_stop_passes_gates_and_orders() {
+        assert_eq!(post_stop_passes(false, false), vec![]);
+        assert_eq!(post_stop_passes(true, false), vec![PostStopPass::ReTranscribe]);
+        assert_eq!(post_stop_passes(false, true), vec![PostStopPass::Rediarize]);
+        assert_eq!(
+            post_stop_passes(true, true),
+            vec![PostStopPass::ReTranscribe, PostStopPass::Rediarize],
+            "re-transcribe must run before diarize"
+        );
+    }
+
+    /// An empty plan invokes `run_pass` zero times (no background work).
+    #[tokio::test]
+    async fn run_post_stop_passes_noop_when_empty() {
+        let mut calls: Vec<PostStopPass> = Vec::new();
+        run_post_stop_passes(&[], MeetingId::new(), |pass| {
+            calls.push(pass);
+            async { Ok(()) }
+        })
+        .await;
+        assert!(calls.is_empty(), "no passes → run_pass never called");
+    }
+
+    /// All planned passes run, in order, when each succeeds.
+    #[tokio::test]
+    async fn run_post_stop_passes_runs_all_in_order() {
+        let passes = post_stop_passes(true, true);
+        let mut calls: Vec<PostStopPass> = Vec::new();
+        run_post_stop_passes(&passes, MeetingId::new(), |pass| {
+            calls.push(pass);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(
+            calls,
+            vec![PostStopPass::ReTranscribe, PostStopPass::Rediarize]
+        );
+    }
+
+    /// A failed re-transcribe (InvalidInput = busy, OR any other error) is
+    /// tolerated and does NOT prevent the diarize pass from being attempted —
+    /// the recording is already safely persisted.
+    #[tokio::test]
+    async fn run_post_stop_passes_failure_does_not_abort_later_passes() {
+        for first_err in [
+            AppError::InvalidInput { context: "busy".into() },
+            AppError::Internal { context: "boom".into() },
+        ] {
+            let passes = post_stop_passes(true, true);
+            let mut calls: Vec<PostStopPass> = Vec::new();
+            // Move the error into the closure via an Option taken on first call.
+            let mut first_err = Some(first_err);
+            run_post_stop_passes(&passes, MeetingId::new(), |pass| {
+                calls.push(pass);
+                let result = match pass {
+                    PostStopPass::ReTranscribe => Err(first_err.take().expect("one re-transcribe call")),
+                    PostStopPass::Rediarize => Ok(()),
+                };
+                async move { result }
+            })
+            .await;
+            assert_eq!(
+                calls,
+                vec![PostStopPass::ReTranscribe, PostStopPass::Rediarize],
+                "diarize must still be attempted after a failed re-transcribe"
+            );
+        }
     }
 }

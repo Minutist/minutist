@@ -193,7 +193,11 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
     //      the repaired transcript (`rediarize` carries its own length-relative
     //      timeout). Emits `AppEvent::DiarizationComplete` when done.
     // Both claim the offline slot internally and run sequentially; errors are
-    // logged (the recording is safely on disk).
+    // logged (the recording is safely on disk). NOTE: `take_transcript_incomplete`
+    // is consumed here, so a re-transcribe that fails or is skipped (recorder
+    // busy with another op) is NOT auto-retried — the user-triggered re-transcribe
+    // action is the recovery path. (Only the meeting INDEX self-heals, via
+    // `reconcile_orphans` on `list_meetings`.)
     let needs_retranscribe = state.orchestrator.take_transcript_incomplete();
     let needs_diarize = state.orchestrator.diarization_enabled();
     if needs_retranscribe || needs_diarize {
@@ -203,20 +207,39 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
         tokio::spawn(async move {
             if needs_retranscribe {
                 if let Err(e) = orchestrator.re_transcribe(&index, meeting_id).await {
-                    tracing::warn!(
-                        target: "ipc-bridge",
-                        meeting_id = %meeting_id.0,
-                        "background re-transcribe after stop failed: {e}; keeping the live transcript"
-                    );
+                    // InvalidInput == the offline slot is held by another op (e.g.
+                    // the user started a new recording) — a skip, not a failure.
+                    if matches!(e, AppError::InvalidInput { .. }) {
+                        tracing::info!(
+                            target: "ipc-bridge",
+                            meeting_id = %meeting_id.0,
+                            "background re-transcribe skipped: recorder busy with another op"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "ipc-bridge",
+                            meeting_id = %meeting_id.0,
+                            "background re-transcribe after stop failed: {e}; keeping the live \
+                             transcript (not auto-retried — use the re-transcribe action)"
+                        );
+                    }
                 }
             }
             if needs_diarize {
                 if let Err(e) = orchestrator.rediarize(&index, meeting_id).await {
-                    tracing::warn!(
-                        target: "ipc-bridge",
-                        meeting_id = %meeting_id.0,
-                        "background on-stop diarization failed: {e}; meeting left un-diarized"
-                    );
+                    if matches!(e, AppError::InvalidInput { .. }) {
+                        tracing::info!(
+                            target: "ipc-bridge",
+                            meeting_id = %meeting_id.0,
+                            "background diarization skipped: recorder busy with another op"
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: "ipc-bridge",
+                            meeting_id = %meeting_id.0,
+                            "background on-stop diarization failed: {e}; meeting left un-diarized"
+                        );
+                    }
                 }
             }
         });

@@ -90,15 +90,17 @@ async fn state_machine_happy_path_emits_state_changed_events() {
         other => panic!("expected StateChanged(Recording), got {other:?}"),
     }
 
-    // --- stop → Stopping then Idle ---
-    // The `stop()` call emits StateChanged(Stopping) *before* awaiting the runner,
-    // and then StateChanged(Idle) after the runner finalises. Both events are
+    // --- stop → Stopping → Finalising → Idle ---
+    // `stop()` emits StateChanged(Stopping) before awaiting the runner, then
+    // StateChanged(Finalising) while the runner finalises on its thread, then
+    // StateChanged(Idle) + MeetingFinalised once finalise completes. All are
     // broadcast synchronously from within the stop() future, so by the time
     // stop() returns they're already in the channel.
     let meta = orch.stop().await.expect("stop");
 
-    // Drain all pending events to find Stopping and Idle.
+    // Drain pending events to find the Stopping → Finalising → Idle sequence.
     let mut saw_stopping = false;
+    let mut saw_finalising = false;
     let mut saw_idle = false;
 
     // Use recv() with a short timeout to collect all queued events.
@@ -114,10 +116,16 @@ async fn state_machine_happy_path_emits_state_changed_events() {
                 saw_stopping = true;
             }
             Ok(AppEvent::StateChanged {
+                state: RecordingState::Finalising { .. },
+            }) => {
+                saw_finalising = true;
+            }
+            Ok(AppEvent::StateChanged {
                 state: RecordingState::Idle,
             }) => {
                 saw_idle = true;
             }
+            Ok(AppEvent::MeetingFinalised { .. }) => {}
             Ok(AppEvent::AudioMeter { .. }) => {}
             Ok(other) => panic!("unexpected event: {other:?}"),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
@@ -129,16 +137,55 @@ async fn state_machine_happy_path_emits_state_changed_events() {
                 tracing::warn!("test receiver lagged by {n}");
             }
         }
-        if saw_stopping && saw_idle {
+        if saw_stopping && saw_finalising && saw_idle {
             break;
         }
     }
 
     assert!(saw_stopping, "expected StateChanged(Stopping)");
+    assert!(saw_finalising, "expected StateChanged(Finalising)");
     assert!(saw_idle, "expected StateChanged(Idle)");
     assert_eq!(orch.state().await, RecordingState::Idle);
     assert_eq!(meta.uuid, meeting_id);
     assert_eq!(meta.speaker_count, 0);
+}
+
+/// `diarize_timeout` / `retranscribe_timeout` clamp their length-relative budget
+/// at the documented floors/caps (sub-floor → floor, proportional mid-range,
+/// supra-cap → cap). re-transcribe runs ~3× real-time vs diarize's ~1×.
+#[test]
+fn timeout_helpers_clamp_to_documented_bounds() {
+    // diarize: ~1× real-time, floor 120 s, cap 600 s.
+    assert_eq!(crate::diarize_timeout(0), Duration::from_secs(120));
+    assert_eq!(crate::diarize_timeout(300_000), Duration::from_secs(300));
+    assert_eq!(crate::diarize_timeout(3_600_000), Duration::from_secs(600));
+    // re-transcribe: ~3× real-time, floor 300 s, cap 1800 s.
+    assert_eq!(crate::retranscribe_timeout(0), Duration::from_secs(300));
+    assert_eq!(crate::retranscribe_timeout(300_000), Duration::from_secs(900));
+    assert_eq!(crate::retranscribe_timeout(3_600_000), Duration::from_secs(1800));
+}
+
+/// A clean recording (live ASR kept up, no drop-oldest, drained in time) is NOT
+/// flagged incomplete through `stop()`, and `take_transcript_incomplete()`
+/// read-resets. (The drop→incomplete detection itself is covered by the
+/// runner-level `dispatch_flush_drops_oldest_when_queue_full` test.)
+#[tokio::test]
+async fn clean_recording_is_not_flagged_transcript_incomplete() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (orch, _dir) = make_orchestrator();
+    let source = DummyAudioSource::new(3200, 1600);
+    let streams = source.generate_streams(5, 32, 64);
+    orch.start_with_streams(streams).await.expect("start");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    orch.stop().await.expect("stop");
+    assert!(
+        !orch.take_transcript_incomplete(),
+        "a clean recording must not be flagged transcript-incomplete"
+    );
+    assert!(
+        !orch.take_transcript_incomplete(),
+        "take_transcript_incomplete must read-reset (still false)"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -355,6 +355,17 @@ pub enum RecordingState {
     Stopping {
         meeting_id: MeetingId,
     },
+    /// The recorder is busy but not capturing: either a just-stopped meeting is
+    /// finalising in the background (the live ASR backlog drains and
+    /// `transcript.json` / `metadata.json` / `audio.opus` are written), or an
+    /// offline re-transcribe / re-diarize pass holds the recorder (the automatic
+    /// post-stop repairs and the user-triggered actions both claim the slot).
+    /// The UI stays responsive during this window — only starting a NEW recording
+    /// waits. After a stop, `Idle` plus `AppEvent::MeetingFinalised` fire on
+    /// completion; an offline pass returns to `Idle` when it finishes.
+    Finalising {
+        meeting_id: MeetingId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +412,18 @@ pub enum AppEvent {
     },
     /// Summary generation finished; `summary.md` now exists for this meeting.
     SummaryReady { meeting_id: MeetingId },
+    /// A stopped meeting finished finalising on disk (`transcript.json` +
+    /// `metadata.json` written, `audio.opus` closed). The webview refreshes the
+    /// meeting list so the just-recorded meeting appears. Distinct from
+    /// `StateChanged { Idle }`: the list refresh keys on the meeting being
+    /// *ready on disk*, which is exactly when this fires.
+    MeetingFinalised { meeting_id: MeetingId },
+    /// An offline re-transcribe finished rewriting `transcript.json`. The webview
+    /// re-reads the meeting's transcript (list excerpt + any open-meeting view),
+    /// mirroring `DiarizationComplete`. Emitted by both the user-triggered
+    /// re-transcribe and the background post-stop repair, so a repaired
+    /// transcript surfaces without a manual refresh even when diarization is off.
+    TranscriptReady { meeting_id: MeetingId },
     /// Model download progress, used by the first-run flow.
     ModelDownloadProgress {
         model_id: ModelId,

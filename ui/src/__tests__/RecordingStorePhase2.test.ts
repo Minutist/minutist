@@ -94,7 +94,17 @@ describe("recording store — Phase 2 extensions", () => {
     expect(useRecordingStore.getState().lastError).toBeNull();
   });
 
+  /** Put the store into a live recording so transcript_segment events for that
+   * meeting append (segments are filtered by the live meeting_id). */
+  function startLive(meetingId: string) {
+    useRecordingStore.getState().handleEvent({
+      kind: "state_changed",
+      state: { kind: "recording", meeting_id: meetingId, started_at_ms: 0 },
+    });
+  }
+
   it("handleEvent transcript_segment appends segment to transcript", () => {
+    startLive("m1");
     const seg = makeSegment(1000, "first segment");
     const event: AppEvent = {
       kind: "transcript_segment",
@@ -109,6 +119,7 @@ describe("recording store — Phase 2 extensions", () => {
   });
 
   it("handleEvent transcript_segment appends multiple segments in order", () => {
+    startLive("m1");
     const segs = [
       makeSegment(0, "first"),
       makeSegment(1000, "second"),
@@ -126,6 +137,19 @@ describe("recording store — Phase 2 extensions", () => {
     const stored = useRecordingStore.getState().transcript;
     expect(stored).toHaveLength(3);
     expect(stored.map((s) => s.text)).toEqual(["first", "second", "third"]);
+  });
+
+  it("handleEvent transcript_segment ignores segments for a non-live meeting", () => {
+    // A background/offline re-transcribe emits transcript_segment for a
+    // previously-stopped meeting; with no matching live recording it must NOT
+    // pollute the live transcript array.
+    startLive("m1");
+    useRecordingStore.getState().handleEvent({
+      kind: "transcript_segment",
+      meeting_id: "other-meeting",
+      segment: makeSegment(0, "from an offline re-transcribe"),
+    });
+    expect(useRecordingStore.getState().transcript).toHaveLength(0);
   });
 
   it("handleEvent state_changed → recording clears transcript", () => {

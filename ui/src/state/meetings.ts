@@ -143,16 +143,26 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   },
 
   handleEvent: (event) => {
-    if (event.kind !== "diarization_complete") return;
-    // Diarization finished assigning speakers to THIS meeting's segments
-    // (`transcript.json` was rewritten with the overlaid `speaker_id`s). Re-read
-    // that meeting's transcript via `open_meeting` SCOPED TO THE EVENT'S
-    // `meeting_id` — not the live recording store — so the restored
-    // `openMeetingState.transcript` (the source the transcript pane reads for a
-    // saved meeting, U1) reflects the new speaker tags. Only act when the event
-    // is for the meeting currently open, so an unrelated meeting's event does
-    // not clobber the open-meeting view (and a re-diarize triggered from the
-    // list while no meeting is open quietly refreshes only the list).
+    if (event.kind === "meeting_finalised") {
+      // A just-stopped meeting finished finalising on disk (the background
+      // drain/finalise completed). Refresh the list so the new row appears —
+      // `list_meetings` reconciles it from disk if the stop-time upsert has not
+      // landed yet. This is what makes the meeting show without a manual
+      // refresh now that finalise is decoupled from the stop response.
+      void get().refresh();
+      return;
+    }
+    if (event.kind !== "diarization_complete" && event.kind !== "transcript_ready")
+      return;
+    // A background/offline pass rewrote THIS meeting's `transcript.json`:
+    // diarization overlaid `speaker_id`s (`diarization_complete`), or a
+    // re-transcribe repaired the text (`transcript_ready`). Re-read that
+    // meeting's transcript via `open_meeting` SCOPED TO THE EVENT'S `meeting_id`
+    // — not the live recording store — so the restored `openMeetingState.transcript`
+    // (the source the transcript pane reads for a saved meeting, U1) reflects the
+    // new content. Only act when the event is for the meeting currently open, so
+    // an unrelated meeting's event does not clobber the open-meeting view (a pass
+    // triggered while no meeting is open quietly refreshes only the list).
     const eventMeetingId = event.meeting_id;
     if (get().openMeetingId !== eventMeetingId) {
       // Not the open meeting: refresh the list so the row's speaker count

@@ -429,6 +429,22 @@ export type AppEvent =
  */
 { kind: "summary_ready"; meeting_id: MeetingId } | 
 /**
+ * A stopped meeting finished finalising on disk (`transcript.json` +
+ * `metadata.json` written, `audio.opus` closed). The webview refreshes the
+ * meeting list so the just-recorded meeting appears. Distinct from
+ * `StateChanged { Idle }`: the list refresh keys on the meeting being
+ * *ready on disk*, which is exactly when this fires.
+ */
+{ kind: "meeting_finalised"; meeting_id: MeetingId } | 
+/**
+ * An offline re-transcribe finished rewriting `transcript.json`. The webview
+ * re-reads the meeting's transcript (list excerpt + any open-meeting view),
+ * mirroring `DiarizationComplete`. Emitted by both the user-triggered
+ * re-transcribe and the background post-stop repair, so a repaired
+ * transcript surfaces without a manual refresh even when diarization is off.
+ */
+{ kind: "transcript_ready"; meeting_id: MeetingId } | 
+/**
  * Model download progress, used by the first-run flow.
  */
 { kind: "model_download_progress"; model_id: ModelId; bytes_done: number; bytes_total: number | null } | 
@@ -601,7 +617,18 @@ export type NotesDocument = { notes_json: string; notes_markdown: string }
  * pause-*excluding* clock (same origin as `Segment::start_ms`). The
  * `started_at_ms` recipe above is for elapsed-time *display* only.
  */
-export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id: MeetingId; started_at_ms: number } | { kind: "paused"; meeting_id: MeetingId; paused_at_ms: number } | { kind: "stopping"; meeting_id: MeetingId }
+export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id: MeetingId; started_at_ms: number } | { kind: "paused"; meeting_id: MeetingId; paused_at_ms: number } | { kind: "stopping"; meeting_id: MeetingId } | 
+/**
+ * The recorder is busy but not capturing: either a just-stopped meeting is
+ * finalising in the background (the live ASR backlog drains and
+ * `transcript.json` / `metadata.json` / `audio.opus` are written), or an
+ * offline re-transcribe / re-diarize pass holds the recorder (the automatic
+ * post-stop repairs and the user-triggered actions both claim the slot).
+ * The UI stays responsive during this window — only starting a NEW recording
+ * waits. After a stop, `Idle` plus `AppEvent::MeetingFinalised` fire on
+ * completion; an offline pass returns to `Idle` when it finishes.
+ */
+{ kind: "finalising"; meeting_id: MeetingId }
 /**
  * One transcript segment with optional speaker assignment.
  * 

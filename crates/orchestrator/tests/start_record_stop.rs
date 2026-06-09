@@ -312,8 +312,9 @@ async fn pause_resume_decoded_duration_includes_pause_gap() {
 
     // Collect state-change events and verify the ordering.
     //
-    // All five transitions are already emitted onto the broadcast channel by
-    // the orchestrator calls above; this loop only drains them. The deadline
+    // All six transitions (… → Stopping → Finalising → Idle) are already emitted
+    // onto the broadcast channel by the orchestrator calls above; this loop only
+    // drains them. The deadline
     // must therefore tolerate a saturated scheduler — when the gated
     // transcription_e2e binary loads a model and runs CPU inference in a
     // parallel test process, a tight 500 ms window starved this drain loop and
@@ -338,8 +339,8 @@ async fn pause_resume_decoded_duration_includes_pause_gap() {
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
         }
-        // Recording → Paused → Recording → Stopping → Idle = 5 transitions.
-        if events.len() >= 5 {
+        // Recording → Paused → Recording → Stopping → Finalising → Idle = 6.
+        if events.len() >= 6 {
             break;
         }
     }
@@ -364,6 +365,12 @@ async fn pause_resume_decoded_duration_includes_pause_gap() {
         "expected RecordingState::Stopping event, got: {events:?}"
     );
     assert!(
+        events.iter().any(
+            |s| matches!(s, RecordingState::Finalising { meeting_id: mid } if *mid == meeting_id)
+        ),
+        "expected RecordingState::Finalising event, got: {events:?}"
+    );
+    assert!(
         events.iter().any(|s| matches!(s, RecordingState::Idle)),
         "expected RecordingState::Idle event, got: {events:?}"
     );
@@ -379,6 +386,7 @@ async fn pause_resume_decoded_duration_includes_pause_gap() {
     let pos_recording = first_pos(&|s| matches!(s, RecordingState::Recording { .. }));
     let pos_paused = first_pos(&|s| matches!(s, RecordingState::Paused { .. }));
     let pos_stopping = first_pos(&|s| matches!(s, RecordingState::Stopping { .. }));
+    let pos_finalising = first_pos(&|s| matches!(s, RecordingState::Finalising { .. }));
     let pos_idle = first_pos(&|s| matches!(s, RecordingState::Idle));
 
     assert!(
@@ -390,8 +398,12 @@ async fn pause_resume_decoded_duration_includes_pause_gap() {
         "Paused must appear before Stopping in event stream"
     );
     assert!(
-        pos_stopping < pos_idle,
-        "Stopping must appear before Idle in event stream"
+        pos_stopping < pos_finalising,
+        "Stopping must appear before Finalising in event stream"
+    );
+    assert!(
+        pos_finalising < pos_idle,
+        "Finalising must appear before Idle in event stream"
     );
 
     // Decode the resulting audio.opus and check the pause gap is included.

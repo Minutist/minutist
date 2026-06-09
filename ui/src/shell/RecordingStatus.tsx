@@ -43,6 +43,7 @@ export function RecordingStatus() {
   const isRecording = kind === "recording";
   const isPaused = kind === "paused";
   const isStopping = kind === "stopping";
+  const isFinalising = kind === "finalising";
 
   const start = startedAtMs(state);
   const [now, setNow] = useState(() => Date.now());
@@ -69,6 +70,10 @@ export function RecordingStatus() {
     label = "Paused";
   } else if (isStopping) {
     label = "Stopping…";
+  } else if (isFinalising) {
+    // The recorder is finalising the meeting in the background; the UI stays
+    // responsive (only a new recording is gated until this completes).
+    label = "Finalising…";
   } else {
     label = "Ready";
   }

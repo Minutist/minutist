@@ -403,9 +403,23 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         // Trigger a re-fetch; ignore the promise — fire and forget.
         void get().refreshDevices();
         break;
-      case "transcript_segment":
-        set((s) => ({ transcript: [...s.transcript, event.segment] }));
+      case "transcript_segment": {
+        // Only append segments from the LIVE recording. An offline/background
+        // re-transcribe emits `transcript_segment` for a previously-stopped
+        // meeting (and the recorder is then in `finalising`, not `recording`),
+        // so matching on the live meeting_id keeps those out of the live
+        // transcript array — that pass persists the full transcript and emits
+        // `transcript_ready`, which the meetings store handles instead.
+        const live = get().state;
+        const liveId =
+          live.kind === "recording" || live.kind === "paused"
+            ? live.meeting_id
+            : null;
+        if (liveId !== null && liveId === event.meeting_id) {
+          set((s) => ({ transcript: [...s.transcript, event.segment] }));
+        }
         break;
+      }
       case "error_occurred":
         set({ lastError: ipcErrorMessage(event.error) });
         break;

@@ -9,8 +9,9 @@
 //! Idle → Recording  (start)
 //! Recording → Paused  (pause)
 //! Paused → Recording  (resume)
-//! Recording | Paused → Stopping  (stop)
-//! Stopping → Idle  (runner task completion)
+//! Recording | Paused → Stopping  (stop — capture stopping)
+//! Stopping → Finalising  (background drain/finalise begins)
+//! Stopping | Finalising → Idle  (finalise complete)
 //! ```
 
 use meeting_app_common::{AppError, AppResult, MeetingId, RecordingState};
@@ -40,18 +41,22 @@ pub(crate) enum InternalState {
     Stopping {
         meeting_id: MeetingId,
     },
-    /// An offline operation (re-transcribe / re-diarize) is running. The
-    /// recorder is not live, but the slot is **claimed** so a concurrent
-    /// `start`, `re_transcribe`, or `rediarize` is rejected and cannot clobber
-    /// the same meeting's `transcript.json` (TIMELINE-DRIFT #5). Restored to
-    /// `Idle` when the op completes (including on error).
-    ///
-    /// `meeting_id` records which meeting holds the claim; it is surfaced via
-    /// the `Debug` derive in the release-path diagnostic log. It is otherwise
-    /// not read (the claim is a binary gate, not keyed on the id), hence the
-    /// `allow(dead_code)` — keeping the id documents the claim and aids tracing.
+    /// Capture has stopped; the meeting is finalising in the background (drain +
+    /// transcript/metadata/audio writes). The recorder is still busy — a new
+    /// `start` is refused — but it reports a distinct public state so the UI
+    /// stays responsive. See `RecordingState::Finalising`.
+    Finalising {
+        meeting_id: MeetingId,
+    },
+    /// An offline operation (re-transcribe / re-diarize, including the automatic
+    /// post-stop repair passes) is running. The recorder is not live, but the
+    /// slot is **claimed** so a concurrent `start`, `re_transcribe`, or
+    /// `rediarize` is rejected and cannot clobber the same meeting's
+    /// `transcript.json` (TIMELINE-DRIFT #5). Restored to `Idle` when the op
+    /// completes (including on error). `meeting_id` is surfaced as the public
+    /// `Finalising` state's id (see [`InternalState::as_public`]) so the UI gates
+    /// Start and shows a busy indicator while the claim is held.
     Offline {
-        #[allow(dead_code)]
         meeting_id: MeetingId,
     },
 }
@@ -79,11 +84,18 @@ impl InternalState {
             InternalState::Stopping { meeting_id } => RecordingState::Stopping {
                 meeting_id: *meeting_id,
             },
-            // An offline op leaves the recorder idle from the webview's
-            // perspective (no live capture); the claim is internal-only. The
-            // public `RecordingState` (in `common`) has no Offline variant and
-            // must not gain one, so it maps to Idle.
-            InternalState::Offline { .. } => RecordingState::Idle,
+            InternalState::Finalising { meeting_id } => RecordingState::Finalising {
+                meeting_id: *meeting_id,
+            },
+            // An offline op (re-transcribe / re-diarize, incl. the automatic
+            // post-stop repair passes) holds the claim, so a new `start` is
+            // refused. Report `Finalising` rather than `Idle` so the UI gates the
+            // Start button and shows a busy state instead of enabling Start into
+            // an `InvalidInput` failure. `common` has no `Offline` variant; the
+            // existing `Finalising` busy-state covers this.
+            InternalState::Offline { meeting_id } => RecordingState::Finalising {
+                meeting_id: *meeting_id,
+            },
         }
     }
 }
@@ -214,15 +226,33 @@ pub(crate) fn transition_stop(state: &mut InternalState) -> AppResult<MeetingId>
     }
 }
 
-/// Drive Stopping → Idle once the runner task completes.
+/// Drive Stopping → Finalising when the background drain/finalise begins.
+///
+/// Keeps the recorder marked busy (a new `start` is refused) while the meeting
+/// finalises off the stop path, but reports a distinct public state so the UI
+/// stays responsive instead of showing a blocking "stopping" indicator.
+pub(crate) fn transition_finalising(state: &mut InternalState) -> AppResult<MeetingId> {
+    match state {
+        InternalState::Stopping { meeting_id } => {
+            let id = *meeting_id;
+            *state = InternalState::Finalising { meeting_id: id };
+            Ok(id)
+        }
+        _ => Err(AppError::Internal {
+            context: "transition_finalising called outside Stopping state".into(),
+        }),
+    }
+}
+
+/// Drive Stopping | Finalising → Idle once finalise completes.
 pub(crate) fn transition_idle(state: &mut InternalState) -> AppResult<()> {
     match state {
-        InternalState::Stopping { .. } => {
+        InternalState::Stopping { .. } | InternalState::Finalising { .. } => {
             *state = InternalState::Idle;
             Ok(())
         }
         _ => Err(AppError::Internal {
-            context: "transition_idle called outside Stopping state".into(),
+            context: "transition_idle called outside Stopping/Finalising state".into(),
         }),
     }
 }

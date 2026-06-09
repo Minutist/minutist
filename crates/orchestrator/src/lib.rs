@@ -60,8 +60,8 @@ use model_registry::ModelRegistry;
 use persistence::{MeetingIndex, MeetingWriter};
 use settings::SettingsHandle;
 use state::{
-    transition_idle, transition_offline_claim, transition_offline_release, transition_pause,
-    transition_resume, transition_start, transition_stop, InternalState,
+    transition_finalising, transition_idle, transition_offline_claim, transition_offline_release,
+    transition_pause, transition_resume, transition_start, transition_stop, InternalState,
 };
 use tokio::sync::{broadcast, Mutex};
 
@@ -449,6 +449,24 @@ impl Orchestrator {
                     context: "runner command channel closed before stop could be sent".into(),
                 })?;
 
+            // Capture has stopped and the Stop command is dispatched; the runner
+            // now finalises (drain + writes) on its own thread. Mark the recorder
+            // Finalising and broadcast it so the UI stays responsive while the
+            // (possibly slow) drain runs — `Stopping` was momentary; only a NEW
+            // recording is gated until finalise completes.
+            {
+                let mut guard = self.inner.lock().await;
+                if let Err(e) = transition_finalising(&mut guard.state) {
+                    tracing::warn!(
+                        target: "orchestrator",
+                        "unexpected state entering finalise: {e:?}"
+                    );
+                }
+            }
+            self.emit(AppEvent::StateChanged {
+                state: RecordingState::Finalising { meeting_id },
+            });
+
             let finalised = reply_rx.await.map_err(|_| AppError::Internal {
                 context: "runner reply channel closed before finalise completed".into(),
             })??;
@@ -481,6 +499,11 @@ impl Orchestrator {
         self.emit(AppEvent::StateChanged {
             state: RecordingState::Idle,
         });
+
+        // The meeting is now fully on disk. Announce it so the webview refreshes
+        // the meeting list (the row appears via `reconcile_orphans`/`upsert`);
+        // distinct from the `Idle` transition, which also fires in other paths.
+        self.emit(AppEvent::MeetingFinalised { meeting_id });
 
         tracing::info!(
             target: "orchestrator",
@@ -594,7 +617,26 @@ impl Orchestrator {
         );
         let missing_model_id = runner::engine_model_id(engine);
 
-        let segments: Vec<Segment> = tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
+        // Bound the (uninterruptible) offline ASR run with a length-relative
+        // timeout sized for ASR (slower than diarization), mirroring the
+        // diarization timeout in `rediarize_inner`: a wedged or pathologically
+        // slow re-transcribe must not hold the offline claim — and thereby block
+        // the next recording — without bound. On timeout we return before any
+        // transcript write; the abandoned `spawn_blocking` thread's result is
+        // discarded (tokio cannot cancel it).
+        let duration_dir = meeting_dir.clone();
+        let duration_ms = tokio::task::spawn_blocking(move || {
+            persistence::read_metadata(&duration_dir).map(|m| m.duration_ms)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("re_transcribe metadata read join failed: {e}"),
+        })??;
+        let budget = retranscribe_timeout(duration_ms);
+
+        let segments: Vec<Segment> = match tokio::time::timeout(
+            budget,
+            tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
             // Decode pause-INCLUDING PCM.
             let pcm = persistence::read_audio_pcm(&meeting_dir_for_blocking)?;
 
@@ -620,11 +662,24 @@ impl Orchestrator {
             };
 
             runner::re_transcribe_buffer(&pcm, runtime.as_mut(), &event_tx, meeting_id)
-        })
+            }),
+        )
         .await
-        .map_err(|e| AppError::Internal {
-            context: format!("re_transcribe spawn_blocking join failed: {e}"),
-        })??;
+        {
+            Ok(joined) => joined.map_err(|e| AppError::Internal {
+                context: format!("re_transcribe spawn_blocking join failed: {e}"),
+            })??,
+            Err(_elapsed) => {
+                return Err(AppError::Inference {
+                    backend: "asr".to_string(),
+                    context: format!(
+                        "re-transcribe exceeded its {} s budget (recording {duration_ms} ms); \
+                         transcript left unchanged",
+                        budget.as_secs(),
+                    ),
+                });
+            }
+        };
 
         self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
             .await
@@ -641,8 +696,17 @@ impl Orchestrator {
     /// so two concurrent offline ops (or an offline op racing a `start`) can no
     /// longer both pass the gate and clobber the same `transcript.json`.
     async fn claim_offline(&self, meeting_id: MeetingId) -> AppResult<()> {
-        let mut guard = self.inner.lock().await;
-        transition_offline_claim(&mut guard.state, meeting_id)
+        {
+            let mut guard = self.inner.lock().await;
+            transition_offline_claim(&mut guard.state, meeting_id)?;
+        }
+        // Broadcast the busy state (Offline maps to the public `Finalising`) so
+        // the webview gates Start while the offline op holds the claim, rather
+        // than enabling Start into an `InvalidInput` failure.
+        self.emit(AppEvent::StateChanged {
+            state: RecordingState::Finalising { meeting_id },
+        });
+        Ok(())
     }
 
     /// Release an offline claim, returning the recorder to `Idle`.
@@ -650,8 +714,14 @@ impl Orchestrator {
     /// Called on every exit path of an offline op (success and error) so a
     /// failed op never wedges the recorder out of `Idle`.
     async fn release_offline(&self) {
-        let mut guard = self.inner.lock().await;
-        transition_offline_release(&mut guard.state);
+        {
+            let mut guard = self.inner.lock().await;
+            transition_offline_release(&mut guard.state);
+        }
+        // Return the public state to Idle so the UI re-enables Start.
+        self.emit(AppEvent::StateChanged {
+            state: RecordingState::Idle,
+        });
     }
 
     /// Rewrite `transcript.json` from the refreshed `segments` and refresh the
@@ -701,6 +771,13 @@ impl Orchestrator {
         })??;
 
         index.upsert(&entry).await?;
+
+        // Announce the refreshed transcript so the webview re-reads it (the
+        // meeting-list excerpt + any open-meeting view), mirroring how
+        // `finalise_diarization` emits `DiarizationComplete`. Without this, a
+        // background re-transcribe with diarization OFF (the default) would leave
+        // the UI showing the stale/truncated transcript until a manual refresh.
+        self.emit(AppEvent::TranscriptReady { meeting_id });
 
         tracing::info!(
             target: "orchestrator",
@@ -1044,6 +1121,20 @@ fn diarize_timeout(recording_duration_ms: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Length-relative timeout budget for an offline re-transcribe.
+///
+/// Like [`diarize_timeout`] but sized for ASR, which re-runs the model over the
+/// full audio and is slower than diarization: ~3x real-time, floored at 5 min,
+/// capped at 30 min. Deliberately generous so a legitimate long re-transcribe is
+/// not cut short; the bound exists so a wedged ASR run cannot hold the offline
+/// claim (and block the next recording) forever.
+fn retranscribe_timeout(recording_duration_ms: u64) -> Duration {
+    const FLOOR_SECS: u64 = 300; // 5 min
+    const CAP_SECS: u64 = 1800; // 30 min
+    let secs = (recording_duration_ms / 1000 * 3).clamp(FLOOR_SECS, CAP_SECS);
+    Duration::from_secs(secs)
+}
+
 /// The `ModelDescriptor` recorded in `metadata.json` after a diarization pass.
 ///
 /// Identifies the bundled segmentation model (the diarizer is a two-model
@@ -1291,7 +1382,6 @@ impl Orchestrator {
         self.release_offline().await;
         result
     }
-
 
     /// Borrow the orchestrator's `SettingsHandle` so a test can flip a setting
     /// (e.g. `diarization_enabled`) on the same handle `stop()` reads.

@@ -71,6 +71,11 @@ update in the same commit.
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
 
+The recorder-lifecycle additions `RecordingState::Finalising` and the
+`AppEvent::{MeetingFinalised, TranscriptReady}` variants are documented with
+their producers in the `orchestrator`/`ipc-bridge` "Responsive stop" and
+re-transcribe notes below.
+
 **Phase 7 — shared LlamaBackend (feature-gated).** Behind the optional
 `llama-backend` feature (`dep:llama-cpp-2`, OFF by default so the default
 `common` build stays pure), `common` exposes
@@ -726,17 +731,23 @@ are produced it emits `AppEvent::TranscriptSegment` (the same event the live pat
 emits), rewrites `transcript.json` via `persistence::write_transcript` (atomic
 tmp+rename; an empty result removes the file), and refreshes the index row
 (`MeetingIndex::upsert`) so the meeting-list excerpt reflects the new first
-segment. Unlike the live path's best-effort skip when no model is present, an
-explicit user-triggered re-transcribe with no available model is an error
-(`AppError::ModelLoad`). The orchestrator does not own a `MeetingIndex`; the
-index handle is passed in by `ipc-bridge` (which owns it in `IpcState`).
-Besides the user-triggered command, `ipc-bridge` also spawns this as a
-**background pass after `stop()`** when the live transcript fell behind
-(`take_transcript_incomplete()` — set by the runner on a drop-oldest flush or a
-stop-drain timeout), repairing both mid-recording drops AND a truncated tail from
-the complete audio; that background invocation logs and swallows errors (e.g. a
-missing model) rather than surfacing them, since the live transcript is already
-on disk.
+segment, then emits `AppEvent::TranscriptReady { meeting_id }` so the webview
+re-reads the transcript (mirroring `DiarizationComplete`). The ASR run is wrapped
+in a length-relative timeout (`retranscribe_timeout`: ≈3× real-time, floored 5
+min / capped 30 min — generous, since ASR is slower than diarization), so a
+wedged run cannot hold the offline claim forever. Unlike the live path's
+best-effort skip when no model is present, an explicit user-triggered
+re-transcribe with no available model is an error (`AppError::ModelLoad`). The
+orchestrator does not own a `MeetingIndex`; the index handle is passed in by
+`ipc-bridge` (which owns it in `IpcState`). Besides the user-triggered command,
+`ipc-bridge` also spawns this as a **background pass after `stop()`** when the
+live transcript fell behind (`take_transcript_incomplete()` — set by the runner
+on a drop-oldest flush or a stop-drain timeout), repairing both mid-recording
+drops AND a truncated tail from the complete audio; that background invocation
+logs and swallows errors (a missing model, or an `InvalidInput` claim-skip when
+the recorder is busy) rather than surfacing them, since the live transcript is
+already on disk. A failed/skipped background re-transcribe is NOT auto-retried
+(the flag is consumed) — the user-triggered command is the recovery.
 
 **Test seam — `re_transcribe_with_backend(&MeetingIndex, MeetingId, Box<dyn
 AsrBackend + Send>)`.** A `#[cfg(any(test, feature = "test-source"))]`-gated
@@ -1035,8 +1046,13 @@ timed out — `re_transcribe` re-runs ASR over the complete `audio.opus`, the
 authoritative transcript (the audio is captured in full regardless of live-ASR
 speed); (2) if `orchestrator.diarization_enabled()`, `rediarize` runs AFTER any
 re-transcribe so it labels the repaired transcript — each with its own
-length-relative timeout. Both refresh the index row and emit their events on
-completion (errors logged). And because a derived cache can always drift from
+length-relative timeout (`retranscribe_timeout` / `diarize_timeout`). Both
+refresh the index row and emit their events on completion (`TranscriptReady` /
+`DiarizationComplete`; errors logged, claim-skips logged at info). While a pass
+holds the offline claim the recorder reports the public `Finalising` busy state
+(`Offline → Finalising` in `as_public`, broadcast by `claim_offline`/
+`release_offline`), so the webview gates the Start button instead of enabling it
+into an `InvalidInput` failure. And because a derived cache can always drift from
 disk, `list_meetings` first calls
 `MeetingIndex::reconcile_orphans(meetings_dir)` — a cheap `readdir` + set-diff
 that lazily indexes any meeting folder present on disk but missing from the cache
@@ -1044,6 +1060,21 @@ that lazily indexes any meeting folder present on disk but missing from the cach
 meeting can never stay hidden within a session, even without a restart. Reconcile
 is best-effort (a failure logs and serves the cache as-is) and never deletes
 (removals are reconciled by the next startup `rebuild_from_disk`).
+
+**Responsive stop — `Finalising` state + `MeetingFinalised` event.** The
+in-session drain/finalise (transcribing the live backlog, writing the meeting
+files) runs on the runner's own thread, but `stop()` used to keep the UI in
+`Stopping` for its whole duration (up to the 30 s drain). `stop()` now, after
+dispatching the stop command, broadcasts `RecordingState::Finalising` and flips
+to `Idle` only once the runner replies — so the webview stays responsive during
+the drain; the record controls treat `finalising` as busy, gating only a NEW
+recording, which the state machine enforces (`Recording|Paused → Stopping →
+Finalising → Idle`, via `transition_finalising`). On completion `stop()` emits
+`Idle` plus `AppEvent::MeetingFinalised { meeting_id }`; the webview's meetings
+store refreshes on that event so the just-finalised meeting appears (through
+`reconcile_orphans`/`upsert`) with no manual refresh. `RecordingState` gains a
+`Finalising` variant and `AppEvent` a `MeetingFinalised` variant — bindings
+regenerated.
 
 **Phase 4 additions (18 commands at Phase 4; `re_summarise` removed in Phase 5)
 — meeting list / open / actions.** Six commands back the meeting-list view

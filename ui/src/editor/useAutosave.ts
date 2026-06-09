@@ -19,14 +19,15 @@ export const DEFAULT_AUTOSAVE_INTERVAL_SECS = 5;
 /**
  * Extract the MeetingId from a recording state, or `null` when idle.
  *
- * `idle` has no meeting; `recording` / `paused` / `stopping` all reference the
- * in-flight meeting.
+ * `idle` has no meeting; `recording` / `paused` / `stopping` / `finalising` all
+ * reference the in-flight (or finalising) meeting.
  */
 export function activeMeetingId(state: RecordingState): string | null {
   switch (state.kind) {
     case "recording":
     case "paused":
     case "stopping":
+    case "finalising":
       return state.meeting_id;
     case "idle":
       return null;

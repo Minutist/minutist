@@ -28,16 +28,22 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
+use agent_tools::{ToolContext, ToolOutput};
+use chat_agent::{LlamaTurnBackend, LlamaTurnConfig, TurnEngine};
 use meeting_app_common::{
-    AppError, AppEvent, AudioDevice, MeetingId, MeetingListEntry, MeetingMeta, MeetingState,
-    ModelId, ModelStatus, NotesDocument, RecordingState, Summariser,
+    AppError, AppEvent, AppResult, AudioDevice, ChatMessage, ChatRole, ChatSession, ChatSessionId,
+    MeetingId, MeetingListEntry, MeetingMeta, MeetingState, ModelId, ModelStatus, NotesDocument,
+    RecordingState, Summariser,
 };
-use persistence::{meeting_ops, NotesStore};
+use persistence::{meeting_ops, ChatStore, NotesStore};
 use settings::Settings;
 use summariser::{LlamaSummariser, SummariserConfig};
 use tauri::State;
 use tokio::sync::broadcast;
 
+use crate::chat::{engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX};
 use crate::{error::IpcError, IpcState};
 
 /// The bundled default LLM model id used when `settings.llm_model_id` is unset.
@@ -62,7 +68,7 @@ pub const DEFAULT_LLM_MODEL_ID: &str = "gemma-4-e4b-it-q4_k_m";
 /// Extracted (rather than inlined in the command) so the settings-override /
 /// fallback decision is unit-testable without a Tauri runtime or an
 /// orchestrator (a Phase 5 design decision).
-fn resolve_llm_model_id(settings: &Settings) -> ModelId {
+pub(crate) fn resolve_llm_model_id(settings: &Settings) -> ModelId {
     settings
         .llm_model_id
         .clone()
@@ -665,32 +671,26 @@ pub async fn summarise_meeting(
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
     let settings = state.settings.current();
-    let model_id = resolve_llm_model_id(&settings);
 
-    // Resolve (download if needed) the model directory on the async worker.
-    let model_dir = state
-        .orchestrator
-        .ensure_model_path(&model_id)
-        .await
-        .map_err(IpcError::from)?;
+    // Phase 9 (C2): use the HELD summariser substrate — loaded once on first
+    // chat/summarise use and shared with the chat agent — instead of opening a
+    // fresh `LlamaSummariser` per call (the old per-call GGUF reload killed
+    // latency). `ensure_summariser` resolves the model id + directory via the
+    // orchestrator (keeping the `model-registry` edge there) and opens the GGUF
+    // on `spawn_blocking` the FIRST time only; thereafter this is a cheap clone.
+    let summariser = state.ensure_summariser().await?;
 
     let meetings_dir = state.meetings_dir.clone();
     // Resolve the preset-aware effective prompt (Phase 9 — D4): the user's
     // custom `summary_system_prompt` override when non-empty, else the built-in
     // prompt for the selected `summary_preset`.
     let system_prompt = settings.effective_summary_prompt();
-    // GPU offload is a runtime decision: only when BOTH the build has a GPU
-    // feature AND the `gpu_acceleration` setting is on. `resolve_summariser_gpu_layers`
-    // returns the compile-time ceiling when on, `0` (force CPU) when off (see
-    // `architecture/cross-cutting.md` — "GPU portability").
-    let n_gpu_layers = resolve_summariser_gpu_layers(settings.gpu_acceleration);
 
-    // Heavy, synchronous summariser work on a blocking thread. The summariser
-    // is constructed inside the closure so the GGUF load happens off the async
-    // worker threads.
+    // Heavy, synchronous summarise work on a blocking thread (the held model's
+    // `summarise` builds a fresh `LlamaContext` and decodes). The held handle is
+    // cloned into the closure; no GGUF reload.
     let summary_md = tokio::task::spawn_blocking(move || {
-        let summariser = open_summariser_in_dir(&model_dir, n_gpu_layers)?;
-        summarise_meeting_inner(&meetings_dir, meeting_id, &summariser, &system_prompt)
+        summarise_meeting_inner(&meetings_dir, meeting_id, summariser.as_ref(), &system_prompt)
     })
     .await
     .map_err(|e| AppError::Internal {
@@ -818,7 +818,7 @@ fn save_summary_inner(
 /// so a CPU build is unaffected by the flag); `enabled == false` → `0` (force
 /// CPU even in a GPU build). Pure + unit-tested so the wiring is verified
 /// without a model. See `architecture/cross-cutting.md` — "GPU portability".
-fn resolve_summariser_gpu_layers(enabled: bool) -> u32 {
+pub(crate) fn resolve_summariser_gpu_layers(enabled: bool) -> u32 {
     if enabled {
         summariser::gpu_layers()
     } else {
@@ -837,7 +837,7 @@ fn resolve_summariser_gpu_layers(enabled: bool) -> u32 {
 /// but the helper defends against a directory that also contains an `mmproj-*`
 /// file so the wrong file is never loaded. A missing or ambiguous weights file
 /// is an `AppError::ModelLoad`.
-fn open_summariser_in_dir(
+pub(crate) fn open_summariser_in_dir(
     model_dir: &Path,
     n_gpu_layers: u32,
 ) -> Result<LlamaSummariser, AppError> {
@@ -901,6 +901,381 @@ fn emit_summary_ready(event_tx: &broadcast::Sender<AppEvent>, meeting_id: Meetin
             target: "ipc-bridge",
             "SummaryReady dropped (no subscribers)"
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat (Phase 9)
+// ---------------------------------------------------------------------------
+
+/// Send a user message to the chat agent for a meeting, streaming the reply.
+///
+/// Creates or loads the chat [`ChatSession`], appends the user message, and
+/// **spawns the turn on a background task**, returning the session id
+/// immediately. The turn streams to the webview via the chat `AppEvent`s
+/// (`ChatToken` / `ChatToolCall` / `ChatToolResult` / `ChatTurnComplete` /
+/// `ChatError`) on the shared bus; the updated session is persisted via
+/// [`ChatStore`] at turn end. A second `send_chat_message` for a session whose
+/// turn is still running is rejected with `InvalidInput { "session busy" }`
+/// (§6 — single in-flight turn per session).
+///
+/// The engine work runs on `spawn_blocking` (the LLM is FFI-bound); tool
+/// dispatch re-enters async via a captured `Handle::block_on` for the dispatch
+/// step only (§4.5 — the one place async/sync cross).
+#[tauri::command]
+#[specta::specta]
+pub async fn send_chat_message(
+    meeting_id: Option<MeetingId>,
+    session_id: Option<ChatSessionId>,
+    message: String,
+    state: State<'_, IpcState>,
+) -> Result<ChatSessionId, IpcError> {
+    if message.trim().is_empty() {
+        return Err(AppError::InvalidInput {
+            context: "chat message must not be empty".into(),
+        }
+        .into());
+    }
+
+    let meetings_dir = state.meetings_dir.clone();
+
+    // Load the existing session (when a session id + meeting id are given) or
+    // start a fresh one. Persistence reads run on a blocking thread.
+    let mut session = load_or_new_session(&meetings_dir, meeting_id, session_id).await?;
+    let sid = session.id;
+
+    // Single in-flight turn per session.
+    {
+        let mut in_flight = state.chat_in_flight.lock().expect("chat_in_flight poisoned");
+        if !in_flight.insert(sid) {
+            return Err(AppError::InvalidInput {
+                context: "session busy: a turn is already running".into(),
+            }
+            .into());
+        }
+    }
+
+    // The per-session monotonic turn id: one past the max already recorded.
+    let turn_id = session
+        .messages
+        .iter()
+        .map(|m| m.turn_id)
+        .max()
+        .map_or(0, |t| t + 1);
+
+    // Append the user message to the persisted session up front so it is durable
+    // even if the turn errors mid-flight.
+    session.messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: message.clone(),
+        tool_name: None,
+        turn_id,
+    });
+
+    // Ensure the held model is loaded (downloads on first use) BEFORE spawning,
+    // so a load failure surfaces synchronously to the caller rather than only as
+    // a ChatError event. Cheap after the first call.
+    let summariser = match state.ensure_summariser().await {
+        Ok(s) => s,
+        Err(e) => {
+            state.chat_in_flight.lock().expect("chat_in_flight poisoned").remove(&sid);
+            return Err(e);
+        }
+    };
+
+    // Build the tool context for this session (default_meeting scopes meeting_id
+    // omission for the internal UI).
+    let ctx = ToolContext::new(
+        Arc::clone(&state.orchestrator),
+        Arc::clone(&state.index),
+        meetings_dir.clone(),
+        summariser.clone() as Arc<dyn Summariser>,
+        state.event_tx.clone(),
+        meeting_id,
+    );
+
+    let system_prompt = state.settings.current().chat_system_prompt.clone();
+    let registry = Arc::clone(&state.tool_registry);
+    let event_tx = state.event_tx.clone();
+    let in_flight = Arc::clone(&state.chat_in_flight);
+    let handle = tokio::runtime::Handle::current();
+
+    // Spawn the driver; the turn streams via events. The session id is returned
+    // to the caller now. The turn task OWNS `session` (already carrying the user
+    // message); at the end it appends the turn's produced messages and SAVES the
+    // whole in-memory session. The single-in-flight-turn guard makes this turn the
+    // sole writer, so we save the in-memory copy directly rather than
+    // reload-and-append — that guarantees the user message is persisted, even when
+    // the turn errors mid-flight.
+    tokio::spawn(async move {
+        let join = tokio::task::spawn_blocking(move || {
+            let produced = run_chat_turn_on_held_model(
+                &summariser,
+                &registry,
+                &ctx,
+                &handle,
+                sid,
+                turn_id,
+                &system_prompt,
+                &session,
+                &event_tx,
+            );
+            (session, produced)
+        })
+        .await;
+
+        match join {
+            Ok((mut session, Ok(produced))) => {
+                session.messages.extend(produced);
+                persist_session(&meetings_dir, meeting_id, session).await;
+            }
+            Ok((session, Err(_))) => {
+                // The driver already emitted ChatError; still persist the session
+                // so the user's message (and any earlier turns) are not lost.
+                persist_session(&meetings_dir, meeting_id, session).await;
+            }
+            Err(join_err) => {
+                tracing::warn!(target: "ipc-bridge", "chat turn task join failed: {join_err}");
+            }
+        }
+        in_flight.lock().expect("chat_in_flight poisoned").remove(&sid);
+    });
+
+    Ok(sid)
+}
+
+/// Get one chat session for a meeting, or `None` when it does not exist.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_chat_session(
+    meeting_id: MeetingId,
+    session_id: ChatSessionId,
+    state: State<'_, IpcState>,
+) -> Result<Option<ChatSession>, IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || ChatStore::load(&meetings_dir, meeting_id, session_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("get_chat_session task join failed: {e}"),
+        })?
+        .map_err(IpcError::from)
+}
+
+/// List all chat sessions for a meeting, most-recently-updated first.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_chat_sessions(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<Vec<ChatSession>, IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || ChatStore::list(&meetings_dir, meeting_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("list_chat_sessions task join failed: {e}"),
+        })?
+        .map_err(IpcError::from)
+}
+
+/// Delete one chat session for a meeting (idempotent).
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_chat_session(
+    meeting_id: MeetingId,
+    session_id: ChatSessionId,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || ChatStore::delete(&meetings_dir, meeting_id, session_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("delete_chat_session task join failed: {e}"),
+        })?
+        .map_err(IpcError::from)
+}
+
+// ---------------------------------------------------------------------------
+// Chat command bodies — extracted so the State-free turn loop is unit-tested in
+// `crate::chat` with a stub engine + stub tools (no model, no Tauri runtime).
+// ---------------------------------------------------------------------------
+
+/// Load the session named by `session_id` for `meeting_id`, or build a fresh one.
+///
+/// A given `(meeting_id, session_id)` that exists is loaded; otherwise a new
+/// session with a fresh id is returned (and `session_id`, if it was supplied but
+/// not found, is honoured so the webview's chosen id is kept). Blocking reads on
+/// `spawn_blocking`.
+async fn load_or_new_session(
+    meetings_dir: &std::path::Path,
+    meeting_id: Option<MeetingId>,
+    session_id: Option<ChatSessionId>,
+) -> Result<ChatSession, IpcError> {
+    let now = chrono::Utc::now().to_rfc3339();
+
+    if let (Some(mid), Some(sid)) = (meeting_id, session_id) {
+        let dir = meetings_dir.to_path_buf();
+        let existing = tokio::task::spawn_blocking(move || ChatStore::load(&dir, mid, sid))
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("load_or_new_session task join failed: {e}"),
+            })?
+            .map_err(IpcError::from)?;
+        if let Some(session) = existing {
+            return Ok(session);
+        }
+    }
+
+    Ok(ChatSession {
+        id: session_id.unwrap_or_default(),
+        meeting_id,
+        title: None,
+        messages: Vec::new(),
+        created_at: now.clone(),
+        updated_at: now,
+    })
+}
+
+/// Persist the full in-memory chat `session` (prior history + the user message +
+/// the turn's produced messages) via [`ChatStore`].
+///
+/// The single-in-flight-turn guard (`chat_in_flight`) makes the running turn the
+/// sole writer of this session, so we save the in-memory copy DIRECTLY rather
+/// than reload-and-append. The earlier reload-and-append dropped the user message
+/// entirely (it lived only in the in-memory `session`, which was never on disk).
+/// A meeting-less session is not persisted (no folder to write into); the streamed
+/// events already delivered the reply to the webview.
+async fn persist_session(
+    meetings_dir: &std::path::Path,
+    meeting_id: Option<MeetingId>,
+    mut session: ChatSession,
+) {
+    let Some(mid) = meeting_id else {
+        return;
+    };
+    session.updated_at = chrono::Utc::now().to_rfc3339();
+    let session_id = session.id;
+    let dir = meetings_dir.to_path_buf();
+    let result =
+        tokio::task::spawn_blocking(move || ChatStore::save(&dir, mid, &session)).await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            target: "ipc-bridge",
+            session_id = %session_id.0,
+            "persisting chat session failed: {e}"
+        ),
+        Err(join_err) => tracing::warn!(
+            target: "ipc-bridge",
+            "persist_session task join failed: {join_err}"
+        ),
+    }
+}
+
+/// Drive ONE chat turn on the held model (the `spawn_blocking` body).
+///
+/// Builds the real [`TurnEngine`] over a [`LlamaTurnBackend`] from the borrowed
+/// held model, runs the State-free [`run_chat_turn`] loop, and dispatches each
+/// tool call by re-entering async via `handle.block_on(registry.dispatch(...))`
+/// — the only async/sync crossing (§4.5). Tokens + tool + completion events are
+/// emitted on `event_tx` through the emit closure, which ALSO records the wire
+/// messages this turn produced (the assistant final + each tool result) so the
+/// caller can persist them. Returns those wire messages.
+#[allow(clippy::too_many_arguments)]
+fn run_chat_turn_on_held_model(
+    summariser: &LlamaSummariser,
+    registry: &agent_tools::ToolRegistry,
+    ctx: &ToolContext,
+    handle: &tokio::runtime::Handle,
+    session_id: ChatSessionId,
+    turn_id: u64,
+    system_prompt: &str,
+    session: &ChatSession,
+    event_tx: &broadcast::Sender<AppEvent>,
+) -> Result<Vec<ChatMessage>, AppError> {
+    let backend = LlamaTurnBackend::new(summariser.model(), LlamaTurnConfig::default());
+    let engine = TurnEngine::new(backend);
+    let descriptors = registry.descriptors();
+    let cfg = chat_sampler_config();
+
+    // Rebuild the engine-internal history: pinned system prompt + the prior
+    // persisted messages (which include the just-appended user message).
+    let mut history = initial_history(system_prompt);
+    history.extend(session.messages.iter().map(engine_message_from_wire));
+    // Everything the driver appends to `history` past this point is THIS turn's
+    // output (the assistant final + each tool result).
+    let prefix_len = history.len();
+
+    // The emit closure just forwards each event to the bus. The persisted turn
+    // messages are derived from the engine-history DELTA below (not from events),
+    // so a `Tool` message persists the FULL machine payload (the engine's
+    // `content`) rather than the one-line human `ChatToolResult.summary` — a
+    // reloaded multi-turn session then feeds the model the same tool data it saw
+    // live.
+    let emit = |event: AppEvent| emit_chat_event(event_tx, event);
+
+    // The dispatch closure: re-enter async for the registry dispatch only.
+    let dispatch = |call: &chat_agent::ToolCall| -> AppResult<ToolOutput> {
+        let args: serde_json::Value = serde_json::from_str(&call.arguments_json).map_err(|e| {
+            AppError::InvalidInput {
+                context: format!("tool {} arguments are not valid JSON: {e}", call.name),
+            }
+        })?;
+        handle.block_on(registry.dispatch(ctx, &call.name, args))
+    };
+
+    let outcome = run_chat_turn(
+        &engine,
+        session_id,
+        turn_id,
+        &mut history,
+        &descriptors,
+        &cfg,
+        CHAT_N_CTX,
+        dispatch,
+        emit,
+    );
+
+    // The loop already emitted ChatError on failure; surface it for the caller's
+    // log (the caller still persists the user message).
+    outcome?;
+
+    // Derive the turn's produced wire messages from the engine-history DELTA: the
+    // assistant final + each tool result the driver appended. Tool messages carry
+    // the FULL machine payload (the engine `content`) + the tool name, so a
+    // reloaded session is faithful to what the model saw in-turn.
+    Ok(wire_produced_from_delta(&history[prefix_len..], turn_id))
+}
+
+/// Map the engine-history delta a turn produced (assistant final + tool results,
+/// in order) into persisted/wire [`ChatMessage`]s. Pure + unit-tested.
+fn wire_produced_from_delta(
+    new_engine_messages: &[chat_agent::ChatMessage],
+    turn_id: u64,
+) -> Vec<ChatMessage> {
+    new_engine_messages
+        .iter()
+        .map(|m| ChatMessage {
+            role: wire_role(m.role),
+            content: m.content.clone(),
+            tool_name: m.name.clone(),
+            turn_id,
+        })
+        .collect()
+}
+
+/// The default chat sampler config (§6.4): a small-temperature sampling chain.
+/// The driver injects a per-turn non-zero seed before each `run_turn`; the base
+/// config's fixed `seed = 0` is never used on a non-greedy turn.
+fn chat_sampler_config() -> chat_agent::SamplerConfig {
+    chat_agent::SamplerConfig::default()
+}
+
+/// Emit one chat `AppEvent` on the shared broadcast sender (mirror of
+/// [`emit_summary_ready`]). A send with no live subscribers is not an error.
+fn emit_chat_event(event_tx: &broadcast::Sender<AppEvent>, event: AppEvent) {
+    if event_tx.send(event).is_err() {
+        tracing::trace!(target: "ipc-bridge", "chat event dropped (no subscribers)");
     }
 }
 
@@ -1602,5 +1977,100 @@ mod tests {
                 "diarize must still be attempted after a failed re-transcribe"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Chat-turn persistence (regression guards for the IMPL-4a review CRITICAL +
+    // WARNING-2): the user message must be persisted, and a Tool message must
+    // persist the FULL machine payload (not the one-line event summary).
+    // -----------------------------------------------------------------------
+
+    /// `wire_produced_from_delta` maps the engine-history delta to wire messages
+    /// carrying the FULL tool payload + the tool name (not the lossy summary).
+    #[test]
+    fn wire_produced_from_delta_keeps_full_tool_payload() {
+        let delta = vec![
+            chat_agent::ChatMessage::tool_result(
+                "call_1",
+                "get_summary",
+                r#"{"decisions":["ship Phase 9"]}"#,
+            ),
+            chat_agent::ChatMessage::assistant("We decided to ship Phase 9."),
+        ];
+        let wire = wire_produced_from_delta(&delta, 3);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0].role, ChatRole::Tool);
+        assert_eq!(wire[0].tool_name.as_deref(), Some("get_summary"));
+        assert!(
+            wire[0].content.contains("decisions"),
+            "the full machine payload must be persisted, not a one-line summary"
+        );
+        assert_eq!(wire[0].turn_id, 3);
+        assert_eq!(wire[1].role, ChatRole::Assistant);
+        assert_eq!(wire[1].content, "We decided to ship Phase 9.");
+        assert!(wire[1].tool_name.is_none());
+    }
+
+    /// `persist_session` saves the WHOLE in-memory session — including the user
+    /// message (the IMPL-4a CRITICAL: it was previously dropped) and the
+    /// full-payload tool message — without a reload-and-append.
+    #[tokio::test]
+    async fn persist_session_round_trips_user_and_full_tool_payload() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = MeetingId::new();
+        MeetingFolder::create(root, meeting_id).expect("meeting folder");
+        let sid = ChatSessionId::new();
+
+        let session = ChatSession {
+            id: sid,
+            meeting_id: Some(meeting_id),
+            title: None,
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "what was decided?".into(),
+                    tool_name: None,
+                    turn_id: 0,
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: r#"{"decisions":["ship"]}"#.into(),
+                    tool_name: Some("get_summary".into()),
+                    turn_id: 0,
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: "We decided to ship.".into(),
+                    tool_name: None,
+                    turn_id: 0,
+                },
+            ],
+            created_at: "2026-06-10T00:00:00Z".into(),
+            updated_at: "2026-06-10T00:00:00Z".into(),
+        };
+
+        persist_session(root, Some(meeting_id), session).await;
+
+        let loaded = ChatStore::load(root, meeting_id, sid)
+            .expect("load")
+            .expect("session must be persisted");
+        // CRITICAL regression guard: the user message survives.
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .any(|m| m.role == ChatRole::User && m.content == "what was decided?"),
+            "the user message must be persisted"
+        );
+        // WARNING-2 guard: the Tool message keeps the full payload + tool name.
+        let tool = loaded
+            .messages
+            .iter()
+            .find(|m| m.role == ChatRole::Tool)
+            .expect("a tool message must be persisted");
+        assert!(tool.content.contains("decisions"), "full tool payload persisted");
+        assert_eq!(tool.tool_name.as_deref(), Some("get_summary"));
+        assert_eq!(loaded.messages.len(), 3);
     }
 }

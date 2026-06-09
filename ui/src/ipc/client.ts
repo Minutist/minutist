@@ -96,6 +96,17 @@ export const commands: Commands = {
   // the Vitest mocks still intercept here.
   rediarizeMeeting: (meetingId) =>
     callCommand("rediarizeMeeting", [meetingId]),
+  // Phase 9 chat surface. The backend (this step, 4a) is wired; the chat UI is
+  // a later step (4b). These delegations exist so the typed `commands` surface
+  // matches the regenerated `bindings.ts` and consumers have a single seam.
+  sendChatMessage: (meetingId, sessionId, message) =>
+    callCommand("sendChatMessage", [meetingId, sessionId, message]),
+  getChatSession: (meetingId, sessionId) =>
+    callCommand("getChatSession", [meetingId, sessionId]),
+  listChatSessions: (meetingId) =>
+    callCommand("listChatSessions", [meetingId]),
+  deleteChatSession: (meetingId, sessionId) =>
+    callCommand("deleteChatSession", [meetingId, sessionId]),
 };
 
 // Re-export types that callers commonly need. `AppEvent` is the generated

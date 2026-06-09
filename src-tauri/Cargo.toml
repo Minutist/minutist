@@ -37,6 +37,7 @@ meeting-app-common = { path = "../crates/common" }
 ipc-bridge = { path = "../crates/ipc-bridge" }
 orchestrator = { path = "../crates/orchestrator" }
 model-registry = { path = "../crates/model-registry" }
+agent-tools = { path = "../crates/agent-tools" }
 settings = { path = "../crates/settings" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-fs = { workspace = true }

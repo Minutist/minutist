@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (21 total)
+//! ## Commands (25 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -29,10 +29,23 @@
 //! | `get_summary` | `Option<String>` | 5 |
 //! | `save_summary` | `()` | 5 |
 //! | `rediarize_meeting` | `()` | 6 |
+//! | `send_chat_message` | `ChatSessionId` | 9 |
+//! | `get_chat_session` | `Option<ChatSession>` | 9 |
+//! | `list_chat_sessions` | `Vec<ChatSession>` | 9 |
+//! | `delete_chat_session` | `()` | 9 |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
 //! action points at `summarise_meeting`, so the stub had no caller.
+//!
+//! The Phase-9 chat commands realise the granted `ipc-bridge → agent-tools` +
+//! `ipc-bridge → chat-agent` edges. `send_chat_message` creates/loads the chat
+//! [`meeting_app_common::ChatSession`], appends the user message, and spawns the
+//! turn on a background task; the turn streams via the chat `AppEvent`s and the
+//! session is persisted via `persistence::ChatStore` at turn end. The held LLM
+//! substrate ([`IpcState::summariser`], a lazily-loaded `Arc<LlamaSummariser>`)
+//! is loaded once and shared by both the chat engine (which borrows
+//! `&LlamaModel`) and `summarise_meeting` (Phase 9 — C2).
 //!
 //! All commands return `Result<T, IpcError>`.
 //!
@@ -83,6 +96,7 @@
 //!
 //! All log calls use `target: "ipc-bridge"`.
 
+pub mod chat;
 pub mod commands;
 pub mod error;
 pub mod events;
@@ -90,12 +104,14 @@ pub mod events;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_tools::ToolRegistry;
 use meeting_app_common::AppEvent;
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use settings::SettingsHandle;
+use summariser::LlamaSummariser;
 use tauri_specta::{collect_commands, collect_events, Builder};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, OnceCell};
 
 pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
@@ -138,6 +154,71 @@ pub struct IpcState {
     /// re-deriving it from the orchestrator) keeps the single-bus invariant from
     /// `architecture/cross-cutting.md` "Model lifecycle".
     pub event_tx: broadcast::Sender<AppEvent>,
+    /// The lazily-loaded, **held** LLM summariser substrate (Phase 9, C2).
+    ///
+    /// The GGUF is loaded **once** on first chat/summarise use (via
+    /// [`Self::ensure_summariser`]) and retained for the process lifetime, rather
+    /// than reloaded per call. Both the one-shot `summarise_meeting` path and the
+    /// chat driver share this handle: the chat engine borrows `&LlamaModel` via
+    /// `LlamaSummariser::model()`, and the `agent-tools` `ToolContext`'s
+    /// `resummarise` coerces it to `Arc<dyn Summariser>`. `tokio::sync::OnceCell`
+    /// gives a `Send + Sync`, awaitable single-init that the async command
+    /// handlers can drive without a `block_on`. See
+    /// `architecture/cross-cutting.md` — "Agent chat loop".
+    pub summariser: Arc<OnceCell<Arc<LlamaSummariser>>>,
+    /// The chat tool registry, built once (`ToolRegistry::v1(false)` — the
+    /// inter-agent bridge tool is Phase 10). Shared by the chat driver, which
+    /// reads `descriptors()` for the offered tools and `dispatch(...)` to run
+    /// them. Held as `Arc` so it crosses into the per-turn `spawn_blocking`
+    /// dispatch closure.
+    pub tool_registry: Arc<ToolRegistry>,
+    /// Per-session in-flight guard for the chat driver. A session id present in
+    /// this set has a turn currently running; `send_chat_message` rejects a
+    /// concurrent turn for the same session (§6 — single in-flight turn). A
+    /// `std::sync::Mutex<HashSet>` (not async) because every access is a brief,
+    /// non-awaiting insert/remove.
+    pub chat_in_flight:
+        Arc<std::sync::Mutex<std::collections::HashSet<meeting_app_common::ChatSessionId>>>,
+}
+
+impl IpcState {
+    /// Resolve the **held** summariser, loading the GGUF once on first use.
+    ///
+    /// The model id is the user-selected `settings.llm_model_id` or the bundled
+    /// default ([`commands::DEFAULT_LLM_MODEL_ID`]); the directory is resolved
+    /// (downloaded + verified when absent) via `Orchestrator::ensure_model_path`
+    /// — keeping the `model-registry` edge inside the orchestrator. The GGUF is
+    /// opened on `spawn_blocking` (the heavy load is synchronous) with the
+    /// GPU-offload count resolved from the `gpu_acceleration` setting **at load
+    /// time** (a held model is loaded once, so its GPU placement is fixed for the
+    /// process — toggling the setting takes effect on the next start). Subsequent
+    /// calls return the cached `Arc` without reloading.
+    pub async fn ensure_summariser(&self) -> Result<Arc<LlamaSummariser>, IpcError> {
+        let handle = self
+            .summariser
+            .get_or_try_init(|| async {
+                let settings = self.settings.current();
+                let model_id = commands::resolve_llm_model_id(&settings);
+                let model_dir = self.orchestrator.ensure_model_path(&model_id).await?;
+                let n_gpu_layers =
+                    commands::resolve_summariser_gpu_layers(settings.gpu_acceleration);
+                let summariser = tokio::task::spawn_blocking(move || {
+                    commands::open_summariser_in_dir(&model_dir, n_gpu_layers)
+                })
+                .await
+                .map_err(|e| meeting_app_common::AppError::Internal {
+                    context: format!("summariser load task join failed: {e}"),
+                })??;
+                tracing::info!(
+                    target: "ipc-bridge",
+                    "held LLM summariser loaded (shared by summarise + chat)"
+                );
+                Ok::<_, meeting_app_common::AppError>(Arc::new(summariser))
+            })
+            .await
+            .map_err(IpcError::from)?;
+        Ok(Arc::clone(handle))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +275,7 @@ pub fn open_meeting_index(
 // bindings_builder — shared builder for app-main and the export helper
 // ---------------------------------------------------------------------------
 
-/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1–6 commands
+/// Construct a `tauri_specta::Builder` pre-loaded with all Phase 1–9 commands
 /// and the `AppEventPayload` event.
 ///
 /// Both `app-main` (to build the invoke handler) and a bindings-export helper
@@ -241,6 +322,10 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::get_summary,
             commands::save_summary,
             commands::rediarize_meeting,
+            commands::send_chat_message,
+            commands::get_chat_session,
+            commands::list_chat_sessions,
+            commands::delete_chat_session,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -262,9 +347,11 @@ mod tests {
     /// it for each expected command name.  Each command appears in the TS
     /// as a string literal in the `invoke` call.
     ///
-    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21
+    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
     /// (P5 removes `re_summarise` and adds `summarise_meeting` / `get_summary`
-    /// / `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`: 20 + 1 = 21).
+    /// / `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`: 20 + 1 = 21;
+    /// P9 adds `send_chat_message` / `get_chat_session` / `list_chat_sessions` /
+    /// `delete_chat_session`: 21 + 4 = 25).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -301,9 +388,13 @@ mod tests {
             "get_summary",
             "save_summary",
             "rediarize_meeting",
+            "send_chat_message",
+            "get_chat_session",
+            "list_chat_sessions",
+            "delete_chat_session",
         ];
 
-        assert_eq!(expected.len(), 21, "command ledger must be 21 in Phase 6");
+        assert_eq!(expected.len(), 25, "command ledger must be 25 in Phase 9");
 
         // `re_summarise` was removed in Phase 5 (no caller once
         // `summarise_meeting` landed); assert it is gone from the surface.

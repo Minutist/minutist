@@ -444,6 +444,50 @@ constraints are binding on them):
   re-establishes names afterward. Names are an overlay applied at read time, never
   baked into `transcript.json`.
 
+- **The driver loop (`ipc-bridge`, on `spawn_blocking`).** `chat-agent`'s
+  `ChatEngine` is stateless per call; the driver owns the conversation history and
+  the turn loop. The loop is a State-free generic helper
+  (`ipc_bridge::chat::run_chat_turn`, generic over the engine + a tool-dispatch
+  closure + an emit closure) so the default test suite drives a full turn — a
+  final-only turn, a tool-call-then-final turn, the max-iteration cap, and a
+  hard-floor context overflow — with a stub engine and stub tools, no model and no
+  Tauri runtime. Per iteration: apply `chat_agent::trim_to_budget` (hard floor →
+  reject `InvalidInput { "message too large for context window" }`), run one
+  engine turn streaming `ChatToken`s, then either return the `Final` text (emit
+  `ChatTurnComplete`) or dispatch each requested tool (emit `ChatToolCall`,
+  `registry.dispatch`, emit `ChatToolResult`, append a tool-result message) and
+  loop. A `MAX_TOOL_ITERATIONS` cap bounds the loop: once hit, the engine is
+  re-invoked with NO tools to force a final answer; a turn that still cannot finish
+  emits `ChatError`. Tool dispatch re-enters async via a captured
+  `Handle::block_on(registry.dispatch(...))` for the dispatch step only (§4.5 — the
+  one async/sync crossing).
+
+- **Per-turn seed (binding).** `chat_agent::SamplerConfig`'s default `seed` is `0`,
+  which is FIXED/reproducible — every non-greedy reply would be verbatim-identical.
+  The driver therefore injects a per-turn **non-zero** seed (derived from
+  wall-clock nanos + a process-wide nonce + the turn id) before each non-greedy
+  `run_turn`. The deterministic (greedy, `temperature == 0.0`) profile leaves the
+  seed untouched — it is ignored on the greedy path and the test suite relies on
+  greedy reproducibility.
+
+- **Chat persistence (`persistence::ChatStore`).** The driver persists the session
+  through `ChatStore` at **turn end** (re-loading the on-disk session first so a
+  concurrent edit is not clobbered, then appending the turn's produced messages):
+  `{meetings_dir}/{meeting_id}/chat/{session_id}.json`, atomic tmp+rename,
+  `persistence` the sole writer. A meeting-less session is not persisted (the
+  events already delivered the reply). `delete_meeting` removes the meeting folder,
+  so chat sessions go with it.
+
+- **Held-model lifecycle (C2).** The LLM GGUF is loaded **once**, lazily, on first
+  chat/summarise use into `IpcState::summariser`
+  (`Arc<OnceCell<Arc<LlamaSummariser>>>`), and shared by both the chat engine (which
+  borrows `&LlamaModel`) and the one-shot `summarise_meeting` path (refactored from
+  its prior per-call GGUF load). GPU placement is resolved from the
+  `gpu_acceleration` setting **at load time**; toggling it takes effect on the next
+  process start. Each turn still allocates a fresh `LlamaContext` (clean KV cache).
+  A single in-flight turn per session is enforced via
+  `IpcState::chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`.
+
 ## Configuration
 
 Single source: the `settings` crate, backed by a `serde_json` + `std::fs`

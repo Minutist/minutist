@@ -19,6 +19,8 @@
 import type {
   AppEvent,
   AudioDevice,
+  ChatSession,
+  ChatSessionId,
   ModelStatus,
   RecordingState,
   Result,
@@ -473,6 +475,33 @@ export const devCommands = {
         speaker_count: 2,
       }),
     );
+    return ok(null);
+  },
+  // Phase 9 chat surface (4a backend). The chat UI (4b) is not built yet, so
+  // the DEV shim returns inert stubs — enough for the typed `commands` surface
+  // and so any early caller in `vite dev` does not throw.
+  async sendChatMessage(
+    _meetingId: MeetingId | null,
+    sessionId: ChatSessionId | null,
+    _message: string,
+  ): Promise<Result<ChatSessionId, IpcError>> {
+    return ok(sessionId ?? "00000000-0000-4000-8000-000000000000");
+  },
+  async getChatSession(
+    _meetingId: MeetingId,
+    _sessionId: ChatSessionId,
+  ): Promise<Result<ChatSession | null, IpcError>> {
+    return ok(null);
+  },
+  async listChatSessions(
+    _meetingId: MeetingId,
+  ): Promise<Result<ChatSession[], IpcError>> {
+    return ok([]);
+  },
+  async deleteChatSession(
+    _meetingId: MeetingId,
+    _sessionId: ChatSessionId,
+  ): Promise<Result<null, IpcError>> {
     return ok(null);
   },
 };

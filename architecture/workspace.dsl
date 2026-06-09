@@ -213,10 +213,13 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
         meetingApp.core.ipcBridge -> meetingApp.core.orchestrator "Invokes commands; subscribes to events"
         meetingApp.core.ipcBridge -> meetingApp.core.persistence "Meeting list / load / delete"
-        meetingApp.core.ipcBridge -> meetingApp.core.summariser  "Triggers Summarise"
+        meetingApp.core.ipcBridge -> meetingApp.core.summariser  "Triggers Summarise; holds the LLM substrate"
         meetingApp.core.ipcBridge -> meetingApp.core.settings    "Get / set settings"
+        meetingApp.core.ipcBridge -> meetingApp.core.agentTools  "Builds the registry + context; dispatches tools"
+        meetingApp.core.ipcBridge -> meetingApp.core.chatAgent   "Holds the engine; drives the turn loop"
         meetingApp.core.appMain   -> meetingApp.core.ipcBridge   "Mounts command handlers"
         meetingApp.core.appMain   -> meetingApp.core.orchestrator "Owns lifetime"
+        meetingApp.core.appMain   -> meetingApp.core.agentTools  "Wires the tool registry"
 
         // Webview ↔ ipc-bridge.
         meetingApp.webview.ipcClient -> meetingApp.core.ipcBridge "invoke + listen" "Tauri IPC"

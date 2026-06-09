@@ -2172,6 +2172,9 @@ dependencies = [
 name = "ipc-bridge"
 version = "0.0.0"
 dependencies = [
+ "agent-tools",
+ "chat-agent",
+ "chrono",
  "meeting-app-common",
  "model-registry",
  "orchestrator",
@@ -2623,6 +2626,7 @@ dependencies = [
 name = "meeting-app"
 version = "0.0.0"
 dependencies = [
+ "agent-tools",
  "ipc-bridge",
  "meeting-app-common",
  "model-registry",

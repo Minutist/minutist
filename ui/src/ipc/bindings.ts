@@ -356,6 +356,63 @@ async rediarizeMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Send a user message to the chat agent for a meeting, streaming the reply.
+ * 
+ * Creates or loads the chat [`ChatSession`], appends the user message, and
+ * **spawns the turn on a background task**, returning the session id
+ * immediately. The turn streams to the webview via the chat `AppEvent`s
+ * (`ChatToken` / `ChatToolCall` / `ChatToolResult` / `ChatTurnComplete` /
+ * `ChatError`) on the shared bus; the updated session is persisted via
+ * [`ChatStore`] at turn end. A second `send_chat_message` for a session whose
+ * turn is still running is rejected with `InvalidInput { "session busy" }`
+ * (§6 — single in-flight turn per session).
+ * 
+ * The engine work runs on `spawn_blocking` (the LLM is FFI-bound); tool
+ * dispatch re-enters async via a captured `Handle::block_on` for the dispatch
+ * step only (§4.5 — the one place async/sync cross).
+ */
+async sendChatMessage(meetingId: MeetingId | null, sessionId: ChatSessionId | null, message: string) : Promise<Result<ChatSessionId, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("send_chat_message", { meetingId, sessionId, message }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Get one chat session for a meeting, or `None` when it does not exist.
+ */
+async getChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<Result<ChatSession | null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_chat_session", { meetingId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List all chat sessions for a meeting, most-recently-updated first.
+ */
+async listChatSessions(meetingId: MeetingId) : Promise<Result<ChatSession[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_chat_sessions", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Delete one chat session for a meeting (idempotent).
+ */
+async deleteChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_chat_session", { meetingId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -530,6 +587,68 @@ export type AudioFormat = { codec: string; sample_rate: number; channels: number
  * compute alongside capture.
  */
 export type AudioMeterFrame = { peak: number; rms: number }
+/**
+ * One persisted chat message (the wire / on-disk shape).
+ * 
+ * Distinct from `chat-agent`'s engine-internal message: this is the durable,
+ * specta-typed record the webview renders and `persistence::ChatStore`
+ * serialises. `turn_id` is the per-session monotonic turn counter the streaming
+ * chat `AppEvent`s also carry, so the UI can correlate a stored message with
+ * the deltas it saw live. `tool_name` is present only on `Tool` messages (the
+ * name of the tool whose result the message carries).
+ */
+export type ChatMessage = { role: ChatRole; content: string; 
+/**
+ * For a `Tool` message: the tool whose result this message carries.
+ * `None` for system/user/assistant messages.
+ */
+tool_name?: string | null; 
+/**
+ * The per-session monotonic turn this message belongs to. The user message
+ * and the assistant/tool messages produced answering it share one `turn_id`
+ * (the same value the `ChatToken`/`ChatTurnComplete` events carry).
+ */
+turn_id: number }
+/**
+ * The role of one persisted chat message as it crosses the IPC boundary and is
+ * stored on disk.
+ * 
+ * This is the **wire / persisted** role, distinct from `chat-agent`'s
+ * engine-internal `Role` (which serialises the same snake_case names for the
+ * oaicompat template but is a different type owned by that crate). The driver
+ * (`ipc-bridge`) maps between the engine's history and these persisted/wire
+ * shapes at its boundary. `serde` snake_case so the TS binding mirrors the
+ * engine's role names.
+ */
+export type ChatRole = 
+/**
+ * The session's system prompt (turn 0): persona + meeting context.
+ */
+"system" | 
+/**
+ * A message the user typed.
+ */
+"user" | 
+/**
+ * An assistant reply (the model's final text for a turn).
+ */
+"assistant" | 
+/**
+ * A tool-result message appended after the driver ran a tool call.
+ */
+"tool"
+/**
+ * A persisted chat session for one meeting.
+ * 
+ * `persistence::ChatStore` stores this under
+ * `{meetings_dir}/{meeting_id}/chat/{session_id}.json` (atomic tmp+rename); the
+ * chat IPC commands load/save it. `meeting_id` is optional so a session may be
+ * un-scoped (an MCP-originated session that targets no specific meeting);
+ * `title` is optional so an untitled session round-trips. Timestamps are RFC
+ * 3339 strings to avoid pulling a time crate into `common`, mirroring
+ * `MeetingMeta::started_at`.
+ */
+export type ChatSession = { id: ChatSessionId; meeting_id?: MeetingId | null; title?: string | null; messages: ChatMessage[]; created_at: string; updated_at: string }
 /**
  * Stable identifier for a chat session on disk. UUIDv4. Mirrors [`MeetingId`].
  * 
@@ -722,13 +841,14 @@ start_hidden?: boolean;
  */
 autosave_interval_secs?: number; 
 /**
- * Summary system prompt passed to the summariser (FR-28).
+ * Optional CUSTOM summary system prompt that OVERRIDES the selected
+ * [`SummaryPreset`] (FR-28 / D4).
  * 
- * The `summariser` forwards this verbatim as the chat `system` message
- * when generating `summary.md`. Defaults to a structured-summary
- * instruction (headings / key decisions / action items); an older store
- * written before this field existed deserialises to the default via
- * `#[serde(default = ...)]`.
+ * Empty by default (the common case): [`Settings::effective_summary_prompt`]
+ * then returns `preset_prompt(self.summary_preset)`, so the preset picker
+ * drives summarisation. A non-empty value is a user override and wins over
+ * the preset. The `summariser` forwards the effective prompt verbatim as the
+ * `system` message when generating `summary.md`.
  */
 summary_system_prompt?: string; 
 /**

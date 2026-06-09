@@ -14,6 +14,10 @@
 //!   `notes.json` + `notes.md`, independent of [`MeetingWriter`].
 //! - [`summary`] (Phase 4): `summary.md` write/read I/O (the producer lands in
 //!   Phase 5; the path + I/O seam is here).
+//! - [`ChatStore`] (Phase 9): standalone reader/writer for a meeting's chat
+//!   sessions under `chat/{session_id}.json` (atomic tmp+rename), independent of
+//!   [`MeetingWriter`]; the chat driver in `ipc-bridge` persists a session at
+//!   turn end through it.
 //!
 //! # Read surface (Phase 4)
 //!
@@ -41,6 +45,7 @@
 //! and `{app-data}/index.db` are passed in by the caller (orchestrator /
 //! app-main).
 
+pub mod chat;
 pub mod error;
 pub mod folder;
 pub mod index;
@@ -55,6 +60,7 @@ pub mod transcript;
 pub mod writer;
 
 // Public re-exports for the crate's primary surface.
+pub use chat::ChatStore;
 pub use error::Error;
 pub use folder::MeetingFolder;
 pub use index::MeetingIndex;

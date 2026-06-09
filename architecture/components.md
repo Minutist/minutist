@@ -34,8 +34,8 @@ appears in:
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
 | `agent-tools` | 9 | `common`, `persistence`, `orchestrator` |
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
-| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings` |
+| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools` |
 
 Any PR adding an edge not in this table requires an architecture-doc
 update in the same commit.
@@ -87,6 +87,18 @@ in-process bridge types `InterAgentRequest` / `InterAgentReply` (referencing
 `ChatSessionId`), landed now so Phase 10's MCP `send_to_internal_agent` adds no
 `common` change. `ChatToken` is a lossy hint — `ChatTurnComplete.final_text`
 carries the full reconciled reply (see `cross-cutting.md` — "Agent chat loop").
+
+**Phase 9 — chat session wire types.** The persisted/wire chat shapes the chat
+UI renders and `persistence::ChatStore` serialises: `ChatRole { System, User,
+Assistant, Tool }` (serde snake_case); `ChatMessage { role: ChatRole, content:
+String, tool_name: Option<String>, turn_id: u64 }` (the `turn_id` matches the
+chat events' per-session monotonic turn counter; `tool_name` present only on
+`Tool` messages); `ChatSession { id: ChatSessionId, meeting_id: Option<MeetingId>,
+title: Option<String>, messages: Vec<ChatMessage>, created_at: String, updated_at:
+String }` (RFC 3339 timestamps; absent `meeting_id`/`title` omitted). These are
+**distinct from** `chat-agent`'s engine-internal message type (which the engine
+serialises into the oaicompat template); the `ipc-bridge` driver maps between the
+two at its boundary. All derive `specta::Type` (they cross tauri-specta).
 
 **Phase 9 precursor — `Summariser: Send + Sync`.** The summariser trait widens
 from `Send` to `Send + Sync` (SP0-verified). A held `Arc<dyn Summariser>` is
@@ -633,6 +645,23 @@ the editor autosave (FR-18/FR-35) run concurrently with an active recording.
   meeting folder — it does not create the folder and leaves sibling files
   (`audio.opus` / `transcript.json` / `metadata.json`) untouched.
 - `MeetingFolder` exposes `notes_path()` / `notes_md_path()` helpers.
+
+**Phase 9 surface growth — `ChatStore` (chat session persistence).** `ChatStore`
+is a standalone, stateless reader/writer for a meeting's chat sessions under
+`{root}/{meeting_id}/chat/{session_id}.json` (one file per session), mirroring
+`NotesStore`'s shape — **independent of `MeetingWriter`**, no shared handle.
+
+- `ChatStore::save(root, meeting_id, &common::ChatSession) -> AppResult<()>`
+  (atomic tmp+rename in the `chat/` subfolder, created on first save),
+  `ChatStore::load(root, meeting_id, session_id) -> AppResult<Option<ChatSession>>`,
+  `ChatStore::list(root, meeting_id) -> AppResult<Vec<ChatSession>>`
+  (most-recently-updated first; an absent `chat/` folder is an empty list; a
+  single unparseable session file is logged and skipped), and
+  `ChatStore::delete(root, meeting_id, session_id) -> AppResult<()>` (idempotent).
+- The chat driver in `ipc-bridge` persists a session **at turn end** through this
+  store; `persistence` stays the **sole writer** under `meetings/`. `delete_meeting`
+  already removes the whole meeting folder, so a meeting's chat sessions go with
+  it — no separate chat cleanup is required.
 
 **Phase 4 surface growth — readers, libsql index, summary, meeting ops.**
 The minimal write-only crate grows to its full read/write surface. The
@@ -1431,7 +1460,52 @@ dev-dependencies).
   mirroring how the ASR/summariser model-registry edges stay out of `ipc-bridge`.
   `AppEvent::DiarizationComplete` is emitted by the **orchestrator**, not here.
 
-The command ledger is now **21** (P5 20 + `rediarize_meeting`), asserted by the
+**Phase 9 additions (25 commands total) — the chat agent + the held model.**
+Four commands land, realising the granted `ipc-bridge → agent-tools` +
+`ipc-bridge → chat-agent` edges, plus the held-model refactor (C2):
+
+- `send_chat_message(meeting_id: Option<MeetingId>, session_id:
+  Option<ChatSessionId>, message) -> ChatSessionId` — creates or loads the chat
+  `common::ChatSession` (via `persistence::ChatStore`), appends the user message,
+  and **spawns the turn on a background `tokio::spawn`**, returning the session id
+  immediately. The turn itself runs on `spawn_blocking` (the LLM is FFI-bound);
+  tool dispatch re-enters async via a captured `Handle::block_on(registry.
+  dispatch(...))` for the dispatch step only (the one async/sync crossing). The
+  reply streams to the webview as the chat `AppEvent`s; the updated session is
+  persisted by `ChatStore` at turn end. A second send for a session whose turn is
+  still running is rejected `InvalidInput { "session busy" }` (single in-flight
+  turn per session, tracked in `IpcState::chat_in_flight`).
+- `get_chat_session(meeting_id, session_id) -> Option<ChatSession>`,
+  `list_chat_sessions(meeting_id) -> Vec<ChatSession>`,
+  `delete_chat_session(meeting_id, session_id) -> ()` — route directly to
+  `persistence::ChatStore::{load, list, delete}` on `spawn_blocking`.
+
+The **driver loop** is a State-free generic helper (`crate::chat::run_chat_turn`,
+generic over `ChatEngine` + a tool-dispatch closure + an emit closure) so the
+default test suite drives a full turn — final-only, tool-call-then-final, the
+max-iteration cap, and the hard-floor context overflow — with a STUB engine and
+STUB tools, no model and no Tauri runtime. It applies `chat_agent::trim_to_budget`
+before each engine call (hard-floor → `InvalidInput`), runs the tool loop with a
+`MAX_TOOL_ITERATIONS` cap (the escape offers no tools to force a final answer;
+exhaustion emits `ChatError`), and **injects a per-turn non-zero seed** before
+each non-greedy `run_turn` (`chat_agent::SamplerConfig`'s default `seed = 0` is a
+fixed/reproducible trap — every non-greedy reply would be verbatim-identical
+without this).
+
+**Held model (C2).** `IpcState` gains `summariser: Arc<OnceCell<Arc<LlamaSummariser>>>`
+— the LLM GGUF is loaded **once** on first chat/summarise use (via
+`IpcState::ensure_summariser`, which resolves the model id + directory through
+`Orchestrator::ensure_model_path` and opens the GGUF on `spawn_blocking` with the
+GPU-offload count resolved from the `gpu_acceleration` setting at load time) and
+shared thereafter. `summarise_meeting` was **refactored** to reuse this held
+handle instead of constructing a fresh `LlamaSummariser` per call. The chat engine
+borrows `&LlamaModel` from the held handle via `LlamaSummariser::model()`; the
+`agent-tools` `ToolContext`'s `resummarise` coerces the same handle to
+`Arc<dyn Summariser>`. `IpcState` also gains `tool_registry: Arc<ToolRegistry>`
+(built once as `ToolRegistry::v1(false)` — the Phase-10 inter-agent bridge tool is
+omitted) and `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`.
+
+The command ledger is now **25** (P6 21 + the four chat commands), asserted by the
 `bindings_builder_registers_expected_command_ledger` test.
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
@@ -1467,6 +1541,13 @@ Window close intercepts `CloseRequested` and hides rather than exits.
 **Bindings harness:** `cargo run -p meeting-app --bin generate-bindings`
 (alias: `cargo gen-bindings`) writes `ui/src/ipc/bindings.ts` without
 starting the GUI. Run after any `ipc-bridge` command/event surface change.
+
+**Phase 9 wiring.** `app-main` builds the chat `ToolRegistry::v1(false)` once and
+constructs `IpcState` with it plus the lazily-initialised held-model cell
+(`Arc<OnceCell<Arc<LlamaSummariser>>>`, loaded on first chat/summarise use) and the
+`chat_in_flight` guard. The held model is owned by `IpcState`; `app-main` does not
+load the GGUF at startup. This adds the `agent-tools` (the registry is built here)
++ `chat-agent` (transitively via `ipc-bridge`) dependency rows above.
 
 ## Webview components
 

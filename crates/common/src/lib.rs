@@ -358,6 +358,78 @@ pub struct MeetingState {
 }
 
 // ---------------------------------------------------------------------------
+// Chat session wire types (Phase 9 — chat persistence + the chat UI)
+// ---------------------------------------------------------------------------
+
+/// The role of one persisted chat message as it crosses the IPC boundary and is
+/// stored on disk.
+///
+/// This is the **wire / persisted** role, distinct from `chat-agent`'s
+/// engine-internal `Role` (which serialises the same snake_case names for the
+/// oaicompat template but is a different type owned by that crate). The driver
+/// (`ipc-bridge`) maps between the engine's history and these persisted/wire
+/// shapes at its boundary. `serde` snake_case so the TS binding mirrors the
+/// engine's role names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum ChatRole {
+    /// The session's system prompt (turn 0): persona + meeting context.
+    System,
+    /// A message the user typed.
+    User,
+    /// An assistant reply (the model's final text for a turn).
+    Assistant,
+    /// A tool-result message appended after the driver ran a tool call.
+    Tool,
+}
+
+/// One persisted chat message (the wire / on-disk shape).
+///
+/// Distinct from `chat-agent`'s engine-internal message: this is the durable,
+/// specta-typed record the webview renders and `persistence::ChatStore`
+/// serialises. `turn_id` is the per-session monotonic turn counter the streaming
+/// chat `AppEvent`s also carry, so the UI can correlate a stored message with
+/// the deltas it saw live. `tool_name` is present only on `Tool` messages (the
+/// name of the tool whose result the message carries).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+    /// For a `Tool` message: the tool whose result this message carries.
+    /// `None` for system/user/assistant messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// The per-session monotonic turn this message belongs to. The user message
+    /// and the assistant/tool messages produced answering it share one `turn_id`
+    /// (the same value the `ChatToken`/`ChatTurnComplete` events carry).
+    pub turn_id: u64,
+}
+
+/// A persisted chat session for one meeting.
+///
+/// `persistence::ChatStore` stores this under
+/// `{meetings_dir}/{meeting_id}/chat/{session_id}.json` (atomic tmp+rename); the
+/// chat IPC commands load/save it. `meeting_id` is optional so a session may be
+/// un-scoped (an MCP-originated session that targets no specific meeting);
+/// `title` is optional so an untitled session round-trips. Timestamps are RFC
+/// 3339 strings to avoid pulling a time crate into `common`, mirroring
+/// `MeetingMeta::started_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ChatSession {
+    pub id: ChatSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<MeetingId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+// ---------------------------------------------------------------------------
 // Inter-agent bridge (Phase 9 precursor; consumed by Phase 10 MCP)
 // ---------------------------------------------------------------------------
 
@@ -1165,6 +1237,68 @@ mod tests {
         assert!(serde_json::to_string(&err)
             .unwrap()
             .contains("\"kind\":\"chat_error\""));
+    }
+
+    #[test]
+    fn chat_session_round_trips_and_omits_optionals() {
+        let session = ChatSession {
+            id: ChatSessionId::new(),
+            meeting_id: Some(MeetingId::new()),
+            title: Some("Action items".to_string()),
+            messages: vec![
+                ChatMessage {
+                    role: ChatRole::System,
+                    content: "you are a meeting-notes assistant".to_string(),
+                    tool_name: None,
+                    turn_id: 0,
+                },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: "what were the action items?".to_string(),
+                    tool_name: None,
+                    turn_id: 1,
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: "{\"segments\":[]}".to_string(),
+                    tool_name: Some("get_transcript".to_string()),
+                    turn_id: 1,
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: "the action items were …".to_string(),
+                    tool_name: None,
+                    turn_id: 1,
+                },
+            ],
+            created_at: "2026-06-10T10:00:00Z".to_string(),
+            updated_at: "2026-06-10T10:01:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"role\":\"system\""));
+        assert!(json.contains("\"role\":\"tool\""));
+        // The tool message carries its tool_name; non-tool messages omit it.
+        assert!(json.contains("\"tool_name\":\"get_transcript\""));
+        let back: ChatSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, session);
+        assert_eq!(back.messages.len(), 4);
+        assert!(back.messages[0].tool_name.is_none());
+        assert_eq!(back.messages[2].tool_name.as_deref(), Some("get_transcript"));
+
+        // Absent meeting_id / title are omitted from the wire shape.
+        let untitled = ChatSession {
+            id: ChatSessionId::new(),
+            meeting_id: None,
+            title: None,
+            messages: vec![],
+            created_at: "2026-06-10T10:00:00Z".to_string(),
+            updated_at: "2026-06-10T10:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&untitled).unwrap();
+        assert!(!json.contains("meeting_id"), "absent meeting_id must be omitted");
+        assert!(!json.contains("title"), "absent title must be omitted");
+        let back: ChatSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, untitled);
     }
 
     #[test]

@@ -348,6 +348,11 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // unaffected.
             updater::start(&app_handle, updater_event_tx);
 
+            // Build the chat tool registry once (Phase 9). `v1(false)` omits the
+            // Phase-10 inter-agent bridge tool. The held LLM substrate is loaded
+            // lazily on first chat/summarise use (see `IpcState::ensure_summariser`).
+            let tool_registry = Arc::new(agent_tools::ToolRegistry::v1(false));
+
             // Register the IPC state so command handlers can access it.
             app.manage(IpcState {
                 orchestrator: orchestrator.clone(),
@@ -356,6 +361,9 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 index_db_path,
                 index,
                 event_tx: ipc_event_tx,
+                summariser: Arc::new(tokio::sync::OnceCell::new()),
+                tool_registry,
+                chat_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             });
 
             // Build the tray icon.

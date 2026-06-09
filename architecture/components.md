@@ -44,7 +44,8 @@ update in the same commit.
   `audio.opus` + `metadata.json` to a per-meeting folder. Phase 4 grows it
   to the full surface: the folder readers (incl. the graduated
   pause-INCLUDING Opus decoder and the `MeetingState` assembler), the libsql
-  `index.db` index + forward-only migration runner + `rebuild_from_disk`,
+  `index.db` index + forward-only migration runner + `rebuild_from_disk` +
+  self-heal `reconcile_orphans`,
   rename/delete meeting operations, and the `summary.md` path + I/O. It still
   depends only on `common` (libsql / tokio are external crates, not workspace
   components).
@@ -634,6 +635,14 @@ on `common`.
     `{root}/{uuid}/` folder containing a `metadata.json`, deriving each
     `MeetingListEntry` (excerpt = first transcript segment). One unreadable
     folder is skipped with a warning rather than aborting the rebuild.
+  - `reconcile_orphans(meetings_root) -> AppResult<usize>` — the in-session
+    **self-heal**: an ADD-only (never deletes) counterpart to
+    `rebuild_from_disk`. A `readdir` + set-diff against the indexed ids; only
+    folders present on disk but missing from the cache incur a
+    `metadata`/transcript read + `upsert`. Called by `ipc-bridge`'s
+    `list_meetings` so a meeting can never stay hidden after a missed stop-time
+    `upsert` (e.g. the process killed between finalise and the upsert) without
+    waiting for the next startup `rebuild_from_disk`.
 - **Meeting operations (`meeting_ops` module).** `rename_meeting(root, &index,
   id, new_title)` and `delete_meeting(root, &index, id)` (both `async fn ->
   AppResult<()>`) keep the on-disk folder and the index row consistent: the
@@ -771,17 +780,28 @@ depend on `persistence` (the orchestrator sources audio through
   the supplied index row's `speaker_count` (`MeetingIndex::upsert`), and emits
   `AppEvent::DiarizationComplete { meeting_id, speaker_count }` on the shared
   `event_tx`. The index handle is passed in by `ipc-bridge` (the orchestrator does
-  not own one), exactly as for `re_transcribe`.
-- **On-stop pass.** `stop()`, AFTER the meeting is finalised and the recorder is
-  back to `Idle`, runs the **same** diarization pass INLINE (awaited) when
-  `settings.diarization_enabled` is true, so the returned `MeetingMeta`'s
-  `speaker_count` + `diarizer` are correct (the `stop_recording` command upserts
-  the index from that meta, so the on-stop pass takes no index handle). It writes
-  `transcript.json` + `metadata.json` and emits `DiarizationComplete` via the same
-  shared `finalise_diarization` helper. The flag defaults to **false**, so
-  `stop()`'s default behaviour is unchanged; an on-stop diarization failure is
-  best-effort (logged + `AppEvent::ErrorOccurred`), never turning a successful stop
-  into an error.
+  not own one), exactly as for `re_transcribe`. The (uninterruptible) sherpa
+  `compute` is wrapped in a **length-relative timeout** (`diarize_timeout`: ≈1×
+  real-time, floored at 2 min / capped at 10 min — sized from `metadata.duration_ms`);
+  on timeout `rediarize_inner` returns `AppError::Inference` BEFORE any write, so a
+  pathologically slow or wedged pass leaves the meeting un-diarized instead of
+  blocking forever. (`tokio` cannot cancel the `spawn_blocking` thread, so a true
+  infinite hang leaks one thread until exit; the budget bounds the wait, not the
+  thread.)
+- **On-stop pass — decoupled, background.** Diarization is NOT run inline in
+  `stop()`. `stop()` finalises the meeting and returns it **un-diarized**
+  (`speaker_count 0`, `diarizer None`) the instant it is on disk and the recorder
+  is back to `Idle`, exposing the user's choice via
+  `Orchestrator::diarization_enabled()`. When that is true, `ipc-bridge` — AFTER
+  it has indexed the meeting (so visibility is immediate) — **spawns `rediarize`
+  in the background**: the on-stop pass IS the re-diarize pass, just
+  auto-triggered, so it claims the offline slot, applies the timeout above,
+  rewrites `transcript.json` + `metadata.json`, refreshes the index row, and emits
+  `DiarizationComplete` when done. A slow or hung diarization therefore can never
+  wedge `stop()` or hide the meeting. The flag defaults to **false**. (Previously
+  `stop()` ran this pass INLINE/awaited; a hung 30-min diarization then blocked the
+  whole stop flow and left the meeting unindexed until the next launch — fixed by
+  this decoupling.)
 - **Test seam — `rediarize_with_diarizer(&MeetingIndex, MeetingId, Box<dyn
   Diarizer + Send>)`.** A `#[cfg(any(test, feature = "test-source"))]`-gated
   sibling of `rediarize` (mirroring `re_transcribe_with_backend`): both `rediarize`
@@ -810,9 +830,13 @@ rewrite + index-excerpt refresh are exercised in CI without a model. Phase 6
 diarization tests: the **default-suite, model-free** `StubDiarizer` lib tests
 (`tests::diarization`) drive the re-diarize inner path
 (`rediarize_with_diarizer` → `transcript.json` rewrite with `speaker_id`s +
-`metadata.json` `speaker_count` + `DiarizationComplete`) and a **toggle-OFF**
-`stop()` pass (`diarization_enabled = false` → all `speaker_id == None`, no
-`DiarizationComplete`); plus the env-var-gated `rediarize` integration test
+`metadata.json` `speaker_count` + `DiarizationComplete`); two `stop()` tests
+assert diarization is now **decoupled** from `stop()` — both
+`diarization_enabled = true` (`stop_with_diarization_enabled_is_decoupled_from_stop`)
+and `false` return the meeting un-diarized (`speaker_id == None`, `speaker_count
+0`, and no `DiarizationComplete` from `stop()` itself — the background `rediarize`
+pass emits it), with `diarization_enabled()` surfacing the toggle for ipc; plus
+the env-var-gated `rediarize` integration test
 (`MEETING_APP_DIARIZE_SEG_PATH` + `MEETING_APP_DIARIZE_EMB_PATH`, skip-on-unset)
 that stages the two real sherpa models into the registry cache and re-diarizes a
 meeting whose audio is the S1 two-speaker fixture.
@@ -994,12 +1018,28 @@ turn a successful stop into an error. This keeps the orchestrator decoupled from
 the index: the index handle lives in `ipc-bridge` (`IpcState`), so the upsert
 lives at the command boundary, not in the orchestrator.
 
+**Decoupled on-stop diarization + self-healing list (drift fix).** After the
+upsert, if `orchestrator.diarization_enabled()` is set, `stop_recording`
+**spawns `Orchestrator::rediarize` as a background task** (`tokio::spawn` with
+cloned `Arc<Orchestrator>` + `Arc<MeetingIndex>` handles) instead of awaiting
+diarization inline — so a slow or hung pass can neither wedge the stop response
+nor hide the meeting; the pass refreshes the index row and emits
+`DiarizationComplete` when it finishes (errors logged, fire-and-forget). And
+because a derived cache can always drift from disk, `list_meetings` first calls
+`MeetingIndex::reconcile_orphans(meetings_dir)` — a cheap `readdir` + set-diff
+that lazily indexes any meeting folder present on disk but missing from the cache
+(e.g. the process killed between finalise and the stop-time upsert) — so a
+meeting can never stay hidden within a session, even without a restart. Reconcile
+is best-effort (a failure logs and serves the cache as-is) and never deletes
+(removals are reconciled by the next startup `rebuild_from_disk`).
+
 **Phase 4 additions (18 commands at Phase 4; `re_summarise` removed in Phase 5)
 — meeting list / open / actions.** Six commands back the meeting-list view
 (FR-33):
 
-- `list_meetings() -> Vec<MeetingListEntry>` — queries the shared libsql index
-  (`MeetingIndex::list_meetings`, most-recent first).
+- `list_meetings() -> Vec<MeetingListEntry>` — self-heals via
+  `MeetingIndex::reconcile_orphans(meetings_dir)` (best-effort), then queries the
+  shared libsql index (`MeetingIndex::list_meetings`, most-recent first).
 - `open_meeting(meeting_id) -> MeetingState` — assembles the restore payload via
   `persistence::read_meeting_state` (blocking folder reads on `spawn_blocking`);
   the index is **not** consulted (the folder is authoritative for full state).

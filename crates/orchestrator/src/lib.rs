@@ -46,6 +46,7 @@ mod tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
@@ -89,16 +90,6 @@ struct OrchestratorInner {
     runner: Option<runner::RunnerHandle>,
     /// Wall-clock instant the current recording started.
     started_at: Option<DateTime<Utc>>,
-    /// Test-only override for the on-stop diarization pass: when `Some`, the
-    /// next `stop()` whose `diarization_enabled` is true consumes this injected
-    /// diarizer instead of building the production `SherpaDiarizer` via
-    /// `runner::build_diarizer`. This lets a default-suite test drive the FULL
-    /// toggle-ON gate branch of `stop()` model-free, mirroring how
-    /// `rediarize_with_diarizer` injects a diarizer into the re-diarize seam.
-    /// `None` in production (the field is only ever set by the test-only
-    /// `inject_on_stop_diarizer`).
-    #[cfg(any(test, feature = "test-source"))]
-    on_stop_diarizer_override: Option<Box<dyn Diarizer + Send>>,
 }
 
 impl Orchestrator {
@@ -146,8 +137,6 @@ impl Orchestrator {
                 capture: None,
                 runner: None,
                 started_at: None,
-                #[cfg(any(test, feature = "test-source"))]
-                on_stop_diarizer_override: None,
             }),
             event_tx,
         }
@@ -478,108 +467,28 @@ impl Orchestrator {
             "recording stopped and finalised"
         );
 
-        // On-stop diarization pass (FR-11), gated on `settings.diarization_enabled`
-        // (default OFF → `stop()` behaviour is unchanged). The meeting is fully
-        // finalised on disk and the recorder is back to `Idle`, so this runs the
-        // same diarization pass the user-triggered re-diarize uses, INLINE
-        // (awaited) so the returned `MeetingMeta.speaker_count` is correct. The
-        // `stop_recording` command upserts the index from the returned meta, so
-        // no index handle is needed here.
-        let mut finalised_meta = finalised_meta;
-        if self.settings.current().diarization_enabled {
-            match self.diarize_on_stop(meeting_id).await {
-                Ok(speaker_count) => {
-                    finalised_meta.speaker_count = speaker_count;
-                    finalised_meta.diarizer = Some(diarizer_descriptor());
-                }
-                Err(e) => {
-                    // Diarization is a best-effort post-pass; a failure must not
-                    // turn a successful stop into an error (the recording is
-                    // safely on disk). Surface it as a recoverable event.
-                    tracing::warn!(
-                        target: "orchestrator",
-                        meeting_id = %meeting_id.0,
-                        "on-stop diarization failed: {e}; recording is finalised without speaker labels"
-                    );
-                    self.emit(AppEvent::ErrorOccurred { error: e });
-                }
-            }
-        }
-
+        // Diarization is NOT run inline here. The on-stop diarization pass
+        // (FR-11) is now a DECOUPLED background job: `stop()` returns the
+        // finalised meeting un-diarized (`speaker_count` 0, `diarizer` None) the
+        // instant the recording is on disk and the recorder is back to `Idle`,
+        // so the `stop_recording` command can index it immediately — in-session
+        // visibility no longer waits on diarization. When `diarization_enabled`
+        // is set, `ipc-bridge` spawns `Orchestrator::rediarize` in the
+        // background; that pass re-writes the transcript + metadata, refreshes
+        // the index row, and emits `AppEvent::DiarizationComplete` when done. A
+        // slow or hung diarization can therefore never wedge `stop()` or hide
+        // the meeting (the original failure mode). See
+        // `architecture/components.md`, orchestrator "on-stop diarization".
         Ok(finalised_meta)
     }
 
-    /// Run the on-stop diarization pass for `meeting_id` and return the distinct
-    /// speaker count.
-    ///
-    /// Builds the bundled `SherpaDiarizer` off the async worker threads (or, in
-    /// tests, consumes a `StubDiarizer` injected via `inject_on_stop_diarizer`),
-    /// then hands the owned `Box<dyn Diarizer + Send>` to the shared
-    /// [`Self::diarize_on_stop_inner`]. This build → dispatch split mirrors the
-    /// [`Self::rediarize`] → [`Self::rediarize_inner`] seam so a default-suite
-    /// test can drive the toggle-ON `stop()` branch model-free.
-    async fn diarize_on_stop(&self, meeting_id: MeetingId) -> AppResult<u32> {
-        // Test seam: a `StubDiarizer` injected via `inject_on_stop_diarizer`
-        // takes precedence over building the production `SherpaDiarizer`, so a
-        // default-suite test drives the full toggle-ON gate branch (build →
-        // dispatch → finalise) with no sherpa model. In production this is
-        // always `None`, so the build path below runs unchanged.
-        #[cfg(any(test, feature = "test-source"))]
-        {
-            // Take the override in its own scope so the `inner` guard drops
-            // before the multi-second blocking dispatch below — never hold the
-            // central mutex across `diarize_on_stop_inner`.
-            let injected = self.inner.lock().await.on_stop_diarizer_override.take();
-            if let Some(diarizer) = injected {
-                return self.diarize_on_stop_inner(meeting_id, diarizer).await;
-            }
-        }
-
-        let registry = Arc::clone(&self.model_registry);
-        let diarizer: Box<dyn Diarizer + Send> =
-            tokio::task::spawn_blocking(move || -> AppResult<Box<dyn Diarizer + Send>> {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| AppError::Internal {
-                        context: format!("on-stop diarize runtime build failed: {e}"),
-                    })?;
-                let diarizer = rt.block_on(runner::build_diarizer(&registry))?;
-                Ok(Box::new(diarizer))
-            })
-            .await
-            .map_err(|e| AppError::Internal {
-                context: format!("on-stop diarizer-build join failed: {e}"),
-            })??;
-
-        self.diarize_on_stop_inner(meeting_id, diarizer).await
-    }
-
-    /// Shared on-stop diarization core: decode + diarize the meeting with the
-    /// supplied owned `diarizer`, then persist the result via
-    /// [`Self::finalise_diarization`] (rewriting `transcript.json`, updating
-    /// `metadata.json`'s `{ speaker_count, diarizer }`, and emitting
-    /// `AppEvent::DiarizationComplete`). Returns the distinct speaker count. No
-    /// index `upsert` — the `stop_recording` command upserts from the returned
-    /// `MeetingMeta`, whose `speaker_count` this pass has updated.
-    ///
-    /// Driven by [`Self::diarize_on_stop`] with the production `SherpaDiarizer`
-    /// (or a test-injected `StubDiarizer`), exactly as
-    /// [`Self::rediarize_inner`] is driven for the user-triggered re-diarize.
-    async fn diarize_on_stop_inner(
-        &self,
-        meeting_id: MeetingId,
-        diarizer: Box<dyn Diarizer + Send>,
-    ) -> AppResult<u32> {
-        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
-
-        let (segments, speaker_count) =
-            run_diarization_blocking(meeting_dir.clone(), diarizer).await?;
-
-        self.finalise_diarization(meeting_id, &meeting_dir, &segments, speaker_count)
-            .await?;
-
-        Ok(speaker_count)
+    /// Whether the on-stop diarization pass should run (the user's
+    /// `diarization_enabled` setting). `ipc-bridge` reads this after `stop()` to
+    /// decide whether to spawn the background [`Self::rediarize`] pass; the
+    /// decision lives here so the orchestrator stays the single owner of the
+    /// settings read, but the *execution* is decoupled from `stop()`.
+    pub fn diarization_enabled(&self) -> bool {
+        self.settings.current().diarization_enabled
     }
 
     /// Return a snapshot of the current recording state.
@@ -861,8 +770,44 @@ impl Orchestrator {
     ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
-        let (segments, speaker_count) =
-            run_diarization_blocking(meeting_dir.clone(), diarizer).await?;
+        // Read the recording length to size the diarization timeout (a small
+        // metadata read on a blocking thread).
+        let duration_dir = meeting_dir.clone();
+        let duration_ms = tokio::task::spawn_blocking(move || {
+            persistence::read_metadata(&duration_dir).map(|m| m.duration_ms)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("diarize metadata read join failed: {e}"),
+        })??;
+        let budget = diarize_timeout(duration_ms);
+
+        // Bound the (uninterruptible) sherpa `compute`: a pathologically slow or
+        // hung diarization on a long recording must not block forever (the
+        // original on-stop hang). On timeout we return BEFORE
+        // `finalise_diarization`, so nothing is written — the meeting is left
+        // un-diarized and the abandoned blocking thread's result (if it ever
+        // completes) is dropped. `tokio` cannot cancel a `spawn_blocking` thread,
+        // so a true infinite hang leaks one thread until process exit; the budget
+        // bounds the wait, not the thread.
+        let (segments, speaker_count) = match tokio::time::timeout(
+            budget,
+            run_diarization_blocking(meeting_dir.clone(), diarizer),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(AppError::Inference {
+                    backend: "diarizer".to_string(),
+                    context: format!(
+                        "diarization exceeded its {} s budget (recording {duration_ms} ms); \
+                         left un-diarized",
+                        budget.as_secs(),
+                    ),
+                });
+            }
+        };
 
         self.finalise_diarization(meeting_id, &meeting_dir, &segments, speaker_count)
             .await?;
@@ -1047,6 +992,25 @@ async fn run_diarization_blocking(
     .map_err(|e| AppError::Internal {
         context: format!("diarization spawn_blocking join failed: {e}"),
     })?
+}
+
+/// Length-relative timeout budget for a diarization pass.
+///
+/// The offline sherpa `compute` is a single uninterruptible FFI call with no
+/// progress callback, so a true per-progress watchdog isn't available at that
+/// boundary; instead we bound it by wall-clock relative to the recording
+/// length: ≈1× real-time, floored at `FLOOR_SECS` (so short meetings still get
+/// a sane minimum) and capped at `CAP_SECS` (so a hang on a long recording
+/// can't hold the offline claim — and thereby block starting a new recording —
+/// for too long). A normal diarization runs well under real-time, so this only
+/// fires on a pathologically slow or wedged pass; because visibility is
+/// decoupled the meeting is already indexed, so a fired timeout merely leaves it
+/// un-diarized for a manual re-diarize.
+fn diarize_timeout(recording_duration_ms: u64) -> Duration {
+    const FLOOR_SECS: u64 = 120; // 2 min
+    const CAP_SECS: u64 = 600; // 10 min
+    let secs = (recording_duration_ms / 1000).clamp(FLOOR_SECS, CAP_SECS);
+    Duration::from_secs(secs)
 }
 
 /// The `ModelDescriptor` recorded in `metadata.json` after a diarization pass.
@@ -1297,23 +1261,6 @@ impl Orchestrator {
         result
     }
 
-    /// Inject a `diarizer` for the next on-stop diarization pass, so a real
-    /// [`Self::stop`] call with `diarization_enabled = true` exercises the FULL
-    /// toggle-ON gate branch (`settings.diarization_enabled == true → build →
-    /// dispatch → finalise`) without building a real `SherpaDiarizer`.
-    ///
-    /// [`Self::diarize_on_stop`] consumes this override (via `take()`) in place
-    /// of `runner::build_diarizer`; everything downstream — decode, diarize,
-    /// `transcript.json` / `metadata.json` rewrite, and the
-    /// `AppEvent::DiarizationComplete` emission — is the production path. The
-    /// override is one-shot: once consumed, the next `stop()` builds the real
-    /// diarizer again.
-    ///
-    /// This is the on-stop analogue of [`Self::rediarize_with_diarizer`].
-    /// Available only under the `test-source` feature (or in `#[cfg(test)]`).
-    pub async fn inject_on_stop_diarizer(&self, diarizer: Box<dyn Diarizer + Send>) {
-        self.inner.lock().await.on_stop_diarizer_override = Some(diarizer);
-    }
 
     /// Borrow the orchestrator's `SettingsHandle` so a test can flip a setting
     /// (e.g. `diarization_enabled`) on the same handle `stop()` reads.

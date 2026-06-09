@@ -250,6 +250,86 @@ impl MeetingIndex {
             }
         }
     }
+
+    /// Self-heal: index any on-disk meeting folder missing from the index,
+    /// WITHOUT touching existing rows. Cheap in the common case — one directory
+    /// read plus a set-diff; only folders not already indexed incur a
+    /// metadata/transcript read + `upsert`.
+    ///
+    /// Guards in-session visibility against any missed `upsert` (e.g. the
+    /// process being killed between finalise and the stop-time index write):
+    /// `list_meetings` runs this so a meeting present on disk can never stay
+    /// hidden until the next startup `rebuild_from_disk`. Unlike
+    /// [`Self::rebuild_from_disk`] it never deletes — a folder removed off-app
+    /// is reconciled by the next rebuild, not here. Returns the number of orphan
+    /// meetings newly indexed.
+    pub async fn reconcile_orphans(&self, meetings_root: &Path) -> AppResult<usize> {
+        Ok(self.reconcile_orphans_inner(meetings_root).await?)
+    }
+
+    async fn reconcile_orphans_inner(&self, meetings_root: &Path) -> Result<usize, Error> {
+        // Ids already indexed — the cheap half of the diff.
+        let known = self.existing_ids().await?;
+
+        let dirs = match std::fs::read_dir(meetings_root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(Error::Io(e)),
+        };
+
+        let mut indexed = 0usize;
+        for entry in dirs {
+            let entry = entry.map_err(Error::Io)?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // The folder name is the meeting uuid; skip already-indexed folders
+            // before any (more expensive) metadata read.
+            let id = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if known.contains(name) => continue,
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+            if !path.join("metadata.json").exists() {
+                continue;
+            }
+
+            match entry_from_folder(&path).await {
+                Ok(list_entry) => {
+                    self.upsert_inner(&list_entry).await?;
+                    indexed += 1;
+                    tracing::info!(
+                        target: "persistence",
+                        meeting_id = %id,
+                        "indexed orphan meeting folder (self-heal)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "persistence",
+                        folder = %path.display(),
+                        error = %e,
+                        "skipping meeting folder during orphan reconcile"
+                    );
+                }
+            }
+        }
+
+        Ok(indexed)
+    }
+
+    /// The set of meeting ids currently in the index (string form, matching the
+    /// on-disk folder names). Used by [`Self::reconcile_orphans`] for the diff.
+    async fn existing_ids(&self) -> Result<std::collections::HashSet<String>, Error> {
+        let mut rows = self.conn.query("SELECT id FROM meetings", ()).await?;
+        let mut ids = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            ids.insert(id);
+        }
+        Ok(ids)
+    }
 }
 
 /// Build a [`MeetingListEntry`] from a meeting folder by reading its metadata

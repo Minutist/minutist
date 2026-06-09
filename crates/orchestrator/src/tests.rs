@@ -483,32 +483,24 @@ mod diarization {
         assert!(got, "DiarizationComplete must be emitted");
     }
 
-    /// With `diarization_enabled = true`, a real `stop()` drives the FULL
-    /// toggle-ON gate branch (lib.rs `settings.diarization_enabled == true →
-    /// build → dispatch → finalise`) using a `StubDiarizer` injected via the
-    /// `inject_on_stop_diarizer` seam — so the on-stop pass is exercised in the
-    /// default suite with no sherpa model. The seeded `transcript.json` is
-    /// rewritten with `speaker_id`s, `metadata.json`'s `{ speaker_count,
-    /// diarizer }` is set, and `AppEvent::DiarizationComplete` is emitted with
-    /// the right count.
-    ///
-    /// The transcript is seeded into the meeting folder after `start` (the live
-    /// no-model path produces no segments); the empty-buffer `finalise` in the
-    /// writer is a no-op and does not clobber it, so the seeded segments survive
-    /// to the on-stop pass.
+    /// With `diarization_enabled = true`, `stop()` is now DECOUPLED from
+    /// diarization: it returns the meeting un-diarized (`speaker_count` 0,
+    /// `diarizer` None), does NOT rewrite the transcript, and emits no
+    /// `DiarizationComplete`. The on-stop pass is run in the BACKGROUND by
+    /// `ipc-bridge` (via [`Orchestrator::rediarize`]) AFTER the meeting is
+    /// indexed, so a slow or hung diarization can never wedge `stop()` or hide
+    /// the meeting (the original failure mode). `stop()` only surfaces the
+    /// toggle via [`Orchestrator::diarization_enabled`] for ipc to act on; the
+    /// actual diarize + persist + index path is covered by the `rediarize`
+    /// tests.
     #[tokio::test]
-    async fn stop_with_diarization_enabled_runs_on_stop_pass() {
+    async fn stop_with_diarization_enabled_is_decoupled_from_stop() {
         let _ = tracing_subscriber::fmt::try_init();
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let orch = test_orchestrator(root.clone());
         let mut event_rx = orch.subscribe_events();
 
-        // Enable the on-stop diarization pass (default is OFF). NO settings
-        // subscriber is held — this mirrors the production condition exactly
-        // (nothing holds one), which `SettingsHandle::update` supports because
-        // it publishes via `send_replace`, so `Orchestrator::stop()`'s
-        // `settings.current().diarization_enabled` read sees the new value.
         orch.settings_handle_for_test()
             .update(|s| s.diarization_enabled = true)
             .await
@@ -518,8 +510,7 @@ mod diarization {
         let streams = source.generate_streams(5, 32, 64);
         let meeting_id = orch.start_with_streams(streams).await.expect("start");
 
-        // Seed the meeting's transcript.json with unlabelled segments so the
-        // on-stop pass has something to label (no ASR model → no live segments).
+        // Seed unlabelled segments; stop() must leave them untouched.
         let meeting_dir = root.join(meeting_id.0.to_string());
         let seeded: Vec<Segment> = ["alpha", "beta", "gamma"]
             .iter()
@@ -535,40 +526,33 @@ mod diarization {
             .collect();
         persistence::write_transcript(&meeting_dir, &seeded).expect("seed transcript");
 
-        // Inject the stub so the toggle-ON gate branch builds + dispatches it
-        // (rather than building a real SherpaDiarizer).
-        orch.inject_on_stop_diarizer(Box::new(StubDiarizer { speakers: 2 }))
-            .await;
-
         tokio::time::sleep(Duration::from_millis(100)).await;
         let meta = orch.stop().await.expect("stop");
 
-        // Returned meta carries the diarized speaker count + diarizer descriptor.
-        assert_eq!(meta.speaker_count, 2, "toggle-ON stop must diarize");
-        assert!(meta.diarizer.is_some(), "toggle-ON stop must record the diarizer");
+        // The toggle is surfaced for ipc, but stop() itself does not diarize.
+        assert!(orch.diarization_enabled(), "accessor reflects the enabled toggle");
+        assert_eq!(
+            meta.speaker_count, 0,
+            "stop() returns un-diarized regardless of the toggle (diarization is decoupled)"
+        );
+        assert!(meta.diarizer.is_none(), "stop() does not set the diarizer");
 
-        // transcript.json rewritten with speaker_ids (A/B round-robin).
+        // Transcript untouched (still unlabelled) and no DiarizationComplete.
         let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
-        assert_eq!(after.len(), 3);
-        assert_eq!(after[0].speaker_id.as_deref(), Some("A"));
-        assert_eq!(after[1].speaker_id.as_deref(), Some("B"));
-        assert_eq!(after[2].speaker_id.as_deref(), Some("A"));
-
-        // metadata.json speaker_count updated + diarizer descriptor set.
-        let on_disk = persistence::read_metadata(&meeting_dir).expect("read metadata");
-        assert_eq!(on_disk.speaker_count, 2);
-        assert!(on_disk.diarizer.is_some());
-
-        // DiarizationComplete emitted with the right meeting_id + count.
-        let mut got = false;
+        assert!(
+            after.iter().all(|s| s.speaker_id.is_none()),
+            "stop() must not rewrite the transcript with speaker ids"
+        );
+        let mut saw_diarization = false;
         while let Ok(ev) = event_rx.try_recv() {
-            if let AppEvent::DiarizationComplete { meeting_id: mid, speaker_count } = ev {
-                assert_eq!(mid, meeting_id);
-                assert_eq!(speaker_count, 2);
-                got = true;
+            if matches!(ev, AppEvent::DiarizationComplete { .. }) {
+                saw_diarization = true;
             }
         }
-        assert!(got, "DiarizationComplete must be emitted by the on-stop pass");
+        assert!(
+            !saw_diarization,
+            "stop() must not emit DiarizationComplete (the background pass does)"
+        );
     }
 
     /// With `diarization_enabled = false` (the default), `stop()` runs no

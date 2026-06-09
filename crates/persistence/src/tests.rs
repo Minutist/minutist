@@ -1245,6 +1245,68 @@ async fn test_index_rebuild_from_disk() {
     assert_eq!(index.list_meetings().await.expect("list").len(), 2);
 }
 
+// ---------------------------------------------------------------------------
+// reconcile_orphans: the in-session self-heal — index on-disk meetings missing
+// from the cache, without deleting existing rows (used by list_meetings so a
+// meeting can never stay hidden after a missed stop-time upsert).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_reconcile_orphans_indexes_only_missing() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id_a = write_synthetic_meeting(
+        root,
+        "Meeting A",
+        "2026-06-01T09:00:00Z",
+        &[make_segment(0, 500, "alpha")],
+        None,
+        None,
+    );
+
+    // Index starts knowing only A (simulating the stop-time upsert for A).
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    assert_eq!(index.rebuild_from_disk(root).await.expect("seed"), 1);
+
+    // A second meeting lands on disk WITHOUT an upsert (simulating the process
+    // killed between finalise and the stop-time index write — the live bug).
+    let id_b = write_synthetic_meeting(
+        root,
+        "Orphan B",
+        "2026-06-03T09:00:00Z",
+        &[make_segment(0, 500, "bravo")],
+        None,
+        None,
+    );
+    // A stray non-meeting dir (no metadata.json) must be ignored.
+    std::fs::create_dir_all(root.join("not-a-meeting")).expect("stray");
+
+    // Reconcile indexes ONLY the orphan; A is already indexed and untouched.
+    let added = index.reconcile_orphans(root).await.expect("reconcile");
+    assert_eq!(added, 1, "only the orphan B should be newly indexed");
+
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().any(|m| m.id == id_a));
+    assert!(listed.iter().any(|m| m.id == id_b));
+
+    // Idempotent: a second reconcile finds nothing new.
+    assert_eq!(index.reconcile_orphans(root).await.expect("reconcile 2"), 0);
+    assert_eq!(index.list_meetings().await.expect("list").len(), 2);
+}
+
+#[tokio::test]
+async fn test_reconcile_orphans_missing_root_is_empty() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let missing = tempdir.path().join("does-not-exist");
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    assert_eq!(
+        index.reconcile_orphans(&missing).await.expect("reconcile missing"),
+        0
+    );
+}
+
 /// A concurrent reader must never observe a half-rebuilt table
 /// (TIMELINE-DRIFT #7): `rebuild_from_disk` wraps the DELETE + repopulate in a
 /// single transaction, so a `list_meetings` racing the rebuild sees either the

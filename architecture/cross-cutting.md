@@ -35,7 +35,7 @@ that.
 | Audio mixer (mic + loopback) | A `spawn`/`spawn_blocking` task draining the two per-source 16 kHz batch channels; SUMS sample-wise, clamps, meters, and forwards the single mixed stream. Only present when system-audio capture is on; mic-only otherwise. Never blocks the RT callbacks (those feed the upstream rings). **Starvation valve:** if one source is idle (e.g. loopback when nothing is playing through the speakers) the mixer must NOT wait to pair samples — past a ~30 ms skew (`mixer::MAX_SKEW_SAMPLES`) it zero-fills the idle source and emits the live one, else the mic is buffered forever (silent transcript + dead meter). The cap also sets the meter/mic-latency cadence on the idle-loopback path (~30 Hz). |
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
-| Diarization (offline) | One-shot `spawn_blocking` task triggered on stop or user action — the authoritative pass. |
+| Diarization (offline) | One-shot `spawn_blocking` task — the authoritative pass — spawned as a background job by `ipc-bridge` *after* stop (decoupled from the stop response), or by user action (re-diarize). |
 | Diarization (live, Phase B) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from the runner's drain-loop thread (`spawn_blocking`) at SegmentEnd — gated on the `diarization_enabled` setting AND the embedding model being locally `Available` (no download, no block at start; the heavy `EmbeddingExtractor` load is built on `spawn_blocking` before the runner spawns). Best-effort/additive: any failure degrades to "no label" without affecting recording/transcription. See the live-vs-offline note below. |
 | Summarisation | One-shot `spawn_blocking` task triggered by user action. |
 | Persistence writes | `spawn_blocking` per write op for now; revisit if it shows up in profiling. |
@@ -75,7 +75,8 @@ drain-loop thread and rides a parallel `speaker_ids` column
 `AppEvent::TranscriptSegment` and persisted via `WriterCommand::WriteSegment`
 (into `transcript.json`) DURING recording. The on-stop pass remains
 authoritative: when `diarization_enabled` is true, the whole-transcript
-rewrite on stop overwrites the live labels with the offline result. The
+rewrite (a background pass `ipc-bridge` spawns *after* stop, not inline in
+`stop()`) overwrites the live labels with the offline result. The
 wiring adds no dependency edge (the `orchestrator → diarizer` edge pre-exists)
 and no `common`-level online trait (the live path is a concrete struct;
 the existing `common::Diarizer` trait stays offline-only).

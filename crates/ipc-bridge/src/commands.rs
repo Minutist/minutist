@@ -181,6 +181,30 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
         }
     }
 
+    // Decoupled on-stop diarization (FR-11): the meeting is now indexed and
+    // visible, so run the diarization pass in the BACKGROUND rather than inline
+    // in `stop()`. A slow or hung pass can therefore no longer wedge the stop
+    // flow or hide the meeting (the original failure mode). Reuses
+    // `Orchestrator::rediarize`, which — with its length-relative timeout —
+    // rewrites the transcript + metadata, refreshes the index row, and emits
+    // `AppEvent::DiarizationComplete` when done. Gated on the user's
+    // `diarization_enabled` setting; fire-and-forget, errors are logged (the
+    // recording is safely on disk and can be re-diarized manually).
+    if state.orchestrator.diarization_enabled() {
+        let orchestrator = std::sync::Arc::clone(&state.orchestrator);
+        let index = std::sync::Arc::clone(&state.index);
+        let meeting_id = meta.uuid;
+        tokio::spawn(async move {
+            if let Err(e) = orchestrator.rediarize(&index, meeting_id).await {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "background on-stop diarization failed: {e}; meeting left un-diarized"
+                );
+            }
+        });
+    }
+
     Ok(meta)
 }
 
@@ -397,6 +421,17 @@ fn load_notes_inner(
 #[tauri::command]
 #[specta::specta]
 pub async fn list_meetings(state: State<'_, IpcState>) -> Result<Vec<MeetingListEntry>, IpcError> {
+    // Self-heal: index any meeting present on disk but missing from the cache
+    // (e.g. the process killed between finalise and the stop-time upsert) so it
+    // can never stay hidden until the next startup `rebuild_from_disk`. Cheap
+    // (a readdir + set-diff; only NEW folders are read). Best-effort — a
+    // reconcile failure must not break listing, so log and serve the cache.
+    if let Err(e) = state.index.reconcile_orphans(&state.meetings_dir).await {
+        tracing::warn!(
+            target: "ipc-bridge",
+            "meeting-list self-heal reconcile failed: {e}; listing cached rows as-is"
+        );
+    }
     state.index.list_meetings().await.map_err(IpcError::from)
 }
 

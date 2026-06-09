@@ -213,6 +213,24 @@ impl LlamaSummariser {
     pub fn config(&self) -> &SummariserConfig {
         &self.config
     }
+
+    /// Borrow the loaded [`LlamaModel`] for the chat engine (Phase 9, D5).
+    ///
+    /// The substrate seam: `ipc-bridge` holds the concrete
+    /// `Arc<LlamaSummariser>`, lends `&LlamaModel` to `chat-agent`'s
+    /// `LlamaTurnBackend`, and coerces the same handle to `Arc<dyn Summariser>`
+    /// for the `agent-tools` `ToolContext`. The model is `unsafe impl Send +
+    /// Sync` (`llama-cpp-2`), so it crosses threads and is referenced
+    /// concurrently; the chat engine builds its own `!Sync` `LlamaContext`
+    /// fresh per turn (clean KV cache), exactly as `summarise` does. No GGUF is
+    /// reloaded per turn. Keeping this an accessor (rather than wrapping the
+    /// model) preserves `summarise()` unchanged and avoids a `summariser →
+    /// chat-agent` edge — `chat-agent` depends on `summariser`, never the
+    /// reverse. See `architecture/components.md` — `summariser` (model
+    /// exposure) and `chat-agent`.
+    pub fn model(&self) -> &LlamaModel {
+        &self.model
+    }
 }
 
 impl Summariser for LlamaSummariser {

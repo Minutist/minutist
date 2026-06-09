@@ -26,6 +26,7 @@ role when work is parallel.
 | `settings` | data-engineer | `crates/settings/**` | Same | `common` |
 | `orchestrator` | systems-engineer | `crates/orchestrator/**` | Same | `common` + all live-pipeline crates per table in `components.md` |
 | `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator` |
+| `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |
@@ -108,6 +109,8 @@ These rules let multiple agents work concurrently without coordination:
 | "Add a new keyboard shortcut" | frontend-engineer |
 | "Refactor the live pipeline to use a different chunking strategy" | systems-engineer (orchestrator) — but specify the new contract in this doc first |
 | "Add Ollama dispatcher as a `Summariser` impl" | ml-runtime-engineer (lives in `summariser`, no new edge) |
+| "Add a chat tool" | systems-engineer (`agent-tools` — one `impl Tool` + register in `ToolRegistry::v1`) |
+| "Change the agent loop / sampling / tool-call parsing" | ml-runtime-engineer (`chat-agent`) |
 | "Add a telemetry hook" | architecture-owner (it's not in scope yet, requires a doc update) |
 
 ## Anti-patterns the reviewer flags

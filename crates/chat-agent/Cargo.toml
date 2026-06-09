@@ -1,0 +1,37 @@
+[package]
+name = "chat-agent"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Phase 9: the stateless, OpenAI-compatible, tool-calling chat TURN engine over
+# the bundled local LLM. Sits ABOVE summariser (the loaded-model substrate) and
+# agent-tools (the tool descriptors). Edges: common, summariser, agent-tools
+# (+ external llama-cpp-2, serde, serde_json, thiserror, tracing). NOT tauri,
+# NOT persistence/orchestrator directly. The DRIVER (ipc-bridge, a later phase)
+# owns the conversation history, the sliding window, tool dispatch, the loop and
+# the max-iteration cap; this crate runs ONE assistant turn per call.
+
+[dependencies]
+meeting-app-common = { path = "../common" }
+summariser = { path = "../summariser" }
+agent-tools = { path = "../agent-tools" }
+llama-cpp-2 = { workspace = true }
+encoding_rs = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[features]
+# GPU acceleration backends (Phase 7 parity), OFF by default — forward to
+# llama-cpp-2 so a GPU workspace build links chat-agent against the same backend
+# as summariser/asr-runtime (the shared process-wide LlamaBackend).
+vulkan = ["llama-cpp-2/vulkan"]
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+rocm = ["llama-cpp-2/rocm"]

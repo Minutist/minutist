@@ -96,6 +96,8 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
 
                 agentTools = component "agent-tools" "Shared tool layer. One Tool trait + ToolRegistry; the single place a tool is defined; driven by both the chat agent and (Phase 10) the MCP server." "Rust crate: crates/agent-tools"
 
+                chatAgent = component "chat-agent" "Stateless, OpenAI-compatible, tool-calling chat TURN engine over the bundled local LLM. Reuses the summariser model substrate + the agent-tools descriptors; the driver (ipc-bridge) owns history + the loop + tool dispatch." "Rust crate: crates/chat-agent"
+
                 settings = component "settings" "Settings schema, validation, change notifications. Persists via tauri-plugin-store." "Rust crate: crates/settings"
 
                 ipcBridge = component "ipc-bridge" "Tauri command + event surface. tauri-specta generates the TypeScript bindings consumed by the webview's IPC client. The only crate that knows about Tauri APIs." "Rust crate: crates/ipc-bridge"
@@ -154,6 +156,7 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // workspace conventions, not by every edge here.
         meetingApp.core.orchestrator -> meetingApp.core.common "Uses interface types"
         meetingApp.core.agentTools   -> meetingApp.core.common "Uses interface types"
+        meetingApp.core.chatAgent    -> meetingApp.core.common "Uses interface types"
         meetingApp.core.appMain      -> meetingApp.core.common "Uses interface types"
         meetingApp.core.ipcBridge    -> meetingApp.core.common "Uses interface types"
 
@@ -198,6 +201,14 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // model-registry edge — agent-tools has none).
         meetingApp.core.agentTools -> meetingApp.core.persistence "Reads meeting artefacts; writes via existing writers"
         meetingApp.core.agentTools -> meetingApp.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
+
+        // Chat agent (Phase 9). The stateless turn engine sits ABOVE both the
+        // summariser substrate (borrows the loaded LlamaModel via the D5 seam)
+        // and the agent-tools descriptors (for the oaicompat prompt + grammar).
+        // The driver (ipc-bridge, a later phase) owns history + the loop + tool
+        // dispatch.
+        meetingApp.core.chatAgent -> meetingApp.core.summariser "Reuses the loaded model substrate (LlamaSummariser::model)"
+        meetingApp.core.chatAgent -> meetingApp.core.agentTools "Reads tool descriptors for the prompt + grammar"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
         meetingApp.core.ipcBridge -> meetingApp.core.orchestrator "Invokes commands; subscribes to events"

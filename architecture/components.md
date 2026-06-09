@@ -33,6 +33,7 @@ appears in:
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
 | `agent-tools` | 9 | `common`, `persistence`, `orchestrator` |
+| `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings` |
 
@@ -517,6 +518,21 @@ block (if a model emits one) is stripped before return. The optional
 `external-ollama` feature adds `OllamaSummariser` (a `reqwest::blocking`
 dispatcher to a local `/api/chat` endpoint); `reqwest` + `serde` are pulled in
 only by that feature.
+
+**Phase 9 — model exposure for the chat engine (D5, the ONLY summariser
+change).** `LlamaSummariser` gains `pub fn model(&self) -> &LlamaModel`, the
+substrate seam the Phase-9 `chat-agent` engine borrows. `summarise()` is
+unchanged. `ipc-bridge` holds the concrete `Arc<LlamaSummariser>`, lends
+`&LlamaModel` to `chat-agent`'s `LlamaTurnBackend`, and coerces the same handle
+to `Arc<dyn Summariser>` for the `agent-tools` `ToolContext`. The model is
+`unsafe impl Send + Sync` (`llama-cpp-2`), so it crosses threads and is
+referenced concurrently; the chat engine builds its own `!Sync` `LlamaContext`
+fresh per turn, exactly as `summarise` does — no GGUF is reloaded per turn.
+Keeping this an accessor (not a wrapper) preserves `summarise()` and avoids a
+`summariser → chat-agent` edge: `chat-agent` depends on `summariser`, never the
+reverse. `pub fn gpu_layers()` (the compile-time GPU-offload ceiling) is also
+re-used by `chat-agent`'s `LlamaTurnConfig` default. No new dependency edge —
+`summariser` still depends only on `common`.
 
 **`external-ollama` test coverage + verification.** `OllamaSummariser`'s
 deterministic seams are factored into pure functions — `chat_url` (base-URL
@@ -1034,6 +1050,80 @@ offline claim for free (`InvalidInput` when busy). `set_speaker_name` and
 claim, so they take a `ToolContext`-owned **per-meeting async mutex** across the
 read-modify-write — the one tool-layer-owned write lock. `relisten_section` and
 `resummarise` are read-only-with-compute (write nothing).
+
+### `chat-agent`
+**Crate:** `crates/chat-agent` (Phase 9)
+**Owns:** the stateless, OpenAI-compatible, tool-calling chat TURN engine over
+the bundled local LLM. It sits ABOVE both `summariser` (the loaded-model
+substrate) and `agent-tools` (the tool descriptors); folding the loop into
+`summariser` would force a backwards `summariser → agent-tools` edge. Edges:
+`common`, `summariser`, `agent-tools` (+ external `llama-cpp-2`, `serde`,
+`serde_json`, `thiserror`, `tracing`, `encoding_rs`).
+
+**Deliberately NOT edges.** No `tauri`/`specta`, no `persistence`/`orchestrator`
+directly (the DRIVER reaches those through `agent-tools`), no `model-registry`
+(it reuses the held model via the substrate seam), no `common`-trait addition —
+the engine types (`ChatEngine`, `ChatMessage`, `TurnOutcome`, `SamplerConfig`,
+`TurnBackend`) live in `chat-agent`, not `common`, because no `common`-level
+signature names them (the asymmetry with `common::Summariser` is principled:
+`Summariser` is named by a `common` type — `agent-tools::ToolContext` — so it
+stays in `common`).
+
+**Stateless per call; the driver owns the loop (§1.2/§1.3).** The engine runs
+ONE assistant turn: `ChatEngine::run_turn(history: &[ChatMessage],
+tool_descriptors: &[agent_tools::ToolDescriptor], cfg: &SamplerConfig, token_cb:
+&mut dyn FnMut(&str)) -> AppResult<TurnOutcome>`. It does NOT own the
+conversation history, does NOT dispatch tools, and does NOT emit `AppEvent`s
+(it holds no broadcast handle). The DRIVER (`ipc-bridge`, a later phase) owns the
+`Vec<ChatMessage>` history + the sliding window + the turn loop + the
+max-iteration cap, dispatches via `agent_tools::ToolRegistry::dispatch`, appends
+a tool-result message, and calls `run_turn` again. A `TurnOutcome` is either
+`Final(String)` (a final assistant reply — stop the loop) or
+`ToolCalls(Vec<ToolCall>)` (calls for the driver to execute).
+
+**oaicompat tool calling (§0a).** `run_turn` converts the history to an
+OpenAI-format `messages_json` and the descriptors to an OpenAI `tools_json`
+(`{"type":"function","function":{name,description,parameters:<input_schema>}}`),
+then the real backend renders the prompt via
+`LlamaModel::apply_chat_template_oaicompat` (the GGUF's own tool template),
+generates over a FRESH `LlamaContext` (clean KV cache), streams content via the
+`ChatParseStateOaicompat` streaming parser (tool-call JSON is NEVER streamed
+through `token_cb`), and does a final authoritative `parse_response_oaicompat`
+into a `RawTurn`. The engine maps `RawTurn` → `TurnOutcome`: non-empty tool
+calls ⇒ `ToolCalls`; else non-empty text ⇒ `Final`; else malformed →
+`AppError::InvalidInput`.
+
+**Sampling (§6.4).** A `temp/top_p/dist(seed)` chain by default; **greedy when
+`temperature == 0.0`** (the deterministic test mode). A lazy GBNF grammar
+(`json_schema_to_grammar` over the offered-tool schemas, snapped via
+`grammar_lazy` on the template's tool-call trigger) is the reliability backstop
+for the 4B model — wired but behind `SamplerConfig::grammar_backstop`.
+
+**The substrate seam (D5).** The real turn needs the loaded `LlamaModel`.
+`summariser` exposes it via `LlamaSummariser::model() -> &LlamaModel`.
+`ipc-bridge` holds the concrete `Arc<LlamaSummariser>`, lends `&LlamaModel` to
+`LlamaTurnBackend`, and coerces the same handle to `Arc<dyn Summariser>` for the
+`agent-tools` `ToolContext`. The model is `Send + Sync`; no GGUF is reloaded per
+turn.
+
+**Testability (the `TurnBackend` seam).** The FFI LLM call is behind a
+`TurnBackend` trait (`run(messages_json, tools_json, cfg, token_cb) ->
+Result<RawTurn, Error>`). The real `LlamaTurnBackend` uses the oaicompat APIs; a
+test stub returns canned text/tool-calls. The engine's turn logic (prompt
+assembly, outcome parsing, tool-call extraction, error mapping, the
+sliding-window trim, and the CI gate that compiles every registry schema through
+`json_schema_to_grammar`) is unit-tested with the stub (no model);
+`LlamaTurnBackend` gets a gated test (`#[ignore]` / skip-on-unset
+`MEETING_APP_LLM_MODEL_PATH`), mirroring the `summariser`/`asr-runtime` gated
+tests.
+
+**Context budget (§6.2, "until context full").** A pure `trim_to_budget`
+helper + a `fits_budget` check live here even though the DRIVER applies them: it
+pins turn 0 (the system prompt + tool list, NOT the full transcript), evicts the
+oldest non-pinned turns until the re-tokenised windowed prompt fits `prompt +
+max_tokens + reserve <= n_ctx`, and reports a hard floor (`HARD_FLOOR_REJECT`)
+when a single turn is genuinely too large (the driver rejects it as
+`AppError::InvalidInput`).
 
 ### `settings`
 **Crate:** `crates/settings`

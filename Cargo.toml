@@ -13,6 +13,7 @@ members = [
     "crates/diarizer",
     "crates/orchestrator",
     "crates/agent-tools",
+    "crates/chat-agent",
     "crates/ipc-bridge",
     "src-tauri",
     "spikes/asr",

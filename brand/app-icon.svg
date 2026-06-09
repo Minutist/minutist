@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Minutist app icon — paper rounded-tile + oxblood nib mark (master, open
+       slit). Mark scaled to ~62% of the tile (icon safe-area padding). For sizes
+       >= 48px; small sizes use app-icon-small.svg (bolder baseline). -->
+  <defs>
+    <path id="spade" d="M 533 293
+             C 461 345 384 384 296 408
+             C 285 502 264 614 210 703
+             C 194 738 165 766 136 794
+             C 130 804 130 814 138 822
+             C 153 841 176 861 194 857
+             C 216 852 238 813 269 797
+             C 292 784 314 768 340 752
+             C 414 714 496 691 588 688
+             C 606 616 642 521 688 450
+             C 689 444 687 438 681 430
+             C 622 376 570 330 533 293 Z"/>
+    <line id="slit-geom" x1="430" y1="558" x2="140" y2="860" stroke-width="24" stroke-linecap="round"/>
+    <circle id="hole-geom" cx="451" cy="537" r="40"/>
+    <mask id="nibcut" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <use href="#spade" fill="white"/>
+      <use href="#hole-geom" fill="black"/>
+      <use href="#slit-geom" stroke="black"/>
+    </mask>
+  </defs>
+
+  <rect width="1024" height="1024" rx="224" fill="#fcfaf4"/>
+  <g transform="translate(83.6,83.6) scale(0.84)" fill="#7a2e2e">
+    <path id="cap" d="M 613 160 L 822 367 L 764 426 C 748 443 722 443 705 426 L 553 276 C 536 259 537 233 553 217 L 613 160 Z"/>
+    <use id="nib" href="#spade" mask="url(#nibcut)"/>
+    <path id="baseline" d="M 290 814 C 268 828 251 843 243 856 C 240 860 244 861 252 860 L 862 859 C 879 858 889 850 889 836 C 889 823 879 814 862 814 L 290 814 Z"/>
+  </g>
+</svg>

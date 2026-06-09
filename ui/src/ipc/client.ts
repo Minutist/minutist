@@ -101,6 +101,7 @@ export const commands: Commands = {
   // matches the regenerated `bindings.ts` and consumers have a single seam.
   sendChatMessage: (meetingId, sessionId, message) =>
     callCommand("sendChatMessage", [meetingId, sessionId, message]),
+  cancelChatTurn: (sessionId) => callCommand("cancelChatTurn", [sessionId]),
   getChatSession: (meetingId, sessionId) =>
     callCommand("getChatSession", [meetingId, sessionId]),
   listChatSessions: (meetingId) =>

@@ -39,7 +39,7 @@ use summariser::plan_prefill;
 
 use crate::backend::{RawTurn, TurnBackend};
 use crate::error::Error;
-use crate::types::{SamplerConfig, ToolCall};
+use crate::types::{CancelFlag, SamplerConfig, ToolCall};
 
 /// Runtime knobs for the real turn backend. Mirrors the relevant
 /// `summariser::SummariserConfig` fields so the chat context is sized like the
@@ -239,6 +239,7 @@ impl TurnBackend for LlamaTurnBackend<'_> {
         messages_json: &str,
         tools_json: Option<&str>,
         cfg: &SamplerConfig,
+        cancel: &CancelFlag,
         token_cb: &mut dyn FnMut(&str),
     ) -> Result<RawTurn, Error> {
         let backend = Self::backend()?;
@@ -305,6 +306,17 @@ impl TurnBackend for LlamaTurnBackend<'_> {
         let mut n_past = tokens.len() as i32;
 
         for _ in 0..cfg.max_tokens {
+            // Cancellation check BETWEEN decoded tokens (P1): a raised flag stops
+            // generation and returns the partial content as a cancelled turn,
+            // rather than running the whole budget or surfacing a final answer.
+            if cancel.is_cancelled() {
+                return Ok(RawTurn {
+                    text: raw_text,
+                    tool_calls: Vec::new(),
+                    cancelled: true,
+                });
+            }
+
             let token = sampler.sample(&llama_ctx, -1);
             sampler.accept(token);
             if self.model.is_eog_token(token) {
@@ -407,7 +419,11 @@ fn parse_final_message(final_json: &str) -> RawTurn {
             });
         }
     }
-    RawTurn { text, tool_calls }
+    RawTurn {
+        text,
+        tool_calls,
+        cancelled: false,
+    }
 }
 
 #[cfg(test)]

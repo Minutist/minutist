@@ -48,11 +48,13 @@ export function ChatView({ meetingId }: ChatViewProps) {
   const inFlight = useChatStore((s) => s.inFlight);
   const toolActivity = useChatStore((s) => s.toolActivity);
   const lastError = useChatStore((s) => s.lastError);
+  const historyTrimmed = useChatStore((s) => s.historyTrimmed);
   const setMeeting = useChatStore((s) => s.setMeeting);
   const openSession = useChatStore((s) => s.openSession);
   const newSession = useChatStore((s) => s.newSession);
   const deleteSession = useChatStore((s) => s.deleteSession);
   const send = useChatStore((s) => s.send);
+  const cancel = useChatStore((s) => s.cancel);
 
   const [draft, setDraft] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -224,6 +226,13 @@ export function ChatView({ meetingId }: ChatViewProps) {
         )}
       </div>
 
+      {historyTrimmed && (
+        <p className="chat-view__notice" role="note">
+          Older messages were trimmed to fit the context window; the agent may
+          not recall the earliest turns.
+        </p>
+      )}
+
       {lastError && (
         <p className="chat-view__error" role="alert">
           {lastError}
@@ -240,14 +249,25 @@ export function ChatView({ meetingId }: ChatViewProps) {
           onKeyDown={onKeyDown}
           rows={2}
         />
-        <button
-          type="button"
-          className="chat-view__send"
-          onClick={submit}
-          disabled={inFlight || draft.trim() === ""}
-        >
-          {inFlight ? "Sending…" : "Send"}
-        </button>
+        {inFlight ? (
+          <button
+            type="button"
+            className="chat-view__send chat-view__stop"
+            onClick={() => void cancel()}
+            title="Stop the agent and keep the partial reply"
+          >
+            Stop
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="chat-view__send"
+            onClick={submit}
+            disabled={draft.trim() === ""}
+          >
+            Send
+          </button>
+        )}
       </div>
     </section>
   );

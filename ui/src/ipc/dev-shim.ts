@@ -500,6 +500,11 @@ export const devCommands = {
     startDevChatTurn(id, message);
     return ok(id);
   },
+  async cancelChatTurn(
+    _sessionId: ChatSessionId,
+  ): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
   async getChatSession(
     _meetingId: MeetingId,
     sessionId: ChatSessionId,
@@ -545,12 +550,14 @@ function devChatSession(id: ChatSessionId): ChatSession {
       {
         role: "user",
         content: "What were the action items from this meeting?",
+        tool_calls: [],
         turn_id: 0,
       },
       {
         role: "assistant",
         content:
           "There were two action items:\n\n1. **Alex** to circulate the revised budget by Friday.\n2. **Sam** to book the venue for the offsite.",
+        tool_calls: [],
         turn_id: 0,
       },
     ],

@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (26 total)
+//! ## Commands (27 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -30,6 +30,7 @@
 //! | `save_summary` | `()` | 5 |
 //! | `rediarize_meeting` | `()` | 6 |
 //! | `send_chat_message` | `ChatSessionId` | 9 |
+//! | `cancel_chat_turn` | `()` | 9 |
 //! | `get_chat_session` | `Option<ChatSession>` | 9 |
 //! | `list_chat_sessions` | `Vec<ChatSession>` | 9 |
 //! | `delete_chat_session` | `()` | 9 |
@@ -185,6 +186,17 @@ pub struct IpcState {
     /// (so an external turn and a human turn cannot run on one session at once).
     pub chat_in_flight:
         Arc<std::sync::Mutex<std::collections::HashSet<meeting_app_common::ChatSessionId>>>,
+    /// Per-session chat-turn cancellation flags (P1). A running turn registers a
+    /// `chat_agent::CancelFlag` here keyed by session id; `cancel_chat_turn`
+    /// raises it, and the decode loop stops at the next between-token check. The
+    /// driver removes the entry when the turn ends. A `std::sync::Mutex<HashMap>`
+    /// (not async) because every access is a brief, non-awaiting insert / get /
+    /// remove, mirroring `chat_in_flight`.
+    pub chat_cancel: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<meeting_app_common::ChatSessionId, chat_agent::CancelFlag>,
+        >,
+    >,
     /// The live MCP server endpoint, set by `app-main` after `mcp_server::serve`
     /// binds (Phase 10). `None` when the MCP server is disabled or not yet
     /// listening. The `get_mcp_server_info` command reads it to reveal the URL +
@@ -340,6 +352,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::save_summary,
             commands::rediarize_meeting,
             commands::send_chat_message,
+            commands::cancel_chat_turn,
             commands::get_chat_session,
             commands::list_chat_sessions,
             commands::delete_chat_session,
@@ -366,11 +379,12 @@ mod tests {
     /// as a string literal in the `invoke` call.
     ///
     /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
-    /// → P10 26 (P5 removes `re_summarise` and adds `summarise_meeting` /
-    /// `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`:
-    /// 20 + 1 = 21; P9 adds `send_chat_message` / `get_chat_session` /
-    /// `list_chat_sessions` / `delete_chat_session`: 21 + 4 = 25; P10 adds
-    /// `get_mcp_server_info`: 25 + 1 = 26).
+    /// → P10 26 → P9 review-fix 27 (P5 removes `re_summarise` and adds
+    /// `summarise_meeting` / `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6
+    /// adds `rediarize_meeting`: 20 + 1 = 21; P9 adds `send_chat_message` /
+    /// `get_chat_session` / `list_chat_sessions` / `delete_chat_session`: 21 + 4
+    /// = 25; P10 adds `get_mcp_server_info`: 25 + 1 = 26; the P9 chat review-fix
+    /// adds `cancel_chat_turn` (P1 — turn cancellation): 26 + 1 = 27).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -408,6 +422,7 @@ mod tests {
             "save_summary",
             "rediarize_meeting",
             "send_chat_message",
+            "cancel_chat_turn",
             "get_chat_session",
             "list_chat_sessions",
             "delete_chat_session",
@@ -416,8 +431,8 @@ mod tests {
 
         assert_eq!(
             expected.len(),
-            26,
-            "command ledger must be 26 after Phase 10 (Phase 9's 25 + get_mcp_server_info)"
+            27,
+            "command ledger must be 27 (Phase 10's 26 + cancel_chat_turn, P9 review-fix)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

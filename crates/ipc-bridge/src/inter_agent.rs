@@ -165,6 +165,8 @@ async fn run_one_turn(
         role: ChatRole::User,
         content: message,
         tool_name: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
         turn_id,
     });
 
@@ -190,6 +192,9 @@ async fn run_one_turn(
     // Run the turn synchronously (the external caller's tools/call blocks on it,
     // capped by the tool's timeout). The turn task OWNS `session` while running.
     let session_for_turn = session.clone();
+    // The inter-agent (MCP) path has no user-facing cancel surface; drive the
+    // turn with a fresh never-raised flag (P1).
+    let cancel = chat_agent::CancelFlag::new();
     let join = tokio::task::spawn_blocking(move || {
         let produced = run_chat_turn_on_held_model(
             &summariser,
@@ -201,6 +206,7 @@ async fn run_one_turn(
             &system_prompt,
             &session_for_turn,
             &event_tx,
+            &cancel,
         );
         (session_for_turn, produced)
     })

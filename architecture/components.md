@@ -77,10 +77,12 @@ trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
 
 **Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
-newtype mirroring `MeetingId`); five chat `AppEvent` variants (`ChatToken`,
-`ChatToolCall`, `ChatToolResult`, `ChatTurnComplete`, `ChatError`) that ride
-the existing `AppEventPayload` newtype + the single
-`collect_events![AppEventPayload]` registration — no new event registration;
+newtype mirroring `MeetingId`); six chat `AppEvent` variants (`ChatToken`,
+`ChatToolCall`, `ChatToolResult`, `ChatTurnComplete`, `ChatError`,
+`ChatContextTrimmed { session_id, dropped_turns }` — the last emitted when the
+driver's sliding window evicts older turns, P2) that ride the existing
+`AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
+registration — no new event registration;
 `MeetingMeta.speaker_names: BTreeMap<String, String>` (diarizer-label →
 display-name overlay, `#[serde(default, skip_serializing_if = …)]` so existing
 `metadata.json` still deserialises and the wire shape only grows); and the
@@ -91,15 +93,25 @@ carries the full reconciled reply (see `cross-cutting.md` — "Agent chat loop")
 
 **Phase 9 — chat session wire types.** The persisted/wire chat shapes the chat
 UI renders and `persistence::ChatStore` serialises: `ChatRole { System, User,
-Assistant, Tool }` (serde snake_case); `ChatMessage { role: ChatRole, content:
-String, tool_name: Option<String>, turn_id: u64 }` (the `turn_id` matches the
-chat events' per-session monotonic turn counter; `tool_name` present only on
-`Tool` messages); `ChatSession { id: ChatSessionId, meeting_id: Option<MeetingId>,
-title: Option<String>, messages: Vec<ChatMessage>, created_at: String, updated_at:
-String }` (RFC 3339 timestamps; absent `meeting_id`/`title` omitted). These are
-**distinct from** `chat-agent`'s engine-internal message type (which the engine
-serialises into the oaicompat template); the `ipc-bridge` driver maps between the
-two at its boundary. All derive `specta::Type` (they cross tauri-specta).
+Assistant, Tool }` (serde snake_case); `ToolCallRecord { id, name,
+arguments_json }` (one requested tool call, the persisted mirror of
+`chat-agent`'s engine `ToolCall`); `ChatMessage { role: ChatRole, content:
+String, tool_name: Option<String>, tool_call_id: Option<String>, tool_calls:
+Vec<ToolCallRecord>, turn_id: u64 }` (the `turn_id` matches the chat events'
+per-session monotonic turn counter; `tool_name`/`tool_call_id` present only on
+`Tool` messages; `tool_calls` present only on an `Assistant` message that
+requested tools — the carrier that keeps a reloaded multi-tool turn a valid
+OpenAI `assistant(tool_calls) → tool(result)` sequence, CQ1; both default-empty
+so older `chat/*.json` still deserialises); `ChatSession { id: ChatSessionId,
+meeting_id: Option<MeetingId>, title: Option<String>, messages:
+Vec<ChatMessage>, created_at: String, updated_at: String }` (RFC 3339
+timestamps; absent `meeting_id`/`title` omitted). These are **distinct from**
+`chat-agent`'s engine-internal message type (which the engine serialises into
+the oaicompat template — its `ChatMessage` likewise carries a `tool_calls:
+Vec<ToolCall>` for the assistant turn, plus a `CancelFlag` cancellation signal
+and a `TurnOutcome::Cancelled` outcome, P1); the `ipc-bridge` driver maps
+between the two at its boundary. All wire types derive `specta::Type` (they
+cross tauri-specta).
 
 **Phase 9 precursor — `Summariser: Send + Sync`.** The summariser trait widens
 from `Send` to `Send + Sync` (SP0-verified). A held `Arc<dyn Summariser>` is
@@ -1534,6 +1546,13 @@ Four commands land, realising the granted `ipc-bridge → agent-tools` +
   persisted by `ChatStore` at turn end. A second send for a session whose turn is
   still running is rejected `InvalidInput { "session busy" }` (single in-flight
   turn per session, tracked in `IpcState::chat_in_flight`).
+- `cancel_chat_turn(session_id: ChatSessionId) -> ()` — raises the per-session
+  `chat_agent::CancelFlag` registered by `send_chat_message` (held in
+  `IpcState::chat_cancel: Arc<Mutex<HashMap<ChatSessionId, CancelFlag>>>`); the
+  engine's decode loop checks it between tokens and stops, and the driver ends
+  the turn with a terminal `ChatTurnComplete` carrying the partial reply (NOT a
+  `ChatError` — cancellation is a user action). Idempotent: a session with no
+  running turn is a no-op success (P1).
 - `get_chat_session(meeting_id, session_id) -> Option<ChatSession>`,
   `list_chat_sessions(meeting_id) -> Vec<ChatSession>`,
   `delete_chat_session(meeting_id, session_id) -> ()` — route directly to
@@ -1544,9 +1563,15 @@ generic over `ChatEngine` + a tool-dispatch closure + an emit closure) so the
 default test suite drives a full turn — final-only, tool-call-then-final, the
 max-iteration cap, and the hard-floor context overflow — with a STUB engine and
 STUB tools, no model and no Tauri runtime. It applies `chat_agent::trim_to_budget`
-before each engine call (hard-floor → `InvalidInput`), runs the tool loop with a
-`MAX_TOOL_ITERATIONS` cap (the escape offers no tools to force a final answer;
-exhaustion emits `ChatError`), and **injects a per-turn non-zero seed** before
+before each engine call (hard-floor → `InvalidInput`; on eviction it snaps the
+drop count forward to a user-message group boundary and emits
+`ChatContextTrimmed`, CQ2/P2), runs the tool loop with a `MAX_TOOL_ITERATIONS`
+cap (the escape offers no tools to force a final answer; exhaustion emits
+`ChatError`), appends the **assistant-`tool_calls` message before** the per-call
+tool results so the engine renders a valid OpenAI `assistant(tool_calls) →
+tool(result)` sequence (CQ1), threads the per-turn `CancelFlag` into each engine
+call (a `TurnOutcome::Cancelled` ends the turn with a terminal `ChatTurnComplete`
+carrying the partial text, P1), and **injects a per-turn non-zero seed** before
 each non-greedy `run_turn` (`chat_agent::SamplerConfig`'s default `seed = 0` is a
 fixed/reproducible trap — every non-greedy reply would be verbatim-identical
 without this).
@@ -1562,10 +1587,13 @@ borrows `&LlamaModel` from the held handle via `LlamaSummariser::model()`; the
 `agent-tools` `ToolContext`'s `resummarise` coerces the same handle to
 `Arc<dyn Summariser>`. `IpcState` also gains `tool_registry: Arc<ToolRegistry>`
 (built once as `ToolRegistry::v1(false)` — the Phase-10 inter-agent bridge tool is
-omitted) and `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`.
+omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
+`chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
+per-session cancel flags `cancel_chat_turn` raises, P1).
 
-The command ledger is now **25** (P6 21 + the four chat commands), asserted by the
-`bindings_builder_registers_expected_command_ledger` test.
+The command ledger is now **27** (P6 21 + the four P9 chat commands = 25; P10's
+`get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27),
+asserted by the `bindings_builder_registers_expected_command_ledger` test.
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name

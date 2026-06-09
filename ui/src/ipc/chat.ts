@@ -77,3 +77,15 @@ export async function deleteChatSession(
 ): Promise<void> {
   unwrap(await commands.deleteChatSession(meetingId, sessionId));
 }
+
+/**
+ * Cancel the in-flight chat turn for a session (P1).
+ *
+ * Raises the backend's per-session cancel flag; the engine stops between tokens
+ * and the turn ends with a terminal `chat_turn_complete` carrying the partial
+ * reply (not a `chat_error`). Idempotent — a session with no running turn is a
+ * no-op success, so the UI can call it to clear a stuck in-flight state.
+ */
+export async function cancelChatTurn(sessionId: ChatSessionId): Promise<void> {
+  unwrap(await commands.cancelChatTurn(sessionId));
+}

@@ -412,6 +412,10 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // cannot run on one session at once.
             let chat_in_flight = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
+            // Per-session chat-turn cancel flags (P1); `cancel_chat_turn` raises
+            // the flag for a running UI turn.
+            let chat_cancel = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
             // The held-summariser cell, shared by the chat command + the
             // inter-agent driver (both load the SAME model once).
             let summariser_cell = Arc::new(tokio::sync::OnceCell::new());
@@ -432,6 +436,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 summariser: summariser_cell.clone(),
                 tool_registry,
                 chat_in_flight: chat_in_flight.clone(),
+                chat_cancel: chat_cancel.clone(),
                 mcp_info: mcp_info.clone(),
             });
 

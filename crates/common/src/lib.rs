@@ -378,6 +378,24 @@ pub enum ChatRole {
     Tool,
 }
 
+/// One tool call an assistant message requested, in the persisted/wire shape.
+///
+/// Mirrors `chat-agent`'s engine-internal `ToolCall` (`id` / `name` /
+/// `arguments_json` — the repo's "arguments cross as a String, not a `Value`"
+/// rule). Carried on an `Assistant` [`ChatMessage`] so a reloaded session
+/// reconstructs the `assistant(tool_calls) → tool(result)` exchange the GGUF
+/// tool template requires (CQ1) instead of an orphan `tool` message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ToolCallRecord {
+    /// The OpenAI tool-call id the matching `Tool` message answers.
+    pub id: String,
+    /// The tool name.
+    pub name: String,
+    /// The tool arguments as a JSON-object string.
+    pub arguments_json: String,
+}
+
 /// One persisted chat message (the wire / on-disk shape).
 ///
 /// Distinct from `chat-agent`'s engine-internal message: this is the durable,
@@ -385,7 +403,9 @@ pub enum ChatRole {
 /// serialises. `turn_id` is the per-session monotonic turn counter the streaming
 /// chat `AppEvent`s also carry, so the UI can correlate a stored message with
 /// the deltas it saw live. `tool_name` is present only on `Tool` messages (the
-/// name of the tool whose result the message carries).
+/// name of the tool whose result the message carries). `tool_calls` is present
+/// only on an `Assistant` message that requested tools — the carrier that keeps
+/// a reloaded multi-tool turn a valid OpenAI sequence (CQ1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct ChatMessage {
@@ -395,6 +415,18 @@ pub struct ChatMessage {
     /// `None` for system/user/assistant messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// For a `Tool` message: the OpenAI tool-call id this result answers — the
+    /// id of the matching entry in the preceding assistant message's
+    /// `tool_calls` (CQ1). Persisted so a reloaded turn re-links each tool
+    /// result to its call rather than synthesising an id that no longer matches
+    /// the assistant `tool_calls`. `None` for non-tool messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// For an `Assistant` message: the tool calls it requested (CQ1). Empty for
+    /// every other message and for a plain assistant free-text reply. Defaulted
+    /// so an older on-disk session (written before this field existed) reloads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCallRecord>,
     /// The per-session monotonic turn this message belongs to. The user message
     /// and the assistant/tool messages produced answering it share one `turn_id`
     /// (the same value the `ChatToken`/`ChatTurnComplete` events carry).
@@ -628,6 +660,16 @@ pub enum AppEvent {
     ChatError {
         session_id: ChatSessionId,
         message: String,
+    },
+    /// The driver's sliding window evicted the oldest non-pinned messages to
+    /// keep the conversation within the context budget (Phase 9).
+    /// `dropped_turns` is the number of history messages dropped (snapped to a
+    /// user-message group boundary, CQ2). The webview shows a "history trimmed"
+    /// affordance so the user knows older turns no longer inform the agent. The
+    /// pinned system head (turn 0) is never evicted.
+    ChatContextTrimmed {
+        session_id: ChatSessionId,
+        dropped_turns: u32,
     },
 
     // --- MCP server (Phase 10) -------------------------------------------
@@ -1298,6 +1340,23 @@ mod tests {
     }
 
     #[test]
+    fn app_event_chat_context_trimmed_serialises_with_tag() {
+        let e = AppEvent::ChatContextTrimmed {
+            session_id: ChatSessionId::new(),
+            dropped_turns: 4,
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"chat_context_trimmed\""));
+        assert!(json.contains("\"dropped_turns\":4"));
+        match serde_json::from_str::<AppEvent>(&json).unwrap() {
+            AppEvent::ChatContextTrimmed { dropped_turns, .. } => {
+                assert_eq!(dropped_turns, 4);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
     fn chat_session_round_trips_and_omits_optionals() {
         let session = ChatSession {
             id: ChatSessionId::new(),
@@ -1308,24 +1367,44 @@ mod tests {
                     role: ChatRole::System,
                     content: "you are a meeting-notes assistant".to_string(),
                     tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                     turn_id: 0,
                 },
                 ChatMessage {
                     role: ChatRole::User,
                     content: "what were the action items?".to_string(),
                     tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    turn_id: 1,
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: vec![ToolCallRecord {
+                        id: "call_1".to_string(),
+                        name: "get_transcript".to_string(),
+                        arguments_json: "{}".to_string(),
+                    }],
                     turn_id: 1,
                 },
                 ChatMessage {
                     role: ChatRole::Tool,
                     content: "{\"segments\":[]}".to_string(),
                     tool_name: Some("get_transcript".to_string()),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_calls: Vec::new(),
                     turn_id: 1,
                 },
                 ChatMessage {
                     role: ChatRole::Assistant,
                     content: "the action items were …".to_string(),
                     tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                     turn_id: 1,
                 },
             ],
@@ -1337,12 +1416,20 @@ mod tests {
         assert!(json.contains("\"role\":\"tool\""));
         // The tool message carries its tool_name; non-tool messages omit it.
         assert!(json.contains("\"tool_name\":\"get_transcript\""));
+        // The assistant-tool_calls message carries the OpenAI tool-call carrier
+        // (CQ1) so a reloaded multi-tool turn is a valid sequence.
+        assert!(json.contains("\"tool_calls\""));
+        assert!(json.contains("\"arguments_json\":\"{}\""));
         let back: ChatSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, session);
-        assert_eq!(back.messages.len(), 4);
+        assert_eq!(back.messages.len(), 5);
         assert!(back.messages[0].tool_name.is_none());
+        // index 2 = assistant(tool_calls), index 3 = the matching tool result.
+        assert_eq!(back.messages[2].role, ChatRole::Assistant);
+        assert_eq!(back.messages[2].tool_calls.len(), 1);
+        assert_eq!(back.messages[2].tool_calls[0].id, "call_1");
         assert_eq!(
-            back.messages[2].tool_name.as_deref(),
+            back.messages[3].tool_name.as_deref(),
             Some("get_transcript")
         );
 

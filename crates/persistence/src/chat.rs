@@ -200,7 +200,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
 mod tests {
     use super::*;
     use crate::folder::MeetingFolder;
-    use meeting_app_common::{ChatMessage, ChatRole};
+    use meeting_app_common::{ChatMessage, ChatRole, ToolCallRecord};
     use tempfile::TempDir;
 
     fn make_meeting() -> (TempDir, PathBuf, MeetingId) {
@@ -221,18 +221,36 @@ mod tests {
                     role: ChatRole::User,
                     content: "what were the action items?".to_string(),
                     tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                    turn_id: 1,
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: String::new(),
+                    tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: vec![ToolCallRecord {
+                        id: "call_1".to_string(),
+                        name: "get_transcript".to_string(),
+                        arguments_json: "{}".to_string(),
+                    }],
                     turn_id: 1,
                 },
                 ChatMessage {
                     role: ChatRole::Tool,
                     content: "{\"segments\":[]}".to_string(),
                     tool_name: Some("get_transcript".to_string()),
+                    tool_call_id: Some("call_1".to_string()),
+                    tool_calls: Vec::new(),
                     turn_id: 1,
                 },
                 ChatMessage {
                     role: ChatRole::Assistant,
                     content: "the action items were …".to_string(),
                     tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                     turn_id: 1,
                 },
             ],
@@ -292,6 +310,8 @@ mod tests {
             role: ChatRole::User,
             content: "and who owns them?".to_string(),
             tool_name: None,
+            tool_call_id: None,
+            tool_calls: Vec::new(),
             turn_id: 2,
         });
         session.updated_at = "2026-06-10T10:05:00Z".to_string();

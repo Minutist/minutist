@@ -21,6 +21,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: vi.fn() }));
 
 vi.mock("../ipc/chat", () => ({
   sendChatMessage: vi.fn().mockResolvedValue("session-1"),
+  cancelChatTurn: vi.fn().mockResolvedValue(undefined),
   getChatSession: vi.fn().mockResolvedValue(null),
   listChatSessions: vi.fn().mockResolvedValue([]),
   deleteChatSession: vi.fn().mockResolvedValue(undefined),
@@ -28,7 +29,7 @@ vi.mock("../ipc/chat", () => ({
 
 import { ChatView, renderChatMarkdown } from "../shell/ChatView";
 import { useChatStore } from "../state/chat";
-import { sendChatMessage, listChatSessions } from "../ipc/chat";
+import { sendChatMessage, cancelChatTurn, listChatSessions } from "../ipc/chat";
 import type { ChatSession } from "../ipc/chat";
 
 const MEETING = "meeting-0001";
@@ -45,6 +46,7 @@ function resetStore() {
       inFlight: false,
       toolActivity: null,
       lastError: null,
+      historyTrimmed: false,
     });
   });
 }
@@ -75,8 +77,13 @@ describe("ChatView (Phase 9)", () => {
       useChatStore.setState({
         sessionId: SESSION,
         messages: [
-          { role: "user", content: "Hi there", turn_id: 0 },
-          { role: "assistant", content: "**Bold** answer", turn_id: 0 },
+          { role: "user", content: "Hi there", tool_calls: [], turn_id: 0 },
+          {
+            role: "assistant",
+            content: "**Bold** answer",
+            tool_calls: [],
+            turn_id: 0,
+          },
         ],
       });
     });
@@ -115,13 +122,37 @@ describe("ChatView (Phase 9)", () => {
     expect(sendChatMessage).not.toHaveBeenCalled();
   });
 
-  it("disables the send control while a turn is in flight", async () => {
+  it("replaces Send with a Stop control while a turn is in flight, and cancels", async () => {
     render(<ChatView meetingId={MEETING} />);
     await waitFor(() => expect(listChatSessions).toHaveBeenCalled());
     act(() => {
       useChatStore.setState({ sessionId: SESSION, inFlight: true });
     });
-    expect(screen.getByRole("button", { name: "Sending…" })).toBeDisabled();
+    // The Send control is gone; a Stop control is shown (P1).
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+    const stop = screen.getByRole("button", { name: "Stop" });
+    await act(async () => {
+      fireEvent.click(stop);
+    });
+    // Cancelling raises the backend flag and clears the in-flight state.
+    expect(cancelChatTurn).toHaveBeenCalledWith(SESSION);
+    await waitFor(() => expect(useChatStore.getState().inFlight).toBe(false));
+  });
+
+  it("surfaces the history-trimmed notice on chat_context_trimmed", async () => {
+    render(<ChatView meetingId={MEETING} />);
+    await waitFor(() => expect(listChatSessions).toHaveBeenCalled());
+    act(() => {
+      useChatStore.setState({ sessionId: SESSION });
+    });
+    act(() => {
+      useChatStore.getState().handleEvent({
+        kind: "chat_context_trimmed",
+        session_id: SESSION,
+        dropped_turns: 2,
+      });
+    });
+    expect(screen.getByText(/Older messages were trimmed/i)).toBeInTheDocument();
   });
 
   it("shows the streamed text with a caret, then the finalised assistant message", async () => {

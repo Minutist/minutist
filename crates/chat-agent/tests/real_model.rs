@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use chat_agent::{ChatEngine, ChatMessage, LlamaTurnBackend, LlamaTurnConfig, SamplerConfig, TurnEngine, TurnOutcome};
+use chat_agent::{CancelFlag, ChatEngine, ChatMessage, LlamaTurnBackend, LlamaTurnConfig, SamplerConfig, TurnEngine, TurnOutcome};
 use summariser::{LlamaSummariser, SummariserConfig};
 
 use agent_tools::ToolDescriptor;
@@ -55,6 +55,7 @@ fn real_turn_produces_a_final_answer() {
             &history,
             &[], // tool-less ⇒ forces a final answer
             &SamplerConfig::deterministic(),
+            &CancelFlag::new(),
             &mut |t| streamed.push_str(t),
         )
         .expect("a tool-less turn must succeed");
@@ -66,6 +67,9 @@ fn real_turn_produces_a_final_answer() {
         }
         TurnOutcome::ToolCalls(calls) => {
             panic!("a tool-less turn must not request tools, got {calls:?}");
+        }
+        TurnOutcome::Cancelled { .. } => {
+            panic!("an un-cancelled turn must not report cancellation");
         }
     }
 }
@@ -105,7 +109,7 @@ fn real_turn_can_request_a_tool() {
     };
 
     let outcome = engine
-        .run_turn(&history, &descriptors, &cfg, &mut |_| {})
+        .run_turn(&history, &descriptors, &cfg, &CancelFlag::new(), &mut |_| {})
         .expect("a tool-offering turn must succeed");
 
     // Loosely asserted: the model MAY answer directly or request the tool;
@@ -120,6 +124,9 @@ fn real_turn_can_request_a_tool() {
         }
         TurnOutcome::Final(text) => {
             eprintln!("real tool turn => answered directly: {text:?}");
+        }
+        TurnOutcome::Cancelled { .. } => {
+            panic!("an un-cancelled turn must not report cancellation");
         }
     }
 }

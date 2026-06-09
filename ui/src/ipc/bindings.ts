@@ -382,6 +382,25 @@ async sendChatMessage(meetingId: MeetingId | null, sessionId: ChatSessionId | nu
 }
 },
 /**
+ * Cancel the in-flight chat turn for a session (P1).
+ * 
+ * Raises the per-session [`chat_agent::CancelFlag`] registered by
+ * `send_chat_message`; the engine's decode loop observes it between tokens,
+ * stops, and the driver emits the terminal `ChatTurnComplete` with the partial
+ * text (cancellation is a user action, not a `ChatError`) and clears the
+ * in-flight guard. Idempotent: a session with no running turn (no registered
+ * flag) is a no-op success — the UI can call this freely to clear a stuck
+ * "Sending…" state.
+ */
+async cancelChatTurn(sessionId: ChatSessionId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_chat_turn", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Get one chat session for a meeting, or `None` when it does not exist.
  */
 async getChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<Result<ChatSession | null, IpcError>> {
@@ -573,6 +592,15 @@ export type AppEvent =
  */
 { kind: "chat_error"; session_id: ChatSessionId; message: string } | 
 /**
+ * The driver's sliding window evicted the oldest non-pinned messages to
+ * keep the conversation within the context budget (Phase 9).
+ * `dropped_turns` is the number of history messages dropped (snapped to a
+ * user-message group boundary, CQ2). The webview shows a "history trimmed"
+ * affordance so the user knows older turns no longer inform the agent. The
+ * pinned system head (turn 0) is never evicted.
+ */
+{ kind: "chat_context_trimmed"; session_id: ChatSessionId; dropped_turns: number } | 
+/**
  * The in-process MCP server bound its loopback Streamable HTTP listener.
  * `app-main` emits this after `mcp_server::serve` returns the bound addr so
  * the Settings → MCP pane can show the live endpoint URL. The bearer token
@@ -622,7 +650,9 @@ export type AudioMeterFrame = { peak: number; rms: number }
  * serialises. `turn_id` is the per-session monotonic turn counter the streaming
  * chat `AppEvent`s also carry, so the UI can correlate a stored message with
  * the deltas it saw live. `tool_name` is present only on `Tool` messages (the
- * name of the tool whose result the message carries).
+ * name of the tool whose result the message carries). `tool_calls` is present
+ * only on an `Assistant` message that requested tools — the carrier that keeps
+ * a reloaded multi-tool turn a valid OpenAI sequence (CQ1).
  */
 export type ChatMessage = { role: ChatRole; content: string; 
 /**
@@ -630,6 +660,20 @@ export type ChatMessage = { role: ChatRole; content: string;
  * `None` for system/user/assistant messages.
  */
 tool_name?: string | null; 
+/**
+ * For a `Tool` message: the OpenAI tool-call id this result answers — the
+ * id of the matching entry in the preceding assistant message's
+ * `tool_calls` (CQ1). Persisted so a reloaded turn re-links each tool
+ * result to its call rather than synthesising an id that no longer matches
+ * the assistant `tool_calls`. `None` for non-tool messages.
+ */
+tool_call_id?: string | null; 
+/**
+ * For an `Assistant` message: the tool calls it requested (CQ1). Empty for
+ * every other message and for a plain assistant free-text reply. Defaulted
+ * so an older on-disk session (written before this field existed) reloads.
+ */
+tool_calls: ToolCallRecord[]; 
 /**
  * The per-session monotonic turn this message belongs to. The user message
  * and the assistant/tool messages produced answering it share one `turn_id`
@@ -1064,6 +1108,28 @@ export type Theme = "light" | "dark" |
  * Follow the OS preference (default).
  */
 "system"
+/**
+ * One tool call an assistant message requested, in the persisted/wire shape.
+ * 
+ * Mirrors `chat-agent`'s engine-internal `ToolCall` (`id` / `name` /
+ * `arguments_json` — the repo's "arguments cross as a String, not a `Value`"
+ * rule). Carried on an `Assistant` [`ChatMessage`] so a reloaded session
+ * reconstructs the `assistant(tool_calls) → tool(result)` exchange the GGUF
+ * tool template requires (CQ1) instead of an orphan `tool` message.
+ */
+export type ToolCallRecord = { 
+/**
+ * The OpenAI tool-call id the matching `Tool` message answers.
+ */
+id: string; 
+/**
+ * The tool name.
+ */
+name: string; 
+/**
+ * The tool arguments as a JSON-object string.
+ */
+arguments_json: string }
 /**
  * Optional per-word timestamp data when the ASR model supports it.
  */

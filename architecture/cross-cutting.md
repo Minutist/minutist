@@ -449,18 +449,50 @@ constraints are binding on them):
   the turn loop. The loop is a State-free generic helper
   (`ipc_bridge::chat::run_chat_turn`, generic over the engine + a tool-dispatch
   closure + an emit closure) so the default test suite drives a full turn — a
-  final-only turn, a tool-call-then-final turn, the max-iteration cap, and a
-  hard-floor context overflow — with a stub engine and stub tools, no model and no
-  Tauri runtime. Per iteration: apply `chat_agent::trim_to_budget` (hard floor →
-  reject `InvalidInput { "message too large for context window" }`), run one
-  engine turn streaming `ChatToken`s, then either return the `Final` text (emit
-  `ChatTurnComplete`) or dispatch each requested tool (emit `ChatToolCall`,
-  `registry.dispatch`, emit `ChatToolResult`, append a tool-result message) and
-  loop. A `MAX_TOOL_ITERATIONS` cap bounds the loop: once hit, the engine is
-  re-invoked with NO tools to force a final answer; a turn that still cannot finish
-  emits `ChatError`. Tool dispatch re-enters async via a captured
-  `Handle::block_on(registry.dispatch(...))` for the dispatch step only (§4.5 — the
-  one async/sync crossing).
+  final-only turn, a tool-call-then-final turn, a multi-tool turn (history-shape
+  assertion), the max-iteration cap, a cancelled turn, and a hard-floor context
+  overflow — with a stub engine and stub tools, no model and no Tauri runtime. Per
+  iteration: apply `chat_agent::trim_to_budget` (hard floor → reject `InvalidInput
+  { "message too large for context window" }`), run one engine turn streaming
+  `ChatToken`s, then either return the `Final` text (emit `ChatTurnComplete`) or
+  dispatch each requested tool and loop. A `MAX_TOOL_ITERATIONS` cap bounds the
+  loop: once hit, the engine is re-invoked with NO tools to force a final answer; a
+  turn that still cannot finish emits `ChatError`. Tool dispatch re-enters async
+  via a captured `Handle::block_on(registry.dispatch(...))` for the dispatch step
+  only (§4.5 — the one async/sync crossing).
+
+- **Assistant-`tool_calls` message in history (binding, CQ1).** The OpenAI tool
+  protocol the GGUF tool template renders is `assistant(tool_calls) →
+  tool(result)*`: a `tool` message MUST be preceded by the assistant message that
+  bears the matching `tool_calls` array. When a turn requests tools, the driver
+  therefore appends ONE assistant message carrying ALL the requested calls
+  (`chat_agent::ChatMessage::assistant_tool_calls`) BEFORE the per-call
+  `tool_result` messages — never a bare `tool` after `[system, user]`, which the
+  template either hard-errors on or silently degrades. The engine `ChatMessage`
+  carries `tool_calls: Vec<ToolCall>` for this; `backend::messages_json`
+  serialises it as the OpenAI `tool_calls` array (with `content: null`). The
+  carrier is persisted on the wire `common::ChatMessage` (`tool_calls:
+  Vec<ToolCallRecord>` on the assistant message, `tool_call_id` on the tool
+  message) so a reloaded multi-tool turn reconstructs the same valid sequence.
+
+- **Turn cancellation (binding, P1).** Each turn runs against a
+  `chat_agent::CancelFlag` (`Arc<AtomicBool>`). `send_chat_message` registers one
+  per session in `IpcState::chat_cancel`; the `cancel_chat_turn(session_id)`
+  command raises it. The engine's real decode loop checks the flag BETWEEN decoded
+  tokens and, when raised, stops and returns `TurnOutcome::Cancelled { partial }`.
+  The driver ends the turn with a terminal `ChatTurnComplete` carrying the partial
+  text (cancellation is a user action, not a `ChatError`), clears the in-flight
+  guard + the cancel-flag entry, and persists the session. The inter-agent (MCP)
+  path drives a fresh never-raised flag (no user cancel surface).
+
+- **Group-boundary eviction (binding, CQ2/P2).** `chat_agent::trim_to_budget` is a
+  pure planner that returns the MINIMUM messages to drop after the pinned system
+  head. The driver (which owns the message roles) SNAPS that count forward to the
+  next user-message boundary before draining, so the survivor at `history[1]` is a
+  `User` turn — never an orphan `assistant`/`tool` lead (which, with the CQ1
+  assistant-`tool_calls` rule, would be a malformed sequence). On any eviction the
+  driver emits `AppEvent::ChatContextTrimmed { session_id, dropped_turns }`; the
+  webview shows a quiet "history trimmed" affordance.
 
 - **Per-turn seed (binding).** `chat_agent::SamplerConfig`'s default `seed` is `0`,
   which is FIXED/reproducible — every non-greedy reply would be verbatim-identical.

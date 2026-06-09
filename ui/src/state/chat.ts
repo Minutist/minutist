@@ -40,6 +40,7 @@
 import { create } from "zustand";
 import {
   sendChatMessage,
+  cancelChatTurn,
   getChatSession,
   listChatSessions,
   deleteChatSession,
@@ -81,6 +82,12 @@ export type ChatStore = {
   toolActivity: ToolActivity | null;
   /** Last error surfaced by a chat IPC call or a `chat_error` event. */
   lastError: string | null;
+  /**
+   * Set when the backend's sliding window evicted older turns to stay within
+   * the context budget (`chat_context_trimmed`, P2). The view shows a quiet
+   * "history trimmed" affordance; cleared on the next send / session switch.
+   */
+  historyTrimmed: boolean;
 
   /** Scope the chat to a meeting (on open); loads its sessions. */
   setMeeting: (meetingId: MeetingId | null) => Promise<void>;
@@ -94,6 +101,8 @@ export type ChatStore = {
   deleteSession: (sessionId: ChatSessionId) => Promise<void>;
   /** Send a user message; appends it optimistically and enters the in-flight state. */
   send: (message: string) => Promise<void>;
+  /** Cancel the in-flight turn (P1); the backend ends it with a partial reply. */
+  cancel: () => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -104,7 +113,7 @@ function errorMessage(err: unknown): string {
 
 /** A user `ChatMessage` for the optimistic append on send. */
 function userMessage(content: string, turnId: number): ChatMessage {
-  return { role: "user", content, turn_id: turnId };
+  return { role: "user", content, tool_calls: [], turn_id: turnId };
 }
 
 export const useChatStore = create<ChatStore>((set, get) => ({
@@ -116,6 +125,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   inFlight: false,
   toolActivity: null,
   lastError: null,
+  historyTrimmed: false,
 
   setMeeting: async (meetingId) => {
     // Switching meetings resets the open session and its messages — chat is
@@ -129,6 +139,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       inFlight: false,
       toolActivity: null,
       lastError: null,
+      historyTrimmed: false,
     });
     if (meetingId === null) return;
     await get().loadSessions();
@@ -163,6 +174,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         inFlight: false,
         toolActivity: null,
         lastError: null,
+        historyTrimmed: false,
       });
     } catch (err) {
       set({ lastError: errorMessage(err) });
@@ -179,6 +191,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       inFlight: false,
       toolActivity: null,
       lastError: null,
+      historyTrimmed: false,
     });
   },
 
@@ -195,6 +208,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           streaming: null,
           inFlight: false,
           toolActivity: null,
+          historyTrimmed: false,
         });
       }
       set({ lastError: null });
@@ -226,6 +240,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       inFlight: true,
       toolActivity: null,
       lastError: null,
+      historyTrimmed: false,
     });
 
     try {
@@ -248,6 +263,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     }
   },
 
+  cancel: async () => {
+    const { sessionId, inFlight } = get();
+    if (!inFlight || sessionId === null) return;
+    try {
+      await cancelChatTurn(sessionId);
+      // The backend ends the turn with a terminal `chat_turn_complete` carrying
+      // the partial reply, which clears `inFlight`. If that terminal event is
+      // dropped on the lossy bus, clear the in-flight state here so the UI does
+      // not stick on "Stop".
+      set({ inFlight: false, streaming: null, toolActivity: null });
+    } catch (err) {
+      set({ lastError: errorMessage(err) });
+    }
+  },
+
   handleEvent: (event) => {
     switch (event.kind) {
       case "chat_token":
@@ -255,6 +285,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       case "chat_tool_result":
       case "chat_turn_complete":
       case "chat_error":
+      case "chat_context_trimmed":
         break;
       default:
         return;
@@ -298,6 +329,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         const assistant: ChatMessage = {
           role: "assistant",
           content: event.final_text,
+          tool_calls: [],
           turn_id: event.turn_id,
         };
         set({
@@ -319,6 +351,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           toolActivity: null,
           lastError: event.message,
         });
+        return;
+      }
+      case "chat_context_trimmed": {
+        // The backend evicted older turns to stay within the context budget
+        // (P2). Surface a quiet "history trimmed" affordance; the turn continues.
+        set({ historyTrimmed: true });
         return;
       }
     }

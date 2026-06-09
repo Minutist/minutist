@@ -21,6 +21,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../ipc/chat", () => ({
   sendChatMessage: vi.fn().mockResolvedValue("session-1"),
+  cancelChatTurn: vi.fn().mockResolvedValue(undefined),
   getChatSession: vi.fn().mockResolvedValue(null),
   listChatSessions: vi.fn().mockResolvedValue([]),
   deleteChatSession: vi.fn().mockResolvedValue(undefined),
@@ -28,6 +29,7 @@ vi.mock("../ipc/chat", () => ({
 
 import {
   sendChatMessage,
+  cancelChatTurn,
   getChatSession,
   listChatSessions,
   deleteChatSession,
@@ -49,6 +51,7 @@ function resetStore() {
     inFlight: false,
     toolActivity: null,
     lastError: null,
+    historyTrimmed: false,
   });
 }
 
@@ -165,6 +168,19 @@ describe("useChatStore — event reconciliation", () => {
     expect(state.streaming).toBeNull();
   });
 
+  it("chat_context_trimmed sets the history-trimmed flag without ending the turn", () => {
+    useChatStore.setState({ inFlight: true, historyTrimmed: false });
+    useChatStore.getState().handleEvent({
+      kind: "chat_context_trimmed",
+      session_id: SESSION,
+      dropped_turns: 3,
+    });
+    const state = useChatStore.getState();
+    expect(state.historyTrimmed).toBe(true);
+    // The turn continues — the trim is informational, not terminal.
+    expect(state.inFlight).toBe(true);
+  });
+
   it("ignores an event for a NON-active session (per-session scoping)", () => {
     useChatStore.setState({ streaming: "active text", inFlight: true });
     useChatStore.getState().handleEvent({
@@ -257,6 +273,21 @@ describe("useChatStore — actions", () => {
     expect(state.lastError).toBe("session busy");
   });
 
+  it("cancel raises the backend flag and clears the in-flight state (P1)", async () => {
+    useChatStore.setState({ sessionId: SESSION, inFlight: true, streaming: "x" });
+    await useChatStore.getState().cancel();
+    expect(cancelChatTurn).toHaveBeenCalledWith(SESSION);
+    const state = useChatStore.getState();
+    expect(state.inFlight).toBe(false);
+    expect(state.streaming).toBeNull();
+  });
+
+  it("cancel is a no-op when no turn is in flight", async () => {
+    useChatStore.setState({ sessionId: SESSION, inFlight: false });
+    await useChatStore.getState().cancel();
+    expect(cancelChatTurn).not.toHaveBeenCalled();
+  });
+
   it("loadSessions populates the session list", async () => {
     const sample: ChatSession = {
       id: SESSION,
@@ -277,7 +308,7 @@ describe("useChatStore — actions", () => {
       id: SESSION,
       meeting_id: MEETING,
       title: "A chat",
-      messages: [{ role: "user", content: "hello", turn_id: 0 }],
+      messages: [{ role: "user", content: "hello", tool_calls: [], turn_id: 0 }],
       created_at: "2026-06-10T00:00:00Z",
       updated_at: "2026-06-10T00:00:00Z",
     };
@@ -291,7 +322,7 @@ describe("useChatStore — actions", () => {
   it("deleteSession deletes, clears the open conversation, and refreshes the list", async () => {
     useChatStore.setState({
       sessionId: SESSION,
-      messages: [{ role: "user", content: "x", turn_id: 0 }],
+      messages: [{ role: "user", content: "x", tool_calls: [], turn_id: 0 }],
     });
     await useChatStore.getState().deleteSession(SESSION);
     expect(deleteChatSession).toHaveBeenCalledWith(MEETING, SESSION);
@@ -304,7 +335,7 @@ describe("useChatStore — actions", () => {
   it("newSession clears the open session so the next send mints a fresh one", () => {
     useChatStore.setState({
       sessionId: SESSION,
-      messages: [{ role: "user", content: "x", turn_id: 0 }],
+      messages: [{ role: "user", content: "x", tool_calls: [], turn_id: 0 }],
     });
     useChatStore.getState().newSession();
     const state = useChatStore.getState();
@@ -315,7 +346,7 @@ describe("useChatStore — actions", () => {
   it("setMeeting scopes the chat and loads its sessions, resetting the prior session", async () => {
     useChatStore.setState({
       sessionId: SESSION,
-      messages: [{ role: "user", content: "x", turn_id: 0 }],
+      messages: [{ role: "user", content: "x", tool_calls: [], turn_id: 0 }],
     });
     await useChatStore.getState().setMeeting("meeting-0002");
     const state = useChatStore.getState();

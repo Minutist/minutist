@@ -8,6 +8,9 @@
 //! between the two at its boundary. Keeping the engine types here keeps
 //! `chat-agent` off the `common` precursor.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// The role of one message in the conversation history.
@@ -37,6 +40,13 @@ pub enum Role {
 /// `tool_call_id` / `name` carry the OpenAI tool-message linkage so a `Tool`
 /// message can be tied back to the assistant tool call it answers; both are
 /// omitted from the wire shape when absent.
+///
+/// `tool_calls` carries the calls an `Assistant` message requested. An OpenAI
+/// tool exchange is `assistant(tool_calls) → tool(result)*`: the template
+/// REQUIRES the assistant message bearing the `tool_calls` array to precede the
+/// `tool` result messages, so the driver appends an
+/// [`ChatMessage::assistant_tool_calls`] BEFORE the per-call
+/// [`ChatMessage::tool_result`]s (CQ1). Empty for every non-tool-call message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
@@ -49,6 +59,12 @@ pub struct ChatMessage {
     /// result). `None` for system/user/assistant messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// For an `Assistant` message: the tool calls it requested. Serialised into
+    /// the OpenAI `tool_calls` array by [`crate::backend::messages_json`] so the
+    /// `assistant(tool_calls) → tool(result)` sequence the GGUF tool template
+    /// expects is valid. Empty for every other message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl ChatMessage {
@@ -59,6 +75,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             name: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -77,6 +94,24 @@ impl ChatMessage {
         Self::text(Role::Assistant, content)
     }
 
+    /// An assistant turn that REQUESTED tool calls (CQ1).
+    ///
+    /// The driver appends this BEFORE the per-call [`Self::tool_result`]s so the
+    /// engine renders the OpenAI `assistant(tool_calls) → tool(result)`
+    /// sequence the GGUF tool template requires; a bare `tool` message with no
+    /// preceding assistant-`tool_calls` is a template-protocol violation. The
+    /// `content` is any leading prose the assistant emitted alongside the calls
+    /// (usually empty).
+    pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            name: None,
+            tool_calls,
+        }
+    }
+
     /// A tool-result message answering the call `tool_call_id` from tool
     /// `name`. The driver builds this after running [`ToolCall`] through the
     /// `agent-tools` `ToolRegistry::dispatch`, then calls the engine again.
@@ -90,6 +125,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -123,6 +159,11 @@ pub enum TurnOutcome {
     /// One or more tool calls to execute; the driver dispatches, appends tool
     /// results, and re-invokes the engine.
     ToolCalls(Vec<ToolCall>),
+    /// The decode loop observed a raised cancel flag between tokens and stopped
+    /// early (P1). `partial` is the user-visible text accumulated so far (it may
+    /// be empty). The driver ends the turn with a terminal event rather than
+    /// looping or treating it as a final answer.
+    Cancelled { partial: String },
 }
 
 /// Sampling knobs for one turn (§1.4 / §6.4).
@@ -177,5 +218,33 @@ impl SamplerConfig {
     /// Whether this config selects the greedy (deterministic) decode path.
     pub fn is_greedy(&self) -> bool {
         self.temperature == 0.0
+    }
+}
+
+/// A shared cancellation signal for one chat turn (P1).
+///
+/// The driver builds one per session and hands a clone to the engine call; the
+/// `cancel_chat_turn` command raises it. The real decode loop
+/// ([`crate::llama::LlamaTurnBackend::run`]) checks [`CancelFlag::is_cancelled`]
+/// BETWEEN decoded tokens and stops early, returning
+/// [`TurnOutcome::Cancelled`]. A cheap `Arc<AtomicBool>` (Relaxed ordering — the
+/// flag is a single boolean with no other state to synchronise).
+#[derive(Debug, Clone, Default)]
+pub struct CancelFlag(Arc<AtomicBool>);
+
+impl CancelFlag {
+    /// A fresh, un-raised flag.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raise the flag — the decode loop stops at the next between-token check.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the flag has been raised.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
     }
 }

@@ -977,6 +977,8 @@ pub async fn send_chat_message(
         role: ChatRole::User,
         content: message.clone(),
         tool_name: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
         turn_id,
     });
 
@@ -1010,7 +1012,17 @@ pub async fn send_chat_message(
     let registry = Arc::clone(&state.tool_registry);
     let event_tx = state.event_tx.clone();
     let in_flight = Arc::clone(&state.chat_in_flight);
+    let cancel_map = Arc::clone(&state.chat_cancel);
     let handle = tokio::runtime::Handle::current();
+
+    // Register a fresh per-session cancel flag (P1) before spawning, so a
+    // `cancel_chat_turn` arriving any time after this returns can raise it. The
+    // decode loop checks it between tokens; the driver clears the entry at end.
+    let cancel = chat_agent::CancelFlag::new();
+    cancel_map
+        .lock()
+        .expect("chat_cancel poisoned")
+        .insert(sid, cancel.clone());
 
     // Spawn the driver; the turn streams via events. The session id is returned
     // to the caller now. The turn task OWNS `session` (already carrying the user
@@ -1031,6 +1043,7 @@ pub async fn send_chat_message(
                 &system_prompt,
                 &session,
                 &event_tx,
+                &cancel,
             );
             (session, produced)
         })
@@ -1054,9 +1067,39 @@ pub async fn send_chat_message(
             .lock()
             .expect("chat_in_flight poisoned")
             .remove(&sid);
+        cancel_map
+            .lock()
+            .expect("chat_cancel poisoned")
+            .remove(&sid);
     });
 
     Ok(sid)
+}
+
+/// Cancel the in-flight chat turn for a session (P1).
+///
+/// Raises the per-session [`chat_agent::CancelFlag`] registered by
+/// `send_chat_message`; the engine's decode loop observes it between tokens,
+/// stops, and the driver emits the terminal `ChatTurnComplete` with the partial
+/// text (cancellation is a user action, not a `ChatError`) and clears the
+/// in-flight guard. Idempotent: a session with no running turn (no registered
+/// flag) is a no-op success — the UI can call this freely to clear a stuck
+/// "Sending…" state.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_chat_turn(
+    session_id: ChatSessionId,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    if let Some(flag) = state
+        .chat_cancel
+        .lock()
+        .expect("chat_cancel poisoned")
+        .get(&session_id)
+    {
+        flag.cancel();
+    }
+    Ok(())
 }
 
 /// The live MCP server endpoint (URL + bearer token) for the Settings → MCP
@@ -1222,6 +1265,7 @@ pub(crate) fn run_chat_turn_on_held_model(
     system_prompt: &str,
     session: &ChatSession,
     event_tx: &broadcast::Sender<AppEvent>,
+    cancel: &chat_agent::CancelFlag,
 ) -> Result<Vec<ChatMessage>, AppError> {
     let backend = LlamaTurnBackend::new(summariser.model(), LlamaTurnConfig::default());
     let engine = TurnEngine::new(backend);
@@ -1261,6 +1305,7 @@ pub(crate) fn run_chat_turn_on_held_model(
         &descriptors,
         &cfg,
         CHAT_N_CTX,
+        cancel,
         dispatch,
         emit,
     );
@@ -1276,8 +1321,13 @@ pub(crate) fn run_chat_turn_on_held_model(
     Ok(wire_produced_from_delta(&history[prefix_len..], turn_id))
 }
 
-/// Map the engine-history delta a turn produced (assistant final + tool results,
-/// in order) into persisted/wire [`ChatMessage`]s. Pure + unit-tested.
+/// Map the engine-history delta a turn produced (the assistant-tool_calls
+/// message + each tool result + the assistant final, in order) into
+/// persisted/wire [`ChatMessage`]s. Pure + unit-tested.
+///
+/// CQ1: the assistant-tool_calls message's `tool_calls` and each tool result's
+/// `tool_call_id` are carried onto the wire shape so a reloaded multi-tool turn
+/// reconstructs the valid `assistant(tool_calls) → tool(result)` sequence.
 fn wire_produced_from_delta(
     new_engine_messages: &[chat_agent::ChatMessage],
     turn_id: u64,
@@ -1288,6 +1338,16 @@ fn wire_produced_from_delta(
             role: wire_role(m.role),
             content: m.content.clone(),
             tool_name: m.name.clone(),
+            tool_call_id: m.tool_call_id.clone(),
+            tool_calls: m
+                .tool_calls
+                .iter()
+                .map(|c| meeting_app_common::ToolCallRecord {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    arguments_json: c.arguments_json.clone(),
+                })
+                .collect(),
             turn_id,
         })
         .collect()
@@ -2045,10 +2105,18 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `wire_produced_from_delta` maps the engine-history delta to wire messages
-    /// carrying the FULL tool payload + the tool name (not the lossy summary).
+    /// carrying the FULL tool payload + the tool name (not the lossy summary),
+    /// AND (CQ1) the assistant-tool_calls carrier + the tool result's
+    /// tool_call_id so a reloaded multi-tool turn is a valid OpenAI sequence.
     #[test]
     fn wire_produced_from_delta_keeps_full_tool_payload() {
+        let call = chat_agent::ToolCall {
+            id: "call_1".to_string(),
+            name: "get_summary".to_string(),
+            arguments_json: "{}".to_string(),
+        };
         let delta = vec![
+            chat_agent::ChatMessage::assistant_tool_calls("", vec![call]),
             chat_agent::ChatMessage::tool_result(
                 "call_1",
                 "get_summary",
@@ -2057,17 +2125,26 @@ mod tests {
             chat_agent::ChatMessage::assistant("We decided to ship Phase 9."),
         ];
         let wire = wire_produced_from_delta(&delta, 3);
-        assert_eq!(wire.len(), 2);
-        assert_eq!(wire[0].role, ChatRole::Tool);
-        assert_eq!(wire[0].tool_name.as_deref(), Some("get_summary"));
+        assert_eq!(wire.len(), 3);
+        // CQ1: the assistant-tool_calls message carries the OpenAI tool-call
+        // carrier (id/name/arguments), preceding the tool result.
+        assert_eq!(wire[0].role, ChatRole::Assistant);
+        assert_eq!(wire[0].tool_calls.len(), 1);
+        assert_eq!(wire[0].tool_calls[0].id, "call_1");
+        assert_eq!(wire[0].tool_calls[0].name, "get_summary");
+        // The tool result carries the matching tool_call_id + full payload.
+        assert_eq!(wire[1].role, ChatRole::Tool);
+        assert_eq!(wire[1].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(wire[1].tool_name.as_deref(), Some("get_summary"));
         assert!(
-            wire[0].content.contains("decisions"),
+            wire[1].content.contains("decisions"),
             "the full machine payload must be persisted, not a one-line summary"
         );
-        assert_eq!(wire[0].turn_id, 3);
-        assert_eq!(wire[1].role, ChatRole::Assistant);
-        assert_eq!(wire[1].content, "We decided to ship Phase 9.");
-        assert!(wire[1].tool_name.is_none());
+        assert_eq!(wire[1].turn_id, 3);
+        assert_eq!(wire[2].role, ChatRole::Assistant);
+        assert_eq!(wire[2].content, "We decided to ship Phase 9.");
+        assert!(wire[2].tool_name.is_none());
+        assert!(wire[2].tool_calls.is_empty());
     }
 
     /// `persist_session` saves the WHOLE in-memory session — including the user
@@ -2090,18 +2167,24 @@ mod tests {
                     role: ChatRole::User,
                     content: "what was decided?".into(),
                     tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                     turn_id: 0,
                 },
                 ChatMessage {
                     role: ChatRole::Tool,
                     content: r#"{"decisions":["ship"]}"#.into(),
                     tool_name: Some("get_summary".into()),
+                    tool_call_id: Some("call_1".into()),
+                    tool_calls: Vec::new(),
                     turn_id: 0,
                 },
                 ChatMessage {
                     role: ChatRole::Assistant,
                     content: "We decided to ship.".into(),
                     tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
                     turn_id: 0,
                 },
             ],

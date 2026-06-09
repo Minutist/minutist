@@ -31,7 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_tools::{ToolDescriptor, ToolOutput};
 use chat_agent::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
-use chat_agent::{ChatEngine, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
+use chat_agent::{
+    CancelFlag, ChatEngine, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome,
+};
 use meeting_app_common::{AppError, AppEvent, AppResult, ChatSessionId};
 
 /// The max number of tool-call iterations one turn may take before the driver
@@ -70,15 +72,20 @@ pub struct TurnResult {
 ///   slice forces a tool-less final-answer turn (the max-iteration escape).
 /// - `cfg` — the base sampler config; the driver injects a per-turn seed into a
 ///   clone before each `run_turn` (greedy turns ignore the seed).
+/// - `cancel` — the per-turn cancellation signal (P1). Passed into each engine
+///   call; the decode loop checks it between tokens and returns
+///   [`TurnOutcome::Cancelled`], which the driver turns into a terminal
+///   `ChatTurnComplete` carrying the partial text (the session is not an error).
 /// - `dispatch` — runs ONE tool call to a [`ToolOutput`] (production: a closure
 ///   that does `Handle::block_on(registry.dispatch(ctx, name, args))`).
 /// - `emit` — receives each chat `AppEvent` (production: forwards to the
 ///   broadcast bus; tests: records into a Vec).
 ///
 /// Returns the assistant's final text. Streaming `ChatToken`s, `ChatToolCall` /
-/// `ChatToolResult` per dispatch, and the terminal `ChatTurnComplete` are all
-/// emitted through `emit`; a hard-floor context overflow or a backend error
-/// surfaces both as an `Err(AppError)` AND an emitted `ChatError`.
+/// `ChatToolResult` per dispatch, a `ChatContextTrimmed` when the sliding window
+/// evicts history (P2), and the terminal `ChatTurnComplete` are all emitted
+/// through `emit`; a hard-floor context overflow or a backend error surfaces
+/// both as an `Err(AppError)` AND an emitted `ChatError`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_chat_turn<E, D, M>(
     engine: &E,
@@ -88,6 +95,7 @@ pub fn run_chat_turn<E, D, M>(
     descriptors: &[ToolDescriptor],
     cfg: &SamplerConfig,
     n_ctx: usize,
+    cancel: &CancelFlag,
     mut dispatch: D,
     mut emit: M,
 ) -> AppResult<TurnResult>
@@ -100,12 +108,19 @@ where
     loop {
         // Apply the sliding-window trim before each engine call (§6.2). A
         // hard-floor overflow is a genuinely-too-large turn → reject + ChatError.
-        apply_trim(history, cfg, n_ctx).inspect_err(|e| {
+        // On eviction, emit ChatContextTrimmed with the dropped count (P2).
+        let dropped = apply_trim(history, cfg, n_ctx).inspect_err(|e| {
             emit(AppEvent::ChatError {
                 session_id,
                 message: e.to_string(),
             });
         })?;
+        if dropped > 0 {
+            emit(AppEvent::ChatContextTrimmed {
+                session_id,
+                dropped_turns: dropped as u32,
+            });
+        }
 
         // The max-iteration escape: once the cap is hit, offer NO tools so the
         // model must answer in free text (§6.1 step d).
@@ -127,7 +142,7 @@ where
         };
 
         let outcome = engine
-            .run_turn(history, offered, &turn_cfg, &mut token_cb)
+            .run_turn(history, offered, &turn_cfg, cancel, &mut token_cb)
             .inspect_err(|e| {
                 emit(AppEvent::ChatError {
                     session_id,
@@ -148,6 +163,23 @@ where
                     tool_iterations: iteration,
                 });
             }
+            TurnOutcome::Cancelled { partial } => {
+                // The user cancelled mid-stream (P1). End the turn cleanly: keep
+                // the partial text as the assistant reply (so the session stays a
+                // valid alternation) and emit the terminal ChatTurnComplete with
+                // it. NOT a ChatError — cancellation is a user action, not a
+                // failure.
+                history.push(ChatMessage::assistant(partial.clone()));
+                emit(AppEvent::ChatTurnComplete {
+                    session_id,
+                    turn_id,
+                    final_text: partial.clone(),
+                });
+                return Ok(TurnResult {
+                    final_text: partial,
+                    tool_iterations: iteration,
+                });
+            }
             TurnOutcome::ToolCalls(_calls) if offered.is_empty() => {
                 // The escape turn (no tools offered) still requested a tool: the
                 // model is misbehaving. Treat the loop as exhausted with no final
@@ -162,6 +194,17 @@ where
                 return Err(AppError::Internal { context: message });
             }
             TurnOutcome::ToolCalls(calls) => {
+                // CQ1: the OpenAI tool protocol is `assistant(tool_calls) →
+                // tool(result)*`. Append the ASSISTANT message bearing the
+                // requested tool_calls BEFORE the per-call tool results, so the
+                // next engine render is a valid sequence (a bare `tool` message
+                // with no preceding assistant-tool_calls is malformed and the
+                // GGUF tool template hard-errors or silently degrades on it).
+                history.push(ChatMessage::assistant_tool_calls(
+                    String::new(),
+                    calls.clone(),
+                ));
+
                 for call in &calls {
                     emit(AppEvent::ChatToolCall {
                         session_id,
@@ -212,15 +255,26 @@ where
     }
 }
 
-/// Apply the sliding-window trim to `history` in place (§6.2).
+/// Apply the sliding-window trim to `history` in place (§6.2). Returns the
+/// number of messages evicted (`0` when nothing was dropped) so the driver can
+/// emit a `ChatContextTrimmed` event (P2).
 ///
 /// Estimates each message's token length (a cheap chars/4 heuristic — the engine
 /// re-tokenises authoritatively, and a fresh context per turn makes eviction
 /// free), then drops the oldest non-pinned messages per
-/// [`chat_agent::trim_to_budget`]. A hard floor (a single turn too large even
-/// after dropping all evictable history) is rejected as
+/// [`chat_agent::trim_to_budget`]. The pure planner returns the MINIMUM count to
+/// drop; the driver (which owns the message roles) then SNAPS that count FORWARD
+/// to the next user-message boundary so the surviving window after the pinned
+/// head starts on a `User` turn (CQ2) — leaving an orphan `Assistant`/`Tool` at
+/// `history[1]` is a malformed OpenAI sequence and (with CQ1) breaks the tool
+/// template. A hard floor (a single turn too large even after dropping all
+/// evictable history) is rejected as
 /// `AppError::InvalidInput { context: HARD_FLOOR_REJECT }`.
-fn apply_trim(history: &mut Vec<ChatMessage>, cfg: &SamplerConfig, n_ctx: usize) -> AppResult<()> {
+fn apply_trim(
+    history: &mut Vec<ChatMessage>,
+    cfg: &SamplerConfig,
+    n_ctx: usize,
+) -> AppResult<usize> {
     if history.len() <= 1 {
         // Pinned head only (or empty): nothing evictable. Still hard-floor-check.
         let total: usize = history.iter().map(estimate_tokens).sum();
@@ -229,21 +283,51 @@ fn apply_trim(history: &mut Vec<ChatMessage>, cfg: &SamplerConfig, n_ctx: usize)
                 context: HARD_FLOOR_REJECT.to_string(),
             });
         }
-        return Ok(());
+        return Ok(0);
     }
 
     let lens: Vec<usize> = history.iter().map(estimate_tokens).collect();
     match trim_to_budget(&lens, cfg.max_tokens, CONTEXT_RESERVE_TOKENS, n_ctx) {
-        TrimOutcome::Fits { drop_after_head: 0 } => Ok(()),
+        TrimOutcome::Fits { drop_after_head: 0 } => Ok(0),
         TrimOutcome::Fits { drop_after_head } => {
-            // Drop `drop_after_head` messages immediately after the pinned head.
-            history.drain(1..1 + drop_after_head);
-            Ok(())
+            // Snap the minimum drop count FORWARD to a user-message group
+            // boundary so the survivor at history[1] is a `User` turn (CQ2).
+            let drop = snap_to_group_boundary(history, drop_after_head);
+            history.drain(1..1 + drop);
+            Ok(drop)
         }
         TrimOutcome::HardFloor => Err(AppError::InvalidInput {
             context: HARD_FLOOR_REJECT.to_string(),
         }),
     }
+}
+
+/// Snap `drop_after_head` (the pure planner's minimum) FORWARD to the next
+/// user-message group boundary (CQ2).
+///
+/// The OpenAI/template alternation is `user → assistant[(tool_calls) → tool*]`
+/// groups after the pinned system head. Dropping a non-group-aligned prefix can
+/// leave an orphan `Assistant`/`Tool` as the first survivor, which is malformed.
+/// We therefore extend the drop forward to the next index `i >= 1 +
+/// drop_after_head` whose message is a `User` (a group start), so the survivor
+/// window begins on a clean turn boundary. We never advance past the last
+/// message: the planner guarantees `drop_after_head <= history.len() - 2`, and
+/// if no later `User` boundary exists we keep the planner's count rather than
+/// evict the most-recent turn.
+fn snap_to_group_boundary(history: &[ChatMessage], drop_after_head: usize) -> usize {
+    let start = 1 + drop_after_head;
+    // Search for the next group start (a User message) at or after `start`,
+    // without ever reaching the final message (always retained).
+    for (idx, msg) in history.iter().enumerate().take(history.len() - 1).skip(start) {
+        if msg.role == Role::User {
+            return idx - 1;
+        }
+    }
+    // No later user boundary before the last message: fall back to the planner's
+    // count (better than dropping the whole tail). With CQ1 the surviving lead
+    // is at worst an assistant message, still preferable to evicting the
+    // most-recent turn.
+    drop_after_head
 }
 
 /// Cheap per-message token estimate: ~4 chars per token, min 1. The engine's
@@ -311,17 +395,36 @@ pub fn initial_history(system_prompt: &str) -> Vec<ChatMessage> {
 /// Map a `common::ChatMessage` (the persisted/wire shape) into the engine's
 /// internal [`ChatMessage`]. The driver rebuilds the engine history from a loaded
 /// session this way.
+///
+/// CQ1: an `Assistant` message that carries `tool_calls` reconstructs the
+/// engine's assistant-tool_calls message (so a reloaded multi-tool turn renders
+/// the valid `assistant(tool_calls) → tool(result)` sequence), and a `Tool`
+/// message uses its persisted `tool_call_id` so it re-links to the matching
+/// call rather than a synthesised id.
 pub fn engine_message_from_wire(m: &meeting_app_common::ChatMessage) -> ChatMessage {
     use meeting_app_common::ChatRole;
     match m.role {
         ChatRole::System => ChatMessage::system(m.content.clone()),
         ChatRole::User => ChatMessage::user(m.content.clone()),
+        ChatRole::Assistant if !m.tool_calls.is_empty() => ChatMessage::assistant_tool_calls(
+            m.content.clone(),
+            m.tool_calls
+                .iter()
+                .map(|c| ToolCall {
+                    id: c.id.clone(),
+                    name: c.name.clone(),
+                    arguments_json: c.arguments_json.clone(),
+                })
+                .collect(),
+        ),
         ChatRole::Assistant => ChatMessage::assistant(m.content.clone()),
         ChatRole::Tool => ChatMessage::tool_result(
-            // The wire shape does not carry the OpenAI tool_call_id; synthesise a
-            // stable id from the turn + tool name so the template can still
-            // attribute the result. The model only needs the name + content.
-            format!("call_{}", m.turn_id),
+            // Prefer the persisted tool_call_id (links to the assistant's
+            // tool_calls); fall back to a stable per-turn synthetic id for an
+            // older on-disk session written before the field existed.
+            m.tool_call_id
+                .clone()
+                .unwrap_or_else(|| format!("call_{}", m.turn_id)),
             m.tool_name.clone().unwrap_or_default(),
             m.content.clone(),
         ),
@@ -350,16 +453,21 @@ mod tests {
     // ----- A stub ChatEngine driving the loop without a model ---------------
 
     /// A scripted engine: each `run_turn` returns the next queued outcome,
-    /// streaming the queued chunks for that step through the token callback.
+    /// streaming the queued chunks for that step through the token callback. It
+    /// also CAPTURES the history it received on each call so a multi-iteration
+    /// test can assert the exact sequence the engine saw (CQ1).
     struct ScriptedEngine {
         /// One entry per `run_turn` call: (streamed chunks, outcome).
         steps: Mutex<std::collections::VecDeque<(Vec<String>, TurnOutcome)>>,
+        /// The history (a clone) seen on each `run_turn` call, in order.
+        seen_histories: Mutex<Vec<Vec<ChatMessage>>>,
     }
 
     impl ScriptedEngine {
         fn new(steps: Vec<(Vec<String>, TurnOutcome)>) -> Self {
             Self {
                 steps: Mutex::new(steps.into_iter().collect()),
+                seen_histories: Mutex::new(Vec::new()),
             }
         }
         fn final_only(text: &str) -> Self {
@@ -373,11 +481,13 @@ mod tests {
     impl ChatEngine for ScriptedEngine {
         fn run_turn(
             &self,
-            _history: &[ChatMessage],
+            history: &[ChatMessage],
             _descriptors: &[ToolDescriptor],
             _cfg: &SamplerConfig,
+            _cancel: &CancelFlag,
             token_cb: &mut dyn FnMut(&str),
         ) -> AppResult<TurnOutcome> {
+            self.seen_histories.lock().unwrap().push(history.to_vec());
             let (chunks, outcome) = self
                 .steps
                 .lock()
@@ -437,6 +547,7 @@ mod tests {
             &[descriptor("get_transcript")],
             &SamplerConfig::deterministic(),
             CHAT_N_CTX,
+            &CancelFlag::new(),
             no_dispatch,
             emit,
         )
@@ -495,6 +606,7 @@ mod tests {
             &[descriptor("get_transcript")],
             &SamplerConfig::deterministic(),
             CHAT_N_CTX,
+            &CancelFlag::new(),
             dispatch,
             emit,
         )
@@ -530,6 +642,30 @@ mod tests {
         assert!(history
             .iter()
             .any(|m| m.role == Role::Tool && m.content.contains("segments")));
+
+        // CQ1: the history the engine saw on the 2nd run_turn is
+        // [system, user, assistant(tool_calls), tool] — the assistant message
+        // bearing the tool_calls precedes the tool result (a valid OpenAI
+        // sequence), not [system, user, tool, …].
+        let seen = engine.seen_histories.lock().unwrap();
+        assert_eq!(seen.len(), 2, "engine ran twice (tool turn + final turn)");
+        let second = &seen[1];
+        assert_eq!(second.len(), 4);
+        assert_eq!(second[0].role, Role::System);
+        assert_eq!(second[1].role, Role::User);
+        assert_eq!(second[2].role, Role::Assistant);
+        assert_eq!(
+            second[2].tool_calls.len(),
+            1,
+            "the assistant message carries the requested tool_calls"
+        );
+        assert_eq!(second[2].tool_calls[0].name, "get_transcript");
+        assert_eq!(second[3].role, Role::Tool);
+        assert_eq!(
+            second[3].tool_call_id.as_deref(),
+            Some("call_get_transcript"),
+            "the tool result links to the assistant tool_call id"
+        );
     }
 
     #[test]
@@ -558,6 +694,7 @@ mod tests {
             &[descriptor("get_transcript")],
             &SamplerConfig::deterministic(),
             CHAT_N_CTX,
+            &CancelFlag::new(),
             dispatch,
             emit,
         )
@@ -588,6 +725,7 @@ mod tests {
                 _history: &[ChatMessage],
                 _descriptors: &[ToolDescriptor],
                 _cfg: &SamplerConfig,
+                _cancel: &CancelFlag,
                 _token_cb: &mut dyn FnMut(&str),
             ) -> AppResult<TurnOutcome> {
                 Ok(TurnOutcome::ToolCalls(vec![tool_call(
@@ -609,6 +747,7 @@ mod tests {
             &[descriptor("get_transcript")],
             &SamplerConfig::deterministic(),
             CHAT_N_CTX,
+            &CancelFlag::new(),
             dispatch,
             emit,
         )
@@ -640,6 +779,7 @@ mod tests {
             &[],
             &SamplerConfig::deterministic(),
             64, // tiny n_ctx forces the hard floor
+            &CancelFlag::new(),
             no_dispatch,
             emit,
         )
@@ -682,6 +822,241 @@ mod tests {
         assert_ne!(
             injected.seed, 0,
             "non-greedy turns must get a non-zero seed"
+        );
+    }
+
+    #[test]
+    fn multi_tool_turn_history_is_valid_openai_sequence() {
+        // CQ1: a turn that requests TWO tools in one iteration must produce ONE
+        // assistant(tool_calls) message bearing both calls, followed by the two
+        // tool results — the history the engine sees on the next run is
+        // [system, user, assistant(2 tool_calls), tool, tool].
+        let engine = ScriptedEngine::new(vec![
+            (
+                vec![],
+                TurnOutcome::ToolCalls(vec![
+                    tool_call("get_transcript", "{}"),
+                    tool_call("get_summary", "{}"),
+                ]),
+            ),
+            (vec![], TurnOutcome::Final("done".to_string())),
+        ]);
+        let mut history = base_history();
+        let (_events, emit) = collector();
+        let dispatch = |_: &EngineToolCall| Ok(ToolOutput::new(serde_json::json!({}), "ok"));
+
+        run_chat_turn(
+            &engine,
+            ChatSessionId::new(),
+            1,
+            &mut history,
+            &[descriptor("get_transcript"), descriptor("get_summary")],
+            &SamplerConfig::deterministic(),
+            CHAT_N_CTX,
+            &CancelFlag::new(),
+            dispatch,
+            emit,
+        )
+        .expect("multi-tool turn reaches a final answer");
+
+        let seen = engine.seen_histories.lock().unwrap();
+        let second = &seen[1];
+        assert_eq!(second.len(), 5, "[system, user, assistant(calls), tool, tool]");
+        assert_eq!(second[2].role, Role::Assistant);
+        assert_eq!(
+            second[2].tool_calls.len(),
+            2,
+            "ONE assistant message carries BOTH requested calls"
+        );
+        assert_eq!(second[3].role, Role::Tool);
+        assert_eq!(second[4].role, Role::Tool);
+        // No bare tool message precedes the assistant-tool_calls message.
+        assert_eq!(second[1].role, Role::User);
+    }
+
+    #[test]
+    fn cancel_flag_stops_turn_with_terminal_complete() {
+        // P1: an engine that reports a Cancelled outcome ends the turn with a
+        // terminal ChatTurnComplete carrying the partial text (NOT a ChatError),
+        // and the partial is appended as the assistant reply.
+        let engine = ScriptedEngine::new(vec![(
+            vec!["par".into(), "tial".into()],
+            TurnOutcome::Cancelled {
+                partial: "partial".to_string(),
+            },
+        )]);
+        let mut history = base_history();
+        let (events, emit) = collector();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+
+        let result = run_chat_turn(
+            &engine,
+            ChatSessionId::new(),
+            1,
+            &mut history,
+            &[descriptor("get_transcript")],
+            &SamplerConfig::deterministic(),
+            CHAT_N_CTX,
+            &cancel,
+            no_dispatch,
+            emit,
+        )
+        .expect("a cancelled turn ends cleanly, not as an error");
+
+        assert_eq!(result.final_text, "partial");
+        let ev = events.borrow();
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, AppEvent::ChatTurnComplete { .. }))
+                .count(),
+            1,
+            "cancellation emits a terminal ChatTurnComplete"
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, AppEvent::ChatError { .. })),
+            "cancellation is NOT a ChatError"
+        );
+        assert_eq!(history.last().unwrap().role, Role::Assistant);
+        assert_eq!(history.last().unwrap().content, "partial");
+    }
+
+    #[test]
+    fn cancel_flag_set_makes_engine_return_cancelled_outcome() {
+        // P1 (engine seam): the real engine threads the flag to the decode loop;
+        // here we assert the driver passes the SAME flag through to the engine,
+        // by observing the engine's behaviour change when the flag is raised.
+        struct FlagWatchingEngine;
+        impl ChatEngine for FlagWatchingEngine {
+            fn run_turn(
+                &self,
+                _history: &[ChatMessage],
+                _descriptors: &[ToolDescriptor],
+                _cfg: &SamplerConfig,
+                cancel: &CancelFlag,
+                token_cb: &mut dyn FnMut(&str),
+            ) -> AppResult<TurnOutcome> {
+                token_cb("x");
+                if cancel.is_cancelled() {
+                    Ok(TurnOutcome::Cancelled {
+                        partial: "x".to_string(),
+                    })
+                } else {
+                    Ok(TurnOutcome::Final("full answer".to_string()))
+                }
+            }
+        }
+        let mut history = base_history();
+        let (_events, emit) = collector();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let result = run_chat_turn(
+            &FlagWatchingEngine,
+            ChatSessionId::new(),
+            1,
+            &mut history,
+            &[],
+            &SamplerConfig::deterministic(),
+            CHAT_N_CTX,
+            &cancel,
+            no_dispatch,
+            emit,
+        )
+        .expect("cancelled turn ends cleanly");
+        assert_eq!(
+            result.final_text, "x",
+            "the raised flag reached the engine and it returned the partial"
+        );
+    }
+
+    #[test]
+    fn apply_trim_snaps_eviction_to_user_group_boundary() {
+        // CQ2: eviction must not leave an orphan assistant/tool at history[1].
+        // Build [system, user1, assistant(calls), tool, user2, assistant2] with
+        // big messages and a tiny budget so the planner wants to drop a few; the
+        // driver snaps the drop FORWARD so the survivor after the head is user2.
+        let big = "x".repeat(4_000); // ~1000 token estimate each
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(big.clone()),
+            ChatMessage::assistant_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_1".into(),
+                    name: "get_transcript".into(),
+                    arguments_json: "{}".into(),
+                }],
+            ),
+            ChatMessage::tool_result("call_1", "get_transcript", big.clone()),
+            ChatMessage::user(big.clone()),
+            ChatMessage::assistant(big.clone()),
+        ];
+        let cfg = SamplerConfig {
+            max_tokens: 256,
+            ..SamplerConfig::deterministic()
+        };
+        // n_ctx small enough that the first user-group (user1+assistant+tool) must
+        // be evicted but the second group (user2+assistant2) survives.
+        let dropped = apply_trim(&mut history, &cfg, 4_096).expect("fits after trim");
+        assert!(dropped > 0, "eviction happened");
+        // The pinned head is retained, and the first survivor after it is a User
+        // (a clean group boundary) — never an orphan assistant/tool.
+        assert_eq!(history[0].role, Role::System);
+        assert_eq!(
+            history[1].role,
+            Role::User,
+            "survivor after the pinned head must be a user-group start (CQ2)"
+        );
+        // The whole first group was dropped (no orphan tool/assistant lead).
+        assert!(
+            !history[1..]
+                .iter()
+                .take_while(|m| m.role != Role::User)
+                .any(|m| matches!(m.role, Role::Tool)),
+            "no orphan tool message leads the surviving window"
+        );
+    }
+
+    #[test]
+    fn eviction_emits_chat_context_trimmed() {
+        // P2: when the sliding window evicts history, the driver emits
+        // ChatContextTrimmed with the dropped count.
+        let big = "x".repeat(4_000);
+        let engine = ScriptedEngine::final_only("ok");
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(big.clone()),
+            ChatMessage::assistant(big.clone()),
+            ChatMessage::user(big.clone()),
+            ChatMessage::assistant(big.clone()),
+            ChatMessage::user("recent".to_string()),
+        ];
+        let (events, emit) = collector();
+        // A small n_ctx forces eviction of the older groups.
+        run_chat_turn(
+            &engine,
+            ChatSessionId::new(),
+            2,
+            &mut history,
+            &[],
+            &SamplerConfig {
+                max_tokens: 256,
+                ..SamplerConfig::deterministic()
+            },
+            4_096,
+            &CancelFlag::new(),
+            no_dispatch,
+            emit,
+        )
+        .expect("turn succeeds after trim");
+        let ev = events.borrow();
+        let trimmed = ev.iter().find_map(|e| match e {
+            AppEvent::ChatContextTrimmed { dropped_turns, .. } => Some(*dropped_turns),
+            _ => None,
+        });
+        assert!(
+            matches!(trimmed, Some(n) if n > 0),
+            "eviction must emit ChatContextTrimmed with a positive dropped_turns"
         );
     }
 }

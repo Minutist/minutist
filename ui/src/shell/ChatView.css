@@ -237,6 +237,21 @@
   font-size: 0.85rem;
 }
 
+/* --- History-trimmed notice (P2) --------------------------------------- */
+
+.chat-view__notice {
+  flex: 0 0 auto;
+  margin: 0 1.5rem;
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  color: var(--ink-muted, var(--ink));
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+  font-style: italic;
+}
+
 /* --- Composer ----------------------------------------------------------- */
 
 .chat-view__composer {
@@ -287,4 +302,15 @@
 .chat-view__send:disabled {
   cursor: not-allowed;
   opacity: 0.4;
+}
+
+/* The Stop control replaces Send while a turn is in flight (P1). */
+.chat-view__stop {
+  color: var(--accent);
+  background: var(--sheet);
+}
+
+.chat-view__stop:hover:not(:disabled) {
+  background: var(--sheet);
+  border-color: var(--accent-soft);
 }

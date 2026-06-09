@@ -53,7 +53,7 @@ mod window;
 pub use backend::{messages_json, tools_json, RawTurn, TurnBackend};
 pub use error::Error;
 pub use llama::{LlamaTurnBackend, LlamaTurnConfig};
-pub use types::{ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
+pub use types::{CancelFlag, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
 pub use window::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
 
 use agent_tools::ToolDescriptor;
@@ -73,6 +73,9 @@ pub trait ChatEngine: Send + Sync {
     ///   An empty slice forces a tool-less, final-answer turn (the driver's
     ///   max-iteration escape).
     /// - `cfg` — per-turn sampling knobs.
+    /// - `cancel` — the per-turn cancellation signal (P1). The decode loop
+    ///   checks it BETWEEN tokens; when raised mid-generation the call returns
+    ///   [`TurnOutcome::Cancelled`] carrying the partial text.
     /// - `token_cb` — called per detokenised user-visible piece (the driver
     ///   maps these to `ChatToken` events). Tool-call JSON is NEVER streamed
     ///   through it.
@@ -81,6 +84,7 @@ pub trait ChatEngine: Send + Sync {
         history: &[ChatMessage],
         tool_descriptors: &[ToolDescriptor],
         cfg: &SamplerConfig,
+        cancel: &CancelFlag,
         token_cb: &mut dyn FnMut(&str),
     ) -> AppResult<TurnOutcome>;
 }
@@ -107,6 +111,7 @@ impl<B: TurnBackend> ChatEngine for TurnEngine<B> {
         history: &[ChatMessage],
         tool_descriptors: &[ToolDescriptor],
         cfg: &SamplerConfig,
+        cancel: &CancelFlag,
         token_cb: &mut dyn FnMut(&str),
     ) -> AppResult<TurnOutcome> {
         let messages = messages_json(history)?;
@@ -114,7 +119,13 @@ impl<B: TurnBackend> ChatEngine for TurnEngine<B> {
 
         let raw = self
             .backend
-            .run(&messages, tools.as_deref(), cfg, token_cb)?;
+            .run(&messages, tools.as_deref(), cfg, cancel, token_cb)?;
+
+        // A cancel observed mid-decode short-circuits the outcome mapping: the
+        // turn was interrupted, not a final answer or a tool request (P1).
+        if raw.cancelled {
+            return Ok(TurnOutcome::Cancelled { partial: raw.text });
+        }
 
         // Outcome mapping (§1.2): tool calls take precedence; else final text;
         // an empty turn (no calls, no text) is malformed.
@@ -158,6 +169,7 @@ mod tests {
                 result: RawTurn {
                     text: text.to_string(),
                     tool_calls: vec![],
+                    cancelled: false,
                 },
                 stream_chunks: text.split_inclusive(' ').map(str::to_string).collect(),
                 seen: Mutex::new(None),
@@ -172,6 +184,7 @@ mod tests {
                         name: name.into(),
                         arguments_json: args.into(),
                     }],
+                    cancelled: false,
                 },
                 stream_chunks: vec![],
                 seen: Mutex::new(None),
@@ -192,6 +205,7 @@ mod tests {
             messages_json: &str,
             tools_json: Option<&str>,
             _cfg: &SamplerConfig,
+            _cancel: &CancelFlag,
             token_cb: &mut dyn FnMut(&str),
         ) -> Result<RawTurn, Error> {
             *self.seen.lock().unwrap() =
@@ -232,6 +246,7 @@ mod tests {
                 &history(),
                 &[descriptor("get_transcript")],
                 &SamplerConfig::deterministic(),
+                &CancelFlag::new(),
                 &mut |t| streamed.push_str(t),
             )
             .unwrap();
@@ -250,6 +265,7 @@ mod tests {
                 &history(),
                 &[descriptor("get_transcript")],
                 &SamplerConfig::deterministic(),
+                &CancelFlag::new(),
                 &mut |_| {},
             )
             .unwrap();
@@ -271,6 +287,7 @@ mod tests {
                 &history(),
                 &[],
                 &SamplerConfig::deterministic(),
+                &CancelFlag::new(),
                 &mut |_| {},
             )
             .unwrap_err();
@@ -289,6 +306,7 @@ mod tests {
                 _: &str,
                 _: Option<&str>,
                 _: &SamplerConfig,
+                _: &CancelFlag,
                 _: &mut dyn FnMut(&str),
             ) -> Result<RawTurn, Error> {
                 Err(Error::Inference("decode blew up".into()))
@@ -296,9 +314,58 @@ mod tests {
         }
         let engine = TurnEngine::new(Failing);
         let err = engine
-            .run_turn(&history(), &[], &SamplerConfig::default(), &mut |_| {})
+            .run_turn(
+                &history(),
+                &[],
+                &SamplerConfig::default(),
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
             .unwrap_err();
         assert!(matches!(err, AppError::Inference { .. }));
+    }
+
+    #[test]
+    fn cancelled_raw_turn_maps_to_cancelled_outcome() {
+        // P1: a backend that reports `cancelled` (the decode loop saw the flag
+        // raised) maps to `TurnOutcome::Cancelled` carrying the partial text,
+        // never a `Final` or a malformed-output error.
+        struct CancelledBackend;
+        impl TurnBackend for CancelledBackend {
+            fn run(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: &SamplerConfig,
+                _: &CancelFlag,
+                token_cb: &mut dyn FnMut(&str),
+            ) -> Result<RawTurn, Error> {
+                token_cb("partial ");
+                Ok(RawTurn {
+                    text: "partial ".to_string(),
+                    tool_calls: vec![],
+                    cancelled: true,
+                })
+            }
+        }
+        let engine = TurnEngine::new(CancelledBackend);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let outcome = engine
+            .run_turn(
+                &history(),
+                &[descriptor("get_transcript")],
+                &SamplerConfig::deterministic(),
+                &cancel,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            TurnOutcome::Cancelled {
+                partial: "partial ".to_string()
+            }
+        );
     }
 
     #[test]
@@ -310,6 +377,7 @@ mod tests {
                 &history(),
                 &[descriptor("get_transcript"), descriptor("get_summary")],
                 &SamplerConfig::deterministic(),
+                &CancelFlag::new(),
                 &mut |_| {},
             )
             .unwrap();
@@ -330,7 +398,13 @@ mod tests {
         let backend = StubBackend::final_text("done");
         let engine = TurnEngine::new(backend);
         engine
-            .run_turn(&history(), &[], &SamplerConfig::default(), &mut |_| {})
+            .run_turn(
+                &history(),
+                &[],
+                &SamplerConfig::default(),
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
             .unwrap();
         let seen = engine.backend.seen.lock().unwrap();
         let (_, tools) = seen.as_ref().unwrap();

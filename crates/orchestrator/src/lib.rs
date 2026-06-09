@@ -432,6 +432,7 @@ impl Orchestrator {
             asr_model: None,
             llm_model: None,
             diarizer: None,
+            speaker_names: std::collections::BTreeMap::new(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 

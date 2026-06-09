@@ -111,6 +111,7 @@ const RESTORED_STATE: MeetingState = {
     asr_model: null,
     llm_model: null,
     diarizer: null,
+    speaker_names: {},
     app_version: "0.0.0",
   },
   transcript: RESTORED_SEGMENTS,

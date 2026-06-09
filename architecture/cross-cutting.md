@@ -408,6 +408,42 @@ value; it never changes per-user; and a single-file source asset avoids
 forcing every phase that uses VAD to also pull in `model-registry`. This
 is the only model file that bypasses the registry.
 
+## Agent chat loop (Phase 9)
+
+The built-in chat agent (`chat-agent` crate, driven by `ipc-bridge`) runs a
+multi-turn, tool-calling loop over the bundled LLM. The decided cross-cutting
+rules (the engine itself lands in the Phase 9 implementation streams; these
+constraints are binding on them):
+
+- **Held model, fresh context per turn.** The `LlamaModel` is loaded once and
+  held (an `Arc<dyn Summariser>`/substrate owned by `ipc-bridge`/`app-main`,
+  shared with the one-shot summary path) rather than reloaded per call. Each
+  assistant turn allocates a fresh `LlamaContext` (clean KV cache); the engine is
+  stateless — the driver owns the conversation history and the sliding window.
+- **Token streaming is a lossy hint; `final_text` is authoritative.** Generation
+  streams `AppEvent::ChatToken { session_id, turn_id, token }` over the shared
+  broadcast bus. The bus is lossy (slow subscribers get `Lagged`), so the webview
+  MUST treat tokens as a progressive hint only and reconcile against
+  `AppEvent::ChatTurnComplete { …, final_text }`, which carries the full reply
+  text for the turn. `ChatToolCall` / `ChatToolResult` are emitted around each
+  tool dispatch; `ChatError` terminates a turn.
+- **Tool calling uses llama-cpp-2's OpenAI-compatible path.** Prompt rendering is
+  `apply_chat_template_with_tools_oaicompat` (the GGUF's own tool template);
+  tool-call extraction is the streaming `ChatParseStateOaicompat` parser; a
+  lazy GBNF grammar (`json_schema_to_grammar` + `LlamaSampler::grammar_lazy`)
+  from each tool's input schema is the reliability backstop for the small model.
+  A max-tool-iteration cap bounds the loop; malformed tool calls are recovered by
+  re-prompting, not by crashing the turn.
+- **`Summariser: Send + Sync`.** The held handle crosses threads and is referenced
+  concurrently by the summary path and the chat `resummarise` tool, so the trait
+  is `Send + Sync` (SP0-verified; see `components.md` — `common`).
+- **`speaker_names` and re-diarization.** `MeetingMeta.speaker_names` maps a
+  diarizer label (`A`/`B`/…) to a user-set display name. Because re-diarization
+  re-clusters and can re-letter speakers, a `rediarize` pass CLEARS `speaker_names`
+  (the old label→name mapping is no longer valid); the `set_speaker_name` tool
+  re-establishes names afterward. Names are an overlay applied at read time, never
+  baked into `transcript.json`.
+
 ## Configuration
 
 Single source: the `settings` crate, backed by a `serde_json` + `std::fs`

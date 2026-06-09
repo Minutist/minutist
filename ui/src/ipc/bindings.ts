@@ -468,7 +468,35 @@ export type AppEvent =
  * A recoverable error occurred during a background task. The pipeline
  * continues; the webview shows a notification.
  */
-{ kind: "error_occurred"; error: AppError }
+{ kind: "error_occurred"; error: AppError } | 
+/**
+ * One streamed token (or token fragment) of the assistant's reply for the
+ * in-flight turn. Lossy: a dropped delta is reconciled by the `final_text`
+ * carried on `ChatTurnComplete` (see `cross-cutting.md`).
+ */
+{ kind: "chat_token"; session_id: ChatSessionId; turn_id: number; token: string } | 
+/**
+ * The assistant requested a tool call mid-turn. `args_json` is the tool's
+ * arguments serialised as a JSON string (the repo's "Value crosses as
+ * String" rule).
+ */
+{ kind: "chat_tool_call"; session_id: ChatSessionId; turn_id: number; tool: string; args_json: string } | 
+/**
+ * A tool call finished. `ok` is `false` when the tool errored; `summary` is
+ * the one-line human/LLM-facing render shown on the UI tool card.
+ */
+{ kind: "chat_tool_result"; session_id: ChatSessionId; turn_id: number; tool: string; ok: boolean; summary: string } | 
+/**
+ * The assistant turn finished. `final_text` carries the FULL reconciled
+ * reply so the store can overwrite regardless of any dropped `ChatToken`
+ * deltas (lossy-broadcast mitigation).
+ */
+{ kind: "chat_turn_complete"; session_id: ChatSessionId; turn_id: number; final_text: string } | 
+/**
+ * The chat turn failed. `message` is a stable human-readable string the
+ * webview surfaces in the chat pane.
+ */
+{ kind: "chat_error"; session_id: ChatSessionId; message: string }
 /**
  * Typed wrapper that gives `AppEvent` a stable tauri-specta event name.
  * 
@@ -503,6 +531,15 @@ export type AudioFormat = { codec: string; sample_rate: number; channels: number
  */
 export type AudioMeterFrame = { peak: number; rms: number }
 /**
+ * Stable identifier for a chat session on disk. UUIDv4. Mirrors [`MeetingId`].
+ * 
+ * A chat session is meeting-scoped; `persistence` stores its turns under
+ * `{meetings_dir}/{meeting_id}/chat/{session_id}.json` (Phase 9 §7). The
+ * streaming chat `AppEvent`s carry this so the webview store routes deltas to
+ * the right session.
+ */
+export type ChatSessionId = string
+/**
  * Error type returned from every Tauri command in `ipc-bridge`.
  * 
  * Carries the same discriminants as `common::AppError` and serialises to the
@@ -533,7 +570,18 @@ excerpt?: string | null }
  * Timestamps are ISO 8601 strings to avoid pulling `chrono` into `common`.
  * Consumers parse as needed.
  */
-export type MeetingMeta = { uuid: MeetingId; title: string; started_at: string; ended_at: string | null; duration_ms: number; speaker_count: number; audio_format: AudioFormat; asr_model: ModelDescriptor | null; llm_model: ModelDescriptor | null; diarizer: ModelDescriptor | null; app_version: string }
+export type MeetingMeta = { uuid: MeetingId; title: string; started_at: string; ended_at: string | null; duration_ms: number; speaker_count: number; audio_format: AudioFormat; asr_model: ModelDescriptor | null; llm_model: ModelDescriptor | null; diarizer: ModelDescriptor | null; 
+/**
+ * User-set display names for identified speakers, keyed by the diarizer's
+ * label (e.g. `"A"` → `"Alice"`). Written by the `set_speaker_name` chat
+ * tool and overlaid at read time; cleared by re-diarization (which can
+ * re-letter speakers, see `cross-cutting.md` "Agent chat loop"). Phase 9.
+ * 
+ * `#[serde(default, skip_serializing_if = …)]` so existing `metadata.json`
+ * (written before the field existed) still deserialises and the wire shape
+ * only grows when the map is non-empty.
+ */
+speaker_names: Partial<{ [key in string]: string }>; app_version: string }
 /**
  * The full restorable state of a meeting, assembled by `persistence` for
  * `open_meeting`: metadata, transcript segments, and the notes document
@@ -772,7 +820,51 @@ prefer_large_asr_model?: boolean;
  * to `true`; an older store written before this field existed deserialises
  * to `true`.
  */
-notes_paper_rules?: boolean }
+notes_paper_rules?: boolean; 
+/**
+ * Chat-agent system prompt (Phase 9). The chat engine forwards this
+ * verbatim as the session's `system` message. `#[serde(default = ...)]`
+ * defaults to a meeting-notes-assistant instruction; an older store
+ * written before this field existed deserialises to that default. Added
+ * to the hand-written `Default` impl.
+ */
+chat_system_prompt?: string; 
+/**
+ * Selected summary prompt preset (Phase 9 — D4). Drives the effective
+ * summary prompt via [`preset_prompt`] UNLESS `summary_system_prompt` is a
+ * non-empty user override (see [`Settings::effective_summary_prompt`]).
+ * `#[serde(default)]` defaults to [`SummaryPreset::Default`] (the prior
+ * behaviour); an older store deserialises to `Default`.
+ */
+summary_preset?: SummaryPreset }
+/**
+ * Built-in summary prompt presets (Phase 9 — D4).
+ * 
+ * Each preset maps to a built-in system prompt via [`preset_prompt`]. The
+ * selected preset drives the effective summary prompt UNLESS the user sets a
+ * custom override in `summary_system_prompt` (see
+ * [`Settings::effective_summary_prompt`]). `Default` reproduces the prior
+ * `summarise_meeting` behaviour exactly.
+ */
+export type SummaryPreset = 
+/**
+ * Structured summary: Summary / Key Decisions / Action Items. The prior
+ * (pre-preset) default behaviour.
+ */
+"default" | 
+/**
+ * Like `Default` but explicitly omits greetings, small-talk and sign-off
+ * chit-chat at the start and end of the meeting.
+ */
+"filter_chit_chat" | 
+/**
+ * Focus on decisions, action items and their owners.
+ */
+"action_items" | 
+/**
+ * A thorough, sectioned summary covering topics, discussion and outcomes.
+ */
+"detailed"
 /**
  * UI colour-scheme preference.
  */

@@ -675,7 +675,10 @@ pub async fn summarise_meeting(
         .map_err(IpcError::from)?;
 
     let meetings_dir = state.meetings_dir.clone();
-    let system_prompt = settings.summary_system_prompt.clone();
+    // Resolve the preset-aware effective prompt (Phase 9 — D4): the user's
+    // custom `summary_system_prompt` override when non-empty, else the built-in
+    // prompt for the selected `summary_preset`.
+    let system_prompt = settings.effective_summary_prompt();
     // GPU offload is a runtime decision: only when BOTH the build has a GPU
     // feature AND the `gpu_acceleration` setting is on. `resolve_summariser_gpu_layers`
     // returns the compile-time ceiling when on, `0` (force CPU) when off (see
@@ -1007,6 +1010,7 @@ mod tests {
             asr_model: None,
             llm_model: None,
             diarizer: None,
+            speaker_names: std::collections::BTreeMap::new(),
             app_version: "0.0.0".into(),
         };
         let meta_json = serde_json::to_vec_pretty(&meta).expect("serialise metadata");

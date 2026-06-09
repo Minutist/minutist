@@ -103,15 +103,96 @@ fn default_transcription_language() -> String {
 /// verbatim as the chat `system` message; users may override it from the
 /// settings UI. An older store written before this field existed
 /// deserialises to this value via `#[serde(default = ...)]`.
-fn default_summary_system_prompt() -> String {
-    "You are a meeting-notes assistant. Summarise the meeting transcript and \
-     the user's notes into clear Markdown. Use these sections with `##` \
-     headings, omitting any that have no content: Summary (a short overview), \
-     Key Decisions (a bulleted list of decisions made), and Action Items (a \
-     bulleted list of follow-ups, naming the owner when stated). Be concise \
-     and factual; do not invent information that is not present in the \
-     transcript or notes."
+/// Default chat-agent system prompt (Phase 9).
+///
+/// A concise instruction framing the bundled LLM as a meeting-notes chat
+/// assistant that uses tools to read the meeting and act on the user's behalf.
+/// The chat engine passes this verbatim as the session's `system` message;
+/// users may override it from the settings UI. An older store written before
+/// this field existed deserialises to this value via `#[serde(default = ...)]`.
+fn default_chat_system_prompt() -> String {
+    "You are a meeting-notes assistant for a single meeting. Answer the user's \
+     questions about this meeting using the available tools to read its \
+     transcript, summary, notes and metadata, and to act on the user's behalf \
+     (re-listen to a span, summarise differently, search, set speaker names). \
+     Prefer calling a tool over guessing. Be concise and factual; cite \
+     timestamps or speakers when relevant; do not invent information that is \
+     not present in the meeting."
         .to_string()
+}
+
+/// Built-in summary prompt presets (Phase 9 — D4).
+///
+/// Each preset maps to a built-in system prompt via [`preset_prompt`]. The
+/// selected preset drives the effective summary prompt UNLESS the user sets a
+/// custom override in `summary_system_prompt` (see
+/// [`Settings::effective_summary_prompt`]). `Default` reproduces the prior
+/// `summarise_meeting` behaviour exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum SummaryPreset {
+    /// Structured summary: Summary / Key Decisions / Action Items. The prior
+    /// (pre-preset) default behaviour.
+    #[default]
+    Default,
+    /// Like `Default` but explicitly omits greetings, small-talk and sign-off
+    /// chit-chat at the start and end of the meeting.
+    FilterChitChat,
+    /// Focus on decisions, action items and their owners.
+    ActionItems,
+    /// A thorough, sectioned summary covering topics, discussion and outcomes.
+    Detailed,
+}
+
+/// The built-in system prompt for a summary [`SummaryPreset`]. Pure; returns a
+/// `'static` string so callers can use it without allocating. `Default`
+/// returns the same instruction as the pre-preset `summary_system_prompt`
+/// default, so an existing store with the default prompt and the default
+/// preset produces byte-identical summarisation behaviour.
+pub fn preset_prompt(preset: SummaryPreset) -> &'static str {
+    match preset {
+        SummaryPreset::Default => {
+            "You are a meeting-notes assistant. Summarise the meeting transcript and \
+             the user's notes into clear Markdown. Use these sections with `##` \
+             headings, omitting any that have no content: Summary (a short overview), \
+             Key Decisions (a bulleted list of decisions made), and Action Items (a \
+             bulleted list of follow-ups, naming the owner when stated). Be concise \
+             and factual; do not invent information that is not present in the \
+             transcript or notes."
+        }
+        SummaryPreset::FilterChitChat => {
+            "You are a meeting-notes assistant. Summarise the meeting transcript and \
+             the user's notes into clear Markdown. Explicitly IGNORE and OMIT general \
+             chit-chat: greetings and small-talk at the start, off-topic banter, and \
+             sign-off pleasantries at the end — summarise only the substantive \
+             discussion. Use these sections with `##` headings, omitting any that have \
+             no content: Summary (a short overview), Key Decisions (a bulleted list of \
+             decisions made), and Action Items (a bulleted list of follow-ups, naming \
+             the owner when stated). Be concise and factual; do not invent information \
+             that is not present in the transcript or notes."
+        }
+        SummaryPreset::ActionItems => {
+            "You are a meeting-notes assistant. From the meeting transcript and the \
+             user's notes, extract what was decided and what needs to happen next. Use \
+             these sections with `##` headings, omitting any that have no content: Key \
+             Decisions (a bulleted list of decisions made) and Action Items (a bulleted \
+             list of follow-ups, each naming the owner when stated and a due date if \
+             mentioned). Keep any narrative summary to one or two sentences at most. Be \
+             concise and factual; do not invent owners, dates or commitments that are \
+             not present in the transcript or notes."
+        }
+        SummaryPreset::Detailed => {
+            "You are a meeting-notes assistant. Produce a thorough, well-structured \
+             Markdown summary of the meeting transcript and the user's notes. Open with \
+             a `## Summary` overview, then a `## Discussion` section with one `###` \
+             subsection per topic covering the points raised and the reasoning, then \
+             `## Key Decisions` (a bulleted list of decisions made) and `## Action \
+             Items` (a bulleted list of follow-ups, naming the owner when stated). Omit \
+             any section that has no content. Be factual and do not invent information \
+             that is not present in the transcript or notes."
+        }
+    }
 }
 
 /// Application settings.
@@ -152,14 +233,15 @@ pub struct Settings {
     #[serde(default = "default_autosave_interval_secs")]
     pub autosave_interval_secs: u32,
 
-    /// Summary system prompt passed to the summariser (FR-28).
+    /// Optional CUSTOM summary system prompt that OVERRIDES the selected
+    /// [`SummaryPreset`] (FR-28 / D4).
     ///
-    /// The `summariser` forwards this verbatim as the chat `system` message
-    /// when generating `summary.md`. Defaults to a structured-summary
-    /// instruction (headings / key decisions / action items); an older store
-    /// written before this field existed deserialises to the default via
-    /// `#[serde(default = ...)]`.
-    #[serde(default = "default_summary_system_prompt")]
+    /// Empty by default (the common case): [`Settings::effective_summary_prompt`]
+    /// then returns `preset_prompt(self.summary_preset)`, so the preset picker
+    /// drives summarisation. A non-empty value is a user override and wins over
+    /// the preset. The `summariser` forwards the effective prompt verbatim as the
+    /// `system` message when generating `summary.md`.
+    #[serde(default)]
     pub summary_system_prompt: String,
 
     /// Selected LLM model for summarisation (FR-35).
@@ -251,6 +333,39 @@ pub struct Settings {
     /// to `true`.
     #[serde(default = "default_notes_paper_rules")]
     pub notes_paper_rules: bool,
+
+    /// Chat-agent system prompt (Phase 9). The chat engine forwards this
+    /// verbatim as the session's `system` message. `#[serde(default = ...)]`
+    /// defaults to a meeting-notes-assistant instruction; an older store
+    /// written before this field existed deserialises to that default. Added
+    /// to the hand-written `Default` impl.
+    #[serde(default = "default_chat_system_prompt")]
+    pub chat_system_prompt: String,
+
+    /// Selected summary prompt preset (Phase 9 — D4). Drives the effective
+    /// summary prompt via [`preset_prompt`] UNLESS `summary_system_prompt` is a
+    /// non-empty user override (see [`Settings::effective_summary_prompt`]).
+    /// `#[serde(default)]` defaults to [`SummaryPreset::Default`] (the prior
+    /// behaviour); an older store deserialises to `Default`.
+    #[serde(default)]
+    pub summary_preset: SummaryPreset,
+}
+
+impl Settings {
+    /// The effective summary system prompt (Phase 9 — D4).
+    ///
+    /// Returns the user's `summary_system_prompt` when it is a non-empty custom
+    /// override; otherwise the built-in prompt for the selected
+    /// [`summary_preset`](Self::summary_preset). `summarise_meeting` resolves the
+    /// prompt through this so the preset picker and the custom-prompt override
+    /// share one resolution point.
+    pub fn effective_summary_prompt(&self) -> String {
+        if self.summary_system_prompt.trim().is_empty() {
+            preset_prompt(self.summary_preset).to_string()
+        } else {
+            self.summary_system_prompt.clone()
+        }
+    }
 }
 
 impl Default for Settings {
@@ -261,7 +376,7 @@ impl Default for Settings {
             data_directory: None,
             start_hidden: false,
             autosave_interval_secs: default_autosave_interval_secs(),
-            summary_system_prompt: default_summary_system_prompt(),
+            summary_system_prompt: String::new(),
             llm_model_id: None,
             diarization_enabled: false,
             onboarding_completed: false,
@@ -270,6 +385,8 @@ impl Default for Settings {
             transcription_language: default_transcription_language(),
             prefer_large_asr_model: default_prefer_large_asr_model(),
             notes_paper_rules: default_notes_paper_rules(),
+            chat_system_prompt: default_chat_system_prompt(),
+            summary_preset: SummaryPreset::default(),
         }
     }
 }
@@ -312,6 +429,8 @@ mod tests {
             transcription_language: "Japanese".to_string(),
             prefer_large_asr_model: true,
             notes_paper_rules: false,
+            chat_system_prompt: "Be a terse assistant.".to_string(),
+            summary_preset: SummaryPreset::ActionItems,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -359,12 +478,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn summary_system_prompt_defaults_to_structured_instruction() {
-        let prompt = Settings::default().summary_system_prompt;
-        assert!(!prompt.is_empty(), "default prompt must be non-empty");
-        // The default asks for the three structured sections (FR-28).
-        assert!(prompt.contains("Key Decisions"));
-        assert!(prompt.contains("Action Items"));
+    fn summary_prompt_defaults_to_default_preset() {
+        // The custom override is EMPTY by default (D4), so the effective prompt is
+        // the Default preset — which asks for the three structured sections (FR-28).
+        let s = Settings::default();
+        assert!(
+            s.summary_system_prompt.is_empty(),
+            "custom override must default empty so the preset drives"
+        );
+        assert_eq!(s.summary_preset, SummaryPreset::Default);
+        let effective = s.effective_summary_prompt();
+        assert!(effective.contains("Key Decisions"));
+        assert!(effective.contains("Action Items"));
+        assert_eq!(effective, preset_prompt(SummaryPreset::Default));
     }
 
     #[test]
@@ -395,10 +521,14 @@ mod tests {
         // `llm_model_id` existed (it still carries the Phase-3 field).
         let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
         let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            restored.summary_system_prompt.is_empty(),
+            "missing summary_system_prompt must deserialise to the empty override (preset drives)"
+        );
         assert_eq!(
-            restored.summary_system_prompt,
-            default_summary_system_prompt(),
-            "missing summary_system_prompt must deserialise to the default"
+            restored.effective_summary_prompt(),
+            preset_prompt(SummaryPreset::Default),
+            "with no override + default preset, the effective prompt is the Default preset"
         );
         assert_eq!(
             restored.llm_model_id, None,
@@ -641,6 +771,137 @@ mod tests {
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1j. chat_system_prompt + summary_preset: defaults + round-trip +
+    //     missing-field deserialisation (Phase 9 — D4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chat_system_prompt_defaults_to_assistant_instruction() {
+        let prompt = Settings::default().chat_system_prompt;
+        assert!(!prompt.is_empty(), "default chat prompt must be non-empty");
+        assert_eq!(prompt, default_chat_system_prompt());
+    }
+
+    #[test]
+    fn summary_preset_defaults_to_default_variant() {
+        assert_eq!(Settings::default().summary_preset, SummaryPreset::Default);
+    }
+
+    #[test]
+    fn chat_prompt_and_preset_round_trip() {
+        let original = Settings {
+            chat_system_prompt: "Stay terse.".to_string(),
+            summary_preset: SummaryPreset::Detailed,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.chat_system_prompt, "Stay terse.");
+        assert_eq!(restored.summary_preset, SummaryPreset::Detailed);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn summary_preset_serialises_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&SummaryPreset::Default).unwrap(),
+            "\"default\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SummaryPreset::FilterChitChat).unwrap(),
+            "\"filter_chit_chat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SummaryPreset::ActionItems).unwrap(),
+            "\"action_items\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SummaryPreset::Detailed).unwrap(),
+            "\"detailed\""
+        );
+    }
+
+    #[test]
+    fn old_store_json_without_chat_and_preset_fields_defaults() {
+        // A store written before `chat_system_prompt` / `summary_preset` existed.
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert_eq!(
+            restored.chat_system_prompt,
+            default_chat_system_prompt(),
+            "missing chat_system_prompt must deserialise to the default"
+        );
+        assert_eq!(
+            restored.summary_preset,
+            SummaryPreset::Default,
+            "missing summary_preset must deserialise to Default"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1k. preset_prompt + effective_summary_prompt (Phase 9 — D4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preset_prompt_default_is_the_structured_instruction() {
+        // The `Default` preset reproduces the pre-preset default behaviour: the
+        // structured Summary / Key Decisions / Action Items instruction, so a
+        // default install summarises byte-identically to before presets existed.
+        let p = preset_prompt(SummaryPreset::Default);
+        assert!(p.contains("Key Decisions"));
+        assert!(p.contains("Action Items"));
+        assert!(p.contains("Summarise the meeting transcript"));
+    }
+
+    #[test]
+    fn preset_prompt_each_variant_is_distinct_and_nonempty() {
+        let prompts = [
+            preset_prompt(SummaryPreset::Default),
+            preset_prompt(SummaryPreset::FilterChitChat),
+            preset_prompt(SummaryPreset::ActionItems),
+            preset_prompt(SummaryPreset::Detailed),
+        ];
+        for p in prompts {
+            assert!(!p.is_empty(), "preset prompt must be non-empty");
+        }
+        // FilterChitChat explicitly mentions omitting chit-chat.
+        assert!(preset_prompt(SummaryPreset::FilterChitChat)
+            .to_lowercase()
+            .contains("chit-chat"));
+        // Distinctness: at least the chit-chat and detailed presets differ from
+        // the default.
+        assert_ne!(prompts[0], prompts[1]);
+        assert_ne!(prompts[0], prompts[2]);
+        assert_ne!(prompts[0], prompts[3]);
+    }
+
+    #[test]
+    fn effective_summary_prompt_override_wins_when_nonempty() {
+        let s = Settings {
+            summary_system_prompt: "My custom prompt.".to_string(),
+            summary_preset: SummaryPreset::Detailed,
+            ..Settings::default()
+        };
+        assert_eq!(s.effective_summary_prompt(), "My custom prompt.");
+    }
+
+    #[test]
+    fn effective_summary_prompt_falls_back_to_preset_when_override_blank() {
+        // A blank (whitespace-only) override falls through to the selected preset.
+        let s = Settings {
+            summary_system_prompt: "   ".to_string(),
+            summary_preset: SummaryPreset::ActionItems,
+            ..Settings::default()
+        };
+        assert_eq!(
+            s.effective_summary_prompt(),
+            preset_prompt(SummaryPreset::ActionItems)
+        );
     }
 
     // -----------------------------------------------------------------------

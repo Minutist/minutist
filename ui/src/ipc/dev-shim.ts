@@ -344,6 +344,7 @@ function devMeetingState(meetingId: MeetingId): MeetingState {
       asr_model: null,
       llm_model: null,
       diarizer: null,
+      speaker_names: {},
       app_version: "0.0.0-dev",
     },
     transcript: DEV_TRANSCRIPT,
@@ -379,6 +380,7 @@ export const devCommands = {
       asr_model: null,
       llm_model: null,
       diarizer: null,
+      speaker_names: {},
       app_version: "0.0.0-dev",
     });
   },

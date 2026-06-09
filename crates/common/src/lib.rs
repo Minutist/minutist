@@ -49,6 +49,35 @@ impl Default for MeetingId {
     }
 }
 
+/// Stable identifier for a chat session on disk. UUIDv4. Mirrors [`MeetingId`].
+///
+/// A chat session is meeting-scoped; `persistence` stores its turns under
+/// `{meetings_dir}/{meeting_id}/chat/{session_id}.json` (Phase 9 §7). The
+/// streaming chat `AppEvent`s carry this so the webview store routes deltas to
+/// the right session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
+pub struct ChatSessionId(
+    // Use `#[specta(type = String)]` so the TS binding mirrors how serde
+    // emits a Uuid (a hyphenated lowercase string) without needing the
+    // optional `uuid` feature on the `specta` crate.
+    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
+);
+
+impl ChatSessionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ChatSessionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Stable identifier for a model in the registry.
 ///
 /// Examples: `"qwen3-asr-1.7b-q8_0"`, `"qwen2.5-3b-instruct-q4_k_m"`,
@@ -258,6 +287,19 @@ pub struct MeetingMeta {
     pub asr_model: Option<ModelDescriptor>,
     pub llm_model: Option<ModelDescriptor>,
     pub diarizer: Option<ModelDescriptor>,
+    /// User-set display names for identified speakers, keyed by the diarizer's
+    /// label (e.g. `"A"` → `"Alice"`). Written by the `set_speaker_name` chat
+    /// tool and overlaid at read time; cleared by re-diarization (which can
+    /// re-letter speakers, see `cross-cutting.md` "Agent chat loop"). Phase 9.
+    ///
+    /// `#[serde(default, skip_serializing_if = …)]` so existing `metadata.json`
+    /// (written before the field existed) still deserialises and the wire shape
+    /// only grows when the map is non-empty.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    pub speaker_names: std::collections::BTreeMap<String, String>,
     pub app_version: String,
 }
 
@@ -313,6 +355,33 @@ pub struct MeetingState {
     pub transcript: Vec<Segment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<NotesDocument>,
+}
+
+// ---------------------------------------------------------------------------
+// Inter-agent bridge (Phase 9 precursor; consumed by Phase 10 MCP)
+// ---------------------------------------------------------------------------
+
+/// A request from an external agent (the Phase 10 MCP `send_to_internal_agent`
+/// tool) to the internal chat agent. Landed now so Phase 10 adds zero `common`
+/// change. `session_id`/`meeting_id` scope the request; both optional so a
+/// caller may start a fresh session or target an existing one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InterAgentRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<ChatSessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<MeetingId>,
+    pub message: String,
+}
+
+/// The internal chat agent's reply to an [`InterAgentRequest`]. Carries the
+/// session id so the external caller can continue the conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InterAgentReply {
+    pub session_id: ChatSessionId,
+    pub reply: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +518,51 @@ pub enum AppEvent {
     /// A recoverable error occurred during a background task. The pipeline
     /// continues; the webview shows a notification.
     ErrorOccurred { error: AppError },
+
+    // --- Chat agent (Phase 9) --------------------------------------------
+    // These ride the existing `AppEventPayload` newtype + the single
+    // `collect_events![AppEventPayload]` registration in `ipc-bridge` — no new
+    // event registration. `turn_id` is a per-session monotonic turn counter.
+    /// One streamed token (or token fragment) of the assistant's reply for the
+    /// in-flight turn. Lossy: a dropped delta is reconciled by the `final_text`
+    /// carried on `ChatTurnComplete` (see `cross-cutting.md`).
+    ChatToken {
+        session_id: ChatSessionId,
+        turn_id: u64,
+        token: String,
+    },
+    /// The assistant requested a tool call mid-turn. `args_json` is the tool's
+    /// arguments serialised as a JSON string (the repo's "Value crosses as
+    /// String" rule).
+    ChatToolCall {
+        session_id: ChatSessionId,
+        turn_id: u64,
+        tool: String,
+        args_json: String,
+    },
+    /// A tool call finished. `ok` is `false` when the tool errored; `summary` is
+    /// the one-line human/LLM-facing render shown on the UI tool card.
+    ChatToolResult {
+        session_id: ChatSessionId,
+        turn_id: u64,
+        tool: String,
+        ok: bool,
+        summary: String,
+    },
+    /// The assistant turn finished. `final_text` carries the FULL reconciled
+    /// reply so the store can overwrite regardless of any dropped `ChatToken`
+    /// deltas (lossy-broadcast mitigation).
+    ChatTurnComplete {
+        session_id: ChatSessionId,
+        turn_id: u64,
+        final_text: String,
+    },
+    /// The chat turn failed. `message` is a stable human-readable string the
+    /// webview surfaces in the chat pane.
+    ChatError {
+        session_id: ChatSessionId,
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +719,15 @@ pub trait Diarizer: Send {
 /// external Ollama), selected by settings.
 ///
 /// Threading: sync, called from `spawn_blocking`.
-pub trait Summariser: Send {
+///
+/// `Send + Sync` (Phase 9): a held `Arc<dyn Summariser>` is shared by the
+/// one-shot summary path and the chat agent's `resummarise` tool, so it must
+/// cross threads *and* be referenced concurrently. All impls satisfy this:
+/// `LlamaSummariser` holds a `LlamaModel` (`unsafe impl Send + Sync`) plus a
+/// `PathBuf` + config and builds its `!Sync` `LlamaContext` fresh per call
+/// (never stored — SP0); `OllamaSummariser` holds a `reqwest::blocking::Client`
+/// (Sync); the test stub holds `Mutex`-guarded fields (Sync).
+pub trait Summariser: Send + Sync {
     /// Produce a markdown summary from a transcript + the user's notes.
     ///
     /// `notes_markdown` is the markdown export of the Tiptap notes (or
@@ -845,6 +967,7 @@ mod tests {
             asr_model: None,
             llm_model: None,
             diarizer: None,
+            speaker_names: std::collections::BTreeMap::new(),
             app_version: "0.0.0".to_string(),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -889,6 +1012,7 @@ mod tests {
             asr_model: None,
             llm_model: None,
             diarizer: None,
+            speaker_names: std::collections::BTreeMap::new(),
             app_version: "0.0.0".to_string(),
         };
         let segment = Segment {
@@ -921,5 +1045,150 @@ mod tests {
         assert!(!json.contains("notes"), "absent notes must be omitted");
         let back: MeetingState = serde_json::from_str(&json).unwrap();
         assert!(back.notes.is_none());
+    }
+
+    #[test]
+    fn chat_session_id_is_distinct_per_construction() {
+        let a = ChatSessionId::new();
+        let b = ChatSessionId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn chat_session_id_serialises_as_bare_uuid_string() {
+        let id = ChatSessionId::new();
+        let json = serde_json::to_string(&id).unwrap();
+        // `#[serde(transparent)]` → a bare hyphenated lowercase UUID string.
+        assert_eq!(json, format!("\"{}\"", id.0));
+        let back: ChatSessionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn meeting_meta_speaker_names_default_omitted_and_round_trips() {
+        // An older metadata.json without the field deserialises to an empty map.
+        let old_json = r#"{
+            "uuid": "00000000-0000-4000-8000-000000000000",
+            "title": "Old meeting",
+            "started_at": "2026-06-02T10:00:00Z",
+            "ended_at": null,
+            "duration_ms": 0,
+            "speaker_count": 0,
+            "audio_format": { "codec": "opus", "sample_rate": 16000, "channels": 1 },
+            "asr_model": null,
+            "llm_model": null,
+            "diarizer": null,
+            "app_version": "0.0.0"
+        }"#;
+        let restored: MeetingMeta =
+            serde_json::from_str(old_json).expect("old metadata.json must still deserialise");
+        assert!(
+            restored.speaker_names.is_empty(),
+            "missing speaker_names must deserialise to an empty map"
+        );
+        // An empty map is omitted from the wire shape.
+        let json = serde_json::to_string(&restored).unwrap();
+        assert!(
+            !json.contains("speaker_names"),
+            "an empty speaker_names map must be omitted"
+        );
+
+        // A populated map round-trips.
+        let mut meta = restored;
+        meta.speaker_names.insert("A".to_string(), "Alice".to_string());
+        meta.speaker_names.insert("B".to_string(), "Bob".to_string());
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("speaker_names"));
+        let back: MeetingMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.speaker_names.get("A").map(String::as_str), Some("Alice"));
+        assert_eq!(back.speaker_names.get("B").map(String::as_str), Some("Bob"));
+    }
+
+    #[test]
+    fn app_event_chat_token_serialises_with_tag() {
+        let e = AppEvent::ChatToken {
+            session_id: ChatSessionId::new(),
+            turn_id: 3,
+            token: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"chat_token\""));
+        assert!(json.contains("\"turn_id\":3"));
+        match serde_json::from_str::<AppEvent>(&json).unwrap() {
+            AppEvent::ChatToken { turn_id, token, .. } => {
+                assert_eq!(turn_id, 3);
+                assert_eq!(token, "hello");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn app_event_chat_tool_call_and_result_serialise_with_tags() {
+        let call = AppEvent::ChatToolCall {
+            session_id: ChatSessionId::new(),
+            turn_id: 1,
+            tool: "get_transcript".to_string(),
+            args_json: "{\"meeting_id\":\"x\"}".to_string(),
+        };
+        assert!(serde_json::to_string(&call)
+            .unwrap()
+            .contains("\"kind\":\"chat_tool_call\""));
+
+        let result = AppEvent::ChatToolResult {
+            session_id: ChatSessionId::new(),
+            turn_id: 1,
+            tool: "get_transcript".to_string(),
+            ok: true,
+            summary: "12 segments".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"kind\":\"chat_tool_result\""));
+        assert!(json.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn app_event_chat_turn_complete_and_error_serialise_with_tags() {
+        let complete = AppEvent::ChatTurnComplete {
+            session_id: ChatSessionId::new(),
+            turn_id: 7,
+            final_text: "the full reply".to_string(),
+        };
+        let json = serde_json::to_string(&complete).unwrap();
+        assert!(json.contains("\"kind\":\"chat_turn_complete\""));
+        assert!(json.contains("the full reply"));
+
+        let err = AppEvent::ChatError {
+            session_id: ChatSessionId::new(),
+            message: "context full".to_string(),
+        };
+        assert!(serde_json::to_string(&err)
+            .unwrap()
+            .contains("\"kind\":\"chat_error\""));
+    }
+
+    #[test]
+    fn inter_agent_request_and_reply_round_trip() {
+        let req = InterAgentRequest {
+            session_id: None,
+            meeting_id: Some(MeetingId::new()),
+            message: "what were the action items?".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // Absent session_id is omitted.
+        assert!(!json.contains("session_id"));
+        let back: InterAgentRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.message, req.message);
+        assert!(back.session_id.is_none());
+        assert_eq!(back.meeting_id, req.meeting_id);
+
+        let reply = InterAgentReply {
+            session_id: ChatSessionId::new(),
+            reply: "the action items were …".to_string(),
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        let back: InterAgentReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_id, reply.session_id);
+        assert_eq!(back.reply, reply.reply);
     }
 }

@@ -63,13 +63,39 @@ update in the same commit.
 
 ### `common`
 **Crate:** `crates/common`
-**Owns:** shared types (`MeetingId`, `ModelId`, `AudioChunk`, `Segment`,
+**Owns:** shared types (`MeetingId`, `ChatSessionId`, `ModelId`,
+`AudioChunk`, `Segment`,
 `WordTimestamp`, `MeetingMeta`, `ModelDescriptor`, `RecordingState`,
 `AppEvent`, `AudioDevice`, `AudioMeterFrame`, `AudioFormat`,
 `ModelKind`, `ModelManifestEntry`, `ModelFileEntry`, `ModelStatusState`,
-`ModelStatus`, `MeetingListEntry`, `NotesDocument`, `MeetingState`),
+`ModelStatus`, `MeetingListEntry`, `NotesDocument`, `MeetingState`,
+`InterAgentRequest`, `InterAgentReply`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
+
+**Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
+newtype mirroring `MeetingId`); five chat `AppEvent` variants (`ChatToken`,
+`ChatToolCall`, `ChatToolResult`, `ChatTurnComplete`, `ChatError`) that ride
+the existing `AppEventPayload` newtype + the single
+`collect_events![AppEventPayload]` registration — no new event registration;
+`MeetingMeta.speaker_names: BTreeMap<String, String>` (diarizer-label →
+display-name overlay, `#[serde(default, skip_serializing_if = …)]` so existing
+`metadata.json` still deserialises and the wire shape only grows); and the
+in-process bridge types `InterAgentRequest` / `InterAgentReply` (referencing
+`ChatSessionId`), landed now so Phase 10's MCP `send_to_internal_agent` adds no
+`common` change. `ChatToken` is a lossy hint — `ChatTurnComplete.final_text`
+carries the full reconciled reply (see `cross-cutting.md` — "Agent chat loop").
+
+**Phase 9 precursor — `Summariser: Send + Sync`.** The summariser trait widens
+from `Send` to `Send + Sync` (SP0-verified). A held `Arc<dyn Summariser>` is
+shared by the one-shot summary path and the chat agent's `resummarise` tool, so
+it must cross threads AND be referenced concurrently; with only `Send` an
+`Arc<dyn Summariser>` is not `Sync` and the chat tool's `async_trait` `Send`
+future bound fails to compile. All impls already satisfy it: `LlamaSummariser`
+holds a `LlamaModel` (`unsafe impl Send + Sync`) + a `PathBuf` + config and
+builds its `!Sync` `LlamaContext` fresh per call (never stored);
+`OllamaSummariser` holds a `reqwest::blocking::Client`; the test stub holds
+`Mutex`-guarded fields.
 
 The recorder-lifecycle additions `RecordingState::Finalising` and the
 `AppEvent::{MeetingFinalised, TranscriptReady}` variants are documented with
@@ -999,6 +1025,24 @@ the sentinel `"auto"` (case-insensitive), empty, and whitespace-only → `None`
 English name, trimmed and forwarded verbatim → prefix-force. The same resolver
 feeds the live, offline-re-transcribe, and test-source start paths. No new
 dependency edge. See the `asr-runtime` "Language hint" note above.
+
+**Phase 9 fields — `chat_system_prompt: String` and the summary prompt
+presets (D4).** `chat_system_prompt` `#[serde(default = ...)]`-defaults to a
+meeting-notes-assistant instruction the chat engine forwards verbatim as the
+session `system` message; an older store deserialises to that default. The
+existing summarise feature gains selectable presets: a `SummaryPreset` enum
+(`Default` | `FilterChitChat` | `ActionItems` | `Detailed`, serde snake_case,
+`Default` impl = `Default`) and a `summary_preset: SummaryPreset` field
+(`#[serde(default)]` → `Default`, the prior behaviour). `preset_prompt(preset)
+-> &'static str` is a pure function returning the built-in prompt per preset
+(`Default` is byte-identical to the prior `summary_system_prompt` default, so
+existing behaviour is preserved). `Settings::effective_summary_prompt(&self) ->
+String` resolves the prompt: the user's `summary_system_prompt` when it is a
+non-empty custom override, else `preset_prompt(self.summary_preset)`.
+`ipc-bridge`'s `summarise_meeting` reads `effective_summary_prompt()` (was
+`summary_system_prompt`) so the preset picker and the custom override share one
+resolution point. Both new fields are added to the hand-written `Default` impl.
+No new dependency edge.
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

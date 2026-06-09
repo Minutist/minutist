@@ -114,6 +114,7 @@ fn dummy_meta(id: MeetingId, duration_ms: u64) -> MeetingMeta {
         asr_model: None,
         llm_model: None,
         diarizer: None,
+        speaker_names: std::collections::BTreeMap::new(),
         app_version: "0.0.0-test".to_string(),
     }
 }

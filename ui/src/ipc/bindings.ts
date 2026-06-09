@@ -439,9 +439,14 @@ async deleteChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promis
  * 
  * The bearer token is sensitive and crosses the IPC boundary ONLY here, on this
  * explicit read — it is never on the event bus, never logged, and not baked
- * into the bindings. The pane reveals it on user request (and offers
- * regenerate, which rotates it + restarts the listener — a documented
- * restart-required for v1).
+ * into the bindings. The pane reveals it on user request.
+ * 
+ * v1 has no live token-rotation command: the token is generated once and
+ * persisted to `{app-data}/mcp_token`, and the listener is spawned once at
+ * startup. Rotating the token (delete the file → restart) is therefore
+ * restart-required, consistent with the rest of the MCP lifecycle (enable /
+ * port / write-tools changes are also restart-required for v1). The pane copy
+ * states this; it does NOT offer a live regenerate control (C2).
  */
 async getMcpServerInfo() : Promise<Result<McpServerInfo | null, IpcError>> {
     try {

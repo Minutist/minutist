@@ -24,7 +24,9 @@ use meeting_app_common::{
 use serde_json::json;
 use tokio::sync::oneshot;
 
-use crate::{require_str, require_u64, resolve_meeting, Tool, ToolContext, ToolOutput};
+use crate::{
+    require_bounded_str, require_str, require_u64, resolve_meeting, Tool, ToolContext, ToolOutput,
+};
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -504,6 +506,12 @@ impl Tool for RelistenSection {
 // resummarise
 // ---------------------------------------------------------------------------
 
+/// Fixed compute cap for one `resummarise` run (S2). The held LLM over a full
+/// transcript can be slow on a CPU model, so this is deliberately generous; the
+/// bound exists so an MCP/bridged caller cannot pin a blocking-pool thread + the
+/// held model forever on a wedged decode, not to cut a legitimate run short.
+const RESUMMARISE_TIMEOUT: Duration = Duration::from_secs(300);
+
 pub struct Resummarise;
 
 #[async_trait]
@@ -542,14 +550,33 @@ impl Tool for Resummarise {
 
         // Run the held summariser on a blocking thread (sync inference must not
         // run in an async handler). The instruction is the system prompt.
+        //
+        // Bound the run with a fixed compute timeout (S2): `resummarise` is the
+        // one MCP-exposed tool that runs the held LLM over the FULL transcript,
+        // and the underlying `summarise` is a single uninterruptible FFI call
+        // with no progress callback, so an MCP/bridged caller could otherwise pin
+        // a blocking-pool thread + the held model indefinitely on a wedged or
+        // pathologically long decode. On timeout we return `AppError::Inference`
+        // cleanly; the abandoned `spawn_blocking` thread's result is discarded
+        // (tokio cannot cancel it).
         let summariser = ctx.summariser.clone();
-        let text = tokio::task::spawn_blocking(move || {
+        let join = tokio::task::spawn_blocking(move || {
             summariser.summarise(&transcript, &notes_markdown, &instruction)
-        })
-        .await
-        .map_err(|e| AppError::Internal {
-            context: format!("resummarise spawn_blocking join failed: {e}"),
-        })??;
+        });
+        let text = match tokio::time::timeout(RESUMMARISE_TIMEOUT, join).await {
+            Ok(joined) => joined.map_err(|e| AppError::Internal {
+                context: format!("resummarise spawn_blocking join failed: {e}"),
+            })??,
+            Err(_elapsed) => {
+                return Err(AppError::Inference {
+                    backend: "llm".to_string(),
+                    context: format!(
+                        "resummarise exceeded its {} s budget",
+                        RESUMMARISE_TIMEOUT.as_secs(),
+                    ),
+                });
+            }
+        };
 
         Ok(ToolOutput::new(
             json!({ "text": text }),
@@ -592,8 +619,10 @@ impl Tool for SetSpeakerName {
     }
     async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
         let id = resolve_meeting(ctx, &args)?;
-        let speaker_id = require_str(&args, "speaker_id")?.to_string();
-        let name = require_str(&args, "name")?.to_string();
+        // Cap the free-text label + name at dispatch (S4) so an MCP/bridged
+        // caller cannot persist an unbounded value into metadata.json.
+        let speaker_id = require_bounded_str(&args, "speaker_id")?.to_string();
+        let name = require_bounded_str(&args, "name")?.to_string();
 
         // Hold the per-meeting metadata mutex across the whole read-modify-write
         // so a concurrent set_speaker_name / rename_meeting cannot drop a write
@@ -648,7 +677,8 @@ impl Tool for RenameMeeting {
     }
     async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
         let id = resolve_meeting(ctx, &args)?;
-        let title = require_str(&args, "title")?.to_string();
+        // Cap the title at dispatch (S4): a meeting title is a short label.
+        let title = require_bounded_str(&args, "title")?.to_string();
 
         // rename_meeting also touches metadata.json (title) + upserts the index,
         // so it takes the SAME per-meeting metadata mutex as set_speaker_name (a

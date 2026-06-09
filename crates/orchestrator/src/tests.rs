@@ -150,9 +150,10 @@ async fn state_machine_happy_path_emits_state_changed_events() {
     assert_eq!(meta.speaker_count, 0);
 }
 
-/// `diarize_timeout` / `retranscribe_timeout` clamp their length-relative budget
-/// at the documented floors/caps (sub-floor → floor, proportional mid-range,
-/// supra-cap → cap). re-transcribe runs ~3× real-time vs diarize's ~1×.
+/// `diarize_timeout` / `retranscribe_timeout` / `relisten_timeout` clamp their
+/// length-relative budget at the documented floors/caps (sub-floor → floor,
+/// proportional mid-range, supra-cap → cap). re-transcribe + relisten run ~3×
+/// real-time vs diarize's ~1×; relisten is bounded by the WINDOW length (S2).
 #[test]
 fn timeout_helpers_clamp_to_documented_bounds() {
     // diarize: ~1× real-time, floor 120 s, cap 600 s.
@@ -163,6 +164,10 @@ fn timeout_helpers_clamp_to_documented_bounds() {
     assert_eq!(crate::retranscribe_timeout(0), Duration::from_secs(300));
     assert_eq!(crate::retranscribe_timeout(300_000), Duration::from_secs(900));
     assert_eq!(crate::retranscribe_timeout(3_600_000), Duration::from_secs(1800));
+    // relisten (S2): ~3× the WINDOW length, floor 60 s, cap 300 s.
+    assert_eq!(crate::relisten_timeout(0), Duration::from_secs(60)); // sub-floor → floor
+    assert_eq!(crate::relisten_timeout(30_000), Duration::from_secs(90)); // 30 s window × 3
+    assert_eq!(crate::relisten_timeout(600_000), Duration::from_secs(300)); // supra-cap → cap
 }
 
 /// A clean recording (live ASR kept up, no drop-oldest, drained in time) is NOT

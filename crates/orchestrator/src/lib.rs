@@ -862,39 +862,61 @@ impl Orchestrator {
 
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
-        tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
-            let pcm = persistence::read_audio_pcm(&meeting_dir)?;
+        // Bound the (uninterruptible) windowed ASR run with a length-relative
+        // timeout sized for the requested span (S2): unlike `re_transcribe`, a
+        // re-listen does NOT hold the offline claim, but an MCP/bridged caller
+        // could still pin a blocking-pool thread + the second ASR model's memory
+        // indefinitely on a wedged or pathologically slow decode. On timeout we
+        // return before any result; the abandoned `spawn_blocking` thread's
+        // result is discarded (tokio cannot cancel it).
+        let budget = relisten_timeout(end_ms.saturating_sub(start_ms));
 
-            // Build the production ASR backend for the routed engine on a
-            // current-thread runtime (model resolution is the only async step),
-            // exactly as `re_transcribe_claimed` does.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| AppError::Internal {
-                    context: format!("transcribe_pcm_window runtime build failed: {e}"),
-                })?;
-            let mut backend = match rt.block_on(runner::build_asr_backend_for_retranscribe(
-                &registry,
-                engine,
-                n_gpu_layers,
-                effective_language,
-            ))? {
-                Some(b) => b,
-                None => {
-                    return Err(AppError::ModelLoad {
-                        model_id: missing_model_id.into(),
-                        context: "ASR model not available; cannot re-listen to the section".into(),
-                    });
-                }
-            };
+        match tokio::time::timeout(
+            budget,
+            tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
+                let pcm = persistence::read_audio_pcm(&meeting_dir)?;
 
-            transcribe_pcm_window_blocking(&pcm, backend.as_mut(), start_ms, end_ms)
-        })
+                // Build the production ASR backend for the routed engine on a
+                // current-thread runtime (model resolution is the only async step),
+                // exactly as `re_transcribe_claimed` does.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Internal {
+                        context: format!("transcribe_pcm_window runtime build failed: {e}"),
+                    })?;
+                let mut backend = match rt.block_on(runner::build_asr_backend_for_retranscribe(
+                    &registry,
+                    engine,
+                    n_gpu_layers,
+                    effective_language,
+                ))? {
+                    Some(b) => b,
+                    None => {
+                        return Err(AppError::ModelLoad {
+                            model_id: missing_model_id.into(),
+                            context: "ASR model not available; cannot re-listen to the section"
+                                .into(),
+                        });
+                    }
+                };
+
+                transcribe_pcm_window_blocking(&pcm, backend.as_mut(), start_ms, end_ms)
+            }),
+        )
         .await
-        .map_err(|e| AppError::Internal {
-            context: format!("transcribe_pcm_window spawn_blocking join failed: {e}"),
-        })?
+        {
+            Ok(joined) => joined.map_err(|e| AppError::Internal {
+                context: format!("transcribe_pcm_window spawn_blocking join failed: {e}"),
+            })?,
+            Err(_elapsed) => Err(AppError::Inference {
+                backend: "asr".to_string(),
+                context: format!(
+                    "re-listen exceeded its {} s budget (window [{start_ms}, {end_ms}) ms)",
+                    budget.as_secs(),
+                ),
+            }),
+        }
     }
 
     /// Re-run speaker diarization for a previously-recorded meeting offline
@@ -1287,6 +1309,25 @@ fn retranscribe_timeout(recording_duration_ms: u64) -> Duration {
     const FLOOR_SECS: u64 = 300; // 5 min
     const CAP_SECS: u64 = 1800; // 30 min
     let secs = (recording_duration_ms / 1000 * 3).clamp(FLOOR_SECS, CAP_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Length-relative timeout budget for a single `relisten_section` window (S2).
+///
+/// `transcribe_pcm_window` re-runs ASR over a BOUNDED span, not the whole
+/// recording, so its budget is relative to the requested window length
+/// (`end_ms - start_ms`) rather than the recording duration. Like
+/// [`retranscribe_timeout`] it allows ~3x real-time but with a much smaller
+/// floor/cap (a re-listen is meant to be a quick spot-check, and — unlike a
+/// re-transcribe — it does NOT hold the offline claim, but an MCP/bridged caller
+/// could still pin a `spawn_blocking` thread + the second ASR model's memory
+/// indefinitely on a wedged decode). On timeout the call returns
+/// `AppError::Inference` cleanly; the abandoned `spawn_blocking` thread's result
+/// is discarded (tokio cannot cancel it).
+fn relisten_timeout(window_ms: u64) -> Duration {
+    const FLOOR_SECS: u64 = 60; // 1 min (covers model build + a short window)
+    const CAP_SECS: u64 = 300; // 5 min
+    let secs = (window_ms / 1000 * 3).clamp(FLOOR_SECS, CAP_SECS);
     Duration::from_secs(secs)
 }
 

@@ -743,6 +743,118 @@ async fn rename_meeting_updates_title_and_index() {
 }
 
 // ---------------------------------------------------------------------------
+// S4: the metadata-write tools cap user-supplied free-text at dispatch.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_speaker_name_rejects_overlong_name() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "M",
+        vec![seg(0, 1000, "x", Some("A"))],
+        BTreeMap::new(),
+    )
+    .await;
+
+    // 513 chars > the 512-char cap.
+    let overlong = "n".repeat(513);
+    let err = reg
+        .dispatch(
+            &ctx,
+            "set_speaker_name",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "speaker_id": "A", "name": overlong }),
+        )
+        .await
+        .expect_err("an over-length name must be rejected");
+    match err {
+        meeting_app_common::AppError::InvalidInput { context } => {
+            assert!(context.contains("too long"), "got: {context}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+
+    // Nothing was persisted (the cap fires before the metadata write).
+    let dir = root.join(id.0.to_string());
+    let meta = persistence::read_metadata(&dir).unwrap();
+    assert!(
+        meta.speaker_names.is_empty(),
+        "no speaker name may be persisted when the value is rejected"
+    );
+}
+
+#[tokio::test]
+async fn set_speaker_name_rejects_overlong_speaker_id() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+
+    let overlong = "A".repeat(513);
+    let err = reg
+        .dispatch(
+            &ctx,
+            "set_speaker_name",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "speaker_id": overlong, "name": "Alice" }),
+        )
+        .await
+        .expect_err("an over-length speaker_id must be rejected");
+    assert!(matches!(
+        err,
+        meeting_app_common::AppError::InvalidInput { .. }
+    ));
+}
+
+#[tokio::test]
+async fn rename_meeting_rejects_overlong_title() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "Old title", vec![], BTreeMap::new()).await;
+
+    let overlong = "t".repeat(513);
+    let err = reg
+        .dispatch(
+            &ctx,
+            "rename_meeting",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "title": overlong }),
+        )
+        .await
+        .expect_err("an over-length title must be rejected");
+    match err {
+        meeting_app_common::AppError::InvalidInput { context } => {
+            assert!(context.contains("too long"), "got: {context}");
+        }
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+
+    // The title is unchanged on disk (the cap fires before the rename write).
+    let dir = root.join(id.0.to_string());
+    assert_eq!(persistence::read_metadata(&dir).unwrap().title, "Old title");
+}
+
+#[tokio::test]
+async fn set_speaker_name_accepts_max_length_name() {
+    // A name AT the cap (512 chars) is accepted — the boundary is inclusive.
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+
+    let at_cap = "n".repeat(512);
+    reg.dispatch(
+        &ctx,
+        "set_speaker_name",
+        serde_json::json!({ "meeting_id": id.0.to_string(), "speaker_id": "A", "name": at_cap.clone() }),
+    )
+    .await
+    .expect("a name at the 512-char cap must be accepted");
+
+    let dir = root.join(id.0.to_string());
+    let meta = persistence::read_metadata(&dir).unwrap();
+    assert_eq!(meta.speaker_names.get("A"), Some(&at_cap));
+}
+
+// ---------------------------------------------------------------------------
 // send_to_internal_agent (the MCP-only inter-agent bridge tool) — error paths
 //
 // The happy path (a real reply) needs the chat engine, which lives in

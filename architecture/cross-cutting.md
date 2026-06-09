@@ -555,9 +555,15 @@ revision 2025-11-25). Binding controls:
   a cross-origin browser request). Cautionary precedent: CVE-2025-49596 (MCP
   Inspector RCE) was a localhost MCP service with no auth + browser-reachable —
   exactly what bearer + Host/Origin + loopback prevent. The token is stored at
-  `{app-data}/mcp_token` (`0600` on Unix); OS-keychain hardening is a documented
-  follow-up. The token is never logged and never on the event bus — it is revealed
-  only via the `get_mcp_server_info` command on explicit user request.
+  `{app-data}/mcp_token`, CREATED with mode `0600` atomically on Unix
+  (`OpenOptions().mode(0o600)` — no write-then-chmod window); on Windows it
+  inherits the per-user app-data directory's ACL (no extra file-ACL tightening in
+  v1, so the owner-only guarantee is Unix-scoped). OS-keychain hardening is a
+  documented follow-up. Rotating the token is restart-required for v1 (delete the
+  file → restart regenerates it); there is no live regenerate command, consistent
+  with the rest of the MCP lifecycle (enable / port / write-tools are also
+  restart-required). The token is never logged and never on the event bus — it is
+  revealed only via the `get_mcp_server_info` command on explicit user request.
 
 - **The destructive-write exposure policy (a binding control).** The `Tool`
   trait's `expose_over_mcp()` (default `!is_write()`) is the server-side gate.
@@ -569,10 +575,15 @@ revision 2025-11-25). Binding controls:
   `false`) gates the reversible writes: off ⇒ read/compute + the inter-agent tool
   only; on ⇒ the two reversible writes join. The gate is enforced at projection
   AND on call (`mcp_call_allowed`). NOTE: read-only ≠ zero-cost — even with writes
-  off, an external agent holding the token can invoke unbounded-cost COMPUTE tools
-  (`relisten_section` runs ASR; `resummarise` runs the LLM) repeatedly. The v1
-  threat model trusts the bearer holder; a per-client rate/concurrency cap on the
-  heavy compute tools is a documented follow-up.
+  off, an external agent holding the token can invoke COMPUTE tools
+  (`relisten_section` runs ASR; `resummarise` runs the LLM) repeatedly. Each heavy
+  compute tool is bounded by a per-call timeout so a single wedged/slow call
+  cannot pin a blocking-pool thread + the model indefinitely: `transcribe_pcm_window`
+  (relisten) takes a window-length-relative budget (mirroring `re_transcribe`'s
+  length-relative timeout; floor 1 min / cap 5 min), and `resummarise` takes a
+  fixed 5-min cap; a fired timeout returns `AppError::Inference` cleanly. The v1
+  threat model trusts the bearer holder; a per-client rate/concurrency cap (a
+  global semaphore across the heavy compute tools) is a documented follow-up.
 
 - **The inter-agent bridge.** `send_to_internal_agent` (MCP-only, in the
   `v1(true)` registry) reaches the internal chat agent through a `common`-typed
@@ -582,6 +593,18 @@ revision 2025-11-25). Binding controls:
   `chat-agent` edge and the single chat-turn site in `ipc-bridge`. v1 is a
   synchronous request/reply (bounded mpsc(16) `try_send` → "busy"; per-request
   timeout → "timed out"; single-in-flight-per-session → "session busy").
+  **The bridge applies the same MCP write gate the direct `tools/call` path
+  uses** (binding control): an external caller talking through the bridge must get
+  NO broader a write surface than a direct MCP call under the active
+  `settings.mcp_write_tools`. The `v1(false)` internal registry still INCLUDES the
+  destructive `retranscribe_meeting` / `rediarize_meeting` ops (the internal UI
+  agent uses them), so the bridge driver threads `allow_writes` from settings and
+  bounds the turn to the gated surface — the engine is offered only
+  `mcp_tool_descriptors_gated(allow_writes)` (the model never sees retranscribe/
+  rediarize) AND the per-call dispatch rejects a non-allowed tool via
+  `mcp_call_allowed` (defence in depth, mirroring `McpToolHandler::call_tool`).
+  Both layers reuse the single gate policy in `agent-tools` — the bridge does not
+  duplicate it.
 
 - **Threading model row.** *MCP HTTP listener → tokio task spawned from `setup`
   via `tauri::async_runtime::spawn`; rmcp's own hyper-based `StreamableHttpService`

@@ -225,9 +225,14 @@ fn resolve_silero_model(app: &tauri::AppHandle) {
 /// Resolve the MCP bearer token (Phase 10 §4.2): read the persisted token, or
 /// generate + persist a fresh 256-bit CSPRNG one on first enable.
 ///
-/// **Storage.** v1 stores the token in `{app-data}/mcp_token` with
-/// owner-only permissions on Unix (`0o600`). A documented follow-up hardens this
-/// to the OS keychain (e.g. the `keyring` crate); Tauri 2 ships no built-in
+/// **Storage.** v1 stores the token in `{app-data}/mcp_token`. On Unix the file
+/// is CREATED with mode `0o600` atomically (`OpenOptions().mode(0o600)`), so
+/// there is no write-then-chmod window in which the token is world-readable
+/// (S3). On Windows the file inherits the app-data directory's ACL — the
+/// app-data dir is a per-user location, but this code does NOT additionally
+/// tighten the file ACL, so the owner-only guarantee holds only on Unix; the
+/// Windows wording is scoped accordingly. A documented follow-up hardens this to
+/// the OS keychain (e.g. the `keyring` crate); Tauri 2 ships no built-in
 /// keychain API, and pulling a cross-platform keychain dependency (with its own
 /// platform build concerns) is deferred so it can be reviewed on its own. The
 /// token is high-entropy regardless of the at-rest store, and the loopback bind
@@ -250,29 +255,46 @@ fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
 
-    // Persist it with owner-only permissions where the platform supports it.
-    if let Err(e) = std::fs::write(&token_path, &token) {
+    if let Err(e) = write_token_file(&token_path, &token) {
         tracing::warn!(
             target: "app-main",
             "failed to persist MCP token to {:?}: {e}; using a per-run token",
             token_path
         );
     } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))
-            {
-                tracing::warn!(
-                    target: "app-main",
-                    "failed to set 0600 on MCP token file: {e}"
-                );
-            }
-        }
         tracing::info!(target: "app-main", "generated a new MCP bearer token");
     }
     token
+}
+
+/// Write the token to `path`, creating the file with owner-only mode `0o600`
+/// atomically on Unix (no write-then-chmod window — S3). On Windows the file
+/// inherits the parent directory's ACL (no extra tightening in v1).
+fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Create with 0600 so the token is never momentarily world-readable.
+        // `mode` applies only when the file is CREATED; if it already exists
+        // (a blank file we are overwriting) re-assert the mode below.
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Re-assert 0600 in case the file pre-existed with looser perms (the
+        // `mode` above is a no-op then). Cheap and closes the pre-existing-file
+        // edge.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(token.as_bytes())?;
+    file.flush()?;
+    Ok(())
 }
 
 /// The Tauri runtime entry point.
@@ -462,8 +484,15 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                         settings: settings_handle.clone(),
                         summariser: summariser_cell.clone(),
                     };
-                    let bridge_tx =
-                        ipc_bridge::spawn_inter_agent_driver(chat_handles, chat_in_flight.clone());
+                    // The bridged turn is bounded by the SAME MCP write gate as a
+                    // direct `tools/call` (S1), so an external caller cannot reach
+                    // a destructive op (retranscribe/rediarize) through the bridge.
+                    let allow_writes = settings_now.mcp_write_tools;
+                    let bridge_tx = ipc_bridge::spawn_inter_agent_driver(
+                        chat_handles,
+                        chat_in_flight.clone(),
+                        allow_writes,
+                    );
 
                     // The MCP registry is `v1(true)` — includes
                     // `send_to_internal_agent` — and its context carries the
@@ -474,7 +503,6 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                     // generate + persist a fresh 256-bit one on first enable.
                     let token = resolve_mcp_token(&app_data_dir);
                     let port = settings_now.mcp_port;
-                    let allow_writes = settings_now.mcp_write_tools;
 
                     // The MCP ToolContext needs the held summariser. Build it
                     // lazily inside the spawned task (so a slow first model load

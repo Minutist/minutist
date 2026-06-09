@@ -19,6 +19,23 @@
 //! `ToolRegistry::v1(false)` — so the internal agent it drives does NOT itself
 //! get `send_to_internal_agent`, closing the trivial infinite-loop foot-gun.
 //!
+//! # The MCP write gate on the bridge (S1)
+//!
+//! An external MCP client reaching the internal agent through this bridge must
+//! get NO broader a write surface than a DIRECT MCP call under the active
+//! `settings.mcp_write_tools`. `ToolRegistry::v1(false)` includes the destructive
+//! `retranscribe_meeting` / `rediarize_meeting` ops the direct MCP path keeps
+//! unreachable (`expose_over_mcp() == false`), so the bridge applies the SAME
+//! gate the direct path uses (the single policy in `agent-tools`):
+//! - the engine is offered only the MCP-allowed descriptors
+//!   (`mcp_tool_descriptors_gated(allow_writes)`), so the model never sees
+//!   `retranscribe`/`rediarize`; and
+//! - the per-call dispatch REJECTS a non-allowed tool (`mcp_call_allowed`) as
+//!   defence in depth, even if the model requests it by name.
+//!
+//! The `allow_writes` bool is threaded from `settings.mcp_write_tools` into the
+//! driver.
+//!
 //! # Concurrency (W4)
 //!
 //! - The bridge channel is bounded (the tool `try_send`s — a full queue surfaces
@@ -67,9 +84,14 @@ fn bridge_session_id() -> ChatSessionId {
 /// uses; `chat_in_flight` is the SHARED single-in-flight guard (the same set the
 /// UI's `send_chat_message` uses), so an external turn and a human turn cannot
 /// run on one session at once.
+///
+/// `allow_writes` is `settings.mcp_write_tools` (S1): it bounds the bridged
+/// turn's tool surface to the SAME MCP gate a direct `tools/call` is under, so a
+/// bridged external caller cannot reach a tool a direct MCP call could not.
 pub fn spawn_inter_agent_driver(
     handles: ChatHandles,
     chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>,
+    allow_writes: bool,
 ) -> mpsc::Sender<InterAgentEnvelope> {
     let (tx, mut rx) = mpsc::channel::<InterAgentEnvelope>(INTER_AGENT_QUEUE_DEPTH);
 
@@ -80,7 +102,8 @@ pub fn spawn_inter_agent_driver(
     tauri::async_runtime::spawn(async move {
         tracing::info!(target: "ipc-bridge", "inter-agent bridge driver started");
         while let Some((request, reply_tx)) = rx.recv().await {
-            let result = handle_request(&handles, &registry, &chat_in_flight, request).await;
+            let result =
+                handle_request(&handles, &registry, &chat_in_flight, allow_writes, request).await;
             // The external caller may have given up (timeout) and dropped the
             // receiver; that is fine — ignore the send error.
             let _ = reply_tx.send(result);
@@ -97,6 +120,7 @@ async fn handle_request(
     handles: &ChatHandles,
     registry: &Arc<ToolRegistry>,
     chat_in_flight: &Arc<Mutex<HashSet<ChatSessionId>>>,
+    allow_writes: bool,
     request: meeting_app_common::InterAgentRequest,
 ) -> AppResult<InterAgentReply> {
     let meetings_dir = handles.meetings_dir.clone();
@@ -121,7 +145,15 @@ async fn handle_request(
     }
 
     // Always release the guard, even on an early error.
-    let outcome = run_one_turn(handles, registry, &mut session, meeting_id, request.message).await;
+    let outcome = run_one_turn(
+        handles,
+        registry,
+        &mut session,
+        meeting_id,
+        allow_writes,
+        request.message,
+    )
+    .await;
     chat_in_flight
         .lock()
         .expect("chat_in_flight poisoned")
@@ -144,6 +176,7 @@ async fn run_one_turn(
     registry: &Arc<ToolRegistry>,
     session: &mut ChatSession,
     meeting_id: Option<MeetingId>,
+    allow_writes: bool,
     message: String,
 ) -> AppResult<String> {
     if message.trim().is_empty() {
@@ -207,6 +240,10 @@ async fn run_one_turn(
             &session_for_turn,
             &event_tx,
             &cancel,
+            // S1: the bridge applies the SAME MCP write gate the direct MCP path
+            // uses, so a bridged external caller cannot reach a tool (e.g.
+            // retranscribe/rediarize) a direct `tools/call` could not.
+            Some(allow_writes),
         );
         (session_for_turn, produced)
     })

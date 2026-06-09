@@ -5,6 +5,7 @@ import { useModelsStore } from "../state/models";
 import { useSummaryStore } from "../state/summary";
 import { useMeetingsStore } from "../state/meetings";
 import { useChatStore } from "../state/chat";
+import { useMcpServerInfoStore } from "../state/mcp-server-info";
 
 /**
  * Mount the global Tauri event bridge exactly once.
@@ -23,6 +24,7 @@ export function useAppEventBridge(): void {
   const handleSummaryEvent = useSummaryStore((s) => s.handleEvent);
   const handleMeetingsEvent = useMeetingsStore((s) => s.handleEvent);
   const handleChatEvent = useChatStore((s) => s.handleEvent);
+  const handleMcpServerInfoEvent = useMcpServerInfoStore((s) => s.handleEvent);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -33,6 +35,7 @@ export function useAppEventBridge(): void {
       handleSummaryEvent(event);
       handleMeetingsEvent(event);
       handleChatEvent(event);
+      handleMcpServerInfoEvent(event);
     })
       .then((fn) => {
         unlisten = fn;
@@ -52,5 +55,6 @@ export function useAppEventBridge(): void {
     handleSummaryEvent,
     handleMeetingsEvent,
     handleChatEvent,
+    handleMcpServerInfoEvent,
   ]);
 }

@@ -22,8 +22,7 @@ import {
   readMcpWriteTools,
   DEFAULT_MCP_PORT,
 } from "../state/mcp-settings";
-import { commands, unwrap } from "../ipc/client";
-import type { McpServerInfo } from "../ipc/bindings";
+import { useMcpServerInfoStore } from "../state/mcp-server-info";
 
 export function McpSettingsPane() {
   const settings = useRecordingStore((s) => s.settings);
@@ -35,26 +34,18 @@ export function McpSettingsPane() {
   const port = readMcpPort(settings);
   const writeTools = readMcpWriteTools(settings);
 
-  const [info, setInfo] = useState<McpServerInfo | null>(null);
+  // The live endpoint info comes from the shared store (C1): it re-fetches on
+  // the `mcp_server_listening` event, so the pane reflects the live URL without
+  // a remount. We additionally refresh on mount / enabled-change to cover the
+  // case where the listener bound before this pane (and the store) existed.
+  const info = useMcpServerInfoStore((s) => s.info);
+  const refreshInfo = useMcpServerInfoStore((s) => s.refresh);
   const [revealed, setRevealed] = useState(false);
   const [restartHint, setRestartHint] = useState(false);
 
-  // Fetch the live endpoint info when the pane mounts (and after a re-enable).
   useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const result = await commands.getMcpServerInfo();
-        const fetched = unwrap(result);
-        if (!cancelled) setInfo(fetched);
-      } catch {
-        if (!cancelled) setInfo(null);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [enabled]);
+    void refreshInfo();
+  }, [enabled, refreshInfo]);
 
   // A change to enable/port/write-tools is restart-required for v1.
   const markRestart = () => setRestartHint(true);
@@ -165,8 +156,9 @@ export function McpSettingsPane() {
           </div>
           <p className="settings-drawer__hint">
             Paste the URL and token into the Minutist bridge in Claude Desktop
-            (Settings &rarr; Extensions). Regenerating the token requires
-            replacing it there.
+            (Settings &rarr; Extensions). To rotate the token, delete the{" "}
+            <code>mcp_token</code> file in the app-data directory and restart the
+            app; a new token is generated on the next launch.
           </p>
         </div>
       )}

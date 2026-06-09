@@ -493,6 +493,32 @@ pub(crate) fn require_str<'a>(args: &'a serde_json::Value, field: &str) -> AppRe
         })
 }
 
+/// The dispatch-time length cap for user-supplied free-text identifiers written
+/// to metadata (S4): speaker labels, display names, meeting titles. A name/title
+/// is a short human label; a value past this is rejected rather than persisted,
+/// bounding metadata bloat + hostile-string render. 512 chars is comfortably
+/// above any legitimate name/title.
+pub(crate) const MAX_NAME_LEN: usize = 512;
+
+/// Read a required string argument and reject it if longer than [`MAX_NAME_LEN`]
+/// chars (S4). Used by the two metadata-write tools (`set_speaker_name`,
+/// `rename_meeting`) so an MCP/bridged caller cannot persist an unbounded value.
+/// The length is measured in Unicode scalar values (`chars`), not bytes.
+pub(crate) fn require_bounded_str<'a>(
+    args: &'a serde_json::Value,
+    field: &str,
+) -> AppResult<&'a str> {
+    let s = require_str(args, field)?;
+    if s.chars().count() > MAX_NAME_LEN {
+        return Err(AppError::InvalidInput {
+            context: format!(
+                "argument `{field}` is too long (max {MAX_NAME_LEN} characters)"
+            ),
+        });
+    }
+    Ok(s)
+}
+
 /// Read a required unsigned-integer argument. `InvalidInput` when absent or not
 /// a non-negative integer.
 pub(crate) fn require_u64(args: &serde_json::Value, field: &str) -> AppResult<u64> {

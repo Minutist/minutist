@@ -1044,6 +1044,8 @@ pub async fn send_chat_message(
                 &session,
                 &event_tx,
                 &cancel,
+                // The internal UI chat keeps the full tool set (no MCP gate).
+                None,
             );
             (session, produced)
         })
@@ -1107,9 +1109,14 @@ pub async fn cancel_chat_turn(
 ///
 /// The bearer token is sensitive and crosses the IPC boundary ONLY here, on this
 /// explicit read — it is never on the event bus, never logged, and not baked
-/// into the bindings. The pane reveals it on user request (and offers
-/// regenerate, which rotates it + restarts the listener — a documented
-/// restart-required for v1).
+/// into the bindings. The pane reveals it on user request.
+///
+/// v1 has no live token-rotation command: the token is generated once and
+/// persisted to `{app-data}/mcp_token`, and the listener is spawned once at
+/// startup. Rotating the token (delete the file → restart) is therefore
+/// restart-required, consistent with the rest of the MCP lifecycle (enable /
+/// port / write-tools changes are also restart-required for v1). The pane copy
+/// states this; it does NOT offer a live regenerate control (C2).
 #[tauri::command]
 #[specta::specta]
 pub async fn get_mcp_server_info(
@@ -1254,6 +1261,17 @@ pub(crate) async fn persist_session(
 /// emitted on `event_tx` through the emit closure, which ALSO records the wire
 /// messages this turn produced (the assistant final + each tool result) so the
 /// caller can persist them. Returns those wire messages.
+///
+/// `mcp_gate` (S1) bounds the tool surface the turn may use to the MCP-allowed
+/// set, REUSING the single policy in `agent-tools`
+/// (`mcp_tool_descriptors_gated` / `mcp_call_allowed`):
+/// - `None` — the internal UI chat: the full registry tool set, no gate.
+/// - `Some(allow_writes)` — the Phase-10 inter-agent bridge: the model sees ONLY
+///   the gated descriptors (so destructive ops like `retranscribe_meeting` /
+///   `rediarize_meeting` are never offered), AND a non-allowed tool requested
+///   anyway is rejected before dispatch as defence in depth — mirroring the
+///   direct MCP `tools/call` path so a bridged external caller gets NO broader a
+///   write surface than a direct MCP call under the same `mcp_write_tools`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_chat_turn_on_held_model(
     summariser: &LlamaSummariser,
@@ -1266,10 +1284,17 @@ pub(crate) fn run_chat_turn_on_held_model(
     session: &ChatSession,
     event_tx: &broadcast::Sender<AppEvent>,
     cancel: &chat_agent::CancelFlag,
+    mcp_gate: Option<bool>,
 ) -> Result<Vec<ChatMessage>, AppError> {
     let backend = LlamaTurnBackend::new(summariser.model(), LlamaTurnConfig::default());
     let engine = TurnEngine::new(backend);
-    let descriptors = registry.descriptors();
+    // The tool surface offered to the model: the full set for the UI path, or
+    // the MCP-gated set for the inter-agent bridge (S1). The gating policy lives
+    // in `agent-tools`; this only selects which projection to feed the engine.
+    let descriptors = match mcp_gate {
+        Some(allow_writes) => registry.mcp_tool_descriptors_gated(allow_writes),
+        None => registry.descriptors(),
+    };
     let cfg = chat_sampler_config();
 
     // Rebuild the engine-internal history: pinned system prompt + the prior
@@ -1288,8 +1313,14 @@ pub(crate) fn run_chat_turn_on_held_model(
     // live.
     let emit = |event: AppEvent| emit_chat_event(event_tx, event);
 
-    // The dispatch closure: re-enter async for the registry dispatch only.
+    // The dispatch closure: re-enter async for the registry dispatch only. On
+    // the gated (bridge) path, REJECT a tool the MCP gate does not allow before
+    // dispatching — defence in depth mirroring the direct MCP `tools/call` path
+    // (`McpToolHandler::call_tool`), so a bridged caller cannot reach a tool
+    // absent from its gated descriptor list even if the (stub or real) model
+    // requests it by name (S1). Reuses `agent-tools`' `mcp_call_allowed`.
     let dispatch = |call: &chat_agent::ToolCall| -> AppResult<ToolOutput> {
+        mcp_gate_check(registry, mcp_gate, &call.name)?;
         let args: serde_json::Value =
             serde_json::from_str(&call.arguments_json).map_err(|e| AppError::InvalidInput {
                 context: format!("tool {} arguments are not valid JSON: {e}", call.name),
@@ -1319,6 +1350,29 @@ pub(crate) fn run_chat_turn_on_held_model(
     // the FULL machine payload (the engine `content`) + the tool name, so a
     // reloaded session is faithful to what the model saw in-turn.
     Ok(wire_produced_from_delta(&history[prefix_len..], turn_id))
+}
+
+/// Apply the MCP write gate to one requested tool name before dispatch (S1).
+///
+/// `None` — the internal UI chat: no gate, every tool is allowed.
+/// `Some(allow_writes)` — the inter-agent bridge: reject any tool the active gate
+/// does not allow, REUSING the single policy in `agent-tools`
+/// (`ToolRegistry::mcp_call_allowed`), exactly as the direct MCP `tools/call`
+/// path does. Extracted so the bridge gate is unit-testable without a held model
+/// (the S1 regression test in `crate::chat`).
+pub(crate) fn mcp_gate_check(
+    registry: &agent_tools::ToolRegistry,
+    mcp_gate: Option<bool>,
+    name: &str,
+) -> Result<(), AppError> {
+    if let Some(allow_writes) = mcp_gate {
+        if !registry.mcp_call_allowed(name, allow_writes) {
+            return Err(AppError::InvalidInput {
+                context: format!("tool `{name}` is not exposed over MCP"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Map the engine-history delta a turn produced (the assistant-tool_calls

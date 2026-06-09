@@ -1059,4 +1059,161 @@ mod tests {
             "eviction must emit ChatContextTrimmed with a positive dropped_turns"
         );
     }
+
+    // ----- S1: the inter-agent bridge applies the MCP write gate -------------
+
+    /// The bridge's MCP-gated descriptor set never offers the destructive ops,
+    /// for EITHER `mcp_write_tools` value. This is the FIRST line of the gate
+    /// (the model never sees them), mirroring the direct MCP `tools/list`.
+    #[test]
+    fn bridge_gated_descriptors_never_offer_retranscribe_or_rediarize() {
+        // The bridge drives an INTERNAL registry (`v1(false)`), exactly as the
+        // production driver does.
+        let registry = agent_tools::ToolRegistry::v1(false);
+        for allow_writes in [false, true] {
+            let names: Vec<&str> = registry
+                .mcp_tool_descriptors_gated(allow_writes)
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
+            assert!(
+                !names.contains(&"retranscribe_meeting"),
+                "retranscribe_meeting must never be offered over the bridge (allow_writes={allow_writes})"
+            );
+            assert!(
+                !names.contains(&"rediarize_meeting"),
+                "rediarize_meeting must never be offered over the bridge (allow_writes={allow_writes})"
+            );
+            // A read is still offered (the bridge is otherwise functional).
+            assert!(names.contains(&"get_transcript"));
+        }
+    }
+
+    /// End-to-end through the SAME `run_chat_turn` loop the bridge runs: even
+    /// when the (stub) model REQUESTS `retranscribe_meeting`/`rediarize_meeting`
+    /// by name, the gated dispatch (the production `commands::mcp_gate_check`
+    /// → `mcp_call_allowed` path) rejects them WITHOUT dispatching — for either
+    /// `mcp_write_tools` value (S1). This is the defence-in-depth second line of
+    /// the gate.
+    #[test]
+    fn bridge_turn_cannot_dispatch_destructive_tools_even_when_model_requests_them() {
+        // The two destructive ops the direct MCP path keeps unreachable, asked
+        // for one per turn, under both `mcp_write_tools` values.
+        for blocked in ["retranscribe_meeting", "rediarize_meeting"] {
+            for allow_writes in [false, true] {
+                let registry = agent_tools::ToolRegistry::v1(false);
+                // Step 1: the model asks for the destructive op. The gate rejects
+                // it WITHOUT dispatching; the loop feeds the rejection back as a
+                // tool-result error. Step 2: the model answers in free text.
+                let engine = ScriptedEngine::new(vec![
+                    (
+                        vec![],
+                        TurnOutcome::ToolCalls(vec![tool_call(
+                            blocked,
+                            "{\"meeting_id\":\"00000000-0000-4000-8000-000000000001\"}",
+                        )]),
+                    ),
+                    (
+                        vec!["no".into()],
+                        TurnOutcome::Final("cannot do that".to_string()),
+                    ),
+                ]);
+                let mut history = base_history();
+                let (events, emit) = collector();
+                let sid = ChatSessionId::new();
+
+                // Record every tool name that reaches REAL dispatch. The dispatch
+                // closure is built EXACTLY as `run_chat_turn_on_held_model` builds
+                // it on the bridge path: `mcp_gate_check(registry,
+                // Some(allow_writes), name)` first, then (only if allowed) the
+                // real dispatch — here a recording stub stands in for
+                // `registry.dispatch`, which the gate must prevent reaching for a
+                // blocked tool.
+                let dispatched = std::cell::RefCell::new(Vec::<String>::new());
+                let dispatch = |call: &EngineToolCall| -> AppResult<ToolOutput> {
+                    crate::commands::mcp_gate_check(&registry, Some(allow_writes), &call.name)?;
+                    dispatched.borrow_mut().push(call.name.clone());
+                    Ok(ToolOutput::new(serde_json::json!({}), "ok"))
+                };
+
+                // The gated descriptor set offered to the model never lists the
+                // blocked op in the first place (the first line of the gate).
+                let descriptors = registry.mcp_tool_descriptors_gated(allow_writes);
+                assert!(
+                    !descriptors.iter().any(|d| d.name == blocked),
+                    "{blocked} must not be offered over the bridge (allow_writes={allow_writes})"
+                );
+
+                run_chat_turn(
+                    &engine,
+                    sid,
+                    1,
+                    &mut history,
+                    &descriptors,
+                    &SamplerConfig::deterministic(),
+                    CHAT_N_CTX,
+                    &CancelFlag::new(),
+                    dispatch,
+                    emit,
+                )
+                .expect("the turn recovers after the gate rejects the blocked tool");
+
+                // THE load-bearing assertion: the destructive op was NEVER
+                // dispatched, for either gate value.
+                assert!(
+                    dispatched.borrow().is_empty(),
+                    "{blocked} must never be dispatched over the bridge (allow_writes={allow_writes}); got {:?}",
+                    dispatched.borrow()
+                );
+                // The model saw a FAILED tool result for the blocked op (fed back,
+                // not executed).
+                let ev = events.borrow();
+                assert!(
+                    ev.iter().any(|e| matches!(
+                        e,
+                        AppEvent::ChatToolResult { ok: false, tool, .. } if tool == blocked
+                    )),
+                    "the blocked tool must surface a failed ChatToolResult (allow_writes={allow_writes})"
+                );
+            }
+        }
+    }
+
+    /// Symmetry check: the gate does NOT block an MCP-allowed read on the bridge
+    /// path (so the fix is a write-surface bound, not a functionality regression).
+    #[test]
+    fn bridge_turn_still_dispatches_an_allowed_read() {
+        let registry = agent_tools::ToolRegistry::v1(false);
+        let engine = ScriptedEngine::new(vec![
+            (
+                vec![],
+                TurnOutcome::ToolCalls(vec![tool_call("get_transcript", "{}")]),
+            ),
+            (vec!["ok".into()], TurnOutcome::Final("done".to_string())),
+        ]);
+        let mut history = base_history();
+        let (_events, emit) = collector();
+
+        let dispatched = std::cell::RefCell::new(Vec::<String>::new());
+        let dispatch = |call: &EngineToolCall| -> AppResult<ToolOutput> {
+            crate::commands::mcp_gate_check(&registry, Some(false), &call.name)?;
+            dispatched.borrow_mut().push(call.name.clone());
+            Ok(ToolOutput::new(serde_json::json!({}), "ok"))
+        };
+        let descriptors = registry.mcp_tool_descriptors_gated(false);
+        run_chat_turn(
+            &engine,
+            ChatSessionId::new(),
+            1,
+            &mut history,
+            &descriptors,
+            &SamplerConfig::deterministic(),
+            CHAT_N_CTX,
+            &CancelFlag::new(),
+            dispatch,
+            emit,
+        )
+        .expect("an allowed read must dispatch and the turn must complete");
+        assert_eq!(dispatched.borrow().as_slice(), ["get_transcript"]);
+    }
 }

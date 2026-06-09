@@ -81,6 +81,92 @@
   border-color: var(--accent-soft);
 }
 
+/* Summary-prompt configuration (Phase 9 — D4) — a quiet disclosure. */
+.summary-view__prompt {
+  margin: 0 0 1rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--sheet);
+}
+
+.summary-view__prompt-toggle {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  cursor: pointer;
+  font-family: var(--font-text);
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  letter-spacing: 0.01em;
+}
+
+.summary-view__prompt-toggle::-webkit-details-marker {
+  display: none;
+}
+
+.summary-view__prompt-current {
+  font-size: 0.78rem;
+  color: var(--stone);
+}
+
+.summary-view__prompt-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  padding: 0.25rem 0.75rem 0.85rem;
+  border-top: 1px solid var(--rule);
+}
+
+.summary-view__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.summary-view__field > label {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+.summary-view__field select {
+  font-family: var(--font-text);
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  background: var(--sheet-quiet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.32rem 0.5rem;
+  cursor: pointer;
+}
+
+.summary-view__prompt-textarea {
+  resize: vertical;
+  font-family: var(--font-text);
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--sheet-quiet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.65rem;
+}
+
+.summary-view__prompt-textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.summary-view__prompt-hint {
+  margin: 0;
+  font-size: 0.76rem;
+  font-style: italic;
+  color: var(--stone);
+}
+
 .summary-view__error {
   font-family: var(--font-text);
   font-size: 0.9rem;

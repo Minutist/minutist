@@ -4,6 +4,7 @@ import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useSummaryStore } from "../state/summary";
 import { useMeetingsStore } from "../state/meetings";
+import { useChatStore } from "../state/chat";
 
 /**
  * Mount the global Tauri event bridge exactly once.
@@ -21,6 +22,7 @@ export function useAppEventBridge(): void {
   const handleModelsEvent = useModelsStore((s) => s.handleEvent);
   const handleSummaryEvent = useSummaryStore((s) => s.handleEvent);
   const handleMeetingsEvent = useMeetingsStore((s) => s.handleEvent);
+  const handleChatEvent = useChatStore((s) => s.handleEvent);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -30,6 +32,7 @@ export function useAppEventBridge(): void {
       handleModelsEvent(event);
       handleSummaryEvent(event);
       handleMeetingsEvent(event);
+      handleChatEvent(event);
     })
       .then((fn) => {
         unlisten = fn;
@@ -48,5 +51,6 @@ export function useAppEventBridge(): void {
     handleModelsEvent,
     handleSummaryEvent,
     handleMeetingsEvent,
+    handleChatEvent,
   ]);
 }

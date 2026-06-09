@@ -11,11 +11,18 @@
  * seam); the component holds only local editor draft state. It consumes
  * `theme.css` tokens only and renders in the DEV shim with sample summary data.
  */
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import MarkdownIt from "markdown-it";
 import { useSummaryStore } from "../state/summary";
 import { useModelsStore } from "../state/models";
-import type { MeetingId } from "../ipc/bindings";
+import { useRecordingStore } from "../state/recording";
+import {
+  SUMMARY_PRESETS,
+  SUMMARY_PRESET_LABELS,
+  readSummaryPreset,
+  readSummarySystemPrompt,
+} from "../state/summary-preset-settings";
+import type { MeetingId, SummaryPreset } from "../ipc/bindings";
 import "./SummaryView.css";
 
 // A single shared renderer — markdown-only, no raw HTML (the summary is
@@ -67,6 +74,19 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
   } else if (llm?.status.state === "downloading" && llm.status.bytes_total > 0) {
     downloadPct = Math.round((100 * llm.status.bytes_done) / llm.status.bytes_total);
   }
+
+  // Summary-prompt configuration (Phase 9 — D4). The selected preset drives the
+  // effective prompt unless a non-empty custom override is set, which wins. Both
+  // route through the existing `update_settings` seam on the recording store.
+  const settings = useRecordingStore((s) => s.settings);
+  const setSummaryPreset = useRecordingStore((s) => s.setSummaryPreset);
+  const setSummarySystemPrompt = useRecordingStore(
+    (s) => s.setSummarySystemPrompt,
+  );
+  const summaryPreset = readSummaryPreset(settings);
+  const customPrompt = readSummarySystemPrompt(settings);
+  const customPromptActive = customPrompt.trim() !== "";
+  const [promptOpen, setPromptOpen] = useState(false);
 
   // Edit mode applies only when the stored draft belongs to THIS meeting.
   const editing = editingFlag && editMeetingId === meetingId;
@@ -150,6 +170,63 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
           )}
         </div>
       </header>
+
+      {/*
+        Summary-prompt configuration (Phase 9 — D4): a disclosure holding the
+        preset picker + a custom-prompt override. A non-empty custom prompt
+        OVERRIDES the selected preset — the UI says so explicitly. Both persist
+        through the existing `update_settings` seam.
+      */}
+      <details
+        className="summary-view__prompt"
+        open={promptOpen}
+        onToggle={(e) => setPromptOpen((e.target as HTMLDetailsElement).open)}
+      >
+        <summary className="summary-view__prompt-toggle">
+          Summary prompt
+          <span className="summary-view__prompt-current">
+            {customPromptActive
+              ? "Custom prompt"
+              : SUMMARY_PRESET_LABELS[summaryPreset]}
+          </span>
+        </summary>
+        <div className="summary-view__prompt-body">
+          <div className="summary-view__field">
+            <label htmlFor="summary-preset">Preset</label>
+            <select
+              id="summary-preset"
+              value={summaryPreset}
+              disabled={settings === null}
+              onChange={(e) =>
+                void setSummaryPreset(e.target.value as SummaryPreset)
+              }
+            >
+              {SUMMARY_PRESETS.map((preset) => (
+                <option key={preset} value={preset}>
+                  {SUMMARY_PRESET_LABELS[preset]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="summary-view__field">
+            <label htmlFor="summary-custom-prompt">Custom prompt</label>
+            <textarea
+              id="summary-custom-prompt"
+              className="summary-view__prompt-textarea"
+              value={customPrompt}
+              disabled={settings === null}
+              placeholder="Leave empty to use the selected preset."
+              onChange={(e) => void setSummarySystemPrompt(e.target.value)}
+              rows={3}
+            />
+            <p className="summary-view__prompt-hint">
+              {customPromptActive
+                ? "A custom prompt is set — it overrides the preset above."
+                : "Empty: the selected preset is used. Type a prompt to override it."}
+            </p>
+          </div>
+        </div>
+      </details>
 
       {lastError && (
         <p className="summary-view__error" role="alert">

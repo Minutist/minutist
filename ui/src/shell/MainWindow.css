@@ -433,6 +433,12 @@
   background: transparent;
 }
 
+/* Chat — a workspace column (Phase 9); the ChatView supplies its own surface
+   (recessed `--sheet-quiet`, header, message list, composer). */
+.main-window__pane--chat {
+  background: transparent;
+}
+
 /* Hairline divider with a subtle, centred grip. */
 .main-window__resize-handle {
   position: relative;

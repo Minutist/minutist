@@ -477,26 +477,32 @@ export const devCommands = {
     );
     return ok(null);
   },
-  // Phase 9 chat surface (4a backend). The chat UI (4b) is not built yet, so
-  // the DEV shim returns inert stubs — enough for the typed `commands` surface
-  // and so any early caller in `vite dev` does not throw.
+  // Phase 9 chat surface. The DEV shim drives a representative streamed turn so
+  // the chat pane renders and animates under `vite dev` for visual QA: it adopts
+  // (or mints) a session id, then fans out `chat_token` deltas, a tool
+  // call/result pair, and an authoritative `chat_turn_complete` into the live
+  // event stream — mirroring the real backend's spawn-a-turn-on-a-background-task
+  // contract (`send_chat_message` returns the id immediately; the reply streams
+  // over the chat `AppEvent`s).
   async sendChatMessage(
     _meetingId: MeetingId | null,
     sessionId: ChatSessionId | null,
-    _message: string,
+    message: string,
   ): Promise<Result<ChatSessionId, IpcError>> {
-    return ok(sessionId ?? "00000000-0000-4000-8000-000000000000");
+    const id = sessionId ?? DEV_CHAT_SESSION_ID;
+    startDevChatTurn(id, message);
+    return ok(id);
   },
   async getChatSession(
     _meetingId: MeetingId,
-    _sessionId: ChatSessionId,
+    sessionId: ChatSessionId,
   ): Promise<Result<ChatSession | null, IpcError>> {
-    return ok(null);
+    return ok(devChatSession(sessionId));
   },
   async listChatSessions(
     _meetingId: MeetingId,
   ): Promise<Result<ChatSession[], IpcError>> {
-    return ok([]);
+    return ok([devChatSession(DEV_CHAT_SESSION_ID)]);
   },
   async deleteChatSession(
     _meetingId: MeetingId,
@@ -505,6 +511,94 @@ export const devCommands = {
     return ok(null);
   },
 };
+
+// --- DEV-only chat sample data + streamed turn -----------------------------
+
+const DEV_CHAT_SESSION_ID: ChatSessionId = "dev-chat-0001";
+
+/** A small seeded chat session so the pane has content under `vite dev`. */
+function devChatSession(id: ChatSessionId): ChatSession {
+  const now = new Date().toISOString();
+  return {
+    id,
+    meeting_id: DEV_MEETING_ID,
+    title: "Action items",
+    created_at: now,
+    updated_at: now,
+    messages: [
+      {
+        role: "user",
+        content: "What were the action items from this meeting?",
+        turn_id: 0,
+      },
+      {
+        role: "assistant",
+        content:
+          "There were two action items:\n\n1. **Alex** to circulate the revised budget by Friday.\n2. **Sam** to book the venue for the offsite.",
+        turn_id: 0,
+      },
+    ],
+  };
+}
+
+/**
+ * DEV-only chat-event fan-out so the shim's `sendChatMessage` can stream a turn
+ * into the live event stream started by {@link startDevEventStream}. The real
+ * backend emits the chat `AppEvent`s on the shared bus; this mirrors them.
+ */
+const devChatListeners = new Set<(event: AppEvent) => void>();
+
+/** Drive a representative streamed assistant turn for the dev shim. */
+function startDevChatTurn(sessionId: ChatSessionId, _message: string): void {
+  const turnId = 1;
+  const reply =
+    "Based on the transcript, the team agreed to ship the beta next sprint and to revisit pricing after the launch.";
+  const words = reply.split(" ");
+  const fan = (event: AppEvent) =>
+    devChatListeners.forEach((cb) => cb(event));
+
+  let i = 0;
+  // A tool call/result pair first, then the streamed tokens, then the
+  // authoritative completion.
+  setTimeout(() => {
+    fan({
+      kind: "chat_tool_call",
+      session_id: sessionId,
+      turn_id: turnId,
+      tool: "get_transcript",
+      args_json: "{}",
+    });
+  }, 120);
+  setTimeout(() => {
+    fan({
+      kind: "chat_tool_result",
+      session_id: sessionId,
+      turn_id: turnId,
+      tool: "get_transcript",
+      ok: true,
+      summary: "read 42 segments",
+    });
+  }, 360);
+  const tokenTimer = setInterval(() => {
+    if (i >= words.length) {
+      clearInterval(tokenTimer);
+      fan({
+        kind: "chat_turn_complete",
+        session_id: sessionId,
+        turn_id: turnId,
+        final_text: reply,
+      });
+      return;
+    }
+    fan({
+      kind: "chat_token",
+      session_id: sessionId,
+      turn_id: turnId,
+      token: (i === 0 ? "" : " ") + words[i],
+    });
+    i += 1;
+  }, 90);
+}
 
 /**
  * DEV-only `diarization_complete` fan-out so the dev shim's `rediarize_meeting`
@@ -544,6 +638,9 @@ export function startDevEventStream(
   // Likewise forward dev `diarization_complete` notifications (fired by the
   // shim's `rediarize_meeting`) so the meetings store re-reads the transcript.
   devDiarizationListeners.add(emit);
+  // Likewise forward dev chat events (fired by the shim's `sendChatMessage`) so
+  // the chat store streams the sample turn under `vite dev`.
+  devChatListeners.add(emit);
 
   // Establish the recording state on the next tick (after stores subscribe).
   timers.push(
@@ -579,6 +676,7 @@ export function startDevEventStream(
     cancelled = true;
     devSummaryReadyListeners.delete(emit);
     devDiarizationListeners.delete(emit);
+    devChatListeners.delete(emit);
     timers.forEach(clearTimeout);
     clearInterval(tick);
   };

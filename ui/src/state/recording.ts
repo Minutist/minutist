@@ -22,7 +22,11 @@ import { withCaptureSystemAudio } from "./system-audio-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
 import { withTranscriptionLanguage } from "./transcription-language-settings";
 import { withNotesPaperRules } from "./notes-paper-settings";
-import type { Theme } from "../ipc/bindings";
+import {
+  withSummaryPreset,
+  withSummarySystemPrompt,
+} from "./summary-preset-settings";
+import type { Theme, SummaryPreset } from "../ipc/bindings";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
 
@@ -119,6 +123,20 @@ export type RecordingStore = {
    * round-trip-through-settings pattern as `setDiarizationEnabled`.
    */
   setOnboardingCompleted: (completed: boolean) => Promise<void>;
+  /**
+   * Set the summary prompt preset (Phase 9 — D4), persisting via
+   * `commands.updateSettings` — the same round-trip-through-settings pattern as
+   * `setTheme`. The selected preset drives the effective summary prompt unless a
+   * non-empty custom override is set in `summary_system_prompt`.
+   */
+  setSummaryPreset: (preset: SummaryPreset) => Promise<void>;
+  /**
+   * Set the custom summary-prompt override (Phase 9 — D4), persisting via
+   * `commands.updateSettings`. An empty string means "use the selected preset";
+   * a non-empty value overrides the preset (the backend's
+   * `Settings::effective_summary_prompt`).
+   */
+  setSummarySystemPrompt: (prompt: string) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -369,6 +387,40 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withOnboardingCompleted(current, completed);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setSummaryPreset: async (preset) => {
+    // Persist via `update_settings` (same round-trip as `setTheme`).
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withSummaryPreset(current, preset);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setSummarySystemPrompt: async (prompt) => {
+    // Persist via `update_settings` (same round-trip as `setSummaryPreset`).
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    const next = withSummarySystemPrompt(current, prompt);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

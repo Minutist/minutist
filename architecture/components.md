@@ -1843,6 +1843,49 @@ version, and the NOTICE line remain static in `about-content.ts` (they are not
 in the manifest). The `dev-shim` still hand-seeds models for `vite dev` visual
 QA, but that path never reaches the shipped dialog.
 
+**Phase 9 — chat pane + summary preset picker.**
+
+- **Chat store (`ui/src/state/chat.ts`, zustand).** Holds the meeting-scoped
+  chat pane's transient state: the open session (`sessionId`), its `messages`,
+  the in-flight streamed assistant text (`streaming`), a transient
+  `toolActivity` indicator, the `sessions` list (the switcher), and
+  `inFlight` / `lastError`. Its `handleEvent` is dispatched alongside the other
+  stores' from the single `useAppEventBridge` fan-out (one listener, no second
+  subscription). **Event-reconciliation rule (the lossy-broadcast guarantee, see
+  `cross-cutting.md` — "Agent chat loop"):** `chat_token` deltas APPEND to the
+  `streaming` buffer as a progressive hint and are NEVER trusted as the final
+  answer; `chat_turn_complete.final_text` is authoritative and REPLACES the
+  streamed buffer with the full reconciled reply (appended as the assistant
+  message), so a dropped delta on the broadcast channel cannot corrupt the stored
+  text. `chat_tool_call` / `chat_tool_result` drive the transient tool indicator;
+  `chat_error` surfaces the error and clears the in-flight state. Every chat
+  event is per-session scoped — an event whose `session_id` is not the open
+  session is ignored, so a backgrounded session's turn never clobbers the open
+  one. All IPC routes through the `ui/src/ipc/chat.ts` seam (wrapping the
+  shim-aware `commands.*` from `./client`, NOT raw `bindings.ts`), so tests mock
+  the seam.
+- **Chat pane (`ui/src/shell/ChatView.tsx` + `.css`).** A workspace column (not
+  an overlay) wired into `MainWindow`'s `buildPanes` alongside notes / transcript
+  / summary, gated on a concrete `activeMeetingId` (a live recording's meeting or
+  an opened saved meeting) and hidden on the meeting-list entry surface — chat is
+  meeting-scoped. A "Chat" segment is added to the existing pane-visibility
+  toggle (off by default; the last visible pane still cannot be hidden). It
+  renders user / assistant bubbles (assistant markdown via the Phase-3
+  markdown-it, `html: false`), a compact tool-activity row, a streaming caret
+  while tokens arrive, an error state, a send box (Enter to send, Shift+Enter for
+  a newline, disabled while a turn is in flight), and a session switcher
+  (new / pick / delete). Editorial-Ink tokens only.
+- **Summary preset picker (D4).** The summary view (`SummaryView.tsx`) gains a
+  "Summary prompt" disclosure: a preset `<select>` bound to
+  `settings.summary_preset` (the four `SummaryPreset` values, human labels) + a
+  custom-prompt `<textarea>` bound to `settings.summary_system_prompt`. A
+  non-empty custom prompt OVERRIDES the selected preset (the backend's
+  `Settings::effective_summary_prompt`); the UI states this explicitly. Both
+  persist through the **existing** `commands.updateSettings` seam via two new
+  recording-store actions (`setSummaryPreset` / `setSummarySystemPrompt`) and the
+  `ui/src/state/summary-preset-settings.ts` read/with helpers — no new command,
+  the same round-trip-through-settings pattern as `setTheme`.
+
 ### Design system — "Editorial Ink" (light theme)
 
 A warm-paper, document-centric **light** theme applied across the webview.

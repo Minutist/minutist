@@ -1,0 +1,290 @@
+/*
+ * Editorial Ink — chat pane (Phase 9).
+ *
+ * A recessed `--sheet-quiet` workspace column matching the transcript / summary
+ * panes: a header with the session switcher, a scrolling message list of
+ * user / assistant bubbles, a quiet tool-activity row, and a composer pinned to
+ * the foot. All colour / radius / type values come from `styles/theme.css`;
+ * the single oxblood accent is used sparingly (the user bubble + the send
+ * action + the streaming caret).
+ */
+
+.chat-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--sheet-quiet);
+  border-left: 1px solid var(--rule);
+  font-family: var(--font-text);
+  color: var(--ink-soft);
+}
+
+/* --- Header + session switcher ----------------------------------------- */
+
+.chat-view__header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 1.1rem 1.5rem 0.85rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.chat-view__heading {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 520;
+  font-size: 1.1rem;
+  color: var(--ink);
+}
+
+.chat-view__session-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.chat-view__session-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+.chat-view__session-select {
+  font-family: var(--font-text);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.28rem 0.5rem;
+  max-width: 9rem;
+  cursor: pointer;
+}
+
+.chat-view__session-select:hover {
+  border-color: var(--stone-faint);
+}
+
+.chat-view__session-btn {
+  font-family: var(--font-text);
+  font-size: 0.76rem;
+  letter-spacing: 0.02em;
+  color: var(--stone);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 0.28rem 0.6rem;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.chat-view__session-btn:hover {
+  color: var(--ink-soft);
+  border-color: var(--rule-strong);
+}
+
+/* --- Message list ------------------------------------------------------- */
+
+.chat-view__messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 1.25rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.chat-view__empty {
+  color: var(--stone);
+  text-align: center;
+  margin-top: 2.5rem;
+  font-style: italic;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.chat-view__bubble {
+  max-width: 88%;
+  padding: 0.55rem 0.85rem;
+  border-radius: var(--radius);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+/* User — a quiet oxblood-tinted card, right-aligned. */
+.chat-view__bubble--user {
+  align-self: flex-end;
+  background: var(--accent-tint);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+}
+
+/* Assistant — a paper card, left-aligned (the brighter reading surface). */
+.chat-view__bubble--assistant {
+  align-self: flex-start;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  color: var(--ink);
+}
+
+.chat-view__bubble-text {
+  margin: 0;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+/* Rendered assistant markdown — tighten the block spacing inside the bubble. */
+.chat-view__markdown {
+  white-space: normal;
+}
+
+.chat-view__markdown :first-child {
+  margin-top: 0;
+}
+
+.chat-view__markdown :last-child {
+  margin-bottom: 0;
+}
+
+.chat-view__markdown p {
+  margin: 0 0 0.5rem;
+}
+
+.chat-view__markdown ul,
+.chat-view__markdown ol {
+  margin: 0 0 0.5rem;
+  padding-left: 1.2rem;
+}
+
+.chat-view__markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+}
+
+.chat-view__stream-text {
+  white-space: pre-wrap;
+}
+
+.chat-view__thinking {
+  color: var(--stone);
+  font-style: italic;
+}
+
+/* The streaming caret — a thin blinking oxblood bar after the streamed text. */
+.chat-view__caret {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  animation: chat-caret-blink 1s step-end infinite;
+}
+
+@keyframes chat-caret-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+/* --- Tool-activity row (compact) ---------------------------------------- */
+
+.chat-view__tool {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  max-width: 88%;
+  padding: 0.3rem 0.6rem;
+  border-radius: var(--radius);
+  background: var(--sheet);
+  border: 1px dashed var(--rule-strong);
+  font-size: 0.78rem;
+  color: var(--stone);
+}
+
+.chat-view__tool-name {
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--ink-soft);
+}
+
+.chat-view__tool-summary {
+  color: var(--stone);
+  word-break: break-word;
+}
+
+/* --- Error -------------------------------------------------------------- */
+
+.chat-view__error {
+  flex: 0 0 auto;
+  margin: 0 1.5rem;
+  background: var(--sheet);
+  border: 1px solid var(--accent);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  color: var(--accent);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+/* --- Composer ----------------------------------------------------------- */
+
+.chat-view__composer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 0.6rem;
+  padding: 0.85rem 1.5rem 1.25rem;
+  border-top: 1px solid var(--rule);
+}
+
+.chat-view__input {
+  flex: 1;
+  resize: none;
+  font-family: var(--font-text);
+  font-size: 0.92rem;
+  line-height: 1.45;
+  color: var(--ink);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.65rem;
+}
+
+.chat-view__input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.chat-view__send {
+  flex: 0 0 auto;
+  font-family: var(--font-text);
+  font-size: 0.85rem;
+  color: var(--sheet);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.chat-view__send:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+}
+
+.chat-view__send:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}

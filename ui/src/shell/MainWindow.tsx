@@ -10,6 +10,7 @@ import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
 import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
+import { ChatView } from "./ChatView";
 import { SettingsDrawer } from "./SettingsDrawer";
 import { About } from "./About";
 import { Editor } from "../editor/Editor";
@@ -99,12 +100,21 @@ export function MainWindow() {
     openMeetingId !== null && recordingState.kind === "idle";
   const showSummaryPane = isFinishedMeeting;
 
+  // Phase 9 — the chat agent is meeting-scoped: offered whenever the workspace
+  // is operating on a concrete meeting (a live recording's meeting or an opened
+  // saved meeting), and hidden on the meeting-list entry surface. It needs the
+  // `activeMeetingId` to scope the conversation.
+  const showChatPane = inWorkspace && activeMeetingId !== null;
+
   // Pane visibility (FR-21/FR-30). Panes are included/excluded from the Group
   // rather than collapsed to zero width. Reset to the per-mode default whenever
   // the workspace is (re-)entered or the mode flips (see the effect below).
   const [notesShown, setNotesShown] = useState(true);
   const [transcriptShown, setTranscriptShown] = useState(true);
   const [summaryShown, setSummaryShown] = useState(true);
+  // Chat is OFF by default (notes are the primary surface); one click on the
+  // toggle reveals it.
+  const [chatShown, setChatShown] = useState(false);
 
   // The About dialog (Phase 7, S6) is hidden by default; a header affordance
   // opens it. Presentational overlay; closing returns to the prior surface.
@@ -138,13 +148,15 @@ export function MainWindow() {
     setNotesShown(true);
     setTranscriptShown(false);
     setSummaryShown(true); // only rendered when showSummaryPane (finished meeting)
+    setChatShown(false); // chat is one click away on the toggle
   }, [inWorkspace, showSummaryPane]);
 
   // How many panes are currently visible — used to forbid hiding the last one.
   const visibleCount =
     (notesShown ? 1 : 0) +
     (transcriptShown ? 1 : 0) +
-    (showSummaryPane && summaryShown ? 1 : 0);
+    (showSummaryPane && summaryShown ? 1 : 0) +
+    (showChatPane && chatShown ? 1 : 0);
 
   function togglePane(
     shown: boolean,
@@ -259,6 +271,16 @@ export function MainWindow() {
                   Summary
                 </button>
               )}
+              {showChatPane && (
+                <button
+                  type="button"
+                  className="main-window__view-seg"
+                  aria-pressed={chatShown}
+                  onClick={() => togglePane(chatShown, setChatShown)}
+                >
+                  Chat
+                </button>
+              )}
             </div>
           )}
           {/*
@@ -328,6 +350,17 @@ export function MainWindow() {
                 defaultSize="40%"
               >
                 <SummaryView meetingId={activeMeetingId} />
+              </Panel>
+            ),
+            showChatPane && chatShown && activeMeetingId !== null && (
+              <Panel
+                key="chat"
+                id="chat"
+                className="main-window__pane main-window__pane--chat"
+                minSize="20%"
+                defaultSize="34%"
+              >
+                <ChatView meetingId={activeMeetingId} />
               </Panel>
             ),
           ])}

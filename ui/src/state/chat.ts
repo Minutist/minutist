@@ -21,16 +21,21 @@
  *     indicator (shown while a tool runs, replaced by its one-line result).
  *   - `chat_error` surfaces the error string and clears the in-flight state.
  *
- * KNOWN GAP (tracked follow-up): the TERMINAL events (`chat_turn_complete` /
+ * KNOWN GAP (narrowed — #57): the TERMINAL events (`chat_turn_complete` /
  * `chat_error`) ride the same lossy broadcast bus as the deltas. If a terminal
- * event is dropped on lag, the store stays `inFlight` with no automatic recovery
- * IN the open session. Recovery today is to re-open the session (`openSession`
- * re-reads the persisted messages from disk and clears `inFlight`). A fuller fix
- * — a cancel/timeout escape from a stuck `inFlight`, and emitting the terminal
- * event only AFTER the backend has persisted the turn (so an on-terminal disk
- * reconcile would not race `persist_session`) — is deferred. Do NOT reconcile
- * from disk on the terminal event as-is: the driver emits it DURING the turn,
- * before `persist_session` runs, so the read would race and miss the new turn.
+ * event is dropped on lag, no terminal event clears the open session's
+ * `inFlight`. The ESCAPE is the `Stop` control wired to `cancel()` (the Group-1
+ * cancel surface): it raises the backend's cancel flag AND clears `inFlight` /
+ * `streaming` / `toolActivity` locally — synchronously, not waiting on the bus —
+ * then best-effort re-reads the persisted session (the cancel path persists the
+ * partial turn) to reconcile `messages`. So a user is never permanently stuck:
+ * pressing Stop always unsticks the UI. Re-opening the session (`openSession`)
+ * remains a second recovery path (it re-reads from disk and clears `inFlight`).
+ * A timeout watchdog (auto-cancel a turn that never terminates) is deliberately
+ * OUT of scope. Do NOT reconcile from disk on the terminal EVENT as-is: the
+ * driver emits it DURING the turn, before `persist_session` runs, so that read
+ * would race and miss the new turn — only the explicit cancel/openSession reads,
+ * which happen after the user acts, are safe.
  *
  * Per-session scoping: every chat event carries a `session_id`. An event whose
  * `session_id` is not the currently-open session is IGNORED, so a turn streaming
@@ -264,15 +269,35 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   cancel: async () => {
-    const { sessionId, inFlight } = get();
+    const { sessionId, meetingId, inFlight } = get();
     if (!inFlight || sessionId === null) return;
     try {
       await cancelChatTurn(sessionId);
-      // The backend ends the turn with a terminal `chat_turn_complete` carrying
-      // the partial reply, which clears `inFlight`. If that terminal event is
-      // dropped on the lossy bus, clear the in-flight state here so the UI does
-      // not stick on "Stop".
+      // Clear the in-flight state IMMEDIATELY so the UI is never permanently
+      // stuck on "Stop" — this is the escape from a dropped terminal event (see
+      // the KNOWN-GAP note above). The backend also ends the turn with a terminal
+      // `chat_turn_complete` carrying the partial reply, but we do not depend on
+      // that event arriving.
       set({ inFlight: false, streaming: null, toolActivity: null });
+      // Best-effort reconcile: the cancel path persists the (partial) turn on the
+      // backend, so re-read the session from disk to reflect the saved messages —
+      // an `openSession`-style reconcile that does NOT depend on the lossy bus.
+      // Guard against a race: only apply if the session/meeting are still open.
+      if (meetingId !== null) {
+        try {
+          const session = await getChatSession(meetingId, sessionId);
+          if (
+            get().meetingId === meetingId &&
+            get().sessionId === sessionId &&
+            session
+          ) {
+            set({ messages: session.messages });
+          }
+        } catch {
+          // A reconcile read failure is non-fatal — inFlight is already cleared,
+          // so the user is unstuck regardless; the next openSession will reconcile.
+        }
+      }
     } catch (err) {
       set({ lastError: errorMessage(err) });
     }

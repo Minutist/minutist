@@ -31,3 +31,7 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 orchestrator = { path = "../orchestrator", features = ["test-source"] }
 model-registry = { path = "../model-registry" }
 settings = { path = "../settings" }
+# Test-only: `DummyAudioSource` feeds the orchestrator's `start_with_streams`
+# test seam so the `start_recording`→`stop_recording` round-trip test runs with
+# no real microphone. Dev-only; not a production dependency edge.
+audio-capture = { path = "../audio-capture", features = ["test-source"] }

@@ -221,15 +221,12 @@ pub struct McpServerInfo {
 impl IpcState {
     /// Resolve the **held** summariser, loading the GGUF once on first use.
     ///
-    /// The model id is the user-selected `settings.llm_model_id` or the bundled
-    /// default ([`commands::DEFAULT_LLM_MODEL_ID`]); the directory is resolved
-    /// (downloaded + verified when absent) via `Orchestrator::ensure_model_path`
-    /// — keeping the `model-registry` edge inside the orchestrator. The GGUF is
-    /// opened on `spawn_blocking` (the heavy load is synchronous) with the
-    /// GPU-offload count resolved from the `gpu_acceleration` setting **at load
-    /// time** (a held model is loaded once, so its GPU placement is fixed for the
-    /// process — toggling the setting takes effect on the next start). Subsequent
-    /// calls return the cached `Arc` without reloading.
+    /// A thin delegate to [`ChatHandles::ensure_summariser`], which is the single
+    /// load implementation (model-id resolution, directory ensure, the
+    /// `spawn_blocking` GGUF open, and the load-time GPU placement) — see its doc
+    /// for the load logic. This wrapper exists so the UI `summarise` / chat paths
+    /// can call it directly off `IpcState` without first materialising a
+    /// [`ChatHandles`]; both routes share the SAME lazily-loaded model `Arc`.
     pub async fn ensure_summariser(&self) -> Result<Arc<LlamaSummariser>, IpcError> {
         self.chat_handles().ensure_summariser().await
     }

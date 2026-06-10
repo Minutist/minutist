@@ -288,6 +288,41 @@ describe("useChatStore — actions", () => {
     expect(cancelChatTurn).not.toHaveBeenCalled();
   });
 
+  it("cancel reconciles messages from the persisted session (#57 escape)", async () => {
+    // The backend persists the (partial) turn on cancel; cancel re-reads it so
+    // the saved messages reconcile into the open session, and the user is never
+    // left stuck on a dropped terminal event.
+    const persisted: ChatSession = {
+      id: SESSION,
+      meeting_id: MEETING,
+      title: "A chat",
+      messages: [
+        { role: "user", content: "hi", tool_calls: [], turn_id: 0 },
+        { role: "assistant", content: "partial reply…", tool_calls: [], turn_id: 0 },
+      ],
+      created_at: "2026-06-10T00:00:00Z",
+      updated_at: "2026-06-10T00:00:00Z",
+    };
+    vi.mocked(getChatSession).mockResolvedValueOnce(persisted);
+    useChatStore.setState({
+      meetingId: MEETING,
+      sessionId: SESSION,
+      inFlight: true,
+      streaming: "partial reply…",
+      messages: [{ role: "user", content: "hi", tool_calls: [], turn_id: 0 }],
+    });
+
+    await useChatStore.getState().cancel();
+
+    expect(cancelChatTurn).toHaveBeenCalledWith(SESSION);
+    expect(getChatSession).toHaveBeenCalledWith(MEETING, SESSION);
+    const state = useChatStore.getState();
+    expect(state.inFlight).toBe(false);
+    expect(state.streaming).toBeNull();
+    // The persisted assistant partial is reconciled into the open session.
+    expect(state.messages).toEqual(persisted.messages);
+  });
+
   it("loadSessions populates the session list", async () => {
     const sample: ChatSession = {
       id: SESSION,

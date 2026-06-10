@@ -28,7 +28,7 @@ role when work is parallel.
 | `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator` |
 | `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
-| `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings` |
+| `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |
 

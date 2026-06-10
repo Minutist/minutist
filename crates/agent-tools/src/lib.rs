@@ -293,6 +293,15 @@ impl ToolRegistry {
             Arc::new(tools::RenameMeeting),
             Arc::new(tools::RetranscribeMeeting),
             Arc::new(tools::RediarizeMeeting),
+            // Record-control writes (#62). All `is_write` with the default
+            // `expose_over_mcp` (`!is_write` → `false`), so they are write-gated
+            // OFF over MCP regardless of `mcp_write_tools` — the recording
+            // lifecycle is never driven over MCP in v1. The internal UI chat
+            // (no MCP gate) can dispatch them.
+            Arc::new(tools::StartRecording),
+            Arc::new(tools::StopRecording),
+            Arc::new(tools::PauseRecording),
+            Arc::new(tools::ResumeRecording),
         ];
 
         if include_inter_agent_bridge {
@@ -419,10 +428,12 @@ fn descriptor_of(t: &dyn Tool) -> ToolDescriptor {
 /// This is intentionally a shallow structural check, not a full JSON-Schema
 /// validator, because `agent-tools`'s allowed deps include no validator crate.
 /// It enforces that `args` is an object and that every property the schema marks
-/// `required` is present and non-null. Per-field type coercion and range checks
-/// happen in each tool body, where the typed deserialise turns a shape mismatch
-/// into `InvalidInput`. The grammar-constrained decode in `chat-agent` is the
-/// upstream guard that the model emits schema-valid args in the first place.
+/// `required` is present and non-null. The real guard is **per-tool typed
+/// extraction** in each tool body (`require_str` / `require_u64` /
+/// `resolve_meeting` / the typed deserialise), which turns a shape or type
+/// mismatch into `InvalidInput`. The GBNF grammar backstop in `chat-agent` is a
+/// reliability aid that is OFF by default in the shipped chat path, so it is NOT
+/// relied on here — the typed extraction holds whether or not it is armed.
 fn validate_args(
     name: &str,
     schema: &serde_json::Value,

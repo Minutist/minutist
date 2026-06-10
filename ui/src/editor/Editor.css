@@ -343,11 +343,15 @@
  */
 .notes-editor__anchor-mark {
   position: absolute;
-  /* Sit in the gutter, right-aligned so the timestamp ends flush against the
-     oxblood margin rule (its right edge lands at x = --notes-gutter). */
-  left: calc(-1 * (var(--notes-text-pad) + 2.9rem));
-  width: 2.9rem;
-  text-align: right;
+  /* Sit in the gutter band — from the sheet's left edge (x = 0) to the oxblood
+     margin rule (x = --notes-gutter) — and centre the timestamp horizontally
+     within it. The band is narrowed on the right by --notes-anchor-gap so the
+     timestamp never touches the red rule (it read as crowded when flush-right).
+     The paragraph this is positioned against starts at x = gutter + text-pad,
+     so the band's left edge is `-(gutter + text-pad)` from it. */
+  left: calc(-1 * (var(--notes-gutter) + var(--notes-text-pad)));
+  width: calc(var(--notes-gutter) - var(--notes-anchor-gap));
+  text-align: center;
   font-size: 0.7rem;
   line-height: var(--notes-leading);
   color: var(--stone);

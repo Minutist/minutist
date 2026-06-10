@@ -168,6 +168,10 @@ async fn registry_v1_has_the_documented_tool_set() {
         "rename_meeting",
         "retranscribe_meeting",
         "rediarize_meeting",
+        "start_recording",
+        "stop_recording",
+        "pause_recording",
+        "resume_recording",
     ];
     assert_eq!(reg.len(), expected.len(), "v1 tool count");
     for name in expected {
@@ -234,6 +238,67 @@ async fn mcp_write_gate_projection() {
 }
 
 #[tokio::test]
+async fn record_control_tools_are_write_gated_over_mcp() {
+    // The four record-control tools (#62) are `is_write` AND `expose_over_mcp`,
+    // so they are WRITE-GATED exactly like `set_speaker_name`/`rename_meeting`:
+    // absent + rejected when `mcp_write_tools` is OFF (the default), present +
+    // callable when it is ON. This is what lets an external MCP client drive the
+    // record→transcribe→read loop for E2E only when explicitly opted in.
+    let reg = ToolRegistry::v1(true);
+    let record_control = [
+        "start_recording",
+        "stop_recording",
+        "pause_recording",
+        "resume_recording",
+    ];
+
+    // OFF gate: absent from tools/list and rejected by mcp_call_allowed.
+    let off: Vec<&str> = reg
+        .mcp_tool_descriptors_gated(false)
+        .iter()
+        .map(|d| d.name)
+        .collect();
+    for name in record_control {
+        assert!(
+            !off.contains(&name),
+            "{name} must be absent from tools/list when mcp_write_tools is off"
+        );
+        assert!(
+            !reg.mcp_call_allowed(name, false),
+            "{name} must be rejected over MCP when mcp_write_tools is off"
+        );
+    }
+
+    // ON gate: present in tools/list and callable.
+    let on: Vec<&str> = reg
+        .mcp_tool_descriptors_gated(true)
+        .iter()
+        .map(|d| d.name)
+        .collect();
+    for name in record_control {
+        assert!(
+            on.contains(&name),
+            "{name} must be exposed over MCP when mcp_write_tools is on"
+        );
+        assert!(
+            reg.mcp_call_allowed(name, true),
+            "{name} must be callable over MCP when mcp_write_tools is on"
+        );
+    }
+
+    // They ARE in the expose-only projection (expose_over_mcp == true), unlike
+    // the internal-only writes (retranscribe/rediarize).
+    let exposed: Vec<&str> = reg.mcp_tool_descriptors().iter().map(|d| d.name).collect();
+    for name in record_control {
+        assert!(exposed.contains(&name), "{name} must be MCP-exposable");
+    }
+    assert!(
+        !exposed.contains(&"retranscribe_meeting") && !exposed.contains(&"rediarize_meeting"),
+        "heavy ops stay internal-only (expose_over_mcp == false)"
+    );
+}
+
+#[tokio::test]
 async fn write_flags_are_set_correctly() {
     let reg = ToolRegistry::v1(false);
     let writes = [
@@ -241,6 +306,10 @@ async fn write_flags_are_set_correctly() {
         "rename_meeting",
         "retranscribe_meeting",
         "rediarize_meeting",
+        "start_recording",
+        "stop_recording",
+        "pause_recording",
+        "resume_recording",
     ];
     for name in writes {
         assert!(
@@ -918,4 +987,97 @@ async fn send_to_internal_agent_busy_on_full_queue() {
         }
         other => panic!("expected InvalidInput busy, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Record-control tools (#62) — dispatch through the registry
+//
+// `start_recording` dispatches to `Orchestrator::start`, which opens a real
+// audio device — impractical in a headless unit test — so the registry-shape +
+// MCP-gate coverage above is the primary guard for it. The stop/pause/resume
+// tools are dispatched here against an idle test orchestrator: they each reach
+// the orchestrator and surface its state-machine rejection (`InvalidInput` when
+// not in a state that permits the transition), proving the registry plumbs the
+// internal-UI (no MCP gate) call straight through to the orchestrator method.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stop_recording_dispatches_to_orchestrator_and_rejects_when_idle() {
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    // The internal-UI path (mcp_gate None) dispatches directly through the
+    // registry — no write gate. An idle orchestrator has nothing to stop, so the
+    // state machine rejects it with InvalidInput (proving the call reached it).
+    let err = reg
+        .dispatch(&ctx, "stop_recording", serde_json::json!({}))
+        .await
+        .expect_err("stop while idle must be rejected by the orchestrator");
+    assert!(matches!(
+        err,
+        meeting_app_common::AppError::InvalidInput { .. }
+    ));
+}
+
+#[tokio::test]
+async fn pause_and_resume_recording_dispatch_to_orchestrator_and_reject_when_idle() {
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+
+    let pause_err = reg
+        .dispatch(&ctx, "pause_recording", serde_json::json!({}))
+        .await
+        .expect_err("pause while idle must be rejected");
+    assert!(matches!(
+        pause_err,
+        meeting_app_common::AppError::InvalidInput { .. }
+    ));
+
+    let resume_err = reg
+        .dispatch(&ctx, "resume_recording", serde_json::json!({}))
+        .await
+        .expect_err("resume while idle must be rejected");
+    assert!(matches!(
+        resume_err,
+        meeting_app_common::AppError::InvalidInput { .. }
+    ));
+}
+
+#[tokio::test]
+async fn start_then_stop_recording_via_registry_round_trips() {
+    // A full start→stop dispatch through the registry, using the orchestrator's
+    // `test-source` seam to start without a real device, then stopping via the
+    // `stop_recording` tool. This exercises the tool's dispatch + the
+    // orchestrator's stop method end-to-end (no model present → empty transcript,
+    // recording still finalises). `start_recording` itself opens a real device so
+    // it cannot be the start seam here; we start the session via the test seam and
+    // assert the tool can stop it.
+    use audio_capture::test_source::DummyAudioSource;
+
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+
+    // Start a recording through the test-source seam (no real microphone).
+    let source = DummyAudioSource::new(1600, 800);
+    let streams = source.generate_streams(4, 32, 64);
+    let started_id = ctx
+        .orchestrator
+        .start_with_streams(streams)
+        .await
+        .expect("test-source start should succeed");
+
+    // Now stop it via the registry tool — the internal-UI dispatch path.
+    let out = reg
+        .dispatch(&ctx, "stop_recording", serde_json::json!({}))
+        .await
+        .expect("stop_recording must finalise the running meeting");
+    let stopped_id: MeetingId =
+        serde_json::from_value(out.data["meeting_id"].clone()).expect("meeting_id in result");
+    assert_eq!(
+        stopped_id, started_id,
+        "stop_recording returns the finished meeting's id"
+    );
+    assert!(
+        out.data.get("duration_ms").is_some(),
+        "stop_recording returns the meeting duration"
+    );
 }

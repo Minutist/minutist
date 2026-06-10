@@ -19,6 +19,7 @@ name = "agent-tools"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "audio-capture",
  "meeting-app-common",
  "model-registry",
  "orchestrator",

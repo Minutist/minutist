@@ -113,6 +113,17 @@ and a `TurnOutcome::Cancelled` outcome, P1); the `ipc-bridge` driver maps
 between the two at its boundary. All wire types derive `specta::Type` (they
 cross tauri-specta).
 
+**Persisted shape — what actually shipped (P3).** The shipped wire/persisted
+chat types are the `ChatRole` / `ToolCallRecord` / `ChatMessage` / `ChatSession`
+set described above. The earlier plan-draft names `ChatTurn` / `ChatStopReason`
+/ `ChatSessionHeader` were **not** built: a session persists as a flat
+`Vec<ChatMessage>` (each carrying a monotonic `turn_id`), not a `Vec<ChatTurn>`;
+turn termination is conveyed by the `AppEvent::ChatTurnComplete` / `ChatError`
+events (and the engine's `TurnOutcome`), not a persisted `ChatStopReason`; and
+the session-header fields live inline on `ChatSession` (`id` / `meeting_id` /
+`title` / `created_at` / `updated_at`), not a separate `ChatSessionHeader`. The
+on-disk `chat/{session_id}.json` is exactly the `ChatSession` JSON.
+
 **Phase 9 precursor — `Summariser: Send + Sync`.** The summariser trait widens
 from `Send` to `Send + Sync` (SP0-verified). A held `Arc<dyn Summariser>` is
 shared by the one-shot summary path and the chat agent's `resummarise` tool, so
@@ -1101,9 +1112,19 @@ then `execute`.
 `set_speaker_name`, `rename_meeting` (both MCP-allowlisted — reversible, low
 blast radius), `retranscribe_meeting`, `rediarize_meeting` (internal-only — heavy;
 holding the offline claim via MCP would block the user's ability to record).
-MCP-only (Phase 10, `v1(true)`): `send_to_internal_agent` — forwards one message
-to the internal chat agent over the bridge channel and returns its reply (body in
-`agent-tools`; chat-engine driver in `ipc-bridge::inter_agent`).
+Record-control writes (#62): `start_recording` (optional `device_id`, returns the
+new `MeetingId`), `stop_recording` (returns the finished meeting's id + title +
+duration), `pause_recording`, `resume_recording` — each dispatches to the
+matching `Orchestrator` method (`start`/`stop`/`pause`/`resume`), adding no new
+dependency edge. All four are `is_write` AND override `expose_over_mcp() == true`,
+so they are **write-gated** like `set_speaker_name`/`rename_meeting`: absent +
+rejected when `mcp_write_tools` is OFF (the default), exposed + callable when it
+is ON — the deliberate opt-in that lets an external MCP client drive the
+record→transcribe→read loop for E2E (off by default, behind the bearer token +
+loopback). The internal UI chat (no MCP gate) can always drive them. MCP-only
+(Phase 10, `v1(true)`): `send_to_internal_agent` — forwards one
+message to the internal chat agent over the bridge channel and returns its reply
+(body in `agent-tools`; chat-engine driver in `ipc-bridge::inter_agent`).
 
 **Speaker-name overlay.** `get_transcript`, `get_meeting`,
 `search_within_transcript`, and `speaker_talk_time` apply the
@@ -1118,7 +1139,11 @@ offline claim for free (`InvalidInput` when busy). `set_speaker_name` and
 `rename_meeting` are read-modify-writes of `metadata.json` that bypass that
 claim, so they take a `ToolContext`-owned **per-meeting async mutex** across the
 read-modify-write — the one tool-layer-owned write lock. `relisten_section` and
-`resummarise` are read-only-with-compute (write nothing).
+`resummarise` are read-only-with-compute (write nothing). The record-control
+tools (`start_recording`/`stop_recording`/`pause_recording`/`resume_recording`)
+own no write lock of their own — they delegate straight to the orchestrator's
+recording state machine, which serialises lifecycle transitions under its own
+lock and rejects an invalid transition with `InvalidInput`.
 
 ### `chat-agent`
 **Crate:** `crates/chat-agent` (Phase 9)

@@ -630,7 +630,13 @@ revision 2025-11-25). Binding controls:
   trait's `expose_over_mcp()` (default `!is_write()`) is the server-side gate.
   `set_speaker_name` / `rename_meeting` are MCP-allowlisted (reversible, low blast
   radius); `retranscribe_meeting` / `rediarize_meeting` are internal-only (heavy;
-  holding the offline claim via MCP would block the user's recording); no
+  holding the offline claim via MCP would block the user's recording); the
+  record-control tools (`start_recording` / `stop_recording` / `pause_recording`
+  / `resume_recording`, #62) are MCP-allowlisted **write-gated** control tools —
+  `is_write` AND `expose_over_mcp() == true`, so the recording lifecycle is
+  driveable over MCP **only when the user turns `mcp_write_tools` ON** (off by
+  default, behind the bearer token + loopback bind); this is the deliberate opt-in
+  that lets an external client run the record→transcribe→read loop for E2E. No
   destructive tool (`delete_meeting`, notes mutation, summary overwrite) is in the
   v1 registry at all. ON TOP of that, `settings.mcp_write_tools` (D3, default
   `false`) gates the reversible writes: off ⇒ read/compute + the inter-agent tool
@@ -905,9 +911,12 @@ offloaded nothing.)
 
 The features fan out through a single chain so the app binary is the only place
 a backend is chosen: `meeting-app` (src-tauri) → `ipc-bridge` → {`summariser`,
-`orchestrator` → {`asr-runtime`, `diarizer`}}. `ipc-bridge` is the fan-out point
-because it sits above both `summariser` (direct dep) and `orchestrator` (which
-owns `asr-runtime` + `diarizer`); the orchestrator does NOT depend on summariser
+`chat-agent`, `orchestrator` → {`asr-runtime`, `diarizer`}}. `ipc-bridge` is the
+fan-out point because it sits above `summariser` (direct dep), `chat-agent` (the
+held-model chat engine, which forwards `vulkan`/`metal`/`cuda`/`rocm` to its own
+`llama-cpp-2` so a GPU build links the chat engine against the same process-wide
+`LlamaBackend` as summariser/asr-runtime), and `orchestrator` (which owns
+`asr-runtime` + `diarizer`); the orchestrator does NOT depend on summariser
 (rule A5), so summariser is reached via ipc-bridge, not orchestrator.
 
 **Q7 — one artefact per platform.** v1 ships a single build per OS with a

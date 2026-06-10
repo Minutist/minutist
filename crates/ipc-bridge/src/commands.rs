@@ -1502,6 +1502,15 @@ pub(crate) fn run_chat_turn_on_held_model(
             serde_json::from_str(&call.arguments_json).map_err(|e| AppError::InvalidInput {
                 context: format!("tool {} arguments are not valid JSON: {e}", call.name),
             })?;
+        // Thread-occupancy cost (documented): this whole turn already runs on a
+        // `spawn_blocking` thread (the engine decode is sync), and this nested
+        // `block_on` parks THAT blocking thread for the full duration of the
+        // async tool dispatch — including any in-tool `spawn_blocking` (e.g. a
+        // `relisten`/`resummarise` inference). So one chat tool call holds a
+        // blocking-pool thread end-to-end; concurrent tool-calling turns scale
+        // with the blocking-pool size, not the worker count. Acceptable for v1
+        // (single in-flight turn per session); revisit if the tool surface grows
+        // long-running fan-out.
         handle.block_on(registry.dispatch(ctx, &call.name, args))
     };
 

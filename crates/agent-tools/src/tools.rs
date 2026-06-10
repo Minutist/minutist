@@ -830,6 +830,150 @@ fn aggregate_talk_time(
 }
 
 // ---------------------------------------------------------------------------
+// Record-control tools (WRITE — MCP write-gated, off by default) — #62
+// ---------------------------------------------------------------------------
+//
+// Four tools that drive the orchestrator's live recording lifecycle so an
+// external MCP client can run the record→transcribe→read loop for E2E (and the
+// internal UI chat can drive recording too). Each dispatches to an existing
+// `Orchestrator` method — `start(device_id)` / `stop()` / `pause()` / `resume()`
+// — and adds NO new dependency edge (`agent-tools → orchestrator` pre-exists).
+//
+// All four set `is_write() == true` AND override `expose_over_mcp() == true`, so
+// they are WRITE-GATED over MCP exactly like `set_speaker_name`/`rename_meeting`
+// (Group 2): absent from `mcp_tool_descriptors_gated` / rejected by
+// `mcp_call_allowed` when `mcp_write_tools` is OFF (the default), and exposed +
+// callable only when the user turns `mcp_write_tools` ON — so an external MCP
+// client can drive the record→transcribe→read loop for end-to-end testing only
+// when explicitly opted in (off by default, behind the bearer token + loopback
+// bind). The internal chat agent (no MCP gate) can always dispatch them.
+
+pub struct StartRecording;
+
+#[async_trait]
+impl Tool for StartRecording {
+    fn name(&self) -> &'static str {
+        "start_recording"
+    }
+    fn description(&self) -> &'static str {
+        "Start a new recording. Optionally pick an input device by id (omit for the OS default). \
+         Returns the new meeting's id. Fails if a recording is already in progress."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        // `device_id` is optional (omit → OS default). No regex `pattern` (the
+        // GBNF converter rejects PCRE shorthands).
+        schema_obj(
+            json!({
+                "device_id": { "type": "string", "description": "Optional input-device id; omit for the OS default" },
+            }),
+            &[],
+        )
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    fn expose_over_mcp(&self) -> bool {
+        true // write-gated: callable over MCP only when `mcp_write_tools` is on
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let device_id = args
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let meeting_id = ctx.orchestrator.start(device_id).await?;
+        let data = json!({ "meeting_id": meeting_id });
+        Ok(ToolOutput::new(
+            data,
+            format!("recording started ({})", meeting_id.0),
+        ))
+    }
+}
+
+pub struct StopRecording;
+
+#[async_trait]
+impl Tool for StopRecording {
+    fn name(&self) -> &'static str {
+        "stop_recording"
+    }
+    fn description(&self) -> &'static str {
+        "Stop the current recording and finalise the meeting. Returns the finished meeting's id, \
+         title, and duration. Fails if no recording is in progress."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(json!({}), &[])
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    fn expose_over_mcp(&self) -> bool {
+        true // write-gated: callable over MCP only when `mcp_write_tools` is on
+    }
+    async fn execute(&self, ctx: &ToolContext, _args: serde_json::Value) -> AppResult<ToolOutput> {
+        let meta = ctx.orchestrator.stop().await?;
+        let data = json!({
+            "meeting_id": meta.uuid,
+            "title": meta.title,
+            "duration_ms": meta.duration_ms,
+        });
+        Ok(ToolOutput::new(
+            data,
+            format!("recording stopped ({} — {} ms)", meta.uuid.0, meta.duration_ms),
+        ))
+    }
+}
+
+pub struct PauseRecording;
+
+#[async_trait]
+impl Tool for PauseRecording {
+    fn name(&self) -> &'static str {
+        "pause_recording"
+    }
+    fn description(&self) -> &'static str {
+        "Pause the current recording. Fails if no recording is in progress."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(json!({}), &[])
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    fn expose_over_mcp(&self) -> bool {
+        true // write-gated: callable over MCP only when `mcp_write_tools` is on
+    }
+    async fn execute(&self, ctx: &ToolContext, _args: serde_json::Value) -> AppResult<ToolOutput> {
+        ctx.orchestrator.pause().await?;
+        Ok(ToolOutput::new(json!({ "ok": true }), "recording paused"))
+    }
+}
+
+pub struct ResumeRecording;
+
+#[async_trait]
+impl Tool for ResumeRecording {
+    fn name(&self) -> &'static str {
+        "resume_recording"
+    }
+    fn description(&self) -> &'static str {
+        "Resume a paused recording. Fails if the recording is not currently paused."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(json!({}), &[])
+    }
+    fn is_write(&self) -> bool {
+        true
+    }
+    fn expose_over_mcp(&self) -> bool {
+        true // write-gated: callable over MCP only when `mcp_write_tools` is on
+    }
+    async fn execute(&self, ctx: &ToolContext, _args: serde_json::Value) -> AppResult<ToolOutput> {
+        ctx.orchestrator.resume().await?;
+        Ok(ToolOutput::new(json!({ "ok": true }), "recording resumed"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // send_to_internal_agent (MCP-only — Phase 10 §3)
 // ---------------------------------------------------------------------------
 

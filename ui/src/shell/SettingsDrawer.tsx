@@ -19,6 +19,7 @@ import { useEffect, useRef } from "react";
 import { useRecordingStore } from "../state/recording";
 import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
+import { readPreloadSummariser } from "../state/preload-summariser-settings";
 import { readPreferLargeAsrModel } from "../state/large-asr-model-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
 import { readNotesPaperRules } from "../state/notes-paper-settings";
@@ -45,6 +46,9 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
     (s) => s.setDiarizationEnabled,
   );
   const setGpuAcceleration = useRecordingStore((s) => s.setGpuAcceleration);
+  const setPreloadSummariser = useRecordingStore(
+    (s) => s.setPreloadSummariser,
+  );
   const setPreferLargeAsrModel = useRecordingStore(
     (s) => s.setPreferLargeAsrModel,
   );
@@ -56,6 +60,7 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
 
   const diarizationEnabled = readDiarizationEnabled(settings);
   const gpuAcceleration = readGpuAcceleration(settings);
+  const preloadSummariser = readPreloadSummariser(settings);
   const preferLargeAsrModel = readPreferLargeAsrModel(settings);
   const captureSystemAudio = readCaptureSystemAudio(settings);
   const theme = readTheme(settings);
@@ -184,6 +189,18 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
               onChange={(e) => void setPreferLargeAsrModel(e.target.checked)}
             />
             <span>Higher-accuracy speech model (GPU)</span>
+          </label>
+          <label
+            className="settings-drawer__toggle"
+            title="Load the summary & chat model when the app starts (if it is already downloaded) and keep it ready, so the first Summarise or chat is instant. Turn off to load it on first use and keep idle memory lower."
+          >
+            <input
+              type="checkbox"
+              checked={preloadSummariser}
+              disabled={settings === null}
+              onChange={(e) => void setPreloadSummariser(e.target.checked)}
+            />
+            <span>Keep the summary &amp; chat model loaded</span>
           </label>
         </section>
 

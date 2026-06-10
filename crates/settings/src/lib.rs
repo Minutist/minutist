@@ -92,6 +92,14 @@ const fn default_mcp_port() -> u16 {
 /// ready without the user pressing Summarise. An older store written before this
 /// field existed deserialises to `true` via `#[serde(default = ...)]`. See
 /// `architecture/cross-cutting.md` — the Agent/stop lifecycle.
+/// Default for `preload_summariser`: ON. The summary/chat model is warmed at
+/// startup (when already downloaded) so the first use is instant; an older store
+/// written before this field existed deserialises to `true` via
+/// `#[serde(default = ...)]`.
+const fn default_preload_summariser() -> bool {
+    true
+}
+
 const fn default_auto_summarise_on_stop() -> bool {
     true
 }
@@ -411,6 +419,21 @@ pub struct Settings {
     /// Agent/stop lifecycle.
     #[serde(default = "default_auto_summarise_on_stop")]
     pub auto_summarise_on_stop: bool,
+
+    /// Preload the summary/chat LLM at app startup and keep it resident.
+    ///
+    /// The summary path and the chat agent share ONE held `LlamaSummariser`
+    /// (loaded once, kept for the process lifetime). When `true` (the default),
+    /// `app-main` warms it in the background at startup IF the model is already
+    /// downloaded — so the first Summarise / chat is instant rather than paying a
+    /// multi-GB load. It NEVER triggers a download at startup (a not-yet-fetched
+    /// model is left to load on first use / after the onboarding download). When
+    /// `false`, the model loads on-demand on first use (the prior behaviour) — the
+    /// escape hatch for keeping idle memory low. `#[serde(default = ...)]`
+    /// defaults to `true`; an older store written before this field existed
+    /// deserialises to `true`.
+    #[serde(default = "default_preload_summariser")]
+    pub preload_summariser: bool,
 }
 
 impl Settings {
@@ -453,6 +476,7 @@ impl Default for Settings {
             mcp_port: default_mcp_port(),
             mcp_write_tools: false,
             auto_summarise_on_stop: default_auto_summarise_on_stop(),
+            preload_summariser: default_preload_summariser(),
         }
     }
 }
@@ -501,6 +525,7 @@ mod tests {
             mcp_port: 9999,
             mcp_write_tools: true,
             auto_summarise_on_stop: false,
+            preload_summariser: false,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -681,6 +706,41 @@ mod tests {
         assert!(
             restored.auto_summarise_on_stop,
             "missing auto_summarise_on_stop must deserialise to true (#68 default)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 1e'. preload_summariser: default + round-trip + missing-field
+    //      deserialisation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn preload_summariser_defaults_to_true() {
+        assert!(
+            Settings::default().preload_summariser,
+            "the summary/chat model preloads at startup by default"
+        );
+    }
+
+    #[test]
+    fn preload_summariser_round_trips() {
+        let original = Settings {
+            preload_summariser: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(!restored.preload_summariser);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_preload_summariser_field_defaults_to_true() {
+        let old_json = r#"{ "theme": "dark" }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            restored.preload_summariser,
+            "missing preload_summariser must deserialise to true"
         );
     }
 

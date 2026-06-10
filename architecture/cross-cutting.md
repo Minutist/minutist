@@ -475,6 +475,17 @@ the first start is in flight the webview shows a "Preparing transcription model�
 status and disables the Start control (a double-press is then impossible) — see
 "Operation progress" below.
 
+**Summariser preload (same shape, for the LLM).** The summary/chat LLM is the
+other heavy lazy load (mmap + warmup on the first Summarise / chat). Gated on
+`settings.preload_summariser` (default ON), `app-main` warms it on a background
+startup task via `ChatHandles::maybe_preload_summariser`, mirroring `prewarm_asr`:
+it checks the model is already downloaded (`Orchestrator::list_models`, NEVER
+downloading) and, if so, calls `ensure_summariser` to load the shared held
+instance early; otherwise it skips (the model loads on first use). The held
+`OnceCell` keeps the instance resident for the process lifetime, so once loaded
+(preloaded or on-demand) it stays ready — the `preload_summariser` toggle only
+chooses startup-warm vs load-on-demand, there is no idle unload.
+
 ## Operation progress
 
 Long-running per-meeting operations emit `AppEvent::OperationProgress {

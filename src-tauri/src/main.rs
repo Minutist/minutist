@@ -475,6 +475,19 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 mcp_info: mcp_info.clone(),
             });
 
+            // Preload the shared summary/chat LLM in the background so the first
+            // Summarise / chat is instant (the model loads in ~seconds the first
+            // time otherwise). Gated on `settings.preload_summariser` (default ON)
+            // and best-effort: it NEVER downloads — a not-yet-fetched model is
+            // left to load on first use. Mirrors the ASR prewarm above;
+            // `async_runtime::spawn` because `setup` has no entered tokio runtime.
+            {
+                let preload_handles = app.state::<IpcState>().chat_handles();
+                tauri::async_runtime::spawn(async move {
+                    preload_handles.maybe_preload_summariser().await;
+                });
+            }
+
             // --- Phase 10: the MCP server + the inter-agent bridge ------------
             //
             // Gated on `settings.mcp_enabled` (off by default). When enabled,

@@ -17,6 +17,7 @@ import type { AppEvent } from "../ipc/app-event";
 import { useModelsStore } from "./models";
 import { withDiarizationEnabled } from "./diarization-settings";
 import { withGpuAcceleration } from "./gpu-acceleration-settings";
+import { withPreloadSummariser } from "./preload-summariser-settings";
 import { withPreferLargeAsrModel } from "./large-asr-model-settings";
 import { withCaptureSystemAudio } from "./system-audio-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
@@ -105,6 +106,14 @@ export type RecordingStore = {
    * inference runs on CPU even in a GPU-feature build.
    */
   setGpuAcceleration: (enabled: boolean) => Promise<void>;
+  /**
+   * Toggle preloading the summary/chat LLM at startup (on by default),
+   * persisting via `commands.updateSettings` — the same round-trip-through-
+   * settings pattern as `setGpuAcceleration`. On: the model is warmed at startup
+   * (when downloaded) so the first Summarise / chat is instant. Off: it loads
+   * on-demand on first use, keeping idle memory lower.
+   */
+  setPreloadSummariser: (enabled: boolean) => Promise<void>;
   /**
    * Opt the Qwen ASR branch into the larger 1.7B GPU tier (off by default),
    * persisting via `commands.updateSettings` — the same round-trip-through-
@@ -352,6 +361,23 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withGpuAcceleration(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setPreloadSummariser: async (enabled) => {
+    // Persist via `update_settings`, the same round-trip pattern as
+    // `setGpuAcceleration`.
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    const next = withPreloadSummariser(current, enabled);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

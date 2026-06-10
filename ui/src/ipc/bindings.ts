@@ -1144,7 +1144,22 @@ mcp_write_tools?: boolean;
  * new default for existing users. See `architecture/cross-cutting.md` — the
  * Agent/stop lifecycle.
  */
-auto_summarise_on_stop?: boolean }
+auto_summarise_on_stop?: boolean; 
+/**
+ * Preload the summary/chat LLM at app startup and keep it resident.
+ * 
+ * The summary path and the chat agent share ONE held `LlamaSummariser`
+ * (loaded once, kept for the process lifetime). When `true` (the default),
+ * `app-main` warms it in the background at startup IF the model is already
+ * downloaded — so the first Summarise / chat is instant rather than paying a
+ * multi-GB load. It NEVER triggers a download at startup (a not-yet-fetched
+ * model is left to load on first use / after the onboarding download). When
+ * `false`, the model loads on-demand on first use (the prior behaviour) — the
+ * escape hatch for keeping idle memory low. `#[serde(default = ...)]`
+ * defaults to `true`; an older store written before this field existed
+ * deserialises to `true`.
+ */
+preload_summariser?: boolean }
 /**
  * Built-in summary prompt presets (Phase 9 — D4).
  * 

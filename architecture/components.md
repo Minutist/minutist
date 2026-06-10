@@ -1437,6 +1437,16 @@ is ON by default; an older store written before the field existed deserialises t
 as the third gate of `post_stop_passes`. No new dependency edge. See
 `cross-cutting.md` — "Finalise returns to the meeting list".
 
+**Field — `preload_summariser: bool`.** Whether the shared summary/chat LLM is
+warmed at app startup (and kept resident — the held `OnceCell` never unloads).
+`#[serde(default = ...)]`-defaults to `true`; an older store deserialises to
+`true`. `app-main` reads it via `ChatHandles::maybe_preload_summariser` on a
+background startup task (mirroring `prewarm_asr`): when `true` AND the LLM is
+already downloaded (checked via `Orchestrator::list_models`, no download), it
+calls `ensure_summariser` so the first Summarise / chat is instant; when `false`
+the model loads on-demand on first use. It NEVER downloads at startup. See
+`cross-cutting.md` — "ASR prewarm".
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates

@@ -67,4 +67,42 @@ impl ChatHandles {
             .map_err(IpcError::from)?;
         Ok(Arc::clone(handle))
     }
+
+    /// Preload the held summariser at startup when the user has opted in
+    /// (`settings.preload_summariser`, the default) AND the LLM is already
+    /// downloaded — so the first Summarise / chat is instant.
+    ///
+    /// Best-effort and **never downloads**: it consults the registry's local
+    /// availability (`Orchestrator::list_models`) and only warms an
+    /// already-present model; a not-yet-fetched model is left for the first
+    /// on-demand use (which downloads). All outcomes are logged, none surfaced —
+    /// a failed preload must never block startup, and the model still loads
+    /// lazily on first use. Driven from `app-main` on a background startup task,
+    /// mirroring `Orchestrator::prewarm_asr`.
+    pub async fn maybe_preload_summariser(&self) {
+        if !self.settings.current().preload_summariser {
+            tracing::debug!(target: "ipc-bridge", "summariser preload disabled by setting");
+            return;
+        }
+        let model_id = commands::resolve_llm_model_id(&self.settings.current());
+        let available = self.orchestrator.list_models().into_iter().any(|m| {
+            m.id == model_id
+                && matches!(m.status, meeting_app_common::ModelStatusState::Available { .. })
+        });
+        if !available {
+            tracing::info!(
+                target: "ipc-bridge",
+                model_id = %model_id.0,
+                "summariser preload skipped: LLM not downloaded yet (loads on first use)"
+            );
+            return;
+        }
+        match self.ensure_summariser().await {
+            Ok(_) => tracing::info!(target: "ipc-bridge", "summariser preloaded at startup"),
+            Err(e) => tracing::warn!(
+                target: "ipc-bridge",
+                "summariser preload failed: {e}; will retry on first use"
+            ),
+        }
+    }
 }

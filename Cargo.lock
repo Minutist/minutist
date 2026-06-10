@@ -1026,6 +1026,7 @@ version = "0.0.0"
 dependencies = [
  "hound",
  "meeting-app-common",
+ "persistence",
  "sherpa-rs",
  "thiserror 1.0.69",
  "tracing",

@@ -49,12 +49,21 @@ fn find_recording(dir: &str) -> Option<PathBuf> {
 }
 
 fn diarize_at(seg_path: &Path, emb_path: &Path, threshold: f32, audio: &[f32], segs: &[Segment]) -> u32 {
+    // A raw threshold-only sweep: disable the temporal smoothing and the
+    // post-cluster prune/cap (issue #63) so this curve shows the unpruned
+    // agglomerative count vs `cluster_threshold` alone. The pruned shipped curve
+    // lives in `crates/diarizer/tests/oversplit_eval.rs`.
     let d = SherpaDiarizer::open(
         seg_path,
         emb_path,
         DiarizerConfig {
             num_clusters: None,
             cluster_threshold: threshold,
+            min_duration_on: 0.0,
+            min_duration_off: 0.0,
+            min_cluster_share: 0.0,
+            min_cluster_segments: 0,
+            max_speakers: None,
         },
     )
     .expect("open diarizer");

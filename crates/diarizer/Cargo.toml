@@ -25,3 +25,8 @@ sherpa-rs = { workspace = true }
 # WAV decoding for the env-var-gated fixtures (`tests/accuracy.rs`,
 # `tests/online_embedding.rs`).
 hound = { workspace = true }
+# `persistence::read_audio_pcm` + `read_transcript` for the env-var-gated
+# over-split count-vs-knob eval (`tests/oversplit_eval.rs`, issue #63). Test-only
+# (dev-dependency), so no `diarizer → persistence` runtime edge — persistence
+# depends only on `common`, so there is no cycle.
+persistence = { path = "../persistence" }

@@ -39,7 +39,11 @@ appears in:
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server` |
 
 Any PR adding an edge not in this table requires an architecture-doc
-update in the same commit.
+update in the same commit. The table tracks **runtime** edges only;
+test-only dev-dependencies (e.g. `diarizer → persistence` and
+`diarizer → hound` for the over-split eval's audio decode, mirroring
+`orchestrator`'s test-only deps) are documented in prose where they are
+used, not added here.
 
 ### Crates that grow across phases
 
@@ -435,28 +439,41 @@ upstream notices).
 and diarization is single-threaded per call so the mutex is never contended on
 the hot path). `DiarizerConfig` maps onto sherpa's `DiarizeConfig`:
 `num_clusters = Some(n)` → exact-cluster mode; `None` → `num_clusters = Some(-1)`
-(sherpa's "use threshold" sentinel, Spike 4) with `cluster_threshold`. The
-orchestrator constructs the diarizer with `DiarizerConfig::default()`
-(`num_clusters = None`, `cluster_threshold = 0.5`) for BOTH the on-stop pass and
-the user-triggered re-diarize pass: at record time the speaker count is unknown,
-so production uses threshold/auto-count mode to discover it rather than fixing a
-cluster count. There is no `Some(1)` production path. `assign_speakers` rejects any
+(sherpa's "use threshold" sentinel, Spike 4) with `cluster_threshold`, plus
+sherpa's `min_duration_on` / `min_duration_off` smoothing. The orchestrator
+constructs the diarizer with `DiarizerConfig::default()` (`num_clusters = None`,
+`cluster_threshold = 0.75`, `min_duration_on = 0.3`, `min_duration_off = 0.5`,
+`min_cluster_share = 0.02`) for BOTH the on-stop pass and the user-triggered
+re-diarize pass: at record time the speaker count is unknown, so production uses
+threshold/auto-count mode to discover it rather than fixing a cluster count.
+There is no `Some(1)` production path. `assign_speakers` rejects any
 `sample_rate != 16000` with `AppError::InvalidInput`, short-circuits empty
 audio/segments to `0`, runs `Diarize::compute`, and overlays via a pure
-`overlay_speakers(&[sherpa::Segment], &mut [Segment]) -> u32`: per ASR segment it
-picks the max-overlap sherpa turn (seconds→ms, half-open `[start_ms, end_ms)`;
-ties resolve to the earlier turn; no overlap → `speaker_id = None`), relabels the
-chosen `i32` cluster ids to first-seen-order `A`/`B`/… across segment slice
-order, and returns the distinct-label count. The sherpa `eyre::Result` is mapped
-to `Error::ModelLoad`/`Error::Inference` → `AppError::{ModelLoad,Inference{backend:"diarizer"}}`
-at the boundary (eyre arrives transitively via `sherpa-rs`; no separate `eyre`
-dep). `sherpa-rs = { workspace = true }` is added to `crates/diarizer/Cargo.toml`;
-`hound` is a dev-dependency for the gated test's WAV decode. Tests: the default
-suite covers `overlay_speakers` (interval-join, no-overlap=None, tie-break,
-first-seen relabel, stale-label clearing) with no model; the env-var-gated
-`tests/accuracy.rs` (`MEETING_APP_DIARIZE_SEG_PATH` + `MEETING_APP_DIARIZE_EMB_PATH`,
-skip-on-unset) runs `assign_speakers` over committed
-fixtures (`tests/fixtures/two_speakers_synth.wav` = two distinct real-speech
+`overlay_speakers(&[sherpa::Segment], &mut [Segment], &DiarizerConfig) -> u32`:
+per ASR segment it picks the max-total-overlap sherpa CLUSTER (seconds→ms,
+half-open `[start_ms, end_ms)`; ties resolve to the lower cluster id; no overlap
+→ `speaker_id = None`), then applies the **post-cluster prune + cap** (issue #63:
+drop clusters below `min_cluster_share` of the attributed speech duration — or
+below the off-by-default `min_cluster_segments` / above the off-by-default
+`max_speakers` — and reassign their segments to the nearest surviving cluster),
+relabels the surviving `i32` cluster ids to first-seen-order `A`/`B`/… across
+segment slice order, and returns the distinct-label count. The prune is the
+robust lever against the long-recording over-split (a single distance threshold
+cannot separate a drifted same-speaker embedding from a distinct speaker); see
+`cross-cutting.md` — "Offline over-split prune". The sherpa `eyre::Result` is
+mapped to `Error::ModelLoad`/`Error::Inference` →
+`AppError::{ModelLoad,Inference{backend:"diarizer"}}` at the boundary (eyre
+arrives transitively via `sherpa-rs`; no separate `eyre` dep). `sherpa-rs =
+{ workspace = true }` is added to `crates/diarizer/Cargo.toml`; `hound` and
+`persistence` (test-only, the over-split eval's audio/transcript decode) are
+dev-dependencies. Tests: the default suite covers `overlay_speakers`
+(interval-join, no-overlap=None, tie-break, first-seen relabel, stale-label
+clearing) AND the prune/cap (tiny-share drop + reassign, genuine-speaker keep,
+segment-count floor, cap-to-largest, never-zero fallback) with no model; the
+env-var-gated `tests/accuracy.rs` (`MEETING_APP_DIARIZE_SEG_PATH` +
+`MEETING_APP_DIARIZE_EMB_PATH`, skip-on-unset) runs `assign_speakers` over
+committed fixtures (`tests/fixtures/two_speakers_synth.wav` = two distinct
+real-speech
 speaker clips concatenated, with self-authored ground truth;
 `single_speaker_control.wav` = one real speaker repeated), asserting ≥ 80 %
 permutation-invariant segment accuracy and exactly one label on the control.

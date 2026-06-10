@@ -66,6 +66,32 @@ that still separates two distinct speakers, maximising single-speaker merging.
 The greedy online path has little margin, so live labels stay provisional — the
 on-stop pass is the safety net.
 
+**Offline over-split prune (issue #63, 2026-06-10).** On long, acoustically-
+varied recordings (room coloration + system-audio loopback + a podcast over a
+loudspeaker) the offline pass over-split: one speaker's embeddings drift past the
+single distance `cluster_threshold`, minting extra clusters — the field saw 19 /
+29 speakers where the truth was a handful. A distance threshold alone cannot
+separate "same speaker, drifted" from "different speaker", so the robust fix is a
+**post-cluster prune** in `overlay_speakers`, NOT a higher threshold. The
+shipped `DiarizerConfig::default()` now carries three additional knobs:
+`min_duration_on` / `min_duration_off` (`0.3` / `0.5`, sherpa's own example
+values — previously pinned to `0.0`/disabled — bridging short intra-speaker gaps
+and dropping sub-300 ms turns inside sherpa) and `min_cluster_share` (`0.02`):
+after the interval-join, any cluster winning under 2 % of the attributed speech
+DURATION is dropped and its segments reassigned to the nearest surviving cluster
+(mirroring pyannote's production `min_cluster_size` reassignment and the 2026
+relative-min-cluster-size result, f ≈ 0.01–0.02). A `min_cluster_segments`
+floor and a `max_speakers` cap exist but are OFF by default (`0` / `None`) — the
+duration-share prune is the primary lever; the segment-count floor would wrongly
+fold a genuine speaker who utters one long, high-share segment. The prune is pure
+post-processing over sherpa's turns (sherpa-onnx's `FastClustering` exposes no
+such knob and returns every cluster it forms). On a 6-min slice of the reported-
+19 meeting the shipped config takes the count 9 → 5; the effect compounds over
+the full recording. See the journal sweep (2026-06-10) for the count-vs-knob
+table and `crates/diarizer/tests/oversplit_eval.rs` for the gated eval harness.
+The clean-fixture accuracy test still gives 2 / 1 (balanced speakers sit well
+above the 2 % floor).
+
 As of **Phase B** the live path is wired into the orchestrator (see
 `components.md` — `orchestrator` "Phase B — live diarization wiring").
 The label is assigned per VAD segment at SegmentEnd on the runner's

@@ -37,12 +37,26 @@
 //! 3. converts the seconds to milliseconds and overlays a `speaker_id` onto each
 //!    ASR `Segment` by **max-overlap interval-join** over `[start_ms, end_ms]`
 //!    (no overlap → `None`),
-//! 4. relabels the chosen `i32` cluster ids to first-seen-order `"A"`, `"B"`, …
-//!    and returns the distinct-label count.
+//! 4. applies a **post-cluster prune** (and optional cap) — drops clusters that
+//!    win a negligible share of the attributed speech and reassigns their
+//!    segments to the nearest surviving cluster (issue #63) — then
+//! 5. relabels the surviving `i32` cluster ids to first-seen-order `"A"`, `"B"`,
+//!    … and returns the distinct-label count.
 //!
-//! The interval-join and the first-seen relabel are pure functions
-//! ([`overlay_speakers`]) covered by the default (no-model) test suite; the
-//! sherpa `compute` call is exercised by the env-var-gated accuracy test.
+//! The over-split fix (issue #63, 2026-06-10): on long, acoustically-varied
+//! recordings (room coloration + system-audio loopback + a podcast over a
+//! loudspeaker) one speaker's embeddings drift past the single distance
+//! `cluster_threshold`, minting extra clusters; the user saw 19 / 29 speakers
+//! where the truth was a handful. A distance threshold alone cannot tell
+//! "same speaker, drifted" from "different speaker", so the robust lever is the
+//! duration-share prune in [`overlay_speakers`] (plus sherpa's temporal
+//! smoothing, now enabled). See [`DiarizerConfig`] for the knobs and the journal
+//! sweep (2026-06-10) for the count-vs-knob trend on the two real meetings.
+//!
+//! The interval-join, the prune/cap, and the first-seen relabel are pure
+//! functions ([`overlay_speakers`]) covered by the default (no-model) test
+//! suite; the sherpa `compute` call is exercised by the env-var-gated accuracy
+//! test (`tests/accuracy.rs`) and the count-vs-knob eval (`tests/oversplit_eval.rs`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -65,12 +79,52 @@ pub use online::{OnlineDiarizer, OnlineDiarizerConfig};
 /// threshold mode) because the speaker count is unknown at record time;
 /// `num_clusters = Some(n)` is available for callers that genuinely know the
 /// count (e.g. fixed-count tests).
+///
+/// On top of sherpa's clustering, two post-cluster guards run in
+/// [`overlay_speakers`] against the segment→cluster assignment (the only layer
+/// that sees per-cluster speech share):
+/// - a **min-cluster prune** drops clusters that win a negligible share of the
+///   attributed speech (or too few segments) and reassigns their segments to the
+///   nearest surviving cluster, and
+/// - an optional **max-speaker cap** collapses to the N largest clusters by
+///   speech mass when more than `max_speakers` survive.
+///
+/// Both are pure post-processing over the sherpa turns; sherpa-onnx exposes no
+/// such knob (its `FastClustering` returns every cluster it forms). They are the
+/// robust lever against the long-recording over-split (issue #63): a single
+/// distance `cluster_threshold` cannot tell "same speaker, embedding drifted"
+/// from "different speaker", but a tiny-share cluster is almost always the
+/// former. See `architecture/cross-cutting.md` — "Live vs. offline diarization".
 #[derive(Debug, Clone)]
 pub struct DiarizerConfig {
     /// Fixed speaker count, when known. `None` → use `cluster_threshold`.
     pub num_clusters: Option<u32>,
     /// Agglomerative-clustering distance threshold when the count is unknown.
     pub cluster_threshold: f32,
+    /// Drop turns shorter than this (seconds) inside sherpa before they reach the
+    /// overlay; `0.0` disables. Smooths brief embedding excursions that would
+    /// otherwise seed a spurious turn. Maps to sherpa `min_duration_on`.
+    pub min_duration_on: f32,
+    /// Merge adjacent same-speaker turns separated by a gap shorter than this
+    /// (seconds) inside sherpa; `0.0` disables. The single most direct lever
+    /// against one speaker fragmenting into many turns. Maps to sherpa
+    /// `min_duration_off`.
+    pub min_duration_off: f32,
+    /// Post-cluster prune: a cluster whose share of total attributed speech
+    /// DURATION is below this fraction (`[0.0, 1.0]`) is dropped and its segments
+    /// reassigned to the nearest surviving cluster. `0.0` disables the share
+    /// prune. Duration-weighted (NOT a raw segment count) so many short segments
+    /// of one true speaker do not out-vote a few long ones.
+    pub min_cluster_share: f32,
+    /// Post-cluster prune: a cluster winning fewer than this many segments is
+    /// dropped and its segments reassigned to the nearest surviving cluster.
+    /// `0` disables the segment-count prune. Complements `min_cluster_share`
+    /// (either condition prunes a cluster).
+    pub min_cluster_segments: usize,
+    /// Optional hard ceiling on the surviving speaker count. After the prune, if
+    /// more than this many clusters remain, keep the N largest by speech mass and
+    /// reassign the rest to their nearest survivor. `None` → uncapped.
+    pub max_speakers: Option<usize>,
 }
 
 impl Default for DiarizerConfig {
@@ -84,6 +138,33 @@ impl Default for DiarizerConfig {
             // the old 0.5 (with the Mandarin model) the same recording
             // over-split into 3-4 speakers. Higher => fewer speakers.
             cluster_threshold: 0.75,
+            // Temporal smoothing inside sherpa (issue #63). sherpa's own example
+            // ships 0.3 / 0.5; both were previously pinned to 0.0 (disabled),
+            // which let every brief embedding excursion on long, acoustically-
+            // varied audio become its own turn/cluster. `min_duration_off` (0.5)
+            // bridges short intra-speaker pauses; `min_duration_on` (0.3) drops
+            // sub-300 ms turns.
+            min_duration_on: 0.3,
+            min_duration_off: 0.5,
+            // Post-cluster prune (issue #63). A cluster winning < 2% of the
+            // attributed speech duration is treated as a drifted-embedding
+            // artefact and folded into the nearest surviving cluster. This mirrors
+            // pyannote's production `min_cluster_size` reassignment and the 2026
+            // relative-min-cluster-size result (f ≈ 0.01–0.02 of total). On the
+            // two real over-split meetings this is what collapses the reported
+            // 19 / 29 down to a handful (see the journal sweep, 2026-06-10).
+            min_cluster_share: 0.02,
+            // The segment-count prune is OFF by default. It is an independent
+            // axis (a cluster below it is pruned regardless of share), so a
+            // genuine speaker who utters a single long, high-share segment would
+            // be wrongly folded away. The duration-share prune above is the
+            // robust primary lever; the count floor stays available for the eval
+            // / callers that want it.
+            min_cluster_segments: 0,
+            // No hard cap by default — the share prune is the primary lever and a
+            // floor-free cap would only mask a still-misbehaving prune. Callers
+            // that need a guaranteed ceiling set this explicitly.
+            max_speakers: None,
         }
     }
 }
@@ -179,11 +260,13 @@ impl SherpaDiarizer {
 ///
 /// `num_clusters = Some(n)` → exact-cluster mode (`n` clusters). `None` →
 /// `num_clusters = Some(-1)`, sherpa's "use threshold instead" sentinel (Spike
-/// 4), with the agglomerative `cluster_threshold`. `min_duration_*` keep
-/// sherpa's defaults. Production (both the on-stop and re-diarize passes) builds
-/// the diarizer with [`DiarizerConfig::default`] → threshold mode, since the
-/// speaker count is unknown at record time; the conservative `cluster_threshold`
-/// is what guards against over-splitting one speaker.
+/// 4), with the agglomerative `cluster_threshold`. `min_duration_on` /
+/// `min_duration_off` forward the config's temporal smoothing (issue #63 —
+/// previously both pinned to `0.0`/disabled). Production (both the on-stop and
+/// re-diarize passes) builds the diarizer with [`DiarizerConfig::default`] →
+/// threshold mode, since the speaker count is unknown at record time; the
+/// conservative `cluster_threshold`, the smoothing, and the post-cluster prune
+/// in [`overlay_speakers`] together guard against over-splitting one speaker.
 fn sherpa_diarize_config(config: &DiarizerConfig) -> DiarizeConfig {
     DiarizeConfig {
         num_clusters: match config.num_clusters {
@@ -192,8 +275,8 @@ fn sherpa_diarize_config(config: &DiarizerConfig) -> DiarizeConfig {
             None => Some(-1),
         },
         threshold: Some(config.cluster_threshold),
-        min_duration_on: Some(0.0),
-        min_duration_off: Some(0.0),
+        min_duration_on: Some(config.min_duration_on),
+        min_duration_off: Some(config.min_duration_off),
         provider: None,
         debug: false,
     }
@@ -225,34 +308,76 @@ impl Diarizer for SherpaDiarizer {
                 .map_err(|e| Error::Inference(format!("sherpa Diarize::compute failed: {e:?}")))?
         };
 
-        Ok(overlay_speakers(&turns, segments))
+        Ok(overlay_speakers(&turns, segments, &self.config))
     }
 }
 
 /// Overlay first-seen-relabelled speaker ids onto `segments` by max-overlap
-/// interval-join, returning the distinct-label count.
+/// interval-join, applying the `config`'s post-cluster prune + cap, and return
+/// the distinct-label count.
 ///
-/// For each ASR `segment`, the sherpa turn (in **seconds**) with the greatest
-/// temporal overlap over `[start_ms, end_ms]` wins; its `i32` cluster id is
-/// recorded. Segments with no overlapping turn get `speaker_id = None`. Ties
-/// (equal overlap) resolve to the **earlier** turn in `turns` order — sherpa
-/// sorts turns by start time, so the earlier turn is the lower start, a stable,
-/// deterministic tie-break. The chosen `i32` ids are then relabelled to
-/// first-seen order `"A"`, `"B"`, … (first-seen across `segments` in slice
-/// order), and each segment's `speaker_id` is set. The return value is the
-/// number of distinct labels actually assigned (segments left `None` do not
+/// For each ASR `segment`, the sherpa cluster (turns are in **seconds**) with
+/// the greatest total temporal overlap over `[start_ms, end_ms)` wins; its `i32`
+/// cluster id is recorded. Segments with no overlapping turn get
+/// `speaker_id = None`. Ties (equal overlap) resolve to the **lower** cluster id
+/// (deterministic; sherpa numbers clusters by first appearance, so the lower id
+/// is the earlier-seen speaker — the same orientation as the previous earlier-
+/// turn tie-break, but now over per-cluster totals).
+///
+/// Then, when the `config` enables it (issue #63):
+/// 1. **Prune** — tally each cluster's share of total attributed speech DURATION
+///    and its segment count; a cluster below `min_cluster_share` of the duration
+///    OR below `min_cluster_segments` is marked spurious. Each segment whose
+///    winner is spurious is reassigned to its next-best *surviving* cluster
+///    (greatest overlap among survivors), or `None` if it overlaps no survivor.
+/// 2. **Cap** — if more clusters still survive than `max_speakers`, keep the N
+///    largest by speech duration and reassign the rest the same way.
+///
+/// The surviving cluster ids are then relabelled to first-seen order `"A"`,
+/// `"B"`, … across `segments` in slice order. The return value is the number of
+/// distinct surviving labels actually assigned (segments left `None` do not
 /// count).
 ///
 /// Pure (no FFI, no I/O) so the default test suite covers it without a model.
-pub fn overlay_speakers(turns: &[SherpaSegment], segments: &mut [Segment]) -> u32 {
-    // First pass: pick the max-overlap sherpa cluster id (if any) per segment.
-    let chosen: Vec<Option<i32>> = segments
+pub fn overlay_speakers(
+    turns: &[SherpaSegment],
+    segments: &mut [Segment],
+    config: &DiarizerConfig,
+) -> u32 {
+    // Per-segment ranked overlaps: (cluster_id, overlap_ms) sorted descending by
+    // overlap, lower cluster id breaking ties. Lets the prune/cap reassign a
+    // segment to its next-best SURVIVING cluster without re-touching the turns.
+    let ranked: Vec<Vec<(i32, u64)>> = segments
         .iter()
-        .map(|seg| max_overlap_speaker(turns, seg.start_ms, seg.end_ms))
+        .map(|seg| ranked_overlaps(turns, seg.start_ms, seg.end_ms))
         .collect();
 
-    // Build first-seen-order label map over the chosen cluster ids, in segment
-    // slice order (so labels read top-to-bottom of the transcript).
+    // Initial winner per segment: the top-ranked cluster (or None).
+    let mut chosen: Vec<Option<i32>> = ranked
+        .iter()
+        .map(|r| r.first().map(|&(id, _)| id))
+        .collect();
+
+    // Determine the surviving set after prune + cap, then reassign pruned
+    // segments to their next-best survivor.
+    let survivors = surviving_clusters(&chosen, &ranked, config);
+    if let Some(survivors) = survivors {
+        for (slot, r) in chosen.iter_mut().zip(ranked.iter()) {
+            let drop = match *slot {
+                Some(id) => !survivors.contains(&id),
+                None => false,
+            };
+            if drop {
+                *slot = r
+                    .iter()
+                    .find(|(id, _)| survivors.contains(id))
+                    .map(|&(id, _)| id);
+            }
+        }
+    }
+
+    // Build first-seen-order label map over the (post-prune) chosen cluster ids,
+    // in segment slice order (so labels read top-to-bottom of the transcript).
     let mut seen: Vec<i32> = Vec::new();
     for id in chosen.iter().flatten() {
         if !seen.contains(id) {
@@ -260,7 +385,7 @@ pub fn overlay_speakers(turns: &[SherpaSegment], segments: &mut [Segment]) -> u3
         }
     }
 
-    // Second pass: stamp the relabelled id onto each segment.
+    // Stamp the relabelled id onto each segment.
     for (seg, id) in segments.iter_mut().zip(chosen.iter()) {
         seg.speaker_id = id.map(|cluster| {
             let idx = seen
@@ -274,16 +399,109 @@ pub fn overlay_speakers(turns: &[SherpaSegment], segments: &mut [Segment]) -> u3
     seen.len() as u32
 }
 
-/// Pick the sherpa cluster id with the greatest overlap over the half-open
-/// millisecond window `[start_ms, end_ms)`, or `None` when nothing overlaps.
+/// Decide the surviving cluster set after the `config`'s prune + cap, or `None`
+/// when neither is active (no reassignment needed — every winner survives).
+///
+/// Spurious = a winning cluster below `min_cluster_share` of the total attributed
+/// speech DURATION, OR below `min_cluster_segments` won. The cap then keeps only
+/// the `max_speakers` largest survivors by duration. A pure helper over the
+/// initial `chosen` winners; returns the survivor ids (unordered).
+fn surviving_clusters(
+    chosen: &[Option<i32>],
+    ranked: &[Vec<(i32, u64)>],
+    config: &DiarizerConfig,
+) -> Option<Vec<i32>> {
+    let prune_active = config.min_cluster_share > 0.0 || config.min_cluster_segments > 0;
+    let cap_active = config.max_speakers.is_some();
+    if !prune_active && !cap_active {
+        return None;
+    }
+
+    // Tally per-cluster duration mass + segment count over the initial winners.
+    // Duration = the winning segment's own overlap with its cluster (the speech
+    // actually attributed to that cluster), so many tiny segments cannot out-mass
+    // a few long ones.
+    let mut ids: Vec<i32> = Vec::new();
+    let mut dur: Vec<u64> = Vec::new();
+    let mut cnt: Vec<usize> = Vec::new();
+    for (slot, r) in chosen.iter().zip(ranked.iter()) {
+        let Some(id) = *slot else { continue };
+        // The winner's overlap is the head of its ranked list.
+        let overlap = r
+            .iter()
+            .find(|(cid, _)| *cid == id)
+            .map(|&(_, ov)| ov)
+            .unwrap_or(0);
+        match ids.iter().position(|x| *x == id) {
+            Some(i) => {
+                dur[i] += overlap;
+                cnt[i] += 1;
+            }
+            None => {
+                ids.push(id);
+                dur.push(overlap);
+                cnt.push(1);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let total_dur: u64 = dur.iter().sum();
+
+    // 1. Prune by share + segment count.
+    let mut survivors: Vec<i32> = Vec::new();
+    for (i, &id) in ids.iter().enumerate() {
+        let share = if total_dur > 0 {
+            dur[i] as f32 / total_dur as f32
+        } else {
+            0.0
+        };
+        let below_share = config.min_cluster_share > 0.0 && share < config.min_cluster_share;
+        let below_count =
+            config.min_cluster_segments > 0 && cnt[i] < config.min_cluster_segments;
+        if !(below_share || below_count) {
+            survivors.push(id);
+        }
+    }
+
+    // Edge case: the prune removed everything (e.g. one big cluster but a
+    // share floor > 1.0, or every cluster below the count floor). Keep the
+    // single largest-duration cluster so we never return zero speakers for a
+    // non-empty transcript.
+    if survivors.is_empty() {
+        if let Some((i, _)) = dur.iter().enumerate().max_by_key(|(_, d)| **d) {
+            survivors.push(ids[i]);
+        }
+    }
+
+    // 2. Cap: keep the `max_speakers` largest survivors by duration.
+    if let Some(max) = config.max_speakers {
+        if survivors.len() > max {
+            // Sort survivors by duration desc, lower id breaking ties, keep N.
+            survivors.sort_by(|a, b| {
+                let da = dur[ids.iter().position(|x| x == a).unwrap()];
+                let db = dur[ids.iter().position(|x| x == b).unwrap()];
+                db.cmp(&da).then(a.cmp(b))
+            });
+            survivors.truncate(max);
+        }
+    }
+
+    Some(survivors)
+}
+
+/// Per-cluster total overlap of `turns` over the half-open millisecond window
+/// `[start_ms, end_ms)`, ranked descending by overlap (lower cluster id breaks a
+/// tie). Empty when nothing overlaps.
 ///
 /// sherpa turns carry start/end in **seconds**; they are converted to
-/// milliseconds for the overlap computation. A zero-overlap segment (e.g. a
-/// segment falling entirely in a silence gap the diarizer dropped) yields
-/// `None`. On an exact overlap tie the earlier turn in `turns` order wins
-/// (deterministic; sherpa pre-sorts turns by start time).
-fn max_overlap_speaker(turns: &[SherpaSegment], start_ms: u64, end_ms: u64) -> Option<i32> {
-    let mut best: Option<(i32, u64)> = None;
+/// milliseconds for the overlap computation. Overlap is summed PER CLUSTER (a
+/// cluster may own several turns touching one segment), which is what the prune
+/// reassignment needs to pick a segment's next-best surviving speaker.
+fn ranked_overlaps(turns: &[SherpaSegment], start_ms: u64, end_ms: u64) -> Vec<(i32, u64)> {
+    let mut totals: Vec<(i32, u64)> = Vec::new();
     for turn in turns {
         let turn_start_ms = seconds_to_ms(turn.start);
         let turn_end_ms = seconds_to_ms(turn.end);
@@ -291,13 +509,15 @@ fn max_overlap_speaker(turns: &[SherpaSegment], start_ms: u64, end_ms: u64) -> O
         if overlap == 0 {
             continue;
         }
-        match best {
-            // Strict `>` keeps the earlier (already-stored) turn on a tie.
-            Some((_, best_overlap)) if overlap <= best_overlap => {}
-            _ => best = Some((turn.speaker, overlap)),
+        match totals.iter_mut().find(|(id, _)| *id == turn.speaker) {
+            Some((_, acc)) => *acc += overlap,
+            None => totals.push((turn.speaker, overlap)),
         }
     }
-    best.map(|(speaker, _)| speaker)
+    // Descending overlap; lower cluster id wins a tie (deterministic, and the
+    // lower id is the earlier-seen sherpa cluster).
+    totals.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    totals
 }
 
 /// Overlap length in milliseconds of two half-open intervals `[a0, a1)` and
@@ -367,6 +587,21 @@ mod tests {
         }
     }
 
+    /// A config with the prune + cap fully disabled, so the overlay tests
+    /// exercise the raw interval-join / relabel without the post-cluster guards
+    /// (those guards have their own dedicated tests below).
+    fn no_prune() -> DiarizerConfig {
+        DiarizerConfig {
+            num_clusters: None,
+            cluster_threshold: 0.75,
+            min_duration_on: 0.0,
+            min_duration_off: 0.0,
+            min_cluster_share: 0.0,
+            min_cluster_segments: 0,
+            max_speakers: None,
+        }
+    }
+
     #[test]
     fn require_supported_sample_rate_accepts_16khz_rejects_others() {
         // 16 kHz is accepted.
@@ -422,7 +657,7 @@ mod tests {
             seg(2_100, 3_900), // overlaps the 3-turn → B
             seg(4_100, 5_900), // overlaps the 7-turn → A
         ];
-        let count = overlay_speakers(&turns, &mut segs);
+        let count = overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -434,7 +669,7 @@ mod tests {
         let turns = vec![turn(0.0, 1.0, 0)];
         // Segment sits entirely after the only turn → no overlap → None.
         let mut segs = vec![seg(5_000, 6_000)];
-        let count = overlay_speakers(&turns, &mut segs);
+        let count = overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(count, 0);
         assert_eq!(segs[0].speaker_id, None);
     }
@@ -447,31 +682,47 @@ mod tests {
             turn(1.2, 3.0, 1), // 1200..3000 ms : overlaps [1000,2000) by 800 ms
         ];
         let mut segs = vec![seg(1_000, 2_000)];
-        let count = overlay_speakers(&turns, &mut segs);
+        let count = overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(count, 1);
         // Cluster id 1 is the only chosen id → first-seen → "A".
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
     }
 
     #[test]
-    fn overlay_tie_breaks_to_earlier_turn() {
-        // Equal overlap (500 ms each) — the earlier turn in slice order wins.
+    fn overlay_tie_breaks_to_lower_cluster_id() {
+        // Equal per-cluster overlap (500 ms each) — the LOWER cluster id wins
+        // (deterministic; the lower id is the earlier-seen sherpa cluster).
         let turns = vec![
             turn(0.0, 1.5, 9), // overlaps [1000,2000) by 500 ms (1000..1500)
             turn(1.5, 3.0, 4), // overlaps [1000,2000) by 500 ms (1500..2000)
         ];
         let mut segs = vec![seg(1_000, 2_000)];
-        let count = overlay_speakers(&turns, &mut segs);
+        let count = overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(count, 1);
-        // Earlier turn (cluster 9) wins the tie → first-seen → "A".
+        // Cluster 4 (the lower id) wins the tie; as the only chosen id it
+        // first-seen-relabels to "A".
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn ranked_overlaps_sums_per_cluster_and_ranks() {
+        // Cluster 4 owns two turns touching the segment (200 + 300 = 500 ms);
+        // cluster 9 owns one (400 ms). Per-cluster summing makes 4 the winner
+        // even though no single 4-turn beats the 9-turn.
+        let turns = vec![
+            turn(0.0, 1.2, 4), // [1000,2000) overlap 200 ms (1000..1200)
+            turn(1.2, 1.6, 9), // overlap 400 ms (1200..1600)
+            turn(1.6, 1.9, 4), // overlap 300 ms (1600..1900)
+        ];
+        let ranked = ranked_overlaps(&turns, 1_000, 2_000);
+        assert_eq!(ranked, vec![(4, 500), (9, 400)]);
     }
 
     #[test]
     fn overlay_single_speaker_one_label() {
         let turns = vec![turn(0.0, 10.0, 2)];
         let mut segs = vec![seg(0, 2_000), seg(3_000, 5_000), seg(6_000, 9_000)];
-        let count = overlay_speakers(&turns, &mut segs);
+        let count = overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(count, 1);
         for s in &segs {
             assert_eq!(s.speaker_id.as_deref(), Some("A"));
@@ -494,7 +745,7 @@ mod tests {
             seg(2_500, 3_500), // gap → None
             seg(4_100, 4_900), // C
         ];
-        let count = overlay_speakers(&turns, &mut segs);
+        let count = overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(count, 3);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -506,7 +757,7 @@ mod tests {
     fn overlay_empty_segments_is_zero() {
         let turns = vec![turn(0.0, 1.0, 0)];
         let mut segs: Vec<Segment> = Vec::new();
-        assert_eq!(overlay_speakers(&turns, &mut segs), 0);
+        assert_eq!(overlay_speakers(&turns, &mut segs, &no_prune()), 0);
     }
 
     #[test]
@@ -518,7 +769,154 @@ mod tests {
             speaker_id: Some("Z".to_string()),
             ..seg(5_000, 6_000)
         }];
-        overlay_speakers(&turns, &mut segs);
+        overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(segs[0].speaker_id, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-cluster prune + cap (issue #63). Model-free: synthetic turns drive
+    // the duration-weighted prune and the speech-mass cap directly.
+    // -----------------------------------------------------------------------
+
+    /// A config with the share prune at `share`, the segment-count prune at
+    /// `min_segs`, and the cap at `cap`. Everything else neutral.
+    fn pruned(share: f32, min_segs: usize, cap: Option<usize>) -> DiarizerConfig {
+        DiarizerConfig {
+            min_cluster_share: share,
+            min_cluster_segments: min_segs,
+            max_speakers: cap,
+            ..no_prune()
+        }
+    }
+
+    #[test]
+    fn prune_drops_tiny_share_cluster_and_reassigns() {
+        // Cluster 0 owns ~9.9 s of speech; cluster 1 owns one 100 ms blip
+        // (~1% of the total). With a 2% share floor the blip is pruned and its
+        // segment reassigns to its next-best surviving cluster (0). One speaker
+        // survives.
+        let turns = vec![
+            turn(0.0, 5.0, 0),
+            turn(5.0, 5.1, 1), // tiny spurious turn (100 ms)
+            turn(5.1, 10.0, 0),
+        ];
+        // Segments: long ones on cluster 0, one short segment straddling the
+        // blip whose top overlap is cluster 1 but which also overlaps 0.
+        let mut segs = vec![
+            seg(0, 4_900),
+            seg(5_000, 5_300), // top overlap = cluster 1 (100 ms) vs cluster 0 (200 ms)
+            seg(5_400, 9_900),
+        ];
+        // The straddling segment's winner is cluster 0 (200 ms > 100 ms), so the
+        // blip cluster only ever wins via a turn no segment maxes on — exercise
+        // the share prune with a segment that DOES max on the blip.
+        segs[1] = seg(5_000, 5_150); // overlaps cluster 1 by 100 ms, cluster 0 by 50 ms
+        let count = overlay_speakers(&turns, &mut segs, &pruned(0.02, 0, None));
+        assert_eq!(count, 1, "tiny-share cluster must be pruned away");
+        // The straddling segment reassigned to the surviving cluster 0 → "A".
+        assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
+        for s in &segs {
+            assert_eq!(s.speaker_id.as_deref(), Some("A"));
+        }
+    }
+
+    #[test]
+    fn prune_keeps_genuinely_distinct_speakers() {
+        // Two balanced speakers, each with several segments (so neither trips the
+        // segment-count floor) and each owning ~half the speech (so neither trips
+        // the share floor). Both must survive — the prune must not collapse
+        // genuine speakers.
+        let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 10.0, 1)];
+        let mut segs = vec![
+            seg(0, 2_400),
+            seg(2_500, 4_900),
+            seg(5_100, 7_400),
+            seg(7_500, 9_900),
+        ];
+        let count = overlay_speakers(&turns, &mut segs, &pruned(0.02, 2, None));
+        assert_eq!(count, 2);
+        assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
+        assert_eq!(segs[2].speaker_id.as_deref(), Some("B"));
+        assert_eq!(segs[3].speaker_id.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn prune_by_segment_count_drops_single_segment_cluster() {
+        // Cluster 1 wins exactly one segment; cluster 0 wins three. With
+        // min_cluster_segments = 2 (and the share floor off), cluster 1 is
+        // pruned and its one segment reassigns to its next-best surviving
+        // cluster (0), which it also overlaps.
+        let turns = vec![
+            turn(0.0, 3.0, 0),
+            turn(2.9, 3.6, 1), // cluster-1 turn, mostly in the 3.0..3.5 gap
+            turn(3.5, 8.0, 0),
+        ];
+        let mut segs = vec![
+            seg(0, 1_000),
+            seg(1_000, 2_000),
+            // Overlaps cluster 1 by 650 ms (2900..3550) and cluster 0 by 150 ms
+            // (2900..3000 + 3500..3550); cluster 1 wins initially, then is pruned
+            // and the segment reassigns to cluster 0.
+            seg(2_900, 3_550),
+            seg(4_100, 5_000),
+        ];
+        let count = overlay_speakers(&turns, &mut segs, &pruned(0.0, 2, None));
+        assert_eq!(count, 1, "single-segment cluster pruned by the count floor");
+        assert_eq!(segs[2].speaker_id.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn cap_collapses_to_largest_speakers() {
+        // Three clusters, all above the share floor; cap at 2 keeps the two
+        // largest by duration (0: 6 s, 1: 4 s) and folds cluster 2 (2 s) into its
+        // nearest survivor.
+        let turns = vec![
+            turn(0.0, 6.0, 0),
+            turn(6.0, 10.0, 1),
+            turn(10.0, 12.0, 2), // smallest → capped out
+        ];
+        let mut segs = vec![
+            seg(0, 5_900),
+            seg(6_100, 9_900),
+            seg(10_100, 11_900), // overlaps only cluster 2; after cap, reassigns
+        ];
+        let count = overlay_speakers(&turns, &mut segs, &pruned(0.0, 0, Some(2)));
+        assert_eq!(count, 2, "cap must keep exactly the two largest speakers");
+        // The capped-out segment had no overlap with a survivor → None (no
+        // surviving turn covers [10100,11900)).
+        assert_eq!(segs[2].speaker_id, None);
+    }
+
+    #[test]
+    fn prune_never_returns_zero_for_nonempty_assignment() {
+        // A single cluster owns everything but the share floor is impossibly
+        // high (1.0 would prune the lone 100%-share cluster on the strict `<`?
+        // No — 1.0 is not < 1.0). Use > 1.0 to force the all-pruned branch and
+        // confirm the largest cluster is retained.
+        let turns = vec![turn(0.0, 5.0, 0)];
+        let mut segs = vec![seg(0, 4_900)];
+        let count = overlay_speakers(&turns, &mut segs, &pruned(2.0, 0, None));
+        assert_eq!(count, 1, "the largest cluster is retained when all prune");
+        assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn default_config_prunes_a_long_recording_oversplit() {
+        // Simulates the real over-split: one dominant speaker (cluster 0, ~30 s
+        // of speech) plus a scatter of tiny drifted-embedding clusters, each a
+        // single short turn. DiarizerConfig::default() (share 0.02, min segs 2)
+        // must fold the scatter back into the dominant speaker.
+        let mut turns = vec![turn(0.0, 30.0, 0)];
+        let mut segs = vec![seg(0, 29_900)];
+        // 8 tiny spurious clusters, each a 200 ms turn + a segment landing on it.
+        for k in 0..8u64 {
+            let t = 30.0 + k as f32 * 1.0;
+            turns.push(turn(t, t + 0.2, (k + 1) as i32));
+            let start = (t * 1000.0) as u64;
+            segs.push(seg(start, start + 200));
+        }
+        let count = overlay_speakers(&turns, &mut segs, &DiarizerConfig::default());
+        assert_eq!(count, 1, "default prune collapses the tiny-cluster scatter");
     }
 }

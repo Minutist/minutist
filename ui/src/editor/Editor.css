@@ -82,13 +82,12 @@
   color: var(--ink);
   font-variation-settings: "opsz" 16;
   box-sizing: border-box;
-  /* Left-aligned writing column: a narrow timestamp gutter, then the text. The
-     reading measure caps the line length on a wide pane (the binder margin to
-     the right stays blank ruled paper). One leading of top padding so the first
-     text line lands on the grid the sheet's ruled lines share. */
-  max-width: calc(
-    var(--notes-gutter) + var(--notes-text-pad) + var(--reading-measure) + 2.25rem
-  );
+  /* Left-aligned writing column: a narrow timestamp gutter, then the text,
+     filling the pane width. The text soft-wraps at the pane's right edge (the
+     2.25rem right padding) — there is deliberately NO reading-measure cap here:
+     a measure suits the read-only summary sheet (where it aids reading), but a
+     note-taking pane should use the width it is given. One leading of top
+     padding so the first text line lands on the grid the ruled lines share. */
   padding: var(--notes-leading) 2.25rem 3rem
     calc(var(--notes-gutter) + var(--notes-text-pad));
 }

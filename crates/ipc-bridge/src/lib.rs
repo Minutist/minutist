@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (28 total)
+//! ## Commands (29 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -21,6 +21,7 @@
 //! | `ensure_model` | `()` | 2 |
 //! | `save_notes` | `()` | 3 |
 //! | `load_notes` | `Option<NotesDocument>` | 3 |
+//! | `save_note_image` | `String` (portable asset ref) | notes images |
 //! | `list_meetings` | `Vec<MeetingListEntry>` | 4 |
 //! | `open_meeting` | `MeetingState` | 4 |
 //! | `rename_meeting` | `()` | 4 |
@@ -335,6 +336,109 @@ pub fn open_meeting_index(
 }
 
 // ---------------------------------------------------------------------------
+// Note-image asset serving — the `meetingasset:` URI scheme resolver
+// ---------------------------------------------------------------------------
+
+/// The custom URI scheme name used to serve note image assets to the webview.
+///
+/// `app-main` registers a protocol handler under this name on the Tauri
+/// `Builder`; the frontend turns a stored portable filename into a working URL
+/// via `convertFileSrc(<meeting_id>/<filename>, MEETING_ASSET_SCHEME)`. Tauri
+/// serves it at `meetingasset://localhost/<path>` (macOS/Linux) or
+/// `http://meetingasset.localhost/<path>` (Windows) — both deliver the SAME
+/// request path to the handler, so the platform difference is invisible here.
+pub const MEETING_ASSET_SCHEME: &str = "meetingasset";
+
+/// A resolved note-image asset: its bytes plus the MIME content type to serve.
+pub struct ResolvedNoteAsset {
+    /// The asset file bytes.
+    pub bytes: Vec<u8>,
+    /// The `Content-Type` for the response, inferred from the extension.
+    pub content_type: &'static str,
+}
+
+/// Resolve a `meetingasset:` request path to the asset bytes + content type.
+///
+/// The request path is `/<meeting_id>/<filename>` (URL path component, as
+/// produced by `convertFileSrc(<meeting_id>/<filename>, MEETING_ASSET_SCHEME)`).
+/// This:
+///
+/// 1. Splits the path into exactly `meeting_id` + `filename` (rejecting any
+///    extra segments — no nesting),
+/// 2. Parses `meeting_id` as a UUID (rejecting anything else),
+/// 3. Reads the bytes via `persistence::read_note_asset`, which applies its own
+///    path-traversal guard on `filename` (separator / `..` rejected),
+/// 4. Infers the `Content-Type` from the filename extension.
+///
+/// Lives here (not in `app-main`) so the `persistence` dependency edge stays
+/// inside `ipc-bridge` (the dependency table grants `ipc-bridge → persistence`,
+/// NOT `app-main → persistence`). `app-main` calls this from its registered
+/// protocol handler and only handles the HTTP-response shaping.
+///
+/// Returns `AppError::InvalidInput` for a malformed path / id, and surfaces the
+/// `persistence` error (traversal rejection → `InvalidInput`; missing file →
+/// `Io`) otherwise. The handler maps any error to a 404/empty response, so no
+/// detail leaks to the webview.
+pub fn resolve_note_asset(
+    meetings_dir: &std::path::Path,
+    request_path: &str,
+) -> Result<ResolvedNoteAsset, meeting_app_common::AppError> {
+    use meeting_app_common::{AppError, MeetingId};
+
+    // Strip the leading '/', then split into exactly two non-empty segments.
+    let trimmed = request_path.trim_start_matches('/');
+    let mut parts = trimmed.splitn(2, '/');
+    let (id_str, filename) = match (parts.next(), parts.next()) {
+        (Some(id), Some(file)) if !id.is_empty() && !file.is_empty() => (id, file),
+        _ => {
+            return Err(AppError::InvalidInput {
+                context: format!("malformed meetingasset path: {request_path:?}"),
+            })
+        }
+    };
+    // `filename` must be a single segment — no further '/'.
+    if filename.contains('/') {
+        return Err(AppError::InvalidInput {
+            context: format!("meetingasset path has nested segments: {request_path:?}"),
+        });
+    }
+
+    let uuid = uuid::Uuid::parse_str(id_str).map_err(|_| AppError::InvalidInput {
+        context: format!("meetingasset path has a non-UUID meeting id: {id_str:?}"),
+    })?;
+    let meeting_id = MeetingId(uuid);
+
+    // `read_note_asset` applies the path-traversal guard on `filename`.
+    let bytes = persistence::read_note_asset(meetings_dir, meeting_id, filename)?;
+    let content_type = content_type_for(filename);
+
+    Ok(ResolvedNoteAsset {
+        bytes,
+        content_type,
+    })
+}
+
+/// Infer the image `Content-Type` from a filename extension.
+///
+/// Mirrors the `ipc-bridge` `save_note_image` allowlist; an unknown extension
+/// falls back to `application/octet-stream` (the persistence layer only ever
+/// writes allow-listed extensions, so this is a defensive default).
+fn content_type_for(filename: &str) -> &'static str {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // bindings_builder — shared builder for app-main and the export helper
 // ---------------------------------------------------------------------------
 
@@ -377,6 +481,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::ensure_model,
             commands::save_notes,
             commands::load_notes,
+            commands::save_note_image,
             commands::list_meetings,
             commands::open_meeting,
             commands::rename_meeting,
@@ -405,6 +510,67 @@ mod tests {
     use super::*;
     use tauri_specta::Event;
 
+    // -----------------------------------------------------------------------
+    // Note-image asset resolver (`meetingasset:` scheme). No Tauri runtime
+    // needed — drives `resolve_note_asset` against a tempdir meetings root.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_note_asset_serves_saved_image_with_content_type() {
+        use meeting_app_common::MeetingId;
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+        persistence::MeetingFolder::create(root, id).expect("folder");
+
+        let bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let filename = persistence::save_note_asset(root, id, &bytes, "png").expect("save");
+
+        // Path as `convertFileSrc(<id>/<filename>)` yields it (leading slash).
+        let path = format!("/{}/{}", id.0, filename);
+        let resolved = resolve_note_asset(root, &path).expect("resolve");
+        assert_eq!(resolved.bytes, bytes);
+        assert_eq!(resolved.content_type, "image/png");
+    }
+
+    #[test]
+    fn resolve_note_asset_rejects_malformed_and_traversal_paths() {
+        use meeting_app_common::{AppError, MeetingId};
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+        persistence::MeetingFolder::create(root, id).expect("folder");
+
+        // Malformed (not <uuid>/<file>) → InvalidInput.
+        for bad in ["", "/", "/only-one-segment", "/not-a-uuid/file.png"] {
+            assert!(
+                matches!(resolve_note_asset(root, bad), Err(AppError::InvalidInput { .. })),
+                "path {bad:?} should be rejected as InvalidInput"
+            );
+        }
+
+        // Valid UUID but traversal filename → rejected by persistence guard
+        // (InvalidInput), and a nested path → rejected here.
+        let traversal = format!("/{}/../../etc/passwd", id.0);
+        assert!(resolve_note_asset(root, &traversal).is_err());
+        let nested = format!("/{}/sub/dir.png", id.0);
+        assert!(
+            matches!(resolve_note_asset(root, &nested), Err(AppError::InvalidInput { .. })),
+            "nested path should be rejected"
+        );
+    }
+
+    #[test]
+    fn content_type_for_maps_known_extensions() {
+        assert_eq!(content_type_for("a.png"), "image/png");
+        assert_eq!(content_type_for("a.jpg"), "image/jpeg");
+        assert_eq!(content_type_for("a.jpeg"), "image/jpeg");
+        assert_eq!(content_type_for("a.gif"), "image/gif");
+        assert_eq!(content_type_for("a.webp"), "image/webp");
+        assert_eq!(content_type_for("a.bin"), "application/octet-stream");
+        assert_eq!(content_type_for("noext"), "application/octet-stream");
+    }
+
     /// Verify that `bindings_builder()` produces a builder with the full command
     /// surface registered, by inspecting the TypeScript export.
     ///
@@ -414,12 +580,14 @@ mod tests {
     /// as a string literal in the `invoke` call.
     ///
     /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
-    /// → P10 26 → P9 review-fix 27 (P5 removes `re_summarise` and adds
-    /// `summarise_meeting` / `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6
-    /// adds `rediarize_meeting`: 20 + 1 = 21; P9 adds `send_chat_message` /
-    /// `get_chat_session` / `list_chat_sessions` / `delete_chat_session`: 21 + 4
-    /// = 25; P10 adds `get_mcp_server_info`: 25 + 1 = 26; the P9 chat review-fix
-    /// adds `cancel_chat_turn` (P1 — turn cancellation): 26 + 1 = 27).
+    /// → P10 26 → P9 review-fix 27 → +prewarm_asr 28 → +save_note_image 29 (P5
+    /// removes `re_summarise` and adds `summarise_meeting` / `get_summary` /
+    /// `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`: 20 + 1 = 21;
+    /// P9 adds `send_chat_message` / `get_chat_session` / `list_chat_sessions` /
+    /// `delete_chat_session`: 21 + 4 = 25; P10 adds `get_mcp_server_info`: 25 + 1
+    /// = 26; the P9 chat review-fix adds `cancel_chat_turn` (P1 — turn
+    /// cancellation): 26 + 1 = 27; `prewarm_asr` (live-test UX T2): 27 + 1 = 28;
+    /// `save_note_image` (note image paste/drop): 28 + 1 = 29).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -448,6 +616,7 @@ mod tests {
             "ensure_model",
             "save_notes",
             "load_notes",
+            "save_note_image",
             "list_meetings",
             "open_meeting",
             "rename_meeting",
@@ -467,8 +636,8 @@ mod tests {
 
         assert_eq!(
             expected.len(),
-            28,
-            "command ledger must be 28 (27 + prewarm_asr, live-test UX T2)"
+            29,
+            "command ledger must be 29 (28 + save_note_image, note image paste/drop)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

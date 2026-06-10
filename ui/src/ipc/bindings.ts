@@ -212,6 +212,32 @@ async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDocument | null, Ipc
 }
 },
 /**
+ * Persist a pasted/dropped note image to the meeting's `assets/` directory and
+ * return its **portable** reference (the bare `<contenthash>.<ext>` filename)
+ * for the frontend to store into `notes.json`.
+ * 
+ * Routes **directly** to `persistence::save_note_asset` against
+ * `IpcState::meetings_dir` — note assets are independent of the live recording
+ * pipeline (see `architecture/components.md`, `persistence` "Note image
+ * assets"), so the orchestrator is not involved. The blocking filesystem write
+ * runs on `spawn_blocking` per the threading model.
+ * 
+ * `ext` is validated against [`ALLOWED_IMAGE_EXTS`] (case-insensitively); a
+ * non-image extension is rejected as `AppError::InvalidInput`. The returned
+ * filename is portable: it names only the file, not a path or a URL, so the
+ * meeting folder (with `assets/`) can be copied to another machine and the
+ * notes still resolve. The webview turns the filename into a working
+ * `meetingasset:` URL at render time via `convertFileSrc`.
+ */
+async saveNoteImage(meetingId: MeetingId, bytes: number[], ext: string) : Promise<Result<string, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_note_image", { meetingId, bytes, ext }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * List all meetings for the meeting-list view (FR-33), most-recent first.
  * 
  * Reads straight from the libsql `index.db` ([`MeetingIndex::list_meetings`])

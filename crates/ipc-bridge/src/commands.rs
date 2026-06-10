@@ -582,6 +582,69 @@ fn load_notes_inner(
     }
 }
 
+/// The image extensions a pasted/dropped note image may carry.
+///
+/// Lower-cased, no leading dot. The frontend derives `ext` from the clipboard
+/// `File`'s MIME type / name; this allowlist is the authoritative gate so an
+/// arbitrary extension can never reach the filesystem. The matching set is
+/// mirrored by the protocol handler's content-type map in `app-main`.
+const ALLOWED_IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/// Persist a pasted/dropped note image to the meeting's `assets/` directory and
+/// return its **portable** reference (the bare `<contenthash>.<ext>` filename)
+/// for the frontend to store into `notes.json`.
+///
+/// Routes **directly** to `persistence::save_note_asset` against
+/// `IpcState::meetings_dir` — note assets are independent of the live recording
+/// pipeline (see `architecture/components.md`, `persistence` "Note image
+/// assets"), so the orchestrator is not involved. The blocking filesystem write
+/// runs on `spawn_blocking` per the threading model.
+///
+/// `ext` is validated against [`ALLOWED_IMAGE_EXTS`] (case-insensitively); a
+/// non-image extension is rejected as `AppError::InvalidInput`. The returned
+/// filename is portable: it names only the file, not a path or a URL, so the
+/// meeting folder (with `assets/`) can be copied to another machine and the
+/// notes still resolve. The webview turns the filename into a working
+/// `meetingasset:` URL at render time via `convertFileSrc`.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_note_image(
+    meeting_id: MeetingId,
+    bytes: Vec<u8>,
+    ext: String,
+    state: State<'_, IpcState>,
+) -> Result<String, IpcError> {
+    let ext = normalise_image_ext(&ext)?;
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        persistence::save_note_asset(&meetings_dir, meeting_id, &bytes, &ext)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("save_note_image task join failed: {e}"),
+    })?
+    .map_err(IpcError::from)
+}
+
+/// Validate + normalise a note-image extension to a lower-cased, dot-less form
+/// drawn from the [`ALLOWED_IMAGE_EXTS`] allowlist.
+///
+/// Pure + unit-tested so the allowlist gate is verified without a Tauri runtime.
+/// Strips a single leading dot, lower-cases, and rejects anything not on the
+/// list as `AppError::InvalidInput`.
+fn normalise_image_ext(ext: &str) -> Result<String, AppError> {
+    let cleaned = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    if ALLOWED_IMAGE_EXTS.contains(&cleaned.as_str()) {
+        Ok(cleaned)
+    } else {
+        Err(AppError::InvalidInput {
+            context: format!(
+                "unsupported note image extension {ext:?}; allowed: {ALLOWED_IMAGE_EXTS:?}"
+            ),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Meeting list + open + actions (Phase 4)
 // ---------------------------------------------------------------------------
@@ -1851,6 +1914,53 @@ mod tests {
         let err = save_notes_inner(tempdir.path(), meeting_id, "not json", "")
             .expect_err("invalid JSON must error");
         assert!(matches!(err, AppError::InvalidInput { .. }));
+    }
+
+    /// `save_note_image`'s extension allowlist gate (`normalise_image_ext`):
+    /// accepts the image set (case-/dot-insensitively), rejects everything else.
+    #[test]
+    fn normalise_image_ext_accepts_allowlist_rejects_others() {
+        // Accepted, normalised to lower-cased, dot-less.
+        for (input, expected) in [
+            ("png", "png"),
+            ("PNG", "png"),
+            (".jpg", "jpg"),
+            ("  .JPEG  ", "jpeg"),
+            ("GIF", "gif"),
+            ("webp", "webp"),
+        ] {
+            assert_eq!(
+                normalise_image_ext(input).expect("allowed ext"),
+                expected,
+                "ext {input:?} should normalise to {expected:?}"
+            );
+        }
+        // Rejected as InvalidInput — non-image / executable / path-y extensions.
+        for evil in ["svg", "exe", "txt", "", "png.exe", "../png", "bmp"] {
+            assert!(
+                matches!(normalise_image_ext(evil), Err(AppError::InvalidInput { .. })),
+                "ext {evil:?} must be rejected"
+            );
+        }
+    }
+
+    /// `save_note_asset` (the persistence body the command calls) round-trips an
+    /// image and returns a portable bare-filename reference.
+    #[test]
+    fn save_note_asset_round_trips_via_meetings_dir() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = MeetingId::new();
+        MeetingFolder::create(root, meeting_id).expect("folder");
+
+        let bytes = b"\x89PNG\r\n\x1a\n-image-bytes".to_vec();
+        let filename = persistence::save_note_asset(root, meeting_id, &bytes, "png").expect("save");
+        // Portable ref: a bare filename, no separators.
+        assert!(!filename.contains('/') && !filename.contains('\\'));
+        assert!(filename.ends_with(".png"));
+
+        let read = persistence::read_note_asset(root, meeting_id, &filename).expect("read");
+        assert_eq!(read, bytes);
     }
 
     // -----------------------------------------------------------------------

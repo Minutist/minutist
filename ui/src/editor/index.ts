@@ -12,6 +12,13 @@ export {
 export type { ClipboardPayload } from "./clipboard";
 export { TranscriptChip, CHIP_NODE_NAME } from "./transcript-chip";
 export type { TranscriptChipAttrs } from "./transcript-chip";
+export { NoteImage, resolveImageSrc } from "./note-image";
+export type { MeetingIdSource } from "./note-image";
+export {
+  handleImagePaste,
+  handleImageDrop,
+  imageFilesFromDataTransfer,
+} from "./image-paste";
 export { NotesHoverBridge } from "./hover-bridge";
 export type { HoverAnchorReporter } from "./hover-bridge";
 export {

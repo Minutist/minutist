@@ -21,6 +21,10 @@
  *   - TranscriptChip — first-class block node for a dragged-in transcript
  *     segment (FR-24/25; see ./transcript-chip). Survives notes.json round-trip
  *     and exports to markdown as a fenced quotation.
+ *   - NoteImage — pasted/dropped images stored as FILES in the meeting folder
+ *     (see ./note-image). The node's `src` is a PORTABLE filename ref in
+ *     notes.json; a node view converts it to a `meetingasset:` URL at display
+ *     time, so the meeting folder stays copyable across machines.
  *   - NotesHoverBridge — presentation-only plugin reporting the hovered
  *     paragraph's `data-anchor-ms` (FR-22 read side; see ./hover-bridge); adds
  *     no attrs and dispatches no transactions, so it cannot affect anchoring.
@@ -40,6 +44,8 @@ import { AnchorMarginalia } from "./anchor-marginalia";
 import { TranscriptChip } from "./transcript-chip";
 import { NotesHoverBridge } from "./hover-bridge";
 import type { HoverAnchorReporter } from "./hover-bridge";
+import { NoteImage } from "./note-image";
+import type { MeetingIdSource } from "./note-image";
 
 export type BuildExtensionsOptions = {
   /** Supplies the recording state + pause-excluding clock to ParagraphAnchor. */
@@ -50,6 +56,12 @@ export type BuildExtensionsOptions = {
    * editor tests that don't exercise cross-reference).
    */
   onHoverAnchor?: HoverAnchorReporter;
+  /**
+   * Supplies the current meeting id to {@link NoteImage} so a stored portable
+   * image ref resolves to its `meetingasset:` URL at render time. Defaults to a
+   * no-op (`null`) when omitted; bare refs then render as-is (unresolved).
+   */
+  meetingIdSource?: MeetingIdSource;
 };
 
 /**
@@ -88,6 +100,10 @@ export function buildEditorExtensions(
     AnchorMarginalia,
     // First-class dragged-in transcript segment (FR-24/25).
     TranscriptChip,
+    // Pasted/dropped note images, stored as files + referenced portably.
+    NoteImage.configure({
+      meetingIdSource: options.meetingIdSource ?? (() => null),
+    }),
     // FR-22 read side: reports the hovered paragraph's anchor. Presentation-only
     // (no doc mutation), so it cannot affect ParagraphAnchor's stamping.
     NotesHoverBridge.configure({

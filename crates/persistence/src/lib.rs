@@ -18,6 +18,12 @@
 //!   sessions under `chat/{session_id}.json` (atomic tmp+rename), independent of
 //!   [`MeetingWriter`]; the chat driver in `ipc-bridge` persists a session at
 //!   turn end through it.
+//! - [`assets`]: content-addressed note image files under
+//!   `{meeting}/assets/<contenthash>.<ext>`, written by [`save_note_asset`] and
+//!   read back (with a path-traversal guard) by [`read_note_asset`]. Referenced
+//!   from `notes.json` by bare filename (a portable reference); `notes.json`
+//!   itself is untouched (the opacity guarantee). Auto-cleaned by
+//!   `meeting_ops::delete_meeting`'s `remove_dir_all`.
 //!
 //! # Read surface (Phase 4)
 //!
@@ -45,6 +51,7 @@
 //! and `{app-data}/index.db` are passed in by the caller (orchestrator /
 //! app-main).
 
+pub mod assets;
 pub mod chat;
 pub mod error;
 pub mod folder;
@@ -60,6 +67,7 @@ pub mod transcript;
 pub mod writer;
 
 // Public re-exports for the crate's primary surface.
+pub use assets::{read_note_asset, save_note_asset};
 pub use chat::ChatStore;
 pub use error::Error;
 pub use folder::MeetingFolder;

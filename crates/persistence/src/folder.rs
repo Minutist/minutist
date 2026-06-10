@@ -93,4 +93,17 @@ impl MeetingFolder {
     pub fn notes_md_path(&self) -> PathBuf {
         self.path.join("notes.md")
     }
+
+    /// Path to the `assets/` subdirectory within the folder.
+    ///
+    /// `assets/` holds pasted/dropped note image files (see
+    /// [`crate::save_note_asset`]). The files are referenced from `notes.json`
+    /// by bare filename (a portable, machine-independent reference) so the
+    /// meeting folder — including `assets/` — can be copied to another machine
+    /// and the notes still resolve. The directory is created lazily by
+    /// [`crate::save_note_asset`], and removed wholesale by
+    /// `meeting_ops::delete_meeting`'s `remove_dir_all` (no extra cleanup).
+    pub fn assets_dir(&self) -> PathBuf {
+        self.path.join("assets")
+    }
 }

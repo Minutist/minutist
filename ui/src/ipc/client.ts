@@ -70,6 +70,10 @@ export const commands: Commands = {
   saveNotes: (meetingId, notesJson, notesMarkdown) =>
     callCommand("saveNotes", [meetingId, notesJson, notesMarkdown]),
   loadNotes: (meetingId) => callCommand("loadNotes", [meetingId]),
+  // Persist a pasted/dropped note image; returns the portable filename ref the
+  // editor stores into notes.json. The DEV shim no-ops it (no backend).
+  saveNoteImage: (meetingId, bytes, ext) =>
+    callCommand("saveNoteImage", [meetingId, bytes, ext]),
   // Phase 4 meeting-list + open surface (FR-33). Now present on the generated
   // `commands` object (the temporary "pending generation" path was collapsed
   // once Stream C regenerated `bindings.ts`), so these route through

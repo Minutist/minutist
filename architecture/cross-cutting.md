@@ -808,7 +808,10 @@ change.
 │   ├── notes.json
 │   ├── notes.md
 │   ├── summary.md
-│   └── metadata.json
+│   ├── metadata.json
+│   ├── assets/                 pasted/dropped note images (content-hash files)
+│   │   └── <sha256>.<ext>
+│   └── chat/{session_id}.json  chat sessions (Phase 9)
 ├── models/                     owned by `model-registry` (and nobody else)
 │   ├── asr/{model-id}/...      downloaded GGUF + mmproj per manifest entry
 │   ├── llm/{model-id}/...
@@ -836,6 +839,56 @@ index `upsert` failure on stop is logged-and-swallowed, not fatal). The schema
 is versioned and the migration runner is **forward-only** (a `schema_version`
 gate; opening an empty DB or a prior-schema DB migrates up without data loss).
 Nothing depends on `index.db` being byte-stable or even present.
+
+## Note image assets
+
+Images pasted or dropped into the notes editor are stored as **files** under
+`{app-data}/meetings/{uuid}/assets/<sha256(bytes)>.<ext>`, written/read only by
+`persistence` (the `assets` module — `save_note_asset` / `read_note_asset`).
+The content-hash filename means identical pastes dedupe to one file.
+
+- **Stored portable reference (binding).** `notes.json` stores the **bare
+  filename** as the image node's `src` — NOT a machine-specific absolute path
+  and NOT a platform-specific webview URL. Because `notes.json` and the asset
+  live in the same meeting folder, the folder (with its `assets/`) can be copied
+  to another machine and the notes still resolve. The editor's `getJSON` keeps
+  this portable value; the conversion to a working URL happens only at render
+  time and is never written back. This keeps the `notes.json` **opacity
+  guarantee** intact — the Rust side never parses the document to find images.
+
+- **Rendered URL (per-platform).** At display time the webview converts the
+  stored filename into a working URL via Tauri's
+  `convertFileSrc("<meeting_id>/<filename>", "meetingasset")`, which yields
+  `meetingasset://localhost/<meeting_id>/<filename>` on macOS/Linux and
+  `http://meetingasset.localhost/<meeting_id>/<filename>` on Windows (the
+  live-test target). The meeting id is supplied by the editor at render time
+  (not baked into the document), since the asset always lives under the open
+  meeting's folder.
+
+- **Serving mechanism (verified, Tauri 2.11.2).** `app-main` registers a custom
+  URI-scheme protocol on the `tauri::Builder` via
+  `register_uri_scheme_protocol("meetingasset", handler)`. The synchronous
+  handler signature is `Fn(UriSchemeContext<'_, Wry>, http::Request<Vec<u8>>) ->
+  http::Response<Vec<u8>>`. It reads `meetings_dir` from the managed `IpcState`,
+  delegates parse + read to `ipc_bridge::resolve_note_asset` (which owns the
+  `persistence` edge — `app-main` does not depend on `persistence`), sets the
+  `Content-Type` from the extension, and returns an empty **404** on ANY
+  validation/read failure so no detail leaks.
+
+- **Path-traversal guard (binding).** The protocol exposes **only**
+  `{meetings_dir}/<uuid>/assets/<filename>` — never the whole filesystem.
+  `resolve_note_asset` parses the request path into a `Uuid` + single filename
+  segment (rejecting non-UUID ids and nested paths), and
+  `persistence::read_note_asset` rejects any filename containing a path
+  separator or `..` before reading.
+
+- **`ext` allowlist.** The `save_note_image` command and the content-type map
+  accept only `png` / `jpg` / `jpeg` / `gif` / `webp`; anything else is an
+  `AppError::InvalidInput`.
+
+- **Auto-cleanup.** `meeting_ops::delete_meeting`'s `remove_dir_all` removes the
+  whole meeting folder, so `assets/` (and its images) are deleted with the
+  meeting — no separate asset cleanup path is required.
 
 ## Telemetry
 

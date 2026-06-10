@@ -308,6 +308,18 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Note-image asset protocol (`meetingasset:`). Serves the bytes of a
+        // pasted/dropped note image from `{meetings_dir}/<uuid>/assets/<file>`
+        // to the webview. The webview renders a stored PORTABLE filename ref via
+        // `convertFileSrc(<uuid>/<file>, "meetingasset")`; this handler resolves
+        // it back to bytes. NO whole-filesystem exposure — `resolve_note_asset`
+        // (in `ipc-bridge`, which owns the `persistence` edge) parses the path
+        // into `(meeting_id: Uuid, filename)`, and `persistence::read_note_asset`
+        // applies a path-traversal guard, so only a file directly inside a
+        // meeting's `assets/` can ever be read. Any validation/read failure →
+        // an empty 404 (no detail leaks). See architecture/cross-cutting.md —
+        // "Note image assets".
+        .register_uri_scheme_protocol(ipc_bridge::MEETING_ASSET_SCHEME, serve_note_asset)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // Mount events first so the event channel is ready before any
@@ -670,6 +682,54 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
         })
         .run(tauri::generate_context!())
         .expect("error running meeting-app");
+}
+
+/// Handle a `meetingasset:` URI-scheme request: serve a note image asset's
+/// bytes from the open meeting's `assets/` directory.
+///
+/// The request URI path is `/<meeting_id>/<filename>` (as produced by
+/// `convertFileSrc(<meeting_id>/<filename>, "meetingasset")` on the frontend).
+/// `meetings_dir` is read from the managed [`IpcState`] (the same root every
+/// other command resolves against), so there is no separate path computation.
+///
+/// All parsing + validation + the path-traversal guard live in
+/// `ipc_bridge::resolve_note_asset` (which owns the `persistence` edge —
+/// `app-main` does not depend on `persistence`). This handler only shapes the
+/// HTTP response: a `200` with the inferred `Content-Type` on success, or an
+/// empty `404` on ANY failure (malformed path, non-UUID id, traversal attempt,
+/// or a missing file) so no detail leaks to the webview.
+fn serve_note_asset(
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::{header, Response, StatusCode};
+
+    let meetings_dir = {
+        let state = ctx.app_handle().state::<IpcState>();
+        state.meetings_dir.clone()
+    };
+
+    match ipc_bridge::resolve_note_asset(&meetings_dir, request.uri().path()) {
+        Ok(asset) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, asset.content_type)
+            // The asset is immutable (content-addressed filename), so it is
+            // safe for the webview to cache aggressively.
+            .header(header::CACHE_CONTROL, "private, max-age=31536000, immutable")
+            .body(asset.bytes)
+            .unwrap_or_else(|_| Response::new(Vec::new())),
+        Err(e) => {
+            tracing::debug!(
+                target: "app-main",
+                path = %request.uri().path(),
+                "meetingasset request rejected: {e}"
+            );
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Vec::new())
+                .unwrap_or_else(|_| Response::new(Vec::new()))
+        }
+    }
 }
 
 /// Placeholder 32×32 RGBA tray icon — solid blue (#1E64B4).

@@ -21,9 +21,10 @@ import { useMeetingsStore } from "../state/meetings";
 import { useCrossRefStore } from "../state/cross-ref";
 import { activeTranscript } from "../state/active-transcript";
 import { buildEditorExtensions } from "./extensions";
-import { useAutosave } from "./useAutosave";
+import { useAutosave, activeMeetingId } from "./useAutosave";
 import { buildClipboardPayload } from "./clipboard";
 import { handleSegmentDrop } from "./transcript-dnd";
+import { handleImagePaste, handleImageDrop } from "./image-paste";
 import { scrollToNearestAnchor } from "./scroll-to-anchor";
 import { shouldUseDevShim } from "../ipc/dev-shim-guard";
 import { loadNotes } from "../ipc/notes";
@@ -44,6 +45,22 @@ function readAutosaveInterval(settings: unknown): number | null {
     if (typeof value === "number") return value;
   }
   return null;
+}
+
+/**
+ * Resolve the editor's current meeting id from the live stores, read
+ * non-reactively (so it is always the latest value at paste/drop/render time).
+ *
+ * Notes belong to a meeting: it is either the in-flight recording's meeting
+ * (`recording` / `paused` / `stopping` / `finalising`) OR the open saved
+ * meeting being viewed. Returns `null` when neither is present (the live entry
+ * surface with no meeting), in which case there is nowhere to store an image.
+ */
+function currentMeetingId(): string | null {
+  const recording = activeMeetingId(useRecordingStore.getState().state);
+  if (recording !== null) return recording;
+  const open = useMeetingsStore.getState().openMeetingId;
+  return open ?? null;
 }
 
 export function Editor() {
@@ -84,6 +101,9 @@ export function Editor() {
       // computation against the active transcript (live or saved meeting).
       onHoverAnchor: (anchorMs, nextAnchorMs) =>
         hoverNotesAnchor(anchorMs, nextAnchorMs, activeTranscript()),
+      // Resolve a stored portable image ref → a `meetingasset:` URL at render
+      // time. Read lazily so it tracks the open/recording meeting.
+      meetingIdSource: currentMeetingId,
     }),
     editorProps: {
       attributes: {
@@ -91,15 +111,37 @@ export function Editor() {
         "aria-label": "Notes",
       },
       // Override copy/cut to write a Word-friendly HTML payload; handle drops of
-      // a transcript segment (FR-24) by inserting a transcript-chip node.
+      // a transcript segment (FR-24) by inserting a transcript-chip node, and
+      // paste/drop of image FILES by saving them to the meeting folder and
+      // inserting a portable image node.
       handleDOMEvents: {
         copy: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
         cut: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
+        // Image paste: only intercept when the clipboard carries image files
+        // and no text payload (returns false otherwise, so text / markdown
+        // paste flows through the existing tiptap-markdown handling untouched).
+        paste: (_view, event) => {
+          const current = editorRef.current;
+          if (!current) return false;
+          const clipboardEvent = event as ClipboardEvent;
+          const handled = handleImagePaste(
+            current,
+            clipboardEvent,
+            currentMeetingId,
+          );
+          if (handled) clipboardEvent.preventDefault();
+          return handled;
+        },
         drop: (_view, event) => {
           const current = editorRef.current;
           if (!current) return false;
           const dragEvent = event as DragEvent;
-          const handled = handleSegmentDrop(current, dragEvent);
+          // Transcript-segment drop takes precedence (it carries our private
+          // MIME type); an image-file drop is handled only when that misses.
+          let handled = handleSegmentDrop(current, dragEvent);
+          if (!handled) {
+            handled = handleImageDrop(current, dragEvent, currentMeetingId);
+          }
           if (handled) dragEvent.preventDefault();
           return handled;
         },

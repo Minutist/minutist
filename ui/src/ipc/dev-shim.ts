@@ -424,6 +424,16 @@ export const devCommands = {
   ): Promise<Result<NotesDocument | null, IpcError>> {
     return ok({ notes_json: DEV_NOTES_JSON, notes_markdown: DEV_NOTES_MD });
   },
+  // No backend in a `vite dev` browser; return a plausible content-hash-style
+  // filename so the paste path doesn't throw during visual QA (the resulting
+  // `meetingasset:` URL won't resolve to bytes, which is expected in dev).
+  async saveNoteImage(
+    _meetingId: MeetingId,
+    _bytes: number[],
+    ext: string,
+  ): Promise<Result<string, IpcError>> {
+    return ok(`devassetstub.${ext}`);
+  },
   // --- Phase 4 meeting-list + open surface (FR-33) ------------------------
   async listMeetings(): Promise<Result<MeetingListEntry[], IpcError>> {
     return ok(DEV_MEETINGS);

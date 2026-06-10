@@ -739,6 +739,33 @@ the editor autosave (FR-18/FR-35) run concurrently with an active recording.
   (`audio.opus` / `transcript.json` / `metadata.json`) untouched.
 - `MeetingFolder` exposes `notes_path()` / `notes_md_path()` helpers.
 
+**Note image assets (`assets` module).** Images pasted/dropped into the notes
+editor are stored as **separate files** under `{root}/{meeting_id}/assets/`,
+NOT embedded in `notes.json`. The `assets` module is the sole writer/reader of
+that subdirectory; `notes.json` is untouched (the opacity guarantee holds — the
+editor stores only a bare filename into the document, which `NotesStore`
+round-trips verbatim).
+
+- `save_note_asset(root, meeting_id, bytes: &[u8], ext: &str) -> AppResult<String>`
+  — creates `assets/` on demand and writes the bytes to
+  `<sha256(bytes)>.<ext>` (a **content-hash** filename, so identical pastes
+  dedupe to one file), via an atomic tmp+rename; returns the bare filename. The
+  content hash uses the `sha2` crate, newly a direct dependency of
+  `persistence` (already in the workspace dep set — `model-registry` uses it
+  for model verification). This is a third-party dependency, not a
+  crate-to-crate edge, so the dependency table above is unchanged
+  (`persistence` still depends only on `common`).
+- `read_note_asset(root, meeting_id, filename: &str) -> AppResult<Vec<u8>>` —
+  **REJECTS** any `filename` containing a path separator or a `..` component
+  (path-traversal guard, `AppError::InvalidInput`) before reading, so a request
+  can only ever name a file directly inside the meeting's `assets/`.
+- `MeetingFolder::assets_dir()` exposes the `{folder}/assets` path. The returned
+  filename is a **portable** reference: it names only the file, so the meeting
+  folder (with `assets/`) can be copied to another machine and the notes still
+  resolve. `meeting_ops::delete_meeting`'s `remove_dir_all` removes `assets/`
+  with the folder — no separate cleanup. See `cross-cutting.md` — "Note image
+  assets".
+
 **Phase 9 surface growth — `ChatStore` (chat session persistence).** `ChatStore`
 is a standalone, stateless reader/writer for a meeting's chat sessions under
 `{root}/{meeting_id}/chat/{session_id}.json` (one file per session), mirroring
@@ -1500,6 +1527,21 @@ type directly rather than a local mirror) because a bare `serde_json::Value`
 does not derive `specta::Type`; `save_notes` parses the string to a
 `serde_json::Value` before handing it to `NotesStore` and `load_notes`
 re-serialises the loaded value back to a string.
+
+**Note image command — `save_note_image` (29 commands total).**
+`save_note_image(meeting_id, bytes: Vec<u8>, ext: String) -> String` persists a
+pasted/dropped note image and returns the **portable** filename ref the
+frontend stores into `notes.json`. Like `save_notes`, it routes **directly** to
+`persistence::save_note_asset` (no orchestrator) on `spawn_blocking`; `ext` is
+validated against an image allowlist (`png` / `jpg` / `jpeg` / `gif` / `webp`)
+and rejected as `AppError::InvalidInput` otherwise. `ipc-bridge` also owns the
+**`meetingasset:` asset resolver** (`resolve_note_asset(meetings_dir,
+request_path) -> ResolvedNoteAsset`, plus `MEETING_ASSET_SCHEME`): it parses an
+asset request path `/<meeting_id>/<filename>` into a `Uuid` + filename and
+resolves bytes via `persistence::read_note_asset` (whose path-traversal guard it
+relies on). This lives in `ipc-bridge` — not `app-main` — so the `persistence`
+edge stays inside `ipc-bridge` (`app-main` does not depend on `persistence`).
+See `cross-cutting.md` — "Note image assets".
 
 **Phase 4 — `stop_recording` index upsert (FR-33, in-session visibility).**
 `Orchestrator::stop` finalises the meeting folder but deliberately never touches

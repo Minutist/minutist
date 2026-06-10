@@ -1130,6 +1130,16 @@ tool bodies still push CPU/fs/inference work onto `spawn_blocking`.
 `broadcast::Sender<AppEvent>`, an optional `default_meeting` (the internal-UI
 session scope; MCP leaves it `None` so an MCP caller passes `meeting_id`
 explicitly), a per-meeting metadata-write mutex map, and (Phase 10) an optional
+inter-agent bridge SENDER. `default_meeting` lets a tool resolve an omitted
+`meeting_id` via `resolve_meeting`, but the MODEL must also be TOLD a meeting is
+in scope or it asks the user for an id: when the chat is meeting-scoped,
+`send_chat_message` / the inter-agent bridge append a "# Current meeting" block
+(meeting id + title) to `chat_system_prompt` via
+`chat_system_prompt_for_meeting`, instructing the agent to call the tools
+(which default to this meeting) rather than ask, AND relax `meeting_id` from the
+offered schemas' `required` (`agent_tools::relax_meeting_id_requirement`) so a
+schema-respecting model is free to omit it. The context also holds a
+per-meeting metadata-write mutex map and (Phase 10) an optional
 inter-agent bridge SENDER (`mpsc::Sender<(InterAgentRequest, oneshot)>`, set via
 `with_inter_agent_bridge` for the MCP registry context only; `None` for the
 internal agent so it cannot message itself). The bridge uses only `common` types

@@ -423,6 +423,29 @@ fn descriptor_of(t: &dyn Tool) -> ToolDescriptor {
     }
 }
 
+/// Drop `"meeting_id"` from each descriptor's JSON-schema `required` array.
+///
+/// Used when the chat is meeting-scoped (`ToolContext::default_meeting` is set):
+/// a tool resolves an omitted `meeting_id` from the context via
+/// [`ToolContext::resolve_meeting`], so the MODEL must be free to omit it — left
+/// marked `required`, a schema-respecting model asks the user for the field
+/// instead of calling the tool (the reported "it asked for a meeting id" bug).
+/// The `meeting_id` PROPERTY stays in `properties` (still documented + accepted);
+/// only its requiredness is relaxed. This pairs with the system-prompt scope line
+/// (`ipc-bridge::chat_system_prompt_for_meeting`): the prompt tells the model
+/// which meeting it is in, this lets it actually omit the id.
+pub fn relax_meeting_id_requirement(descriptors: &mut [ToolDescriptor]) {
+    for d in descriptors.iter_mut() {
+        if let Some(required) = d
+            .input_schema
+            .get_mut("required")
+            .and_then(|r| r.as_array_mut())
+        {
+            required.retain(|f| f.as_str() != Some("meeting_id"));
+        }
+    }
+}
+
 /// Lightweight argument validation against the tool's JSON Schema.
 ///
 /// This is intentionally a shallow structural check, not a full JSON-Schema
@@ -538,4 +561,66 @@ pub(crate) fn require_u64(args: &serde_json::Value, field: &str) -> AppResult<u6
         .ok_or_else(|| AppError::InvalidInput {
             context: format!("missing or non-integer argument `{field}`"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn relax_meeting_id_requirement_drops_only_meeting_id() {
+        let mut descriptors = vec![ToolDescriptor {
+            name: "get_transcript",
+            description: "…",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "meeting_id": { "type": "string" },
+                    "max_chars": { "type": "integer" }
+                },
+                "required": ["meeting_id", "max_chars"]
+            }),
+        }];
+        relax_meeting_id_requirement(&mut descriptors);
+        let req = descriptors[0].input_schema["required"].as_array().unwrap();
+        assert!(
+            !req.iter().any(|f| f.as_str() == Some("meeting_id")),
+            "meeting_id is no longer required"
+        );
+        assert!(
+            req.iter().any(|f| f.as_str() == Some("max_chars")),
+            "other required fields are kept"
+        );
+        // The property itself stays documented + accepted.
+        assert!(descriptors[0].input_schema["properties"]["meeting_id"].is_object());
+    }
+
+    #[test]
+    fn relax_meeting_id_requirement_tolerates_a_missing_required_array() {
+        let mut descriptors = vec![ToolDescriptor {
+            name: "x",
+            description: "",
+            input_schema: json!({ "type": "object", "properties": {} }),
+        }];
+        relax_meeting_id_requirement(&mut descriptors); // no `required` key → no-op, no panic
+        assert!(descriptors[0].input_schema.get("required").is_none());
+    }
+
+    #[test]
+    fn real_descriptors_have_meeting_id_relaxed_when_scoped() {
+        // The production registry's read tools mark `meeting_id` required; after
+        // relaxation (meeting-scoped chat) none of them do.
+        let mut descriptors = ToolRegistry::v1(false).descriptors();
+        relax_meeting_id_requirement(&mut descriptors);
+        for d in &descriptors {
+            if let Some(req) = d.input_schema.get("required").and_then(|r| r.as_array()) {
+                assert!(
+                    !req.iter().any(|f| f.as_str() == Some("meeting_id")),
+                    "tool {} still requires meeting_id after relaxation",
+                    d.name
+                );
+            }
+        }
+    }
 }

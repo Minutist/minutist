@@ -217,7 +217,18 @@ async fn run_one_turn(
         meeting_id,
     );
 
-    let system_prompt = handles.settings.current().chat_system_prompt.clone();
+    // Scope the prompt to the addressed meeting (the inter-agent bridge can be
+    // meeting-scoped too), so the internal agent grounds its answer in that
+    // meeting rather than asking for a meeting id.
+    let title = match meeting_id {
+        Some(mid) => crate::commands::read_meeting_title(&handles.meetings_dir, mid).await,
+        None => None,
+    };
+    let system_prompt = crate::commands::chat_system_prompt_for_meeting(
+        &handles.settings.current().chat_system_prompt,
+        meeting_id,
+        title.as_deref(),
+    );
     let registry = Arc::clone(registry);
     let event_tx = handles.event_tx.clone();
     let handle = tokio::runtime::Handle::current();

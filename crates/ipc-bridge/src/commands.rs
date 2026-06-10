@@ -1202,6 +1202,51 @@ fn emit_summary_ready(event_tx: &broadcast::Sender<AppEvent>, meeting_id: Meetin
 // Chat (Phase 9)
 // ---------------------------------------------------------------------------
 
+/// Read a meeting's title for the chat scope line (best-effort; `None` when its
+/// metadata can't be read). Runs the blocking `std::fs` read on `spawn_blocking`.
+pub(crate) async fn read_meeting_title(
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+) -> Option<String> {
+    let dir = meetings_dir.join(meeting_id.0.to_string());
+    tokio::task::spawn_blocking(move || persistence::read_metadata(&dir).ok().map(|m| m.title))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Scope the chat system prompt to the open meeting.
+///
+/// When the chat is meeting-scoped, the agent must GROUND its answers in that
+/// meeting and never ask the user for a meeting id — every meeting tool defaults
+/// to it via [`ToolContext::default_meeting`]. The base prompt says "this
+/// meeting" but never names which one, so without this the model has no meeting
+/// identity and asks the user instead of calling a tool. With no meeting in scope
+/// (a meeting-less chat) the base prompt is returned unchanged — the agent then
+/// locates a meeting via `search_meetings` / an explicit id, as before.
+pub(crate) fn chat_system_prompt_for_meeting(
+    base: &str,
+    meeting_id: Option<MeetingId>,
+    title: Option<&str>,
+) -> String {
+    let Some(mid) = meeting_id else {
+        return base.to_string();
+    };
+    let titled = match title {
+        Some(t) if !t.trim().is_empty() => format!(" titled \"{}\"", t.trim()),
+        _ => String::new(),
+    };
+    format!(
+        "{base}\n\n# Current meeting\n\
+         You are assisting with the meeting the user currently has open \
+         (id: {id}{titled}). Every meeting tool defaults to THIS meeting, so NEVER \
+         ask the user which meeting or for a meeting id — call the tools directly \
+         (get_meeting, get_transcript, get_summary, get_notes, and the re-listen / \
+         re-summarise / search / set-speaker tools) to ground your answers in it.",
+        id = mid.0,
+    )
+}
+
 /// Send a user message to the chat agent for a meeting, streaming the reply.
 ///
 /// Creates or loads the chat [`ChatSession`], appends the user message, and
@@ -1297,7 +1342,17 @@ pub async fn send_chat_message(
         meeting_id,
     );
 
-    let system_prompt = state.settings.current().chat_system_prompt.clone();
+    // Scope the prompt to the open meeting so the agent uses the tools (which
+    // default to this meeting) instead of asking the user for a meeting id.
+    let title = match meeting_id {
+        Some(mid) => read_meeting_title(&meetings_dir, mid).await,
+        None => None,
+    };
+    let system_prompt = chat_system_prompt_for_meeting(
+        &state.settings.current().chat_system_prompt,
+        meeting_id,
+        title.as_deref(),
+    );
     let registry = Arc::clone(&state.tool_registry);
     let event_tx = state.event_tx.clone();
     let in_flight = Arc::clone(&state.chat_in_flight);
@@ -1580,10 +1635,17 @@ pub(crate) fn run_chat_turn_on_held_model(
     // The tool surface offered to the model: the full set for the UI path, or
     // the MCP-gated set for the inter-agent bridge (S1). The gating policy lives
     // in `agent-tools`; this only selects which projection to feed the engine.
-    let descriptors = match mcp_gate {
+    let mut descriptors = match mcp_gate {
         Some(allow_writes) => registry.mcp_tool_descriptors_gated(allow_writes),
         None => registry.descriptors(),
     };
+    // Meeting-scoped chat: the context fills an omitted `meeting_id`
+    // (`ToolContext::resolve_meeting`), so relax the schema's requiredness — else
+    // a schema-respecting model treats `meeting_id` as a required field it lacks
+    // and asks the user for it. Pairs with the prompt's "# Current meeting" scope.
+    if ctx.default_meeting.is_some() {
+        agent_tools::relax_meeting_id_requirement(&mut descriptors);
+    }
     let cfg = chat_sampler_config();
 
     // Rebuild the engine-internal history: pinned system prompt + the prior
@@ -2704,5 +2766,43 @@ mod tests {
         );
         assert_eq!(tool.tool_name.as_deref(), Some("get_summary"));
         assert_eq!(loaded.messages.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Chat prompt scoping — the agent must not ask for a meeting id when a
+    // meeting is open (it has `default_meeting` in scope).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn chat_prompt_scopes_to_the_open_meeting() {
+        let mid = MeetingId::new();
+        let p = chat_system_prompt_for_meeting("BASE", Some(mid), Some("Standup"));
+        assert!(p.starts_with("BASE"), "base prompt is preserved");
+        assert!(p.contains("# Current meeting"));
+        assert!(p.contains(&mid.0.to_string()), "the meeting id is named");
+        assert!(p.contains("titled \"Standup\""));
+        assert!(
+            p.contains("NEVER ask the user"),
+            "must instruct the agent not to ask for a meeting id"
+        );
+    }
+
+    #[test]
+    fn chat_prompt_without_title_omits_the_titled_clause() {
+        let mid = MeetingId::new();
+        let p = chat_system_prompt_for_meeting("BASE", Some(mid), None);
+        assert!(p.contains(&mid.0.to_string()));
+        assert!(!p.contains("titled"));
+        // A blank/whitespace title is treated as no title.
+        let blank = chat_system_prompt_for_meeting("BASE", Some(mid), Some("   "));
+        assert!(!blank.contains("titled"));
+    }
+
+    #[test]
+    fn chat_prompt_meeting_less_is_unchanged() {
+        assert_eq!(
+            chat_system_prompt_for_meeting("BASE", None, Some("ignored")),
+            "BASE"
+        );
     }
 }

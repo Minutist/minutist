@@ -148,6 +148,24 @@ The recorder-lifecycle additions `RecordingState::Finalising` and the
 their producers in the `orchestrator`/`ipc-bridge` "Responsive stop" and
 re-transcribe notes below.
 
+**VRAM-aware GPU placement — the probe + the pure plan.** `common` now exposes
+the GPU auto-detection surface: `probe_primary_gpu() -> Option<GpuProbe>` (behind
+the `llama-backend` feature — the same feature that owns the shared
+`LlamaBackend`; `None` on a CPU-only build), the `GpuProbe { total_bytes,
+free_bytes, is_integrated, name }` snapshot, the tri-state `GpuAcceleration {
+Auto, On, Off }` enum (serde snake_case, `Default = Auto`, `specta::Type` — it is
+a `Settings` field so it crosses IPC), the `GpuPlan { summariser_gpu, asr_gpu,
+effective_prefer_large }` per-model decision, and the **pure**
+`resolve_gpu_plan(probe, mode, prefer_large_asr) -> GpuPlan` that the consumers
+call at each model-load moment. `settings.gpu_acceleration` is now this
+`GpuAcceleration` enum (was `bool`; a `deserialize_with` shim migrates a legacy
+bool store, `true → Auto` / `false → Off`). `ipc-bridge` and `orchestrator` are
+the consumers; the policy + thresholds live in `cross-cutting.md` — "GPU
+portability". **No dependency-table edge changes:** the probe + plan live in
+`common` (which every crate already depends on) and `probe_primary_gpu` reuses
+the existing `llama-backend` feature, so no new crate or `use` edge is
+introduced.
+
 **Operation-progress event (live-test UX).** `AppEvent::OperationProgress {
 meeting_id, op: OperationKind, fraction: Option<f32>, label: String }` (plus the
 `OperationKind { ReTranscribe, Summarise, Rediarize, Finalise }` enum) rides the
@@ -1365,19 +1383,20 @@ dependency edge. (Phase 7 also adds
 two app-main updater events to `common` — `AppEvent::UpdateAvailable` /
 `UpdateProgress` — see `cross-cutting.md` "Auto-update".)
 
-**Field — `gpu_acceleration: bool`.** The runtime GPU-acceleration toggle.
-`#[serde(default = ...)]`-defaults to `true` (GPU on by default); an older store
-written before the field existed deserialises to `true`, preserving the prior
-compile-time behaviour. Added to the hand-written `Default` impl (`true`). GPU
-offload happens ONLY when BOTH (a) the build was compiled with a GPU feature
-(`vulkan`/`metal`/`cuda`/`rocm`) AND (b) this flag is `true`; when `false`,
-inference runs on CPU (`n_gpu_layers = 0`) even in a GPU-feature build — the
-runtime escape hatch for weak GPUs / driver trouble. In a default CPU-only build
-the flag has no effect (inference is always on CPU). The orchestrator reads it
-(`current().gpu_acceleration`) to resolve the live + offline-re-transcribe ASR
-`n_gpu_layers`, and `ipc-bridge`'s `summarise_meeting` reads it to resolve the
-summariser `n_gpu_layers`. No new dependency edge. See `cross-cutting.md` —
-"GPU portability".
+**Field — `gpu_acceleration: GpuAcceleration`.** The runtime GPU-acceleration
+mode, now the tri-state `common::GpuAcceleration { Auto, On, Off }` (was `bool`).
+`#[serde(default = ...)]`-defaults to `Auto`; an older store written before the
+field existed deserialises to `Auto`, and a `deserialize_with` shim migrates a
+legacy bool store (`true → Auto`, `false → Off`). Added to the hand-written
+`Default` impl (`Auto`). `Auto` probes GPU VRAM at each model load and offloads a
+model to the GPU only when it fits; `On`/`Off` are hard overrides that never
+consult the probe. GPU offload only ever happens in a build compiled with a GPU
+feature (`vulkan`/`metal`/`cuda`/`rocm`); a default CPU-only build is always on
+CPU. The orchestrator reads it (`current().gpu_acceleration`) into a `GpuPlan`
+via `gpu_plan()` to resolve the live + offline-re-transcribe + re-listen + prewarm
+ASR `n_gpu_layers` and ASR tier, and `ipc-bridge`'s held-summariser load reads it
+into a `GpuPlan` to resolve the summariser `n_gpu_layers`. No new dependency edge
+(the probe + plan live in `common`). See `cross-cutting.md` — "GPU portability".
 
 **Field — `capture_system_audio: bool`.** Whether to capture the system/call
 (loopback) audio alongside the mic and MIX them into one transcribed stream, so
@@ -1713,8 +1732,9 @@ without this).
 — the LLM GGUF is loaded **once** on first chat/summarise use (via
 `IpcState::ensure_summariser`, which resolves the model id + directory through
 `Orchestrator::ensure_model_path` and opens the GGUF on `spawn_blocking` with the
-GPU-offload count resolved from the `gpu_acceleration` setting at load time) and
-shared thereafter. `summarise_meeting` was **refactored** to reuse this held
+GPU-offload count resolved at load time from the VRAM-aware `GpuPlan`
+(`plan.summariser_gpu`; see `cross-cutting.md` — "GPU portability") computed from
+the `gpu_acceleration` setting) and shared thereafter. `summarise_meeting` was **refactored** to reuse this held
 handle instead of constructing a fresh `LlamaSummariser` per call. The chat engine
 borrows `&LlamaModel` from the held handle via `LlamaSummariser::model()`; the
 `agent-tools` `ToolContext`'s `resummarise` coerces the same handle to

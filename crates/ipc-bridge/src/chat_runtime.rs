@@ -48,8 +48,15 @@ impl ChatHandles {
                 let settings = self.settings.current();
                 let model_id = commands::resolve_llm_model_id(&settings);
                 let model_dir = self.orchestrator.ensure_model_path(&model_id).await?;
-                let n_gpu_layers =
-                    commands::resolve_summariser_gpu_layers(settings.gpu_acceleration);
+                // VRAM-aware plan: the summariser's GPU decision is `plan.summariser_gpu`
+                // (the summariser is budgeted FIRST). See `architecture/cross-cutting.md`
+                // — "GPU portability".
+                let plan = meeting_app_common::resolve_gpu_plan(
+                    meeting_app_common::probe_primary_gpu().as_ref(),
+                    settings.gpu_acceleration,
+                    settings.prefer_large_asr_model,
+                );
+                let n_gpu_layers = commands::resolve_summariser_gpu_layers(plan.summariser_gpu);
                 let summariser = tokio::task::spawn_blocking(move || {
                     commands::open_summariser_in_dir(&model_dir, n_gpu_layers)
                 })

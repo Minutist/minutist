@@ -475,6 +475,19 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 mcp_info: mcp_info.clone(),
             });
 
+            // Log the GPU probe + the resolved default plan at startup so the
+            // (estimated) VRAM thresholds in `resolve_gpu_plan` can be validated
+            // against real hardware. Best-effort + off the main thread: the probe
+            // self-inits the llama backend and can block, so it rides a background
+            // `async_runtime::spawn` (NOT a bare `tokio::spawn` — `setup` has no
+            // entered runtime). Mirrors the ASR-prewarm spawn above.
+            {
+                let probe_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    probe_handle.state::<IpcState>().log_gpu_probe();
+                });
+            }
+
             // Preload the shared summary/chat LLM in the background so the first
             // Summarise / chat is instant (the model loads in ~seconds the first
             // time otherwise). Gated on `settings.preload_summariser` (default ON)

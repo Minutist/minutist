@@ -42,6 +42,34 @@ pub fn shared_llama_backend() -> AppResult<&'static LlamaBackend> {
         .expect("backend was just set under the init lock"))
 }
 
+/// List the ggml backend devices (name/type/memory), or an empty vec when the
+/// GPU backend is not compiled in. The crate-internal entry point behind
+/// [`crate::probe_primary_gpu`]; kept here so the `llama_cpp_2` use stays inside
+/// the `llama-backend`-gated module.
+pub(crate) fn list_gpu_devices() -> Vec<crate::GpuProbe> {
+    use llama_cpp_2::LlamaBackendDeviceType as T;
+    // Backend init registers the GPU devices; without it the list is empty.
+    if shared_llama_backend().is_err() {
+        return Vec::new();
+    }
+    llama_cpp_2::list_llama_ggml_backend_devices()
+        .into_iter()
+        .filter_map(|d| {
+            let is_gpu = matches!(d.device_type, T::Gpu | T::IntegratedGpu);
+            is_gpu.then(|| crate::GpuProbe {
+                total_bytes: d.memory_total as u64,
+                free_bytes: d.memory_free as u64,
+                is_integrated: d.device_type == T::IntegratedGpu,
+                name: if d.description.is_empty() {
+                    d.name
+                } else {
+                    d.description
+                },
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

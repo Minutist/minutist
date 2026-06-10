@@ -860,6 +860,178 @@ pub const PARAKEET_LANGUAGES: &[&str] = &[
     "Ukrainian",
 ];
 
+// ---------------------------------------------------------------------------
+// GPU acceleration mode + the VRAM-aware offload plan
+// ---------------------------------------------------------------------------
+
+/// A snapshot of the GPU device a model would be offloaded to.
+///
+/// `total_bytes` / `free_bytes` are the ggml-reported device memory. NOTE: a
+/// Vulkan device without `VK_EXT_memory_budget` reports `free == total` (the
+/// heap size), so `free` is optimistic there; [`resolve_gpu_plan`] decides on
+/// `total` and uses `free` only to TIGHTEN. `is_integrated` marks a
+/// shared-system-RAM GPU (budgeted far more conservatively). Plain data (no
+/// llama dependency) so the plan + its tests build in a CPU-only configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuProbe {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub is_integrated: bool,
+    /// Human-readable device name (e.g. "NVIDIA GeForce RTX 3080").
+    pub name: String,
+}
+
+/// Probe the GPU device a model would be offloaded to, or `None` when there is
+/// no usable GPU (CPU-only build, no driver, or the enumeration finds none).
+///
+/// Prefers the first discrete `Gpu`; falls back to an `IntegratedGpu` only when
+/// no discrete GPU exists (flagged `is_integrated`). Multi-GPU is out of scope —
+/// one host device is chosen, never accumulated. The real probe lives behind the
+/// `llama-backend` feature (it queries the same ggml backend that loads the
+/// GGUFs); a CPU-only build has no GPU and returns `None`.
+#[cfg(feature = "llama-backend")]
+pub fn probe_primary_gpu() -> Option<GpuProbe> {
+    let devices = llama_backend::list_gpu_devices();
+    // Discrete GPU first, else the integrated one.
+    devices
+        .iter()
+        .find(|d| !d.is_integrated)
+        .or_else(|| devices.first())
+        .cloned()
+}
+
+/// CPU-only build (no `llama-backend` feature): there is never a GPU to probe.
+#[cfg(not(feature = "llama-backend"))]
+pub fn probe_primary_gpu() -> Option<GpuProbe> {
+    None
+}
+
+/// GPU-acceleration mode (replaces the old `gpu_acceleration: bool`).
+///
+/// `Auto` (the default) probes GPU VRAM at each model load and offloads a model
+/// to the GPU only when it fits, falling back to CPU otherwise. `On`/`Off` are
+/// hard overrides that NEVER consult the probe — `On` forces full GPU offload
+/// (the old `true`), `Off` forces CPU (the old `false`). Only effective in a
+/// build compiled with a GPU feature (`vulkan`/`metal`/…); a CPU-only build
+/// always runs on CPU regardless. See `architecture/cross-cutting.md` — "GPU
+/// portability".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum GpuAcceleration {
+    /// Probe VRAM per model load; GPU iff it fits, else CPU. The new default.
+    #[default]
+    Auto,
+    /// Force GPU offload (no probe) — the old `gpu_acceleration = true`.
+    On,
+    /// Force CPU (no probe) — the old `gpu_acceleration = false`.
+    Off,
+}
+
+/// The resolved per-model GPU-offload decision for one model-load moment.
+///
+/// Produced by [`resolve_gpu_plan`]. Binary per model (whole model on GPU or on
+/// CPU): partial layer offload is slower than CPU for models this small, and the
+/// existing `n_gpu_layers` resolution is already binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuPlan {
+    /// Offload the summariser / chat LLM to the GPU.
+    pub summariser_gpu: bool,
+    /// Offload the (Qwen) ASR model to the GPU. Moot for the Parakeet engine,
+    /// which runs on its own ONNX provider, not llama.cpp.
+    pub asr_gpu: bool,
+    /// The ASR tier to actually use: the requested `prefer_large_asr_model` only
+    /// when the larger model ALSO fits the remaining budget, else downgraded to
+    /// the small tier (running the 1.7B model purely on CPU is strictly worse
+    /// than the 0.6B CPU default).
+    pub effective_prefer_large: bool,
+}
+
+const GPU_PLAN_GIB: u64 = 1024 * 1024 * 1024;
+/// VRAM to host the summariser (Gemma-4-E4B Q4_K_M ~5.3 GB weights + KV @ 32K +
+/// compute headroom). ESTIMATE — validate against the live probe log.
+const SUMMARISER_VRAM_BYTES: u64 = 8 * GPU_PLAN_GIB;
+/// VRAM to host the small ASR tier (Qwen3-ASR-0.6B Q8_0).
+const ASR_SMALL_VRAM_BYTES: u64 = 2 * GPU_PLAN_GIB;
+/// VRAM to host the large ASR tier (Qwen3-ASR-1.7B Q8_0).
+const ASR_LARGE_VRAM_BYTES: u64 = 7 * GPU_PLAN_GIB / 2; // 3.5 GiB
+/// Usable fraction of a DISCRETE GPU's memory (fragmentation + co-tenant slack).
+const DISCRETE_HEADROOM: f64 = 0.90;
+/// Usable fraction of an INTEGRATED GPU's "memory" (it is shared system RAM;
+/// budget far more conservatively). A guess — flagged for live validation.
+const IGPU_HEADROOM: f64 = 0.50;
+
+/// Resolve the per-model GPU-offload plan from a VRAM probe + the user's mode.
+///
+/// PURE (the probe is an input) so it is unit-tested without a GPU. `On`/`Off`
+/// short-circuit without consulting the probe. `Auto` budgets the summariser
+/// FIRST (it is resident while an ASR model loads when `preload_summariser` is
+/// on), then budgets ASR against the REMAINING headroom and downgrades the large
+/// ASR tier if it would not fit alongside. A `None` probe (no GPU / probe
+/// failed) resolves everything to CPU — the fail-safe (a false "fits" risks an
+/// out-of-memory load or a silent host-memory spill).
+///
+/// VRAM decision base: `total × headroom`, NOT `free` — a Vulkan device without
+/// `VK_EXT_memory_budget` reports `free == total`, so `free` is trusted only to
+/// TIGHTEN the budget when it is a credible smaller number.
+pub fn resolve_gpu_plan(
+    probe: Option<&GpuProbe>,
+    mode: GpuAcceleration,
+    prefer_large_asr: bool,
+) -> GpuPlan {
+    match mode {
+        GpuAcceleration::On => GpuPlan {
+            summariser_gpu: true,
+            asr_gpu: true,
+            effective_prefer_large: prefer_large_asr,
+        },
+        GpuAcceleration::Off => GpuPlan {
+            summariser_gpu: false,
+            asr_gpu: false,
+            effective_prefer_large: false,
+        },
+        GpuAcceleration::Auto => {
+            let Some(p) = probe else {
+                return GpuPlan {
+                    summariser_gpu: false,
+                    asr_gpu: false,
+                    effective_prefer_large: false,
+                };
+            };
+            let headroom = if p.is_integrated {
+                IGPU_HEADROOM
+            } else {
+                DISCRETE_HEADROOM
+            };
+            let total_budget = (p.total_bytes as f64 * headroom) as u64;
+            // Use `free` ONLY to tighten, and only when it is a credible smaller
+            // number (>0 and < total) — Vulkan's `free == total` and a bogus 0
+            // both fall back to the total-based budget.
+            let budget = if p.free_bytes > 0 && p.free_bytes < p.total_bytes {
+                total_budget.min((p.free_bytes as f64 * headroom) as u64)
+            } else {
+                total_budget
+            };
+
+            let summariser_gpu = budget >= SUMMARISER_VRAM_BYTES;
+            let asr_headroom =
+                budget.saturating_sub(if summariser_gpu { SUMMARISER_VRAM_BYTES } else { 0 });
+            let effective_prefer_large = prefer_large_asr && asr_headroom >= ASR_LARGE_VRAM_BYTES;
+            let asr_need = if effective_prefer_large {
+                ASR_LARGE_VRAM_BYTES
+            } else {
+                ASR_SMALL_VRAM_BYTES
+            };
+            let asr_gpu = asr_headroom >= asr_need;
+            GpuPlan {
+                summariser_gpu,
+                asr_gpu,
+                effective_prefer_large,
+            }
+        }
+    }
+}
+
 /// Choose the ASR engine deterministically from the user's transcription-language
 /// setting (never by inspecting the audio — the language isn't known before
 /// transcription). Pure so the orchestrator and any future UI surface agree.
@@ -1011,6 +1183,80 @@ mod tests {
         );
         // Auto-detect + GPU opt-in -> the bigger Qwen.
         assert_eq!(asr_engine_for_language("auto", true), AsrEngine::Qwen17B);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_gpu_plan — pure, no GPU needed (probe is an input)
+    // -----------------------------------------------------------------------
+
+    fn probe(total_gib: u64, integrated: bool) -> GpuProbe {
+        GpuProbe {
+            total_bytes: total_gib * GPU_PLAN_GIB,
+            free_bytes: total_gib * GPU_PLAN_GIB, // Vulkan-style free == total
+            is_integrated: integrated,
+            name: "test-gpu".to_string(),
+        }
+    }
+
+    #[test]
+    fn gpu_plan_on_forces_gpu_off_forces_cpu_without_probe() {
+        let on = resolve_gpu_plan(None, GpuAcceleration::On, true);
+        assert!(on.summariser_gpu && on.asr_gpu && on.effective_prefer_large);
+        let off = resolve_gpu_plan(Some(&probe(64, false)), GpuAcceleration::Off, true);
+        assert!(!off.summariser_gpu && !off.asr_gpu && !off.effective_prefer_large);
+    }
+
+    #[test]
+    fn gpu_plan_auto_no_gpu_falls_back_to_cpu() {
+        let p = resolve_gpu_plan(None, GpuAcceleration::Auto, true);
+        assert!(!p.summariser_gpu && !p.asr_gpu && !p.effective_prefer_large);
+    }
+
+    #[test]
+    fn gpu_plan_auto_large_card_runs_everything_on_gpu() {
+        // 24 GB discrete: summariser (8) + large ASR (3.5) fit easily.
+        let p = resolve_gpu_plan(Some(&probe(24, false)), GpuAcceleration::Auto, true);
+        assert!(p.summariser_gpu && p.asr_gpu && p.effective_prefer_large);
+    }
+
+    #[test]
+    fn gpu_plan_auto_eight_gb_card_runs_asr_on_gpu_but_summariser_on_cpu() {
+        // 8 GB × 0.90 = 7.2 GiB budget < 8 GiB summariser need -> summariser CPU;
+        // the full budget is then free for ASR, so the large tier fits.
+        let p = resolve_gpu_plan(Some(&probe(8, false)), GpuAcceleration::Auto, true);
+        assert!(!p.summariser_gpu, "8 GB cannot host the summariser");
+        assert!(p.asr_gpu, "ASR fits when the summariser is on CPU");
+        assert!(p.effective_prefer_large, "7.2 GiB headroom fits the large ASR");
+    }
+
+    #[test]
+    fn gpu_plan_auto_downgrades_large_asr_when_it_wont_fit_beside_summariser() {
+        // 12 GB × 0.90 = 10.8 budget; summariser takes 8 -> 2.8 left: large (3.5)
+        // does not fit, small (2.0) does, so downgrade but keep ASR on GPU.
+        let p = resolve_gpu_plan(Some(&probe(12, false)), GpuAcceleration::Auto, true);
+        assert!(p.summariser_gpu);
+        assert!(p.asr_gpu);
+        assert!(!p.effective_prefer_large, "large ASR downgraded to fit beside summariser");
+    }
+
+    #[test]
+    fn gpu_plan_auto_free_tightens_the_budget() {
+        // total 24 GB but only 4 GB free (a budget-aware device under load):
+        // 4 × 0.90 = 3.6 < 8 -> summariser CPU; small ASR (2.0) still fits.
+        let mut p = probe(24, false);
+        p.free_bytes = 4 * GPU_PLAN_GIB;
+        let plan = resolve_gpu_plan(Some(&p), GpuAcceleration::Auto, false);
+        assert!(!plan.summariser_gpu, "low free VRAM tightens the budget below the summariser need");
+        assert!(plan.asr_gpu);
+    }
+
+    #[test]
+    fn gpu_plan_auto_integrated_gpu_budgets_conservatively() {
+        // iGPU reports 16 GB shared RAM but the 0.50 cap = 8 GiB budget: exactly
+        // the summariser need, nothing left for ASR on GPU.
+        let p = resolve_gpu_plan(Some(&probe(16, true)), GpuAcceleration::Auto, true);
+        assert!(p.summariser_gpu);
+        assert!(!p.asr_gpu, "iGPU 0.50 cap leaves no ASR headroom");
     }
 
     #[test]

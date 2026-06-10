@@ -1,15 +1,16 @@
 /**
- * GPU-acceleration toggle webview tests.
+ * GPU-acceleration control webview tests.
  *
  * Mirrors the Phase-6 diarization-toggle test (`Diarization.test.tsx`, section
  * 3): the runtime `gpu_acceleration` setting round-trips through
  * `commands.updateSettings` at the existing seam, with no new command and no
- * raw invoke (rule A9). Default-on, persists, and a fresh `getSettings` reads it
+ * raw invoke (rule A9). It is now a tri-state `GpuAcceleration` ("auto" by
+ * default); the control persists a mode, and a fresh `getSettings` reads it
  * back. This is a default-suite test: it needs no model, GPU, or microphone —
  * the mocked seams are the fixtures.
  *
- * GPU offload happens ONLY when BOTH the build has a GPU feature AND this
- * setting is true; the UI toggle only controls the setting half. See
+ * GPU offload happens ONLY when the build has a GPU feature AND the resolved
+ * plan offloads; the UI control only sets the mode half. See
  * `architecture/cross-cutting.md` — "GPU portability".
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -79,17 +80,17 @@ function resetStore() {
   });
 }
 
-describe("gpu_acceleration toggle round-trip", () => {
+describe("gpu_acceleration mode round-trip", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore();
   });
 
-  it("defaults to on (true) when the field is absent or settings unloaded", () => {
-    // An older store / not-yet-loaded snapshot reads as on (matches the
-    // backend `#[serde(default)]` of true).
-    expect(readGpuAcceleration(BASE_SETTINGS)).toBe(true);
-    expect(readGpuAcceleration(null)).toBe(true);
+  it("defaults to auto when the field is absent or settings unloaded", () => {
+    // An older store / not-yet-loaded snapshot reads as "auto" (matches the
+    // backend `#[serde(default)]` of `Auto`).
+    expect(readGpuAcceleration(BASE_SETTINGS)).toBe("auto");
+    expect(readGpuAcceleration(null)).toBe("auto");
   });
 
   it("setGpuAcceleration persists via update_settings, preserving other fields", async () => {
@@ -98,39 +99,39 @@ describe("gpu_acceleration toggle round-trip", () => {
     });
     vi.mocked(commands.updateSettings).mockReturnValueOnce(okVoid);
 
-    await useRecordingStore.getState().setGpuAcceleration(false);
+    await useRecordingStore.getState().setGpuAcceleration("off");
 
     expect(commands.updateSettings).toHaveBeenCalledWith({
       ...BASE_SETTINGS,
-      gpu_acceleration: false,
+      gpu_acceleration: "off",
     });
     // The store snapshot reflects the persisted value.
     expect(readGpuAcceleration(useRecordingStore.getState().settings)).toBe(
-      false,
+      "off",
     );
   });
 
   it("round-trips back to on, and a fresh getSettings reads it back", async () => {
     act(() => {
       useRecordingStore.setState({
-        settings: withGpuAcceleration(BASE_SETTINGS, false),
+        settings: withGpuAcceleration(BASE_SETTINGS, "off"),
       });
     });
     vi.mocked(commands.updateSettings).mockReturnValueOnce(okVoid);
 
-    await useRecordingStore.getState().setGpuAcceleration(true);
+    await useRecordingStore.getState().setGpuAcceleration("on");
     expect(commands.updateSettings).toHaveBeenCalledWith({
       ...BASE_SETTINGS,
-      gpu_acceleration: true,
+      gpu_acceleration: "on",
     });
 
     // Simulate a reload: getSettings returns the persisted object.
     vi.mocked(commands.getSettings).mockReturnValueOnce(
-      okSettings(withGpuAcceleration(BASE_SETTINGS, true) as Settings),
+      okSettings(withGpuAcceleration(BASE_SETTINGS, "on") as Settings),
     );
     await useRecordingStore.getState().refreshSettings();
     expect(readGpuAcceleration(useRecordingStore.getState().settings)).toBe(
-      true,
+      "on",
     );
   });
 
@@ -138,7 +139,7 @@ describe("gpu_acceleration toggle round-trip", () => {
     act(() => {
       useRecordingStore.setState({ settings: null });
     });
-    await useRecordingStore.getState().setGpuAcceleration(false);
+    await useRecordingStore.getState().setGpuAcceleration("off");
     expect(commands.updateSettings).not.toHaveBeenCalled();
   });
 });

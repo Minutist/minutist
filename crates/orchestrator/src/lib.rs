@@ -215,10 +215,28 @@ impl Orchestrator {
     /// never stall a fresh install). Wired from `app-main`'s `setup` after the
     /// event bus is up. A build failure is logged and swallowed (the lazy path
     /// remains the safety net), so prewarm can never fail a startup.
+    /// VRAM-aware GPU plan for an ASR/model load, from the current settings.
+    ///
+    /// Computes ONE [`meeting_app_common::GpuPlan`] from the live VRAM probe +
+    /// the user's `gpu_acceleration` mode + `prefer_large_asr_model`. Call it
+    /// once per model-load decision and read `plan.asr_gpu` /
+    /// `plan.effective_prefer_large`; probing twice in one decision would risk
+    /// the two reads disagreeing. See `architecture/cross-cutting.md` — "GPU
+    /// portability".
+    fn gpu_plan(&self) -> meeting_app_common::GpuPlan {
+        let s = self.settings.current();
+        meeting_app_common::resolve_gpu_plan(
+            meeting_app_common::probe_primary_gpu().as_ref(),
+            s.gpu_acceleration,
+            s.prefer_large_asr_model,
+        )
+    }
+
     pub async fn prewarm_asr(&self) {
+        let plan = self.gpu_plan();
         let engine = meeting_app_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
-            self.settings.current().prefer_large_asr_model,
+            plan.effective_prefer_large,
         );
 
         // Idempotent: skip if we already hold a backend for this engine.
@@ -229,7 +247,7 @@ impl Orchestrator {
             }
         }
 
-        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        let n_gpu_layers = runner::resolve_gpu_layers(plan.asr_gpu);
         let language =
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
         let registry = Arc::clone(&self.model_registry);
@@ -369,11 +387,12 @@ impl Orchestrator {
             }
         };
 
-        // GPU offload is a runtime decision: only when BOTH the build has a GPU
-        // feature AND the `gpu_acceleration` setting is on (see
-        // `architecture/cross-cutting.md` — "GPU portability"). `resolve_gpu_layers`
-        // returns the compile-time ceiling when on, `0` (force CPU) when off.
-        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        // GPU offload is a VRAM-aware runtime decision: a single plan probes the
+        // GPU once and decides per model (see `architecture/cross-cutting.md` —
+        // "GPU portability"). `resolve_gpu_layers` maps `plan.asr_gpu` to the
+        // compile-time ceiling (GPU) or `0` (force CPU).
+        let plan = self.gpu_plan();
+        let n_gpu_layers = runner::resolve_gpu_layers(plan.asr_gpu);
 
         // Resolve the ASR language hint from the `transcription_language`
         // setting (see `runner::resolve_transcription_language`): a full English
@@ -384,13 +403,14 @@ impl Orchestrator {
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
 
         // Hybrid ASR (Phase 8): pick the engine from the transcription-language
-        // setting — Parakeet for the languages it covers, else a Qwen tier
-        // (1.7B when `prefer_large_asr_model` is set, else 0.6B). The `language`
-        // hint above only affects the Qwen tiers. See
-        // `common::asr_engine_for_language`.
+        // setting — Parakeet for the languages it covers, else a Qwen tier. The
+        // tier honours `plan.effective_prefer_large` (the requested large tier
+        // only when it ALSO fits the VRAM budget), so a CPU-bound large request
+        // downgrades to the 0.6B default. The `language` hint above only affects
+        // the Qwen tiers. See `common::asr_engine_for_language`.
         let engine = meeting_app_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
-            self.settings.current().prefer_large_asr_model,
+            plan.effective_prefer_large,
         );
 
         // Live diarization (Phase B): build the additive `OnlineDiarizer` BEFORE
@@ -741,11 +761,11 @@ impl Orchestrator {
         let registry = Arc::clone(&self.model_registry);
         let event_tx = self.event_tx.clone();
         let meeting_dir_for_blocking = meeting_dir.clone();
-        // Resolve the runtime GPU-offload count from the `gpu_acceleration`
-        // setting before entering the blocking closure (it cannot read
-        // `self.settings`). The offline re-transcribe honours the same GPU
-        // toggle as the live path.
-        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        // Resolve the VRAM-aware GPU plan before entering the blocking closure
+        // (it cannot read `self.settings`). The offline re-transcribe honours the
+        // same GPU policy + ASR tier as the live path.
+        let plan = self.gpu_plan();
+        let n_gpu_layers = runner::resolve_gpu_layers(plan.asr_gpu);
         // Resolve the ASR language hint before entering the blocking closure (it
         // cannot read `self.settings`). The offline re-transcribe honours the
         // same `transcription_language` setting as the live path.
@@ -753,10 +773,10 @@ impl Orchestrator {
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
         // Hybrid ASR (Phase 8): same engine routing as the live path, so a
         // re-transcribe of an English/EU meeting uses Parakeet (timestamps) and
-        // others use the resolved Qwen tier.
+        // others use the resolved Qwen tier (`plan.effective_prefer_large`).
         let engine = meeting_app_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
-            self.settings.current().prefer_large_asr_model,
+            plan.effective_prefer_large,
         );
         let missing_model_id = runner::engine_model_id(engine);
 
@@ -1008,18 +1028,19 @@ impl Orchestrator {
             });
         }
 
-        // Resolve GPU layers + engine + language hint before entering the
+        // Resolve GPU plan + engine + language hint before entering the
         // blocking closure (it cannot read `self.settings`), mirroring
         // `re_transcribe_claimed`. An explicit caller-supplied `language`
         // overrides the setting-derived hint (the agent may force a re-listen in
         // a known language); the setting-derived engine routing is unchanged.
-        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        let plan = self.gpu_plan();
+        let n_gpu_layers = runner::resolve_gpu_layers(plan.asr_gpu);
         let setting_language =
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
         let effective_language = language.or(setting_language);
         let engine = meeting_app_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
-            self.settings.current().prefer_large_asr_model,
+            plan.effective_prefer_large,
         );
         let missing_model_id = runner::engine_model_id(engine);
         let registry = Arc::clone(&self.model_registry);
@@ -1561,7 +1582,8 @@ impl Orchestrator {
             }
         };
 
-        let n_gpu_layers = runner::resolve_gpu_layers(self.settings.current().gpu_acceleration);
+        let plan = self.gpu_plan();
+        let n_gpu_layers = runner::resolve_gpu_layers(plan.asr_gpu);
         // Resolve the ASR language hint, exactly as the production `start()`
         // path (this test-source path is production-equivalent).
         let language =
@@ -1569,7 +1591,7 @@ impl Orchestrator {
         // Hybrid ASR (Phase 8): same engine routing as the production `start()`.
         let engine = meeting_app_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
-            self.settings.current().prefer_large_asr_model,
+            plan.effective_prefer_large,
         );
         // Phase B: build the live diarizer (gated on diarization_enabled +
         // local model availability), exactly as the production `start()` path.

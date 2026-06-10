@@ -10,6 +10,7 @@ import { commands, unwrap, ipcErrorMessage } from "../ipc/client";
 import type {
   RecordingState,
   AudioDevice,
+  GpuAcceleration,
   Settings,
   Segment,
 } from "../ipc/bindings";
@@ -100,12 +101,13 @@ export type RecordingStore = {
    */
   setDiarizationEnabled: (enabled: boolean) => Promise<void>;
   /**
-   * Toggle the runtime GPU-acceleration setting (on by default), persisting via
+   * Set the runtime GPU-acceleration mode ("auto" by default), persisting via
    * `commands.updateSettings` so the choice survives an app restart — the same
-   * round-trip-through-settings pattern as `setDiarizationEnabled`. When off,
-   * inference runs on CPU even in a GPU-feature build.
+   * round-trip-through-settings pattern as `setDiarizationEnabled`. `Auto`
+   * probes VRAM per model load (GPU when it fits, else CPU); `On`/`Off` force
+   * GPU/CPU. GPU offload only ever happens in a GPU-feature build.
    */
-  setGpuAcceleration: (enabled: boolean) => Promise<void>;
+  setGpuAcceleration: (mode: GpuAcceleration) => Promise<void>;
   /**
    * Toggle preloading the summary/chat LLM at startup (on by default),
    * persisting via `commands.updateSettings` — the same round-trip-through-
@@ -351,7 +353,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
-  setGpuAcceleration: async (enabled) => {
+  setGpuAcceleration: async (mode) => {
     // Persist via `update_settings` so the choice survives an app restart, the
     // same round-trip-through-settings pattern `setDiarizationEnabled` uses.
     const current = get().settings;
@@ -360,7 +362,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       // clobbering with a partial object.
       return;
     }
-    const next = withGpuAcceleration(current, enabled);
+    const next = withGpuAcceleration(current, mode);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

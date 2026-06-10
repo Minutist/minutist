@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use meeting_app_common::ModelId;
+use meeting_app_common::{GpuAcceleration, ModelId};
 use serde::{Deserialize, Serialize};
 
 pub mod error;
@@ -59,8 +59,33 @@ const fn default_autosave_interval_secs() -> u32 {
 /// is only effective in a GPU-feature build: a default CPU-only build always runs
 /// on CPU regardless of this setting. See `architecture/cross-cutting.md` —
 /// "GPU portability".
-const fn default_gpu_acceleration() -> bool {
-    true
+const fn default_gpu_acceleration() -> GpuAcceleration {
+    GpuAcceleration::Auto
+}
+
+/// Deserialize `gpu_acceleration` accepting EITHER the new string enum
+/// (`"auto"`/`"on"`/`"off"`) OR a legacy JSON bool, so an existing store
+/// migrates without losing intent: legacy `true` → `Auto` (the historical
+/// `true` was the unconsidered default, not a deliberate force-GPU, so it adopts
+/// the new safe probe-and-fit behaviour), legacy `false` → `Off` (that WAS a
+/// deliberate CPU choice, so it maps to the hard override). A missing field uses
+/// `#[serde(default)]` (→ `Auto`).
+fn deserialize_gpu_acceleration<'de, D>(deserializer: D) -> Result<GpuAcceleration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrEnum {
+        // bool first: a JSON string falls through to the enum variant.
+        Legacy(bool),
+        Modern(GpuAcceleration),
+    }
+    Ok(match BoolOrEnum::deserialize(deserializer)? {
+        BoolOrEnum::Legacy(true) => GpuAcceleration::Auto,
+        BoolOrEnum::Legacy(false) => GpuAcceleration::Off,
+        BoolOrEnum::Modern(mode) => mode,
+    })
 }
 
 /// Default for `capture_system_audio`: ON. Capturing the call audio is the point
@@ -300,18 +325,21 @@ pub struct Settings {
     #[serde(default)]
     pub onboarding_completed: bool,
 
-    /// Whether GPU acceleration is used at runtime when the build supports it.
+    /// GPU-acceleration MODE (replaces the former `bool`).
     ///
-    /// GPU offload happens ONLY when BOTH (a) the build was compiled with a GPU
-    /// feature (`vulkan`/`metal`/`cuda`/`rocm`) AND (b) this setting is `true`.
-    /// When `false`, inference runs on CPU (`n_gpu_layers = 0`) even in a
-    /// GPU-feature build — the runtime escape hatch for weak GPUs / driver
-    /// trouble. `#[serde(default = ...)]` defaults to `true` (GPU on); an older
-    /// store written before this field existed deserialises to `true`. In a
-    /// default CPU-only build the flag has no effect (inference is always on
-    /// CPU). See `architecture/cross-cutting.md` — "GPU portability".
-    #[serde(default = "default_gpu_acceleration")]
-    pub gpu_acceleration: bool,
+    /// `Auto` (the default) probes GPU VRAM at each model load and offloads a
+    /// model to the GPU only when it fits, else CPU; `On` forces GPU offload;
+    /// `Off` forces CPU. Only effective in a GPU-feature build
+    /// (`vulkan`/`metal`/`cuda`/`rocm`); a default CPU-only build always runs on
+    /// CPU. Migrates a legacy bool store: `true → Auto`, `false → Off` (see
+    /// [`deserialize_gpu_acceleration`]). `#[serde(default = ...)]` →  `Auto` when
+    /// the field is missing. See `architecture/cross-cutting.md` — "GPU
+    /// portability".
+    #[serde(
+        default = "default_gpu_acceleration",
+        deserialize_with = "deserialize_gpu_acceleration"
+    )]
+    pub gpu_acceleration: GpuAcceleration,
 
     /// Whether to capture and mix the system/call (loopback) audio alongside
     /// the microphone, so a Teams-style call transcribes all participants.
@@ -514,7 +542,7 @@ mod tests {
             llm_model_id: Some(ModelId::from("gemma-4-e4b-it-q4_k_m")),
             diarization_enabled: true,
             onboarding_completed: true,
-            gpu_acceleration: false,
+            gpu_acceleration: GpuAcceleration::On,
             capture_system_audio: true,
             transcription_language: "Japanese".to_string(),
             prefer_large_asr_model: true,
@@ -782,42 +810,55 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 1f. gpu_acceleration: default + round-trip + missing-field
-    //     deserialisation (runtime GPU toggle)
+    // 1f. gpu_acceleration: tri-state default + round-trip + legacy-bool
+    //     migration + missing-field deserialisation (runtime GPU mode)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn gpu_acceleration_defaults_to_true() {
-        assert!(
+    fn gpu_acceleration_defaults_to_auto() {
+        assert_eq!(
             Settings::default().gpu_acceleration,
-            "GPU acceleration is on by default; a GPU-feature build offloads, a \
-             CPU-only build ignores the flag (llama.cpp falls back to CPU)"
+            GpuAcceleration::Auto,
+            "GPU mode defaults to Auto (probe VRAM and fit, else CPU)"
         );
     }
 
     #[test]
     fn gpu_acceleration_round_trips() {
-        let original = Settings {
-            gpu_acceleration: false,
-            ..Settings::default()
-        };
-        let json = serde_json::to_string(&original).expect("serialise");
-        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
-        assert!(!restored.gpu_acceleration);
-        assert_eq!(original, restored);
+        for mode in [
+            GpuAcceleration::Auto,
+            GpuAcceleration::On,
+            GpuAcceleration::Off,
+        ] {
+            let original = Settings {
+                gpu_acceleration: mode,
+                ..Settings::default()
+            };
+            let json = serde_json::to_string(&original).expect("serialise");
+            let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+            assert_eq!(restored.gpu_acceleration, mode);
+            assert_eq!(original, restored);
+        }
     }
 
     #[test]
-    fn old_store_json_without_gpu_acceleration_field_defaults_to_true() {
-        // A settings store written before `gpu_acceleration` existed must
-        // deserialise to `true`, preserving the prior compile-time behaviour
-        // (a GPU build offloaded by default).
+    fn gpu_acceleration_migrates_a_legacy_bool_store() {
+        // Legacy `true` was the unconsidered default → adopt the safe Auto.
+        let t: Settings = serde_json::from_str(r#"{ "gpu_acceleration": true }"#).expect("true");
+        assert_eq!(t.gpu_acceleration, GpuAcceleration::Auto);
+        // Legacy `false` WAS a deliberate CPU choice → the hard Off override.
+        let f: Settings = serde_json::from_str(r#"{ "gpu_acceleration": false }"#).expect("false");
+        assert_eq!(f.gpu_acceleration, GpuAcceleration::Off);
+        // The new string form round-trips as-is.
+        let on: Settings = serde_json::from_str(r#"{ "gpu_acceleration": "on" }"#).expect("on");
+        assert_eq!(on.gpu_acceleration, GpuAcceleration::On);
+    }
+
+    #[test]
+    fn old_store_json_without_gpu_acceleration_field_defaults_to_auto() {
         let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
         let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
-        assert!(
-            restored.gpu_acceleration,
-            "missing gpu_acceleration must deserialise to true (GPU on by default)"
-        );
+        assert_eq!(restored.gpu_acceleration, GpuAcceleration::Auto);
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);
     }

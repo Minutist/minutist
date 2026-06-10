@@ -246,6 +246,42 @@ impl IpcState {
             summariser: Arc::clone(&self.summariser),
         }
     }
+
+    /// Log the GPU probe + the resolved plan for the current settings, for
+    /// diagnosing the VRAM auto-detection on real hardware (the thresholds are
+    /// estimates pending this evidence).
+    ///
+    /// `probe_primary_gpu` initialises the llama backend if needed, so call this
+    /// off the async runtime at startup (it can block). See
+    /// `architecture/cross-cutting.md` — "GPU portability".
+    pub fn log_gpu_probe(&self) {
+        let s = self.settings.current();
+        let probe = meeting_app_common::probe_primary_gpu();
+        let plan = meeting_app_common::resolve_gpu_plan(
+            probe.as_ref(),
+            s.gpu_acceleration,
+            s.prefer_large_asr_model,
+        );
+        match &probe {
+            Some(p) => tracing::info!(
+                target: "app-main",
+                gpu = %p.name,
+                total_mb = p.total_bytes / 1048576,
+                free_mb = p.free_bytes / 1048576,
+                integrated = p.is_integrated,
+                mode = ?s.gpu_acceleration,
+                summariser_gpu = plan.summariser_gpu,
+                asr_gpu = plan.asr_gpu,
+                effective_prefer_large = plan.effective_prefer_large,
+                "GPU probe + resolved plan"
+            ),
+            None => tracing::info!(
+                target: "app-main",
+                mode = ?s.gpu_acceleration,
+                "GPU probe: no usable GPU (CPU fallback)"
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

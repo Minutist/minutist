@@ -24,7 +24,7 @@ import { readPreferLargeAsrModel } from "../state/large-asr-model-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
 import { readNotesPaperRules } from "../state/notes-paper-settings";
 import { readTheme } from "../state/onboarding-settings";
-import type { Theme } from "../ipc/bindings";
+import type { GpuAcceleration, Theme } from "../ipc/bindings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
 import { McpSettingsPane } from "./McpSettingsPane";
@@ -169,15 +169,29 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             />
             <span>Identify speakers</span>
           </label>
-          <label className="settings-drawer__toggle">
-            <input
-              type="checkbox"
-              checked={gpuAcceleration}
+          {/* TODO: a live "auto-result" indicator (what Auto actually resolved
+              on this machine) is deferred — it needs a new IPC payload and is
+              out of scope here. The app-startup GPU-probe log
+              (`IpcState::log_gpu_probe`) is the diagnostic for now. */}
+          <div className="settings-drawer__field">
+            <label htmlFor="settings-gpu-acceleration">GPU acceleration</label>
+            <select
+              id="settings-gpu-acceleration"
+              value={gpuAcceleration}
               disabled={settings === null}
-              onChange={(e) => void setGpuAcceleration(e.target.checked)}
-            />
-            <span>GPU acceleration</span>
-          </label>
+              onChange={(e) =>
+                void setGpuAcceleration(e.target.value as GpuAcceleration)
+              }
+            >
+              <option value="auto">Auto</option>
+              <option value="on">On</option>
+              <option value="off">Off</option>
+            </select>
+            <p className="settings-drawer__hint">
+              Auto detects your GPU memory and runs models on GPU when they fit,
+              otherwise CPU.
+            </p>
+          </div>
           <label
             className="settings-drawer__toggle"
             title="Use the larger Qwen3-ASR-1.7B model for languages handled by Qwen (Chinese, Japanese, Korean, Arabic, …). A larger download, best with a GPU. English and European languages use Parakeet regardless of this setting."
@@ -185,11 +199,14 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             <input
               type="checkbox"
               checked={preferLargeAsrModel}
-              disabled={settings === null}
+              disabled={settings === null || gpuAcceleration === "off"}
               onChange={(e) => void setPreferLargeAsrModel(e.target.checked)}
             />
             <span>Higher-accuracy speech model (GPU)</span>
           </label>
+          {gpuAcceleration === "off" && (
+            <p className="settings-drawer__hint">Needs GPU acceleration.</p>
+          )}
           <label
             className="settings-drawer__toggle"
             title="Load the summary & chat model when the app starts (if it is already downloaded) and keep it ready, so the first Summarise or chat is instant. Turn off to load it on first use and keep idle memory lower."

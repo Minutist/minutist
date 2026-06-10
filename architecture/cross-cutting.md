@@ -661,9 +661,10 @@ constraints are binding on them):
   chat/summarise use into `IpcState::summariser`
   (`Arc<OnceCell<Arc<LlamaSummariser>>>`), and shared by both the chat engine (which
   borrows `&LlamaModel`) and the one-shot `summarise_meeting` path (refactored from
-  its prior per-call GGUF load). GPU placement is resolved from the
-  `gpu_acceleration` setting **at load time**; toggling it takes effect on the next
-  process start. Each turn still allocates a fresh `LlamaContext` (clean KV cache).
+  its prior per-call GGUF load). GPU placement is resolved **at load time** from
+  the VRAM-aware `GpuPlan` (`plan.summariser_gpu`; see "GPU portability");
+  toggling the setting takes effect on the next process start. Each turn still
+  allocates a fresh `LlamaContext` (clean KV cache).
   A single in-flight turn per session is enforced via
   `IpcState::chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`.
 
@@ -970,30 +971,67 @@ SDK installed. Feature names match the backend they enable:
   there is no Vulkan/Metal diarization backend, so on those platforms the
   diarizer stays on the ONNX Runtime CPU EP.
 
-Enabling a feature also offloads work to the device, but the layer count is a
-**runtime** decision driven by the `settings.gpu_acceleration` flag (on by
-default). GPU offload happens ONLY when BOTH (a) the build was compiled with a
-GPU feature AND (b) `gpu_acceleration` is `true`. When the flag is `false`,
-inference runs on CPU (`n_gpu_layers = 0`) even in a GPU-feature build — the
-runtime escape hatch for weak GPUs / driver trouble. In a default CPU-only build
-the flag has no effect (the compile-time ceiling is already `0`).
+Enabling a feature also offloads work to the device, but the per-model placement
+is a **VRAM-aware runtime** decision driven by the tri-state
+`settings.gpu_acceleration: GpuAcceleration` (default `Auto`):
+
+- **`Auto`** (default) probes the GPU's reported VRAM at each model-load moment
+  and offloads a model to the GPU only when it fits, else CPU.
+- **`On`** forces full GPU offload without consulting the probe (the old
+  `true`).
+- **`Off`** forces CPU without consulting the probe (the old `false`) — the
+  runtime escape hatch for weak GPUs / driver trouble.
+
+In a default CPU-only build the setting has no effect (the compile-time ceiling
+is already `0`, and `probe_primary_gpu()` returns `None`).
+
+**The probe + the plan.** `common` owns both halves (so the plan + its tests
+build CPU-only):
+
+- `probe_primary_gpu() -> Option<GpuProbe>` (behind the `llama-backend` feature;
+  `None` on a CPU-only build / no device) queries the same ggml backend that
+  loads the GGUFs and reports `{ total_bytes, free_bytes, is_integrated, name }`
+  for the primary device (first discrete GPU, else the integrated one — multi-GPU
+  is out of scope).
+- `resolve_gpu_plan(probe, mode, prefer_large_asr) -> GpuPlan` is **pure** (the
+  probe is an input, so it unit-tests without a GPU) and returns
+  `{ summariser_gpu, asr_gpu, effective_prefer_large }`.
+
+**Policy.** Placement is **binary per model** (whole model on GPU or on CPU):
+partial layer offload is slower than CPU for models this small, and the existing
+`n_gpu_layers` resolution is already binary. Under `Auto` the plan **budgets the
+summariser FIRST** (it stays resident while an ASR model loads when
+`preload_summariser` is on), then budgets ASR against the **remaining** headroom
+and downgrades the requested large ASR tier (`effective_prefer_large = false`)
+when it would not fit alongside the summariser — running the 1.7B model purely on
+CPU is strictly worse than the 0.6B CPU default. The decision base is
+`total_bytes × headroom` (0.90 discrete, 0.50 integrated), **not `free_bytes`**:
+a Vulkan device without `VK_EXT_memory_budget` reports `free == total`, so `free`
+is trusted only to *tighten* the budget when it is a credible smaller number.
+**A `None` probe (no GPU / probe failed) fails safe to CPU** — a false "fits"
+risks an out-of-memory load or a silent host-memory spill. The VRAM thresholds
+in `common` are estimates pending live-hardware evidence; `app-main` logs the
+probe + the resolved default plan once at startup (`IpcState::log_gpu_probe`,
+`target: "app-main"`) so the numbers can be validated against real devices.
 
 Wiring: `asr-runtime`'s `AsrRuntimeConfig` and `summariser`'s `SummariserConfig`
 each carry a `n_gpu_layers: u32` field whose `Default` is the cfg-gated
 compile-time ceiling (`default_n_gpu_layers()` / `gpu_layers()` → `u32::MAX`,
 clamped to `i32::MAX` = "all layers", when a GPU feature is compiled in, else
 `0`). The model-open site uses `config.n_gpu_layers` for `with_n_gpu_layers(...)`,
-and the mtmd `use_gpu` is derived from `config.n_gpu_layers > 0`. The callers
-resolve the runtime value from the setting: the orchestrator
-(`runner::resolve_gpu_layers(enabled)`) for the live + offline-re-transcribe ASR
-path, and `ipc-bridge`'s `summarise_meeting`
-(`resolve_summariser_gpu_layers(enabled)`) for the summariser — each returning
-the compile-time ceiling when the flag is on, `0` when off. llama.cpp falls back
-to CPU at runtime when no device is present, so a GPU-feature build is still safe
-on a CPU-only machine. (Before this, the layer count was purely compile-time; the
-runtime flag now lets a GPU build be forced to CPU. Before *that*, the features
-compiled a GPU backend but the code hard-coded `n_gpu_layers(0)`, so they
-offloaded nothing.)
+and the mtmd `use_gpu` is derived from `config.n_gpu_layers > 0`. Each consumer
+computes **one** `GpuPlan` per model-load decision and maps the relevant boolean
+to the layer count: the orchestrator's private `gpu_plan()` helper feeds
+`runner::resolve_gpu_layers(plan.asr_gpu)` for the live + offline-re-transcribe +
+re-listen + prewarm ASR sites (and `plan.effective_prefer_large` selects the ASR
+tier via `asr_engine_for_language`), while `ipc-bridge`'s held-summariser load
+feeds `commands::resolve_summariser_gpu_layers(plan.summariser_gpu)`. The two
+`resolve_*_gpu_layers(enabled: bool)` helpers are unchanged — only their argument
+is now the plan boolean instead of the old enum-bool. llama.cpp falls back to CPU
+at runtime when no device is present, so a GPU-feature build is still safe on a
+CPU-only machine. (Before this, the placement was a single on/off flag mapped
+straight to the compile-time ceiling; the VRAM-aware plan now lets `Auto` keep
+each model on GPU only when it fits.)
 
 The features fan out through a single chain so the app binary is the only place
 a backend is chosen: `meeting-app` (src-tauri) → `ipc-bridge` → {`summariser`,

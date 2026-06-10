@@ -765,6 +765,30 @@ export type ChatSession = { id: ChatSessionId; meeting_id?: MeetingId | null; ti
  */
 export type ChatSessionId = string
 /**
+ * GPU-acceleration mode (replaces the old `gpu_acceleration: bool`).
+ * 
+ * `Auto` (the default) probes GPU VRAM at each model load and offloads a model
+ * to the GPU only when it fits, falling back to CPU otherwise. `On`/`Off` are
+ * hard overrides that NEVER consult the probe — `On` forces full GPU offload
+ * (the old `true`), `Off` forces CPU (the old `false`). Only effective in a
+ * build compiled with a GPU feature (`vulkan`/`metal`/…); a CPU-only build
+ * always runs on CPU regardless. See `architecture/cross-cutting.md` — "GPU
+ * portability".
+ */
+export type GpuAcceleration = 
+/**
+ * Probe VRAM per model load; GPU iff it fits, else CPU. The new default.
+ */
+"auto" | 
+/**
+ * Force GPU offload (no probe) — the old `gpu_acceleration = true`.
+ */
+"on" | 
+/**
+ * Force CPU (no probe) — the old `gpu_acceleration = false`.
+ */
+"off"
+/**
  * Error type returned from every Tauri command in `ipc-bridge`.
  * 
  * Carries the same discriminants as `common::AppError` and serialises to the
@@ -1026,18 +1050,18 @@ diarization_enabled?: boolean;
  */
 onboarding_completed?: boolean; 
 /**
- * Whether GPU acceleration is used at runtime when the build supports it.
+ * GPU-acceleration MODE (replaces the former `bool`).
  * 
- * GPU offload happens ONLY when BOTH (a) the build was compiled with a GPU
- * feature (`vulkan`/`metal`/`cuda`/`rocm`) AND (b) this setting is `true`.
- * When `false`, inference runs on CPU (`n_gpu_layers = 0`) even in a
- * GPU-feature build — the runtime escape hatch for weak GPUs / driver
- * trouble. `#[serde(default = ...)]` defaults to `true` (GPU on); an older
- * store written before this field existed deserialises to `true`. In a
- * default CPU-only build the flag has no effect (inference is always on
- * CPU). See `architecture/cross-cutting.md` — "GPU portability".
+ * `Auto` (the default) probes GPU VRAM at each model load and offloads a
+ * model to the GPU only when it fits, else CPU; `On` forces GPU offload;
+ * `Off` forces CPU. Only effective in a GPU-feature build
+ * (`vulkan`/`metal`/`cuda`/`rocm`); a default CPU-only build always runs on
+ * CPU. Migrates a legacy bool store: `true → Auto`, `false → Off` (see
+ * [`deserialize_gpu_acceleration`]). `#[serde(default = ...)]` →  `Auto` when
+ * the field is missing. See `architecture/cross-cutting.md` — "GPU
+ * portability".
  */
-gpu_acceleration?: boolean; 
+gpu_acceleration?: GpuAcceleration; 
 /**
  * Whether to capture and mix the system/call (loopback) audio alongside
  * the microphone, so a Teams-style call transcribes all participants.

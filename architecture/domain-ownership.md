@@ -36,6 +36,18 @@ The "Can call without doc update" column is the dependency rule
 restated. Adding any other edge requires updating
 [`components.md`](components.md) in the same commit.
 
+## Cross-cutting ownership notes
+
+- **VRAM-aware GPU placement.** `common` (architecture-owner) owns the VRAM
+  probe `probe_primary_gpu()` (behind the `llama-backend` feature) + the **pure**
+  `resolve_gpu_plan()` and its `GpuProbe` / `GpuAcceleration` / `GpuPlan` types.
+  `ipc-bridge` and `orchestrator` (systems-engineer) are **consumers**: each
+  calls `resolve_gpu_plan` at a model-load moment and maps the plan to the
+  per-model GPU decision (`ipc-bridge` for the summariser; `orchestrator` for
+  ASR). The thresholds + policy are documented in `cross-cutting.md` — "GPU
+  portability". Changing the probe or the plan is an architecture-owner change in
+  `common`; changing only how a consumer uses the plan stays in that consumer.
+
 ## Role definitions
 
 ### `architecture-owner`
@@ -114,6 +126,7 @@ These rules let multiple agents work concurrently without coordination:
 | "Change the agent loop / sampling / tool-call parsing" | ml-runtime-engineer (`chat-agent`) |
 | "Expose a tool over MCP" | systems-engineer (the `expose_over_mcp` allowlist + the `mcp_write_tools` gate in `mcp-server`); the tool itself is `agent-tools` |
 | "Change the MCP transport / auth" | systems-engineer (`mcp-server`) |
+| "Change the VRAM probe or the GPU-plan policy/thresholds" | architecture-owner (`common` — `probe_primary_gpu` / `resolve_gpu_plan`); consumers only re-wire |
 | "Add a telemetry hook" | architecture-owner (it's not in scope yet, requires a doc update) |
 
 ## Anti-patterns the reviewer flags

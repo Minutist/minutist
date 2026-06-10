@@ -8,6 +8,7 @@ import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
+import { MeetingTitle } from "./MeetingTitle";
 import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
 import { ChatView } from "./ChatView";
@@ -194,7 +195,17 @@ export function MainWindow() {
         */}
         <div className="main-window__lead">
           <span className="main-window__wordmark">meeting-app</span>
-          <RecordingStatus />
+          {/*
+            When a finalised meeting is open (idle, not recording), show its
+            editable name here so it can be seen + renamed from the meeting
+            screen, not only the home list. Otherwise (home screen / a live
+            recording) show the recording status.
+          */}
+          {openMeetingId !== null && recordingState.kind === "idle" ? (
+            <MeetingTitle meetingId={openMeetingId} />
+          ) : (
+            <RecordingStatus />
+          )}
         </div>
 
         <div className="main-window__controls">

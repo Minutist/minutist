@@ -25,9 +25,15 @@
 
 use std::path::{Path, PathBuf};
 
-use meeting_app_common::{AppResult, MeetingId};
+use meeting_app_common::{AppResult, MeetingId, NoteBlock};
 
 use crate::error::Error;
+
+/// Paragraph attribute carrying the recording-clock anchor, in milliseconds.
+///
+/// Mirrors `ANCHOR_ATTR` in the editor's `paragraph-anchor.ts`; the editor
+/// stores the anchor under this key in the Tiptap document JSON.
+const ANCHOR_ATTR: &str = "data-anchor-ms";
 
 /// The parsed contents of a meeting's notes files.
 ///
@@ -170,6 +176,91 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     Ok(())
 }
 
+/// Project a Tiptap `notes.json` document into the note paragraphs the
+/// summariser weaves (#70).
+///
+/// Walks the opaque document depth-first and, for every `paragraph` node,
+/// emits one [`NoteBlock`] carrying the paragraph's concatenated plain text and
+/// its `data-anchor-ms` anchor (a number the editor stamps on the
+/// pause-excluding recording clock) when present. Paragraphs are returned in
+/// document order; empty / whitespace-only paragraphs are skipped.
+///
+/// This is a best-effort READ projection, NOT a typed document model: it never
+/// constrains what `notes.json` may contain — the store's opacity guarantee
+/// (see the module docs) is intact — it simply ignores any node shape it does
+/// not recognise. A malformed or non-object document yields an empty vec.
+pub fn note_blocks_from_json(doc: &serde_json::Value) -> Vec<NoteBlock> {
+    let mut out = Vec::new();
+    collect_paragraphs(doc, &mut out);
+    out
+}
+
+/// Depth-first walk collecting one [`NoteBlock`] per non-empty `paragraph` node.
+fn collect_paragraphs(node: &serde_json::Value, out: &mut Vec<NoteBlock>) {
+    if let Some(arr) = node.as_array() {
+        for child in arr {
+            collect_paragraphs(child, out);
+        }
+        return;
+    }
+    let Some(obj) = node.as_object() else {
+        return;
+    };
+
+    if obj.get("type").and_then(|t| t.as_str()) == Some("paragraph") {
+        let mut text = String::new();
+        collect_text(node, &mut text);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let at_ms = obj
+                .get("attrs")
+                .and_then(|a| a.get(ANCHOR_ATTR))
+                .and_then(json_to_ms);
+            out.push(NoteBlock {
+                at_ms,
+                text: trimmed.to_string(),
+            });
+        }
+        // Paragraphs do not nest paragraphs in this schema; the text is already
+        // gathered, so do not recurse into the paragraph's own content.
+        return;
+    }
+
+    // Recurse into `content` to reach paragraphs nested in list items /
+    // blockquotes / the top-level `doc`.
+    if let Some(content) = obj.get("content") {
+        collect_paragraphs(content, out);
+    }
+}
+
+/// Concatenate the plain text of all descendant `text` nodes of `node`.
+fn collect_text(node: &serde_json::Value, out: &mut String) {
+    if let Some(arr) = node.as_array() {
+        for child in arr {
+            collect_text(child, out);
+        }
+        return;
+    }
+    let Some(obj) = node.as_object() else {
+        return;
+    };
+    if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+        if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+            out.push_str(t);
+        }
+    }
+    if let Some(content) = obj.get("content") {
+        collect_text(content, out);
+    }
+}
+
+/// Read a JSON anchor value as a millisecond count. The editor writes an
+/// integer, but tolerate a float-encoded value (clamped non-negative) too.
+fn json_to_ms(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_f64().map(|f| f.max(0.0).round() as u64))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -222,6 +313,76 @@ mod tests {
         // owning type so the layout matches production exactly.
         MeetingFolder::create(&root, id).expect("create meeting folder");
         (tempdir, root, id)
+    }
+
+    // -----------------------------------------------------------------------
+    // 0. note_blocks_from_json projection (#70).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn note_blocks_extracts_anchored_and_nested_paragraphs_in_order() {
+        let blocks = note_blocks_from_json(&representative_doc());
+        // Two paragraphs: the top-level anchored one, then the one nested inside
+        // the bullet list's list item — in document order.
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].at_ms, Some(1234));
+        assert_eq!(blocks[0].text, "Action items from the meeting:");
+        assert_eq!(blocks[1].at_ms, None);
+        assert_eq!(blocks[1].text, "Ship the notes store");
+    }
+
+    #[test]
+    fn note_blocks_skips_empty_paragraphs_and_treats_null_anchor_as_unanchored() {
+        let doc = json!({
+            "type": "doc",
+            "content": [
+                // Empty paragraph (no content) — skipped.
+                { "type": "paragraph", "attrs": { "data-anchor-ms": null } },
+                // Whitespace-only paragraph — skipped.
+                {
+                    "type": "paragraph",
+                    "content": [{ "type": "text", "text": "   " }]
+                },
+                // Explicit null anchor → un-anchored.
+                {
+                    "type": "paragraph",
+                    "attrs": { "data-anchor-ms": null },
+                    "content": [{ "type": "text", "text": "kept" }]
+                },
+            ]
+        });
+        let blocks = note_blocks_from_json(&doc);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].at_ms, None);
+        assert_eq!(blocks[0].text, "kept");
+    }
+
+    #[test]
+    fn note_blocks_concatenates_marked_text_runs_within_a_paragraph() {
+        // A paragraph split into several text nodes (e.g. a bold run) is joined.
+        let doc = json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "attrs": { "data-anchor-ms": 5000 },
+                "content": [
+                    { "type": "text", "text": "decide " },
+                    { "type": "text", "marks": [{ "type": "bold" }], "text": "now" }
+                ]
+            }]
+        });
+        let blocks = note_blocks_from_json(&doc);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].at_ms, Some(5000));
+        assert_eq!(blocks[0].text, "decide now");
+    }
+
+    #[test]
+    fn note_blocks_on_malformed_or_empty_doc_is_empty() {
+        assert!(note_blocks_from_json(&json!({ "type": "doc", "content": [] })).is_empty());
+        assert!(note_blocks_from_json(&json!(null)).is_empty());
+        assert!(note_blocks_from_json(&json!("garbage")).is_empty());
+        assert!(note_blocks_from_json(&json!({ "type": "doc" })).is_empty());
     }
 
     // -----------------------------------------------------------------------

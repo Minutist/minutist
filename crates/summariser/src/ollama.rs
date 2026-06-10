@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use meeting_app_common::{AppResult, Segment, Summariser};
+use meeting_app_common::{AppResult, NoteBlock, Segment, Summariser};
 use serde::{Deserialize, Serialize};
 
 use crate::{render_user_content, strip_think_block, Error};
@@ -112,10 +112,10 @@ impl Summariser for OllamaSummariser {
     fn summarise(
         &self,
         transcript: &[Segment],
-        notes_markdown: &str,
+        notes: &[NoteBlock],
         system_prompt: &str,
     ) -> AppResult<String> {
-        let user_content = render_user_content(transcript, notes_markdown);
+        let user_content = render_user_content(transcript, notes);
         let body = build_chat_request(&self.model, system_prompt, &user_content);
 
         let url = chat_url(&self.base_url);

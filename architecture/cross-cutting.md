@@ -291,7 +291,10 @@ Consequence: `audio.opus` is recorded pause-*including* (the encoder pads each
 pause with synthesised silence), while anchors and segment timestamps are
 pause-*excluding*. Phase 4 cross-reference (FR-22/23) operates **entirely on the
 pause-excluding timeline** (`data-anchor-ms` ↔ `Segment::start_ms`), so it needs
-no conversion. Audio-file *seek-to-anchor* (playing the audio at a clicked
+no conversion. The **summariser** relies on the same coincidence (#70): it
+merges anchored note paragraphs with transcript segments by comparing
+`data-anchor-ms` directly against `Segment::start_ms`, no conversion, to weave
+each note in at the time it was written (see `components.md` — `summariser`). Audio-file *seek-to-anchor* (playing the audio at a clicked
 anchor) is the only feature that must bridge the two timelines — it needs a
 pause-offset map (a list of pause intervals) — and it was **deferred out of
 Phase 4** (no audio player shipped this phase). Whatever phase adds audio
@@ -384,7 +387,10 @@ Owned by `model-registry`. The contract:
   remain skippable and continue in the background if the user proceeds. If the
   LLM was skipped, the Summarise action's in-progress UI distinguishes the
   one-time **model-download phase** (with %) from actual summarisation, so the
-  multi-GB wait is not mislabelled "Summarising…".
+  multi-GB wait is not mislabelled "Summarising…". A downloaded-but-not-yet-
+  loaded LLM still costs an mmap + warmup on the first summarise; #69 surfaces
+  THAT as the indeterminate **"Loading the summarisation model…"** phase of the
+  summarise progress bar (see "Operation progress"), distinct from the download.
 - **Progress UX.** `ensureModel` enters the downloading state optimistically on
   click (seeded at the model's known partial fraction) because resuming a large
   partial spends seconds re-hashing before the first progress event — a lingering
@@ -469,12 +475,22 @@ indicator. Producers + determinism:
 - **`ReTranscribe` (determinate)** — `orchestrator::runner::re_transcribe_buffer`
   emits per accumulator flush, `fraction = kept-samples-fed / total-kept-samples`
   (a pure `re_transcribe_fraction`, unit-tested). Cleared by `TranscriptReady`.
-- **`Summarise` (determinate)** — `ipc-bridge::summarise_meeting` drives the
-  concrete `LlamaSummariser::summarise_with_progress`, whose generation loop
-  reports `(tokens_generated, max_tokens)`; the callback emits a throttled (~5 Hz)
-  `fraction = tokens / max_tokens`. (The `common::Summariser` trait is unchanged —
-  the progress method is concrete on `LlamaSummariser`, which `ipc-bridge` holds.)
-  Cleared by `SummaryReady`.
+- **`Summarise` (two-phase determinate + indeterminate lead-in, #69)** —
+  `ipc-bridge::run_held_summarise` drives the concrete
+  `LlamaSummariser::summarise_with_progress`, which now reports a phased
+  `SummariseProgress`. The bar progresses through up to four labelled phases so
+  the user is never staring at a silent 0% on a long meeting: (1) indeterminate
+  **"Loading the summarisation model…"** around `ensure_summariser` (the
+  multi-GB GGUF mmap + warmup, paid on the first summarise of a session —
+  including the post-stop auto-summarise); (2) indeterminate **"Preparing the
+  model…"** for the `LlamaContext` build (cold-GPU shader compile) before the
+  first prefill tick; (3) determinate **"Reading the meeting…"** `Prefill { done,
+  total }` as the transcript+notes prompt decodes chunk by chunk; (4) determinate
+  **"Writing the summary…"** `Generate { done, max }` per token. The callback is
+  throttled to ~5 Hz but always emits on a phase change and at completion. (The
+  `common::Summariser::summarise` signature changed for #70 — `notes_markdown:
+  &str` → `notes: &[NoteBlock]` — but the *progress* method stays concrete on
+  `LlamaSummariser`, which `ipc-bridge` holds.) Cleared by `SummaryReady`.
 - **`Rediarize` (indeterminate)** — the sherpa diarization `compute` is one opaque
   FFI call with no progress callback, so `fraction = None`. Cleared by
   `DiarizationComplete`.

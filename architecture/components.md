@@ -75,10 +75,14 @@ used, not added here.
 `WordTimestamp`, `MeetingMeta`, `ModelDescriptor`, `RecordingState`,
 `AppEvent`, `AudioDevice`, `AudioMeterFrame`, `AudioFormat`,
 `ModelKind`, `ModelManifestEntry`, `ModelFileEntry`, `ModelStatusState`,
-`ModelStatus`, `MeetingListEntry`, `NotesDocument`, `MeetingState`,
+`ModelStatus`, `MeetingListEntry`, `NotesDocument`, `NoteBlock`, `MeetingState`,
 `InterAgentRequest`, `InterAgentReply`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
+`NoteBlock { at_ms: Option<u64>, text }` (#70) is a note paragraph for the
+summariser — anchored ones carry the `data-anchor-ms` recording-clock
+timestamp; `Summariser::summarise` takes `&[NoteBlock]` (not flat markdown) so
+notes weave into the transcript at their time.
 
 **Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
 newtype mirroring `MeetingId`); six chat `AppEvent` variants (`ChatToken`,
@@ -601,6 +605,22 @@ reverse. `pub fn gpu_layers()` (the compile-time GPU-offload ceiling) is also
 re-used by `chat-agent`'s `LlamaTurnConfig` default. No new dependency edge —
 `summariser` still depends only on `common`.
 
+**Notes weaving + two-phase progress (#69/#70).** The `common::Summariser`
+trait's `summarise` now takes `notes: &[NoteBlock]` (was `notes_markdown:
+&str`). `NoteBlock { at_ms: Option<u64>, text }` is a `common` vocabulary type;
+`persistence::note_blocks_from_json` / `read_note_blocks` project a meeting's
+`notes.json` into these (anchored paragraphs carry their `data-anchor-ms`
+recording-clock timestamp). When any note is anchored, `render_user_content`
+merges the transcript and the anchored notes into ONE time-ordered, `[m:ss]`-
+prefixed timeline so the model sees each note beside what was being said when it
+was written; un-anchored notes trail the timeline. With no anchored notes the
+prior plain transcript + flat `# Notes` block is rendered byte-for-byte (no
+extra context tokens). `summarise_with_progress` now reports a two-phase
+`SummariseProgress` (`Prefill { done, total }` per prompt chunk, then `Generate
+{ done, max }` per token); `ipc-bridge` maps the phases — plus an indeterminate
+model-load / context-prepare phase — onto labelled `OperationProgress` (see
+`cross-cutting.md` — "Operation progress"). Still depends only on `common`.
+
 **`external-ollama` test coverage + verification.** `OllamaSummariser`'s
 deterministic seams are factored into pure functions — `chat_url` (base-URL
 normalisation, trailing slash tolerant), `build_chat_request` (the
@@ -754,6 +774,14 @@ on `common`.
     `meta` + `transcript` + optional `notes` (via `NotesStore::load`, mapped to
     `common::NotesDocument`; the opaque `notes.json` value is re-serialised to
     the wire-facing string). This is the `open_meeting` restore payload.
+  - `read_note_blocks(meeting_dir) -> AppResult<Vec<NoteBlock>>` (#70) —
+    projects `notes.json` into `common::NoteBlock`s for the summariser via the
+    pure `note_blocks_from_json(&Value)`. A best-effort READ projection (one
+    block per non-empty `paragraph` node, carrying its `data-anchor-ms` anchor
+    when present); it does NOT model the Tiptap schema or weaken the
+    `NotesStore` opacity guarantee. Used by `ipc-bridge`'s summarise path and
+    `agent-tools`' `resummarise` so notes weave into the transcript at their
+    timestamp.
 - **libsql index (`index` + `migrations` modules).** `MeetingIndex` opens (or
   creates) `index.db` at an **injected** path (`":memory:"` in tests) and runs
   a **forward-only migration runner** (`migrations::run`): a single-row

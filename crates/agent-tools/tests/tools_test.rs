@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use agent_tools::{ToolContext, ToolRegistry};
 use meeting_app_common::{
-    AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, Segment, Summariser,
+    AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, NoteBlock, Segment, Summariser,
 };
 use orchestrator::test_support::test_orchestrator;
 use orchestrator::Orchestrator;
@@ -33,7 +33,7 @@ impl Summariser for StubSummariser {
     fn summarise(
         &self,
         transcript: &[Segment],
-        _notes_markdown: &str,
+        _notes: &[NoteBlock],
         system_prompt: &str,
     ) -> AppResult<String> {
         Ok(format!(

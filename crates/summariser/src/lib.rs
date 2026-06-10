@@ -49,7 +49,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
-use meeting_app_common::{AppResult, Segment, Summariser};
+use meeting_app_common::{AppResult, NoteBlock, Segment, Summariser};
 
 mod error;
 pub use error::Error;
@@ -58,6 +58,24 @@ pub use error::Error;
 mod ollama;
 #[cfg(feature = "external-ollama")]
 pub use ollama::OllamaSummariser;
+
+/// A phase + position of an in-progress summarise, for a two-phase determinate
+/// bar (#69).
+///
+/// A long summarise spends its first stretch decoding the prompt — transcript +
+/// notes — into the KV cache (`Prefill`), then writes the summary token by
+/// token (`Generate`). Prefill produces NO output and, for a long meeting, runs
+/// for many seconds: reporting only generation (the prior behaviour) left the
+/// bar pinned at 0% for that whole stretch. The caller maps each phase onto its
+/// own labelled, determinate `OperationProgress` so the bar reflects both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummariseProgress {
+    /// Decoding the prompt into the KV cache. `done`/`total` are prompt-token
+    /// counts; `done` reaches `total` as the final chunk is decoded.
+    Prefill { done: usize, total: usize },
+    /// Generating the summary. `done`/`max` are output-token counts.
+    Generate { done: usize, max: usize },
+}
 
 /// Runtime knobs for the summariser. Defaults follow the cross-cutting
 /// chunked-prefill rule (`n_batch` is the per-decode chunk size).
@@ -214,26 +232,25 @@ impl LlamaSummariser {
         &self.config
     }
 
-    /// Like [`Summariser::summarise`] but reports generation progress through
-    /// `on_progress` (live-test UX T4(b)).
+    /// Like [`Summariser::summarise`] but reports progress through `on_progress`
+    /// (live-test UX T4(b), two-phase #69).
     ///
-    /// The callback is invoked after each generated token with `(tokens_generated,
-    /// max_tokens)` so the caller can render a determinate bar
-    /// (`tokens_generated / max_tokens`); `ipc-bridge` maps this onto
-    /// `AppEvent::OperationProgress`. It is throttled by the caller, not here — a
-    /// per-token callback is cheap (an atomic/Instant check + maybe a broadcast
-    /// send). Prefill (no token output yet) is not reported; the caller emits a
-    /// 0.0 start before calling. Kept a concrete method (not on the `common`
-    /// `Summariser` trait) so the trait — and its other impls — are unchanged;
-    /// `ipc-bridge` holds the concrete `Arc<LlamaSummariser>`.
+    /// The callback is invoked with [`SummariseProgress`]: `Prefill` ticks as
+    /// the prompt is decoded chunk by chunk, then `Generate` ticks after each
+    /// generated token. `ipc-bridge` maps each phase onto a labelled
+    /// `AppEvent::OperationProgress` (a determinate bar per phase). It is
+    /// throttled by the caller, not here — the callback is cheap (an
+    /// `Instant` check + maybe a broadcast send). Kept a concrete method (not on
+    /// the `common` `Summariser` trait) so the trait stays minimal for its other
+    /// impls; `ipc-bridge` holds the concrete `Arc<LlamaSummariser>`.
     pub fn summarise_with_progress(
         &self,
         transcript: &[Segment],
-        notes_markdown: &str,
+        notes: &[NoteBlock],
         system_prompt: &str,
-        mut on_progress: impl FnMut(usize, usize),
+        mut on_progress: impl FnMut(SummariseProgress),
     ) -> AppResult<String> {
-        let prompt = self.build_prompt(transcript, notes_markdown, system_prompt)?;
+        let prompt = self.build_prompt(transcript, notes, system_prompt)?;
         let raw = self.generate_with_progress(&prompt, &mut on_progress)?;
         Ok(strip_think_block(&raw))
     }
@@ -261,10 +278,10 @@ impl Summariser for LlamaSummariser {
     fn summarise(
         &self,
         transcript: &[Segment],
-        notes_markdown: &str,
+        notes: &[NoteBlock],
         system_prompt: &str,
     ) -> AppResult<String> {
-        let prompt = self.build_prompt(transcript, notes_markdown, system_prompt)?;
+        let prompt = self.build_prompt(transcript, notes, system_prompt)?;
         let raw = self.generate(&prompt)?;
         Ok(strip_think_block(&raw))
     }
@@ -288,7 +305,7 @@ impl LlamaSummariser {
     fn build_prompt(
         &self,
         transcript: &[Segment],
-        notes_markdown: &str,
+        notes: &[NoteBlock],
         system_prompt: &str,
     ) -> Result<String, Error> {
         let template = self
@@ -296,7 +313,7 @@ impl LlamaSummariser {
             .chat_template(None::<&str>)
             .map_err(|e| Error::Template(e.to_string()))?;
 
-        let user_content = render_user_content(transcript, notes_markdown);
+        let user_content = render_user_content(transcript, notes);
         let combined = format!("{system_prompt}\n\n{user_content}");
 
         let user_msg = LlamaChatMessage::new("user".to_string(), combined.clone())
@@ -326,18 +343,19 @@ impl LlamaSummariser {
     /// Tokenise the prompt, chunked-prefill it, then greedily generate.
     fn generate(&self, prompt: &str) -> Result<String, Error> {
         // No-op progress callback: the no-progress path is unchanged.
-        self.generate_with_progress(prompt, &mut |_, _| {})
+        self.generate_with_progress(prompt, &mut |_| {})
     }
 
-    /// [`Self::generate`] with a per-token progress callback (live-test UX
-    /// T4(b)). The callback receives `(tokens_generated, max_tokens)` after each
-    /// generated token. Everything else (tokenisation, chunked prefill, greedy
-    /// sampling, EOG stop, incremental detokenisation) is identical to
-    /// [`Self::generate`].
+    /// [`Self::generate`] with a two-phase progress callback (live-test UX
+    /// T4(b), #69). The callback receives a [`SummariseProgress::Prefill`] tick
+    /// after each prompt chunk is decoded, then a [`SummariseProgress::Generate`]
+    /// tick after each generated token. Everything else (tokenisation, chunked
+    /// prefill, greedy sampling, EOG stop, incremental detokenisation) is
+    /// identical to [`Self::generate`].
     fn generate_with_progress(
         &self,
         prompt: &str,
-        on_progress: &mut dyn FnMut(usize, usize),
+        on_progress: &mut dyn FnMut(SummariseProgress),
     ) -> Result<String, Error> {
         let backend = get_or_init_backend()?;
 
@@ -376,6 +394,7 @@ impl LlamaSummariser {
         // --- Chunked prefill ---
         let plan = plan_prefill(tokens.len(), self.config.n_batch);
         let mut batch = LlamaBatch::new(self.config.n_batch as usize, 1);
+        let total_prompt = tokens.len();
 
         for chunk in &plan.chunks {
             batch.clear();
@@ -390,6 +409,14 @@ impl LlamaSummariser {
             llama_ctx
                 .decode(&mut batch)
                 .map_err(|e| Error::Inference(format!("decode (prefill): {e}")))?;
+
+            // Report prefill progress AFTER this chunk decodes (#69): `done` is
+            // the count of prompt tokens whose KV cache is now populated.
+            let done = (chunk.start + chunk.len).min(total_prompt);
+            on_progress(SummariseProgress::Prefill {
+                done,
+                total: total_prompt,
+            });
         }
 
         // --- Greedy generation ---
@@ -405,7 +432,10 @@ impl LlamaSummariser {
             if self.model.is_eog_token(token) {
                 // EOG: jump the bar to 100 % so a short summary still completes
                 // the bar rather than leaving it stuck mid-way.
-                on_progress(self.config.max_tokens, self.config.max_tokens);
+                on_progress(SummariseProgress::Generate {
+                    done: self.config.max_tokens,
+                    max: self.config.max_tokens,
+                });
                 break;
             }
 
@@ -416,7 +446,10 @@ impl LlamaSummariser {
             text.push_str(&piece);
 
             // Report progress AFTER appending this token (`i + 1` generated).
-            on_progress(i + 1, self.config.max_tokens);
+            on_progress(SummariseProgress::Generate {
+                done: i + 1,
+                max: self.config.max_tokens,
+            });
 
             batch.clear();
             batch
@@ -447,13 +480,79 @@ fn gemma_turn_prompt(content: &str) -> String {
     format!("<bos><start_of_turn>user\n{content}<end_of_turn>\n<start_of_turn>model\n")
 }
 
-/// Render the transcript + notes into the single `user` message body.
+/// Render the transcript + notes into the single `user` message body (#70).
 ///
-/// Speaker-attributed lines when `speaker_id` is present, plain text
-/// otherwise. The notes markdown follows after a blank line under a heading so
-/// the model can distinguish "what was said" from "what the user wrote".
-fn render_user_content(transcript: &[Segment], notes_markdown: &str) -> String {
+/// When at least one note paragraph is anchored to the recording clock, the
+/// transcript and the anchored notes are merged into ONE chronological timeline,
+/// each line prefixed with its `[m:ss]` timestamp, so the model sees each note
+/// beside what was being said when it was written ("woven in at the time").
+/// Un-anchored notes (and the prior `# Notes` block) follow the timeline.
+///
+/// When NO note is anchored — the meeting was recorded without live note-taking,
+/// or notes were typed while idle / imported — the transcript renders WITHOUT
+/// per-line timestamps (the prior format), so the common case spends no extra
+/// context tokens and the no-notes prompt is byte-for-byte unchanged.
+fn render_user_content(transcript: &[Segment], notes: &[NoteBlock]) -> String {
+    let any_anchored = notes.iter().any(|n| n.at_ms.is_some());
     let mut out = String::new();
+
+    if any_anchored {
+        out.push_str("# Transcript (notes woven in at the time they were written)\n\n");
+
+        // Merge transcript segments and anchored notes into a time-ordered
+        // stream. The sort is stable and keyed on `(ms, kind)` with the
+        // transcript line ranking before a note at the same timestamp (the note
+        // was written about what was just said); ties within a kind keep
+        // document order.
+        enum Line<'a> {
+            Seg(&'a Segment),
+            Note(&'a NoteBlock),
+        }
+        let mut lines: Vec<(u64, u8, Line<'_>)> = Vec::new();
+        for seg in transcript {
+            lines.push((seg.start_ms, 0, Line::Seg(seg)));
+        }
+        for note in notes {
+            if let Some(at) = note.at_ms {
+                lines.push((at, 1, Line::Note(note)));
+            }
+        }
+        lines.sort_by_key(|(ms, kind, _)| (*ms, *kind));
+
+        for (ms, _, line) in &lines {
+            out.push('[');
+            out.push_str(&format_clock(*ms));
+            out.push_str("] ");
+            match line {
+                Line::Seg(seg) => {
+                    if let Some(speaker) = &seg.speaker_id {
+                        out.push_str(speaker);
+                        out.push_str(": ");
+                    }
+                    out.push_str(seg.text.trim());
+                }
+                Line::Note(note) => {
+                    out.push_str("NOTE — ");
+                    out.push_str(note.text.trim());
+                }
+            }
+            out.push('\n');
+        }
+
+        let unanchored: Vec<&NoteBlock> =
+            notes.iter().filter(|n| n.at_ms.is_none()).collect();
+        if !unanchored.is_empty() {
+            out.push_str("\n# Notes (no timestamp)\n\n");
+            for note in unanchored {
+                out.push_str(note.text.trim());
+                out.push('\n');
+            }
+        }
+        return out;
+    }
+
+    // No anchored notes: the prior plain format (transcript, then a flat notes
+    // block reconstructed from the un-anchored paragraphs).
     out.push_str("# Transcript\n\n");
     for seg in transcript {
         if let Some(speaker) = &seg.speaker_id {
@@ -465,14 +564,31 @@ fn render_user_content(transcript: &[Segment], notes_markdown: &str) -> String {
     }
 
     out.push_str("\n# Notes\n\n");
-    if notes_markdown.trim().is_empty() {
+    if notes.is_empty() {
         out.push_str("(no notes taken)\n");
     } else {
-        out.push_str(notes_markdown.trim());
-        out.push('\n');
+        for note in notes {
+            out.push_str(note.text.trim());
+            out.push('\n');
+        }
     }
 
     out
+}
+
+/// Format a millisecond offset as `m:ss` (or `h:mm:ss` past an hour) for the
+/// woven timeline — a coarse marker the model uses to order notes against the
+/// transcript, not a precise clock.
+fn format_clock(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 /// Strip a leading/embedded `<think>…</think>` block from model output.
@@ -790,13 +906,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn seg(text: &str, speaker: Option<&str>) -> Segment {
+        seg_at(0, text, speaker)
+    }
+
+    fn seg_at(start_ms: u64, text: &str, speaker: Option<&str>) -> Segment {
         Segment {
-            start_ms: 0,
-            end_ms: 1_000,
+            start_ms,
+            end_ms: start_ms + 1_000,
             text: text.to_string(),
             speaker_id: speaker.map(|s| s.to_string()),
             confidence: None,
             words: vec![],
+        }
+    }
+
+    fn note(at_ms: Option<u64>, text: &str) -> NoteBlock {
+        NoteBlock {
+            at_ms,
+            text: text.to_string(),
         }
     }
 
@@ -806,22 +933,80 @@ mod tests {
             seg("hello there", Some("Speaker 1")),
             seg("general kenobi", Some("Speaker 2")),
         ];
-        let body = render_user_content(&transcript, "- action item one");
+        let body = render_user_content(&transcript, &[note(None, "- action item one")]);
 
         assert!(body.contains("# Transcript"));
         assert!(body.contains("Speaker 1: hello there"));
         assert!(body.contains("Speaker 2: general kenobi"));
         assert!(body.contains("# Notes"));
         assert!(body.contains("- action item one"));
+        // No anchored note → the plain transcript carries NO per-line timestamp.
+        assert!(!body.contains("[0:00]"), "unanchored path must not timestamp lines");
     }
 
     #[test]
     fn render_user_content_without_speakers_or_notes() {
         let transcript = vec![seg("just one line", None)];
-        let body = render_user_content(&transcript, "   ");
+        let body = render_user_content(&transcript, &[]);
         assert!(body.contains("just one line"));
         assert!(!body.contains(": just one line"), "no speaker prefix expected");
         assert!(body.contains("(no notes taken)"));
+    }
+
+    #[test]
+    fn render_user_content_weaves_anchored_notes_by_timestamp() {
+        // Two segments at 0 s and 1:05; a note anchored at 1:00 must land BETWEEN
+        // them (after the 0 s line, before the 1:05 line), prefixed `NOTE —`.
+        let transcript = vec![
+            seg_at(0, "opening remarks", Some("Alice")),
+            seg_at(65_000, "later point", Some("Bob")),
+        ];
+        let notes = vec![note(Some(60_000), "follow up on budget")];
+        let body = render_user_content(&transcript, &notes);
+
+        assert!(body.contains("woven in"), "weaving heading expected: {body}");
+        let note_pos = body.find("NOTE — follow up on budget").expect("note line");
+        let open_pos = body.find("Alice: opening remarks").expect("open line");
+        let late_pos = body.find("Bob: later point").expect("late line");
+        assert!(open_pos < note_pos, "note must follow the 0 s segment");
+        assert!(note_pos < late_pos, "note must precede the 1:05 segment");
+        // Timestamps are rendered for every line in the woven path.
+        assert!(body.contains("[0:00] Alice: opening remarks"));
+        assert!(body.contains("[1:00] NOTE — follow up on budget"));
+        assert!(body.contains("[1:05] Bob: later point"));
+    }
+
+    #[test]
+    fn render_user_content_segment_outranks_note_at_equal_timestamp() {
+        let transcript = vec![seg_at(30_000, "said this", Some("Cara"))];
+        let notes = vec![note(Some(30_000), "wrote this")];
+        let body = render_user_content(&transcript, &notes);
+        let seg_pos = body.find("Cara: said this").expect("seg");
+        let note_pos = body.find("NOTE — wrote this").expect("note");
+        assert!(seg_pos < note_pos, "transcript ranks before a note at the same ms");
+    }
+
+    #[test]
+    fn render_user_content_lists_unanchored_notes_after_the_woven_timeline() {
+        let transcript = vec![seg_at(0, "hello", None)];
+        let notes = vec![
+            note(Some(5_000), "anchored thought"),
+            note(None, "pre-meeting agenda"),
+        ];
+        let body = render_user_content(&transcript, &notes);
+        let woven = body.find("anchored thought").expect("anchored");
+        let trailing_header = body.find("# Notes (no timestamp)").expect("trailing header");
+        let trailing = body.find("pre-meeting agenda").expect("unanchored");
+        assert!(woven < trailing_header && trailing_header < trailing);
+    }
+
+    #[test]
+    fn format_clock_renders_minutes_and_hours() {
+        assert_eq!(format_clock(0), "0:00");
+        assert_eq!(format_clock(5_000), "0:05");
+        assert_eq!(format_clock(65_000), "1:05");
+        assert_eq!(format_clock(3_600_000), "1:00:00");
+        assert_eq!(format_clock(3_723_000), "1:02:03");
     }
 
     // -----------------------------------------------------------------------
@@ -958,13 +1143,16 @@ mod tests {
                 .expect("model load must succeed with a valid path");
 
         let transcript = synthetic_30min_transcript();
-        let notes = "- Action: own the model-download resume bug\n- Decision: prioritise diarisation accuracy";
+        let notes = [
+            note(None, "- Action: own the model-download resume bug"),
+            note(None, "- Decision: prioritise diarisation accuracy"),
+        ];
         let system_prompt =
             "You are a meeting-notes assistant. Produce a concise markdown summary with headings.";
 
         let start = std::time::Instant::now();
         let summary = summariser
-            .summarise(&transcript, notes, system_prompt)
+            .summarise(&transcript, &notes, system_prompt)
             .expect("summarise must succeed");
         let elapsed = start.elapsed();
 
@@ -1022,7 +1210,7 @@ mod tests {
         let summary = summariser
             .summarise(
                 &transcript,
-                "",
+                &[],
                 "You are a meeting-notes assistant. Produce a concise markdown \
                  summary with headings.",
             )

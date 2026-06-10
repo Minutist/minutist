@@ -35,11 +35,11 @@ use chat_agent::{LlamaTurnBackend, LlamaTurnConfig, TurnEngine};
 use meeting_app_common::{
     AppError, AppEvent, AppResult, AudioDevice, ChatMessage, ChatRole, ChatSession, ChatSessionId,
     MeetingId, MeetingListEntry, MeetingMeta, MeetingState, ModelId, ModelStatus, NotesDocument,
-    RecordingState, Summariser,
+    OperationKind, RecordingState, Summariser,
 };
 use persistence::{meeting_ops, ChatStore, NotesStore};
 use settings::Settings;
-use summariser::{LlamaSummariser, SummariserConfig};
+use summariser::{LlamaSummariser, SummariseProgress, SummariserConfig};
 use tauri::State;
 use tokio::sync::broadcast;
 
@@ -755,6 +755,18 @@ async fn run_held_summarise(
     let current = handles.settings.current();
     let event_tx = &handles.event_tx;
 
+    // #69: surface the model LOAD as an indeterminate phase BEFORE it starts.
+    // `ensure_summariser` mmaps + warms the multi-GB GGUF the FIRST time it is
+    // called (and the first summarise of a session — including the post-stop
+    // auto-summarise — pays it). On a warm load this flashes by; on a cold load
+    // it is the bulk of the wait the user otherwise saw as a stuck 0%.
+    emit_summarise_op(
+        event_tx,
+        meeting_id,
+        None,
+        "Loading the summarisation model…",
+    );
+
     // Phase 9 (C2): use the HELD summariser substrate — loaded once on first
     // chat/summarise use and shared with the chat agent — instead of opening a
     // fresh `LlamaSummariser` per call (the old per-call GGUF reload killed
@@ -768,12 +780,6 @@ async fn run_held_summarise(
     // custom `summary_system_prompt` override when non-empty, else the built-in
     // prompt for the selected `summary_preset`.
     let system_prompt = current.effective_summary_prompt();
-
-    // Live-test UX T4(b): emit a 0.0 DETERMINATE start so the per-row indicator
-    // shows immediately while the LLM prefills (which is several seconds of no
-    // token output). The generation loop then drives the bar via the progress
-    // callback below.
-    emit_summarise_progress(event_tx, meeting_id, 0.0);
 
     // Heavy, synchronous summarise work on a blocking thread (the held model's
     // `summarise` builds a fresh `LlamaContext` and decodes). The held handle is
@@ -906,30 +912,50 @@ fn summarise_meeting_with_progress(
     let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
 
     let transcript = persistence::read_transcript(&meeting_dir)?;
-    let notes_markdown = persistence::read_meeting_state(&meeting_dir)?
-        .notes
-        .map(|n| n.notes_markdown)
-        .unwrap_or_default();
+    // #70: load the note paragraphs WITH their recording-clock anchors so the
+    // summariser can weave them into the transcript at the time they were
+    // written (rather than appending a flat markdown block).
+    let notes = persistence::read_note_blocks(&meeting_dir)?;
 
-    // Throttle the per-token callback to ~5 Hz so a fast GPU run does not flood
-    // the broadcast bus (the meter already runs at ~30 Hz on the same channel).
+    // #69: the model is loaded; the next opaque wait is building the
+    // `LlamaContext` (cold GPU shader compile, tens of seconds on first use)
+    // before the first prefill tick. Show an indeterminate "Preparing…" until
+    // the prefill phase starts reporting.
+    emit_summarise_op(event_tx, meeting_id, None, "Preparing the model…");
+
+    // Throttle the callback to ~5 Hz so a fast GPU run does not flood the
+    // broadcast bus (the meter already runs at ~30 Hz on the same channel), but
+    // ALWAYS emit on a phase change (prefill→generate) and on completion so the
+    // label flips promptly and the bar reaches 100%.
     let mut last_emit = std::time::Instant::now();
+    let mut last_phase: u8 = 0;
     let summary_md = summariser.summarise_with_progress(
         &transcript,
-        &notes_markdown,
+        &notes,
         system_prompt,
-        |generated, max_tokens| {
+        |progress| {
+            let (phase, fraction, label): (u8, f32, &str) = match progress {
+                SummariseProgress::Prefill { done, total } => (
+                    1,
+                    if total == 0 { 1.0 } else { done as f32 / total as f32 },
+                    "Reading the meeting…",
+                ),
+                SummariseProgress::Generate { done, max } => (
+                    2,
+                    if max == 0 { 1.0 } else { done as f32 / max as f32 },
+                    "Writing the summary…",
+                ),
+            };
             let now = std::time::Instant::now();
-            // Always emit the final (generated == max_tokens) tick; throttle the rest.
-            let done = generated >= max_tokens;
-            if done || now.duration_since(last_emit) >= std::time::Duration::from_millis(200) {
+            let phase_changed = phase != last_phase;
+            let complete = fraction >= 1.0;
+            if phase_changed
+                || complete
+                || now.duration_since(last_emit) >= std::time::Duration::from_millis(200)
+            {
                 last_emit = now;
-                let fraction = if max_tokens == 0 {
-                    1.0
-                } else {
-                    (generated as f32 / max_tokens as f32).clamp(0.0, 1.0)
-                };
-                emit_summarise_progress(event_tx, meeting_id, fraction);
+                last_phase = phase;
+                emit_summarise_op(event_tx, meeting_id, Some(fraction), label);
             }
         },
     )?;
@@ -939,17 +965,23 @@ fn summarise_meeting_with_progress(
     Ok(summary_md)
 }
 
-/// Emit a DETERMINATE `AppEvent::OperationProgress` for the summarise op.
-fn emit_summarise_progress(
+/// Emit an `AppEvent::OperationProgress` for the summarise op (#69).
+///
+/// `fraction` is `Some` for a determinate bar (clamped to `0..=1`) or `None`
+/// for an indeterminate spinner (the model-load / context-prepare phases that
+/// have no progress callback). `label` names the phase so the bar explains the
+/// wait rather than sitting at a silent 0%.
+fn emit_summarise_op(
     event_tx: &broadcast::Sender<AppEvent>,
     meeting_id: MeetingId,
-    fraction: f32,
+    fraction: Option<f32>,
+    label: &str,
 ) {
     let _ = event_tx.send(AppEvent::OperationProgress {
         meeting_id,
-        op: meeting_app_common::OperationKind::Summarise,
-        fraction: Some(fraction.clamp(0.0, 1.0)),
-        label: "Summarising…".to_string(),
+        op: OperationKind::Summarise,
+        fraction: fraction.map(|f| f.clamp(0.0, 1.0)),
+        label: label.to_string(),
     });
 }
 
@@ -1024,14 +1056,11 @@ fn summarise_meeting_inner(
     let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
 
     let transcript = persistence::read_transcript(&meeting_dir)?;
-    // The notes markdown comes from the assembled meeting state (notes are
-    // optional — an empty string when the meeting has none).
-    let notes_markdown = persistence::read_meeting_state(&meeting_dir)?
-        .notes
-        .map(|n| n.notes_markdown)
-        .unwrap_or_default();
+    // Note paragraphs with recording-clock anchors (#70); empty when the meeting
+    // has none.
+    let notes = persistence::read_note_blocks(&meeting_dir)?;
 
-    let summary_md = summariser.summarise(&transcript, &notes_markdown, system_prompt)?;
+    let summary_md = summariser.summarise(&transcript, &notes, system_prompt)?;
 
     persistence::write_summary(&meeting_dir, &summary_md)?;
 
@@ -1692,7 +1721,7 @@ fn open_meeting_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meeting_app_common::MeetingId;
+    use meeting_app_common::{MeetingId, NoteBlock};
     use persistence::{MeetingFolder, MeetingIndex};
     use tempfile::TempDir;
 
@@ -2030,21 +2059,40 @@ mod tests {
         fn summarise(
             &self,
             transcript: &[Segment],
-            notes_markdown: &str,
+            notes: &[NoteBlock],
             system_prompt: &str,
         ) -> Result<String, AppError> {
             *self.seen_transcript_len.lock().unwrap() = Some(transcript.len());
-            *self.seen_notes.lock().unwrap() = Some(notes_markdown.to_string());
+            // Capture the note text the inner path read (joined in document
+            // order) — empty string when no notes were taken.
+            let joined = notes
+                .iter()
+                .map(|n| n.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *self.seen_notes.lock().unwrap() = Some(joined);
             *self.seen_prompt.lock().unwrap() = Some(system_prompt.to_string());
             Ok(self.fixed_markdown.clone())
         }
     }
 
-    /// Save notes for a synthetic meeting via the same `NotesStore` path the
-    /// `save_notes` command uses, so `read_meeting_state(..).notes` is populated.
-    fn write_synthetic_notes(root: &Path, meeting_id: MeetingId, markdown: &str) {
-        let value: serde_json::Value = serde_json::json!({ "type": "doc", "content": [] });
-        NotesStore::save(root, meeting_id, &value, markdown).expect("save notes");
+    /// Save notes for a synthetic meeting as a Tiptap document with ONE paragraph
+    /// per line of `text`, so [`persistence::read_note_blocks`] (which projects
+    /// the `notes.json` paragraphs, #70) yields those lines as un-anchored
+    /// [`NoteBlock`]s. Uses the same `NotesStore` path the `save_notes` command
+    /// uses.
+    fn write_synthetic_notes(root: &Path, meeting_id: MeetingId, text: &str) {
+        let content: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                serde_json::json!({
+                    "type": "paragraph",
+                    "content": [{ "type": "text", "text": line }],
+                })
+            })
+            .collect();
+        let value = serde_json::json!({ "type": "doc", "content": content });
+        NotesStore::save(root, meeting_id, &value, text).expect("save notes");
     }
 
     /// `summarise_meeting_inner` reads the meeting's transcript + notes markdown,

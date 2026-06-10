@@ -138,6 +138,27 @@ pub struct WordTimestamp {
     pub text: String,
 }
 
+/// One note paragraph handed to the summariser (#70).
+///
+/// `at_ms` is `Some` when the paragraph was anchored to the recording clock:
+/// the notes editor stamps `data-anchor-ms` on the first keystroke into a
+/// paragraph while recording, on the SAME pause-excluding timeline as
+/// [`Segment::start_ms`] (fed by `AppEvent::RecordingClock`). The summariser
+/// weaves anchored paragraphs into the transcript at their timestamp so the
+/// model sees each note beside what was being said when it was written.
+/// `None` paragraphs (typed while idle, pasted, or written before recording
+/// started) carry no time and render as a trailing block.
+///
+/// `text` is the paragraph's plain text (descendant text nodes concatenated);
+/// markdown formatting from the editor is intentionally not preserved — the
+/// summary prompt needs the words, not the styling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteBlock {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_ms: Option<u64>,
+    pub text: String,
+}
+
 /// One audio-input device exposed to the device-picker UI.
 ///
 /// `id` is a stable, opaque string the IPC layer round-trips back to
@@ -906,13 +927,15 @@ pub trait Diarizer: Send {
 pub trait Summariser: Send + Sync {
     /// Produce a markdown summary from a transcript + the user's notes.
     ///
-    /// `notes_markdown` is the markdown export of the Tiptap notes (or
-    /// empty string if no notes were taken). `system_prompt` is the
-    /// user-configured prompt from settings.
+    /// `notes` are the note paragraphs in document order (#70). Anchored
+    /// paragraphs (`NoteBlock::at_ms == Some`) are woven into the transcript at
+    /// their recording-clock timestamp; un-anchored paragraphs render as a
+    /// trailing block. An empty slice means no notes were taken. `system_prompt`
+    /// is the user-configured prompt from settings.
     fn summarise(
         &self,
         transcript: &[Segment],
-        notes_markdown: &str,
+        notes: &[NoteBlock],
         system_prompt: &str,
     ) -> AppResult<String>;
 }

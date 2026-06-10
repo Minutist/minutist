@@ -28,12 +28,12 @@ use std::path::Path;
 use audiopus::coder::Decoder;
 use audiopus::{Channels, SampleRate};
 use meeting_app_common::{
-    AppResult, MeetingMeta, MeetingState, NotesDocument, Segment,
+    AppResult, MeetingMeta, MeetingState, NoteBlock, NotesDocument, Segment,
 };
 use ogg::PacketReader;
 
 use crate::error::Error;
-use crate::notes::NotesStore;
+use crate::notes::{note_blocks_from_json, NotesStore};
 
 /// Maximum number of mono samples a single Opus packet can decode to at any
 /// supported frame size (120 ms at 48 kHz = 5760). 16 kHz frames are far
@@ -133,6 +133,27 @@ pub fn read_meeting_state(meeting_dir: &Path) -> AppResult<MeetingState> {
         transcript,
         notes,
     })
+}
+
+/// Load a meeting's note paragraphs as [`NoteBlock`]s (#70), or an empty vec
+/// when the meeting has no notes.
+///
+/// Reads `notes.json` via [`NotesStore`] and projects it with
+/// [`note_blocks_from_json`] — anchored paragraphs carry their `data-anchor-ms`
+/// recording-clock timestamp, the rest carry `None`. Mirrors
+/// [`read_meeting_state`]'s root derivation: the meeting folder's parent is the
+/// notes root and the uuid comes from metadata. Reads the parsed value directly
+/// (no markdown round-trip), so the summariser path does not re-parse the
+/// re-serialised `notes_json` string.
+pub fn read_note_blocks(meeting_dir: &Path) -> AppResult<Vec<NoteBlock>> {
+    let meta = read_metadata_inner(meeting_dir)?;
+    let root = meeting_dir.parent().ok_or(Error::InvalidState(
+        "meeting_dir has no parent; cannot resolve notes root",
+    ))?;
+    let blocks = NotesStore::load(root, meta.uuid)?
+        .map(|data| note_blocks_from_json(&data.json))
+        .unwrap_or_default();
+    Ok(blocks)
 }
 
 /// Decode an Ogg/Opus byte buffer into a 16 kHz mono f32 PCM vector.

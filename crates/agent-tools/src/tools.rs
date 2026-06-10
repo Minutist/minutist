@@ -536,15 +536,13 @@ impl Tool for Resummarise {
         let id = resolve_meeting(ctx, &args)?;
         let instruction = require_str(&args, "instruction")?.to_string();
 
-        // Read transcript + notes markdown on a blocking thread.
+        // Read transcript + note blocks (with recording-clock anchors, #70) on a
+        // blocking thread.
         let dir = ctx.meeting_dir(id);
-        let (transcript, notes_markdown) = spawn_blocking_io(move || {
+        let (transcript, notes) = spawn_blocking_io(move || {
             let transcript = persistence::read_transcript(&dir)?;
-            let notes_markdown = persistence::read_meeting_state(&dir)?
-                .notes
-                .map(|n| n.notes_markdown)
-                .unwrap_or_default();
-            Ok((transcript, notes_markdown))
+            let notes = persistence::read_note_blocks(&dir)?;
+            Ok((transcript, notes))
         })
         .await?;
 
@@ -561,7 +559,7 @@ impl Tool for Resummarise {
         // (tokio cannot cancel it).
         let summariser = ctx.summariser.clone();
         let join = tokio::task::spawn_blocking(move || {
-            summariser.summarise(&transcript, &notes_markdown, &instruction)
+            summariser.summarise(&transcript, &notes, &instruction)
         });
         let text = match tokio::time::timeout(RESUMMARISE_TIMEOUT, join).await {
             Ok(joined) => joined.map_err(|e| AppError::Internal {

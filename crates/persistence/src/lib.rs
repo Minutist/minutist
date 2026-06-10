@@ -65,8 +65,10 @@ pub use error::Error;
 pub use folder::MeetingFolder;
 pub use index::MeetingIndex;
 pub use metadata::write_metadata;
-pub use notes::{NotesData, NotesStore};
-pub use reader::{read_audio_pcm, read_meeting_state, read_metadata, read_transcript};
+pub use notes::{note_blocks_from_json, NotesData, NotesStore};
+pub use reader::{
+    read_audio_pcm, read_meeting_state, read_metadata, read_note_blocks, read_transcript,
+};
 pub use summary::{read_summary, summary_blurb, write_summary};
 pub use transcript::{write_transcript, TranscriptWriter};
 pub use writer::MeetingWriter;

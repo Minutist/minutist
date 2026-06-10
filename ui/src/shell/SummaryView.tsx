@@ -267,16 +267,27 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
         </div>
       )}
 
-      {summarising && !editing && (
-        <p className="summary-view__status" role="status">
-          <span className="summary-view__spinner" aria-hidden="true" />
-          {downloadingModel
-            ? `Downloading the summarisation model (one-time, ~5 GB)${
-                downloadPct !== null ? ` — ${downloadPct}%` : "…"
-              }`
-            : "Generating summary from the transcript and your notes…"}
-        </p>
-      )}
+      {/*
+        #69 — textual status line. Once a summarise OPERATION is in flight
+        (`summariseInFlight`), the determinate OperationIndicator above is the
+        authoritative phase display ("Loading the summarisation model…",
+        "Reading the meeting…", "Writing the summary…"), so this line is
+        suppressed to avoid showing two competing messages. It remains for two
+        cases the indicator does not cover: the model DOWNLOAD (which carries a
+        byte %, from the models store, not the operation bus) and the brief gap
+        after dispatch before the first progress event arrives.
+      */}
+      {!editing &&
+        (downloadingModel || (summarising && !summariseInFlight)) && (
+          <p className="summary-view__status" role="status">
+            <span className="summary-view__spinner" aria-hidden="true" />
+            {downloadingModel
+              ? `Downloading the summarisation model (one-time, ~5 GB)${
+                  downloadPct !== null ? ` — ${downloadPct}%` : "…"
+                }`
+              : "Generating summary from the transcript and your notes…"}
+          </p>
+        )}
 
       {editing ? (
         <textarea

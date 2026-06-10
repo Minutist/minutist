@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use agent_tools::{ToolContext, ToolRegistry};
 use mcp_server::{serve, McpServerConfig};
-use meeting_app_common::{AppEvent, AppResult, Segment, Summariser};
+use meeting_app_common::{AppEvent, AppResult, NoteBlock, Segment, Summariser};
 use orchestrator::test_support::test_orchestrator;
 use persistence::MeetingIndex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -34,7 +34,7 @@ impl Summariser for StubSummariser {
     fn summarise(
         &self,
         _transcript: &[Segment],
-        _notes_markdown: &str,
+        _notes: &[NoteBlock],
         _system_prompt: &str,
     ) -> AppResult<String> {
         Ok(String::new())

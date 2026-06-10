@@ -318,11 +318,24 @@ by the pause). Limitation: a ≥ 4 s run of genuinely-silent *input* would be
 misclassified; a persisted pause-interval map (a `common`/schema change) would
 make this exact rather than heuristic — tracked for a later phase.
 
-**Offline ops are serialized.** `re_transcribe` and `rediarize` are offline
-(require `Idle`) and now atomically CLAIM an internal `Offline` state under the
-orchestrator lock (rejecting a concurrent start / re-transcribe / re-diarize with
-`AppError::InvalidInput`) and release it on every exit path, so two offline ops
-can't race and clobber `transcript.json`.
+**Offline ops are serialized — but a new recording preempts them.**
+`re_transcribe` and `rediarize` atomically CLAIM an internal `Offline` state
+under the orchestrator lock (rejecting a concurrent re-transcribe / re-diarize
+with `AppError::InvalidInput`) and release it on every exit path, so two offline
+ops can't race and clobber the SAME meeting's `transcript.json`. However,
+**`start` PREEMPTS the `Offline` claim** (`transition_start` accepts `Idle |
+Offline`): a new recording is a different `meeting_id`/file, so the clobber
+hazard does not apply, and the user must never be blocked from recording the next
+meeting while the previous one's best-effort repair runs. On preempt the
+in-flight op finishes on its own thread (writing the OLD meeting's files —
+harmless) and its release is a no-op (`transition_offline_release` returns
+`false` and leaves the live `Recording` state intact, suppressing the stray
+`Idle` broadcast). `Offline` reports the public **`Idle`** state (NOT
+`Finalising`) precisely so the transport leaves Start enabled during the repair;
+the repair's progress surfaces per-meeting on the meeting-list ROW via
+`OperationProgress`, never as a transport busy-state. The genuine
+`Stopping`/`Finalising` drain (capture teardown + transcript/metadata write) is
+NOT preemptible — it must complete before any start.
 
 ## llama.cpp prefill batching
 
@@ -503,15 +516,21 @@ On stop the meeting is finalised + index-upserted immediately (the orchestrator
 emits `MeetingFinalised` and returns to `Idle` the instant the recording is on
 disk); the heavy background passes run AFTER. They run in order in one
 fire-and-forget task: (1) re-transcribe if the live transcript fell behind, then
-(2) re-diarize — both under the `Offline` claim (public `Finalising`) — then (3)
-**auto-summarise** (#68), gated on `settings.auto_summarise_on_stop` (default ON;
-serde-default so an older store adopts it). The auto-summarise step runs LAST so
-it summarises the FINAL transcript (after any re-transcribe / re-diarize), drives
-the SAME held-summariser path as the user-triggered `summarise_meeting`
-(`run_held_summarise`), and emits the determinate `OperationProgress { op:
-Summarise }` + `SummaryReady`. It does NOT claim the offline slot (it reads, never
-rewrites `transcript.json`); errors are best-effort (logged — the meeting is left
-without a summary, recoverable via the Summarise action). The recording window
+(2) re-diarize — both under the `Offline` claim (which reports the public
+**`Idle`** state, so Start stays enabled — see "Offline ops are serialized") —
+then (3) **auto-summarise** (#68), gated on `settings.auto_summarise_on_stop`
+(default ON; serde-default so an older store adopts it). The auto-summarise step
+runs LAST so it summarises the FINAL transcript (after any re-transcribe /
+re-diarize), drives the SAME held-summariser path as the user-triggered
+`summarise_meeting` (`run_held_summarise`), and emits the determinate
+`OperationProgress { op: Summarise }` + `SummaryReady`. It does NOT claim the
+offline slot (it reads, never rewrites `transcript.json`); errors are best-effort
+(logged — the meeting is left without a summary, recoverable via the Summarise
+action). **A new recording preempts the chain**: re-transcribe / re-diarize
+self-skip once a recording is live (their fresh `Offline` claim then fails), and
+auto-summarise — which takes no claim — checks `recorder_is_live()` and defers
+(the manual Summarise action is the recovery), so the previous meeting's repair
+never contends with the new live recording's GPU use. The recording window
 must **not** stay open for any of these: the webview returns to the home
 meeting-list as soon as the recorder leaves the live states
 (`recording`/`paused`/`stopping`) — it does NOT gate the window-close on the

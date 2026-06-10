@@ -839,32 +839,54 @@ impl Orchestrator {
     /// so two concurrent offline ops (or an offline op racing a `start`) can no
     /// longer both pass the gate and clobber the same `transcript.json`.
     async fn claim_offline(&self, meeting_id: MeetingId) -> AppResult<()> {
-        {
-            let mut guard = self.inner.lock().await;
-            transition_offline_claim(&mut guard.state, meeting_id)?;
-        }
-        // Broadcast the busy state (Offline maps to the public `Finalising`) so
-        // the webview gates Start while the offline op holds the claim, rather
-        // than enabling Start into an `InvalidInput` failure.
-        self.emit(AppEvent::StateChanged {
-            state: RecordingState::Finalising { meeting_id },
-        });
+        let mut guard = self.inner.lock().await;
+        transition_offline_claim(&mut guard.state, meeting_id)?;
+        // No StateChanged broadcast: `Offline` reports the public `Idle` (the
+        // recorder stays READY — a `start` preempts the pass), so claiming the
+        // slot does not change the public state. The repair's progress surfaces
+        // per-meeting via `OperationProgress`, not the transport state.
         Ok(())
     }
 
     /// Release an offline claim, returning the recorder to `Idle`.
     ///
     /// Called on every exit path of an offline op (success and error) so a
-    /// failed op never wedges the recorder out of `Idle`.
+    /// failed op never wedges the recorder out of `Idle`. PREEMPTION-SAFE: if a
+    /// new recording has preempted the slot (`start` took it while this op ran),
+    /// the release is a no-op and the `Idle` broadcast is suppressed — otherwise
+    /// the late release would clobber the live session's `Recording` state in
+    /// both the internal state and the UI.
     async fn release_offline(&self) {
-        {
+        let released = {
             let mut guard = self.inner.lock().await;
-            transition_offline_release(&mut guard.state);
+            transition_offline_release(&mut guard.state)
+        };
+        // Only broadcast Idle when we actually released the claim. If the slot
+        // was preempted, the `start` path already broadcast `Recording`; emitting
+        // `Idle` here would wrongly tell the UI the new recording had stopped.
+        if released {
+            self.emit(AppEvent::StateChanged {
+                state: RecordingState::Idle,
+            });
         }
-        // Return the public state to Idle so the UI re-enables Start.
-        self.emit(AppEvent::StateChanged {
-            state: RecordingState::Idle,
-        });
+    }
+
+    /// True when a live recording session holds the recorder (`Recording`,
+    /// `Paused`, or `Stopping`) — i.e. a new meeting has started, possibly
+    /// preempting a post-stop repair pass.
+    ///
+    /// The post-stop chain uses this to skip its remaining best-effort passes
+    /// once the user has started the next meeting (the re-transcribe / re-diarize
+    /// passes self-skip because their offline claim now fails, but the
+    /// auto-summarise pass does not take the claim, so it checks this gate
+    /// explicitly to avoid contending with the new recording's GPU use).
+    pub async fn recorder_is_live(&self) -> bool {
+        matches!(
+            self.inner.lock().await.state,
+            InternalState::Recording { .. }
+                | InternalState::Paused { .. }
+                | InternalState::Stopping { .. }
+        )
     }
 
     /// Rewrite `transcript.json` from the refreshed `segments` and refresh the

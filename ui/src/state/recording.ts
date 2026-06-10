@@ -584,10 +584,12 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       case "transcript_segment": {
         // Only append segments from the LIVE recording. An offline/background
         // re-transcribe emits `transcript_segment` for a previously-stopped
-        // meeting (and the recorder is then in `finalising`, not `recording`),
-        // so matching on the live meeting_id keeps those out of the live
-        // transcript array — that pass persists the full transcript and emits
-        // `transcript_ready`, which the meetings store handles instead.
+        // meeting while the recorder is idle — or, if the user started the next
+        // meeting (preempting the repair), while the recorder is recording a
+        // DIFFERENT meeting. Matching on the live meeting_id keeps those
+        // background segments out of the live transcript array in both cases —
+        // that pass persists the full transcript and emits `transcript_ready`,
+        // which the meetings store handles instead.
         const live = get().state;
         const liveId =
           live.kind === "recording" || live.kind === "paused"

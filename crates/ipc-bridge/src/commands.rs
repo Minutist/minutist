@@ -260,10 +260,27 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
                         // the shared per-pass error logging; the markdown result is
                         // discarded (the summary is persisted + `SummaryReady`
                         // emitted inside `run_held_summarise`).
-                        PostStopPass::Summarise => run_held_summarise(&handles, meeting_id)
-                            .await
-                            .map(|_| ())
-                            .map_err(AppError::from),
+                        //
+                        // Unlike re-transcribe / re-diarize, this pass does NOT take
+                        // the orchestrator's offline claim, so it cannot self-skip
+                        // when a new recording preempts the slot. Gate it explicitly:
+                        // if the user has started the next meeting, defer this
+                        // meeting's auto-summarise (recoverable via the manual
+                        // Summarise action) rather than contending with the live
+                        // recording's GPU/LLM use.
+                        PostStopPass::Summarise => {
+                            if orchestrator.recorder_is_live().await {
+                                Err(AppError::InvalidInput {
+                                    context: "auto-summarise deferred: a new recording started"
+                                        .into(),
+                                })
+                            } else {
+                                run_held_summarise(&handles, meeting_id)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(AppError::from)
+                            }
+                        }
                     }
                 }
             })

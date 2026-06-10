@@ -1502,10 +1502,15 @@ on completion (`TranscriptReady` / `DiarizationComplete`); all passes are
 best-effort (errors logged, claim-skips logged at info — auto-summarise leaves the
 meeting without a summary on failure, recoverable via the Summarise action). While
 a re-transcribe / re-diarize pass holds the offline claim the recorder reports the
-public `Finalising` busy state (`Offline → Finalising` in `as_public`, broadcast by
-`claim_offline`/`release_offline`), so the webview gates the Start button instead of
-enabling it into an `InvalidInput` failure; the auto-summarise pass does not claim
-the offline slot. And because a derived cache can always drift from
+public **`Idle`** state (`Offline → Idle` in `as_public`), so the transport leaves
+Start ENABLED: a `start` here PREEMPTS the pass (`transition_start` accepts `Idle |
+Offline`) rather than being refused, because the next meeting is a different
+`transcript.json` and the user must never be blocked from recording it. The
+preempted pass finishes on its thread (writing the old meeting's files) and its
+release is a no-op (preemption-safe `transition_offline_release`); the remaining
+chain passes self-skip — re-transcribe/re-diarize because a fresh claim now fails
+against `Recording`, auto-summarise (which takes no claim) because it checks
+`recorder_is_live()`. And because a derived cache can always drift from
 disk, `list_meetings` first calls
 `MeetingIndex::reconcile_orphans(meetings_dir)` — a cheap `readdir` + set-diff
 that lazily indexes any meeting folder present on disk but missing from the cache

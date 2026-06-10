@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! Idle → Recording  (start)
+//! Offline → Recording  (start PREEMPTS a post-stop repair pass)
 //! Recording → Paused  (pause)
 //! Paused → Recording  (resume)
 //! Recording | Paused → Stopping  (stop — capture stopping)
@@ -50,12 +51,21 @@ pub(crate) enum InternalState {
     },
     /// An offline operation (re-transcribe / re-diarize, including the automatic
     /// post-stop repair passes) is running. The recorder is not live, but the
-    /// slot is **claimed** so a concurrent `start`, `re_transcribe`, or
-    /// `rediarize` is rejected and cannot clobber the same meeting's
+    /// slot is **claimed** so a concurrent `re_transcribe` / `rediarize` (or a
+    /// user-triggered one) is rejected and cannot clobber the SAME meeting's
     /// `transcript.json` (TIMELINE-DRIFT #5). Restored to `Idle` when the op
     /// completes (including on error). `meeting_id` is surfaced as the public
-    /// `Finalising` state's id (see [`InternalState::as_public`]) so the UI gates
-    /// Start and shows a busy indicator while the claim is held.
+    /// `Finalising` state's id (see [`InternalState::as_public`]) so the UI shows
+    /// a busy indicator while the claim is held.
+    ///
+    /// **`start` PREEMPTS this state.** A new recording is a new `meeting_id`
+    /// (a different `transcript.json`), so the clobber hazard does not apply, and
+    /// the user must never be blocked from starting the next meeting while the
+    /// previous one's best-effort repair runs. On preempt the in-flight op is
+    /// left to finish in the background (it writes the OLD meeting's files, which
+    /// is harmless) and its eventual release is a no-op (see
+    /// [`transition_offline_release`]); the post-stop chain's remaining passes
+    /// self-skip (a fresh claim now fails against `Recording`).
     Offline {
         meeting_id: MeetingId,
     },
@@ -88,14 +98,14 @@ impl InternalState {
                 meeting_id: *meeting_id,
             },
             // An offline op (re-transcribe / re-diarize, incl. the automatic
-            // post-stop repair passes) holds the claim, so a new `start` is
-            // refused. Report `Finalising` rather than `Idle` so the UI gates the
-            // Start button and shows a busy state instead of enabling Start into
-            // an `InvalidInput` failure. `common` has no `Offline` variant; the
-            // existing `Finalising` busy-state covers this.
-            InternalState::Offline { meeting_id } => RecordingState::Finalising {
-                meeting_id: *meeting_id,
-            },
+            // post-stop repair passes) holds the claim. Report `Idle`: the
+            // recorder is genuinely READY for the next meeting (a `start` here
+            // preempts the pass — see `transition_start`), so the transport must
+            // NOT gate Start behind a busy state. The repair's progress is shown
+            // per-meeting on the meeting-list ROW (via `OperationProgress`), which
+            // is where it belongs; the transport reflects only "can I record
+            // now?" — and the answer during a background repair is yes.
+            InternalState::Offline { .. } => RecordingState::Idle,
         }
     }
 }
@@ -120,31 +130,57 @@ pub(crate) fn transition_offline_claim(
     }
 }
 
-/// Release an offline claim, returning the recorder to `Idle`.
+/// Release an offline claim. Returns `true` when it actually released an
+/// `Offline` claim (→ `Idle`), `false` when the claim had already been preempted
+/// (the state is something else, e.g. `Recording`).
 ///
-/// Tolerant of a non-`Offline` state (logs and forces `Idle`) so a release in a
-/// cleanup/error path can never wedge the recorder: the worst case is a stray
-/// release, which still leaves the recorder usable.
-pub(crate) fn transition_offline_release(state: &mut InternalState) {
-    if !matches!(state, InternalState::Offline { .. }) {
-        tracing::warn!(
-            target: "orchestrator",
-            ?state,
-            "offline release called outside Offline state; forcing Idle"
-        );
+/// PREEMPTION-SAFE: if `start` has already taken over the slot (`Recording`),
+/// the in-flight offline op's late release MUST NOT reset the recorder to `Idle`
+/// — that would clobber the new live session. In that case this leaves the state
+/// untouched and returns `false`; the caller then suppresses the `Idle`
+/// broadcast. A release from any other non-`Offline` state is still forced to
+/// `Idle` (defensive: a stray release in a cleanup path must not wedge the
+/// recorder), which only the `false`-on-preempt `Recording` case excludes.
+pub(crate) fn transition_offline_release(state: &mut InternalState) -> bool {
+    match state {
+        InternalState::Offline { meeting_id } => {
+            tracing::debug!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                "released offline claim → Idle"
+            );
+            *state = InternalState::Idle;
+            true
+        }
+        // The slot was preempted by a live session — leave it alone.
+        InternalState::Recording { .. }
+        | InternalState::Paused { .. }
+        | InternalState::Stopping { .. }
+        | InternalState::Finalising { .. } => false,
+        // Truly unexpected (already Idle): force Idle defensively, but report it
+        // did not transition from a held claim.
+        InternalState::Idle => false,
     }
-    *state = InternalState::Idle;
 }
 
-/// Validate and execute Idle → Recording.
+/// Validate and execute `Idle | Offline → Recording`.
 ///
 /// Returns `(meeting_id, started_at_ms)` on success.
+///
+/// Starting from `Offline` **preempts** a post-stop repair pass (re-transcribe /
+/// re-diarize / auto-summarise) for the PREVIOUS meeting: the user must not be
+/// blocked from recording the next meeting while best-effort repair runs. The
+/// preempted op finishes in the background on its own thread (writing the old
+/// meeting's files — a different `transcript.json`, so no clobber) and its
+/// release becomes a no-op (see [`transition_offline_release`]). The genuine
+/// `Stopping` / `Finalising` drain is NOT preemptible — that is the capture
+/// teardown + transcript/metadata write, which must complete first.
 pub(crate) fn transition_start(state: &mut InternalState) -> AppResult<(MeetingId, u64)> {
     match state {
-        InternalState::Idle => {}
+        InternalState::Idle | InternalState::Offline { .. } => {}
         _ => {
             return Err(Error::InvalidState {
-                context: "start() called when not Idle".into(),
+                context: "start() called while a recording is live or finalising".into(),
             }
             .into())
         }
@@ -264,4 +300,77 @@ pub(crate) fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_from_idle_records() {
+        let mut state = InternalState::Idle;
+        let (id, _) = transition_start(&mut state).expect("idle start");
+        assert!(matches!(state, InternalState::Recording { meeting_id, .. } if meeting_id == id));
+    }
+
+    #[test]
+    fn start_preempts_an_offline_repair_pass() {
+        // A post-stop repair pass for meeting A holds the Offline claim.
+        let old = MeetingId::new();
+        let mut state = InternalState::Offline { meeting_id: old };
+
+        // Starting the next meeting must succeed (NOT block) and take over the
+        // slot with a fresh meeting id.
+        let (new_id, _) = transition_start(&mut state).expect("start preempts Offline");
+        assert_ne!(new_id, old, "the new recording is a distinct meeting");
+        assert!(matches!(state, InternalState::Recording { meeting_id, .. } if meeting_id == new_id));
+    }
+
+    #[test]
+    fn preempted_offline_release_does_not_clobber_the_live_recording() {
+        // Slot preempted: state is now Recording (a new meeting).
+        let live = MeetingId::new();
+        let mut state = InternalState::Recording {
+            meeting_id: live,
+            started_at_ms: 1,
+        };
+        // The preempted op's late release must be a NO-OP — it must not reset to
+        // Idle and clobber the live recording.
+        let released = transition_offline_release(&mut state);
+        assert!(!released, "release after preempt reports it did not release");
+        assert!(matches!(state, InternalState::Recording { meeting_id, .. } if meeting_id == live));
+    }
+
+    #[test]
+    fn normal_offline_release_returns_to_idle() {
+        let mut state = InternalState::Offline {
+            meeting_id: MeetingId::new(),
+        };
+        let released = transition_offline_release(&mut state);
+        assert!(released, "an actual Offline claim release reports true");
+        assert!(matches!(state, InternalState::Idle));
+    }
+
+    #[test]
+    fn start_is_rejected_while_live_or_finalising() {
+        let id = MeetingId::new();
+        for mut state in [
+            InternalState::Recording {
+                meeting_id: id,
+                started_at_ms: 0,
+            },
+            InternalState::Paused {
+                meeting_id: id,
+                paused_at_ms: 0,
+                started_at_ms: 0,
+            },
+            InternalState::Stopping { meeting_id: id },
+            InternalState::Finalising { meeting_id: id },
+        ] {
+            assert!(
+                transition_start(&mut state).is_err(),
+                "start must be refused from a live/finalising state: {state:?}"
+            );
+        }
+    }
 }

@@ -7,13 +7,57 @@
 
 .transcript-pane {
   height: 100%;
-  overflow-y: auto;
-  padding: 1.5rem 1.5rem 3rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0; /* let the scroll child shrink within the flex column */
   background: var(--sheet-quiet);
   border-left: 1px solid var(--rule);
   font-family: var(--font-text);
   font-size: 0.95rem;
   color: var(--ink-soft);
+}
+
+/* The scrolling transcript body; the toolbar (#67) stays pinned above it. */
+.transcript-pane__scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 1.5rem 1.5rem 3rem;
+}
+
+/*
+ * #67 — offline-reprocessing action toolbar pinned to the top of the transcript
+ * pane (Re-transcribe / Re-identify speakers). Hairline-ruled, quiet buttons in
+ * keeping with the Editorial Ink secondary column.
+ */
+.transcript-pane__toolbar {
+  display: flex;
+  gap: 0.4rem;
+  flex: none;
+  padding: 0.6rem 1.5rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.transcript-pane__action {
+  font-family: var(--font-text);
+  font-size: 0.8rem;
+  padding: 0.28rem 0.7rem;
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.transcript-pane__action:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--stone-faint);
+}
+
+.transcript-pane__action:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
 }
 
 .transcript-pane__empty {

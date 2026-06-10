@@ -459,15 +459,29 @@ indicator. Producers + determinism:
 
 On stop the meeting is finalised + index-upserted immediately (the orchestrator
 emits `MeetingFinalised` and returns to `Idle` the instant the recording is on
-disk); the heavy background passes (re-transcribe if the live transcript fell
-behind, then re-diarize) run AFTER, under the `Offline` claim (public
-`Finalising`). The recording window must **not** stay open for those: the webview
-returns to the home meeting-list as soon as the recorder leaves the live states
+disk); the heavy background passes run AFTER. They run in order in one
+fire-and-forget task: (1) re-transcribe if the live transcript fell behind, then
+(2) re-diarize — both under the `Offline` claim (public `Finalising`) — then (3)
+**auto-summarise** (#68), gated on `settings.auto_summarise_on_stop` (default ON;
+serde-default so an older store adopts it). The auto-summarise step runs LAST so
+it summarises the FINAL transcript (after any re-transcribe / re-diarize), drives
+the SAME held-summariser path as the user-triggered `summarise_meeting`
+(`run_held_summarise`), and emits the determinate `OperationProgress { op:
+Summarise }` + `SummaryReady`. It does NOT claim the offline slot (it reads, never
+rewrites `transcript.json`); errors are best-effort (logged — the meeting is left
+without a summary, recoverable via the Summarise action). The recording window
+must **not** stay open for any of these: the webview returns to the home
+meeting-list as soon as the recorder leaves the live states
 (`recording`/`paused`/`stopping`) — it does NOT gate the window-close on the
 offline claim releasing (`Idle`). The background passes surface only as the
 non-blocking per-row "Operation progress" indicator above, which the meeting-list
 store refreshes on the terminal `MeetingFinalised` / `TranscriptReady` /
-`DiarizationComplete` / `SummaryReady` events.
+`DiarizationComplete` / `SummaryReady` events. The auto-summarise progress is ALSO
+surfaced inside the summary pane: when the user opens `SummaryView` while a
+`summarise` op is in flight for that meeting (read from the operation-progress
+store, keyed on `meeting_id` + `op == Summarise`), the determinate
+`OperationIndicator` bar shows — even when the pane itself did not dispatch the
+summarise — and `SummaryReady` then reveals the summary.
 
 ## Agent chat loop (Phase 9)
 

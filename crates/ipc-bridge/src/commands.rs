@@ -46,6 +46,7 @@ use tokio::sync::broadcast;
 use crate::chat::{
     engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX,
 };
+use crate::chat_runtime::ChatHandles;
 use crate::{error::IpcError, IpcState};
 
 /// The bundled default LLM model id used when `settings.llm_model_id` is unset.
@@ -224,27 +225,45 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
     // action is the recovery path. (Only the meeting INDEX self-heals, via
     // `reconcile_orphans` on `list_meetings`.)
     //
+    //   3. Auto-summarise (#68): if `settings.auto_summarise_on_stop` is on (the
+    //      default), run AFTER any re-transcribe / re-diarize so it summarises the
+    //      FINAL transcript. Uses the held-summariser path ([`run_held_summarise`])
+    //      and emits the determinate `OperationProgress` + `SummaryReady` events,
+    //      exactly like the user-triggered `summarise_meeting`. Best-effort: an
+    //      error is logged, the recording is on disk regardless.
+    //
     // The gating/ordering ([`post_stop_passes`]) and per-pass error tolerance
     // ([`run_post_stop_passes`]) are extracted so they are unit-testable without
     // a Tauri runtime or a real orchestrator.
     let passes = post_stop_passes(
         state.orchestrator.take_transcript_incomplete(),
         state.orchestrator.diarization_enabled(),
+        state.settings.current().auto_summarise_on_stop,
     );
     if !passes.is_empty() {
         let orchestrator = std::sync::Arc::clone(&state.orchestrator);
         let index = std::sync::Arc::clone(&state.index);
+        let handles = state.chat_handles();
         let meeting_id = meta.uuid;
         tokio::spawn(async move {
             run_post_stop_passes(&passes, meeting_id, |pass| {
                 let orchestrator = std::sync::Arc::clone(&orchestrator);
                 let index = std::sync::Arc::clone(&index);
+                let handles = handles.clone();
                 async move {
                     match pass {
                         PostStopPass::ReTranscribe => {
                             orchestrator.re_transcribe(&index, meeting_id).await
                         }
                         PostStopPass::Rediarize => orchestrator.rediarize(&index, meeting_id).await,
+                        // Map the held-summarise `IpcError` back to `AppError` for
+                        // the shared per-pass error logging; the markdown result is
+                        // discarded (the summary is persisted + `SummaryReady`
+                        // emitted inside `run_held_summarise`).
+                        PostStopPass::Summarise => run_held_summarise(&handles, meeting_id)
+                            .await
+                            .map(|_| ())
+                            .map_err(AppError::from),
                     }
                 }
             })
@@ -262,21 +281,32 @@ enum PostStopPass {
     ReTranscribe,
     /// Run speaker diarization (`settings.diarization_enabled`).
     Rediarize,
+    /// Auto-summarise the meeting (`settings.auto_summarise_on_stop`, #68). Runs
+    /// LAST so it summarises the final (re-transcribed + re-diarized) transcript.
+    Summarise,
 }
 
-/// The ordered post-stop passes to run, derived from the two gating flags.
+/// The ordered post-stop passes to run, derived from the three gating flags.
 ///
 /// Re-transcribe always precedes diarize so diarization labels the **repaired**
-/// transcript rather than a truncated one. An empty result means no background
-/// task is spawned. Pure + unit-tested so the gating/ordering the review flagged
-/// (Step 5) is verified without a Tauri runtime.
-fn post_stop_passes(needs_retranscribe: bool, needs_diarize: bool) -> Vec<PostStopPass> {
-    let mut passes = Vec::with_capacity(2);
+/// transcript rather than a truncated one; auto-summarise (#68) runs LAST so it
+/// summarises the final transcript after any re-transcribe / re-diarize. An empty
+/// result means no background task is spawned. Pure + unit-tested so the
+/// gating/ordering is verified without a Tauri runtime.
+fn post_stop_passes(
+    needs_retranscribe: bool,
+    needs_diarize: bool,
+    needs_summarise: bool,
+) -> Vec<PostStopPass> {
+    let mut passes = Vec::with_capacity(3);
     if needs_retranscribe {
         passes.push(PostStopPass::ReTranscribe);
     }
     if needs_diarize {
         passes.push(PostStopPass::Rediarize);
+    }
+    if needs_summarise {
+        passes.push(PostStopPass::Summarise);
     }
     passes
 }
@@ -322,6 +352,17 @@ async fn run_post_stop_passes<F, Fut>(
                     target: "ipc-bridge",
                     meeting_id = %meeting_id.0,
                     "background on-stop diarization failed: {e}; meeting left un-diarized"
+                ),
+                // #68 — auto-summarise is best-effort: a failure (model load, an
+                // empty/unsummarisable transcript, etc.) leaves the meeting without
+                // a summary; the user can still press Summarise. The `busy` arm is
+                // not distinguished — `run_held_summarise` does not claim the
+                // offline slot — so both are logged as a warning.
+                (PostStopPass::Summarise, _) => tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "background auto-summarise after stop failed: {e}; no summary written \
+                     (use the Summarise action)"
                 ),
             }
         }
@@ -687,41 +728,66 @@ pub async fn summarise_meeting(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
-    let settings = state.settings.current();
+    // The whole summarise body (held-model resolve → summarise-with-progress →
+    // index refresh → `SummaryReady`) is extracted into [`run_held_summarise`] so
+    // BOTH this user-triggered command and the post-stop auto-summarise chain
+    // (#68, see [`stop_recording`]) drive the SAME path. The command surfaces an
+    // error to the webview; the chain treats it as best-effort.
+    run_held_summarise(&state.chat_handles(), meeting_id).await?;
+    Ok(())
+}
+
+/// Resolve the held summariser, summarise a meeting (streaming determinate
+/// `OperationProgress`), refresh the meeting-list index excerpt, and emit
+/// `AppEvent::SummaryReady`.
+///
+/// Extracted from the `summarise_meeting` command (#68) so it can be invoked
+/// from the post-stop background chain ([`run_post_stop_passes`]) as well as from
+/// the command. Takes a [`ChatHandles`] — the same bundle the chat path uses —
+/// so it shares the SAME lazily-loaded held model `Arc` (no GGUF reload).
+///
+/// Returns the summary markdown on success. The heavy `summarise` runs on
+/// `spawn_blocking`, per the threading-model rule.
+async fn run_held_summarise(
+    handles: &ChatHandles,
+    meeting_id: MeetingId,
+) -> Result<String, IpcError> {
+    let current = handles.settings.current();
+    let event_tx = &handles.event_tx;
 
     // Phase 9 (C2): use the HELD summariser substrate — loaded once on first
     // chat/summarise use and shared with the chat agent — instead of opening a
     // fresh `LlamaSummariser` per call (the old per-call GGUF reload killed
-    // latency). `ensure_summariser` resolves the model id + directory via the
-    // orchestrator (keeping the `model-registry` edge there) and opens the GGUF
-    // on `spawn_blocking` the FIRST time only; thereafter this is a cheap clone.
-    let summariser = state.ensure_summariser().await?;
+    // latency). The load resolves the model id + directory via the orchestrator
+    // (keeping the `model-registry` edge there) and opens the GGUF on
+    // `spawn_blocking` the FIRST time only; thereafter this is a cheap clone.
+    let summariser = handles.ensure_summariser().await?;
 
-    let meetings_dir = state.meetings_dir.clone();
+    let meetings_dir_owned = handles.meetings_dir.clone();
     // Resolve the preset-aware effective prompt (Phase 9 — D4): the user's
     // custom `summary_system_prompt` override when non-empty, else the built-in
     // prompt for the selected `summary_preset`.
-    let system_prompt = settings.effective_summary_prompt();
+    let system_prompt = current.effective_summary_prompt();
 
     // Live-test UX T4(b): emit a 0.0 DETERMINATE start so the per-row indicator
     // shows immediately while the LLM prefills (which is several seconds of no
     // token output). The generation loop then drives the bar via the progress
     // callback below.
-    emit_summarise_progress(&state.event_tx, meeting_id, 0.0);
+    emit_summarise_progress(event_tx, meeting_id, 0.0);
 
     // Heavy, synchronous summarise work on a blocking thread (the held model's
     // `summarise` builds a fresh `LlamaContext` and decodes). The held handle is
     // cloned into the closure; no GGUF reload. The held substrate is the concrete
     // `LlamaSummariser`, so we drive `summarise_with_progress` directly (the
     // `common::Summariser` trait is unchanged — see `summariser`).
-    let event_tx = state.event_tx.clone();
+    let event_tx_for_blocking = event_tx.clone();
     let summary_md = tokio::task::spawn_blocking(move || {
         summarise_meeting_with_progress(
-            &meetings_dir,
+            &meetings_dir_owned,
             meeting_id,
             summariser.as_ref(),
             &system_prompt,
-            &event_tx,
+            &event_tx_for_blocking,
         )
     })
     .await
@@ -735,14 +801,14 @@ pub async fn summarise_meeting(
     // derivation prefers the summary blurb over the first transcript segment). A
     // failure is logged and swallowed — the index is a derived cache the next
     // startup rebuild reconciles, so a failed refresh must not fail the summary.
-    let meetings_dir_for_entry = state.meetings_dir.clone();
+    let meetings_dir_for_entry = handles.meetings_dir.clone();
     match tokio::task::spawn_blocking(move || {
         meeting_list_entry_for_meta_with_summary(&meetings_dir_for_entry, meeting_id)
     })
     .await
     {
         Ok(Ok(Some(entry))) => {
-            if let Err(e) = state.index.upsert(&entry).await {
+            if let Err(e) = handles.index.upsert(&entry).await {
                 tracing::warn!(
                     target: "ipc-bridge",
                     meeting_id = %meeting_id.0,
@@ -770,7 +836,7 @@ pub async fn summarise_meeting(
 
     // Emit SummaryReady so the webview re-reads `summary.md` (this also clears
     // the per-row progress indicator and refreshes the list excerpt).
-    emit_summary_ready(&state.event_tx, meeting_id);
+    emit_summary_ready(event_tx, meeting_id);
 
     tracing::info!(
         target: "ipc-bridge",
@@ -779,7 +845,7 @@ pub async fn summarise_meeting(
         "summary generated and persisted"
     );
 
-    Ok(())
+    Ok(summary_md)
 }
 
 /// Build the [`MeetingListEntry`] for a meeting from its metadata, deriving the
@@ -2257,20 +2323,54 @@ mod tests {
     // by a recording closure that injects per-pass results.
     // -----------------------------------------------------------------------
 
-    /// Gating + ordering: no flags → no passes; each flag adds its pass; both →
-    /// re-transcribe BEFORE diarize (so diarize labels the repaired transcript).
+    /// Gating + ordering: no flags → no passes; each flag adds its pass; all →
+    /// re-transcribe BEFORE diarize BEFORE summarise (so diarize labels the
+    /// repaired transcript and summarise sees the final, #68).
     #[test]
     fn post_stop_passes_gates_and_orders() {
-        assert_eq!(post_stop_passes(false, false), vec![]);
+        assert_eq!(post_stop_passes(false, false, false), vec![]);
         assert_eq!(
-            post_stop_passes(true, false),
+            post_stop_passes(true, false, false),
             vec![PostStopPass::ReTranscribe]
         );
-        assert_eq!(post_stop_passes(false, true), vec![PostStopPass::Rediarize]);
         assert_eq!(
-            post_stop_passes(true, true),
-            vec![PostStopPass::ReTranscribe, PostStopPass::Rediarize],
-            "re-transcribe must run before diarize"
+            post_stop_passes(false, true, false),
+            vec![PostStopPass::Rediarize]
+        );
+        assert_eq!(
+            post_stop_passes(false, false, true),
+            vec![PostStopPass::Summarise]
+        );
+        assert_eq!(
+            post_stop_passes(true, true, true),
+            vec![
+                PostStopPass::ReTranscribe,
+                PostStopPass::Rediarize,
+                PostStopPass::Summarise
+            ],
+            "re-transcribe → diarize → summarise (summarise sees the final transcript)"
+        );
+    }
+
+    /// #68 — when auto-summarise is on, the plan ends with `Summarise` (after any
+    /// re-transcribe / diarize), and when off it is absent.
+    #[test]
+    fn post_stop_passes_appends_summarise_when_enabled() {
+        // Auto-summarise alone (no re-transcribe, no diarize).
+        assert_eq!(
+            post_stop_passes(false, false, true),
+            vec![PostStopPass::Summarise],
+            "auto-summarise on must add the summarise pass"
+        );
+        // Summarise is always LAST.
+        assert_eq!(
+            *post_stop_passes(true, false, true).last().unwrap(),
+            PostStopPass::Summarise
+        );
+        // Off → never planned.
+        assert!(
+            !post_stop_passes(true, true, false).contains(&PostStopPass::Summarise),
+            "auto-summarise off must omit the summarise pass"
         );
     }
 
@@ -2286,10 +2386,11 @@ mod tests {
         assert!(calls.is_empty(), "no passes → run_pass never called");
     }
 
-    /// All planned passes run, in order, when each succeeds.
+    /// All planned passes run, in order, when each succeeds — including the #68
+    /// auto-summarise pass running LAST.
     #[tokio::test]
     async fn run_post_stop_passes_runs_all_in_order() {
-        let passes = post_stop_passes(true, true);
+        let passes = post_stop_passes(true, true, true);
         let mut calls: Vec<PostStopPass> = Vec::new();
         run_post_stop_passes(&passes, MeetingId::new(), |pass| {
             calls.push(pass);
@@ -2298,8 +2399,89 @@ mod tests {
         .await;
         assert_eq!(
             calls,
-            vec![PostStopPass::ReTranscribe, PostStopPass::Rediarize]
+            vec![
+                PostStopPass::ReTranscribe,
+                PostStopPass::Rediarize,
+                PostStopPass::Summarise
+            ]
         );
+    }
+
+    /// #68 — the post-stop chain AUTO-SUMMARISES when `auto_summarise_on_stop` is
+    /// on: the planned passes include `Summarise`, and the `run_pass` closure
+    /// (here a stub summariser writing `summary.md` + emitting `SummaryReady`)
+    /// runs it. Verified WITHOUT a Tauri runtime, a real model, or a real
+    /// orchestrator — the held-summarise side effects are exercised via the
+    /// trait-based [`summarise_meeting_inner`] + [`emit_summary_ready`] seam.
+    #[tokio::test]
+    async fn post_stop_chain_auto_summarises_when_enabled() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = write_synthetic_meeting(
+            root,
+            "Auto-summarised",
+            "2026-06-10T09:00:00Z",
+            Some("the agenda item"),
+        );
+
+        // Gating: auto-summarise on, nothing else → exactly the summarise pass.
+        let passes = post_stop_passes(false, false, /* auto_summarise */ true);
+        assert_eq!(passes, vec![PostStopPass::Summarise]);
+
+        let (event_tx, mut event_rx) = broadcast::channel::<AppEvent>(16);
+        let stub = StubSummariser::new("## Summary\n\nAuto-generated on stop.\n");
+
+        // Drive the chain. The `Summarise` arm runs the SAME read → summarise →
+        // write → `SummaryReady` work `run_held_summarise` performs, but through
+        // the model-free stub seam so CI needs no GGUF.
+        run_post_stop_passes(&passes, meeting_id, |pass| {
+            let event_tx = event_tx.clone();
+            let stub = &stub;
+            async move {
+                match pass {
+                    PostStopPass::Summarise => {
+                        summarise_meeting_inner(root, meeting_id, stub, "prompt")?;
+                        emit_summary_ready(&event_tx, meeting_id);
+                        Ok(())
+                    }
+                    other => panic!("unexpected pass {other:?}"),
+                }
+            }
+        })
+        .await;
+
+        // `summary.md` was written by the auto-summarise pass.
+        let written = get_summary_inner(root, meeting_id).expect("read summary");
+        assert_eq!(
+            written.as_deref(),
+            Some("## Summary\n\nAuto-generated on stop.\n"),
+            "auto-summarise must write summary.md after stop"
+        );
+        // And `SummaryReady` was emitted for the meeting (clears the UI indicator).
+        let event = event_rx.recv().await.expect("a SummaryReady event");
+        match event {
+            AppEvent::SummaryReady { meeting_id: got } => assert_eq!(got, meeting_id),
+            other => panic!("expected SummaryReady, got {other:?}"),
+        }
+    }
+
+    /// #68 — when `auto_summarise_on_stop` is off, the plan omits `Summarise`, so
+    /// the chain never invokes the summarise pass (no `summary.md`, no
+    /// `SummaryReady`).
+    #[tokio::test]
+    async fn post_stop_chain_skips_summarise_when_disabled() {
+        let passes = post_stop_passes(false, false, /* auto_summarise */ false);
+        assert!(passes.is_empty(), "auto-summarise off + nothing else → no passes");
+
+        let mut summarise_calls = 0u32;
+        run_post_stop_passes(&passes, MeetingId::new(), |pass| {
+            if pass == PostStopPass::Summarise {
+                summarise_calls += 1;
+            }
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(summarise_calls, 0, "summarise pass must not run when disabled");
     }
 
     /// A failed re-transcribe (InvalidInput = busy, OR any other error) is
@@ -2315,7 +2497,7 @@ mod tests {
                 context: "boom".into(),
             },
         ] {
-            let passes = post_stop_passes(true, true);
+            let passes = post_stop_passes(true, true, false);
             let mut calls: Vec<PostStopPass> = Vec::new();
             // Move the error into the closure via an Option taken on first call.
             let mut first_err = Some(first_err);
@@ -2325,7 +2507,7 @@ mod tests {
                     PostStopPass::ReTranscribe => {
                         Err(first_err.take().expect("one re-transcribe call"))
                     }
-                    PostStopPass::Rediarize => Ok(()),
+                    PostStopPass::Rediarize | PostStopPass::Summarise => Ok(()),
                 };
                 async move { result }
             })

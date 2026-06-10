@@ -185,6 +185,15 @@
   margin: 0 0 1rem;
 }
 
+/*
+ * #68 — wrapper for the determinate summarise progress bar (the shared
+ * OperationIndicator). Its inner `.operation-indicator*` styles are defined in
+ * MeetingList.css (always loaded by the shell); this only adds spacing.
+ */
+.summary-view__progress {
+  margin: 0 0 1rem;
+}
+
 .summary-view__spinner {
   width: 0.85rem;
   height: 0.85rem;

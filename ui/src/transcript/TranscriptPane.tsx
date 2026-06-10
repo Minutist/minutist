@@ -1,10 +1,72 @@
 import { useEffect, useRef } from "react";
 import { useCrossRefStore } from "../state/cross-ref";
 import { useActiveTranscript } from "../state/active-transcript";
+import { useMeetingsStore } from "../state/meetings";
+import { useRecordingStore } from "../state/recording";
+import { useOperationProgressStore } from "../state/operation-progress";
 import { writeSegmentDrag } from "../editor/transcript-dnd";
 import { speakerColorIndex } from "./speaker-color";
 import type { Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
+
+/**
+ * Action toolbar at the top of the transcript pane (#67).
+ *
+ * Holds the two offline reprocessing actions that used to live in the meeting
+ * heading: Re-transcribe (re-run ASR over the recording) and Re-identify
+ * speakers (re-run diarization). They operate on the OPEN saved meeting and are
+ * shown only when one is open and nothing is recording — an offline op must not
+ * contend with the live pipeline (the backend refuses unless `Idle`).
+ *
+ * Each action is disabled while a recording is live OR while its own op is
+ * already in flight for the open meeting (read from the operation-progress
+ * store, keyed on `meeting_id` + op), so a double-press cannot re-claim the
+ * offline slot.
+ */
+function TranscriptToolbar() {
+  const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
+  const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
+  const reDiarize = useMeetingsStore((s) => s.rediarize);
+  const recordingState = useRecordingStore((s) => s.state);
+  const operation = useOperationProgressStore((s) =>
+    openMeetingId !== null ? s.operations[openMeetingId] : undefined,
+  );
+
+  // Offline reprocessing only applies to a saved meeting that is open while the
+  // recorder is idle (recording / paused / stopping / finalising would contend
+  // with the live pipeline). Render nothing otherwise.
+  if (openMeetingId === null || recordingState.kind !== "idle") return null;
+
+  const retranscribeInFlight = operation?.op === "re_transcribe";
+  const rediarizeInFlight = operation?.op === "rediarize";
+
+  return (
+    <div
+      className="transcript-pane__toolbar"
+      role="toolbar"
+      aria-label="Transcript actions"
+    >
+      <button
+        type="button"
+        className="transcript-pane__action"
+        disabled={retranscribeInFlight}
+        onClick={() => void reTranscribe(openMeetingId)}
+        title="Re-run speech recognition on this recording (rare; e.g. after changing the language or model)."
+      >
+        Re-transcribe
+      </button>
+      <button
+        type="button"
+        className="transcript-pane__action"
+        disabled={rediarizeInFlight}
+        onClick={() => void reDiarize(openMeetingId)}
+        title="Re-run speaker identification on this recording (rare)."
+      >
+        Re-identify speakers
+      </button>
+    </div>
+  );
+}
 
 /**
  * Format a recording-clock millisecond offset as MM:SS.cc.
@@ -77,56 +139,59 @@ export function TranscriptPane() {
   }
 
   return (
-    <div
-      className="transcript-pane"
-      ref={scrollRef}
-      onScroll={handleScroll}
-      aria-label="Transcript"
-      aria-live="polite"
-    >
-      {transcript.length === 0 ? (
-        <p className="transcript-pane__empty">
-          Transcript will appear here while you record.
-        </p>
-      ) : (
-        <ol className="transcript-pane__list">
-          {transcript.map((seg: Segment, idx: number) => {
-            const highlighted =
-              highlightedRange !== null &&
-              idx >= highlightedRange.startIndex &&
-              idx < highlightedRange.endIndex;
-            // Group consecutive rows by speaker: the labelled chip shows only
-            // when the speaker changes from the previous row. Continuation rows
-            // keep just the colour dot, so the per-speaker colour persists on
-            // every diarized row without the "Speaker X" label repeating.
-            const prevSpeaker = idx > 0 ? transcript[idx - 1].speaker_id : null;
-            const speakerChanged =
-              seg.speaker_id != null && seg.speaker_id !== prevSpeaker;
-            const dotColor =
-              seg.speaker_id != null
-                ? `var(--speaker-${speakerColorIndex(seg.speaker_id)})`
-                : undefined;
-            return (
-              <li
-                key={idx}
-                className={
-                  highlighted
-                    ? "transcript-pane__row transcript-pane__row--highlighted"
-                    : "transcript-pane__row"
-                }
-                draggable
-                aria-current={highlighted ? "true" : undefined}
-                title="Drag into your notes, or click to jump to the linked paragraph"
-                onDragStart={(e) => {
-                  if (e.dataTransfer) writeSegmentDrag(e.dataTransfer, seg);
-                }}
-                onClick={() => clickTranscriptSegment(seg)}
-              >
-                <span className="transcript-pane__timestamp tnum">
-                  {formatTimestamp(seg.start_ms)}
-                </span>
-                <span className="transcript-pane__text">
-                  {/*
+    <div className="transcript-pane">
+      <TranscriptToolbar />
+      <div
+        className="transcript-pane__scroll"
+        ref={scrollRef}
+        onScroll={handleScroll}
+        aria-label="Transcript"
+        aria-live="polite"
+      >
+        {transcript.length === 0 ? (
+          <p className="transcript-pane__empty">
+            Transcript will appear here while you record.
+          </p>
+        ) : (
+          <ol className="transcript-pane__list">
+            {transcript.map((seg: Segment, idx: number) => {
+              const highlighted =
+                highlightedRange !== null &&
+                idx >= highlightedRange.startIndex &&
+                idx < highlightedRange.endIndex;
+              // Group consecutive rows by speaker: the labelled chip shows only
+              // when the speaker changes from the previous row. Continuation rows
+              // keep just the colour dot, so the per-speaker colour persists on
+              // every diarized row without the "Speaker X" label repeating.
+              const prevSpeaker =
+                idx > 0 ? transcript[idx - 1].speaker_id : null;
+              const speakerChanged =
+                seg.speaker_id != null && seg.speaker_id !== prevSpeaker;
+              const dotColor =
+                seg.speaker_id != null
+                  ? `var(--speaker-${speakerColorIndex(seg.speaker_id)})`
+                  : undefined;
+              return (
+                <li
+                  key={idx}
+                  className={
+                    highlighted
+                      ? "transcript-pane__row transcript-pane__row--highlighted"
+                      : "transcript-pane__row"
+                  }
+                  draggable
+                  aria-current={highlighted ? "true" : undefined}
+                  title="Drag into your notes, or click to jump to the linked paragraph"
+                  onDragStart={(e) => {
+                    if (e.dataTransfer) writeSegmentDrag(e.dataTransfer, seg);
+                  }}
+                  onClick={() => clickTranscriptSegment(seg)}
+                >
+                  <span className="transcript-pane__timestamp tnum">
+                    {formatTimestamp(seg.start_ms)}
+                  </span>
+                  <span className="transcript-pane__text">
+                    {/*
                     Phase 6/C: a quiet "Speaker {id}" chip when diarization has
                     assigned this segment a speaker, shown only at the start of a
                     speaker's run (see `speakerChanged`). The id is the diarizer's
@@ -135,43 +200,44 @@ export function TranscriptPane() {
                     `speakerColorIndex` mapper and passed via the `--dot-color`
                     custom property — tokens only, no hard-coded colour in TSX.
                   */}
-                  {speakerChanged && (
-                    <span
-                      className="transcript-pane__speaker"
-                      style={{ ["--dot-color" as string]: dotColor }}
-                      aria-label={`Speaker ${seg.speaker_id}`}
-                    >
+                    {speakerChanged && (
                       <span
-                        className="transcript-pane__speaker-dot"
-                        aria-hidden="true"
-                      />
-                      Speaker {seg.speaker_id}
-                    </span>
-                  )}
-                  {/*
+                        className="transcript-pane__speaker"
+                        style={{ ["--dot-color" as string]: dotColor }}
+                        aria-label={`Speaker ${seg.speaker_id}`}
+                      >
+                        <span
+                          className="transcript-pane__speaker-dot"
+                          aria-hidden="true"
+                        />
+                        Speaker {seg.speaker_id}
+                      </span>
+                    )}
+                    {/*
                     Continuation row (same speaker as the row above): the colour
                     dot alone, no repeated label. Decorative — the run's leading
                     chip carries the accessible name.
                   */}
-                  {seg.speaker_id != null && !speakerChanged && (
-                    <span
-                      className="transcript-pane__speaker transcript-pane__speaker--cont"
-                      style={{ ["--dot-color" as string]: dotColor }}
-                      aria-hidden="true"
-                    >
+                    {seg.speaker_id != null && !speakerChanged && (
                       <span
-                        className="transcript-pane__speaker-dot"
+                        className="transcript-pane__speaker transcript-pane__speaker--cont"
+                        style={{ ["--dot-color" as string]: dotColor }}
                         aria-hidden="true"
-                      />
-                    </span>
-                  )}
-                  {seg.text}
-                </span>
-              </li>
-            );
-          })}
-        </ol>
-      )}
+                      >
+                        <span
+                          className="transcript-pane__speaker-dot"
+                          aria-hidden="true"
+                        />
+                      </span>
+                    )}
+                    {seg.text}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+      </div>
     </div>
   );
 }

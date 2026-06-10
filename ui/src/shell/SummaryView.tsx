@@ -16,6 +16,8 @@ import MarkdownIt from "markdown-it";
 import { useSummaryStore } from "../state/summary";
 import { useModelsStore } from "../state/models";
 import { useRecordingStore } from "../state/recording";
+import { useOperationProgressStore } from "../state/operation-progress";
+import { OperationIndicator } from "./OperationIndicator";
 import {
   SUMMARY_PRESETS,
   SUMMARY_PRESET_LABELS,
@@ -56,6 +58,16 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
   const setDraft = useSummaryStore((s) => s.setDraft);
   const endEdit = useSummaryStore((s) => s.endEdit);
 
+  // #68 — a summarise can be in flight for this meeting WITHOUT this pane having
+  // dispatched it: the post-stop auto-summarise chain runs in the background and
+  // streams `OperationProgress { op: "summarise" }`. Read the operation-progress
+  // store (Batch A), keyed on the open meeting_id + op == "summarise", so opening
+  // the pane mid-flight shows the determinate bar even when the local
+  // `summarising` flag is false. (When the pane DID dispatch the summarise, the
+  // same events drive the same bar.)
+  const operation = useOperationProgressStore((s) => s.operations[meetingId]);
+  const summariseInFlight = operation?.op === "summarise";
+
   // Summarisation needs the LLM; on first use the orchestrator downloads it
   // (multi-GB) before any text is generated. Surface THAT phase distinctly so a
   // long wait does not masquerade as "Summarising…" (which reads as broken).
@@ -70,9 +82,16 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
   let downloadPct: number | null = null;
   const llmProgress = llm ? downloadInProgress[llm.id] : undefined;
   if (llmProgress && llmProgress.bytes_total > 0) {
-    downloadPct = Math.round((100 * llmProgress.bytes_done) / llmProgress.bytes_total);
-  } else if (llm?.status.state === "downloading" && llm.status.bytes_total > 0) {
-    downloadPct = Math.round((100 * llm.status.bytes_done) / llm.status.bytes_total);
+    downloadPct = Math.round(
+      (100 * llmProgress.bytes_done) / llmProgress.bytes_total,
+    );
+  } else if (
+    llm?.status.state === "downloading" &&
+    llm.status.bytes_total > 0
+  ) {
+    downloadPct = Math.round(
+      (100 * llm.status.bytes_done) / llm.status.bytes_total,
+    );
   }
 
   // Summary-prompt configuration (Phase 9 — D4). The selected preset drives the
@@ -146,9 +165,9 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
                 type="button"
                 className="summary-view__action summary-view__action--primary"
                 onClick={() => void summarise(meetingId)}
-                disabled={summarising}
+                disabled={summarising || summariseInFlight}
               >
-                {summarising
+                {summarising || summariseInFlight
                   ? downloadingModel
                     ? "Downloading model…"
                     : "Summarising…"
@@ -161,7 +180,7 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
                   type="button"
                   className="summary-view__action"
                   onClick={beginEdit}
-                  disabled={summarising}
+                  disabled={summarising || summariseInFlight}
                 >
                   Edit
                 </button>
@@ -234,6 +253,20 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
         </p>
       )}
 
+      {/*
+        #68 — determinate summarise progress bar. Rendered whenever a summarise is
+        in flight for THIS meeting (op == "summarise" in the operation-progress
+        store), which covers BOTH a pane-dispatched summarise and the post-stop
+        auto-summarise running in the background when the pane is opened. Reuses
+        the shared OperationIndicator (the same per-row indicator the meeting list
+        uses).
+      */}
+      {summariseInFlight && !editing && (
+        <div className="summary-view__progress">
+          <OperationIndicator meetingId={meetingId} />
+        </div>
+      )}
+
       {summarising && !editing && (
         <p className="summary-view__status" role="status">
           <span className="summary-view__spinner" aria-hidden="true" />
@@ -262,8 +295,8 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
       ) : (
         !summarising && (
           <p className="summary-view__empty">
-            No summary yet. Run Summarise to generate one from the transcript and
-            your notes.
+            No summary yet. Run Summarise to generate one from the transcript
+            and your notes.
           </p>
         )
       )}

@@ -26,10 +26,21 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
   WebviewWindow: vi.fn(),
 }));
 
+vi.mock("../ipc/meetings", () => ({
+  listMeetings: vi.fn().mockResolvedValue([]),
+  openMeeting: vi.fn(),
+  renameMeeting: vi.fn(),
+  deleteMeeting: vi.fn(),
+  reTranscribe: vi.fn().mockResolvedValue(undefined),
+  rediarize: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { TranscriptPane, formatTimestamp } from "../transcript/TranscriptPane";
 import { useRecordingStore } from "../state/recording";
 import { useCrossRefStore } from "../state/cross-ref";
 import { useMeetingsStore } from "../state/meetings";
+import { useOperationProgressStore } from "../state/operation-progress";
+import * as meetingsIpc from "../ipc/meetings";
 import { TRANSCRIPT_SEGMENT_MIME } from "../editor/transcript-dnd";
 import type { MeetingState } from "../state/meetings";
 import type { Segment } from "../ipc/bindings";
@@ -320,5 +331,114 @@ describe("TranscriptPane cross-reference interactions", () => {
       screen.queryByText("live should not show"),
     ).not.toBeInTheDocument();
     expect(screen.getAllByRole("listitem")).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #67 — Re-transcribe / Re-identify-speakers action toolbar at the top of the
+// transcript pane (moved out of the meeting heading).
+// ---------------------------------------------------------------------------
+
+describe("TranscriptPane action toolbar (#67)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" }, transcript: [] });
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+      useOperationProgressStore.setState({ operations: {} });
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("hides the toolbar on the live recording (no saved meeting open)", () => {
+    act(() => {
+      useRecordingStore.setState({
+        state: {
+          kind: "recording",
+          meeting_id: "live-1",
+          started_at_ms: Date.now(),
+        },
+        transcript: [makeSegment(0, "live")],
+      });
+      useMeetingsStore.setState({ openMeetingId: null });
+    });
+    render(<TranscriptPane />);
+    expect(
+      screen.queryByRole("toolbar", { name: "Transcript actions" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Re-transcribe" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the toolbar with both actions when a saved meeting is open + idle", () => {
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "saved-1",
+        openMeetingState: { transcript: [] } as unknown as MeetingState,
+      });
+    });
+    render(<TranscriptPane />);
+    expect(
+      screen.getByRole("toolbar", { name: "Transcript actions" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Re-transcribe" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Re-identify speakers" }),
+    ).toBeInTheDocument();
+  });
+
+  it("Re-transcribe / Re-identify-speakers invoke their meetings-store seams with the open meeting id", () => {
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "saved-2",
+        openMeetingState: { transcript: [] } as unknown as MeetingState,
+      });
+    });
+    render(<TranscriptPane />);
+
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Re-transcribe" }));
+    });
+    expect(meetingsIpc.reTranscribe).toHaveBeenCalledWith("saved-2");
+
+    act(() => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Re-identify speakers" }),
+      );
+    });
+    expect(meetingsIpc.rediarize).toHaveBeenCalledWith("saved-2");
+  });
+
+  it("disables a reprocess action while its own op is in flight for the open meeting", () => {
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "saved-3",
+        openMeetingState: { transcript: [] } as unknown as MeetingState,
+      });
+      // A re-transcribe is in flight for the open meeting.
+      useOperationProgressStore.setState({
+        operations: {
+          "saved-3": {
+            op: "re_transcribe",
+            fraction: 0.4,
+            label: "Re-transcribing…",
+          },
+        },
+      });
+    });
+    render(<TranscriptPane />);
+    expect(
+      screen.getByRole("button", { name: "Re-transcribe" }),
+    ).toBeDisabled();
+    // The other action is unaffected (its op is not in flight).
+    expect(
+      screen.getByRole("button", { name: "Re-identify speakers" }),
+    ).not.toBeDisabled();
   });
 });

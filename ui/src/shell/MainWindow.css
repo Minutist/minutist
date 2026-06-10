@@ -180,29 +180,31 @@
 }
 
 /*
- * Emphasis hierarchy: the primary action (Start, the most-used Record entry
- * point) is the strongest control — oxblood fill. Stop is a clear secondary
- * (oxblood outline). Pause/Resume stay quiet.
+ * Emphasis hierarchy (#66 — two context-aware toggles). The RECORD toggle is
+ * the strongest control: Start (the most-used entry point) is an oxblood FILL;
+ * Stop is a clear oxblood OUTLINE secondary. Pause/Resume stay quiet. Keyed on
+ * the button's `data-action` so the emphasis follows the toggle's intent rather
+ * than a positional `nth-child`.
  */
-.meeting-controls button:nth-child(1):not(:disabled) {
+.meeting-controls button[data-action="start"]:not(:disabled) {
   color: var(--sheet);
   background: var(--accent);
   border-color: var(--accent);
 }
 
-.meeting-controls button:nth-child(1):hover:not(:disabled) {
+.meeting-controls button[data-action="start"]:hover:not(:disabled) {
   background: var(--accent-soft);
   border-color: var(--accent-soft);
   color: var(--sheet);
 }
 
-.meeting-controls button:nth-child(4):not(:disabled) {
+.meeting-controls button[data-action="stop"]:not(:disabled) {
   color: var(--accent);
   border-color: var(--accent);
   background: var(--sheet);
 }
 
-.meeting-controls button:nth-child(4):hover:not(:disabled) {
+.meeting-controls button[data-action="stop"]:hover:not(:disabled) {
   color: var(--sheet);
   background: var(--accent);
 }

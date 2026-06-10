@@ -77,10 +77,9 @@ export function MainWindow() {
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
-  const reDiarize = useMeetingsStore((s) => s.rediarize);
-  // Re-processing (re-transcribe / re-diarize) is a rare action that lives in
-  // the opened-meeting view, not on the meeting list — see MeetingList.
-  const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
+  // Re-processing (re-transcribe / re-identify speakers) is a rare action that
+  // lives in the transcript pane's action toolbar (#67) — see TranscriptPane —
+  // not on this heading or the meeting list.
 
   // The recorder is actively capturing (or in the brief stopping handoff). Live-
   // test UX T3: `finalising` is deliberately EXCLUDED — once the meeting is
@@ -172,10 +171,7 @@ export function MainWindow() {
     (showSummaryPane && summaryShown ? 1 : 0) +
     (showChatPane && chatShown ? 1 : 0);
 
-  function togglePane(
-    shown: boolean,
-    setShown: (next: boolean) => void,
-  ) {
+  function togglePane(shown: boolean, setShown: (next: boolean) => void) {
     // Never hide the last visible pane — the workspace must show something.
     if (shown && visibleCount <= 1) return;
     setShown(!shown);
@@ -207,42 +203,24 @@ export function MainWindow() {
             meeting is open AND nothing is recording — leaving an open meeting
             mid-recording would be ambiguous.
           */}
-          {inWorkspace && openMeetingId !== null && recordingState.kind === "idle" && (
-            <button
-              type="button"
-              className="main-window__header-btn"
-              onClick={closeMeeting}
-            >
-              Meetings
-            </button>
-          )}
+          {inWorkspace &&
+            openMeetingId !== null &&
+            recordingState.kind === "idle" && (
+              <button
+                type="button"
+                className="main-window__header-btn"
+                onClick={closeMeeting}
+              >
+                Meetings
+              </button>
+            )}
           {/*
-            Phase 6 — re-diarize the OPEN saved meeting from its workspace menu.
-            Shown only when a saved meeting is open and nothing is recording (a
-            re-diarize must not contend with the live pipeline; the backend
-            refuses unless `Idle`). The `diarization_complete` event re-reads the
-            open meeting's transcript so the speaker chips appear.
+            #67 — the Re-transcribe / Re-identify-speakers offline actions moved
+            out of this heading into an action toolbar at the TOP of the
+            transcript pane (see `TranscriptPane`). The meetings-store
+            `reTranscribe` / `rediarize` seams are unchanged; only the affordance
+            location moved.
           */}
-          {openMeetingId !== null && recordingState.kind === "idle" && (
-            <button
-              type="button"
-              className="main-window__header-btn main-window__reprocess"
-              onClick={() => void reTranscribe(openMeetingId)}
-              title="Re-run speech recognition on this recording (rare; e.g. after changing the language or model)."
-            >
-              Re-transcribe
-            </button>
-          )}
-          {openMeetingId !== null && recordingState.kind === "idle" && (
-            <button
-              type="button"
-              className="main-window__header-btn main-window__reprocess"
-              onClick={() => void reDiarize(openMeetingId)}
-              title="Re-run speaker identification on this recording (rare)."
-            >
-              Re-identify speakers
-            </button>
-          )}
           <MeetingControls />
           <div className="main-window__meter" aria-label="Audio level">
             <AudioMeter />
@@ -331,7 +309,10 @@ export function MainWindow() {
       </div>
 
       {inWorkspace ? (
-        <Group orientation="horizontal" className="main-window__panes ink-reveal">
+        <Group
+          orientation="horizontal"
+          className="main-window__panes ink-reveal"
+        >
           {buildPanes([
             notesShown && (
               <Panel

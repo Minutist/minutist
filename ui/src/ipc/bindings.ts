@@ -1131,7 +1131,20 @@ mcp_port?: number;
  * `false`; an older store deserialises to `false`. See
  * `architecture/cross-cutting.md` — "MCP transport".
  */
-mcp_write_tools?: boolean }
+mcp_write_tools?: boolean; 
+/**
+ * Auto-summarise a meeting after it stops + finalises (#68).
+ * 
+ * When `true` (the default), the post-stop background chain in `ipc-bridge`
+ * runs summarisation as its THIRD step (after any re-transcribe /
+ * re-identify-speakers pass) so the summary is ready without the user
+ * pressing Summarise. Best-effort: an error is logged, like the other
+ * passes. `#[serde(default = ...)]` defaults to `true`; an older store
+ * written before this field existed deserialises to `true`, preserving the
+ * new default for existing users. See `architecture/cross-cutting.md` — the
+ * Agent/stop lifecycle.
+ */
+auto_summarise_on_stop?: boolean }
 /**
  * Built-in summary prompt presets (Phase 9 — D4).
  * 

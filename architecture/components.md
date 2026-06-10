@@ -1371,6 +1371,17 @@ non-empty custom override, else `preset_prompt(self.summary_preset)`.
 resolution point. Both new fields are added to the hand-written `Default` impl.
 No new dependency edge.
 
+**Field — `auto_summarise_on_stop: bool` (#68).** Gates the third post-stop
+background pass: when `true`, `ipc-bridge`'s `stop_recording` auto-runs
+summarisation AFTER any re-transcribe / re-diarize so the summary is generated
+from the final transcript (see the `ipc-bridge` "Decoupled background
+post-processing" note). `#[serde(default = ...)]`-defaults to `true` — auto-summarise
+is ON by default; an older store written before the field existed deserialises to
+`true`, so existing users adopt the new behaviour. Added to the hand-written
+`Default` impl (`true`). `ipc-bridge` reads it (`current().auto_summarise_on_stop`)
+as the third gate of `post_stop_passes`. No new dependency edge. See
+`cross-cutting.md` — "Finalise returns to the meeting list".
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates
@@ -1423,22 +1434,33 @@ the index: the index handle lives in `ipc-bridge` (`IpcState`), so the upsert
 lives at the command boundary, not in the orchestrator.
 
 **Decoupled background post-processing + self-healing list (drift + truncation
-fix).** After the upsert, `stop_recording` runs up to two heavy passes OFF the
+fix).** After the upsert, `stop_recording` runs up to three heavy passes OFF the
 stop path, in order, in one fire-and-forget `tokio::spawn` (cloned
-`Arc<Orchestrator>` + `Arc<MeetingIndex>`), so neither can wedge the stop
-response or hide the meeting: (1) if `orchestrator.take_transcript_incomplete()`
+`Arc<Orchestrator>` + `Arc<MeetingIndex>` + a `ChatHandles` for the held
+summariser), so none can wedge the stop response or hide the meeting: (1) if
+`orchestrator.take_transcript_incomplete()`
 is true — the live ASR dropped audio (drop-oldest flush queue) or its stop-drain
 timed out — `re_transcribe` re-runs ASR over the complete `audio.opus`, the
 authoritative transcript (the audio is captured in full regardless of live-ASR
 speed); (2) if `orchestrator.diarization_enabled()`, `rediarize` runs AFTER any
 re-transcribe so it labels the repaired transcript — each with its own
-length-relative timeout (`retranscribe_timeout` / `diarize_timeout`). Both
-refresh the index row and emit their events on completion (`TranscriptReady` /
-`DiarizationComplete`; errors logged, claim-skips logged at info). While a pass
-holds the offline claim the recorder reports the public `Finalising` busy state
-(`Offline → Finalising` in `as_public`, broadcast by `claim_offline`/
-`release_offline`), so the webview gates the Start button instead of enabling it
-into an `InvalidInput` failure. And because a derived cache can always drift from
+length-relative timeout (`retranscribe_timeout` / `diarize_timeout`); (3) if
+`settings.auto_summarise_on_stop` (default `true`, #68), `run_held_summarise`
+auto-summarises the meeting AFTER any re-transcribe / re-diarize so the summary is
+generated from the FINAL transcript, emitting the determinate
+`OperationProgress { op: Summarise }` + `SummaryReady` exactly as the
+user-triggered `summarise_meeting` does (the summarise body is shared — both call
+`run_held_summarise`, which resolves the held `LlamaSummariser`, runs the heavy
+`summarise_with_progress` on `spawn_blocking`, refreshes the index excerpt, and
+emits `SummaryReady`). Passes (1)/(2) refresh the index row and emit their events
+on completion (`TranscriptReady` / `DiarizationComplete`); all passes are
+best-effort (errors logged, claim-skips logged at info — auto-summarise leaves the
+meeting without a summary on failure, recoverable via the Summarise action). While
+a re-transcribe / re-diarize pass holds the offline claim the recorder reports the
+public `Finalising` busy state (`Offline → Finalising` in `as_public`, broadcast by
+`claim_offline`/`release_offline`), so the webview gates the Start button instead of
+enabling it into an `InvalidInput` failure; the auto-summarise pass does not claim
+the offline slot. And because a derived cache can always drift from
 disk, `list_meetings` first calls
 `MeetingIndex::reconcile_orphans(meetings_dir)` — a cheap `readdir` + set-diff
 that lazily indexes any meeting folder present on disk but missing from the cache
@@ -1447,14 +1469,16 @@ meeting can never stay hidden within a session, even without a restart. Reconcil
 is best-effort (a failure logs and serves the cache as-is) and never deletes
 (removals are reconciled by the next startup `rebuild_from_disk`).
 
-The pass selection (gating + ordering — re-transcribe before diarize) is a pure
-`post_stop_passes(needs_retranscribe, needs_diarize) -> Vec<PostStopPass>`, and
-the execution (each pass tolerant of its own error — `InvalidInput`/busy logged
-at info, anything else at warn — never aborting the remaining passes) is
-`run_post_stop_passes`, which takes the per-pass call as a closure. Both are
-extracted from the `#[tauri::command]` body so the orchestration is unit-tested
-without a Tauri runtime or a real orchestrator (a recording stub injects per-pass
-results).
+The pass selection (gating + ordering — re-transcribe before diarize before
+auto-summarise) is a pure
+`post_stop_passes(needs_retranscribe, needs_diarize, needs_summarise) ->
+Vec<PostStopPass>`, and the execution (each pass tolerant of its own error —
+`InvalidInput`/busy logged at info, anything else at warn — never aborting the
+remaining passes) is `run_post_stop_passes`, which takes the per-pass call as a
+closure. Both are extracted from the `#[tauri::command]` body so the orchestration
+is unit-tested without a Tauri runtime or a real orchestrator (a recording stub
+injects per-pass results; the auto-summarise pass is exercised via a model-free
+`StubSummariser` that writes `summary.md` + emits `SummaryReady`).
 
 **Responsive stop — `Finalising` state + `MeetingFinalised` event.** The
 in-session drain/finalise (transcribing the live backlog, writing the meeting

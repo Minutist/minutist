@@ -24,6 +24,7 @@ vi.mock("../ipc/summary", () => ({
 import { SummaryView, renderSummaryMarkdown } from "../shell/SummaryView";
 import { useSummaryStore } from "../state/summary";
 import { useModelsStore } from "../state/models";
+import { useOperationProgressStore } from "../state/operation-progress";
 import { summariseMeeting, getSummary, saveSummary } from "../ipc/summary";
 import type { ModelStatus } from "../ipc/bindings";
 
@@ -57,6 +58,7 @@ function resetStore() {
       downloadInProgress: {},
       downloadErrors: {},
     });
+    useOperationProgressStore.setState({ operations: {} });
   });
 }
 
@@ -244,5 +246,63 @@ describe("SummaryView (FR-30)", () => {
     expect(
       screen.getByRole("button", { name: "Summarising…" }),
     ).toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // #68(b) — when the pane opens while a summarise is in flight for the open
+  // meeting (op == "summarise" in the operation-progress store, e.g. the
+  // post-stop auto-summarise), the determinate OperationIndicator bar shows even
+  // though THIS pane did not dispatch the summarise (store `summarising` false).
+  // -------------------------------------------------------------------------
+
+  it("shows the determinate summarise progress bar when a summarise is in flight on open", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    act(() => {
+      // The pane did NOT dispatch a summarise (the auto-summarise chain did);
+      // the store's `summarising` flag is false, but a `summarise` op is in
+      // flight for THIS meeting in the operation-progress store.
+      useSummaryStore.setState({ summarising: false, meetingId: null });
+      useOperationProgressStore.setState({
+        operations: {
+          [MEETING]: { op: "summarise", fraction: 0.42, label: "Summarising…" },
+        },
+      });
+    });
+
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+
+    // The determinate bar (from the shared OperationIndicator) is shown at 42%.
+    const bar = screen.getByRole("progressbar");
+    expect(bar).toHaveAttribute("aria-valuenow", "42");
+    // And the manual Summarise button is disabled + labelled "Summarising…" while
+    // the background auto-summarise is in flight (W1 — no double-summarise).
+    const summariseBtn = screen.getByRole("button", { name: /Summarising…/ });
+    expect(summariseBtn).toBeDisabled();
+  });
+
+  it("does not show the summarise progress bar when no summarise op is in flight", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
+
+  it("does not show the bar for a summarise op belonging to a different meeting", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    act(() => {
+      useOperationProgressStore.setState({
+        operations: {
+          "other-meeting": {
+            op: "summarise",
+            fraction: 0.5,
+            label: "Summarising…",
+          },
+        },
+      });
+    });
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
 });

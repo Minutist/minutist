@@ -86,6 +86,16 @@ const fn default_mcp_port() -> u16 {
     8765
 }
 
+/// Default for `auto_summarise_on_stop`: ON (#68). After a meeting is stopped and
+/// finalised, the post-stop background chain auto-runs summarisation (the third
+/// step, after any re-transcribe / re-identify-speakers pass) so the summary is
+/// ready without the user pressing Summarise. An older store written before this
+/// field existed deserialises to `true` via `#[serde(default = ...)]`. See
+/// `architecture/cross-cutting.md` — the Agent/stop lifecycle.
+const fn default_auto_summarise_on_stop() -> bool {
+    true
+}
+
 /// Default for `notes_paper_rules`: ON. The notes editor renders faint
 /// horizontal "writing paper" rules behind the text by default; users disable
 /// them in the Appearance settings. The oxblood *vertical* margin rule that
@@ -388,6 +398,19 @@ pub struct Settings {
     /// `architecture/cross-cutting.md` — "MCP transport".
     #[serde(default)]
     pub mcp_write_tools: bool,
+
+    /// Auto-summarise a meeting after it stops + finalises (#68).
+    ///
+    /// When `true` (the default), the post-stop background chain in `ipc-bridge`
+    /// runs summarisation as its THIRD step (after any re-transcribe /
+    /// re-identify-speakers pass) so the summary is ready without the user
+    /// pressing Summarise. Best-effort: an error is logged, like the other
+    /// passes. `#[serde(default = ...)]` defaults to `true`; an older store
+    /// written before this field existed deserialises to `true`, preserving the
+    /// new default for existing users. See `architecture/cross-cutting.md` — the
+    /// Agent/stop lifecycle.
+    #[serde(default = "default_auto_summarise_on_stop")]
+    pub auto_summarise_on_stop: bool,
 }
 
 impl Settings {
@@ -429,6 +452,7 @@ impl Default for Settings {
             mcp_enabled: false,
             mcp_port: default_mcp_port(),
             mcp_write_tools: false,
+            auto_summarise_on_stop: default_auto_summarise_on_stop(),
         }
     }
 }
@@ -476,6 +500,7 @@ mod tests {
             mcp_enabled: true,
             mcp_port: 9999,
             mcp_write_tools: true,
+            auto_summarise_on_stop: false,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -620,6 +645,43 @@ mod tests {
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1e. auto_summarise_on_stop: default + round-trip + missing-field
+    //     deserialisation (#68)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_summarise_on_stop_defaults_to_true() {
+        assert!(
+            Settings::default().auto_summarise_on_stop,
+            "auto-summarise-on-stop is ON by default (#68)"
+        );
+    }
+
+    #[test]
+    fn auto_summarise_on_stop_round_trips() {
+        let original = Settings {
+            auto_summarise_on_stop: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(!restored.auto_summarise_on_stop);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_auto_summarise_field_defaults_to_true() {
+        // A settings store written before `auto_summarise_on_stop` existed must
+        // adopt the new ON-by-default so existing users get the behaviour.
+        let old_json = r#"{ "theme": "dark", "diarization_enabled": true }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            restored.auto_summarise_on_stop,
+            "missing auto_summarise_on_stop must deserialise to true (#68 default)"
+        );
     }
 
     // -----------------------------------------------------------------------

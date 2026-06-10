@@ -1062,10 +1062,23 @@ CPU is strictly worse than the 0.6B CPU default. The decision base is
 a Vulkan device without `VK_EXT_memory_budget` reports `free == total`, so `free`
 is trusted only to *tighten* the budget when it is a credible smaller number.
 **A `None` probe (no GPU / probe failed) fails safe to CPU** — a false "fits"
-risks an out-of-memory load or a silent host-memory spill. The VRAM thresholds
-in `common` are estimates pending live-hardware evidence; `app-main` logs the
-probe + the resolved default plan once at startup (`IpcState::log_gpu_probe`,
-`target: "app-main"`) so the numbers can be validated against real devices.
+risks an out-of-memory load or a silent host-memory spill.
+
+**The VRAM thresholds are PROVISIONAL ESTIMATES pending live-hardware
+validation.** The decision constants live as named `const`s in `common`
+(`resolve_gpu_plan`): `SUMMARISER_VRAM_BYTES` (the load-bearing one — Gemma-4-E4B
+Q4 weights + KV @ 32K + headroom, ≈ 8 GiB), `ASR_SMALL_VRAM_BYTES`,
+`ASR_LARGE_VRAM_BYTES`, and the `DISCRETE_HEADROOM` / `IGPU_HEADROOM` fractions.
+They were derived from model file sizes, NOT measured — in particular Gemma's KV
+footprint at the 32K context (and its interleaved sliding-window attention) is
+calculated. **To tune:** run the app on the target GPU and read the one-shot
+startup log line `IpcState::log_gpu_probe` (`target: "app-main"`, fields
+`gpu`/`total_mb`/`free_mb`/`integrated`/`summariser_gpu`/`asr_gpu`/`effective_prefer_large`),
+compare the reported VRAM against what the model actually needs (e.g. llama.cpp's
+reported KV/compute-buffer sizes on load), and adjust the consts. `resolve_gpu_plan`
+is pure, so the policy re-tests without a GPU after any change. KNOWN GAPS to
+confirm on real hardware: the Gemma KV estimate, whether Vulkan reports
+`free == total` here, and the integrated-GPU `0.50` cap.
 
 Wiring: `asr-runtime`'s `AsrRuntimeConfig` and `summariser`'s `SummariserConfig`
 each carry a `n_gpu_layers: u32` field whose `Default` is the cfg-gated

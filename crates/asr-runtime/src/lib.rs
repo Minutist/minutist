@@ -15,11 +15,18 @@
 //!    The check is against the full concatenated string so the tag is detected
 //!    even when it spans token boundaries.
 //!
-//! # Script classification
+//! # Auto-language spurious-CJK guard
 //!
-//! [`is_cjk`], [`classify_script`], and [`ScriptClass`] are module-level
-//! helpers (not test-only) so the upcoming auto-language CJK guard and any
-//! future callers can use them without feature-gating.
+//! When `config.language` is `None` (auto-detect), the runtime tracks a rolling
+//! history of script observations across chunks. If the current chunk's text is
+//! majority-CJK but the recent session history is majority-Latin with at least
+//! two prior Latin observations, the chunk is re-run once with `language` forced
+//! to `"English"`. The retry is accepted only if it is plausible (non-empty,
+//! non-degenerate, CJK-free) AND its mean-token-logprob exceeds the auto run's
+//! by more than a small epsilon. If the retry loses or is within epsilon, the
+//! auto result is kept and a warning is emitted — genuine Chinese utterances in
+//! a mixed room are never silently dropped. See `architecture/components.md` —
+//! `asr-runtime` guard contract.
 //!
 //! See `architecture/cross-cutting.md` — "ASR chunking constraint" and
 //! `spikes/asr/README.md` + `spikes/vad-loop/README.md` for findings.
@@ -297,8 +304,134 @@ pub(crate) fn classify_script(text: &str) -> (f32, ScriptClass) {
 }
 
 /// Fraction of non-whitespace characters that must be CJK for a chunk to
-/// be considered CJK-dominant.
+/// trigger the spurious-CJK guard.
 const CJK_MAJORITY_THRESHOLD: f32 = 0.5;
+
+/// Epsilon for mean-logprob comparison: if the forced run's score exceeds the
+/// auto run's by at most this margin, scores are considered equivalent and the
+/// auto result is kept.
+const LOGPROB_EPSILON: f64 = 0.05;
+
+// ---------------------------------------------------------------------------
+// Session-history ring buffer
+// ---------------------------------------------------------------------------
+
+/// Number of recent chunk observations retained in the ring buffer.
+const RING_SIZE: usize = 8;
+
+/// Minimum Latin observations required in the ring buffer before the CJK guard
+/// considers the session to be Latin-dominant.
+const MIN_LATIN_PRIOR: usize = 2;
+
+/// Rolling history of script-class observations, one entry per emitted chunk.
+///
+/// Fixed-capacity ring buffer (`RING_SIZE` entries). The session is considered
+/// Latin-dominant when the majority of recent observations are `Latin` with at
+/// least `MIN_LATIN_PRIOR` Latin entries — the condition under which a sudden
+/// CJK chunk is suspicious and eligible for the retry guard.
+pub(crate) struct ScriptHistory {
+    buf: [ScriptClass; RING_SIZE],
+    /// Write position (mod RING_SIZE).
+    head: usize,
+    /// Number of entries written so far (saturates at RING_SIZE).
+    count: usize,
+}
+
+impl ScriptHistory {
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: [ScriptClass::Other; RING_SIZE],
+            head: 0,
+            count: 0,
+        }
+    }
+
+    /// Record the script class of the most-recently emitted chunk.
+    pub(crate) fn push(&mut self, class: ScriptClass) {
+        self.buf[self.head] = class;
+        self.head = (self.head + 1) % RING_SIZE;
+        self.count = (self.count + 1).min(RING_SIZE);
+    }
+
+    /// Return the number of Latin-class observations in the current window.
+    pub(crate) fn latin_count(&self) -> usize {
+        self.buf[..self.count]
+            .iter()
+            .filter(|&&c| c == ScriptClass::Latin)
+            .count()
+    }
+
+    /// Return `true` when the session history is majority-Latin with at least
+    /// `MIN_LATIN_PRIOR` Latin observations.
+    pub(crate) fn is_latin_session(&self) -> bool {
+        let n = self.count;
+        if n == 0 {
+            return false;
+        }
+        let latin = self.latin_count();
+        latin >= MIN_LATIN_PRIOR && latin * 2 > n
+    }
+
+    /// Number of observations stored (≤ `RING_SIZE`).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.count
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plausibility check for forced-English retry output
+// ---------------------------------------------------------------------------
+
+/// Minimum non-whitespace characters for a retry output to be considered
+/// plausible.
+const MIN_PLAUSIBLE_LEN: usize = 1;
+
+/// Word-level repetition threshold: if any single word accounts for more than
+/// this fraction of all words AND there are at least `DEGENERATE_MIN_WORDS`
+/// words, the output is considered degenerate (model runaway).
+const DEGENERATE_WORD_REPEAT_THRESHOLD: f32 = 0.5;
+
+/// Minimum word count before the word-repetition check fires. Short phrases
+/// like "hello hello" (2 words) are not degenerate even if one word dominates.
+const DEGENERATE_MIN_WORDS: usize = 5;
+
+/// Return `true` when the forced-English output is plausible.
+///
+/// A plausible output:
+/// - Has at least one non-whitespace character.
+/// - Contains no CJK codepoints (force failed or is mixed).
+/// - Is not degenerate: no single word accounts for more than
+///   `DEGENERATE_WORD_REPEAT_THRESHOLD` of all words in a string that is
+///   at least `DEGENERATE_MIN_WORDS` words long.
+pub(crate) fn is_plausible_english(text: &str) -> bool {
+    let non_ws: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if non_ws.len() < MIN_PLAUSIBLE_LEN {
+        return false;
+    }
+    if non_ws.iter().any(|&c| is_cjk(c)) {
+        return false;
+    }
+    // Degenerate repetition check: a model in runaway mode emits the same
+    // word/token repeatedly. Count word frequencies and reject if one word
+    // dominates a string that is long enough to judge.
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let total_words = words.len();
+    if total_words >= DEGENERATE_MIN_WORDS {
+        // Find the most-frequent word.
+        let mut max_count = 0usize;
+        for &w in &words {
+            let count = words.iter().filter(|&&x| x == w).count();
+            if count > max_count {
+                max_count = count;
+            }
+        }
+        if (max_count as f32) / (total_words as f32) > DEGENERATE_WORD_REPEAT_THRESHOLD {
+            return false;
+        }
+    }
+    true
+}
 
 // ---------------------------------------------------------------------------
 // AsrRuntime
@@ -312,10 +445,16 @@ const CJK_MAJORITY_THRESHOLD: f32 = 0.5;
 /// Per-call: a fresh `LlamaContext` is allocated for each `transcribe_chunk`
 /// invocation so the KV cache is always clean without requiring an explicit
 /// reset. This is cheap (sub-100 ms; see Spike 1 Q-P0-2).
+///
+/// Session state: a rolling `ScriptHistory` ring buffer tracks script-class
+/// observations across chunks to drive the auto-language CJK guard (active only
+/// when `config.language` is `None`).
 pub struct AsrRuntime {
     model: LlamaModel,
     mtmd_ctx: MtmdContext,
     config: AsrRuntimeConfig,
+    /// Rolling script-class history, updated after every successfully emitted chunk.
+    script_history: ScriptHistory,
 }
 
 impl AsrRuntime {
@@ -409,7 +548,12 @@ impl AsrRuntime {
             "mtmd context initialised"
         );
 
-        Ok(Self { model, mtmd_ctx, config })
+        Ok(Self {
+            model,
+            mtmd_ctx,
+            config,
+            script_history: ScriptHistory::new(),
+        })
     }
 }
 
@@ -424,51 +568,140 @@ impl AsrBackend for AsrRuntime {
     /// segment carries the chunk's `start_ms` and `end_ms`; `speaker_id` is
     /// left `None` (diarization is a separate post-hoc pass).
     ///
+    /// # Auto-language CJK guard (active when `config.language` is `None`)
+    ///
+    /// When the current chunk's text is majority-CJK but the session history is
+    /// majority-Latin with at least two prior Latin observations, the chunk is
+    /// re-run once with `language = Some("English")`. The retry is accepted when:
+    /// - it passes the plausibility check (non-empty, CJK-free, non-degenerate), AND
+    /// - its mean-token-logprob exceeds the auto run by more than `LOGPROB_EPSILON`.
+    ///
+    /// If the forced run fails plausibility or the score difference is within
+    /// epsilon, the original auto result is kept and a `tracing::warn` is emitted.
+    ///
+    /// **v1 limitation:** in non-English Latin-script rooms the forced-English
+    /// retry will typically score WORSE and be rejected (self-correcting), and the
+    /// forced language will later become locale/settings-driven.
+    ///
     /// # Errors
     ///
-    /// Returns `AppError::InvalidInput` when `chunk.sample_rate` is not 16 kHz:
-    /// the mtmd encoder resamples nothing, so any other rate produces garbage.
-    ///
-    /// # Stop conditions
-    ///
-    /// - `model.is_eog_token(token)` → stop immediately.
-    /// - The full concatenated detokenised text contains `</asr_text>` →
-    ///   stop immediately. This handles the case where Qwen3-ASR does not
-    ///   emit EOG for sub-window audio (Spike 3, API surprise #4). The check
-    ///   is against the complete string, not per-token, so the tag is caught
-    ///   even when it spans a token boundary.
+    /// Returns `AppError::InvalidInput` when `chunk.sample_rate` is not 16 kHz.
     fn transcribe_chunk(&mut self, chunk: &AudioChunk) -> AppResult<Vec<Segment>> {
-        // The mtmd encoder is fixed at 16 kHz and resamples nothing; a mismatch
-        // would be silently transcribed as garbage, so reject it up front.
         require_supported_sample_rate(chunk.sample_rate)?;
 
-        let result = transcribe_inner(
+        let auto_result = transcribe_inner(
             &self.model,
             &self.mtmd_ctx,
             &self.config,
             &chunk.samples,
         )?;
 
-        // `forced` (language prefix-forced) changes the generated text shape, so
-        // the wrapper parse must know which mode produced `result`.
-        let text = strip_asr_wrapper(&result.text, self.config.language.is_some());
+        let forced = self.config.language.is_some();
+        let auto_text = strip_asr_wrapper(&auto_result.text, forced);
+
+        // CJK guard is active only in auto-detect mode.
+        let final_text = if !forced {
+            self.cjk_guard(chunk, &auto_text, &auto_result)?
+        } else {
+            auto_text
+        };
 
         tracing::debug!(
             target = "asr-runtime",
             start_ms = chunk.start_ms,
             end_ms = chunk.end_ms,
-            text = %text,
+            text = %final_text,
             "transcribed chunk"
         );
 
         Ok(vec![Segment {
             start_ms: chunk.start_ms,
             end_ms: chunk.end_ms,
-            text,
+            text: final_text,
             speaker_id: None,
             confidence: None,
             words: vec![],
         }])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CJK guard
+// ---------------------------------------------------------------------------
+
+impl AsrRuntime {
+    /// Apply the auto-language spurious-CJK guard and update session history.
+    ///
+    /// Called from `transcribe_chunk` only when `config.language` is `None`.
+    fn cjk_guard(
+        &mut self,
+        chunk: &AudioChunk,
+        auto_text: &str,
+        auto_result: &InnerResult,
+    ) -> AppResult<String> {
+        let (cjk_frac, script_class) = classify_script(auto_text);
+
+        let final_text = if script_class == ScriptClass::Cjk
+            && self.script_history.is_latin_session()
+        {
+            // Current chunk is majority-CJK; session history is Latin-dominant.
+            // Re-run with language forced to "English".
+            let forced_config = AsrRuntimeConfig {
+                language: Some("English".to_string()),
+                threads: self.config.threads,
+                n_ctx: self.config.n_ctx,
+                n_batch: self.config.n_batch,
+                max_tokens: self.config.max_tokens,
+                n_gpu_layers: self.config.n_gpu_layers,
+            };
+
+            let forced_result = transcribe_inner(
+                &self.model,
+                &self.mtmd_ctx,
+                &forced_config,
+                &chunk.samples,
+            )?;
+            let forced_text = strip_asr_wrapper(&forced_result.text, true);
+
+            let plausible = is_plausible_english(&forced_text);
+            let score_diff = forced_result.mean_logprob - auto_result.mean_logprob;
+            let forced_wins = plausible && score_diff > LOGPROB_EPSILON;
+
+            tracing::debug!(
+                target = "asr-runtime",
+                start_ms = chunk.start_ms,
+                end_ms = chunk.end_ms,
+                cjk_fraction = %format!("{:.2}", cjk_frac),
+                auto_logprob = %format!("{:.4}", auto_result.mean_logprob),
+                forced_logprob = %format!("{:.4}", forced_result.mean_logprob),
+                forced_plausible = %plausible,
+                score_diff = %format!("{:.4}", score_diff),
+                decision = if forced_wins { "accept_forced" } else { "keep_auto" },
+                "CJK guard triggered"
+            );
+
+            if forced_wins {
+                self.script_history.push(ScriptClass::Latin);
+                forced_text
+            } else {
+                tracing::warn!(
+                    target = "asr-runtime",
+                    start_ms = chunk.start_ms,
+                    auto_logprob = %format!("{:.4}", auto_result.mean_logprob),
+                    forced_logprob = %format!("{:.4}", forced_result.mean_logprob),
+                    forced_plausible = %plausible,
+                    "CJK guard: keeping auto result (forced run lost or implausible); \
+                     may be genuine CJK in a mixed room"
+                );
+                self.script_history.push(ScriptClass::Cjk);
+                auto_text.to_string()
+            }
+        } else {
+            self.script_history.push(script_class);
+            auto_text.to_string()
+        };
+
+        Ok(final_text)
     }
 }
 
@@ -528,10 +761,9 @@ fn transcribe_inner(
 
     let input_text = MtmdInputText {
         text: prompt_text,
-        // Step 4: AddBos::Never equivalent — the template already includes BOS.
-        // MtmdInputText.add_special controls whether the tokenizer adds BOS/EOS.
-        // Setting add_special=false, parse_special=true: don't add extra specials,
-        // but do interpret special tokens already present in the template string.
+        // AddBos::Never equivalent — the template already includes BOS.
+        // add_special=false: don't add extra specials.
+        // parse_special=true: interpret special tokens already in the template.
         add_special: false,
         parse_special: true,
     };
@@ -541,12 +773,12 @@ fn transcribe_inner(
         .tokenize(input_text, &[&bitmap])
         .map_err(|e| AppError::from(Error::Tokenize(format!("mtmd tokenize: {e}"))))?;
 
-    // --- Step 5: prefill via mtmd_helper_eval_chunks ---
+    // --- Step 4: prefill via mtmd_helper_eval_chunks ---
     let mut n_past = chunks
         .eval_chunks(mtmd_ctx, &llama_ctx, 0, 0, config.n_batch as i32, true)
         .map_err(|e| AppError::from(Error::Decode(format!("eval_chunks: {e}"))))?;
 
-    // --- Step 6: greedy generation loop ---
+    // --- Step 5: greedy generation loop ---
     //
     // Logprob timing: after prefill (and after each decode), `get_logits()` holds
     // the raw next-token distribution. `sampler.sample` draws from those logits.
@@ -718,7 +950,6 @@ mod tests {
     // Unit tests — always run, no model required
     // -----------------------------------------------------------------------
 
-    // Auto-detect path (forced = false): the model emits the full open wrapper.
     #[test]
     fn strip_wrapper_full() {
         let raw = "language English<asr_text>hello world</asr_text>";
@@ -760,27 +991,18 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // apply_language_prefix — the pure prefix-force helper (no model)
-    // -----------------------------------------------------------------------
-
-    /// `Some(name)` appends exactly `language <Name><asr_text>` to the rendered
-    /// prompt (single space after `language`, no space before `<asr_text>`).
     #[test]
     fn apply_language_prefix_some() {
         assert_eq!(
             apply_language_prefix("PREFIX".to_string(), Some("English")),
             "PREFIXlanguage English<asr_text>"
         );
-        // Spot-check a non-English name to prove the name is interpolated verbatim.
         assert_eq!(
             apply_language_prefix("PREFIX".to_string(), Some("Spanish")),
             "PREFIXlanguage Spanish<asr_text>"
         );
     }
 
-    /// `None` returns the rendered string unchanged — the byte-identical
-    /// auto-detect guard at the helper level.
     #[test]
     fn apply_language_prefix_none_is_identity() {
         assert_eq!(
@@ -789,23 +1011,14 @@ mod tests {
         );
     }
 
-    /// Forced path (forced = true): the prefill is in the PROMPT, so the
-    /// generated `text` is just the transcript (+ close tag). Only the close tag
-    /// is stripped; the open-wrapper parse is skipped so a transcript that
-    /// contains — or even STARTS with — "language …" is never corrupted.
     #[test]
     fn strip_wrapper_forced_only_strips_close_tag() {
         assert_eq!(strip_asr_wrapper("hello world</asr_text>", true), "hello world");
-        // EOG before the close tag (sub-window audio).
         assert_eq!(strip_asr_wrapper("hello world", true), "hello world");
-        // Regression guard (the review-found bug): a transcript that legitimately
-        // contains "language X" must survive intact under the forced default.
         assert_eq!(
             strip_asr_wrapper("the programming language Rust is great</asr_text>", true),
             "the programming language Rust is great"
         );
-        // ...even when it STARTS with "language" (start-anchored stripping would
-        // still have eaten this; the forced flag prevents it entirely).
         assert_eq!(
             strip_asr_wrapper("language models are reshaping search</asr_text>", true),
             "language models are reshaping search"
@@ -844,10 +1057,7 @@ mod tests {
 
     #[test]
     fn require_supported_sample_rate_accepts_16khz_rejects_others() {
-        // 16 kHz is accepted.
         require_supported_sample_rate(16_000).expect("16 kHz must be accepted");
-
-        // Anything else is rejected as InvalidInput, model-free.
         for bad in [8_000u32, 22_050, 44_100, 48_000, 0] {
             let err = require_supported_sample_rate(bad)
                 .expect_err("non-16 kHz must be rejected");
@@ -867,16 +1077,12 @@ mod tests {
             feature = "cuda",
             feature = "rocm"
         )) {
-            // GPU build: offload all layers (clamped to i32::MAX downstream).
             assert_eq!(n, u32::MAX, "GPU build must offload all layers");
         } else {
-            // Default build: CPU-only.
             assert_eq!(n, 0, "default build must keep model on CPU");
         }
     }
 
-    /// The config default's `n_gpu_layers` is the compile-time ceiling, and the
-    /// derived mtmd `use_gpu` (`n_gpu_layers > 0`) matches the build features.
     #[test]
     fn config_default_n_gpu_layers_matches_build_features() {
         let cfg = AsrRuntimeConfig::default();
@@ -891,15 +1097,11 @@ mod tests {
             assert!(cfg.n_gpu_layers > 0, "GPU build derives mtmd use_gpu = true");
         } else {
             assert_eq!(cfg.n_gpu_layers, 0, "default build stays on CPU");
-            let use_gpu = cfg.n_gpu_layers > 0; // the derivation the open site uses
+            let use_gpu = cfg.n_gpu_layers > 0;
             assert!(!use_gpu, "default build derives mtmd use_gpu = false");
         }
     }
 
-    /// Forcing `n_gpu_layers = 0` (the runtime GPU-off path) derives
-    /// `use_gpu = false` regardless of the compiled backend — the CPU escape
-    /// hatch. This asserts the pure derivation the open site uses
-    /// (`config.n_gpu_layers > 0`), so it needs no model.
     #[test]
     fn forced_zero_gpu_layers_yields_use_gpu_false() {
         let cfg = AsrRuntimeConfig {
@@ -907,11 +1109,8 @@ mod tests {
             ..AsrRuntimeConfig::default()
         };
         assert_eq!(cfg.n_gpu_layers, 0);
-        // The open site computes `use_gpu` as `config.n_gpu_layers > 0`.
         let use_gpu = cfg.n_gpu_layers > 0;
         assert!(!use_gpu, "n_gpu_layers = 0 must keep the mtmd encoder on CPU");
-
-        // A non-zero override flips it the other way.
         let cfg_gpu = AsrRuntimeConfig {
             n_gpu_layers: u32::MAX,
             ..AsrRuntimeConfig::default()
@@ -919,8 +1118,6 @@ mod tests {
         assert!(cfg_gpu.n_gpu_layers > 0, "non-zero layers enable mtmd GPU");
     }
 
-    /// (no-model, always runs) — loading from a nonexistent path must
-    /// return `AppError::ModelLoad`, not panic.
     #[test]
     fn new_nonexistent_path_returns_model_load_error() {
         let result = AsrRuntime::new(
@@ -929,7 +1126,7 @@ mod tests {
             AsrRuntimeConfig::default(),
         );
         match result {
-            Err(AppError::ModelLoad { .. }) => { /* expected */ }
+            Err(AppError::ModelLoad { .. }) => {}
             Err(other) => panic!("expected AppError::ModelLoad, got: {other}"),
             Ok(_) => panic!("expected Err, got Ok"),
         }
@@ -1021,6 +1218,89 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // ScriptHistory ring buffer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn script_history_new_is_not_latin_session() {
+        let h = ScriptHistory::new();
+        assert!(!h.is_latin_session(), "empty history is not a Latin session");
+        assert_eq!(h.latin_count(), 0);
+    }
+
+    #[test]
+    fn script_history_single_latin_not_session() {
+        let mut h = ScriptHistory::new();
+        h.push(ScriptClass::Latin);
+        assert!(!h.is_latin_session());
+    }
+
+    #[test]
+    fn script_history_two_latin_is_session() {
+        let mut h = ScriptHistory::new();
+        h.push(ScriptClass::Latin);
+        h.push(ScriptClass::Latin);
+        assert!(h.is_latin_session(), "two Latin observations make a Latin session");
+    }
+
+    #[test]
+    fn script_history_majority_check() {
+        let mut h = ScriptHistory::new();
+        for _ in 0..3 {
+            h.push(ScriptClass::Latin);
+        }
+        for _ in 0..4 {
+            h.push(ScriptClass::Cjk);
+        }
+        assert!(!h.is_latin_session(), "CJK majority must not be Latin session");
+    }
+
+    #[test]
+    fn script_history_ring_wraps() {
+        let mut h = ScriptHistory::new();
+        for _ in 0..RING_SIZE {
+            h.push(ScriptClass::Latin);
+        }
+        assert_eq!(h.len(), RING_SIZE);
+        h.push(ScriptClass::Cjk);
+        assert_eq!(h.len(), RING_SIZE);
+        assert_eq!(h.latin_count(), RING_SIZE - 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_plausible_english
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plausible_normal_english() {
+        assert!(is_plausible_english("hello world"));
+        assert!(is_plausible_english("the quick brown fox"));
+    }
+
+    #[test]
+    fn plausible_rejects_empty() {
+        assert!(!is_plausible_english(""));
+        assert!(!is_plausible_english("   "));
+    }
+
+    #[test]
+    fn plausible_rejects_cjk() {
+        assert!(!is_plausible_english("你好世界"));
+        assert!(!is_plausible_english("hello 世界"));
+    }
+
+    #[test]
+    fn plausible_rejects_degenerate_repetition() {
+        let rep = "the ".repeat(30);
+        assert!(!is_plausible_english(&rep));
+    }
+
+    #[test]
+    fn plausible_accepts_short_non_degenerate() {
+        assert!(is_plausible_english("hello hello"));
+    }
+
+    // -----------------------------------------------------------------------
     // Gated integration tests — skip when model env vars are absent.
     //
     // To run:
@@ -1033,9 +1313,6 @@ mod tests {
         gated_runtime_with_language(None)
     }
 
-    /// Build a gated `AsrRuntime` threading `language` into the config so the
-    /// regression guard can exercise both the forced and auto-detect paths
-    /// against the real model.
     fn gated_runtime_with_language(language: Option<String>) -> Option<AsrRuntime> {
         let model_path = std::env::var("MINUTIST_ASR_MODEL_PATH").ok()?;
         let mmproj_path = std::env::var("MINUTIST_ASR_MMPROJ_PATH").ok()?;
@@ -1054,8 +1331,6 @@ mod tests {
     }
 
     fn load_librispeech_0() -> AudioChunk {
-        // tests/fixtures/librispeech_0.wav — 5.86 s, 16 kHz mono.
-        // Path is relative to the workspace root at test time.
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/librispeech_0.wav");
         let mut reader = hound::WavReader::open(&fixture)
@@ -1138,7 +1413,6 @@ mod tests {
         assert_eq!(seg.end_ms, chunk.end_ms);
         assert!(seg.speaker_id.is_none());
 
-        // Reference from Spike 1 README.
         let reference =
             "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL";
         let wer = word_error_rate(reference, &seg.text);
@@ -1158,14 +1432,7 @@ mod tests {
             Some(r) => r,
             None => return,
         };
-
-        // Use a generous max_tokens that would produce garbage if early-stop
-        // didn't work. The librispeech_0 clip is ~5.86 s; the real transcript
-        // is ~18 words. If we set max_tokens=1000 and early-stop doesn't fire,
-        // the model would fill the remaining 30-s silence window with ~180+
-        // hallucinated tokens.
         runtime.config.max_tokens = 1000;
-
         let chunk = load_librispeech_0();
         let segments = runtime
             .transcribe_chunk(&chunk)
@@ -1173,9 +1440,6 @@ mod tests {
 
         assert_eq!(segments.len(), 1);
         let text = &segments[0].text;
-
-        // A 5.86 s clip cannot produce more than ~30 words of real transcript.
-        // If early-stop fired correctly the word count should be well under 50.
         let word_count = text.split_whitespace().count();
         assert!(
             word_count < 50,
@@ -1184,9 +1448,7 @@ mod tests {
         );
     }
 
-    /// (gated) — THE spurious-Chinese regression guard. With forcing on
-    /// (`language: Some("English")`), the English librispeech fixture must yield
-    /// a non-empty transcript containing NO CJK codepoints.
+    /// (gated) — forced English must yield no CJK codepoints.
     #[test]
     #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
     fn forced_english_output_has_no_cjk() {
@@ -1211,10 +1473,7 @@ mod tests {
         );
     }
 
-    /// (gated) — auto-detect (`language: None`) must not be regressed: the
-    /// English fixture still transcribes within the existing 5% WER bound.
-    /// Pairs with the byte-identical unit guard so both the prompt-build and the
-    /// end-to-end auto path are protected.
+    /// (gated) — auto-detect must not be regressed: English fixture within 5% WER.
     #[test]
     #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
     fn auto_detect_unchanged() {
@@ -1237,5 +1496,63 @@ mod tests {
             wer * 100.0,
             segments[0].text
         );
+    }
+
+    /// (gated) — CJK guard must be INERT when `config.language` is `Some(..)`.
+    /// In forced mode `transcribe_chunk` skips the guard entirely. The English
+    /// fixture must return a clean, low-WER transcript.
+    #[test]
+    #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
+    fn cjk_guard_inert_when_language_forced() {
+        let mut runtime = match gated_runtime_with_language(Some("English".to_string())) {
+            Some(r) => r,
+            None => return,
+        };
+        let chunk = load_librispeech_0();
+        let segments = runtime
+            .transcribe_chunk(&chunk)
+            .expect("transcription must succeed");
+        assert_eq!(segments.len(), 1);
+        let text = &segments[0].text;
+        assert!(!text.trim().is_empty());
+        assert!(!text.chars().any(is_cjk));
+        let reference =
+            "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL";
+        let wer = word_error_rate(reference, text);
+        assert!(
+            wer <= 0.05,
+            "forced-language WER {:.2}% exceeds 5%; transcript: {:?}",
+            wer * 100.0,
+            text
+        );
+    }
+
+    /// (gated) — Auto-mode on English audio for multiple chunks. After two English
+    /// chunks the history is Latin-dominant, but the English fixture is not
+    /// majority-CJK so the guard never triggers. WER stays within 5%.
+    #[test]
+    #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
+    fn cjk_guard_does_not_degrade_english_session() {
+        let mut runtime = match gated_runtime_with_language(None) {
+            Some(r) => r,
+            None => return,
+        };
+        let chunk = load_librispeech_0();
+        let reference =
+            "MISTER QUILTER IS THE APOSTLE OF THE MIDDLE CLASSES AND WE ARE GLAD TO WELCOME HIS GOSPEL";
+
+        for _ in 0..3 {
+            let segments = runtime
+                .transcribe_chunk(&chunk)
+                .expect("transcription must succeed");
+            assert_eq!(segments.len(), 1);
+            let wer = word_error_rate(reference, &segments[0].text);
+            assert!(
+                wer <= 0.05,
+                "guard must not degrade English session; WER {:.2}%; text: {:?}",
+                wer * 100.0,
+                segments[0].text,
+            );
+        }
     }
 }

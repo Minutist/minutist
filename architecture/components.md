@@ -369,6 +369,34 @@ in `resolve_gpu_plan` decides whether it fits alongside the summariser; if not,
 the 0.6B remains the CPU default. Both share the same `#21847` long-audio
 limitation, so the batched-VAD chunking is mandatory for either.
 
+**Auto-language spurious-CJK guard.** When `AsrRuntimeConfig.language` is `None`
+(auto-detect), `AsrRuntime` holds a `ScriptHistory` ring buffer (last 8 chunks)
+tracking script-class observations (Latin / CJK / Other) per emitted chunk.
+
+*Trigger:* current chunk text is majority-CJK (> 50 % of non-whitespace chars are
+CJK codepoints per `is_cjk`) AND the session history is majority-Latin with ≥ 2
+prior Latin observations.
+
+*Action:* re-run `transcribe_inner` once with `language = Some("English")`.
+`transcribe_inner` now always returns an `InnerResult { text, mean_logprob }` —
+the mean log-probability of emitted tokens computed from sample-time logits (read
+between `sampler.sample` and `decode()`; log-sum-exp for numerical stability).
+
+*Acceptance:* prefer the forced output only when (a) it passes a plausibility
+check — non-empty, no CJK codepoints, non-degenerate 3-char n-gram distribution —
+AND (b) its `mean_logprob` exceeds the auto run's by more than `LOGPROB_EPSILON`
+(0.05). If the forced run loses or scores are within epsilon, keep the auto result
+and emit `tracing::warn` — genuine Chinese utterances in a mixed room are never
+silently dropped.
+
+*v1 limitation:* in non-English Latin-script rooms the forced-English retry will
+typically score WORSE and be rejected (self-correcting). The forced language here
+is hardcoded to `"English"`; a future revision will derive it from the user's
+locale/language settings.
+
+*Guard is inert* when `config.language` is `Some(..)` — the `cjk_guard` path is
+skipped entirely and `ScriptHistory` is not updated.
+
 ### `asr-parakeet`
 **Crate:** `crates/asr-parakeet`
 **Owns:** the sherpa-onnx offline-transducer binding, the Parakeet TDT 0.6B v3

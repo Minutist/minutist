@@ -451,7 +451,7 @@ impl AsrBackend for AsrRuntime {
 
         // `forced` (language prefix-forced) changes the generated text shape, so
         // the wrapper parse must know which mode produced `result`.
-        let text = strip_asr_wrapper(&result, self.config.language.is_some());
+        let text = strip_asr_wrapper(&result.text, self.config.language.is_some());
 
         tracing::debug!(
             target = "asr-runtime",
@@ -476,14 +476,35 @@ impl AsrBackend for AsrRuntime {
 // Core inference logic
 // ---------------------------------------------------------------------------
 
-/// Run one ASR pass. Returns the raw model output (including the
-/// `language English<asr_text>...</asr_text>` wrapper).
+/// Return value from [`transcribe_inner`].
+struct InnerResult {
+    /// Raw model output (including the `language English<asr_text>…</asr_text>`
+    /// wrapper — caller strips it).
+    text: String,
+    /// Mean log-probability of emitted tokens, computed from sample-time logits.
+    ///
+    /// Arithmetic mean of `log_softmax(logits)[token_id]` over all generated
+    /// tokens. The O(n_vocab) sum per token is trivial next to the decode itself.
+    /// When no tokens were emitted (e.g. pure EOG on a silent chunk), this is
+    /// `0.0`.
+    ///
+    /// **Comparability caveat:** the logprob is prompt-conditioned — two runs with
+    /// different prompts (auto vs forced) yield values on slightly different
+    /// distributions. The comparison in the CJK guard is a heuristic, not an
+    /// exact likelihood ratio.
+    mean_logprob: f64,
+}
+
+/// Run one ASR pass.
+///
+/// Returns the raw model output (including the wrapper) and the mean
+/// token log-probability computed from sample-time logits.
 fn transcribe_inner(
     model: &LlamaModel,
     mtmd_ctx: &MtmdContext,
     config: &AsrRuntimeConfig,
     samples: &[f32],
-) -> AppResult<String> {
+) -> AppResult<InnerResult> {
     let backend = get_or_init_backend().map_err(AppError::from)?;
 
     // --- Step 1: build audio bitmap ---
@@ -526,10 +547,19 @@ fn transcribe_inner(
         .map_err(|e| AppError::from(Error::Decode(format!("eval_chunks: {e}"))))?;
 
     // --- Step 6: greedy generation loop ---
+    //
+    // Logprob timing: after prefill (and after each decode), `get_logits()` holds
+    // the raw next-token distribution. `sampler.sample` draws from those logits.
+    // The logprob of the SAMPLED token must be read BEFORE calling decode for that
+    // token — after decode the logits hold the distribution for the FOLLOWING token.
     let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
     let mut batch = LlamaBatch::new(config.n_batch as usize, 1);
     let mut decoder = UTF_8.new_decoder();
     let mut text = String::new();
+
+    let n_vocab = model.n_vocab() as usize;
+    let mut logprob_sum: f64 = 0.0;
+    let mut token_count: usize = 0;
 
     for _ in 0..config.max_tokens {
         let token = sampler.sample(&llama_ctx, -1);
@@ -540,14 +570,30 @@ fn transcribe_inner(
             break;
         }
 
+        // Compute log-softmax at sample time (before this token's decode).
+        // get_logits() returns the distribution from which `token` was just
+        // sampled. After decode() below it will hold the next-token distribution.
+        {
+            let logits = llama_ctx.get_logits();
+            debug_assert_eq!(logits.len(), n_vocab, "logit vector length mismatch");
+            // log-sum-exp for numerical stability.
+            let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp: f64 = logits
+                .iter()
+                .map(|&l| ((l - max_logit) as f64).exp())
+                .sum();
+            let log_sum = sum_exp.ln() + max_logit as f64;
+            let token_logprob = (logits[token.0 as usize] as f64) - log_sum;
+            logprob_sum += token_logprob;
+            token_count += 1;
+        }
+
         let piece = model
             .token_to_piece(token, &mut decoder, true, None)
             .map_err(|e| AppError::from(Error::Decode(format!("token_to_piece: {e}"))))?;
         text.push_str(&piece);
 
         // Stop condition 2: </asr_text> tag in the full concatenated output.
-        // Check after appending — the tag may span token boundaries, so
-        // per-token checking would miss it.
         if text.contains("</asr_text>") {
             break;
         }
@@ -563,7 +609,13 @@ fn transcribe_inner(
             .map_err(|e| AppError::from(Error::Decode(format!("llama decode: {e}"))))?;
     }
 
-    Ok(text)
+    let mean_logprob = if token_count > 0 {
+        logprob_sum / token_count as f64
+    } else {
+        0.0
+    };
+
+    Ok(InnerResult { text, mean_logprob })
 }
 
 /// Apply the model's baked chat template and build the prompt string.

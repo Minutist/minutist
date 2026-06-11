@@ -902,15 +902,6 @@ lifetime; a change requires an app restart. Moving existing data is the user's
 responsibility (no automatic migration). There is currently no UI for this
 field; it must be set by editing `settings.store` directly.
 
-**Legacy data-dir migration (2026-06-11 rename).** `{app-data}` is keyed by
-the bundle identifier, which changed `net.alelec.meeting-app` → `ai.minutist`
-when the product was renamed Minutist. `app-main` runs a one-time shim as the
-FIRST statement of `main()` (before the logging bootstrap creates
-`<new-root>/logs`): if the legacy root exists and the new one does not, the
-whole tree is moved (`std::fs::rename`). On failure the legacy tree is left
-untouched and the app starts fresh. The shim is the only code allowed to
-reference the legacy identifier.
-
 **`index.db` is a derived, rebuildable cache (binding — Phase 4, A6).** The
 per-meeting folders are the **source of truth**; `index.db` (the libsql
 meeting-list index) is a query cache derived from each meeting's

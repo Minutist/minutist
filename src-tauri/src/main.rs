@@ -14,46 +14,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 mod updater;
 
 /// The bundle identifier, mirrored from `tauri.conf.json`. Used for the
-/// pre-Tauri log-dir resolution and the legacy data-dir migration below.
+/// pre-Tauri log-dir resolution.
 const APP_IDENTIFIER: &str = "ai.minutist";
 
-/// The pre-rename bundle identifier (the app shipped as `meeting-app` until
-/// 2026-06-11). Referenced ONLY by `migrate_legacy_app_data`; this literal
-/// must keep the old name — do not "fix" it in any future rename sweep.
-const LEGACY_IDENTIFIER: &str = "net.alelec.meeting-app";
-
-/// One-time data-dir migration for the `meeting-app` → Minutist rename: the
-/// identifier change moves the per-app data root, which would silently orphan
-/// existing recordings/models/settings. If the legacy root exists and the new
-/// one does not, move the whole tree (same-volume rename).
-///
-/// MUST be the first thing `main` does: the logging bootstrap right below
-/// creates `<new-root>/logs`, which would make the new root exist and defeat
-/// the `!new.exists()` guard forever after.
-fn migrate_legacy_app_data() {
-    let old_root = app_data_root(LEGACY_IDENTIFIER);
-    let new_root = app_data_root(APP_IDENTIFIER);
-    if old_root.is_dir() && !new_root.exists() {
-        match std::fs::rename(&old_root, &new_root) {
-            Ok(()) => eprintln!(
-                "[app-main] migrated app data {} -> {}",
-                old_root.display(),
-                new_root.display()
-            ),
-            // Tracing is not initialised yet, so stderr is the only channel.
-            // On failure (e.g. the old dir is held open by another process)
-            // leave the legacy tree untouched and start fresh.
-            Err(e) => eprintln!(
-                "[app-main] app-data migration failed ({e}); leaving {} in place",
-                old_root.display()
-            ),
-        }
-    }
-}
-
 fn main() {
-    migrate_legacy_app_data();
-
     // ---------------------------------------------------------------------------
     // Logging — file appender + optional console.
     //

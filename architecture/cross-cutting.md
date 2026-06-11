@@ -1214,6 +1214,8 @@ The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server
 
 **Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` renders in the UI. `vite.config.ts` injects this as a `define`-replaced constant: in the free build the false branch of the `React.lazy()` dynamic import is dead-code-eliminated, dropping `McpSettingsPane`, `mcp-settings.ts`, and `mcp-server-info.ts` from the output bundle. The default is `"1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour without any explicit flag. Verification: `VITE_CONNECTED= npm run build && grep -r "Enable MCP server" dist/` must return no matches.
 
+**Windows build script.** `scripts/build-windows-app.ps1 -Features vulkan` builds the **connected** Vulkan artifact (the `connected` feature is default, so `--features vulkan` implicitly includes it). The free Windows Vulkan build would require `--no-default-features --features vulkan` passed via `$Features`. The `Makefile` `build-free` / `build-free-vulkan` targets show the canonical free invocation on Linux/macOS.
+
 **Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper".
 
 ## What's not decided here

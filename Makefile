@@ -17,6 +17,7 @@ UI_DIR := ui
 .PHONY: help build build-release test test-rust test-ui ui-deps bindings \
         clippy fmt fmt-check render-arch clean clean-all \
         windows-build windows-build-vulkan \
+        build-free build-free-vulkan \
         test-integration test-integration-summary test-integration-asr \
         test-integration-diarize
 
@@ -110,3 +111,20 @@ windows-build: ## Build the portable Windows CPU app (WSL -> Windows MSVC)
 
 windows-build-vulkan: ## Build the portable Windows Vulkan app (WSL -> Windows MSVC)
 	$(WIN_RUN) -Features vulkan
+
+# --- Free-tier (no MCP server) local builds --------------------------------
+# The free artifact is --no-default-features + an explicit GPU backend.
+# VITE_CONNECTED must be unset so the Vite bundler drops the MCP settings
+# pane.  Set it explicitly to empty here to prevent shell inheritance of a
+# parent VITE_CONNECTED=1.
+#
+# Both targets build the frontend first (Node is not on Windows; keep the
+# same WSL-prebuilt-then-mirror pattern if you adapt these for Windows).
+
+build-free: ## Free-tier debug build (no MCP server, CPU only)
+	cd $(UI_DIR) && VITE_CONNECTED= npm run build
+	$(CARGO) build --no-default-features
+
+build-free-vulkan: ## Free-tier debug build (no MCP server, Vulkan GPU)
+	cd $(UI_DIR) && VITE_CONNECTED= npm run build
+	$(CARGO) build --no-default-features --features vulkan

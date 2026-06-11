@@ -59,7 +59,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libasound2-dev \
-            libopus-dev
+            libopus-dev \
+            libfuse2
 
       # Vulkan loader/headers + glslc for the `vulkan` feature on Linux.
       # glslang-tools alone does not provide glslc; llama.cpp's CMake uses
@@ -103,8 +104,13 @@ jobs:
           $installer = "$env:TEMP\VulkanSDK-Installer.exe"
           Write-Host "Downloading LunarG Vulkan SDK $version..."
           Invoke-WebRequest -Uri $url -OutFile $installer
-          Write-Host "Installing (silent)..."
-          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          Write-Host "Installing (unattended)..."
+          # LunarG's SDK installer is Qt IFW-based; the NSIS-style /S switch
+          # is silently ignored (nothing installs). The IFW unattended form
+          # installs the core SDK, which includes Bin\glslc.exe.
+          Start-Process -FilePath $installer -ArgumentList @(
+            "--accept-licenses", "--default-answer", "--confirm-command", "install"
+          ) -Wait
           if (-not (Test-Path "C:\VulkanSDK\$version\Bin\glslc.exe")) {
             Write-Error "glslc.exe not found after install; aborting"
             exit 1
@@ -302,7 +308,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libasound2-dev \
-            libopus-dev
+            libopus-dev \
+            libfuse2
 
       - name: Install Vulkan SDK (Linux)
         run: |

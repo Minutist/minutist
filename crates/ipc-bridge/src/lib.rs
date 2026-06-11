@@ -106,6 +106,7 @@ pub mod commands;
 pub mod error;
 pub mod events;
 pub mod inter_agent;
+pub mod output_language;
 
 use std::path::PathBuf;
 use std::sync::Arc;

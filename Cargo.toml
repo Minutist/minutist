@@ -115,6 +115,13 @@ libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 # feature is a Phase-7 concern. Pinned EXACT; bumping is a coordinated change.
 sherpa-rs = { version = "=0.6.8", default-features = false, features = ["download-binaries"] }
 
+# Output-language locale resolution (ipc-bridge). sys-locale 0.3 returns the
+# host BCP-47 locale tag on Linux (envvar + XDG), macOS (CFLocale), and Windows
+# (GetUserDefaultLocaleName). No OS-framework dep beyond what Tauri already
+# pulls; the crate is pure-Rust on Linux/macOS and links the small Windows API
+# through winapi. Used only by `ipc-bridge`'s `output_language` module.
+sys-locale = "0.3"
+
 # Phase 10 additions
 # rmcp — the official Rust MCP SDK (modelcontextprotocol/rust-sdk). Used by the
 # `mcp-server` crate to expose the agent-tools registry over Streamable HTTP.

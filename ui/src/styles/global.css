@@ -17,6 +17,11 @@ html,
 body,
 #root {
   height: 100%;
+  /* Fixed-viewport desktop shell: the document itself never scrolls, only the
+     inner panes do. Without this the webview bounce-scrolls the whole app when
+     an inner scroll region is flung past its end (overscroll rubber-banding). */
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 body {

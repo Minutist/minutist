@@ -179,15 +179,23 @@ export function TranscriptPane() {
                       ? "transcript-pane__row transcript-pane__row--highlighted"
                       : "transcript-pane__row"
                   }
-                  draggable
                   aria-current={highlighted ? "true" : undefined}
-                  title="Drag into your notes, or click to jump to the linked paragraph"
-                  onDragStart={(e) => {
-                    if (e.dataTransfer) writeSegmentDrag(e.dataTransfer, seg);
-                  }}
                   onClick={() => clickTranscriptSegment(seg)}
                 >
-                  <span className="transcript-pane__timestamp tnum">
+                  {/*
+                    The timestamp is the drag handle (FR-24): only it is
+                    `draggable`, so the segment text stays freely selectable for
+                    copy. Clicking anywhere on the row still jumps to the linked
+                    paragraph (FR-23, the row's onClick).
+                  */}
+                  <span
+                    className="transcript-pane__timestamp tnum"
+                    draggable
+                    title="Drag into your notes, or click to jump to the linked paragraph"
+                    onDragStart={(e) => {
+                      if (e.dataTransfer) writeSegmentDrag(e.dataTransfer, seg);
+                    }}
+                  >
                     {formatTimestamp(seg.start_ms)}
                   </span>
                   <span className="transcript-pane__text">

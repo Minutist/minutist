@@ -22,6 +22,7 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 1.5rem 1.5rem 3rem;
 }
 
@@ -83,8 +84,9 @@
   gap: 0.85rem;
   line-height: 1.55;
   align-items: baseline;
-  /* Drag source (FR-24) + click-to-jump (FR-23). */
-  cursor: grab;
+  /* Click-to-jump (FR-23) on the whole row; the drag source (FR-24) is the
+     timestamp handle only, so the segment text below stays selectable. */
+  cursor: pointer;
   border-radius: var(--radius);
   padding: 0.2rem 0.4rem;
   margin: 0 -0.4rem;
@@ -93,10 +95,6 @@
 
 .transcript-pane__row:hover {
   background: var(--sheet);
-}
-
-.transcript-pane__row:active {
-  cursor: grabbing;
 }
 
 /*
@@ -124,11 +122,21 @@
   font-size: 0.78rem;
   text-align: right;
   padding-top: 0.1rem;
+  /* The drag handle for the row (FR-24). */
+  cursor: grab;
+  user-select: none;
+}
+
+.transcript-pane__timestamp:active {
+  cursor: grabbing;
 }
 
 .transcript-pane__text {
   color: var(--ink-soft);
   word-break: break-word;
+  /* Selectable for copy; overrides the row's pointer cursor over the text. */
+  user-select: text;
+  cursor: text;
 }
 
 /*

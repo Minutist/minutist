@@ -267,8 +267,11 @@ describe("TranscriptPane cross-reference interactions", () => {
     render(<TranscriptPane />);
 
     const rows = screen.getAllByRole("listitem");
+    // The timestamp is the drag handle (the row text stays selectable), so the
+    // dragstart fires on it, not the row.
+    const handle = rows[1].querySelector(".transcript-pane__timestamp")!;
     const dataTransfer = makeDataTransfer();
-    fireEvent.dragStart(rows[1], { dataTransfer });
+    fireEvent.dragStart(handle, { dataTransfer });
 
     // The private MIME type carries the JSON payload in the documented shape.
     const raw = dataTransfer.store.get(TRANSCRIPT_SEGMENT_MIME);
@@ -289,8 +292,9 @@ describe("TranscriptPane cross-reference interactions", () => {
   it("writes speakerId null when the dragged segment has no speaker_id", () => {
     render(<TranscriptPane />);
     const rows = screen.getAllByRole("listitem");
+    const handle = rows[0].querySelector(".transcript-pane__timestamp")!;
     const dataTransfer = makeDataTransfer();
-    fireEvent.dragStart(rows[0], { dataTransfer });
+    fireEvent.dragStart(handle, { dataTransfer });
 
     const payload = JSON.parse(
       dataTransfer.store.get(TRANSCRIPT_SEGMENT_MIME) as string,

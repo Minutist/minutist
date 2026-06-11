@@ -163,3 +163,12 @@ prebuilt in WSL and synced, so Node is not required on Windows.
 Toolchain: Rust on PATH, Visual Studio Build Tools 2022, LLVM (`libclang.dll`),
 and — for the `vulkan` feature — the Vulkan SDK + `ninja`. Edit the env-var paths
 at the top of the scripts if your install differs.
+
+## Licence
+
+[AGPL-3.0-only](LICENSE). The licence map is [REUSE.toml](REUSE.toml);
+contribution terms (DCO sign-off + inbound grant) are in
+[CONTRIBUTING.md](CONTRIBUTING.md). The Minutist name and logo are
+trademarks and are not covered by the code licence, see
+[TRADEMARKS.md](TRADEMARKS.md). The maintainer also distributes builds and
+hosted services under separate commercial terms.

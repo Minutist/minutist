@@ -44,6 +44,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # libopus-dev: audiopus_sys v0.2.2 bundles an opus CMake tree whose
+      # cmake_minimum_required is < 3.5, which CMake 3.27+ rejects.  Installing
+      # the system libopus lets pkg-config satisfy the dep and bypass the
+      # vendored CMake build.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -54,16 +58,46 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libasound2-dev
+            libasound2-dev \
+            libopus-dev
 
-      # Vulkan loader/headers for the `vulkan` feature on Linux. macOS uses
-      # Metal (built into the OS); Windows runners ship the Vulkan loader and
-      # llama.cpp builds the shaders from the bundled headers, so no SDK install
-      # step is required there for a loader-linked build.
+      # Vulkan loader/headers + shaderc (provides glslc) for the `vulkan`
+      # feature on Linux. glslang-tools alone does not provide glslc, and
+      # llama.cpp's CMake uses FindVulkan which requires glslc specifically.
+      # macOS uses Metal (built into the OS). Windows runners ship the Vulkan
+      # loader; the full SDK (with glslc) is installed below via the LunarG
+      # installer so llama.cpp CMake can find it.
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y libvulkan-dev glslang-tools
+          sudo apt-get install -y libvulkan-dev glslang-tools shaderc
+
+      # Install the LunarG Vulkan SDK on Windows so llama.cpp CMake can
+      # find glslc (required by FindVulkan.cmake). The runner ships the Vulkan
+      # loader but not the full SDK tools.
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: latest
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Tools, Glslang
+          vulkan-use-cache: true
+
+      # audiopus_sys v0.2.2's bundled opus CMake tree requires
+      # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.
+      # Installing system Opus bypasses the vendored CMake build via pkg-config.
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: brew install opus
+
+      - name: Install Windows system dependencies (Opus)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install opus:x64-windows-static
+          $libDir = "C:\vcpkg\installed\x64-windows-static\lib"
+          "LIBOPUS_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -205,11 +239,12 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libasound2-dev
+            libasound2-dev \
+            libopus-dev
 
       - name: Install Vulkan SDK (Linux)
         run: |
-          sudo apt-get install -y libvulkan-dev glslang-tools
+          sudo apt-get install -y libvulkan-dev glslang-tools shaderc
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -248,7 +283,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: src-tauri
-          args: --no-default-features --features vulkan
+          args: -- --no-default-features --features vulkan
 
       # Verify the MCP pane token-reveal label is absent from the dist that
       # tauri-action actually bundled (runs after tauri-action, not before).

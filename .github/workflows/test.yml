@@ -49,6 +49,10 @@ jobs:
 
       # Linux WebKit / Tauri system dependencies. Only needed on the Ubuntu
       # leg; Windows and macOS ship the required webview with the OS.
+      # libopus-dev: audiopus_sys v0.2.2's bundled CMakeLists.txt requires
+      # cmake_minimum_required >= 3.5; modern CMake rejects older declarations.
+      # Installing the system libopus lets pkg-config satisfy the dep directly,
+      # bypassing the vendored CMake build entirely.
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -59,7 +63,30 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libasound2-dev
+            libasound2-dev \
+            libopus-dev
+
+      # audiopus_sys v0.2.2 bundles an opus CMake tree whose
+      # cmake_minimum_required is < 3.5, which CMake 3.27+ rejects. Installing
+      # the system Opus library lets pkg-config satisfy the dep and skip the
+      # vendored CMake build.
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: brew install opus
+
+      # Install Opus via vcpkg on Windows. vcpkg is pre-installed on
+      # windows-latest at C:\vcpkg. opus:x64-windows-static provides the
+      # static lib that audiopus_sys needs; LIBOPUS_LIB_DIR + LIBOPUS_STATIC
+      # tell the audiopus_sys build script where to find it, bypassing the
+      # vendored CMake build.
+      - name: Install Windows system dependencies (Opus)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install opus:x64-windows-static
+          $libDir = "C:\vcpkg\installed\x64-windows-static\lib"
+          "LIBOPUS_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -147,11 +174,16 @@ jobs:
   # we resolve `cargo tree -e features`, which expands every inter-crate
   # feature-forward edge and exits non-zero if any edge is missing/renamed —
   # WITHOUT invoking the C++/CUDA/ROCm/DirectML build scripts, so it needs no
-  # GPU toolkit installed. vulkan (Linux/Windows) and metal (macOS) are then
+  # GPU toolkit installed. vulkan (Linux) and metal (macOS) are then
   # additionally `cargo check`ed because their toolchain is present on the
-  # runner, validating the build-script/link path too. cuda/rocm (NVIDIA/AMD
-  # toolkits absent) and directml (Windows-only, SDK absent) are graph-only:
-  # the goal is that a broken feature-forward fails CI, not a full kernel build.
+  # runner, validating the build-script/link path too.
+  #
+  # cuda/rocm (NVIDIA/AMD toolkits absent), directml (Windows-only, SDK absent),
+  # and Windows vulkan (Vulkan SDK with glslc absent on windows-latest runners —
+  # the loader is present but llama.cpp CMake requires glslc from the full SDK)
+  # are graph-only: the goal is that a broken feature-forward fails CI, not a
+  # full kernel build. Windows vulkan is validated end-to-end by build.yml on
+  # push to main.
   gpu-features:
     name: gpu-features (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -159,7 +191,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux: vulkan SDK installed -> full check; cuda/rocm graph-only.
+          # Linux: vulkan SDK (including glslc from shaderc) installed ->
+          # full check; cuda/rocm graph-only.
           - os: ubuntu-latest
             check_features: vulkan
             graph_features: cuda rocm
@@ -167,11 +200,13 @@ jobs:
           - os: macos-latest
             check_features: metal
             graph_features: ""
-          # Windows: vulkan loader present -> full check; directml graph-only
-          # (sherpa DirectML backend); cuda/rocm graph-only.
+          # Windows: Vulkan SDK (full SDK with glslc) not present on
+          # windows-latest runners, so vulkan is graph-only here. directml,
+          # cuda, rocm also graph-only. Windows vulkan is fully checked in
+          # build.yml on push to main.
           - os: windows-latest
-            check_features: vulkan
-            graph_features: cuda rocm directml
+            check_features: ""
+            graph_features: cuda rocm directml vulkan
 
     steps:
       - name: Checkout
@@ -187,13 +222,33 @@ jobs:
             libssl-dev \
             libayatana-appindicator3-dev \
             librsvg2-dev \
-            libasound2-dev
+            libasound2-dev \
+            libopus-dev
 
-      # Vulkan loader/headers + glslang for the `vulkan` cargo check on Linux.
+      # Vulkan loader/headers + shaderc (provides glslc) for the `vulkan`
+      # cargo check on Linux. glslang-tools alone does not provide glslc;
+      # llama.cpp's CMake uses FindVulkan which requires glslc specifically.
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y libvulkan-dev glslang-tools
+          sudo apt-get install -y libvulkan-dev glslang-tools shaderc
+
+      # audiopus_sys v0.2.2's bundled opus CMake tree requires
+      # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.
+      # Installing the system Opus library lets pkg-config satisfy the dep and
+      # bypass the vendored CMake build.
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: brew install opus
+
+      - name: Install Windows system dependencies (Opus)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install opus:x64-windows-static
+          $libDir = "C:\vcpkg\installed\x64-windows-static\lib"
+          "LIBOPUS_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -238,9 +293,11 @@ jobs:
           done
 
       # Full cargo check for the backend whose toolchain is present on this
-      # runner (vulkan SDK on Linux/Windows, Metal on macOS). This validates the
-      # feature graph AND the build-script/link path.
+      # runner (vulkan SDK on Linux, Metal on macOS). Skipped when
+      # check_features is empty (Windows — Vulkan SDK absent; see matrix note).
+      # This validates the feature graph AND the build-script/link path.
       - name: cargo check (${{ matrix.check_features }})
+        if: matrix.check_features != ''
         shell: bash
         run: |
           cargo check -p minutist --no-default-features \

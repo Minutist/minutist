@@ -85,6 +85,15 @@ llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["mtm
 # `audio-capture` (rubato) and EBU loudness is not needed.
 vad-rs = { git = "https://github.com/cjpais/vad-rs", rev = "2a412ed858695b9251f3f5a1a20d95b59fa7c498", default-features = false }
 
+# ort is a transitive dependency via vad-rs, which pins ort =2.0.0-rc.12 but
+# disables default features (including `download-binaries`). Without
+# `download-binaries`, ort-sys emits a `link_error` cfg and never downloads the
+# ONNX Runtime static library, causing a linker failure on CI runners that have
+# no pre-installed libonnxruntime. Declaring ort here with `download-binaries`
+# unifies the feature set (Cargo merges feature lists for the same crate/version
+# across the workspace), ensuring the prebuilt binary is fetched on first build.
+ort = { version = "=2.0.0-rc.12", features = ["download-binaries"] }
+
 # Download + hash for `model-registry`. rustls-tls avoids pulling OpenSSL
 # on Linux / Windows builds; `stream` is required for chunked download
 # into the SHA-256 hasher.

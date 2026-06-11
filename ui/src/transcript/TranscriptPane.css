@@ -148,7 +148,8 @@
 .transcript-pane__speaker {
   /* Phase C: flex row so the per-speaker dot and label stay vertically
      centred. The chip itself keeps its neutral tint; the dot carries the
-     per-speaker colour. */
+     per-speaker colour. Rendered as a <button> (click to rename), so reset
+     the native button chrome and inherit the column's type. */
   display: inline-flex;
   align-items: center;
   margin-right: 0.5rem;
@@ -157,11 +158,37 @@
   background: var(--accent-tint);
   border: 1px solid var(--rule);
   color: var(--ink-soft); /* AA contrast on the accent tint (was --stone) */
+  font-family: inherit;
   font-size: 0.7rem;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.02em;
   vertical-align: baseline;
   white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.transcript-pane__speaker:hover {
+  border-color: var(--accent);
+}
+
+/* Inline rename field shown in place of the chip while editing. */
+.transcript-pane__speaker-input {
+  margin-right: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--accent);
+  background: var(--sheet);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.7rem;
+  letter-spacing: 0.02em;
+  width: 9rem;
+  max-width: 100%;
+}
+
+.transcript-pane__speaker-input:focus {
+  outline: none;
 }
 
 /*
@@ -173,6 +200,7 @@
   background: none;
   border: none;
   padding: 0;
+  cursor: default;
 }
 
 /*

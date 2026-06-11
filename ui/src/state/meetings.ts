@@ -16,6 +16,7 @@ import {
   listMeetings,
   openMeeting,
   renameMeeting,
+  setSpeakerName,
   deleteMeeting,
   reTranscribe,
   rediarize,
@@ -46,6 +47,12 @@ export type MeetingsStore = {
   close: () => void;
   /** Rename a meeting, then refresh the list so the new title shows. */
   rename: (meetingId: MeetingId, title: string) => Promise<void>;
+  /**
+   * Set (or clear, with an empty name) a speaker's display name on the open
+   * meeting, updating its restored `meta.speaker_names` in place so the
+   * transcript re-renders without a reload.
+   */
+  setSpeakerName: (label: string, name: string) => Promise<void>;
   /** Delete a meeting, then refresh the list. */
   remove: (meetingId: MeetingId) => Promise<void>;
   /** Re-run transcription for a meeting. */
@@ -109,6 +116,23 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
       await renameMeeting(meetingId, title);
       set({ lastError: null });
       await get().refresh();
+    } catch (err) {
+      set({ lastError: errorMessage(err) });
+    }
+  },
+
+  setSpeakerName: async (label, name) => {
+    const { openMeetingId, openMeetingState } = get();
+    if (openMeetingId === null || openMeetingState === null) return;
+    try {
+      const speaker_names = await setSpeakerName(openMeetingId, label, name);
+      set({
+        openMeetingState: {
+          ...openMeetingState,
+          meta: { ...openMeetingState.meta, speaker_names },
+        },
+        lastError: null,
+      });
     } catch (err) {
       set({ lastError: errorMessage(err) });
     }

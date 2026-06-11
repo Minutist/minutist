@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useCrossRefStore } from "../state/cross-ref";
 import { useActiveTranscript } from "../state/active-transcript";
 import { useMeetingsStore } from "../state/meetings";
@@ -80,6 +80,77 @@ function TranscriptToolbar() {
  *   75400   → "01:15.40"
  *   3723456 → "62:03.45"
  */
+/**
+ * The run-leading speaker chip. Shows the speaker's display name when one is
+ * set (`speaker_names[label]`), otherwise the bare `Speaker {label}`. Clicking
+ * it opens an inline rename that writes through `setSpeakerName`; the name then
+ * applies to every row for that label. The chip is not the row's drag handle
+ * (the timestamp is) and stops click propagation so renaming does not also
+ * trigger the row's jump-to-paragraph.
+ */
+function SpeakerChip({
+  label,
+  name,
+  dotColor,
+  onRename,
+}: {
+  label: string;
+  name: string | null;
+  dotColor: string | undefined;
+  onRename: (label: string, name: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(name ?? "");
+
+  function commit() {
+    onRename(label, value.trim());
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <input
+        className="transcript-pane__speaker-input"
+        // eslint-disable-next-line jsx-a11y/no-autofocus -- focus the field the click just opened
+        autoFocus
+        value={value}
+        aria-label={`Name for speaker ${label}`}
+        placeholder={`Speaker ${label}`}
+        onClick={(e) => e.stopPropagation()}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            setValue(name ?? "");
+            setEditing(false);
+          }
+        }}
+      />
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="transcript-pane__speaker"
+      style={{ ["--dot-color" as string]: dotColor }}
+      title="Click to rename this speaker"
+      onClick={(e) => {
+        e.stopPropagation();
+        setValue(name ?? "");
+        setEditing(true);
+      }}
+    >
+      <span className="transcript-pane__speaker-dot" aria-hidden="true" />
+      {name ?? `Speaker ${label}`}
+    </button>
+  );
+}
+
 export function formatTimestamp(start_ms: number): string {
   const totalCentiseconds = Math.floor(start_ms / 10);
   const cs = totalCentiseconds % 100;
@@ -116,6 +187,13 @@ export function TranscriptPane() {
   const clickTranscriptSegment = useCrossRefStore(
     (s) => s.clickTranscriptSegment,
   );
+  // Speaker display-name overlay (label → name) for the open saved meeting,
+  // and the writer. The transcript pane only renders for an open idle meeting,
+  // so the open-meeting meta is the right source.
+  const speakerNames = useMeetingsStore(
+    (s) => s.openMeetingState?.meta?.speaker_names,
+  );
+  const setSpeakerName = useMeetingsStore((s) => s.setSpeakerName);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Track whether the user has scrolled away from the bottom.
@@ -200,26 +278,23 @@ export function TranscriptPane() {
                   </span>
                   <span className="transcript-pane__text">
                     {/*
-                    Phase 6/C: a quiet "Speaker {id}" chip when diarization has
-                    assigned this segment a speaker, shown only at the start of a
-                    speaker's run (see `speakerChanged`). The id is the diarizer's
-                    first-seen label (A / B / …), surfaced verbatim. The
-                    per-speaker colour dot's palette slot is resolved by the pure
-                    `speakerColorIndex` mapper and passed via the `--dot-color`
-                    custom property — tokens only, no hard-coded colour in TSX.
+                    Phase 6/C: a quiet speaker chip at the start of a speaker's
+                    run (see `speakerChanged`). It shows the user-set display
+                    name when one exists (`speaker_names[label]`), otherwise the
+                    diarizer's first-seen label (A / B / …); clicking it renames
+                    the speaker. The colour dot's palette slot is resolved by the
+                    pure `speakerColorIndex` mapper and passed via `--dot-color`
+                    — tokens only, no hard-coded colour in TSX.
                   */}
                     {speakerChanged && (
-                      <span
-                        className="transcript-pane__speaker"
-                        style={{ ["--dot-color" as string]: dotColor }}
-                        aria-label={`Speaker ${seg.speaker_id}`}
-                      >
-                        <span
-                          className="transcript-pane__speaker-dot"
-                          aria-hidden="true"
-                        />
-                        Speaker {seg.speaker_id}
-                      </span>
+                      <SpeakerChip
+                        label={seg.speaker_id as string}
+                        name={speakerNames?.[seg.speaker_id as string] ?? null}
+                        dotColor={dotColor}
+                        onRename={(label, name) =>
+                          void setSpeakerName(label, name)
+                        }
+                      />
                     )}
                     {/*
                     Continuation row (same speaker as the row above): the colour

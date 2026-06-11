@@ -862,6 +862,10 @@ on `common`.
   folder is authoritative (rename rewrites `metadata.json` atomically, delete
   removes the folder), then the index row is updated/removed to match. A crash
   between the two steps leaves the index stale-but-rebuildable.
+  `set_speaker_name(root, id, label, name) -> AppResult<speaker_names map>`
+  is the third op: a read-modify-write of `metadata.json`'s `speaker_names`
+  (empty `name` clears the entry). It touches no index row (speaker names are
+  not indexed), so unlike rename there is nothing to reconcile.
 - **Summary hook (`summary` module + `MeetingFolder::summary_path()`).**
   `write_summary(meeting_dir, &str)` (atomic tmp+rename) and
   `read_summary(meeting_dir) -> AppResult<Option<String>>` for `summary.md`.
@@ -1640,6 +1644,12 @@ regenerated.
   `delete_meeting(meeting_id) -> ()` — route to
   `persistence::meeting_ops::{rename_meeting, delete_meeting}`, which keep the
   on-disk folder and the index row consistent.
+- `set_speaker_name(meeting_id, label, name) -> speaker_names map` — routes to
+  `persistence::meeting_ops::set_speaker_name`; maps a diarizer label to a
+  display name in `metadata.json` (empty `name` clears it), returning the
+  updated map so the webview re-renders the transcript overlay without a
+  reload. The same write is also reachable as the `set_speaker_name` agent
+  tool; this is its direct UI path. Label + name capped at 512 chars.
 - `re_transcribe(meeting_id) -> ()` — the **only** Phase-4 read/action command
   that routes through the orchestrator (`Orchestrator::re_transcribe`): an
   offline re-run of the live ASR pipeline (see `orchestrator` below). The shared

@@ -37,6 +37,7 @@ vi.mock("../ipc/meetings", () => ({
   listMeetings: vi.fn().mockResolvedValue([]),
   openMeeting: vi.fn(),
   renameMeeting: vi.fn().mockResolvedValue(undefined),
+  setSpeakerName: vi.fn().mockResolvedValue({}),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
   reTranscribe: vi.fn().mockResolvedValue(undefined),
   rediarize: vi.fn().mockResolvedValue(undefined),
@@ -242,7 +243,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
       useRecordingStore.setState({ transcript: [makeSegment(0, "hi", "A")] });
     });
     render(<TranscriptPane />);
-    const chip = screen.getByLabelText("Speaker A");
+    const chip = screen.getByRole("button", { name: "Speaker A" });
     const dot = chip.querySelector(".transcript-pane__speaker-dot");
     expect(dot).not.toBeNull();
     expect(chip.style.getPropertyValue("--dot-color")).toBe(
@@ -257,7 +258,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     });
     const live = render(<TranscriptPane />);
     expect(
-      live.getByLabelText("Speaker B").style.getPropertyValue("--dot-color"),
+      live.getByRole("button", { name: "Speaker B" }).style.getPropertyValue("--dot-color"),
     ).toBe("var(--speaker-2)");
     live.unmount();
 
@@ -274,7 +275,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     });
     const saved = render(<TranscriptPane />);
     expect(
-      saved.getByLabelText("Speaker B").style.getPropertyValue("--dot-color"),
+      saved.getByRole("button", { name: "Speaker B" }).style.getPropertyValue("--dot-color"),
     ).toBe("var(--speaker-2)");
   });
 
@@ -305,18 +306,63 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
       container.querySelectorAll(".transcript-pane__speaker-dot"),
     ).toHaveLength(1);
     expect(
-      screen.getByLabelText("Speaker A").style.getPropertyValue("--dot-color"),
+      screen.getByRole("button", { name: "Speaker A" }).style.getPropertyValue("--dot-color"),
     ).toBe("var(--speaker-1)");
   });
 
-  it("exposes the chip via aria-label and marks the dot aria-hidden", () => {
+  it("exposes the chip as a button named 'Speaker A' and marks the dot aria-hidden", () => {
     act(() => {
       useRecordingStore.setState({ transcript: [makeSegment(0, "hi", "A")] });
     });
     render(<TranscriptPane />);
-    const chip = screen.getByLabelText("Speaker A");
+    const chip = screen.getByRole("button", { name: "Speaker A" });
     const dot = chip.querySelector(".transcript-pane__speaker-dot");
     expect(dot?.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("overlays the display name from speaker_names instead of the bare label", () => {
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" }, transcript: [] });
+      useMeetingsStore.setState({
+        openMeetingId: "m-1",
+        openMeetingState: {
+          meta: { speaker_names: { A: "Alice" } },
+          transcript: [makeSegment(0, "hi", "A")],
+        } as unknown as MeetingState,
+      });
+    });
+    render(<TranscriptPane />);
+    expect(screen.getByRole("button", { name: "Alice" })).toBeInTheDocument();
+    expect(screen.queryByText("Speaker A")).not.toBeInTheDocument();
+  });
+
+  it("renames a speaker via the chip, writing through the meetings seam", async () => {
+    vi.mocked(meetingsIpc.setSpeakerName).mockResolvedValue({ A: "Alice" });
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" }, transcript: [] });
+      useMeetingsStore.setState({
+        openMeetingId: "m-1",
+        openMeetingState: {
+          meta: { speaker_names: {} },
+          transcript: [makeSegment(0, "hi", "A")],
+        } as unknown as MeetingState,
+      });
+    });
+    render(<TranscriptPane />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Speaker A" }));
+    const input = screen.getByLabelText("Name for speaker A");
+    fireEvent.change(input, { target: { value: "Alice" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(meetingsIpc.setSpeakerName).toHaveBeenCalledWith("m-1", "A", "Alice"),
+    );
+    // The store folds the returned map into the open meeting, so the chip now
+    // shows the name.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Alice" })).toBeInTheDocument(),
+    );
   });
 });
 

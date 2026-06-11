@@ -485,6 +485,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::list_meetings,
             commands::open_meeting,
             commands::rename_meeting,
+            commands::set_speaker_name,
             commands::delete_meeting,
             commands::re_transcribe,
             commands::summarise_meeting,
@@ -620,6 +621,7 @@ mod tests {
             "list_meetings",
             "open_meeting",
             "rename_meeting",
+            "set_speaker_name",
             "delete_meeting",
             "re_transcribe",
             "summarise_meeting",
@@ -636,8 +638,8 @@ mod tests {
 
         assert_eq!(
             expected.len(),
-            29,
-            "command ledger must be 29 (28 + save_note_image, note image paste/drop)"
+            30,
+            "command ledger must be 30 (29 + set_speaker_name, transcript speaker rename)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

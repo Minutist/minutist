@@ -50,6 +50,18 @@ export async function renameMeeting(
   unwrap(await commands.renameMeeting(meetingId, title));
 }
 
+/**
+ * Set a speaker's display name (maps a diarizer label such as `"A"` to a
+ * name); an empty `name` clears it. Returns the updated label→name map.
+ */
+export async function setSpeakerName(
+  meetingId: MeetingId,
+  label: string,
+  name: string,
+): Promise<Partial<Record<string, string>>> {
+  return unwrap(await commands.setSpeakerName(meetingId, label, name));
+}
+
 /** Delete a meeting and its on-disk folder. */
 export async function deleteMeeting(meetingId: MeetingId): Promise<void> {
   unwrap(await commands.deleteMeeting(meetingId));

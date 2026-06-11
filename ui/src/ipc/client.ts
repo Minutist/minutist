@@ -83,6 +83,8 @@ export const commands: Commands = {
   openMeeting: (meetingId) => callCommand("openMeeting", [meetingId]),
   renameMeeting: (meetingId, title) =>
     callCommand("renameMeeting", [meetingId, title]),
+  setSpeakerName: (meetingId, label, name) =>
+    callCommand("setSpeakerName", [meetingId, label, name]),
   deleteMeeting: (meetingId) => callCommand("deleteMeeting", [meetingId]),
   reTranscribe: (meetingId) => callCommand("reTranscribe", [meetingId]),
   // Phase 5 summary surface (FR-30). Now present on the generated `commands`

@@ -449,6 +449,13 @@ export const devCommands = {
   ): Promise<Result<null, IpcError>> {
     return ok(null);
   },
+  async setSpeakerName(
+    _meetingId: MeetingId,
+    label: string,
+    name: string,
+  ): Promise<Result<Record<string, string>, IpcError>> {
+    return ok(name.trim() ? { [label]: name.trim() } : {});
+  },
   async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
     return ok(null);
   },

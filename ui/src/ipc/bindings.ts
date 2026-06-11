@@ -285,6 +285,27 @@ async renameMeeting(meetingId: MeetingId, title: string) : Promise<Result<null, 
 }
 },
 /**
+ * Set a speaker's display name on a saved meeting.
+ * 
+ * Maps a diarizer label (e.g. `"A"`) to a display name in `metadata.json`'s
+ * `speaker_names`; an empty `name` clears the mapping. Returns the updated
+ * map so the caller can re-render without re-reading the meeting. Names are
+ * keyed by the diarizer label, so re-running diarization (which re-letters
+ * speakers) resets them. Routes to `persistence::meeting_ops::set_speaker_name`.
+ * 
+ * The label and name are each capped at `MAX_SPEAKER_NAME_LEN` characters so
+ * the UI cannot persist an unbounded value (mirrors the `set_speaker_name`
+ * chat tool's bound).
+ */
+async setSpeakerName(meetingId: MeetingId, label: string, name: string) : Promise<Result<Partial<{ [key in string]: string }>, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_speaker_name", { meetingId, label, name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Delete a meeting: removes the folder then the index row.
  * 
  * Routes to `persistence::meeting_ops::delete_meeting`.

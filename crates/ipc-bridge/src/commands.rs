@@ -710,6 +710,39 @@ pub async fn rename_meeting(
         .map_err(IpcError::from)
 }
 
+/// Set a speaker's display name on a saved meeting.
+///
+/// Maps a diarizer label (e.g. `"A"`) to a display name in `metadata.json`'s
+/// `speaker_names`; an empty `name` clears the mapping. Returns the updated
+/// map so the caller can re-render without re-reading the meeting. Names are
+/// keyed by the diarizer label, so re-running diarization (which re-letters
+/// speakers) resets them. Routes to `persistence::meeting_ops::set_speaker_name`.
+///
+/// The label and name are each capped at `MAX_SPEAKER_NAME_LEN` characters so
+/// the UI cannot persist an unbounded value (mirrors the `set_speaker_name`
+/// chat tool's bound).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_speaker_name(
+    meeting_id: MeetingId,
+    label: String,
+    name: String,
+    state: State<'_, IpcState>,
+) -> Result<std::collections::BTreeMap<String, String>, IpcError> {
+    const MAX_SPEAKER_NAME_LEN: usize = 512;
+    let name = name.trim().to_string();
+    if label.chars().count() > MAX_SPEAKER_NAME_LEN
+        || name.chars().count() > MAX_SPEAKER_NAME_LEN
+    {
+        return Err(IpcError::from(minutist_common::AppError::InvalidInput {
+            context: format!("speaker label/name too long (max {MAX_SPEAKER_NAME_LEN} characters)"),
+        }));
+    }
+    meeting_ops::set_speaker_name(&state.meetings_dir, meeting_id, &label, &name)
+        .await
+        .map_err(IpcError::from)
+}
+
 /// Delete a meeting: removes the folder then the index row.
 ///
 /// Routes to `persistence::meeting_ops::delete_meeting`.

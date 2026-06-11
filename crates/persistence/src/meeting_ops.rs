@@ -55,6 +55,44 @@ pub async fn rename_meeting(
     Ok(())
 }
 
+/// Set (or clear) a speaker's display name in `metadata.json`.
+///
+/// Writes `meta.speaker_names[label]`: a non-empty `name` upserts the mapping,
+/// an empty `name` removes it (revert to the bare diarizer label). The index
+/// row carries no speaker names, so — unlike [`rename_meeting`] — there is
+/// nothing to refresh there. Returns the updated map so the caller can reflect
+/// it without re-reading.
+///
+/// `AppError::InvalidInput` if the folder has no `metadata.json`.
+pub async fn set_speaker_name(
+    meetings_root: &Path,
+    id: MeetingId,
+    label: &str,
+    name: &str,
+) -> AppResult<std::collections::BTreeMap<String, String>> {
+    let folder = meetings_root.join(id.0.to_string());
+    if !folder.join("metadata.json").exists() {
+        return Err(Error::MeetingNotFound(id).into());
+    }
+
+    let mut meta = reader::read_metadata_inner(&folder)?;
+    if name.is_empty() {
+        meta.speaker_names.remove(label);
+    } else {
+        meta.speaker_names.insert(label.to_string(), name.to_string());
+    }
+    crate::metadata::write_metadata(&folder, &meta)?;
+
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        label,
+        "speaker name set"
+    );
+
+    Ok(meta.speaker_names)
+}
+
 /// Delete a meeting: remove the folder recursively, then remove the index row.
 ///
 /// An absent folder is treated as already-deleted (the index row is still

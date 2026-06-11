@@ -52,7 +52,9 @@
     "windows": {
       "nsis": {
         "displayLanguageSelector": false,
-        "languages": ["English"],
+        "languages": [
+          "English"
+        ],
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "installMode": "currentUser"
@@ -60,7 +62,6 @@
     },
     "linux": {
       "deb": {
-        "maintainer": "Minutist <support@minutist.ai>",
         "section": "utils",
         "depends": [
           "libwebkit2gtk-4.1-0",
@@ -75,7 +76,8 @@
       "exceptionDomain": null,
       "frameworks": [],
       "dmg": {}
-    }
+    },
+    "publisher": "Minutist"
   },
   "plugins": {
     "updater": {

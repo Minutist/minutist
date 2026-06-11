@@ -2396,6 +2396,52 @@ A warm-paper, document-centric **light** theme applied across the webview.
   is a code-review finding. New views should render in the DEV shim with
   representative sample data so they can be visually QA'd the same way.
 
+**Translation UI — translated transcript as derived view (WU4).**
+
+- **`ui/src/ipc/translations.ts` (IPC seam).** Wraps `commands.translateMeeting`
+  and `commands.getTranslations` (both added to `client.ts`'s delegating surface
+  in WU3). `getTranslations` normalises the JSON-wire `Record<string, string>`
+  (JSON object keys are always strings) into a `Map<number, string>` keyed by
+  segment index. Tests mock this seam module, not the generated bindings. The DEV
+  shim supplies no-op stubs for both commands.
+- **`ui/src/state/translations.ts` (Zustand store).** Holds `selectedLanguage`
+  (`null` = verbatim view), `translations: Map<number, string>` (the per-segment
+  cache for the open meeting + language), `translateInFlight` (blocks the Translate
+  button while the backend pass runs), and `openMeetingId` (set by
+  `TranscriptPane` via `setOpenMeeting` so `handleEvent` can guard event-scoped
+  reloads). Actions: `translate(meetingId, language)` — calls `translateMeeting`
+  then `getTranslations` and populates the map; `loadTranslations(meetingId,
+  language)` — reads without re-translating (on-open restore); `showVerbatim()`
+  — clears `selectedLanguage` and drops the map; `setOpenMeeting(id)` — called on
+  meeting open/close to clear stale translations; `reset()` — full reset.
+  `handleEvent` reacts to `translation_ready { meeting_id, language }`: if the
+  event matches the active meeting + `selectedLanguage`, calls `loadTranslations`
+  to refresh the overlay. Dispatched from `useAppEventBridge` alongside the other
+  stores.
+- **`ui/src/state/operation-progress.ts` (updated).** `translation_ready` added
+  to the terminal-event list so the per-row progress indicator clears when a
+  translate pass finishes.
+- **`TranscriptToolbar` (updated in `TranscriptPane.tsx`).** The toolbar gains:
+  a `<select>` pre-seeded to the first language in `OUTPUT_LANGUAGES` (re-used
+  from `OutputLanguagePicker`); a Translate button (disabled while any op is
+  in-flight, label changes to "Translating…" during the pass); a "Show original"
+  button that replaces the selector + Translate pair once a translated view is
+  active. A thin `transcript-pane__toolbar-sep` rule divides the reprocess actions
+  from the translation controls.
+- **Per-segment overlay (updated in `TranscriptPane.tsx`).** When
+  `selectedLanguage !== null`, each row renders the translated text from the
+  `translations` Map if the index is present, or falls back to `seg.text` for
+  segments that have not yet been translated (partial pass). Translated rows show
+  a quiet `transcript-pane__translated-label` suffix (the language name, muted
+  mono) so the substitution is visible at a glance. A one-tap "Show original"
+  in the toolbar flips back to the verbatim view.
+- **Test coverage** (`ui/src/__tests__/Translations.test.tsx`): `translate()`
+  invokes `translateMeeting` then `getTranslations` and populates the store;
+  `loadTranslations()` fetches without a new translation pass; `showVerbatim()`
+  clears; `setOpenMeeting()` resets on meeting change; `handleEvent` refreshes
+  on matching `translation_ready` and ignores events for different languages or
+  meetings; `translation_ready` clears the operation-progress indicator.
+
 ## What lives where — quick reference
 
 - **Editing audio capture buffer size:** `audio-capture` crate.

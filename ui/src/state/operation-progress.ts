@@ -9,10 +9,11 @@
  *
  * Fed by the global event bridge (`shell/event-listener.tsx`) via `handleEvent`:
  *   - `operation_progress`  → upsert the row's in-flight op (label + fraction).
- *   - `transcript_ready`    → clear (the re-transcribe pass finished).
- *   - `diarization_complete`→ clear (the re-identify-speakers pass finished).
- *   - `summary_ready`       → clear (the summarise pass finished).
- *   - `meeting_finalised`   → clear (the finalise drain finished).
+ *   - `transcript_ready`     → clear (the re-transcribe pass finished).
+ *   - `diarization_complete` → clear (the re-identify-speakers pass finished).
+ *   - `summary_ready`        → clear (the summarise pass finished).
+ *   - `meeting_finalised`    → clear (the finalise drain finished).
+ *   - `translation_ready`    → clear (the translate pass finished).
  *
  * The store keeps only transient UI state keyed by `MeetingId`; it is never a
  * source of truth the backend owns.
@@ -66,7 +67,8 @@ export const useOperationProgressStore = create<OperationProgressStore>(
         case "transcript_ready":
         case "diarization_complete":
         case "summary_ready":
-        case "meeting_finalised": {
+        case "meeting_finalised":
+        case "translation_ready": {
           const meetingId = event.meeting_id;
           set((s) => {
             if (!(meetingId in s.operations)) return s;

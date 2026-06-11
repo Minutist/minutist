@@ -4,6 +4,8 @@ import { useActiveTranscript } from "../state/active-transcript";
 import { useMeetingsStore } from "../state/meetings";
 import { useRecordingStore } from "../state/recording";
 import { useOperationProgressStore } from "../state/operation-progress";
+import { useTranslationsStore } from "../state/translations";
+import { OUTPUT_LANGUAGES } from "../shell/OutputLanguagePicker";
 import { writeSegmentDrag } from "../editor/transcript-dnd";
 import { speakerColorIndex } from "./speaker-color";
 import type { Segment } from "../ipc/bindings";
@@ -12,9 +14,9 @@ import "./TranscriptPane.css";
 /**
  * Action toolbar at the top of the transcript pane (#67).
  *
- * Holds the two offline reprocessing actions that used to live in the meeting
- * heading: Re-transcribe (re-run ASR over the recording) and Re-identify
- * speakers (re-run diarization). They operate on the OPEN saved meeting and are
+ * Holds the two offline reprocessing actions (Re-transcribe / Re-identify
+ * speakers) and the translation controls (language selector + Translate /
+ * Show original button). All actions operate on the OPEN saved meeting and are
  * shown only when one is open and nothing is recording — an offline op must not
  * contend with the live pipeline (the backend refuses unless `Idle`).
  *
@@ -22,6 +24,14 @@ import "./TranscriptPane.css";
  * already in flight for the open meeting (read from the operation-progress
  * store, keyed on `meeting_id` + op), so a double-press cannot re-claim the
  * offline slot.
+ *
+ * The translation controls:
+ *   - A `<select>` pre-seeded to the first language in OUTPUT_LANGUAGES when
+ *     no language is selected.
+ *   - A "Translate" button (disabled while a translate op is in flight or any
+ *     other op occupies the slot for this meeting).
+ *   - Once a translated view is active, a "Show original" button flips back to
+ *     the verbatim transcript.
  */
 function TranscriptToolbar() {
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
@@ -32,6 +42,16 @@ function TranscriptToolbar() {
     openMeetingId !== null ? s.operations[openMeetingId] : undefined,
   );
 
+  const selectedLanguage = useTranslationsStore((s) => s.selectedLanguage);
+  const translateInFlight = useTranslationsStore((s) => s.translateInFlight);
+  const translate = useTranslationsStore((s) => s.translate);
+  const showVerbatim = useTranslationsStore((s) => s.showVerbatim);
+
+  // Language picker local state: pre-seeded to the first supported language.
+  const [pickedLanguage, setPickedLanguage] = useState<string>(
+    OUTPUT_LANGUAGES[0],
+  );
+
   // Offline reprocessing only applies to a saved meeting that is open while the
   // recorder is idle (recording / paused / stopping / finalising would contend
   // with the live pipeline). Render nothing otherwise.
@@ -39,6 +59,15 @@ function TranscriptToolbar() {
 
   const retranscribeInFlight = operation?.op === "re_transcribe";
   const rediarizeInFlight = operation?.op === "rediarize";
+  const translateOpInFlight = operation?.op === "translate";
+  // Disable the Translate button if any op is in flight (the backend rejects
+  // re-transcribe / re-diarize while a translate runs and vice versa), or if
+  // the translate store already considers the call in-flight.
+  const translateDisabled =
+    translateInFlight ||
+    translateOpInFlight ||
+    retranscribeInFlight ||
+    rediarizeInFlight;
 
   return (
     <div
@@ -64,6 +93,43 @@ function TranscriptToolbar() {
       >
         Re-identify speakers
       </button>
+      <span className="transcript-pane__toolbar-sep" aria-hidden="true" />
+      {selectedLanguage !== null ? (
+        <button
+          type="button"
+          className="transcript-pane__action"
+          onClick={showVerbatim}
+          title="Return to the verbatim transcript."
+        >
+          Show original
+        </button>
+      ) : (
+        <>
+          <select
+            className="transcript-pane__lang-select"
+            aria-label="Translation target language"
+            value={pickedLanguage}
+            onChange={(e) => setPickedLanguage(e.target.value)}
+          >
+            {OUTPUT_LANGUAGES.map((l) => (
+              <option key={l} value={l}>
+                {l}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="transcript-pane__action"
+            disabled={translateDisabled}
+            onClick={() => void translate(openMeetingId, pickedLanguage)}
+            title="Translate this transcript into the selected language using the local LLM."
+          >
+            {translateOpInFlight || translateInFlight
+              ? "Translating…"
+              : "Translate"}
+          </button>
+        </>
+      )}
     </div>
   );
 }
@@ -194,6 +260,18 @@ export function TranscriptPane() {
     (s) => s.openMeetingState?.meta?.speaker_names,
   );
   const setSpeakerName = useMeetingsStore((s) => s.setSpeakerName);
+  const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
+
+  // Translation state.
+  const selectedLanguage = useTranslationsStore((s) => s.selectedLanguage);
+  const translations = useTranslationsStore((s) => s.translations);
+  const setOpenMeeting = useTranslationsStore((s) => s.setOpenMeeting);
+
+  // Notify the translations store when the open meeting changes so it can
+  // clear stale translations and re-arm `handleEvent` for the new meeting.
+  useEffect(() => {
+    setOpenMeeting(openMeetingId);
+  }, [openMeetingId, setOpenMeeting]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Track whether the user has scrolled away from the bottom.
@@ -313,7 +391,30 @@ export function TranscriptPane() {
                         />
                       </span>
                     )}
-                    {seg.text}
+                    {/*
+                    Translation overlay: when a translated view is active, show
+                    the translated text instead of `seg.text`. If this segment
+                    has no translation yet (partial pass, gap), fall back to the
+                    verbatim text so the row is never blank. A quiet label
+                    identifies translated rows to make the substitution explicit.
+                  */}
+                    {selectedLanguage !== null ? (
+                      <>
+                        {translations.has(idx)
+                          ? translations.get(idx)
+                          : seg.text}
+                        {translations.has(idx) && (
+                          <span
+                            className="transcript-pane__translated-label"
+                            aria-label={`Translated to ${selectedLanguage}`}
+                          >
+                            {selectedLanguage}
+                          </span>
+                        )}
+                      </>
+                    ) : (
+                      seg.text
+                    )}
                   </span>
                 </li>
               );

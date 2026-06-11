@@ -61,6 +61,40 @@
   opacity: 0.4;
 }
 
+/* Thin vertical rule that visually separates the reprocess actions from the
+   translation controls in the toolbar. */
+.transcript-pane__toolbar-sep {
+  display: inline-block;
+  width: 1px;
+  height: 1.1em;
+  background: var(--rule-strong);
+  align-self: center;
+  margin: 0 0.25rem;
+}
+
+/* Language picker within the transcript toolbar. */
+.transcript-pane__lang-select {
+  font-family: var(--font-text);
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.28rem 0.4rem;
+  cursor: pointer;
+}
+
+/* Small label appended to translated segments to make the substitution
+   visible. Quiet — does not dominate the line. */
+.transcript-pane__translated-label {
+  margin-left: 0.35em;
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  color: var(--stone);
+  opacity: 0.7;
+  letter-spacing: 0.02em;
+}
+
 .transcript-pane__empty {
   color: var(--stone);
   text-align: center;

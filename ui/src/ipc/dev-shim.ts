@@ -552,6 +552,20 @@ export const devCommands = {
       token: "dev0000000000000000000000000000000000000000000000000000000000cafe",
     });
   },
+  // Translation commands: no-op in the DEV shim (no LLM available in the
+  // browser preview).
+  async translateMeeting(
+    _meetingId: MeetingId,
+    _targetLanguage: string,
+  ): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async getTranslations(
+    _meetingId: MeetingId,
+    _targetLanguage: string,
+  ): Promise<Result<Record<number, string>, IpcError>> {
+    return ok({});
+  },
 };
 
 // --- DEV-only chat sample data + streamed turn -----------------------------

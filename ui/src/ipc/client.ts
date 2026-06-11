@@ -120,6 +120,13 @@ export const commands: Commands = {
   // Phase 10: the live MCP endpoint (URL + bearer token) for the Settings → MCP
   // pane. The token is sensitive and crosses the boundary only on this read.
   getMcpServerInfo: () => callCommand("getMcpServerInfo", []),
+  // Translation commands: post-hoc per-segment translation backed by the held
+  // LLM. `translateMeeting` triggers the pass (long-running, fire-and-forget
+  // from the UI's perspective); `getTranslations` reads the persisted map.
+  translateMeeting: (meetingId, targetLanguage) =>
+    callCommand("translateMeeting", [meetingId, targetLanguage]),
+  getTranslations: (meetingId, targetLanguage) =>
+    callCommand("getTranslations", [meetingId, targetLanguage]),
 };
 
 // Re-export types that callers commonly need. `AppEvent` is the generated

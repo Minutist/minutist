@@ -199,4 +199,36 @@ describe("operation-progress store — translation_ready clears indicator", () =
       useOperationProgressStore.getState().operationFor(MEETING_ID),
     ).toBeNull();
   });
+
+  /**
+   * Regression: the backend now emits TranslationReady on EVERY exit path
+   * (success and error) so the operation-progress row is never orphaned.
+   * This test verifies the store clears the indicator when translation_ready
+   * arrives after a failed translation pass (simulated by first populating the
+   * progress row and then firing the event — identical to the success-path
+   * signal from the backend's perspective).
+   */
+  it("translation_ready clears the indicator after a failed translation pass", () => {
+    useOperationProgressStore.setState({
+      operations: {
+        [MEETING_ID]: {
+          op: "translate",
+          fraction: 0.3,
+          label: "Translating… (3/10)",
+        },
+      },
+    });
+
+    // The backend emits TranslationReady even when the pass errors mid-segment.
+    const event: AppEvent = {
+      kind: "translation_ready",
+      meeting_id: MEETING_ID,
+      language: "Spanish",
+    };
+    useOperationProgressStore.getState().handleEvent(event);
+
+    expect(
+      useOperationProgressStore.getState().operationFor(MEETING_ID),
+    ).toBeNull();
+  });
 });

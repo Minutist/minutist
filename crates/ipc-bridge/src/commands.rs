@@ -1638,8 +1638,10 @@ const SUPPORTED_TRANSLATION_LANGUAGES: &[&str] = &[
 ///
 /// Emits `AppEvent::OperationProgress { op: OperationKind::Translate }` (fraction
 /// = segments_done / total_segments) throttled to ~5 Hz. Emits
-/// `AppEvent::TranslationReady { meeting_id, language }` on completion so the
-/// webview refreshes the translated view without a manual reload.
+/// `AppEvent::TranslationReady { meeting_id, language }` on every exit path
+/// (success AND error) so the webview's operation-progress indicator is always
+/// cleared. On a partial-failure exit the event fires before the error is
+/// returned to the caller; any completed segments remain on disk.
 ///
 /// # Errors
 ///
@@ -1724,12 +1726,17 @@ pub async fn translate_meeting(
         .expect("translate_in_flight poisoned")
         .remove(&key);
 
-    work_result?;
-
+    // Emit TranslationReady on every exit path so the operation-progress
+    // indicator is cleared even when the pass fails mid-segment. The UI's
+    // `handleEvent` only refetches translations when the meeting and language
+    // match the active view; a refetch on a partial result is harmless — it
+    // surfaces whatever segments completed before the error.
     let _ = state.event_tx.send(AppEvent::TranslationReady {
         meeting_id,
         language: target_language,
     });
+
+    work_result?;
 
     Ok(())
 }

@@ -526,6 +526,12 @@ indicator. Producers + determinism:
   `DiarizationComplete`.
 - **`Finalise` (indeterminate)** — the post-stop drain is opaque, `fraction =
   None`. Cleared by `MeetingFinalised`.
+- **`Translate` (determinate)** — `ipc-bridge::translate_meeting` emits per
+  segment, `fraction = segments_done / total_segments`, throttled to ~5 Hz (plus
+  always on the last segment). Cleared by `TranslationReady`, which is emitted on
+  **every exit path** (success and error) so the indicator is never orphaned by a
+  mid-segment failure. A partial-failure exit leaves completed segments on disk;
+  the UI refetch on the terminal event surfaces them.
 
 ## Finalise returns to the meeting list (live-test UX)
 

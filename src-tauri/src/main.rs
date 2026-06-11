@@ -699,6 +699,9 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 tool_registry,
                 chat_in_flight: chat_in_flight.clone(),
                 chat_cancel: chat_cancel.clone(),
+                translate_in_flight: Arc::new(std::sync::Mutex::new(
+                    std::collections::HashSet::new(),
+                )),
                 mcp_info: mcp_info.clone(),
             });
 

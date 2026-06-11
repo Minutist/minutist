@@ -563,7 +563,8 @@ pub enum RecordingState {
 /// Which long-running operation an [`AppEvent::OperationProgress`] event reports.
 ///
 /// Determinate (a `fraction` is available): `ReTranscribe` (samples processed /
-/// total kept samples) and `Summarise` (tokens generated / max tokens).
+/// total kept samples), `Summarise` (tokens generated / max tokens), and
+/// `Translate` (segments translated / total segments).
 /// Indeterminate (`fraction = None`, one opaque FFI compute call):
 /// `Rediarize` and the `Finalise` drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,6 +579,9 @@ pub enum OperationKind {
     Rediarize,
     /// The post-stop finalise drain (indeterminate).
     Finalise,
+    /// Post-hoc translation of transcript segments (determinate; segments translated
+    /// / total segments). Emitted by `ipc-bridge`'s `translate_meeting` command.
+    Translate,
 }
 
 /// Events emitted from the Rust core to the webview via tauri-specta.
@@ -649,6 +653,18 @@ pub enum AppEvent {
         /// A short human-readable label for the in-flight op (e.g.
         /// "Re-transcribing…", "Summarising…", "Identifying speakers…").
         label: String,
+    },
+    /// A post-hoc translation pass finished for a meeting. Emitted by
+    /// `ipc-bridge`'s `translate_meeting` command once all segments have been
+    /// translated and merged into `translations.json`. The webview re-reads the
+    /// translations for the open meeting when this fires so the translated view
+    /// reflects the new language without a manual refresh.
+    TranslationReady {
+        meeting_id: MeetingId,
+        /// The full English language name the translation was produced for
+        /// (e.g. `"Spanish"`). The webview uses this to refresh only the
+        /// relevant language cache.
+        language: String,
     },
     /// Model download progress, used by the first-run flow.
     ModelDownloadProgress {

@@ -522,6 +522,60 @@ async getMcpServerInfo() : Promise<Result<McpServerInfo | null, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Translate every segment of a meeting's transcript into `target_language` and
+ * persist the results in `translations.json` alongside the meeting folder.
+ * 
+ * The translation is a **derived** view: the verbatim transcript remains
+ * authoritative; `translations.json` is regenerable from it at any time. A
+ * new full `write_transcript` (re-transcribe) automatically clears the sidecar
+ * so stale translations never linger — see `persistence::write_transcript`.
+ * 
+ * # Concurrency
+ * 
+ * A second call for the same `(meeting_id, target_language)` pair while one is
+ * already in flight is rejected with `AppError::InvalidInput` (mirrors the
+ * `chat_in_flight` guard on chat sessions).
+ * 
+ * # Progress
+ * 
+ * Emits `AppEvent::OperationProgress { op: OperationKind::Translate }` (fraction
+ * = segments_done / total_segments) throttled to ~5 Hz. Emits
+ * `AppEvent::TranslationReady { meeting_id, language }` on completion so the
+ * webview refreshes the translated view without a manual reload.
+ * 
+ * # Errors
+ * 
+ * - `AppError::InvalidInput` when `target_language` is not in
+ * [`SUPPORTED_TRANSLATION_LANGUAGES`] or the meeting has no transcript.
+ * - `AppError::InvalidInput` when translation is already in-flight for this
+ * `(meeting_id, target_language)` pair.
+ */
+async translateMeeting(meetingId: MeetingId, targetLanguage: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("translate_meeting", { meetingId, targetLanguage }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read the translations for a single meeting + language combination.
+ * 
+ * Returns a `HashMap<usize, String>` mapping segment index to translated text
+ * for `target_language`, or an empty map when no translations exist yet for
+ * that language (or when `translations.json` is absent). The webview calls this
+ * on meeting open and on `TranslationReady` to populate the translated-view
+ * overlay.
+ */
+async getTranslations(meetingId: MeetingId, targetLanguage: string) : Promise<Result<Partial<{ [key in number]: string }>, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_translations", { meetingId, targetLanguage }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -620,6 +674,14 @@ export type AppEvent =
  * `architecture/cross-cutting.md` — "Operation progress".
  */
 { kind: "operation_progress"; meeting_id: MeetingId; op: OperationKind; fraction: number | null; label: string } | 
+/**
+ * A post-hoc translation pass finished for a meeting. Emitted by
+ * `ipc-bridge`'s `translate_meeting` command once all segments have been
+ * translated and merged into `translations.json`. The webview re-reads the
+ * translations for the open meeting when this fires so the translated view
+ * reflects the new language without a manual refresh.
+ */
+{ kind: "translation_ready"; meeting_id: MeetingId; language: string } | 
 /**
  * Model download progress, used by the first-run flow.
  */
@@ -959,7 +1021,8 @@ export type NotesDocument = { notes_json: string; notes_markdown: string }
  * Which long-running operation an [`AppEvent::OperationProgress`] event reports.
  * 
  * Determinate (a `fraction` is available): `ReTranscribe` (samples processed /
- * total kept samples) and `Summarise` (tokens generated / max tokens).
+ * total kept samples), `Summarise` (tokens generated / max tokens), and
+ * `Translate` (segments translated / total segments).
  * Indeterminate (`fraction = None`, one opaque FFI compute call):
  * `Rediarize` and the `Finalise` drain.
  */
@@ -979,7 +1042,12 @@ export type OperationKind =
 /**
  * The post-stop finalise drain (indeterminate).
  */
-"finalise"
+"finalise" | 
+/**
+ * Post-hoc translation of transcript segments (determinate; segments translated
+ * / total segments). Emitted by `ipc-bridge`'s `translate_meeting` command.
+ */
+"translate"
 /**
  * Top-level state of the recording pipeline. Emitted to the webview on
  * transitions via `AppEvent::StateChanged`.

@@ -168,17 +168,19 @@ introduced.
 
 **Operation-progress event (live-test UX).** `AppEvent::OperationProgress {
 meeting_id, op: OperationKind, fraction: Option<f32>, label: String }` (plus the
-`OperationKind { ReTranscribe, Summarise, Rediarize, Finalise }` enum) rides the
-existing `AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
-registration — no second registration. Producers: the orchestrator's
-`runner::re_transcribe_buffer` emits a DETERMINATE fraction (kept-samples
-processed / total) per accumulator flush; `ipc-bridge`'s `summarise_meeting` emits
-a DETERMINATE fraction (tokens generated / `max_tokens`) threaded through
-`LlamaSummariser::summarise_with_progress`; the re-diarize and finalise-drain
-paths emit INDETERMINATE (`fraction = None`, one opaque sherpa/drain compute with
-no progress callback). The webview clears the per-row indicator on the terminal
-`TranscriptReady` / `SummaryReady` / `DiarizationComplete`. See
-`architecture/cross-cutting.md` — "Operation progress".
+`OperationKind { ReTranscribe, Summarise, Rediarize, Finalise, Translate }` enum)
+rides the existing `AppEventPayload` newtype + the single
+`collect_events![AppEventPayload]` registration — no second registration.
+Producers: the orchestrator's `runner::re_transcribe_buffer` emits a DETERMINATE
+fraction (kept-samples processed / total) per accumulator flush; `ipc-bridge`'s
+`summarise_meeting` emits a DETERMINATE fraction (tokens generated / `max_tokens`)
+threaded through `LlamaSummariser::summarise_with_progress`; `ipc-bridge`'s
+`translate_meeting` emits a DETERMINATE fraction (segments translated / total
+segments); the re-diarize and finalise-drain paths emit INDETERMINATE (`fraction =
+None`, one opaque sherpa/drain compute with no progress callback). The webview
+clears the per-row indicator on the terminal `TranscriptReady` / `SummaryReady` /
+`DiarizationComplete` / `TranslationReady`. See `architecture/cross-cutting.md` —
+"Operation progress".
 
 **Phase 7 — shared LlamaBackend (feature-gated).** Behind the optional
 `llama-backend` feature (`dep:llama-cpp-2`, OFF by default so the default
@@ -1874,9 +1876,11 @@ omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
 `chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
 per-session cancel flags `cancel_chat_turn` raises, P1).
 
-The command ledger is now **27** (P6 21 + the four P9 chat commands = 25; P10's
-`get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27),
-asserted by the `bindings_builder_registers_expected_command_ledger` test.
+The command ledger is now **32** (P6 21 + the four P9 chat commands = 25; P10's
+`get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27;
+`prewarm_asr` = 28; `save_note_image` = 29; `set_speaker_name` = 30;
+`translate_meeting` + `get_translations` = 32), asserted by the
+`bindings_builder_registers_expected_command_ledger` test.
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name
@@ -1904,6 +1908,36 @@ verbatim. Returns `None` for `"auto"` resolving to an unmapped subtag, for an
 empty setting, and for the empty string. The resolved name is appended to the
 summariser and chat system prompts as `"\n\nRespond entirely in {lang}."` (see
 "Summariser and chat injection" in `cross-cutting.md`).
+
+**Translation commands (32 commands total) — translated transcript as derived view.**
+Two commands land, using the existing `ipc-bridge → summariser` +
+`ipc-bridge → persistence` edges (no new dependency table edges):
+
+- `translate_meeting(meeting_id, target_language) -> ()` — validates
+  `target_language` against the 15-language `SUPPORTED_TRANSLATION_LANGUAGES`
+  constant (the same set as `output_language::SUBTAG_TO_LANGUAGE` values).
+  Rejects a second concurrent call for the same `(meeting_id, target_language)`
+  pair via `IpcState::translate_in_flight: Arc<Mutex<HashSet<(MeetingId,
+  String)>>>` (mirrors `chat_in_flight`). Emits an indeterminate
+  `OperationProgress { op: Translate }` while loading the held summariser, then
+  runs the per-segment loop on `spawn_blocking`: for each segment, calls
+  `LlamaSummariser::translate_segment(text, target_language)` and immediately
+  merges the result into `translations.json` via
+  `persistence::merge_translations` (so partial progress survives an
+  interruption). Emits a determinate `OperationProgress` fraction throttled to
+  ~5 Hz. On completion emits `AppEvent::TranslationReady { meeting_id, language }`
+  so the webview refreshes the translated view.
+- `get_translations(meeting_id, target_language) -> HashMap<usize, String>` —
+  reads `translations.json` via `persistence::read_translations` on
+  `spawn_blocking`, returns the per-language segment map (empty map when no
+  translations exist yet). The webview calls this on meeting open and on
+  `TranslationReady`.
+
+`AppEvent` gains `TranslationReady { meeting_id: MeetingId, language: String }` in
+`common`. `OperationKind` gains `Translate`. Both variants require a `specta::Type`
+derivation and are surfaced in the generated TypeScript bindings. The webview's
+`operation-progress` store terminal-event handler must clear on `TranslationReady`
+(mirrors the existing clears for `SummaryReady` / `DiarizationComplete`).
 
 ### `app-main` (bin)
 **Crate:** `src-tauri/` (Tauri convention)

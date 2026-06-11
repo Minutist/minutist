@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (29 total)
+//! ## Commands (32 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -25,6 +25,7 @@
 //! | `list_meetings` | `Vec<MeetingListEntry>` | 4 |
 //! | `open_meeting` | `MeetingState` | 4 |
 //! | `rename_meeting` | `()` | 4 |
+//! | `set_speaker_name` | `()` | transcript speaker rename |
 //! | `delete_meeting` | `()` | 4 |
 //! | `re_transcribe` | `()` | 4 |
 //! | `summarise_meeting` | `()` | 5 |
@@ -37,6 +38,8 @@
 //! | `list_chat_sessions` | `Vec<ChatSession>` | 9 |
 //! | `delete_chat_session` | `()` | 9 |
 //! | `get_mcp_server_info` | `Option<McpServerInfo>` | 10 |
+//! | `translate_meeting` | `()` | translation |
+//! | `get_translations` | `HashMap<usize, String>` | translation |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
@@ -200,6 +203,13 @@ pub struct IpcState {
             std::collections::HashMap<minutist_common::ChatSessionId, chat_agent::CancelFlag>,
         >,
     >,
+    /// Per-`(meeting_id, language)` in-flight guard for the translation driver.
+    /// A pair present in this set has a `translate_meeting` call currently
+    /// running for that language; a second call for the same pair is rejected
+    /// (mirrors `chat_in_flight`). A `std::sync::Mutex<HashSet>` (not async)
+    /// because every access is a brief, non-awaiting insert/remove.
+    pub translate_in_flight:
+        Arc<std::sync::Mutex<std::collections::HashSet<(minutist_common::MeetingId, String)>>>,
     /// The live MCP server endpoint, set by `app-main` after `mcp_server::serve`
     /// binds (Phase 10). `None` when the MCP server is disabled or not yet
     /// listening. The `get_mcp_server_info` command reads it to reveal the URL +
@@ -499,6 +509,8 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::list_chat_sessions,
             commands::delete_chat_session,
             commands::get_mcp_server_info,
+            commands::translate_meeting,
+            commands::get_translations,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -582,14 +594,17 @@ mod tests {
     /// as a string literal in the `invoke` call.
     ///
     /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
-    /// → P10 26 → P9 review-fix 27 → +prewarm_asr 28 → +save_note_image 29 (P5
-    /// removes `re_summarise` and adds `summarise_meeting` / `get_summary` /
-    /// `save_summary`: 18 − 1 + 3 = 20; P6 adds `rediarize_meeting`: 20 + 1 = 21;
-    /// P9 adds `send_chat_message` / `get_chat_session` / `list_chat_sessions` /
-    /// `delete_chat_session`: 21 + 4 = 25; P10 adds `get_mcp_server_info`: 25 + 1
-    /// = 26; the P9 chat review-fix adds `cancel_chat_turn` (P1 — turn
-    /// cancellation): 26 + 1 = 27; `prewarm_asr` (live-test UX T2): 27 + 1 = 28;
-    /// `save_note_image` (note image paste/drop): 28 + 1 = 29).
+    /// → P10 26 → P9 review-fix 27 → +prewarm_asr 28 → +save_note_image 29 → P4
+    /// transcript-rename adds `set_speaker_name` 30 → +translate_meeting
+    /// +get_translations 32 (P5 removes `re_summarise` and adds `summarise_meeting`
+    /// / `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6 adds
+    /// `rediarize_meeting`: 20 + 1 = 21; P9 adds `send_chat_message` /
+    /// `get_chat_session` / `list_chat_sessions` / `delete_chat_session`: 21 + 4
+    /// = 25; P10 adds `get_mcp_server_info`: 25 + 1 = 26; the P9 chat review-fix
+    /// adds `cancel_chat_turn` (P1 — turn cancellation): 26 + 1 = 27;
+    /// `prewarm_asr` (live-test UX T2): 27 + 1 = 28; `save_note_image` (note image
+    /// paste/drop): 28 + 1 = 29; `set_speaker_name` (transcript speaker rename):
+    /// 29 + 1 = 30; translation commands: 30 + 2 = 32).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -635,12 +650,14 @@ mod tests {
             "list_chat_sessions",
             "delete_chat_session",
             "get_mcp_server_info",
+            "translate_meeting",
+            "get_translations",
         ];
 
         assert_eq!(
             expected.len(),
-            30,
-            "command ledger must be 30 (29 + set_speaker_name, transcript speaker rename)"
+            32,
+            "command ledger must be 32 (30 + translate_meeting + get_translations)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

@@ -93,11 +93,26 @@ pub async fn serve(
     config: McpServerConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> AppResult<(SocketAddr, tokio::sync::oneshot::Receiver<()>)> {
-    let listener = tokio::net::TcpListener::bind(config.bind_addr)
-        .await
-        .map_err(|e| AppError::Io {
-            context: format!("MCP server failed to bind {}: {e}", config.bind_addr),
-        })?;
+    // SO_REUSEADDR: closed connections from a previous server instance leave
+    // server-side TIME_WAIT entries on (addr, port); without the flag a
+    // disable→enable cycle can fail to re-bind even after the old listener is
+    // provably dropped. On Linux this does NOT permit binding over an
+    // actively-listening socket (that would need SO_REUSEPORT), so the
+    // one-listener invariant guaranteed by the shutdown completion handle is
+    // preserved.
+    let listener = (|| -> std::io::Result<tokio::net::TcpSocket> {
+        let socket = match config.bind_addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        socket.set_reuseaddr(true)?;
+        socket.bind(config.bind_addr)?;
+        Ok(socket)
+    })()
+    .and_then(|socket| socket.listen(1024))
+    .map_err(|e| AppError::Io {
+        context: format!("MCP server failed to bind {}: {e}", config.bind_addr),
+    })?;
     let bound = listener.local_addr().map_err(|e| AppError::Io {
         context: format!("MCP server failed to read bound addr: {e}"),
     })?;

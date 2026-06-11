@@ -1453,11 +1453,14 @@ call (`mcp_call_allowed`). See `cross-cutting.md` — "MCP transport".
 descriptor, builds an rmcp `Tool` via `Tool::new(name, description, schema)` then
 calls `.with_title(title)` (rmcp 1.7 `Tool::with_title`, setting the top-level
 `title` field — not `ToolAnnotations.title`) and `.with_annotations(...)` for
-`readOnlyHint` / `destructiveHint` / `openWorldHint`. Every projected tool carries
-a non-empty `title` distinct from its snake_case `name` (enforced by the
-`every_projected_tool_has_non_empty_title_distinct_from_snake_case_name` test in
-`handler.rs`). The title originates from `Tool::title()` — the single source of
-truth is the `agent-tools` impl, not a string in `mcp-server`.
+`readOnlyHint` / `destructiveHint` / `openWorldHint`. Every projected rmcp `Tool`
+carries a non-empty `title` distinct from its snake_case `name` (asserted by two
+tests in `handler.rs`: `every_projected_tool_has_non_empty_title_distinct_from_snake_case_name`
+checks the descriptor level; `list_tools_projection_rmcp_tools_have_title` checks
+the rmcp `Tool` structs AND asserts that `serde_json::to_value` produces a
+top-level `"title"` key, confirming spec compliance through the serde layer).
+The title originates from `Tool::title()` in `agent-tools` — the single source of
+truth.
 
 **The inter-agent tool placement.** `send_to_internal_agent` is DEFINED in
 `agent-tools` (registered only on `ToolRegistry::v1(true)`, the MCP registry) so

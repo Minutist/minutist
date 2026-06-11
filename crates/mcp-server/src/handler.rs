@@ -282,6 +282,102 @@ mod tests {
         }
     }
 
+    /// Verify that every rmcp [`Tool`] produced by `list_tools_projection()`
+    /// carries a non-empty `title` that differs from the snake_case wire name,
+    /// AND that the JSON serialisation of at least one such tool includes a
+    /// top-level `"title"` key — confirming the MCP spec 2025-11-25
+    /// §tools.title field survives serde round-tripping.
+    #[test]
+    fn list_tools_projection_rmcp_tools_have_title() {
+        // Build a handler directly (no live ToolContext — the projection never
+        // touches the context, only the registry metadata).
+        let registry = Arc::new(ToolRegistry::v1(true));
+        let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(1);
+        // ToolContext::new requires a Summariser stub; use a minimal one via a
+        // channels-only dummy that satisfies the trait without a live model.
+        // We cannot easily build a full ToolContext in a unit test, so instead
+        // test the projection function directly via the public helper on the
+        // handler's inner method, which only reads registry metadata.
+        //
+        // Call `mcp_tool_descriptors_gated` (the source the projection reads)
+        // and verify the rmcp Tool shapes directly, since `list_tools_projection`
+        // is `pub(crate)` and this module is within the crate.
+        let handler = {
+            use crate::McpToolHandler;
+            use orchestrator::test_support::test_orchestrator;
+            use persistence::MeetingIndex;
+            use minutist_common::{AppEvent, NoteBlock, AppResult, Segment, Summariser};
+            use std::sync::Arc;
+
+            struct StubSummariser;
+            impl Summariser for StubSummariser {
+                fn summarise(&self, _: &[Segment], _: &[NoteBlock], _: &str) -> AppResult<String> {
+                    Ok(String::new())
+                }
+            }
+
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let meetings_dir = tempdir.path().join("meetings");
+            std::fs::create_dir_all(&meetings_dir).expect("meetings dir");
+            let index = Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(MeetingIndex::open(":memory:"))
+                    .expect("index"),
+            );
+            let orchestrator = Arc::new(test_orchestrator(meetings_dir.clone()));
+            let (event_tx, _rx) = tokio::sync::broadcast::channel::<AppEvent>(16);
+            let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
+            let ctx = Arc::new(
+                agent_tools::ToolContext::new(
+                    orchestrator,
+                    index,
+                    meetings_dir,
+                    summariser,
+                    event_tx,
+                    None,
+                )
+                .with_inter_agent_bridge(bridge_tx),
+            );
+            std::mem::forget(tempdir);
+            McpToolHandler::new(Arc::clone(&registry), ctx, true)
+        };
+
+        let tools = handler.list_tools_projection();
+        assert!(!tools.is_empty(), "projection must return at least one tool");
+
+        for tool in &tools {
+            let name: &str = &tool.name;
+            let title = tool
+                .title
+                .as_deref()
+                .unwrap_or_else(|| panic!("tool {name} has None title in rmcp Tool"));
+            assert!(
+                !title.is_empty(),
+                "tool {name} has an empty title in rmcp Tool"
+            );
+            assert_ne!(
+                title, name,
+                "tool {name} title must differ from its snake_case name"
+            );
+        }
+
+        // At least one tool serialises with a top-level "title" key (confirms
+        // that the rmcp Tool's `title` field survives serde and is present in
+        // the JSON the client would see on `tools/list`).
+        let first = &tools[0];
+        let value = serde_json::to_value(first).expect("Tool must serialise");
+        assert!(
+            value.get("title").is_some(),
+            "serialised Tool must have a top-level 'title' key; got: {value}"
+        );
+        let serialised_title = value["title"].as_str().expect("title must be a string");
+        assert!(
+            !serialised_title.is_empty(),
+            "serialised title must not be empty"
+        );
+    }
+
     #[test]
     fn mcp_call_allowed_matches_listing() {
         let registry = ToolRegistry::v1(true);

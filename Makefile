@@ -4,8 +4,10 @@
 # build / test / clean tasks are one-liners with LIBCLANG_PATH (needed by
 # llama-cpp-sys-2's bindgen) already set. Run `make` or `make help` for the list.
 
-# libclang for bindgen. Override via the environment if your LLVM lives elsewhere.
-LIBCLANG_PATH ?= /usr/lib/llvm-18/lib
+# libclang for bindgen. Auto-detects the two common Linux layouts: Debian/
+# Ubuntu versioned dirs (/usr/lib/llvm-N/lib) and Arch/Manjaro flat /usr/lib.
+# Override via the environment if your LLVM lives elsewhere.
+LIBCLANG_PATH ?= $(firstword $(wildcard /usr/lib/llvm-*/lib) $(patsubst %/,%,$(dir $(wildcard /usr/lib/libclang.so))))
 export LIBCLANG_PATH
 
 CARGO  ?= cargo

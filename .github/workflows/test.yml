@@ -245,3 +245,44 @@ jobs:
         run: |
           cargo check -p minutist --no-default-features \
             --features ${{ matrix.check_features }} --locked
+
+      # Build-variant feature-graph guards.
+      #
+      # Free build: mcp-server and rmcp must be ABSENT from the feature graph.
+      # Connected build (default): mcp-server must be PRESENT.
+      # Also validate that the free build compiles cleanly (CPU-only, no GPU
+      # toolkit needed).
+      - name: Validate free-build feature graph (mcp-server/rmcp absent)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::cargo tree --no-default-features (free build)"
+          cargo tree -p minutist --no-default-features -e features --locked
+          echo "::endgroup::"
+          # Fail if mcp-server or rmcp appears in the free feature tree.
+          if cargo tree -p minutist --no-default-features -e features --locked \
+               | grep -qE 'mcp-server|rmcp'; then
+            echo "ERROR: mcp-server or rmcp found in --no-default-features tree"
+            exit 1
+          fi
+          echo "PASS: mcp-server and rmcp absent from free build"
+
+      - name: Validate connected-build feature graph (mcp-server present)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::cargo tree (connected default)"
+          cargo tree -p minutist -e features --locked
+          echo "::endgroup::"
+          if ! cargo tree -p minutist -e features --locked \
+                 | grep -q 'mcp-server'; then
+            echo "ERROR: mcp-server missing from default (connected) feature tree"
+            exit 1
+          fi
+          echo "PASS: mcp-server present in connected build"
+
+      - name: cargo check free build (CPU-only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo check -p minutist --no-default-features --locked

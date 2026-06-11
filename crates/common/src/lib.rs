@@ -977,6 +977,36 @@ const DISCRETE_HEADROOM: f64 = 0.90;
 /// budget far more conservatively). A guess — flagged for live validation.
 const IGPU_HEADROOM: f64 = 0.50;
 
+/// Compute the usable VRAM budget from a probe.
+///
+/// Applies the discrete/iGPU headroom fraction to `total_bytes`, then tightens
+/// by `free_bytes` when it is a credible smaller number (> 0 and < total).
+/// Vulkan devices without `VK_EXT_memory_budget` report `free == total`, and a
+/// bogus 0 is likewise ignored; in both cases the total-based budget is used.
+fn probe_budget(p: &GpuProbe) -> u64 {
+    let headroom = if p.is_integrated {
+        IGPU_HEADROOM
+    } else {
+        DISCRETE_HEADROOM
+    };
+    let total_budget = (p.total_bytes as f64 * headroom) as u64;
+    if p.free_bytes > 0 && p.free_bytes < p.total_bytes {
+        total_budget.min((p.free_bytes as f64 * headroom) as u64)
+    } else {
+        total_budget
+    }
+}
+
+/// Return `true` when the large ASR tier fits in `asr_headroom`.
+///
+/// `asr_headroom` is the VRAM remaining after any already-budgeted models have
+/// been deducted (the caller is responsible for the deduction). Short-circuits
+/// to `false` when `prefer_large` is false so the caller can pass the flag
+/// directly without an outer `if`.
+fn large_asr_fits(asr_headroom: u64, prefer_large: bool) -> bool {
+    prefer_large && asr_headroom >= ASR_LARGE_VRAM_BYTES
+}
+
 /// Resolve the per-model GPU-offload plan from a VRAM probe + the user's mode.
 ///
 /// PURE (the probe is an input) so it is unit-tested without a GPU. `Off`
@@ -991,7 +1021,8 @@ const IGPU_HEADROOM: f64 = 0.50;
 ///
 /// VRAM decision base: `total × headroom`, NOT `free` — a Vulkan device without
 /// `VK_EXT_memory_budget` reports `free == total`, so `free` is trusted only to
-/// TIGHTEN the budget when it is a credible smaller number.
+/// TIGHTEN the budget when it is a credible smaller number. See
+/// `architecture/components.md` — "`common` VRAM-aware GPU placement".
 pub fn resolve_gpu_plan(
     probe: Option<&GpuProbe>,
     mode: GpuAcceleration,
@@ -1002,26 +1033,12 @@ pub fn resolve_gpu_plan(
             // Force GPU on for both models, but still apply the VRAM clamp for
             // the large ASR tier — a no-probe `On` cannot know whether the 1.7B
             // fits, so it falls back to the small tier.
-            let effective_prefer_large = match probe {
-                None => false,
-                Some(p) => {
-                    let headroom = if p.is_integrated {
-                        IGPU_HEADROOM
-                    } else {
-                        DISCRETE_HEADROOM
-                    };
-                    let total_budget = (p.total_bytes as f64 * headroom) as u64;
-                    let budget = if p.free_bytes > 0 && p.free_bytes < p.total_bytes {
-                        total_budget.min((p.free_bytes as f64 * headroom) as u64)
-                    } else {
-                        total_budget
-                    };
-                    // `On` forces the summariser on GPU; deduct its cost before
-                    // checking whether the large ASR tier also fits.
-                    let asr_headroom = budget.saturating_sub(SUMMARISER_VRAM_BYTES);
-                    prefer_large_asr && asr_headroom >= ASR_LARGE_VRAM_BYTES
-                }
-            };
+            let effective_prefer_large = probe.map_or(false, |p| {
+                // `On` forces the summariser on GPU; deduct its cost before
+                // checking whether the large ASR tier also fits.
+                let asr_headroom = probe_budget(p).saturating_sub(SUMMARISER_VRAM_BYTES);
+                large_asr_fits(asr_headroom, prefer_large_asr)
+            });
             GpuPlan {
                 summariser_gpu: true,
                 asr_gpu: true,
@@ -1041,25 +1058,14 @@ pub fn resolve_gpu_plan(
                     effective_prefer_large: false,
                 };
             };
-            let headroom = if p.is_integrated {
-                IGPU_HEADROOM
-            } else {
-                DISCRETE_HEADROOM
-            };
-            let total_budget = (p.total_bytes as f64 * headroom) as u64;
-            // Use `free` ONLY to tighten, and only when it is a credible smaller
-            // number (>0 and < total) — Vulkan's `free == total` and a bogus 0
-            // both fall back to the total-based budget.
-            let budget = if p.free_bytes > 0 && p.free_bytes < p.total_bytes {
-                total_budget.min((p.free_bytes as f64 * headroom) as u64)
-            } else {
-                total_budget
-            };
-
+            let budget = probe_budget(p);
             let summariser_gpu = budget >= SUMMARISER_VRAM_BYTES;
+            // When the summariser fits on GPU it is deducted from the budget
+            // before the ASR decision; when it runs on CPU the full budget is
+            // available for ASR.
             let asr_headroom =
                 budget.saturating_sub(if summariser_gpu { SUMMARISER_VRAM_BYTES } else { 0 });
-            let effective_prefer_large = prefer_large_asr && asr_headroom >= ASR_LARGE_VRAM_BYTES;
+            let effective_prefer_large = large_asr_fits(asr_headroom, prefer_large_asr);
             let asr_need = if effective_prefer_large {
                 ASR_LARGE_VRAM_BYTES
             } else {

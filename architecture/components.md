@@ -157,7 +157,11 @@ Auto, On, Off }` enum (serde snake_case, `Default = Auto`, `specta::Type` — it
 a `Settings` field so it crosses IPC), the `GpuPlan { summariser_gpu, asr_gpu,
 effective_prefer_large }` per-model decision, and the **pure**
 `resolve_gpu_plan(probe, mode, prefer_large_asr) -> GpuPlan` that the consumers
-call at each model-load moment. `settings.gpu_acceleration` is now this
+call at each model-load moment. Private helpers `probe_budget(p) -> u64`
+(headroom + free-tighten computation) and `large_asr_fits(asr_headroom,
+prefer_large) -> bool` (large-ASR VRAM check) are shared by the `On` and `Auto`
+branches inside `resolve_gpu_plan` to avoid duplication; they are not public.
+`settings.gpu_acceleration` is now this
 `GpuAcceleration` enum (was `bool`; a `deserialize_with` shim migrates a legacy
 bool store, `true → Auto` / `false → Off`). `ipc-bridge` and `orchestrator` are
 the consumers; the policy + thresholds live in `cross-cutting.md` — "GPU

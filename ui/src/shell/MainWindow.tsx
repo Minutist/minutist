@@ -14,6 +14,7 @@ import { SummaryView } from "./SummaryView";
 import { ChatView } from "./ChatView";
 import { SettingsDrawer } from "./SettingsDrawer";
 import { About } from "./About";
+import { UpdateBanner } from "./UpdateBanner";
 import { Editor } from "../editor/Editor";
 import { TranscriptPane } from "../transcript/TranscriptPane";
 import "./MainWindow.css";
@@ -311,6 +312,7 @@ export function MainWindow() {
         in the steady state so it does not compete with the writing surface.
       */}
       <div className="main-window__chrome">
+        <UpdateBanner />
         <ModelDownloadStatus />
         {lastError && (
           <div className="main-window__error" role="alert">

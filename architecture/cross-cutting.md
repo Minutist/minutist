@@ -265,9 +265,15 @@ transcription). The mapping is a pure function in `common`
 - `Auto-detect` (the `""`/`"auto"` sentinel) → **Qwen** (broadest coverage is the
   safe default when the language is unknown).
 
-Within the Qwen branch, the 1.7B tier is used only when the user opts into the
-GPU model (a `settings` flag), else the 0.6B. The orchestrator resolves the
-engine once at recording start (and at re-transcribe) in
+Within the Qwen branch, the **large tier (1.7B) is requested automatically** —
+the call sites pass `true` as the `prefer_large_asr` argument to
+`resolve_gpu_plan`, and the VRAM clamp inside that function decides whether the
+1.7B fits alongside whatever else is placed on GPU; if not, `effective_prefer_large`
+comes back `false` and the 0.6B is used instead. `GpuAcceleration::On` applies the
+same clamp (it previously trusted a now-removed user flag blindly). The
+`Settings::prefer_large_asr_model` field is retained in the struct for serde/wire
+compatibility only; its value is no longer read by any call site. The orchestrator
+resolves the engine once at recording start (and at re-transcribe) in
 `runner::build_asr_backend`, mirroring how it already resolves the language hint
 and GPU layers. `model-registry` only fetches the model(s) for the selected
 engine; pulling all three is opt-in (disk).
@@ -799,9 +805,20 @@ change.
 ## Filesystem layout
 
 ```
-{app-data}/
-├── index.db                    libsql; owned by `persistence`
+{app-data}/                     platform default root (XDG_DATA_HOME on Linux,
+│                               ~/Library/Application Support on macOS,
+│                               %APPDATA% on Windows; identifier = ai.minutist)
+├── settings.store              owned by `settings` (always at platform root)
 ├── logs/                       tracing file appender; owned by `app-main`
+│                               (always at platform root — logging bootstraps
+│                               before settings load)
+├── mcp_token                   MCP bearer token (Phase 10); owned by `app-main`
+│
+│   The four entries below are placed at {app-data} by default.
+│   When settings.data_directory is set to a valid absolute path they move
+│   to {data_directory}/ instead (see "data_directory override" below).
+│
+├── index.db                    libsql; owned by `persistence`
 ├── meetings/{uuid}/            owned by `persistence` (and nobody else)
 │   ├── audio.opus
 │   ├── transcript.json
@@ -812,11 +829,10 @@ change.
 │   ├── assets/                 pasted/dropped note images (content-hash files)
 │   │   └── <sha256>.<ext>
 │   └── chat/{session_id}.json  chat sessions (Phase 9)
-├── models/                     owned by `model-registry` (and nobody else)
-│   ├── asr/{model-id}/...      downloaded GGUF + mmproj per manifest entry
-│   ├── llm/{model-id}/...
-│   └── diarize/{model-id}/...
-└── settings.store              owned by `settings` (JsonFileStore: serde_json + std::fs)
+└── models/                     owned by `model-registry` (and nobody else)
+    ├── asr/{model-id}/...      downloaded GGUF + mmproj per manifest entry
+    ├── llm/{model-id}/...
+    └── diarize/{model-id}/...
 ```
 
 The model manifest is **not** written into the cache. It is bundled in the
@@ -826,6 +842,18 @@ downloaded per-kind / per-model files.
 
 Writes to a directory outside a component's owned scope are a review
 finding.
+
+**`settings.data_directory` override.** `app-main` reads
+`settings.data_directory` after loading settings and calls `resolve_data_roots`
+to derive the effective paths for `meetings/`, `models/`, and `index.db`.
+When the field is `Some(path)` and `path` is an absolute, creatable path, those
+three entries move under `path/`; `settings.store` and `logs/` always stay at
+the platform root (bootstrap constraints). An invalid value (relative, empty,
+or uncreatable) is logged via `tracing::error` and falls back to the platform
+default — startup is never aborted. The roots are fixed for the process
+lifetime; a change requires an app restart. Moving existing data is the user's
+responsibility (no automatic migration). There is currently no UI for this
+field; it must be set by editing `settings.store` directly.
 
 **Legacy data-dir migration (2026-06-11 rename).** `{app-data}` is keyed by
 the bundle identifier, which changed `net.alelec.meeting-app` → `ai.minutist`
@@ -1039,8 +1067,9 @@ is a **VRAM-aware runtime** decision driven by the tri-state
 
 - **`Auto`** (default) probes the GPU's reported VRAM at each model-load moment
   and offloads a model to the GPU only when it fits, else CPU.
-- **`On`** forces full GPU offload without consulting the probe (the old
-  `true`).
+- **`On`** forces full GPU offload; the VRAM clamp for the large ASR tier still
+  applies (a no-probe `On` cannot confirm the 1.7B fits, so it falls back to the
+  small tier in that case).
 - **`Off`** forces CPU without consulting the probe (the old `false`) — the
   runtime escape hatch for weak GPUs / driver trouble.
 
@@ -1061,12 +1090,15 @@ build CPU-only):
 
 **Policy.** Placement is **binary per model** (whole model on GPU or on CPU):
 partial layer offload is slower than CPU for models this small, and the existing
-`n_gpu_layers` resolution is already binary. Under `Auto` the plan **budgets the
+`n_gpu_layers` resolution is already binary. The large ASR tier is **requested
+automatically** (call sites pass `prefer_large_asr = true`); the VRAM clamp in
+`resolve_gpu_plan` decides whether it fits. Under `Auto` the plan **budgets the
 summariser FIRST** (it stays resident while an ASR model loads when
 `preload_summariser` is on), then budgets ASR against the **remaining** headroom
-and downgrades the requested large ASR tier (`effective_prefer_large = false`)
-when it would not fit alongside the summariser — running the 1.7B model purely on
-CPU is strictly worse than the 0.6B CPU default. The decision base is
+and downgrades to the small tier (`effective_prefer_large = false`) when the 1.7B
+would not fit — running the 1.7B model purely on CPU is strictly worse than the
+0.6B CPU default. `On` applies the same VRAM clamp to the large ASR tier, rather
+than trusting a now-removed user flag blindly. The decision base is
 `total_bytes × headroom` (0.90 discrete, 0.50 integrated), **not `free_bytes`**:
 a Vulkan device without `VK_EXT_memory_budget` reports `free == total`, so `free`
 is trusted only to *tighten* the budget when it is a credible smaller number.

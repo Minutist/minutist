@@ -363,11 +363,11 @@ string, not per-token, so the tag is caught even when it spans a token
 boundary.
 
 **GPU-tier sibling (Phase 8).** `asr-runtime` also drives **Qwen3-ASR-1.7B**
-(same mtmd path, official `ggml-org` GGUF + mmproj) as an optional
-higher-accuracy / better-multilingual tier, selected only when the user opts
-into the GPU model (see `settings`); the 0.6B remains the CPU default. Both
-share the same `#21847` long-audio limitation, so the batched-VAD chunking is
-mandatory for either.
+(same mtmd path, official `ggml-org` GGUF + mmproj) as a higher-accuracy /
+better-multilingual tier. The tier is requested automatically — the VRAM clamp
+in `resolve_gpu_plan` decides whether it fits alongside the summariser; if not,
+the 0.6B remains the CPU default. Both share the same `#21847` long-audio
+limitation, so the batched-VAD chunking is mandatory for either.
 
 ### `asr-parakeet`
 **Crate:** `crates/asr-parakeet`

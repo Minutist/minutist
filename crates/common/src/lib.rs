@@ -940,10 +940,10 @@ pub struct GpuPlan {
     /// Offload the (Qwen) ASR model to the GPU. Moot for the Parakeet engine,
     /// which runs on its own ONNX provider, not llama.cpp.
     pub asr_gpu: bool,
-    /// The ASR tier to actually use: the requested `prefer_large_asr_model` only
-    /// when the larger model ALSO fits the remaining budget, else downgraded to
-    /// the small tier (running the 1.7B model purely on CPU is strictly worse
-    /// than the 0.6B CPU default).
+    /// The ASR tier to actually use: the large tier only when the VRAM budget
+    /// allows it alongside whatever is already placed on GPU, else downgraded to
+    /// the small tier. Running the 1.7B model purely on CPU is strictly worse
+    /// than the 0.6B CPU default, so the clamp applies for `Auto` and `On` alike.
     pub effective_prefer_large: bool,
 }
 
@@ -963,13 +963,15 @@ const IGPU_HEADROOM: f64 = 0.50;
 
 /// Resolve the per-model GPU-offload plan from a VRAM probe + the user's mode.
 ///
-/// PURE (the probe is an input) so it is unit-tested without a GPU. `On`/`Off`
-/// short-circuit without consulting the probe. `Auto` budgets the summariser
-/// FIRST (it is resident while an ASR model loads when `preload_summariser` is
-/// on), then budgets ASR against the REMAINING headroom and downgrades the large
-/// ASR tier if it would not fit alongside. A `None` probe (no GPU / probe
-/// failed) resolves everything to CPU — the fail-safe (a false "fits" risks an
-/// out-of-memory load or a silent host-memory spill).
+/// PURE (the probe is an input) so it is unit-tested without a GPU. `Off`
+/// short-circuits without consulting the probe. `Auto` and `On` both apply the
+/// VRAM clamp: the large ASR tier is requested unconditionally (the VRAM guard
+/// decides whether it fits). `Auto` budgets the summariser FIRST (it is resident
+/// while an ASR model loads when `preload_summariser` is on), then budgets ASR
+/// against the REMAINING headroom and downgrades the large ASR tier if it would
+/// not fit alongside. `On` applies the same clamp so an explicit override cannot
+/// trigger an out-of-memory load when the large model does not fit. A `None`
+/// probe (no GPU / probe failed) resolves everything to CPU — the fail-safe.
 ///
 /// VRAM decision base: `total × headroom`, NOT `free` — a Vulkan device without
 /// `VK_EXT_memory_budget` reports `free == total`, so `free` is trusted only to
@@ -980,11 +982,36 @@ pub fn resolve_gpu_plan(
     prefer_large_asr: bool,
 ) -> GpuPlan {
     match mode {
-        GpuAcceleration::On => GpuPlan {
-            summariser_gpu: true,
-            asr_gpu: true,
-            effective_prefer_large: prefer_large_asr,
-        },
+        GpuAcceleration::On => {
+            // Force GPU on for both models, but still apply the VRAM clamp for
+            // the large ASR tier — a no-probe `On` cannot know whether the 1.7B
+            // fits, so it falls back to the small tier.
+            let effective_prefer_large = match probe {
+                None => false,
+                Some(p) => {
+                    let headroom = if p.is_integrated {
+                        IGPU_HEADROOM
+                    } else {
+                        DISCRETE_HEADROOM
+                    };
+                    let total_budget = (p.total_bytes as f64 * headroom) as u64;
+                    let budget = if p.free_bytes > 0 && p.free_bytes < p.total_bytes {
+                        total_budget.min((p.free_bytes as f64 * headroom) as u64)
+                    } else {
+                        total_budget
+                    };
+                    // `On` forces the summariser on GPU; deduct its cost before
+                    // checking whether the large ASR tier also fits.
+                    let asr_headroom = budget.saturating_sub(SUMMARISER_VRAM_BYTES);
+                    prefer_large_asr && asr_headroom >= ASR_LARGE_VRAM_BYTES
+                }
+            };
+            GpuPlan {
+                summariser_gpu: true,
+                asr_gpu: true,
+                effective_prefer_large,
+            }
+        }
         GpuAcceleration::Off => GpuPlan {
             summariser_gpu: false,
             asr_gpu: false,
@@ -1199,9 +1226,33 @@ mod tests {
     }
 
     #[test]
-    fn gpu_plan_on_forces_gpu_off_forces_cpu_without_probe() {
+    fn gpu_plan_on_forces_gpu_on_clamps_large_asr_without_probe() {
+        // `On` with no probe: GPU is forced for both models, but the large ASR
+        // tier is clamped to false (no probe → cannot confirm the 1.7B fits).
         let on = resolve_gpu_plan(None, GpuAcceleration::On, true);
+        assert!(on.summariser_gpu && on.asr_gpu, "GPU forced for both models");
+        assert!(!on.effective_prefer_large, "no probe → large ASR clamped off");
+    }
+
+    #[test]
+    fn gpu_plan_on_with_large_card_promotes_large_asr() {
+        // `On` with a 24 GB discrete card: the large ASR tier (3.5 GiB) fits
+        // after the summariser (8 GiB) is deducted from the budget.
+        let on = resolve_gpu_plan(Some(&probe(24, false)), GpuAcceleration::On, true);
         assert!(on.summariser_gpu && on.asr_gpu && on.effective_prefer_large);
+    }
+
+    #[test]
+    fn gpu_plan_on_with_small_card_clamps_large_asr() {
+        // `On` with a 12 GB card: 12 × 0.90 = 10.8 GiB; summariser (8) leaves
+        // 2.8 — below the large ASR threshold (3.5), so clamped to small tier.
+        let on = resolve_gpu_plan(Some(&probe(12, false)), GpuAcceleration::On, true);
+        assert!(on.summariser_gpu && on.asr_gpu, "GPU forced for both models");
+        assert!(!on.effective_prefer_large, "large ASR clamped on 12 GB card");
+    }
+
+    #[test]
+    fn gpu_plan_off_forces_cpu_regardless_of_probe() {
         let off = resolve_gpu_plan(Some(&probe(64, false)), GpuAcceleration::Off, true);
         assert!(!off.summariser_gpu && !off.asr_gpu && !off.effective_prefer_large);
     }

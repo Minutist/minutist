@@ -1744,10 +1744,16 @@ pub async fn translate_meeting(
 /// Blocking body for `translate_meeting`.
 ///
 /// Reads the transcript, translates each segment via
-/// [`LlamaSummariser::translate_segment`], merges results incrementally into
-/// `translations.json` (so partial progress survives an interruption), and emits
-/// `OperationProgress` throttled to ~5 Hz. Synchronous — the caller drives this
-/// on `spawn_blocking`.
+/// [`LlamaSummariser::translate_segment`], and merges batched results into
+/// `translations.json` on the same ~200 ms cadence used for progress emission
+/// (plus unconditionally on loop exit — both the normal completion and any
+/// early-error exit — so partial progress always survives an interruption).
+/// Batching replaces the previous per-segment flush (a full sidecar
+/// read+rewrite+fsync per segment) to avoid O(n²) I/O on long meetings while
+/// preserving the durability guarantee.
+///
+/// Emits `OperationProgress` throttled to ~5 Hz. Synchronous — the caller
+/// drives this on `spawn_blocking`.
 fn translate_meeting_blocking(
     meetings_dir: &Path,
     meeting_id: MeetingId,
@@ -1768,29 +1774,37 @@ fn translate_meeting_blocking(
         });
     }
 
-    let mut last_emit = std::time::Instant::now();
+    let mut pending: HashMap<usize, String> = HashMap::new();
+    let mut last_flush = std::time::Instant::now();
+    let mut result = Ok(());
 
     for (idx, segment) in segments.iter().enumerate() {
-        let translated = summariser
+        let translated = match summariser
             .translate_segment(&segment.text, target_language)
             .map_err(|e| AppError::Internal {
                 context: format!(
                     "translate_segment failed for segment {idx} of meeting {}: {e}",
                     meeting_id.0
                 ),
-            })?;
+            }) {
+            Ok(t) => t,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
 
-        // Merge this segment's result immediately so partial progress is durable.
-        let mut batch = HashMap::new();
-        batch.insert(idx, translated);
-        persistence::merge_translations(&meeting_dir, target_language, &batch)?;
+        pending.insert(idx, translated);
 
-        // Emit progress throttled to ~5 Hz; always emit on the last segment.
+        // Flush pending translations and emit progress on the same ~200 ms
+        // cadence; always flush+emit on the last segment.
         let fraction = (idx + 1) as f32 / total as f32;
         let now = std::time::Instant::now();
         let is_last = idx + 1 == total;
-        if is_last || now.duration_since(last_emit) >= std::time::Duration::from_millis(200) {
-            last_emit = now;
+        if is_last || now.duration_since(last_flush) >= std::time::Duration::from_millis(200) {
+            last_flush = now;
+            persistence::merge_translations(&meeting_dir, target_language, &pending)?;
+            pending.clear();
             let _ = event_tx.send(AppEvent::OperationProgress {
                 meeting_id,
                 op: OperationKind::Translate,
@@ -1800,15 +1814,21 @@ fn translate_meeting_blocking(
         }
     }
 
+    // Flush any segments accumulated since the last throttled flush (covers the
+    // error-exit path: partial progress on completed segments must survive).
+    if !pending.is_empty() {
+        persistence::merge_translations(&meeting_dir, target_language, &pending)?;
+    }
+
     tracing::info!(
         target: "ipc-bridge",
         meeting_id = %meeting_id.0,
         language = target_language,
         segments = total,
-        "translation complete"
+        "translation loop complete"
     );
 
-    Ok(())
+    result
 }
 
 /// Read the translations for a single meeting + language combination.
@@ -2857,6 +2877,60 @@ mod tests {
             .expect("read summary")
             .expect("summary.md must exist after summarise");
         assert_eq!(loaded, summary, "persisted summary must match returned");
+    }
+
+    /// End-to-end translation pass over a 3-segment meeting using the real
+    /// `MINUTIST_LLM_MODEL_PATH` model: verifies that all three translations are
+    /// written to `translations.json` after `translate_meeting_blocking` returns,
+    /// exercising the batched-flush path. Skipped in CI when the env var is unset.
+    #[test]
+    #[ignore = "requires MINUTIST_LLM_MODEL_PATH"]
+    fn translate_meeting_blocking_writes_all_segments_to_sidecar() {
+        let model_path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = MeetingId::new();
+        let folder = persistence::MeetingFolder::create(root, meeting_id).expect("folder");
+
+        // Write a 3-segment transcript.
+        let segments = vec![
+            Segment { start_ms: 0,    end_ms: 1000, text: "Hello world.".into(),        speaker_id: None, confidence: None, words: vec![] },
+            Segment { start_ms: 1000, end_ms: 2000, text: "This is a test.".into(),     speaker_id: None, confidence: None, words: vec![] },
+            Segment { start_ms: 2000, end_ms: 3000, text: "Goodbye for now.".into(),    speaker_id: None, confidence: None, words: vec![] },
+        ];
+        let seg_json = serde_json::to_vec_pretty(&segments).expect("serialise");
+        std::fs::write(folder.transcript_path(), seg_json).expect("write transcript");
+
+        let summariser = LlamaSummariser::open(
+            std::path::PathBuf::from(&model_path),
+            SummariserConfig::default(),
+        )
+        .expect("model load");
+
+        let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(8);
+        let meetings_dir = root.to_path_buf();
+
+        translate_meeting_blocking(
+            &meetings_dir,
+            meeting_id,
+            "Spanish",
+            &summariser,
+            &event_tx,
+        )
+        .expect("translation must succeed");
+
+        // All three segments must be in the sidecar.
+        let meeting_dir = root.join(meeting_id.0.to_string());
+        let all = persistence::read_translations(&meeting_dir).expect("read translations");
+        let spanish = all.get("Spanish").expect("Spanish key present");
+        assert_eq!(spanish.len(), 3, "all 3 segments must be persisted");
+        assert!(!spanish[&0].trim().is_empty(), "segment 0 must be non-empty");
+        assert!(!spanish[&1].trim().is_empty(), "segment 1 must be non-empty");
+        assert!(!spanish[&2].trim().is_empty(), "segment 2 must be non-empty");
     }
 
     // -----------------------------------------------------------------------

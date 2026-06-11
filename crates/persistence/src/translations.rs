@@ -81,8 +81,10 @@ pub fn read_translations(
 ///
 /// Reads the existing sidecar (absent = empty), merges/overwrites entries for
 /// `language` only (other languages are untouched), and writes the result
-/// atomically. Calling this once per segment (after each is translated) means
-/// partial progress survives an interruption.
+/// atomically. The caller is responsible for flush cadence; batching multiple
+/// segments per call reduces I/O on long meetings while still allowing the
+/// caller to flush at any checkpoint so partial progress survives an
+/// interruption.
 pub fn merge_translations(
     meeting_dir: &Path,
     language: &str,

@@ -947,8 +947,9 @@ sidecar is indexed by `(language, segment_index)` and written by `ipc-bridge`'s
   — absent file returns empty map.
 - `merge_translations(meeting_dir, language, &HashMap<usize, String>)` — atomic
   read-modify-write that adds or overwrites entries for one language, leaving
-  other languages untouched. Enables incremental progress: each translated
-  segment is persisted as it arrives so partial progress survives interruption.
+  other languages untouched. The caller batches segments and flushes on a
+  ~200 ms cadence (matching the progress-emit throttle) plus unconditionally
+  on loop exit so partial progress survives interruption without O(n²) I/O.
 - `clear_translations(meeting_dir)` — removes `translations.json`; idempotent
   on an absent file.
 
@@ -1926,12 +1927,14 @@ Two commands land, using the existing `ipc-bridge → summariser` +
   String)>>>` (mirrors `chat_in_flight`). Emits an indeterminate
   `OperationProgress { op: Translate }` while loading the held summariser, then
   runs the per-segment loop on `spawn_blocking`: for each segment, calls
-  `LlamaSummariser::translate_segment(text, target_language)` and immediately
-  merges the result into `translations.json` via
-  `persistence::merge_translations` (so partial progress survives an
-  interruption). Emits a determinate `OperationProgress` fraction throttled to
-  ~5 Hz. On completion emits `AppEvent::TranslationReady { meeting_id, language }`
-  so the webview refreshes the translated view.
+  `LlamaSummariser::translate_segment(text, target_language)`, accumulates
+  the result in a pending batch, and flushes to `translations.json` via
+  `persistence::merge_translations` on the same ~200 ms throttle cadence as
+  the progress emit (plus unconditionally on loop exit) so partial progress
+  survives interruption without O(n²) sidecar rewrites. Emits a determinate
+  `OperationProgress` fraction throttled to ~5 Hz. Emits
+  `AppEvent::TranslationReady { meeting_id, language }` on every exit path
+  (success AND error) so the operation-progress indicator is always cleared.
 - `get_translations(meeting_id, target_language) -> HashMap<usize, String>` —
   reads `translations.json` via `persistence::read_translations` on
   `spawn_blocking`, returns the per-language segment map (empty map when no

@@ -756,9 +756,15 @@ pub enum AppEvent {
     /// `architecture/cross-cutting.md` — "MCP transport".
     McpServerListening { url: String },
     /// The in-process MCP server stopped (disabled via settings toggle).
-    /// `app-main` emits this after the shutdown watch fires so the
+    /// `app-main` emits this after the accept loop has fully exited so the
     /// Settings → MCP pane can clear the live endpoint display.
     McpServerStopped,
+    /// The MCP server failed to start (bind error or summariser load failure).
+    /// `app-main` emits this so the Settings → MCP pane can drop the
+    /// "starting…" hint and surface the reason instead of spinning indefinitely.
+    /// The `reason` field is a concise human-readable English string; it is not
+    /// a serialised `AppError` variant (the pane shows it verbatim).
+    McpServerStartFailed { reason: String },
 }
 
 // ---------------------------------------------------------------------------

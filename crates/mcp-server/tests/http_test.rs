@@ -45,8 +45,10 @@ const TOKEN: &str = "test-bearer-token-deadbeef";
 
 /// Build a real `ToolContext` (test-source orchestrator + in-memory index +
 /// stub summariser) and start the MCP server on `127.0.0.1:0`. Returns the
-/// bound port + the shutdown sender (kept alive so the server keeps running).
-async fn start_server(allow_writes: bool) -> (u16, watch::Sender<bool>) {
+/// bound port, shutdown sender, and completion receiver.
+async fn start_server_with_done(
+    allow_writes: bool,
+) -> (u16, watch::Sender<bool>, tokio::sync::oneshot::Receiver<()>) {
     let tempdir = tempfile::tempdir().expect("tempdir");
     let meetings_dir = tempdir.path().join("meetings");
     std::fs::create_dir_all(&meetings_dir).expect("meetings dir");
@@ -73,7 +75,7 @@ async fn start_server(allow_writes: bool) -> (u16, watch::Sender<bool>) {
     let registry = Arc::new(ToolRegistry::v1(true));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bound = serve(
+    let (bound, done_rx) = serve(
         registry,
         ctx,
         McpServerConfig {
@@ -92,7 +94,14 @@ async fn start_server(allow_writes: bool) -> (u16, watch::Sender<bool>) {
     std::mem::forget(tempdir);
 
     assert_eq!(bound.ip().to_string(), "127.0.0.1", "must bind loopback");
-    (bound.port(), shutdown_tx)
+    (bound.port(), shutdown_tx, done_rx)
+}
+
+/// Convenience wrapper that discards the completion receiver (existing tests
+/// that do not need to await completion).
+async fn start_server(allow_writes: bool) -> (u16, watch::Sender<bool>) {
+    let (port, shutdown, _done) = start_server_with_done(allow_writes).await;
+    (port, shutdown)
 }
 
 /// Send a raw HTTP/1.1 request to `127.0.0.1:{port}` and return the status line.
@@ -201,4 +210,32 @@ async fn graceful_shutdown_stops_accepting() {
             "a post-shutdown connection must not get a live response"
         );
     }
+}
+
+/// Verify that the completion receiver resolves after shutdown, and that the
+/// port can be re-bound immediately after awaiting it (deterministic
+/// stop→start: no port-in-use race).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_completion_and_port_rebind() {
+    let (port, shutdown, done_rx) = start_server_with_done(false).await;
+
+    // The server is alive.
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    let status = raw_request(port, &req).await;
+    assert!(status.contains("401"), "server must be alive: {status:?}");
+
+    // Shut it down and await the completion receiver (bounded: 2 s).
+    shutdown.send(true).expect("send shutdown");
+    tokio::time::timeout(std::time::Duration::from_secs(2), done_rx)
+        .await
+        .expect("completion must resolve within 2 s")
+        .expect("done_tx must not be dropped without sending");
+
+    // Re-bind the SAME explicit port — must succeed immediately because the
+    // completion receiver confirms the listener was dropped.
+    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let rebound = tokio::net::TcpListener::bind(bind_addr).await;
+    assert!(rebound.is_ok(), "port {port} must be rebindable after completion: {rebound:?}");
 }

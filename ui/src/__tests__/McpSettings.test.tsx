@@ -130,15 +130,16 @@ describe("useMcpServerInfoStore event handling", () => {
   beforeEach(() => {
     // Reset the store to a known state before each test.
     act(() => {
-      useMcpServerInfoStore.setState({ info: null });
+      useMcpServerInfoStore.setState({ info: null, startFailedReason: null });
     });
   });
 
-  it("mcp_server_stopped clears the info slot", () => {
-    // Seed a live endpoint.
+  it("mcp_server_stopped clears the info slot and any start-failed reason", () => {
+    // Seed a live endpoint and a stale failure reason.
     act(() => {
       useMcpServerInfoStore.setState({
         info: { url: "http://127.0.0.1:8765/mcp", token: "tok" },
+        startFailedReason: "stale error",
       });
     });
     expect(useMcpServerInfoStore.getState().info).not.toBeNull();
@@ -147,6 +148,7 @@ describe("useMcpServerInfoStore event handling", () => {
       useMcpServerInfoStore.getState().handleEvent({ kind: "mcp_server_stopped" });
     });
     expect(useMcpServerInfoStore.getState().info).toBeNull();
+    expect(useMcpServerInfoStore.getState().startFailedReason).toBeNull();
   });
 
   it("mcp_server_stopped on an already-empty store is a no-op", () => {
@@ -154,6 +156,40 @@ describe("useMcpServerInfoStore event handling", () => {
       useMcpServerInfoStore.getState().handleEvent({ kind: "mcp_server_stopped" });
     });
     expect(useMcpServerInfoStore.getState().info).toBeNull();
+    expect(useMcpServerInfoStore.getState().startFailedReason).toBeNull();
+  });
+
+  it("mcp_server_start_failed sets the failure reason and clears info", () => {
+    act(() => {
+      useMcpServerInfoStore.setState({
+        info: { url: "http://127.0.0.1:8765/mcp", token: "tok" },
+      });
+    });
+    act(() => {
+      useMcpServerInfoStore
+        .getState()
+        .handleEvent({ kind: "mcp_server_start_failed", reason: "bind failed: address in use" });
+    });
+    expect(useMcpServerInfoStore.getState().info).toBeNull();
+    expect(useMcpServerInfoStore.getState().startFailedReason).toBe(
+      "bind failed: address in use",
+    );
+  });
+
+  it("mcp_server_listening clears the start-failed reason before re-fetching", async () => {
+    act(() => {
+      useMcpServerInfoStore.setState({ startFailedReason: "prior error" });
+    });
+    act(() => {
+      useMcpServerInfoStore
+        .getState()
+        .handleEvent({ kind: "mcp_server_listening", url: "http://127.0.0.1:8765/mcp" });
+    });
+    expect(useMcpServerInfoStore.getState().startFailedReason).toBeNull();
+    // Let the async getMcpServerInfo fetch settle.
+    await act(async () => {
+      await Promise.resolve();
+    });
   });
 
   it("other events do not clear the info slot", () => {

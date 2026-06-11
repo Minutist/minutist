@@ -74,8 +74,9 @@ pub struct McpServerConfig {
 }
 
 /// Serve the MCP endpoint on `config.bind_addr` until `shutdown` flips to
-/// `true`. Returns the actually-bound address (so a `:0` test bind can be read
-/// back).
+/// `true`. Returns the actually-bound address and a completion receiver that
+/// resolves when the accept loop has fully exited and the listener has been
+/// dropped — the caller awaits this before re-binding the same port.
 ///
 /// `registry` MUST be a `ToolRegistry::v1(true)` instance (so
 /// `send_to_internal_agent` is present) and `ctx` MUST carry the inter-agent
@@ -84,14 +85,14 @@ pub struct McpServerConfig {
 /// accept loop has been spawned, OR an error if the bind fails.
 ///
 /// Graceful shutdown: when `shutdown` flips, the accept loop stops taking new
-/// connections and the rmcp session manager's cancellation token is fired, so
-/// active sessions terminate.
+/// connections, the rmcp session manager's cancellation token is fired so
+/// active sessions terminate, and the `done_rx` completion receiver resolves.
 pub async fn serve(
     registry: Arc<ToolRegistry>,
     ctx: Arc<ToolContext>,
     config: McpServerConfig,
     mut shutdown: watch::Receiver<bool>,
-) -> AppResult<SocketAddr> {
+) -> AppResult<(SocketAddr, tokio::sync::oneshot::Receiver<()>)> {
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
         .map_err(|e| AppError::Io {
@@ -143,6 +144,11 @@ pub async fn serve(
         "MCP Streamable HTTP server listening (loopback, bearer-gated)"
     );
 
+    // Completion channel: the sender is moved into the accept task and fired
+    // (or dropped on task exit) once the loop breaks and the listener drops.
+    // The caller holds the receiver and awaits it before re-binding the port.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
     // The accept loop runs as its own task so `serve` can return the bound addr
     // to `app-main` immediately (which emits the listening event). `app-main`
     // spawns `serve` itself via `tauri::async_runtime::spawn`, but the accept
@@ -176,9 +182,11 @@ pub async fn serve(
                 }
             }
         }
+        // `listener` is dropped here, releasing the port. Signal completion.
+        let _ = done_tx.send(());
     });
 
-    Ok(bound)
+    Ok((bound, done_rx))
 }
 
 /// Serve one accepted TCP connection: wrap the rmcp service in the bearer-check

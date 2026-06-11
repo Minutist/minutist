@@ -43,6 +43,7 @@ export function McpSettingsPane() {
   // a remount. We additionally refresh on mount / enabled-change to cover the
   // case where the listener bound before this pane (and the store) existed.
   const info = useMcpServerInfoStore((s) => s.info);
+  const startFailedReason = useMcpServerInfoStore((s) => s.startFailedReason);
   const refreshInfo = useMcpServerInfoStore((s) => s.refresh);
   const [revealed, setRevealed] = useState(false);
   const [restartHint, setRestartHint] = useState(false);
@@ -169,11 +170,18 @@ export function McpSettingsPane() {
         </div>
       )}
 
-      {enabled && !info && (
+      {enabled && !info && !startFailedReason && (
         <p className="settings-drawer__hint">
           The MCP server is enabled but not yet listening. It starts
           automatically in the background — this usually resolves in a few
           seconds.
+        </p>
+      )}
+
+      {enabled && startFailedReason && (
+        <p className="settings-drawer__hint settings-drawer__hint--warn">
+          MCP server failed to start: {startFailedReason}. Toggle the server
+          off then on again to retry.
         </p>
       )}
 

@@ -42,6 +42,7 @@ sys-locale = { workspace = true }
 specta-typescript = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
+settings = { path = "../settings" }
 # Test-only: the manifest-consistency guard (`tests/default_model_manifest.rs`)
 # parses `resources/models.json` to assert the bundled DEFAULT_LLM_MODEL_ID
 # stays a real `kind = Llm` entry. This is a dev-dependency, not a production
@@ -49,3 +50,7 @@ tracing-subscriber = { workspace = true }
 # (no production `model-registry` dependency; see components.md dependency
 # table). Mirrors `orchestrator`'s test-only `model-registry` dev-dependency.
 model-registry = { path = "../model-registry" }
+# For `orchestrator::test_support::test_orchestrator` in the inter-agent driver
+# unit test. Not a production edge — the production `orchestrator` dep above
+# provides the runtime path; this activates the `test-source` stub only in cfg(test).
+orchestrator = { path = "../orchestrator", features = ["test-source"] }

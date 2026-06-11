@@ -2016,27 +2016,48 @@ migrated automatically. There is currently no UI for this field; it must be set
 by editing `settings.store` directly.
 
 **Phase 10 wiring (MCP).** Gated on `settings.mcp_enabled` (off by default).
-The shared spawn logic lives in `do_start_mcp_server` (private to `app-main`):
-it spawns `ipc_bridge::spawn_inter_agent_driver` (owns the inter-agent receiver
-+ the internal `v1(false)` chat turn) to get the bridge SENDER, builds the MCP
-`ToolRegistry::v1(true)` + a `ToolContext` carrying that sender, resolves the
-bearer token (generate-on-first-enable, persisted to `{app-data}/mcp_token`
-with `0600`; OS-keychain hardening is a documented follow-up), stores the new
-`watch::Sender<bool>` in `McpShutdownState` (Tauri managed state, connected
-build only), and `tauri::async_runtime::spawn`s `mcp_server::serve` on
-`127.0.0.1:{mcp_port}`. On the bound addr it fills `IpcState.mcp_info` (URL +
-token, read by `get_mcp_server_info`) and emits `AppEvent::McpServerListening`.
+The shared start logic lives in `do_start_mcp_server` (private, `async` fn in
+`app-main`): it first calls `ensure_summariser` (failing early with
+`McpServerStartFailed { reason }` if the model load fails), creates a fresh
+`watch::Sender<bool>` shutdown pair, spawns the inter-agent driver via
+`ipc_bridge::spawn_inter_agent_driver` (passing a `shutdown_rx` clone so the
+driver exits deterministically when the server is disabled), builds the MCP
+`ToolRegistry::v1(true)` + a `ToolContext` carrying the bridge SENDER, resolves
+the bearer token (generate-on-first-enable, persisted to `{app-data}/mcp_token`
+with `0600`; OS-keychain hardening is a documented follow-up), and `await`s
+`mcp_server::serve` on `127.0.0.1:{mcp_port}`. On success, `serve` returns
+`(SocketAddr, oneshot::Receiver<()>)` — the completion receiver resolves when
+the accept loop exits and the listener is dropped. The shutdown sender AND
+completion receiver are stored together in `McpShutdownState` (Tauri managed
+state, an `Arc<McpShutdownState>` the watcher also holds), and `IpcState.mcp_info`
+(URL + token, read by `get_mcp_server_info`) is filled; `AppEvent::McpServerListening`
+is emitted. On any failure, `McpServerStartFailed { reason }` is emitted and the
+handles slot is left `None`.
 
 A settings-watcher task (spawned at startup) subscribes to
-`SettingsHandle::subscribe()` and reacts to `mcp_enabled` changes: on `true`,
-it calls `do_start_mcp_server` (a fresh inter-agent driver + new shutdown
-sender); on `false`, it fires the shutdown watch (stopping the accept loop and
-cancelling active sessions via rmcp's `CancellationToken`), clears
-`IpcState.mcp_info`, and emits `AppEvent::McpServerStopped`. Enable/disable
-therefore takes effect immediately with no restart. Port and `mcp_write_tools`
-changes are NOT reacted to by the watcher — those are restart-required (the
-running server was built with those values). Adds the `mcp-server` dependency
-row above.
+`SettingsHandle::subscribe()` and reacts to `mcp_enabled` transitions: on
+`false→true`, it calls `do_start_mcp_server` directly (not spawned — the
+watcher is itself `async`, so start runs inline and serialises with any
+concurrent stop); on `true→false`, it takes the stored handles, fires the
+shutdown watch, and **awaits the completion receiver** (bounded at 5 s, logging
+a warning on timeout) before clearing `IpcState.mcp_info` and emitting
+`AppEvent::McpServerStopped`. Achieved state is tracked via the presence of
+the handles slot (`Some` = running, `None` = not running), not from the desired
+`mcp_enabled` value — a failed start leaves the slot `None` so a subsequent
+off→on toggle retries the start. Enable/disable takes effect immediately with
+no restart. Port and `mcp_write_tools` changes are NOT reacted to by the
+watcher — those are restart-required (the running server was built with those
+values at start time).
+
+`ipc_bridge::spawn_inter_agent_driver` now accepts a `watch::Receiver<bool>`
+shutdown signal alongside the existing channel/handles parameters (cross-crate
+signature change: `ipc-bridge` → `app-main`). The driver's select loop exits on
+either the shutdown signal or all-senders-dropped, whichever fires first.
+
+`common::AppEvent` gains `McpServerStartFailed { reason: String }` — the UI
+handles it in `useMcpServerInfoStore` (drops the "starting…" hint, shows the
+reason) and in `McpSettingsPane` (renders a `--warn` hint with the reason and
+retry guidance). Adds the `mcp-server` dependency row above.
 
 ## Webview components
 

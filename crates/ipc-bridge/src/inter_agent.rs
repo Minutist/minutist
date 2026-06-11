@@ -55,7 +55,7 @@ use minutist_common::{
     AppError, AppResult, ChatMessage, ChatRole, ChatSession, ChatSessionId, InterAgentReply,
     MeetingId, Summariser,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::chat_runtime::ChatHandles;
 use crate::commands::{load_or_new_session, persist_session, run_chat_turn_on_held_model};
@@ -77,8 +77,14 @@ fn bridge_session_id() -> ChatSessionId {
 
 /// Spawn the inter-agent driver task. Returns the channel SENDER for `app-main`
 /// to hand to `mcp-server`'s `ToolContext` (via
-/// `ToolContext::with_inter_agent_bridge`). The task runs until the sender is
-/// dropped (app shutdown).
+/// `ToolContext::with_inter_agent_bridge`).
+///
+/// The driver exits on either of two conditions (whichever fires first):
+/// - All clones of the returned sender are dropped (primary drop-based exit;
+///   unchanged from the original design).
+/// - `shutdown` flips to `true` (deterministic disable path: `app-main` fires
+///   this when `mcp_enabled` toggles off, tying the driver's lifetime to its
+///   per-instance MCP server lifecycle rather than the full app lifetime).
 ///
 /// `handles` carries the same held-model + persistence handles the chat command
 /// uses; `chat_in_flight` is the SHARED single-in-flight guard (the same set the
@@ -92,6 +98,7 @@ pub fn spawn_inter_agent_driver(
     handles: ChatHandles,
     chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>,
     allow_writes: bool,
+    mut shutdown: watch::Receiver<bool>,
 ) -> mpsc::Sender<InterAgentEnvelope> {
     let (tx, mut rx) = mpsc::channel::<InterAgentEnvelope>(INTER_AGENT_QUEUE_DEPTH);
 
@@ -101,14 +108,45 @@ pub fn spawn_inter_agent_driver(
 
     tauri::async_runtime::spawn(async move {
         tracing::info!(target: "ipc-bridge", "inter-agent bridge driver started");
-        while let Some((request, reply_tx)) = rx.recv().await {
-            let result =
-                handle_request(&handles, &registry, &chat_in_flight, allow_writes, request).await;
-            // The external caller may have given up (timeout) and dropped the
-            // receiver; that is fine — ignore the send error.
-            let _ = reply_tx.send(result);
+        loop {
+            tokio::select! {
+                // Deterministic shutdown signal (per-instance MCP server lifecycle).
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        tracing::info!(
+                            target: "ipc-bridge",
+                            "inter-agent bridge driver stopped (shutdown signal)"
+                        );
+                        break;
+                    }
+                }
+                // Next request from the MCP tool; None = all senders dropped.
+                item = rx.recv() => {
+                    match item {
+                        None => {
+                            tracing::info!(
+                                target: "ipc-bridge",
+                                "inter-agent bridge driver stopped (sender dropped)"
+                            );
+                            break;
+                        }
+                        Some((request, reply_tx)) => {
+                            let result = handle_request(
+                                &handles,
+                                &registry,
+                                &chat_in_flight,
+                                allow_writes,
+                                request,
+                            )
+                            .await;
+                            // The external caller may have given up (timeout)
+                            // and dropped the receiver; that is fine.
+                            let _ = reply_tx.send(result);
+                        }
+                    }
+                }
+            }
         }
-        tracing::info!(target: "ipc-bridge", "inter-agent bridge driver stopped (sender dropped)");
     });
 
     tx
@@ -290,3 +328,77 @@ async fn run_one_turn(
 /// Convenience re-export so app-main need not name the `agent_tools` envelope
 /// type when wiring the bridge.
 pub use agent_tools::InterAgentBridge;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_runtime::ChatHandles;
+    use minutist_common::AppEvent;
+
+    /// Verify that the driver task exits promptly when the shutdown watch fires,
+    /// independently of whether any sender is still alive.
+    ///
+    /// The test creates a driver with a real (but idle) channel, sends the
+    /// shutdown signal, and awaits the sender-side channel close: the driver
+    /// exits its loop, which causes it to drop `rx`, which closes the channel,
+    /// which makes the sender return `SendError` on the next send — a
+    /// detectable proxy for task exit without needing to `join` the spawned
+    /// task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_stops_on_shutdown_signal() {
+        use orchestrator::test_support::test_orchestrator;
+        use persistence::MeetingIndex;
+        use std::sync::Arc;
+        use tokio::sync::{broadcast, watch};
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let meetings_dir = tempdir.path().join("meetings");
+        std::fs::create_dir_all(&meetings_dir).expect("meetings dir");
+
+        let index = Arc::new(
+            MeetingIndex::open(":memory:")
+                .await
+                .expect("in-memory index"),
+        );
+        let orchestrator = Arc::new(test_orchestrator(meetings_dir.clone()));
+        let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
+        let summariser_cell = Arc::new(tokio::sync::OnceCell::new());
+        let settings_dir = tempfile::tempdir().expect("settings tempdir");
+        let settings = settings::SettingsHandle::new(settings::JsonFileStore::new(
+            settings_dir.path().join("settings.store"),
+        ))
+        .expect("settings");
+
+        let handles = ChatHandles {
+            orchestrator,
+            index,
+            meetings_dir,
+            event_tx,
+            settings,
+            summariser: summariser_cell,
+        };
+        let chat_in_flight = Arc::new(Mutex::new(HashSet::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let tx = spawn_inter_agent_driver(handles, chat_in_flight, false, shutdown_rx);
+
+        // The driver is running; the channel is open.
+        assert!(!tx.is_closed(), "driver channel must be open before shutdown");
+
+        // Fire the shutdown signal.
+        shutdown_tx.send(true).expect("send shutdown");
+
+        // Poll until the driver exits (receiver dropped → channel closed).
+        // Bounded at 2 s; the driver exits its select loop on the next tick.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if tx.is_closed() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("inter-agent bridge driver did not stop within 2 s after shutdown signal");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}

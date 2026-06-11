@@ -219,15 +219,21 @@ async fn run_one_turn(
 
     // Scope the prompt to the addressed meeting (the inter-agent bridge can be
     // meeting-scoped too), so the internal agent grounds its answer in that
-    // meeting rather than asking for a meeting id.
+    // meeting rather than asking for a meeting id. The output-language
+    // instruction is appended last so it wins over any conflicting text in
+    // a custom chat_system_prompt.
     let title = match meeting_id {
         Some(mid) => crate::commands::read_meeting_title(&handles.meetings_dir, mid).await,
         None => None,
     };
-    let system_prompt = crate::commands::chat_system_prompt_for_meeting(
-        &handles.settings.current().chat_system_prompt,
-        meeting_id,
-        title.as_deref(),
+    let current_settings = handles.settings.current();
+    let system_prompt = crate::commands::apply_output_language(
+        &crate::commands::chat_system_prompt_for_meeting(
+            &current_settings.chat_system_prompt,
+            meeting_id,
+            title.as_deref(),
+        ),
+        &current_settings.output_language,
     );
     let registry = Arc::clone(registry);
     let event_tx = handles.event_tx.clone();

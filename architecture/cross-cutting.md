@@ -1160,6 +1160,34 @@ etc.); the GPU portability matrix (NVIDIA / AMD / Intel iGPU / Apple Silicon /
 CPU-only, with WER/RTF/warm-first-segment latency) is recorded as manual
 hardware evidence in the engineering journal.
 
+## Output-language injection (summariser and chat)
+
+The `settings.output_language` field controls the language for all LLM-generated
+text (summaries and chat replies). The transcript is NEVER affected.
+
+**Injection point.** `ipc-bridge`'s `apply_output_language(prompt, setting) ->
+String` is the single call site: it calls `resolve_output_language(setting)` from
+the `output_language` module, and when that returns `Some(lang)` it appends
+`"\n\nRespond entirely in {lang}."` to the system prompt. Appending AFTER the full
+prompt (including any user-customised text) ensures the explicit output-language
+setting wins over any conflicting instruction in a custom prompt.
+
+**Summariser path.** `run_held_summarise` (which backs both the direct
+`summarise_meeting` command and the post-stop auto-summarise chain) resolves the
+effective prompt via `Settings::effective_summary_prompt()` and then passes it
+through `apply_output_language` before handing it to the LLM.
+
+**Chat path.** Both `send_chat_message` (the UI chat path) and the inter-agent
+bridge driver in `inter_agent.rs` resolve the chat system prompt via
+`chat_system_prompt_for_meeting` and then pass it through `apply_output_language`
+before starting the turn.
+
+**Resolution.** `resolve_output_language` returns `None` (no instruction) for:
+- the sentinel `"auto"` when `sys_locale::get_locale()` is unavailable or the
+  primary subtag is not in the 15-language mapping table;
+- an empty or whitespace-only setting.
+An explicit full English language name (e.g. `"French"`) passes through verbatim.
+
 ## What's not decided here
 
 These need decisions but are not yet binding:

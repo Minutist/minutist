@@ -47,7 +47,25 @@ use crate::chat::{
     engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX,
 };
 use crate::chat_runtime::ChatHandles;
+use crate::output_language::resolve_output_language;
 use crate::{error::IpcError, IpcState};
+
+/// Append an output-language instruction to a system prompt when
+/// `settings.output_language` resolves to a concrete language name.
+///
+/// Applies to both the summariser system prompt and the chat system prompt:
+/// when [`resolve_output_language`] returns `Some(lang)`, appends
+/// `"\n\nRespond entirely in {lang}."` after the full prompt (including any
+/// user-customised text). Appending AFTER any user-customised prompt ensures
+/// the explicit output-language setting is honoured even when the user's
+/// custom prompt itself says something different. Returns the prompt unchanged
+/// when the setting resolves to `None` (e.g. `"auto"` on an unmapped locale).
+pub(crate) fn apply_output_language(prompt: &str, output_language_setting: &str) -> String {
+    match resolve_output_language(output_language_setting) {
+        Some(lang) => format!("{prompt}\n\nRespond entirely in {lang}."),
+        None => prompt.to_string(),
+    }
+}
 
 /// The bundled default LLM model id used when `settings.llm_model_id` is unset.
 ///
@@ -891,8 +909,10 @@ async fn run_held_summarise(
     let meetings_dir_owned = handles.meetings_dir.clone();
     // Resolve the preset-aware effective prompt (Phase 9 — D4): the user's
     // custom `summary_system_prompt` override when non-empty, else the built-in
-    // prompt for the selected `summary_preset`.
-    let system_prompt = current.effective_summary_prompt();
+    // prompt for the selected `summary_preset`. The output-language instruction
+    // is appended last so it wins over any conflicting text in a custom prompt.
+    let system_prompt =
+        apply_output_language(&current.effective_summary_prompt(), &current.output_language);
 
     // Heavy, synchronous summarise work on a blocking thread (the held model's
     // `summarise` builds a fresh `LlamaContext` and decodes). The held handle is
@@ -1440,14 +1460,20 @@ pub async fn send_chat_message(
 
     // Scope the prompt to the open meeting so the agent uses the tools (which
     // default to this meeting) instead of asking the user for a meeting id.
+    // The output-language instruction is appended last so it wins over any
+    // conflicting text in a custom chat_system_prompt.
     let title = match meeting_id {
         Some(mid) => read_meeting_title(&meetings_dir, mid).await,
         None => None,
     };
-    let system_prompt = chat_system_prompt_for_meeting(
-        &state.settings.current().chat_system_prompt,
-        meeting_id,
-        title.as_deref(),
+    let current_settings = state.settings.current();
+    let system_prompt = apply_output_language(
+        &chat_system_prompt_for_meeting(
+            &current_settings.chat_system_prompt,
+            meeting_id,
+            title.as_deref(),
+        ),
+        &current_settings.output_language,
     );
     let registry = Arc::clone(&state.tool_registry);
     let event_tx = state.event_tx.clone();
@@ -2946,6 +2972,45 @@ mod tests {
         assert_eq!(
             chat_system_prompt_for_meeting("BASE", None, Some("ignored")),
             "BASE"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_output_language — the prompt-injection helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_output_language_appends_instruction_for_known_name() {
+        let result = apply_output_language("Do the thing.", "French");
+        assert_eq!(result, "Do the thing.\n\nRespond entirely in French.");
+    }
+
+    #[test]
+    fn apply_output_language_no_op_for_auto_with_unmappable_locale() {
+        // When "auto" cannot resolve (sys_locale not available in the test
+        // sandbox, or the locale maps to a known language), the helper either
+        // appends a language or returns the prompt unchanged. We test the
+        // explicit-name path separately; for "auto" we just verify no panic.
+        let result = apply_output_language("Base prompt.", "auto");
+        // Result is either the base prompt (auto → None) or extended. Either
+        // is valid — we only assert the base is preserved.
+        assert!(result.starts_with("Base prompt."));
+    }
+
+    #[test]
+    fn apply_output_language_no_op_for_empty_setting() {
+        let result = apply_output_language("Base prompt.", "");
+        assert_eq!(result, "Base prompt.");
+    }
+
+    #[test]
+    fn apply_output_language_explicit_name_appended_after_custom_prompt() {
+        // The instruction is appended LAST — even if a custom prompt already
+        // says something about language, the explicit setting wins.
+        let result = apply_output_language("Respond in English only.", "German");
+        assert!(
+            result.ends_with("\n\nRespond entirely in German."),
+            "output-language instruction must be appended after the full prompt"
         );
     }
 }

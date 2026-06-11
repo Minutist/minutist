@@ -171,6 +171,7 @@ mod tests {
     fn descriptor(name: &'static str) -> ToolDescriptor {
         ToolDescriptor {
             name,
+            title: "Test tool",
             description: "desc",
             input_schema: json!({
                 "type": "object",

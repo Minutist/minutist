@@ -84,6 +84,14 @@ pub trait Tool: Send + Sync {
     /// Stable snake_case wire name. **Never change once shipped.**
     fn name(&self) -> &'static str;
 
+    /// Short human-readable label for directory listings and tool-picker UIs.
+    ///
+    /// Required on every tool — a missing impl is a compile error. The title
+    /// must be distinct from the snake_case `name()` (human-facing, not
+    /// machine-facing). It is projected onto the MCP `tools/list` `title`
+    /// field via [`Tool::with_title`] in `mcp-server`.
+    fn title(&self) -> &'static str;
+
     /// One-line description: the MCP description + injected into the LLM tool
     /// list.
     fn description(&self) -> &'static str;
@@ -246,6 +254,8 @@ impl ToolOutput {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolDescriptor {
     pub name: &'static str,
+    /// Human-readable label for directory listings (see [`Tool::title`]).
+    pub title: &'static str,
     pub description: &'static str,
     pub input_schema: serde_json::Value,
 }
@@ -418,6 +428,7 @@ impl ToolRegistry {
 fn descriptor_of(t: &dyn Tool) -> ToolDescriptor {
     ToolDescriptor {
         name: t.name(),
+        title: t.title(),
         description: t.description(),
         input_schema: t.input_schema(),
     }
@@ -572,6 +583,7 @@ mod tests {
     fn relax_meeting_id_requirement_drops_only_meeting_id() {
         let mut descriptors = vec![ToolDescriptor {
             name: "get_transcript",
+            title: "Get transcript",
             description: "…",
             input_schema: json!({
                 "type": "object",
@@ -600,6 +612,7 @@ mod tests {
     fn relax_meeting_id_requirement_tolerates_a_missing_required_array() {
         let mut descriptors = vec![ToolDescriptor {
             name: "x",
+            title: "X",
             description: "",
             input_schema: json!({ "type": "object", "properties": {} }),
         }];

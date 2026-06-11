@@ -70,7 +70,12 @@ impl McpToolHandler {
                     serde_json::Value::Object(map) => map,
                     _ => serde_json::Map::new(),
                 };
-                let mut tool = Tool::new(d.name, d.description, Arc::new(schema));
+                let mut tool = Tool::new(d.name, d.description, Arc::new(schema))
+                    // Human-readable title for directory listings. The title
+                    // is set directly on Tool (not via ToolAnnotations.title)
+                    // because rmcp 1.7 promotes it to a top-level field on the
+                    // Tool struct (MCP spec 2025-11-25 §tools.title).
+                    .with_title(d.title);
                 // readOnlyHint advertises whether the tool mutates state. It is a
                 // HINT only (a headless client may ignore it); the binding
                 // control is the server-side gate above. `is_write` is the
@@ -254,6 +259,27 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "tool names must be unique");
+    }
+
+    #[test]
+    fn every_projected_tool_has_non_empty_title_distinct_from_snake_case_name() {
+        // Every tool surfaced over MCP must carry a human-readable title that
+        // is non-empty and not identical to its snake_case wire name.
+        //
+        // The projection is pure over registry metadata — no ToolContext needed.
+        let registry = ToolRegistry::v1(true);
+        for d in registry.mcp_tool_descriptors_gated(true) {
+            assert!(
+                !d.title.is_empty(),
+                "tool {} has an empty title",
+                d.name
+            );
+            assert_ne!(
+                d.title, d.name,
+                "tool {} title must differ from its snake_case name",
+                d.name
+            );
+        }
     }
 
     #[test]

@@ -1246,13 +1246,23 @@ mapping is Phase 10's concern and lives in `mcp-server` (keeps `rmcp` out of thi
 crate).
 
 **The `Tool` trait** (`Send + Sync`, async `execute`): `name() -> &'static str`
-(stable snake_case wire name), `description()`, `input_schema() ->
+(stable snake_case wire name), `title() -> &'static str` (required — every tool
+MUST implement it; a missing impl is a compile error; the title is a short
+human-readable label distinct from the snake_case name, projected onto the MCP
+`tools/list` `title` field via `Tool::with_title` in `mcp-server`),
+`description()`, `input_schema() ->
 serde_json::Value` (JSON Schema 2020-12, object root, **no regex `pattern`** — the
 vendored llama.cpp schema→GBNF converter rejects PCRE shorthands), `is_write() ->
 bool`, `expose_over_mcp() -> bool` (default `!is_write()`), and the async
 `execute(&ToolContext, args) -> AppResult<ToolOutput>`. `execute` is async because
 the backing ops are async (the orchestrator's offline ops, libsql index queries);
 tool bodies still push CPU/fs/inference work onto `spawn_blocking`.
+`ToolDescriptor` carries `name`, `title`, `description`, and `input_schema` (pure
+projection; `ToolRegistry::descriptors` / `mcp_tool_descriptors_gated` emit it).
+The rmcp 1.7 `Tool` type exposes `.with_title(str)` which sets the top-level
+`title` field on the MCP tool object (MCP spec 2025-11-25 §tools.title); the
+`mcp-server` handler uses this method, not `ToolAnnotations.title`, because the
+spec promotes title to a first-class field from revision 2025-11-25 onward.
 
 **`ToolContext`** (Clone): `Arc<Orchestrator>`, `Arc<MeetingIndex>`,
 `meetings_dir: PathBuf`, `Arc<dyn Summariser>`, the shared
@@ -1438,6 +1448,16 @@ validation are rmcp-native (`StreamableHttpServerConfig`: the loopback
 cross-origin browser request is a 403). The write-tool exposure gate
 (`allow_writes` = `settings.mcp_write_tools`, D3) is applied at projection AND on
 call (`mcp_call_allowed`). See `cross-cutting.md` — "MCP transport".
+
+**Tool projection** (`McpToolHandler::list_tools_projection`): for each gated
+descriptor, builds an rmcp `Tool` via `Tool::new(name, description, schema)` then
+calls `.with_title(title)` (rmcp 1.7 `Tool::with_title`, setting the top-level
+`title` field — not `ToolAnnotations.title`) and `.with_annotations(...)` for
+`readOnlyHint` / `destructiveHint` / `openWorldHint`. Every projected tool carries
+a non-empty `title` distinct from its snake_case `name` (enforced by the
+`every_projected_tool_has_non_empty_title_distinct_from_snake_case_name` test in
+`handler.rs`). The title originates from `Tool::title()` — the single source of
+truth is the `agent-tools` impl, not a string in `mcp-server`.
 
 **The inter-agent tool placement.** `send_to_internal_agent` is DEFINED in
 `agent-tools` (registered only on `ToolRegistry::v1(true)`, the MCP registry) so

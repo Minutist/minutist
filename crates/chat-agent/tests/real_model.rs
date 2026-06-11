@@ -85,6 +85,7 @@ fn real_turn_can_request_a_tool() {
 
     let descriptors = vec![ToolDescriptor {
         name: "get_transcript",
+        title: "Get transcript",
         description: "Return the full transcript of the current meeting.",
         input_schema: json!({
             "type": "object",

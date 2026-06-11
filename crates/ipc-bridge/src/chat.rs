@@ -512,6 +512,7 @@ mod tests {
     fn descriptor(name: &'static str) -> ToolDescriptor {
         ToolDescriptor {
             name,
+            title: "Test tool",
             description: "d",
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),
         }

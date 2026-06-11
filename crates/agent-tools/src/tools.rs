@@ -108,6 +108,9 @@ impl Tool for ListMeetings {
     fn name(&self) -> &'static str {
         "list_meetings"
     }
+    fn title(&self) -> &'static str {
+        "List meetings"
+    }
     fn description(&self) -> &'static str {
         "List all meetings, newest first."
     }
@@ -132,6 +135,9 @@ pub struct SearchMeetings;
 impl Tool for SearchMeetings {
     fn name(&self) -> &'static str {
         "search_meetings"
+    }
+    fn title(&self) -> &'static str {
+        "Search meetings"
     }
     fn description(&self) -> &'static str {
         "Find meetings whose title or list-excerpt contains the query (does not search transcript bodies; use search_within_transcript for that)."
@@ -164,6 +170,9 @@ pub struct GetMeeting;
 impl Tool for GetMeeting {
     fn name(&self) -> &'static str {
         "get_meeting"
+    }
+    fn title(&self) -> &'static str {
+        "Get meeting"
     }
     fn description(&self) -> &'static str {
         "Full meeting state: metadata (with speaker names overlaid), transcript, notes, and the stored summary if present."
@@ -209,6 +218,9 @@ impl Tool for GetTranscript {
     fn name(&self) -> &'static str {
         "get_transcript"
     }
+    fn title(&self) -> &'static str {
+        "Get transcript"
+    }
     fn description(&self) -> &'static str {
         "Full transcript segments for a meeting, with speaker names overlaid and per-word timestamps when available."
     }
@@ -236,6 +248,9 @@ pub struct GetTranscriptSlice;
 impl Tool for GetTranscriptSlice {
     fn name(&self) -> &'static str {
         "get_transcript_slice"
+    }
+    fn title(&self) -> &'static str {
+        "Get transcript excerpt"
     }
     fn description(&self) -> &'static str {
         "Transcript segments overlapping the [start_ms, end_ms) time window (transcript-clock milliseconds), speaker names overlaid."
@@ -283,6 +298,9 @@ impl Tool for GetSummary {
     fn name(&self) -> &'static str {
         "get_summary"
     }
+    fn title(&self) -> &'static str {
+        "Get summary"
+    }
     fn description(&self) -> &'static str {
         "The stored summary markdown for a meeting (null when the meeting has not been summarised)."
     }
@@ -312,6 +330,9 @@ pub struct GetNotes;
 impl Tool for GetNotes {
     fn name(&self) -> &'static str {
         "get_notes"
+    }
+    fn title(&self) -> &'static str {
+        "Get notes"
     }
     fn description(&self) -> &'static str {
         "The user's hand-typed notes for a meeting (markdown + opaque editor JSON), or null when no notes were taken."
@@ -350,6 +371,9 @@ impl Tool for GetMetadata {
     fn name(&self) -> &'static str {
         "get_metadata"
     }
+    fn title(&self) -> &'static str {
+        "Get meeting metadata"
+    }
     fn description(&self) -> &'static str {
         "Meeting metadata, including any configured speaker_names map."
     }
@@ -375,6 +399,9 @@ pub struct GetRecordingState;
 impl Tool for GetRecordingState {
     fn name(&self) -> &'static str {
         "get_recording_state"
+    }
+    fn title(&self) -> &'static str {
+        "Get recording state"
     }
     fn description(&self) -> &'static str {
         "The recorder's current state (Idle / Recording / Paused / Stopping / Finalising). A busy recorder reports Finalising, never an internal Offline state."
@@ -410,6 +437,9 @@ pub struct SearchWithinTranscript;
 impl Tool for SearchWithinTranscript {
     fn name(&self) -> &'static str {
         "search_within_transcript"
+    }
+    fn title(&self) -> &'static str {
+        "Search within transcript"
     }
     fn description(&self) -> &'static str {
         "Find a phrase in one meeting's transcript body (case-insensitive). Returns matching segments with timestamps and speaker."
@@ -462,6 +492,9 @@ pub struct RelistenSection;
 impl Tool for RelistenSection {
     fn name(&self) -> &'static str {
         "relisten_section"
+    }
+    fn title(&self) -> &'static str {
+        "Re-listen to a section"
     }
     fn description(&self) -> &'static str {
         "Re-run ASR over an audio span and return what was actually said there. \
@@ -518,6 +551,9 @@ pub struct Resummarise;
 impl Tool for Resummarise {
     fn name(&self) -> &'static str {
         "resummarise"
+    }
+    fn title(&self) -> &'static str {
+        "Re-summarise meeting"
     }
     fn description(&self) -> &'static str {
         "Summarise or re-frame this meeting a different way following the given instruction. \
@@ -594,6 +630,9 @@ impl Tool for SetSpeakerName {
     fn name(&self) -> &'static str {
         "set_speaker_name"
     }
+    fn title(&self) -> &'static str {
+        "Set speaker name"
+    }
     fn description(&self) -> &'static str {
         "Name an identified speaker (maps a diarizer label such as \"A\" to a display name). \
          Note: re-running diarization resets all speaker names."
@@ -654,6 +693,9 @@ impl Tool for RenameMeeting {
     fn name(&self) -> &'static str {
         "rename_meeting"
     }
+    fn title(&self) -> &'static str {
+        "Rename meeting"
+    }
     fn description(&self) -> &'static str {
         "Change a meeting's title."
     }
@@ -704,6 +746,9 @@ impl Tool for RetranscribeMeeting {
     fn name(&self) -> &'static str {
         "retranscribe_meeting"
     }
+    fn title(&self) -> &'static str {
+        "Re-transcribe meeting"
+    }
     fn description(&self) -> &'static str {
         "Re-run full ASR over the recording, replacing the stored transcript. \
          Fails if a recording or another offline pass is in progress."
@@ -735,6 +780,9 @@ pub struct RediarizeMeeting;
 impl Tool for RediarizeMeeting {
     fn name(&self) -> &'static str {
         "rediarize_meeting"
+    }
+    fn title(&self) -> &'static str {
+        "Re-diarize meeting"
     }
     fn description(&self) -> &'static str {
         "Re-run speaker diarization, re-assigning speaker labels. This RESETS any \
@@ -771,6 +819,9 @@ pub struct SpeakerTalkTime;
 impl Tool for SpeakerTalkTime {
     fn name(&self) -> &'static str {
         "speaker_talk_time"
+    }
+    fn title(&self) -> &'static str {
+        "Speaker talk time"
     }
     fn description(&self) -> &'static str {
         "Per-speaker total talking time and turn count, with display names overlaid."
@@ -853,6 +904,9 @@ impl Tool for StartRecording {
     fn name(&self) -> &'static str {
         "start_recording"
     }
+    fn title(&self) -> &'static str {
+        "Start recording"
+    }
     fn description(&self) -> &'static str {
         "Start a new recording. Optionally pick an input device by id (omit for the OS default). \
          Returns the new meeting's id. Fails if a recording is already in progress."
@@ -894,6 +948,9 @@ impl Tool for StopRecording {
     fn name(&self) -> &'static str {
         "stop_recording"
     }
+    fn title(&self) -> &'static str {
+        "Stop recording"
+    }
     fn description(&self) -> &'static str {
         "Stop the current recording and finalise the meeting. Returns the finished meeting's id, \
          title, and duration. Fails if no recording is in progress."
@@ -928,6 +985,9 @@ impl Tool for PauseRecording {
     fn name(&self) -> &'static str {
         "pause_recording"
     }
+    fn title(&self) -> &'static str {
+        "Pause recording"
+    }
     fn description(&self) -> &'static str {
         "Pause the current recording. Fails if no recording is in progress."
     }
@@ -952,6 +1012,9 @@ pub struct ResumeRecording;
 impl Tool for ResumeRecording {
     fn name(&self) -> &'static str {
         "resume_recording"
+    }
+    fn title(&self) -> &'static str {
+        "Resume recording"
     }
     fn description(&self) -> &'static str {
         "Resume a paused recording. Fails if the recording is not currently paused."
@@ -999,6 +1062,9 @@ pub struct SendToInternalAgent;
 impl Tool for SendToInternalAgent {
     fn name(&self) -> &'static str {
         "send_to_internal_agent"
+    }
+    fn title(&self) -> &'static str {
+        "Message the in-app assistant"
     }
     fn description(&self) -> &'static str {
         "Send a message to this app's internal meeting-notes chat agent and get its reply. \

@@ -115,6 +115,29 @@ jobs:
         working-directory: ui
         run: npm run test
 
+      # npm audit: report high/critical findings.  Non-blocking (|| true) because
+      # the critical finding (GHSA-67mh-4wv8-2f99, esbuild dev-server) affects the
+      # Vite dev server only and requires a breaking vite@8 bump to fix.  The audit
+      # step surfaces NEW findings in PR review output without blocking merges.
+      - name: npm audit
+        working-directory: ui
+        run: npm audit --audit-level=high || true
+
+  # cargo-deny: licence, advisory, ban, and source checks on every PR/push.
+  # Runs only on Linux (the lock file is cross-platform; no OS-specific crates
+  # are skipped).
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace
+
   # GPU feature-graph gate. The CPU `test` job above never enables a GPU
   # feature, and build.yml only builds vulkan/metal (and only on push to main),
   # so a broken feature-forward (e.g. a renamed/typo'd asr-runtime/vulkan edge,

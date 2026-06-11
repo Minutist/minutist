@@ -1,0 +1,117 @@
+# deny.toml — cargo-deny configuration for the Minutist workspace.
+#
+# Run: cargo deny check
+# CI:  EmbarkStudios/cargo-deny-action in test.yml
+#
+# [licenses] covers every licence that appears in the dependency tree as
+# returned by `cargo deny list` (2026-06-12).  Only OSI-/FSF-free licences
+# are listed; anything unexpected must be investigated rather than rubber-
+# stamped.  Notes on the non-obvious entries:
+#
+#   BSL-1.0       Boost Software License 1.0 — OSI-approved permissive.
+#   CC0-1.0       Public-domain dedication (dunce) — permissive, acceptable.
+#   CDLA-Permissive-2.0
+#                 Community Data License Agreement Permissive 2.0.  Used by
+#                 webpki-root-certs / webpki-roots (Mozilla CA certificates).
+#                 Not OSI-approved but explicitly permissive for software use;
+#                 Mozilla + rustls projects treat it as equivalent to MIT/Apache
+#                 for CA-bundle distribution.  Accepted here on that basis.
+#   LGPL-2.1-or-later
+#                 GNU Lesser General Public License — used by r-efi (UEFI
+#                 bindings), a transitive dep of some Windows crates.  LGPL is
+#                 FSF-free and, for a dynamically-linked shared library, does
+#                 not require the application itself to be GPL.  Accepted.
+#   MIT-0         MIT No Attribution — public-domain-equivalent (dunce).
+#   Unlicense     Public-domain dedication — permissive, acceptable.
+
+[graph]
+# Resolve the full workspace to catch every crate's licence, but only check
+# the crates that actually make it into a build (no [dev-dependencies]-only
+# pull-ins that never ship).
+targets = []
+all-features = false
+
+[licenses]
+# Minimum confidence threshold for licence detection via SPDX text matching.
+confidence-threshold = 0.8
+
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "AGPL-3.0-only",
+    "0BSD",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    "LGPL-2.1-or-later",
+]
+
+# Licences that carry copyleft obligations require explicit review.  If a new
+# GPL-* dep appears cargo-deny will error — investigate before adding it here.
+
+[[licenses.clarify]]
+# ryu is dual-licensed Apache-2.0 / BSL-1.0; the Cargo metadata lists only
+# BSL-1.0 in some versions.  Apache-2.0 is the effective choice for this
+# project.
+name = "ryu"
+expression = "Apache-2.0 OR BSL-1.0"
+license-files = [{ path = "LICENSE-APACHE", hash = 0x1f9c0e71 }]
+
+[advisories]
+# Deny crates with known security vulnerabilities in the RustSec database.
+# Unmaintained advisories for transitive dependencies that have no safe upgrade
+# path are ignored below rather than failing CI.  All entries below are
+# unmaintained (not vulnerability) advisories verified 2026-06-12.
+version = 2
+ignore = [
+    # gtk-rs GTK3 — transitive via Tauri/libappindicator.  Archived upstream;
+    # no gtk4 alternative in the Tauri 2.x dep tree yet.
+    "RUSTSEC-2024-0411",  # gdkwayland-sys
+    "RUSTSEC-2024-0412",  # gdk
+    "RUSTSEC-2024-0413",  # atk
+    "RUSTSEC-2024-0414",  # gdkx11-sys
+    "RUSTSEC-2024-0415",  # gtk
+    "RUSTSEC-2024-0416",  # atk-sys
+    "RUSTSEC-2024-0417",  # gdkx11
+    "RUSTSEC-2024-0418",  # gdk-sys
+    "RUSTSEC-2024-0419",  # gtk3-macros
+    "RUSTSEC-2024-0420",  # gtk-sys
+    # audiopus_sys — our audio stack uses audiopus 0.3.0-rc.0.  No maintained
+    # fork; CMake 4.0 compat issue does not affect our build.
+    "RUSTSEC-2026-0150",
+    # paste — transitive via several macro crates; no maintained alternative.
+    "RUSTSEC-2024-0436",
+    # proc-macro-error — transitive via bindgen and other macro crates.
+    "RUSTSEC-2024-0370",
+    # unic-* — transitive via markup5ever/html5ever (in Tauri's HTML parser).
+    "RUSTSEC-2025-0075",  # unic-char-range
+    "RUSTSEC-2025-0080",  # unic-common
+    "RUSTSEC-2025-0081",  # unic-char-property
+    "RUSTSEC-2025-0098",  # unic-ucd-version
+    "RUSTSEC-2025-0100",  # unic-ucd-ident
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    # vad-rs is pinned to an exact commit SHA; no crates.io release exists.
+    # See workspace Cargo.toml for the rationale.
+    "https://github.com/cjpais/vad-rs",
+]
+
+[bans]
+# Warn (not error) on multiple versions of the same crate: the tree has
+# intentional duplication (e.g. windows-sys 0.45/0.48/0.52/0.59/0.60/0.61)
+# from the Tauri/hyper/reqwest/sherpa-rs stack.  Erroring on every duplicate
+# would generate noise without actionable remediation.
+multiple-versions = "warn"

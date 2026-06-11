@@ -36,7 +36,12 @@ appears in:
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server` |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`† |
+
+† `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
+Cargo feature (default ON). The free artifact is built with
+`--no-default-features` and omits `mcp-server` and its transitive rmcp stack.
+See `cross-cutting.md` — "Build variants".
 
 Any PR adding an edge not in this table requires an architecture-doc
 update in the same commit. The table tracks **runtime** edges only;

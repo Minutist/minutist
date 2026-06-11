@@ -279,6 +279,7 @@ fn resolve_silero_model(app: &tauri::AppHandle) {
 /// platform build concerns) is deferred so it can be reviewed on its own. The
 /// token is high-entropy regardless of the at-rest store, and the loopback bind
 /// + Host/Origin checks are the primary controls. The token is NEVER logged.
+#[cfg(feature = "connected")]
 fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
     let token_path = app_data_dir.join("mcp_token");
 
@@ -312,6 +313,7 @@ fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
 /// Write the token to `path`, creating the file with owner-only mode `0o600`
 /// atomically on Unix (no write-then-chmod window — S3). On Windows the file
 /// inherits the parent directory's ACL (no extra tightening in v1).
+#[cfg(feature = "connected")]
 fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -682,8 +684,10 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // inter-agent driver (both load the SAME model once).
             let summariser_cell = Arc::new(tokio::sync::OnceCell::new());
 
-            // The MCP server info slot (URL + token), filled below when the MCP
-            // server is enabled + bound. `get_mcp_server_info` reads it.
+            // The MCP server info slot (URL + token). In the connected build this
+            // is filled once the MCP server binds; in the free build it is
+            // permanently None (get_mcp_server_info returns None, the MCP pane is
+            // absent from the UI bundle).
             let mcp_info: Arc<std::sync::Mutex<Option<ipc_bridge::McpServerInfo>>> =
                 Arc::new(std::sync::Mutex::new(None));
 
@@ -733,12 +737,12 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
             // --- Phase 10: the MCP server + the inter-agent bridge ------------
             //
-            // Gated on `settings.mcp_enabled` (off by default). When enabled,
-            // spawn the loopback Streamable HTTP server from `setup()` via
-            // `tauri::async_runtime::spawn` (NOT a bare `tokio::spawn` — `setup`
-            // runs on the main thread with no entered tokio runtime; a bare spawn
-            // panics — see cross-cutting "Async runtime"). Toggling the setting at
-            // runtime is a documented restart-required for v1.
+            // Compiled only in the `connected` build (the free build elides the
+            // entire block — no mcp-server crate, no rmcp, no listening socket).
+            // When the feature is present, the server is additionally gated on
+            // `settings.mcp_enabled` (off by default).  Toggling at runtime is a
+            // documented restart-required for v1.
+            #[cfg(feature = "connected")]
             {
                 let settings_now = settings_handle.current();
                 if settings_now.mcp_enabled {

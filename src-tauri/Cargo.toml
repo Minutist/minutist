@@ -29,6 +29,14 @@ rocm = ["ipc-bridge/rocm"]
 cuda = ["ipc-bridge/cuda"]
 directml = ["ipc-bridge/directml"]
 
+# Connected tier (Phase 10): in-process MCP server, bearer-token generation.
+# ON by default so `cargo build` / `cargo run` retain current behaviour.
+# The free artifact is built with --no-default-features (plus an explicit GPU
+# feature when needed, e.g. --no-default-features --features vulkan).
+# See architecture/cross-cutting.md "Build variants".
+connected = ["dep:mcp-server", "dep:rand", "dep:hex"]
+default = ["connected"]
+
 [build-dependencies]
 tauri-build = { workspace = true }
 
@@ -38,7 +46,7 @@ ipc-bridge = { path = "../crates/ipc-bridge" }
 orchestrator = { path = "../crates/orchestrator" }
 model-registry = { path = "../crates/model-registry" }
 agent-tools = { path = "../crates/agent-tools" }
-mcp-server = { path = "../crates/mcp-server" }
+mcp-server = { path = "../crates/mcp-server", optional = true }
 settings = { path = "../crates/settings" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-fs = { workspace = true }
@@ -53,5 +61,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Phase 10: high-entropy MCP bearer-token generation (256-bit, hex-encoded).
-rand = { workspace = true }
-hex = { workspace = true }
+# Optional: only compiled in the `connected` build.
+rand = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }

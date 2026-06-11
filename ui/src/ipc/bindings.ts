@@ -542,8 +542,10 @@ async getMcpServerInfo() : Promise<Result<McpServerInfo | null, IpcError>> {
  * 
  * Emits `AppEvent::OperationProgress { op: OperationKind::Translate }` (fraction
  * = segments_done / total_segments) throttled to ~5 Hz. Emits
- * `AppEvent::TranslationReady { meeting_id, language }` on completion so the
- * webview refreshes the translated view without a manual reload.
+ * `AppEvent::TranslationReady { meeting_id, language }` on every exit path
+ * (success AND error) so the webview's operation-progress indicator is always
+ * cleared. On a partial-failure exit the event fires before the error is
+ * returned to the caller; any completed segments remain on disk.
  * 
  * # Errors
  * 

@@ -1194,6 +1194,28 @@ before starting the turn.
 - an empty or whitespace-only setting.
 An explicit full English language name (e.g. `"French"`) passes through verbatim.
 
+## Build variants
+
+Two shipping artifacts are produced from one source tree:
+
+| Artifact | Cargo invocation | Vite | Contents |
+|---|---|---|---|
+| **Connected** (default) | `cargo build` (or `--features connected`) | `VITE_CONNECTED=1` | MCP server, bearer-token generation, MCP settings pane |
+| **Free** | `cargo build --no-default-features [--features <gpu>]` | `VITE_CONNECTED` unset | No MCP server, no rmcp, no listening socket, no MCP pane in the UI bundle |
+
+**Single identifier.** Both artifacts share `ai.minutist` as the bundle identifier and product name. Artifact names in CI are distinguished by a `-free` suffix on the artifact upload name only — no `productName` change.
+
+**Cargo feature.** `connected` is a default feature in `src-tauri/Cargo.toml`. It gates:
+- `dep:mcp-server` — the entire MCP server crate + rmcp transitive stack.
+- `dep:rand` and `dep:hex` — CSPRNG bearer-token generation (`resolve_mcp_token` in `app-main`).
+- The MCP spawn block in `app-main`'s `setup()` (`#[cfg(feature = "connected")]`).
+
+The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server_info` returns `None` unconditionally. The `mcp_*` fields in `Settings` remain (serde compatibility across tier switches — a user who switches from connected to free keeps their settings file intact with the MCP fields as inert no-ops).
+
+**Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` renders in the UI. In a free bundle the component is tree-shaken away by Vite. The default `vite.config.ts` sets `VITE_CONNECTED = "1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour.
+
+**Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper".
+
 ## What's not decided here
 
 These need decisions but are not yet binding:

@@ -15,6 +15,12 @@
 //!    The check is against the full concatenated string so the tag is detected
 //!    even when it spans token boundaries.
 //!
+//! # Script classification
+//!
+//! [`is_cjk`], [`classify_script`], and [`ScriptClass`] are module-level
+//! helpers (not test-only) so the upcoming auto-language CJK guard and any
+//! future callers can use them without feature-gating.
+//!
 //! See `architecture/cross-cutting.md` — "ASR chunking constraint" and
 //! `spikes/asr/README.md` + `spikes/vad-loop/README.md` for findings.
 
@@ -218,6 +224,81 @@ impl Default for AsrRuntimeConfig {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Script classification
+// ---------------------------------------------------------------------------
+
+/// Classify a character as CJK (broad), Latin, or Other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptClass {
+    /// CJK or related East/Southeast-Asian script.
+    Cjk,
+    /// Latin (basic + extended), ASCII letters.
+    Latin,
+    /// Everything else (digits, punctuation, Cyrillic, Arabic, …).
+    Other,
+}
+
+/// Return `true` when `c` belongs to a CJK or closely related script.
+///
+/// Covered ranges (Unicode):
+/// - Hiragana:                            U+3040–U+309F
+/// - Katakana:                            U+30A0–U+30FF
+/// - CJK Unified Ideographs Extension A: U+3400–U+4DBF
+/// - CJK Unified Ideographs:             U+4E00–U+9FFF
+/// - Hangul Syllables:                    U+AC00–U+D7AF
+/// - Fullwidth Latin / Forms:             U+FF01–U+FFEE (catches
+///   fullwidth digits/letters that appear in CJK-mode model output)
+///
+/// Ranges are conservative: a false negative (non-Latin codepoint missed here)
+/// is safer than a false positive that mislabels a genuine non-CJK utterance.
+pub(crate) fn is_cjk(c: char) -> bool {
+    let cp = c as u32;
+    matches!(
+        cp,
+        0x3040..=0x309F  // Hiragana
+        | 0x30A0..=0x30FF  // Katakana
+        | 0x3400..=0x4DBF  // CJK Extension A
+        | 0x4E00..=0x9FFF  // CJK Unified Ideographs
+        | 0xAC00..=0xD7AF  // Hangul Syllables
+        | 0xFF01..=0xFFEE  // Fullwidth Forms
+    )
+}
+
+/// Classify a text string by its dominant non-whitespace script.
+///
+/// Returns `(cjk_fraction, class)` where `cjk_fraction` is the fraction of
+/// non-whitespace characters that are CJK, and `class` is:
+/// - `Cjk` when `cjk_fraction > CJK_MAJORITY_THRESHOLD`
+/// - `Latin` when no CJK majority AND at least one ASCII letter is present
+/// - `Other` otherwise (mixed or all-punctuation/digit)
+pub(crate) fn classify_script(text: &str) -> (f32, ScriptClass) {
+    let non_ws: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if non_ws.is_empty() {
+        return (0.0, ScriptClass::Other);
+    }
+    let total = non_ws.len() as f32;
+    let cjk_count = non_ws.iter().filter(|&&c| is_cjk(c)).count() as f32;
+    let latin_count = non_ws
+        .iter()
+        .filter(|&&c| c.is_ascii_alphabetic())
+        .count() as f32;
+
+    let cjk_frac = cjk_count / total;
+    let class = if cjk_frac > CJK_MAJORITY_THRESHOLD {
+        ScriptClass::Cjk
+    } else if latin_count > 0.0 {
+        ScriptClass::Latin
+    } else {
+        ScriptClass::Other
+    };
+    (cjk_frac, class)
+}
+
+/// Fraction of non-whitespace characters that must be CJK for a chunk to
+/// be considered CJK-dominant.
+const CJK_MAJORITY_THRESHOLD: f32 = 0.5;
 
 // ---------------------------------------------------------------------------
 // AsrRuntime
@@ -803,6 +884,91 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // is_cjk — promoted runtime helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_cjk_unified() {
+        assert!(is_cjk('\u{4E00}'), "U+4E00 start of CJK Unified");
+        assert!(is_cjk('\u{9FFF}'), "U+9FFF end of CJK Unified");
+        assert!(is_cjk('中'), "CJK ideograph");
+    }
+
+    #[test]
+    fn is_cjk_extension_a() {
+        assert!(is_cjk('\u{3400}'), "U+3400 start of Extension A");
+        assert!(is_cjk('\u{4DBF}'), "U+4DBF end of Extension A");
+    }
+
+    #[test]
+    fn is_cjk_hiragana_katakana() {
+        assert!(is_cjk('\u{3040}'), "U+3040 Hiragana start");
+        assert!(is_cjk('\u{30FF}'), "U+30FF Katakana end");
+        assert!(is_cjk('の'), "Hiragana");
+        assert!(is_cjk('ア'), "Katakana");
+    }
+
+    #[test]
+    fn is_cjk_hangul() {
+        assert!(is_cjk('\u{AC00}'), "U+AC00 Hangul start");
+        assert!(is_cjk('\u{D7AF}'), "U+D7AF Hangul end");
+        assert!(is_cjk('한'), "Hangul syllable");
+    }
+
+    #[test]
+    fn is_cjk_fullwidth_forms() {
+        assert!(is_cjk('\u{FF01}'), "U+FF01 fullwidth exclamation");
+        assert!(is_cjk('\u{FFEE}'), "U+FFEE halfwidth white circle");
+    }
+
+    #[test]
+    fn is_cjk_rejects_latin_and_common() {
+        for c in ['a', 'Z', '0', '9', ' ', '.', ',', '!', '\n'] {
+            assert!(!is_cjk(c), "'{c}' must not be CJK");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_script
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_script_all_latin() {
+        let (frac, class) = classify_script("hello world");
+        assert_eq!(class, ScriptClass::Latin);
+        assert!(frac < 0.01, "no CJK in Latin text");
+    }
+
+    #[test]
+    fn classify_script_majority_cjk() {
+        let (frac, class) = classify_script("你好世界 hi");
+        assert_eq!(class, ScriptClass::Cjk, "majority CJK must classify as Cjk");
+        assert!(frac > 0.5);
+    }
+
+    #[test]
+    fn classify_script_mixed_below_threshold() {
+        // 'a','b','c','d','e','f','好','好' = 2/8 = 25% CJK < 50%
+        let (frac, class) = classify_script("ab cd ef 好 好");
+        assert!(frac < 0.5);
+        assert_eq!(class, ScriptClass::Latin);
+    }
+
+    #[test]
+    fn classify_script_empty() {
+        let (frac, class) = classify_script("");
+        assert_eq!(class, ScriptClass::Other);
+        assert_eq!(frac, 0.0);
+    }
+
+    #[test]
+    fn classify_script_whitespace_only() {
+        let (frac, class) = classify_script("   \t\n");
+        assert_eq!(class, ScriptClass::Other);
+        assert_eq!(frac, 0.0);
+    }
+
+    // -----------------------------------------------------------------------
     // Gated integration tests — skip when model env vars are absent.
     //
     // To run:
@@ -833,14 +999,6 @@ mod tests {
             )
             .expect("model load must succeed with valid paths"),
         )
-    }
-
-    /// `true` if `c` is a CJK / Japanese / Korean codepoint: CJK Unified
-    /// (U+4E00..=U+9FFF), Hiragana/Katakana (U+3040..=U+30FF), or Hangul
-    /// syllables (U+AC00..=U+D7AF). Used by the spurious-Chinese regression guard.
-    fn is_cjk(c: char) -> bool {
-        matches!(c as u32,
-            0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF)
     }
 
     fn load_librispeech_0() -> AudioChunk {

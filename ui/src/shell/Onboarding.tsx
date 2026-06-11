@@ -62,9 +62,9 @@ function ModelStep() {
       <h1 className="onboarding__title">Models</h1>
       <p className="onboarding__lede">
         Local models do the work: a speech model for the transcript and a
-        language model for summaries. Parakeet handles English and European
-        languages with word-level timings; add the multilingual model if you
-        record in Chinese, Japanese, Korean, or Arabic. Download what you need
+        language model for summaries. The English &amp; European speech model
+        provides word-level timings; a separate multilingual model covers
+        Chinese, Japanese, Korean, Arabic, and more. Download what you need
         now, or fetch it later from the main window.
       </p>
       {/* Per-model cards — each self-tracks progress / ready / retry. */}

@@ -45,7 +45,28 @@ fn parakeet_backend_transcribes_real_recording_with_timestamps() {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_MEETING.to_string());
-    let meeting_dir = PathBuf::from(&recordings).join(&meeting_id);
+    // Prefer the named meeting; otherwise any meeting folder with audio. A
+    // recordings dir with no usable recording is a skip, not a failure —
+    // this test needs real audio and cannot synthesize it.
+    let named = PathBuf::from(&recordings).join(&meeting_id);
+    let meeting_dir = if named.join("audio.opus").is_file() {
+        named
+    } else {
+        let fallback = std::fs::read_dir(&recordings)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.join("audio.opus").is_file());
+        match fallback {
+            Some(dir) => dir,
+            None => {
+                eprintln!("skip: no meeting with audio.opus under {recordings}");
+                return;
+            }
+        }
+    };
 
     // Decode to 16 kHz mono f32 (what Parakeet expects) via the app's reader.
     let samples = persistence::read_audio_pcm(&meeting_dir).expect("read_audio_pcm");

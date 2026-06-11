@@ -12,18 +12,29 @@
 # Node is not installed on the Windows side - build the frontend in WSL first
 # (`cd ui && npm run build`). Companion to run-tests-windows.ps1.
 #
-# Usage (from WSL):
+# Usage (from WSL via make):
+#   make windows-build          # derives WslSrc + BuildDir from the Makefile vars
+#   make windows-build-vulkan
+#
+# Usage (direct, from WSL):
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass `
-#     -File '\\wsl.localhost\Ubuntu\home\anl\meeting-app\scripts\build-windows-app.ps1'
-#   ... -SyncOnly        # validate the sync without building
-#   ... -Features vulkan # GPU build (needs the Vulkan SDK + a Vulkan GPU to run)
+#     -File "$(wslpath -w scripts/build-windows-app.ps1)"
+#   ... -SyncOnly                              # validate sync only
+#   ... -Features vulkan                       # Vulkan GPU build
+#   ... -WslSrc '\\wsl.localhost\Arch\repo'   # override WSL source UNC
+#   ... -BuildDir 'C:\dev\minutist'            # override Windows build dir
 #
 # Toolchain: Rust on PATH, VS Build Tools 2022 (MSVC), LLVM (libclang). WebView2
 # runtime must be present to RUN (Evergreen ships on Win10/11).
 
 param(
     [switch]$SyncOnly,
-    [string]$Features = ''
+    [string]$Features  = '',
+    # UNC path to the WSL checkout as seen from Windows.  The Makefile derives
+    # this via wslpath; override when running the script directly.
+    [string]$WslSrc    = '\\wsl.localhost\Ubuntu\home\anl\meeting-app',
+    # Windows-side mirror directory; cargo builds here.
+    [string]$BuildDir  = 'C:\Users\anl\meeting-app'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,10 +42,10 @@ $ErrorActionPreference = 'Stop'
 $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
 $env:VULKAN_SDK    = 'C:\VulkanSDK\1.4.341.1'
 
-$src   = '\\wsl.localhost\Ubuntu\home\anl\meeting-app'
-$build = 'C:\Users\anl\meeting-app'
+$src   = $WslSrc
+$build = $BuildDir
 
-Set-Location C:\Users\anl
+Set-Location (Split-Path $build -Parent)
 Write-Host "==> Syncing $src -> $build (including ui\dist; Node is absent on Windows)"
 # Keep `target` excluded so the Windows incremental build cache survives; keep
 # node_modules/.git/.claude out. NOTE: `dist` is NOT excluded here (unlike the

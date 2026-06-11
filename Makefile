@@ -101,10 +101,19 @@ clean-all: clean ## Also remove the UI node_modules
 
 # --- Windows native build (WSL only; needs the Windows MSVC + Rust toolchain) ---
 # Drives scripts/build-windows-app.ps1 on the Windows side via powershell.exe.
-# The UNC path + C:\Users\anl layout match the other run-*-windows.ps1 scripts;
-# adjust WIN_SCRIPT if your checkout/distro differ.
-WIN_SCRIPT ?= \\wsl.localhost\Ubuntu\home\anl\meeting-app\scripts\build-windows-app.ps1
-WIN_RUN    := powershell.exe -NoProfile -ExecutionPolicy Bypass -File '$(WIN_SCRIPT)'
+#
+# WIN_SRC_UNC: UNC path to THIS repo as seen from Windows.  Derived automatically
+#   via `wslpath -w` (available on any modern WSL2 distro); override if your WSL
+#   build has `wslpath` on a non-standard PATH or you want a hard-coded value.
+#
+# WIN_BUILD_DIR: the Windows-side mirror directory where robocopy stages the
+#   source before cargo builds.  Defaults to C:\Users\<your-Windows-user>\meeting-app.
+#   Override e.g. WIN_BUILD_DIR=C:\dev\minutist to use a different drive/path.
+WIN_SRC_UNC   ?= $(shell wslpath -w "$(CURDIR)" 2>/dev/null || echo '\\wsl.localhost\Ubuntu\home\anl\meeting-app')
+WIN_BUILD_DIR ?= C:\Users\anl\meeting-app
+WIN_SCRIPT    ?= $(WIN_SRC_UNC)\scripts\build-windows-app.ps1
+WIN_RUN       := powershell.exe -NoProfile -ExecutionPolicy Bypass \
+                 -File '$(WIN_SCRIPT)' -WslSrc '$(WIN_SRC_UNC)' -BuildDir '$(WIN_BUILD_DIR)'
 
 windows-build: ## Build the portable Windows CPU app (WSL -> Windows MSVC)
 	$(WIN_RUN)

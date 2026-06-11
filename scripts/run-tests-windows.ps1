@@ -4,15 +4,18 @@
 # env vars pointed at the staged Qwen3-ASR Q8_0 GGUFs so the #[ignore]'d
 # gated tests run. Companion to run-spike-windows.ps1.
 #
-# Source is robocopy-mirrored from the WSL repo to C:\Users\anl\meeting-app
+# Source is robocopy-mirrored from the WSL repo to the Windows build directory
 # so cargo doesn't fight UNC + target/ lockfile races.
 #
-# Usage (from WSL, after copying this script to the Windows side):
+# Usage (from WSL):
 #   powershell.exe -NoProfile -ExecutionPolicy Bypass `
-#     -File 'C:\Users\anl\meeting-app\scripts\run-tests-windows.ps1' `
+#     -File "$(wslpath -w scripts/run-tests-windows.ps1)" `
 #     -Package asr-runtime -Ignored
 #
 #   powershell.exe ... -Package orchestrator -Features test-source -Ignored
+#
+#   # Override source/build dirs for a non-default layout:
+#   powershell.exe ... -WslSrc '\\wsl.localhost\Arch\repo' -BuildDir 'C:\dev\minutist'
 #
 # Toolchain: Rust on PATH, VS Build Tools 2022 (MSVC), LLVM (libclang for
 # bindgen). Vulkan SDK is only needed when the build enables a vulkan feature
@@ -28,7 +31,19 @@ param(
 
     [switch]$Release,
 
-    [switch]$SyncOnly
+    [switch]$SyncOnly,
+
+    # UNC path to the WSL checkout as seen from Windows.
+    [string]$WslSrc   = '\\wsl.localhost\Ubuntu\home\anl\meeting-app',
+
+    # Windows-side mirror directory; cargo builds here.
+    [string]$BuildDir = 'C:\Users\anl\meeting-app',
+
+    # Windows path to the Qwen3-ASR model GGUF.
+    [string]$AsrModelPath  = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B-Q8_0-ggml-org.gguf',
+
+    # Windows path to the Qwen3-ASR mmproj GGUF.
+    [string]$AsrMmprojPath = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B.mmproj-Q8_0.gguf'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,9 +54,9 @@ $ErrorActionPreference = 'Stop'
 $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
 $env:VULKAN_SDK    = 'C:\VulkanSDK\1.4.341.1'
 
-# Staged Qwen3-ASR Q8_0 model files (from prior transcribe-rs work).
-$env:MINUTIST_ASR_MODEL_PATH  = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B-Q8_0-ggml-org.gguf'
-$env:MINUTIST_ASR_MMPROJ_PATH = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B.mmproj-Q8_0.gguf'
+# Staged Qwen3-ASR Q8_0 model files.
+$env:MINUTIST_ASR_MODEL_PATH  = $AsrModelPath
+$env:MINUTIST_ASR_MMPROJ_PATH = $AsrMmprojPath
 
 foreach ($p in @($env:MINUTIST_ASR_MODEL_PATH, $env:MINUTIST_ASR_MMPROJ_PATH)) {
     if (-not (Test-Path $p)) { throw "Model file not found: $p" }
@@ -50,10 +65,10 @@ foreach ($p in @($env:MINUTIST_ASR_MODEL_PATH, $env:MINUTIST_ASR_MMPROJ_PATH)) {
 # ---------------------------------------------------------------------------
 # Sync WSL source to Windows
 # ---------------------------------------------------------------------------
-$src   = '\\wsl.localhost\Ubuntu\home\anl\meeting-app'
-$build = 'C:\Users\anl\meeting-app'
+$src   = $WslSrc
+$build = $BuildDir
 
-Set-Location C:\Users\anl
+Set-Location (Split-Path $build -Parent)
 Write-Host "==> Syncing $src -> $build"
 # Exclude heavy/transient dirs. `/XD <name>` matches that dir name at ANY
 # depth, so nested `target` and `node_modules` are all skipped. node_modules

@@ -1,0 +1,70 @@
+# release-prep.yml — bump version, commit, and push a release tag.
+#
+# Automates the two-step manual process documented in RELEASING.md:
+#   1. Edit Cargo.toml (workspace root) version field.
+#   2. Push the version-bump commit + a matching v* tag.
+#
+# Release.yml then fires on the tag and builds the signed bundles.
+#
+# The workflow updates Cargo.toml and regenerates Cargo.lock via `cargo check`.
+# It does NOT build the app or run tests (the release.yml build + the build.yml
+# CI on main already exercise those). Cargo.lock changes are committed so the
+# tag's lockfile is authoritative for that release.
+---
+name: release-prep
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0 — no leading v)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    name: bump version to ${{ inputs.version }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Push back to main needs a token with write access. The default
+          # GITHUB_TOKEN's push is blocked by branch-protection push-to-main
+          # rules on some repos; if that applies here, swap for a PAT with
+          # repo write scope stored as a secret.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump workspace version in Cargo.toml
+        run: |
+          VERSION="${{ inputs.version }}"
+          # Validate: digits + dots only (basic semver shape).
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "Invalid version: $VERSION"
+            exit 1
+          fi
+          # Replace the [workspace.package] version line. The sed pattern is
+          # anchored to avoid touching dependency version lines.
+          sed -i "s/^version = \".*\"$/version = \"$VERSION\"/" Cargo.toml
+          echo "Cargo.toml version set to $VERSION"
+          grep '^version = ' Cargo.toml | head -1
+
+      - name: Regenerate Cargo.lock
+        run: cargo check --workspace
+
+      - name: Commit + tag
+        run: |
+          VERSION="${{ inputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore: bump version to ${VERSION}"
+          git tag "v${VERSION}"
+          git push origin HEAD:main "v${VERSION}"

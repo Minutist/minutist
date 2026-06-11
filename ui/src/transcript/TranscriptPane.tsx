@@ -148,21 +148,28 @@ function TranscriptToolbar() {
  */
 /**
  * The run-leading speaker chip. Shows the speaker's display name when one is
- * set (`speaker_names[label]`), otherwise the bare `Speaker {label}`. Clicking
- * it opens an inline rename that writes through `setSpeakerName`; the name then
- * applies to every row for that label. The chip is not the row's drag handle
- * (the timestamp is) and stops click propagation so renaming does not also
- * trigger the row's jump-to-paragraph.
+ * set (`speaker_names[label]`), otherwise the bare `Speaker {label}`.
+ *
+ * `editable` is true only when viewing a saved, finalised meeting — there the
+ * chip is a button that opens an inline rename writing through
+ * `setSpeakerName`, applying to every row for that label. During a live
+ * recording it is false: the diarizer's labels are provisional and get
+ * re-lettered (and any names cleared) when the meeting finalises, and there is
+ * no persisted metadata to write yet, so the chip is a plain non-interactive
+ * label. The chip is never the row's drag handle (the timestamp is) and stops
+ * click propagation so renaming does not also trigger the row's jump.
  */
 function SpeakerChip({
   label,
   name,
   dotColor,
+  editable,
   onRename,
 }: {
   label: string;
   name: string | null;
   dotColor: string | undefined;
+  editable: boolean;
   onRename: (label: string, name: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -171,6 +178,18 @@ function SpeakerChip({
   function commit() {
     onRename(label, value.trim());
     setEditing(false);
+  }
+
+  if (!editable) {
+    return (
+      <span
+        className="transcript-pane__speaker transcript-pane__speaker--readonly"
+        style={{ ["--dot-color" as string]: dotColor }}
+      >
+        <span className="transcript-pane__speaker-dot" aria-hidden="true" />
+        {name ?? `Speaker ${label}`}
+      </span>
+    );
   }
 
   if (editing) {
@@ -254,8 +273,7 @@ export function TranscriptPane() {
     (s) => s.clickTranscriptSegment,
   );
   // Speaker display-name overlay (label → name) for the open saved meeting,
-  // and the writer. The transcript pane only renders for an open idle meeting,
-  // so the open-meeting meta is the right source.
+  // and the writer.
   const speakerNames = useMeetingsStore(
     (s) => s.openMeetingState?.meta?.speaker_names,
   );
@@ -272,6 +290,13 @@ export function TranscriptPane() {
   useEffect(() => {
     setOpenMeeting(openMeetingId);
   }, [openMeetingId, setOpenMeeting]);
+
+  // Renaming is only meaningful — and only persists — on a saved, finalised
+  // meeting (open + idle). During a live recording the labels are provisional
+  // (re-lettered on stop) and there is no metadata to write, so the chips are
+  // display-only. This mirrors `active-transcript`'s saved-vs-live rule.
+  const recordingKind = useRecordingStore((s) => s.state.kind);
+  const speakerEditable = openMeetingId !== null && recordingKind === "idle";
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Track whether the user has scrolled away from the bottom.
@@ -369,6 +394,7 @@ export function TranscriptPane() {
                         label={seg.speaker_id as string}
                         name={speakerNames?.[seg.speaker_id as string] ?? null}
                         dotColor={dotColor}
+                        editable={speakerEditable}
                         onRename={(label, name) =>
                           void setSpeakerName(label, name)
                         }

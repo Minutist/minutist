@@ -2287,7 +2287,15 @@ left, transcript right).
   "Phase B — live diarization wiring" note), so the chip renders for live
   segments too — no UI change is needed for that (live-label UI consumption is
   Phase C). The on-stop `SherpaDiarizer` pass remains authoritative and rewrites
-  the labels on stop.
+  the labels on stop. The chip shows the user-set display name when one exists
+  (`MeetingMeta.speaker_names[label]`, sourced from `openMeetingState.meta`),
+  else the bare label. It is an editable button (inline rename → the
+  `set_speaker_name` command) **only when viewing a saved, finalised meeting**
+  (`openMeetingId !== null && recording idle`); during a live recording it is a
+  display-only span, because the live labels are provisional (re-lettered on
+  stop, which also clears `speaker_names`) and there is no finalised metadata to
+  write. The timestamp — not the chip — is the row's drag handle, so the chip
+  stops click propagation to avoid triggering the row's jump.
 - **`diarization_complete` re-read (`ui/src/state/meetings.ts`).** The meetings
   store gains a `handleEvent` (dispatched alongside the recording / models /
   summary stores from `useAppEventBridge`) that, on

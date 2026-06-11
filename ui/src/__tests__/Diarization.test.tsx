@@ -243,7 +243,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
       useRecordingStore.setState({ transcript: [makeSegment(0, "hi", "A")] });
     });
     render(<TranscriptPane />);
-    const chip = screen.getByRole("button", { name: "Speaker A" });
+    const chip = screen.getByText("Speaker A");
     const dot = chip.querySelector(".transcript-pane__speaker-dot");
     expect(dot).not.toBeNull();
     expect(chip.style.getPropertyValue("--dot-color")).toBe(
@@ -258,7 +258,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     });
     const live = render(<TranscriptPane />);
     expect(
-      live.getByRole("button", { name: "Speaker B" }).style.getPropertyValue("--dot-color"),
+      live.getByText("Speaker B").style.getPropertyValue("--dot-color"),
     ).toBe("var(--speaker-2)");
     live.unmount();
 
@@ -275,7 +275,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     });
     const saved = render(<TranscriptPane />);
     expect(
-      saved.getByRole("button", { name: "Speaker B" }).style.getPropertyValue("--dot-color"),
+      saved.getByText("Speaker B").style.getPropertyValue("--dot-color"),
     ).toBe("var(--speaker-2)");
   });
 
@@ -306,16 +306,16 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
       container.querySelectorAll(".transcript-pane__speaker-dot"),
     ).toHaveLength(1);
     expect(
-      screen.getByRole("button", { name: "Speaker A" }).style.getPropertyValue("--dot-color"),
+      screen.getByText("Speaker A").style.getPropertyValue("--dot-color"),
     ).toBe("var(--speaker-1)");
   });
 
-  it("exposes the chip as a button named 'Speaker A' and marks the dot aria-hidden", () => {
+  it("exposes the chip accessible name and marks the dot aria-hidden", () => {
     act(() => {
       useRecordingStore.setState({ transcript: [makeSegment(0, "hi", "A")] });
     });
     render(<TranscriptPane />);
-    const chip = screen.getByRole("button", { name: "Speaker A" });
+    const chip = screen.getByText("Speaker A");
     const dot = chip.querySelector(".transcript-pane__speaker-dot");
     expect(dot?.getAttribute("aria-hidden")).toBe("true");
   });
@@ -332,7 +332,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
       });
     });
     render(<TranscriptPane />);
-    expect(screen.getByRole("button", { name: "Alice" })).toBeInTheDocument();
+    expect(screen.getByText("Alice")).toBeInTheDocument();
     expect(screen.queryByText("Speaker A")).not.toBeInTheDocument();
   });
 
@@ -350,7 +350,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     });
     render(<TranscriptPane />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Speaker A" }));
+    fireEvent.click(screen.getByText("Speaker A"));
     const input = screen.getByLabelText("Name for speaker A");
     fireEvent.change(input, { target: { value: "Alice" } });
     fireEvent.keyDown(input, { key: "Enter" });
@@ -361,7 +361,7 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     // The store folds the returned map into the open meeting, so the chip now
     // shows the name.
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: "Alice" })).toBeInTheDocument(),
+      expect(screen.getByText("Alice")).toBeInTheDocument(),
     );
   });
 });

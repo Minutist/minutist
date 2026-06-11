@@ -206,6 +206,14 @@
   border-color: var(--accent);
 }
 
+/* Display-only chip (live recording): no rename affordance — labels are
+   provisional until the meeting finalises. */
+.transcript-pane__speaker--readonly,
+.transcript-pane__speaker--readonly:hover {
+  cursor: default;
+  border-color: var(--rule);
+}
+
 /* Inline rename field shown in place of the chip while editing. */
 .transcript-pane__speaker-input {
   margin-right: 0.5rem;

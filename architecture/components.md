@@ -914,6 +914,30 @@ implementation (via the crate-private `write_metadata_to_path`); `meeting_ops`'s
 rename re-uses the public function rather than its prior private copy. No new
 cross-component dependency edge — `persistence` still depends only on `common`.
 
+**Translations sidecar — `translations.json`.** The `translations` module
+holds per-language translations of transcript segments as a derived view. The
+sidecar is indexed by `(language, segment_index)` and written by `ipc-bridge`'s
+`translate_meeting` command.
+
+- `translations_path(meeting_dir)` — path helper; mirrors the `summary_path()`
+  and `notes_path()` helpers on `MeetingFolder`.
+- `read_translations(meeting_dir) -> AppResult<HashMap<language, HashMap<index, text>>>`
+  — absent file returns empty map.
+- `merge_translations(meeting_dir, language, &HashMap<usize, String>)` — atomic
+  read-modify-write that adds or overwrites entries for one language, leaving
+  other languages untouched. Enables incremental progress: each translated
+  segment is persisted as it arrives so partial progress survives interruption.
+- `clear_translations(meeting_dir)` — removes `translations.json`; idempotent
+  on an absent file.
+
+**Invariant:** `write_transcript` calls `clear_translations` after writing the
+segment array. A full retranscription renumbers segment indices, so stale
+translations would point at the wrong segments; the clear is at the only call
+site that replaces all segments. Re-diarize does NOT call `write_transcript`
+(only `speaker_id`s change, indices/text are unchanged), so translations survive
+re-diarization. No new dependency edge — `persistence` still depends only on
+`common`.
+
 ### `orchestrator`
 **Crate:** `crates/orchestrator`
 **Owns:** the live recording state machine. Wires `audio-capture →

@@ -94,6 +94,17 @@ impl MeetingFolder {
         self.path.join("notes.md")
     }
 
+    /// Path to `translations.json` within the folder.
+    ///
+    /// `translations.json` holds per-language translations of transcript
+    /// segments, indexed by segment position. It is a derived sidecar written
+    /// by the translation commands in `ipc-bridge`; `write_transcript` clears
+    /// it automatically when the transcript is replaced. See
+    /// [`crate::translations`].
+    pub fn translations_path(&self) -> std::path::PathBuf {
+        self.path.join("translations.json")
+    }
+
     /// Path to the `assets/` subdirectory within the folder.
     ///
     /// `assets/` holds pasted/dropped note image files (see

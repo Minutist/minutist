@@ -64,6 +64,7 @@ pub mod opus_encoder;
 pub mod reader;
 pub mod summary;
 pub mod transcript;
+pub mod translations;
 pub mod writer;
 
 // Public re-exports for the crate's primary surface.
@@ -79,6 +80,7 @@ pub use reader::{
 };
 pub use summary::{read_summary, summary_blurb, write_summary};
 pub use transcript::{write_transcript, TranscriptWriter};
+pub use translations::{clear_translations, merge_translations, read_translations};
 pub use writer::MeetingWriter;
 
 #[cfg(test)]

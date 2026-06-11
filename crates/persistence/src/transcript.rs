@@ -36,9 +36,29 @@ use crate::folder::MeetingFolder;
 /// than writing `[]`, preserving the crate-wide invariant that a zero-segment
 /// meeting has no transcript file (see [`TranscriptWriter`]).
 ///
+/// **Invariant:** `translations.json` is cleared here, immediately after the
+/// transcript is rewritten. A full retranscription renumbers segment indices so
+/// any existing per-index translations would point at the wrong segments; clearing
+/// them here keeps the two files consistent without relying on callers to
+/// remember. Re-diarize does NOT call this function (it only overlays
+/// `speaker_id`s without changing indices or text), so translations survive
+/// re-diarization unaffected.
+///
 /// `meeting_dir` is the `{root}/{uuid}/` folder; it must already exist.
 pub fn write_transcript(meeting_dir: &Path, segments: &[Segment]) -> AppResult<()> {
-    Ok(write_transcript_inner(meeting_dir, segments)?)
+    write_transcript_inner(meeting_dir, segments)?;
+    // Clear stale translations after the transcript is replaced. An error here
+    // is not fatal (the transcript was already written successfully); log and
+    // continue so the caller is not forced to handle a cleanup failure.
+    if let Err(e) = crate::translations::clear_translations(meeting_dir) {
+        tracing::warn!(
+            target: "persistence",
+            folder = %meeting_dir.display(),
+            "failed to clear translations.json after write_transcript: {e}; \
+             stale translations may remain until the next retranscription"
+        );
+    }
+    Ok(())
 }
 
 fn write_transcript_inner(meeting_dir: &Path, segments: &[Segment]) -> Result<(), Error> {

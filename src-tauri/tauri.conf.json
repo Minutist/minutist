@@ -4,7 +4,7 @@
   "version": null,
   "identifier": "ai.minutist",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "cd ui && npm run dev",
     "devUrl": "http://localhost:5173",
     "beforeBuildCommand": "cd ui && npm run build",
     "frontendDist": "../ui/dist"

@@ -95,9 +95,8 @@ const fn default_capture_system_audio() -> bool {
     true
 }
 
-/// Default for `prefer_large_asr_model`: OFF. The larger Qwen3-ASR-1.7B tier is
-/// opt-in (bigger download, GPU-class footprint); the 0.6B CPU model is the
-/// default. See `architecture/cross-cutting.md` — "ASR engine routing".
+/// Serde default for `prefer_large_asr_model` (retained for compatibility; field
+/// is no longer consulted at runtime).
 const fn default_prefer_large_asr_model() -> bool {
     false
 }
@@ -264,7 +263,26 @@ pub struct Settings {
     pub theme: Theme,
 
     /// Root directory for meeting data.  `None` means "use the platform
-    /// default app-data directory" (resolved by `app-main`).
+    /// default app-data directory".
+    ///
+    /// When `Some(path)`, `app-main` derives `meetings/`, `models/`, and
+    /// `index.db` from this path rather than from the platform default.
+    /// The value must be an absolute path; a relative or uncreatable path is
+    /// logged and ignored (falls back to the platform default — startup is
+    /// never aborted).
+    ///
+    /// **Invariants (bootstrap constraints):**
+    /// - `settings.store` always lives at the platform default root — it is
+    ///   how this override is found in the first place.
+    /// - Logs always live at the platform default root — logging starts before
+    ///   settings load.
+    ///
+    /// **Restart required.** Data roots are resolved once at startup.  Moving
+    /// existing data after setting this field is the user's responsibility;
+    /// the app does not migrate data automatically.
+    ///
+    /// **No UI.** The settings pane does not currently render this field; it
+    /// must be set by editing `settings.store` directly and restarting.
     ///
     /// `specta` lacks a built-in `Type` impl for `PathBuf`; the explicit
     /// `#[specta(type = Option<String>)]` hint preserves the same wire
@@ -370,12 +388,11 @@ pub struct Settings {
     #[serde(default = "default_transcription_language")]
     pub transcription_language: String,
 
-    /// Opt into the larger Qwen3-ASR-1.7B tier for the Qwen branch (broader +
-    /// better-multilingual accuracy) instead of the 0.6B CPU default. Only
-    /// affects languages that route to Qwen (the Parakeet branch ignores it);
-    /// see `common::asr_engine_for_language`. Off by default — it is a larger
-    /// download with a GPU-class footprint. An older store deserialises to
-    /// `false`. See `architecture/cross-cutting.md` — "ASR engine routing".
+    /// Retained for serde/wire compatibility; the value is no longer consulted.
+    /// The large ASR tier is requested automatically and the VRAM clamp in
+    /// `common::resolve_gpu_plan` decides whether it fits. An older store written
+    /// before this field existed deserialises to `false`.
+    /// See `architecture/cross-cutting.md` — "ASR engine routing".
     #[serde(default = "default_prefer_large_asr_model")]
     pub prefer_large_asr_model: bool,
 

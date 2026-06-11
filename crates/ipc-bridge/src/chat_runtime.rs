@@ -54,7 +54,7 @@ impl ChatHandles {
                 let plan = minutist_common::resolve_gpu_plan(
                     minutist_common::probe_primary_gpu().as_ref(),
                     settings.gpu_acceleration,
-                    settings.prefer_large_asr_model,
+                    true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
                 );
                 let n_gpu_layers = commands::resolve_summariser_gpu_layers(plan.summariser_gpu);
                 let summariser = tokio::task::spawn_blocking(move || {

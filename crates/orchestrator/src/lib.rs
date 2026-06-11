@@ -218,17 +218,19 @@ impl Orchestrator {
     /// VRAM-aware GPU plan for an ASR/model load, from the current settings.
     ///
     /// Computes ONE [`minutist_common::GpuPlan`] from the live VRAM probe +
-    /// the user's `gpu_acceleration` mode + `prefer_large_asr_model`. Call it
-    /// once per model-load decision and read `plan.asr_gpu` /
+    /// the user's `gpu_acceleration` mode. The large ASR tier is requested
+    /// unconditionally — [`minutist_common::resolve_gpu_plan`] applies the VRAM
+    /// clamp and downgrades to the small tier when the large one would not fit.
+    /// Call it once per model-load decision and read `plan.asr_gpu` /
     /// `plan.effective_prefer_large`; probing twice in one decision would risk
     /// the two reads disagreeing. See `architecture/cross-cutting.md` — "GPU
-    /// portability".
+    /// portability" and "ASR engine routing".
     fn gpu_plan(&self) -> minutist_common::GpuPlan {
         let s = self.settings.current();
         minutist_common::resolve_gpu_plan(
             minutist_common::probe_primary_gpu().as_ref(),
             s.gpu_acceleration,
-            s.prefer_large_asr_model,
+            true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
         )
     }
 

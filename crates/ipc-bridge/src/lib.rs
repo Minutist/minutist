@@ -261,7 +261,7 @@ impl IpcState {
         let plan = minutist_common::resolve_gpu_plan(
             probe.as_ref(),
             s.gpu_acceleration,
-            s.prefer_large_asr_model,
+            true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
         );
         match &probe {
             Some(p) => tracing::info!(

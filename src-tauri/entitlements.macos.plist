@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Minutist on macOS.
+
+  Microphone access: the AVFoundation audio capture stack requires
+  NSMicrophoneUsageDescription (Info.plist) to prompt the user; the
+  hardened runtime also requires the com.apple.security.device.audio-input
+  entitlement or the capture API returns a "no hardware" error.
+
+  JIT / unsigned executable memory: llama.cpp allocates executable memory
+  pages for its compute kernels. Without the allow-jit entitlement the
+  hardened runtime kills the process with SIGKILL on macOS 10.15+.
+-->
+<plist version="1.0">
+<dict>
+  <!-- Hardened runtime: allow JIT (llama.cpp compute kernels). -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- Hardened runtime: allow unsigned executable memory (llama.cpp GGML). -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+
+  <!-- Microphone capture (cpal + AVFoundation). -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>

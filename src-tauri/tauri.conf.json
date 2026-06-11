@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Minutist",
-  "version": "0.0.0",
+  "version": null,
   "identifier": "ai.minutist",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -79,7 +79,9 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": [],
+      "endpoints": [
+        "https://github.com/Minutist/minutist/releases/latest/download/latest.json"
+      ],
       "pubkey": ""
     }
   }

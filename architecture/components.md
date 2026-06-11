@@ -1841,6 +1841,22 @@ constructs `IpcState` with it plus the lazily-initialised held-model cell
 load the GGUF at startup. This adds the `agent-tools` (the registry is built here)
 + `chat-agent` (transitively via `ipc-bridge`) dependency rows above.
 
+**`settings.data_directory` path resolution.** After loading settings,
+`app-main` calls the pure `resolve_data_roots(platform_root,
+settings.data_directory)` helper (unit-tested, in `src-tauri/src/main.rs`) to
+derive three path roots: `meetings/`, `models/`, and the `index.db` parent.
+When `data_directory` is `None`, all three are under `app_data_dir` (the
+platform default — unchanged behaviour). When it is `Some(path)`, the three
+roots are placed under `path` instead, which must be an absolute path that can
+be created; a relative or uncreatable path falls back to the platform default
+with a `tracing::error` and never aborts startup. Two roots are excluded from
+the override by bootstrap constraints: `settings.store` (the file that carries
+the override) and `logs/` (logging starts before settings load); both always
+sit at the platform default root. Data roots are fixed for the lifetime of the
+process — changing the setting requires a restart, and existing data is not
+migrated automatically. There is currently no UI for this field; it must be set
+by editing `settings.store` directly.
+
 **Phase 10 wiring (MCP).** Gated on `settings.mcp_enabled` (off by default), from
 `setup()`: `app-main` spawns `ipc_bridge::spawn_inter_agent_driver` (owns the
 inter-agent receiver + the internal `v1(false)` chat turn) to get the bridge

@@ -339,6 +339,155 @@ fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> 
     Ok(())
 }
 
+/// The set of path roots derived from the platform app-data directory and an
+/// optional user-configured override, passed to the components that own each
+/// directory scope.
+///
+/// `meetings` and `models` may diverge from `index_db` when
+/// `settings.data_directory` is set.
+struct DataRoots {
+    /// Root for per-meeting folders (`{root}/meetings/`).  Owned by
+    /// `persistence`.
+    meetings: PathBuf,
+    /// Root for per-kind model cache (`{root}/models/`).  Owned by
+    /// `model-registry`.
+    models: PathBuf,
+    /// Parent directory for `index.db`.  Must be the same directory that
+    /// `ipc-bridge` opens the DB against.
+    index_db: PathBuf,
+}
+
+/// Derive `DataRoots` from the platform app-data directory and an optional
+/// user-configured data directory override from settings.
+///
+/// When `data_dir_override` is `None`, all roots are placed under
+/// `platform_root`.  When it is `Some(path)`, `meetings`, `models`, and
+/// `index_db` are placed under `path` instead; the override must be an
+/// absolute path that can be created if absent.  An invalid value (relative,
+/// empty, or uncreatable) falls back to `platform_root` with a logged error.
+///
+/// `settings.store` always stays at the platform root regardless of the
+/// override — it is how the override itself is found.  Logs stay at the
+/// platform root for the same reason (logging starts before settings load).
+/// Both invariants are documented in the `Settings::data_directory` field
+/// doc comment.
+///
+/// The paths are fixed at startup; a change requires an app restart.
+fn resolve_data_roots(
+    platform_root: &std::path::Path,
+    data_dir_override: Option<&std::path::Path>,
+) -> DataRoots {
+    let effective = match data_dir_override {
+        None => platform_root.to_path_buf(),
+        Some(p) => {
+            if !p.is_absolute() {
+                tracing::error!(
+                    target: "app-main",
+                    path = %p.display(),
+                    "settings.data_directory is not absolute; falling back to platform default"
+                );
+                platform_root.to_path_buf()
+            } else if p.as_os_str().is_empty() {
+                tracing::error!(
+                    target: "app-main",
+                    "settings.data_directory is empty; falling back to platform default"
+                );
+                platform_root.to_path_buf()
+            } else {
+                match std::fs::create_dir_all(p) {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: "app-main",
+                            path = %p.display(),
+                            "using settings.data_directory as data root"
+                        );
+                        p.to_path_buf()
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "app-main",
+                            path = %p.display(),
+                            "failed to create settings.data_directory ({e}); \
+                             falling back to platform default"
+                        );
+                        platform_root.to_path_buf()
+                    }
+                }
+            }
+        }
+    };
+
+    DataRoots {
+        meetings: effective.join("meetings"),
+        models: effective.join("models"),
+        index_db: effective.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn no_override_uses_platform_root() {
+        let platform = p("/data/app");
+        let roots = resolve_data_roots(&platform, None);
+        assert_eq!(roots.meetings, p("/data/app/meetings"));
+        assert_eq!(roots.models, p("/data/app/models"));
+        assert_eq!(roots.index_db, p("/data/app"));
+    }
+
+    #[test]
+    fn relative_override_falls_back() {
+        let platform = p("/data/app");
+        let roots = resolve_data_roots(&platform, Some(&p("relative/path")));
+        assert_eq!(roots.meetings, p("/data/app/meetings"));
+        assert_eq!(roots.models, p("/data/app/models"));
+        assert_eq!(roots.index_db, p("/data/app"));
+    }
+
+    #[test]
+    fn empty_override_falls_back() {
+        let platform = p("/data/app");
+        let roots = resolve_data_roots(&platform, Some(&p("")));
+        assert_eq!(roots.meetings, p("/data/app/meetings"));
+        assert_eq!(roots.models, p("/data/app/models"));
+        assert_eq!(roots.index_db, p("/data/app"));
+    }
+
+    #[test]
+    fn valid_absolute_override_is_used() {
+        let tmp = std::env::temp_dir().join("minutist_test_override");
+        // Pre-create so create_dir_all succeeds.
+        std::fs::create_dir_all(&tmp).unwrap();
+        let platform = p("/data/app");
+        let roots = resolve_data_roots(&platform, Some(&tmp));
+        assert_eq!(roots.meetings, tmp.join("meetings"));
+        assert_eq!(roots.models, tmp.join("models"));
+        assert_eq!(roots.index_db, tmp);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn uncreatable_override_falls_back() {
+        // A path beneath a non-existent parent that is impossible to create.
+        let bad: PathBuf = if cfg!(unix) {
+            p("/proc/this_cannot_be_created_minutist_test/sub")
+        } else {
+            p("C:\\this_cannot_exist_minutist_test\\sub")
+        };
+        let platform = p("/data/app");
+        let roots = resolve_data_roots(&platform, Some(&bad));
+        // Falls back to platform root.
+        assert_eq!(roots.meetings, p("/data/app/meetings"));
+    }
+}
+
 /// The Tauri runtime entry point.
 ///
 /// Accepts the non-blocking writer guard so it stays alive for the process
@@ -380,7 +529,6 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // "Filesystem layout"). `meetings/` is owned by `persistence`, which
             // creates it on demand via `MeetingFolder::create`; app-main MUST NOT
             // pre-create it here.
-            let meetings_dir = app_data_dir.join("meetings");
             let logs_dir = app_data_dir.join("logs");
             std::fs::create_dir_all(&logs_dir).expect("failed to create logs dir");
 
@@ -403,11 +551,36 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             cleanup_old_logs(&logs_dir, 7);
 
             // Construct settings handle backed by the JSON file store.
+            // `settings.store` always lives at the platform root so the override
+            // path itself can be stored in settings (see `DataRoots` /
+            // `resolve_data_roots`).
             let settings_store = JsonFileStore::new(app_data_dir.join("settings.store"));
             let settings_handle =
                 SettingsHandle::new(settings_store).expect("failed to initialise settings");
 
             tracing::info!(target: "app-main", "settings handle constructed");
+
+            // Resolve the effective data roots for meetings, models, and the
+            // index DB.  When `settings.data_directory` is set to a valid
+            // absolute path, those roots are placed there rather than under
+            // `app_data_dir`.  Logs and `settings.store` always stay at the
+            // platform root (bootstrap constraint — see `resolve_data_roots`).
+            let data_roots = {
+                let current = settings_handle.current();
+                resolve_data_roots(
+                    &app_data_dir,
+                    current.data_directory.as_deref(),
+                )
+            };
+
+            let meetings_dir = data_roots.meetings;
+
+            tracing::info!(
+                target: "app-main",
+                meetings = %meetings_dir.display(),
+                models = %data_roots.models.display(),
+                "data roots resolved"
+            );
 
             // Single event bus shared by the model registry and the
             // orchestrator. The IPC forwarder subscribes once (via
@@ -429,7 +602,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // Construct the model registry. The manifest is bundled at compile
             // time from resources/models.json; the cache root is the per-kind
             // model directory under app-data (model-registry owns this dir).
-            let models_root = app_data_dir.join("models");
+            let models_root = data_roots.models;
             let manifest =
                 model_registry::load_manifest(include_bytes!("../../resources/models.json"))
                     .expect("bundled resources/models.json is malformed");
@@ -464,7 +637,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // from the per-meeting folders on startup so it converges even if a
             // prior run crashed between a folder write and the index update.
             let (index_db_path, index) =
-                ipc_bridge::open_meeting_index(&app_data_dir, &notes_meetings_dir);
+                ipc_bridge::open_meeting_index(&data_roots.index_db, &notes_meetings_dir);
 
             tracing::info!(target: "app-main", "meeting index opened");
 

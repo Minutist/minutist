@@ -714,16 +714,35 @@ revision 2025-11-25). Binding controls:
   DNS-rebinding) and the `Origin` allowlist (set to the loopback origins → 403 on
   a cross-origin browser request). Cautionary precedent: CVE-2025-49596 (MCP
   Inspector RCE) was a localhost MCP service with no auth + browser-reachable —
-  exactly what bearer + Host/Origin + loopback prevent. The token is stored at
+  exactly what bearer + Host/Origin + loopback prevent.
+
+  **Token storage and file permissions.** The token is stored at
   `{app-data}/mcp_token`, CREATED with mode `0600` atomically on Unix
-  (`OpenOptions().mode(0o600)` — no write-then-chmod window); on Windows it
-  inherits the per-user app-data directory's ACL (no extra file-ACL tightening in
-  v1, so the owner-only guarantee is Unix-scoped). OS-keychain hardening is a
-  documented follow-up. Rotating the token is restart-required for v1 (delete the
-  file → restart regenerates it); there is no live regenerate command, consistent
-  with the rest of the MCP lifecycle (enable / port / write-tools are also
-  restart-required). The token is never logged and never on the event bus — it is
-  revealed only via the `get_mcp_server_info` command on explicit user request.
+  (`OpenOptions().mode(0o600)` — no write-then-chmod window); the mode is
+  re-asserted after open to cover any pre-existing file. On Windows the file
+  inherits the per-user app-data directory's ACL. `app-main` does NOT
+  additionally tighten the file ACL on Windows: the correct API is
+  `SetNamedSecurityInfoW` (advapi32) with a DACL granting only the process
+  owner's SID, reachable via `windows-sys >= 0.59`
+  (`Win32_Security` + `Win32_Security_Authorization` features); but
+  `windows-sys` is not a direct dep of `src-tauri` (it is only transitive
+  through Tauri), so calling it requires adding a
+  `[target.'cfg(windows)'.dependencies]` entry — deferred to a dedicated
+  Windows-platform hardening commit. Until then the owner-only guarantee is
+  Unix-scoped; the Windows per-user app-data directory is the operative
+  control. OS-keychain migration (`keyring` crate) is a separate documented
+  follow-up.
+
+  **Token lifetime and the connected-relay path.** The token is stable across
+  restarts: `app-main` reads the existing file on start and reuses it so that
+  a saved external MCP-client config stays valid. To rotate the token, delete
+  the file and restart the app; the next start generates and persists a fresh
+  256-bit token. In the paid connected tier the token doubles as the
+  relay↔app shared secret (the hosted proxy authenticates the in-app endpoint
+  with the same bearer); rotation therefore also invalidates any active relay
+  session. The token is never logged and never on the event bus — it is
+  revealed only via the `get_mcp_server_info` command on explicit user
+  request.
 
 - **The destructive-write exposure policy (a binding control).** The `Tool`
   trait's `expose_over_mcp()` (default `!is_write()`) is the server-side gate.

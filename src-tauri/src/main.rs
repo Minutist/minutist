@@ -264,21 +264,19 @@ fn resolve_silero_model(app: &tauri::AppHandle) {
     );
 }
 
-/// Resolve the MCP bearer token (Phase 10 §4.2): read the persisted token, or
-/// generate + persist a fresh 256-bit CSPRNG one on first enable.
+/// Resolve the MCP bearer token: read the persisted token, or generate + persist
+/// a fresh 256-bit CSPRNG one on first enable.
 ///
-/// **Storage.** v1 stores the token in `{app-data}/mcp_token`. On Unix the file
-/// is CREATED with mode `0o600` atomically (`OpenOptions().mode(0o600)`), so
-/// there is no write-then-chmod window in which the token is world-readable
-/// (S3). On Windows the file inherits the app-data directory's ACL — the
-/// app-data dir is a per-user location, but this code does NOT additionally
-/// tighten the file ACL, so the owner-only guarantee holds only on Unix; the
-/// Windows wording is scoped accordingly. A documented follow-up hardens this to
-/// the OS keychain (e.g. the `keyring` crate); Tauri 2 ships no built-in
-/// keychain API, and pulling a cross-platform keychain dependency (with its own
-/// platform build concerns) is deferred so it can be reviewed on its own. The
-/// token is high-entropy regardless of the at-rest store, and the loopback bind
-/// + Host/Origin checks are the primary controls. The token is NEVER logged.
+/// **Storage.** The token is stored at `{app-data}/mcp_token`. On Unix the file
+/// is CREATED with mode `0o600` atomically (no write-then-chmod window). On
+/// Windows the file inherits the per-user app-data directory's ACL. The correct
+/// API to additionally tighten the Windows file ACL to owner-only is
+/// `SetNamedSecurityInfoW` (advapi32), reachable via `windows-sys >= 0.59`
+/// (`Win32_Security` + `Win32_Security_Authorization` features). That dep is
+/// not yet declared as a direct `[target.'cfg(windows)'.dependencies]` entry in
+/// `src-tauri/Cargo.toml`; adding it is deferred to a dedicated Windows-platform
+/// hardening commit. The loopback bind + bearer + Host/Origin checks are the
+/// primary controls regardless. The token is NEVER logged.
 #[cfg(feature = "connected")]
 fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
     let token_path = app_data_dir.join("mcp_token");
@@ -311,8 +309,9 @@ fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
 }
 
 /// Write the token to `path`, creating the file with owner-only mode `0o600`
-/// atomically on Unix (no write-then-chmod window — S3). On Windows the file
-/// inherits the parent directory's ACL (no extra tightening in v1).
+/// atomically on Unix (no write-then-chmod window). On Windows the file
+/// inherits the parent directory's ACL; per-file ACL tightening via
+/// `SetNamedSecurityInfoW` is not yet implemented (see `resolve_mcp_token`).
 #[cfg(feature = "connected")]
 fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;

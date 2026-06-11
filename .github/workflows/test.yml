@@ -84,7 +84,7 @@ jobs:
         shell: pwsh
         run: |
           vcpkg install opus:x64-windows-static
-          $libDir = "C:\vcpkg\installed\x64-windows-static\lib"
+          $libDir = "C:\vcpkg\installed\x64-windows-static"
           "LIBOPUS_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -228,9 +228,13 @@ jobs:
       # Vulkan loader/headers + shaderc (provides glslc) for the `vulkan`
       # cargo check on Linux. glslang-tools alone does not provide glslc;
       # llama.cpp's CMake uses FindVulkan which requires glslc specifically.
+      # shaderc is in the universe repo; enable it explicitly so the step
+      # works regardless of whether the runner image pre-enables universe.
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo add-apt-repository universe -y
+          sudo apt-get update -qq
           sudo apt-get install -y libvulkan-dev glslang-tools shaderc
 
       # audiopus_sys v0.2.2's bundled opus CMake tree requires
@@ -246,7 +250,7 @@ jobs:
         shell: pwsh
         run: |
           vcpkg install opus:x64-windows-static
-          $libDir = "C:\vcpkg\installed\x64-windows-static\lib"
+          $libDir = "C:\vcpkg\installed\x64-windows-static"
           "LIBOPUS_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
 

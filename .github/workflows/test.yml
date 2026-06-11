@@ -91,8 +91,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # sherpa-rs and ort download prebuilt shared libraries into ~/.cache on
+      # Linux at build time (the download-binaries feature). These directories
+      # are NOT part of the cargo target tree, so Swatinem/rust-cache does not
+      # capture them by default. When the cargo cache hits and restores compiled
+      # artifacts whose link-search paths point at ~/.cache/sherpa-rs/... and
+      # ~/.cache/ort.pyke.io/..., the linker fails if those directories are
+      # absent. Including them in cache-directories ties their lifetime to the
+      # cargo cache key so they are always present when the build artifacts are.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/.cache/ort.pyke.io
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -225,17 +237,18 @@ jobs:
             libasound2-dev \
             libopus-dev
 
-      # Vulkan loader/headers + shaderc (provides glslc) for the `vulkan`
-      # cargo check on Linux. glslang-tools alone does not provide glslc;
-      # llama.cpp's CMake uses FindVulkan which requires glslc specifically.
-      # shaderc is in the universe repo; enable it explicitly so the step
-      # works regardless of whether the runner image pre-enables universe.
+      # Vulkan loader/headers + glslc for the `vulkan` cargo check on Linux.
+      # glslang-tools alone does not provide glslc; llama.cpp's CMake uses
+      # FindVulkan which requires glslc specifically. On Ubuntu 24.04 the
+      # binary package is "glslc" (from source package shaderc), which lives
+      # in the universe repo — enabled explicitly so the install works
+      # regardless of whether the runner image pre-enables universe.
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo add-apt-repository universe -y
           sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools shaderc
+          sudo apt-get install -y libvulkan-dev glslang-tools glslc
 
       # audiopus_sys v0.2.2's bundled opus CMake tree requires
       # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.
@@ -257,8 +270,17 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # sherpa-rs and ort download prebuilt shared libraries at build time into
+      # platform-specific cache dirs outside the cargo target tree. See the
+      # same note in the test job's rust-cache step for the full explanation.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/sherpa-rs
+            ~/Library/Caches/ort.pyke.io
 
       - name: Set LIBCLANG_PATH (Linux)
         if: runner.os == 'Linux'

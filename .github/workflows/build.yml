@@ -61,11 +61,12 @@ jobs:
             libasound2-dev \
             libopus-dev
 
-      # Vulkan loader/headers + shaderc (provides glslc) for the `vulkan`
-      # feature on Linux. glslang-tools alone does not provide glslc, and
-      # llama.cpp's CMake uses FindVulkan which requires glslc specifically.
-      # shaderc is in the universe repo; enable it explicitly so the step
-      # works regardless of whether the runner image pre-enables universe.
+      # Vulkan loader/headers + glslc for the `vulkan` feature on Linux.
+      # glslang-tools alone does not provide glslc; llama.cpp's CMake uses
+      # FindVulkan which requires glslc specifically. On Ubuntu 24.04 the
+      # binary package is "glslc" (from source package shaderc), which lives
+      # in the universe repo — enabled explicitly so the install works
+      # regardless of whether the runner image pre-enables universe.
       # macOS uses Metal (built into the OS). Windows runners ship the Vulkan
       # loader; the full SDK (with glslc) is installed below via the LunarG
       # installer so llama.cpp CMake can find it.
@@ -74,19 +75,49 @@ jobs:
         run: |
           sudo add-apt-repository universe -y
           sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools shaderc
+          sudo apt-get install -y libvulkan-dev glslang-tools glslc
 
-      # Install the LunarG Vulkan SDK on Windows so llama.cpp CMake can
-      # find glslc (required by FindVulkan.cmake). The runner ships the Vulkan
-      # loader but not the full SDK tools. shaderc provides glslc; Glslang
-      # alone provides glslangValidator but NOT glslc.
-      - name: Install Vulkan SDK (Windows)
+      # Install the LunarG Vulkan SDK on Windows so llama.cpp CMake can find
+      # glslc (required by FindVulkan.cmake). humbletim/setup-vulkan-sdk builds
+      # components from source; its CMakeLists.txt does not recognise "shaderc"
+      # as a buildable component (available: Vulkan-Headers, Vulkan-Loader,
+      # SPIRV-Tools, Glslang — glslc is NOT included). The LunarG prebuilt
+      # installer ships the complete SDK including glslc.exe at %VULKAN_SDK%\Bin\.
+      # Pinned to 1.4.321.0 (released 2025-03; stable, pre-dates 1.4.350.0).
+      # The installer is cached by actions/cache keyed on the pinned version so
+      # re-runs do not re-download the ~250 MB exe.
+      - name: Cache Vulkan SDK installer (Windows)
         if: runner.os == 'Windows'
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        id: vulkan-cache
+        uses: actions/cache@v4
         with:
-          vulkan-query-version: latest
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, SPIRV-Tools, Glslang, shaderc
-          vulkan-use-cache: true
+          path: C:\VulkanSDK
+          key: windows-vulkan-sdk-1.4.321.0
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && steps.vulkan-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = "1.4.321.0"
+          $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+          $installer = "$env:TEMP\VulkanSDK-Installer.exe"
+          Write-Host "Downloading LunarG Vulkan SDK $version..."
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Write-Host "Installing (silent)..."
+          Start-Process -FilePath $installer -ArgumentList "/S" -Wait
+          if (-not (Test-Path "C:\VulkanSDK\$version\Bin\glslc.exe")) {
+            Write-Error "glslc.exe not found after install; aborting"
+            exit 1
+          }
+
+      - name: Set VULKAN_SDK env (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "1.4.321.0"
+          $sdk = "C:\VulkanSDK\$version"
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       # audiopus_sys v0.2.2's bundled opus CMake tree requires
       # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.
@@ -107,8 +138,22 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # sherpa-rs and ort download prebuilt shared libraries at build time into
+      # platform-specific cache dirs (Linux: ~/.cache/sherpa-rs,
+      # ~/.cache/ort.pyke.io; macOS: ~/Library/Caches equivalents). These are
+      # NOT inside the cargo target tree and are not captured by the default
+      # Swatinem/rust-cache scope. When a cargo cache hit restores compiled
+      # artifacts whose link-search paths reference those dirs, the linker fails
+      # if the .so/.dylib files are absent. Including them ties their lifetime to
+      # the cargo cache key. Non-existent paths are silently skipped by the action.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/sherpa-rs
+            ~/Library/Caches/ort.pyke.io
 
       # GPU feature-graph guard for the backends NOT bundled on this leg
       # (cuda/rocm everywhere; directml on Windows — sherpa's DirectML backend).
@@ -164,31 +209,43 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      # Conditionally export signing env vars: tauri (not tauri-action) reads
+      # these from the process environment and treats any non-empty value as
+      # "signing requested". GitHub Actions always exports env: variables, even
+      # as empty strings, and Rust's std::env::var returns Some("") for an
+      # empty-string env var — which is truthy in a let-Some binding. Setting
+      # the variables only when the secret is actually populated means tauri
+      # sees them absent (rather than present-but-empty) when secrets are unset,
+      # so the build completes unsigned instead of attempting a keychain import
+      # with an empty certificate. The same guard covers Windows Authenticode
+      # and the updater private key.
+      - name: Prepare signing env
+        shell: bash
+        run: |
+          set_if_nonempty() {
+            local name="$1" val="$2"
+            if [ -n "$val" ]; then
+              printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
+            fi
+          }
+          set_if_nonempty TAURI_SIGNING_PRIVATE_KEY        "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
+          set_if_nonempty TAURI_SIGNING_PRIVATE_KEY_PASSWORD "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
+          set_if_nonempty WINDOWS_CERTIFICATE               "${{ secrets.WINDOWS_CERTIFICATE }}"
+          set_if_nonempty WINDOWS_CERTIFICATE_PASSWORD      "${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}"
+          set_if_nonempty APPLE_CERTIFICATE                 "${{ secrets.APPLE_CERTIFICATE }}"
+          set_if_nonempty APPLE_CERTIFICATE_PASSWORD        "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}"
+          set_if_nonempty APPLE_SIGNING_IDENTITY            "${{ secrets.APPLE_SIGNING_IDENTITY }}"
+          set_if_nonempty APPLE_ID                          "${{ secrets.APPLE_ID }}"
+          set_if_nonempty APPLE_PASSWORD                    "${{ secrets.APPLE_PASSWORD }}"
+          set_if_nonempty APPLE_TEAM_ID                     "${{ secrets.APPLE_TEAM_ID }}"
+
       # tauri-action runs the configured beforeBuildCommand (npm run build) and
       # bundles the app. `--features <gpu>` selects the single per-platform GPU
-      # backend. Signing happens only when the corresponding env is populated:
-      #   - Updater signing:    TAURI_SIGNING_PRIVATE_KEY (+ password)
-      #   - Windows code sign:  WINDOWS_CERTIFICATE (+ password)
-      #   - macOS notarization: APPLE_* family
-      # When a secret is unset GitHub injects an empty string, which tauri-action
-      # treats as "not configured" and skips that signing step — so the build
-      # still succeeds unsigned. Empty secrets are normal on this workflow.
+      # backend. Signing vars are set in the "Prepare signing env" step above
+      # only when the corresponding secrets are populated, so the build completes
+      # unsigned (and logs "unsigned bundle") when secrets are absent.
       - name: Build release bundle
         uses: tauri-apps/tauri-action@v0
-        env:
-          # Updater signing (tauri-plugin-updater). Empty => unsigned bundle.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Windows Authenticode (base64 PFX + password). Empty => unsigned .exe/.msi.
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          # Apple notarization. Empty => unsigned, un-notarized .app/.dmg.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: src-tauri
           args: --features ${{ matrix.features }}
@@ -251,13 +308,17 @@ jobs:
         run: |
           sudo add-apt-repository universe -y
           sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools shaderc
+          sudo apt-get install -y libvulkan-dev glslang-tools glslc
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/.cache/ort.pyke.io
 
       - name: Set LIBCLANG_PATH (Linux)
         run: |

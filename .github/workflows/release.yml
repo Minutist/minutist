@@ -67,7 +67,9 @@ jobs:
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get install -y libvulkan-dev glslang-tools
+          sudo add-apt-repository universe -y
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan-dev glslang-tools glslc
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -106,24 +108,44 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      # Conditionally export signing env vars. tauri reads these from the
+      # process environment; any non-empty value triggers the signing path.
+      # GitHub Actions always exports env: variables even as empty strings, and
+      # std::env::var returns Some("") which is truthy in a let-Some binding.
+      # This step sets variables only when the secret is actually populated,
+      # so an absent secret leaves the env var unset rather than empty.
+      # For release builds the signing secrets are expected to be present, but
+      # the guard prevents an accidental "empty secret configured" from breaking
+      # the build rather than silently producing an unsigned artefact.
+      - name: Prepare signing env
+        shell: bash
+        run: |
+          set_if_nonempty() {
+            local name="$1" val="$2"
+            if [ -n "$val" ]; then
+              printf '%s=%s\n' "$name" "$val" >> "$GITHUB_ENV"
+            fi
+          }
+          set_if_nonempty TAURI_SIGNING_PRIVATE_KEY        "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}"
+          set_if_nonempty TAURI_SIGNING_PRIVATE_KEY_PASSWORD "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
+          set_if_nonempty WINDOWS_CERTIFICATE               "${{ secrets.WINDOWS_CERTIFICATE }}"
+          set_if_nonempty WINDOWS_CERTIFICATE_PASSWORD      "${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}"
+          set_if_nonempty APPLE_CERTIFICATE                 "${{ secrets.APPLE_CERTIFICATE }}"
+          set_if_nonempty APPLE_CERTIFICATE_PASSWORD        "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}"
+          set_if_nonempty APPLE_SIGNING_IDENTITY            "${{ secrets.APPLE_SIGNING_IDENTITY }}"
+          set_if_nonempty APPLE_ID                          "${{ secrets.APPLE_ID }}"
+          set_if_nonempty APPLE_PASSWORD                    "${{ secrets.APPLE_PASSWORD }}"
+          set_if_nonempty APPLE_TEAM_ID                     "${{ secrets.APPLE_TEAM_ID }}"
+
       # Build + sign + bundle, then create/attach to the GitHub Release named
       # after the pushed tag. includeUpdaterJson:true emits latest.json so
-      # tauri-plugin-updater clients can pull this release. Signing env mirrors
-      # build.yml; for releases these secrets are expected to be populated.
+      # tauri-plugin-updater clients can pull this release. Signing vars are
+      # set in the "Prepare signing env" step above only when the corresponding
+      # secrets are populated.
       - name: Build, sign, and publish release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: src-tauri
           args: --features ${{ matrix.features }}

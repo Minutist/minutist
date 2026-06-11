@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use meeting_app_common::AppEvent;
+use minutist_common::AppEvent;
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use settings::SettingsHandle;
@@ -51,8 +51,8 @@ impl ChatHandles {
                 // VRAM-aware plan: the summariser's GPU decision is `plan.summariser_gpu`
                 // (the summariser is budgeted FIRST). See `architecture/cross-cutting.md`
                 // — "GPU portability".
-                let plan = meeting_app_common::resolve_gpu_plan(
-                    meeting_app_common::probe_primary_gpu().as_ref(),
+                let plan = minutist_common::resolve_gpu_plan(
+                    minutist_common::probe_primary_gpu().as_ref(),
                     settings.gpu_acceleration,
                     settings.prefer_large_asr_model,
                 );
@@ -61,14 +61,14 @@ impl ChatHandles {
                     commands::open_summariser_in_dir(&model_dir, n_gpu_layers)
                 })
                 .await
-                .map_err(|e| meeting_app_common::AppError::Internal {
+                .map_err(|e| minutist_common::AppError::Internal {
                     context: format!("summariser load task join failed: {e}"),
                 })??;
                 tracing::info!(
                     target: "ipc-bridge",
                     "held LLM summariser loaded (shared by summarise + chat + inter-agent)"
                 );
-                Ok::<_, meeting_app_common::AppError>(Arc::new(summariser))
+                Ok::<_, minutist_common::AppError>(Arc::new(summariser))
             })
             .await
             .map_err(IpcError::from)?;
@@ -94,7 +94,7 @@ impl ChatHandles {
         let model_id = commands::resolve_llm_model_id(&self.settings.current());
         let available = self.orchestrator.list_models().into_iter().any(|m| {
             m.id == model_id
-                && matches!(m.status, meeting_app_common::ModelStatusState::Available { .. })
+                && matches!(m.status, minutist_common::ModelStatusState::Available { .. })
         });
         if !available {
             tracing::info!(

@@ -1,4 +1,4 @@
-//! `meeting-app` library entry point.
+//! `minutist` library entry point.
 //!
 //! Tauri convention: the app logic lives in a `lib` crate so it can be
 //! linked into mobile targets (iOS = cdylib, Android = cdylib) as well as

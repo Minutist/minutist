@@ -1,5 +1,5 @@
 //! `asr-parakeet` — NVIDIA Parakeet TDT 0.6B v3 via sherpa-onnx, implementing
-//! [`meeting_app_common::AsrBackend`] with per-word timestamps.
+//! [`minutist_common::AsrBackend`] with per-word timestamps.
 //!
 //! The sibling of `asr-runtime`: that crate is the llama-cpp-2 / Qwen domain;
 //! this is the sherpa-onnx / Parakeet domain. Both are interchangeable behind
@@ -21,7 +21,7 @@ use std::ffi::{CStr, CString};
 use std::mem;
 use std::path::PathBuf;
 
-use meeting_app_common::{AppError, AppResult, AudioChunk, Segment, WordTimestamp};
+use minutist_common::{AppError, AppResult, AudioChunk, Segment, WordTimestamp};
 use sherpa_rs::sherpa_rs_sys as sys;
 
 /// Sample rate Parakeet (and our pipeline) operates at; sherpa does not resample.
@@ -192,7 +192,7 @@ impl Drop for ParakeetBackend {
     }
 }
 
-impl meeting_app_common::AsrBackend for ParakeetBackend {
+impl minutist_common::AsrBackend for ParakeetBackend {
     fn transcribe_chunk(&mut self, chunk: &AudioChunk) -> AppResult<Vec<Segment>> {
         if chunk.sample_rate != SAMPLE_RATE {
             return Err(AppError::InvalidInput {

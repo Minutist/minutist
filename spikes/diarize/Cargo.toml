@@ -16,7 +16,7 @@ hound = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-meeting-app-common = { path = "../../crates/common" }
+minutist-common = { path = "../../crates/common" }
 
 # Pin sherpa-rs exactly. This is the Thewh1teagle binding called out in
 # Phase 0 Spike 4 — see README for the maturity verdict.

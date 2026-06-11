@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 /// 300-word paragraph. Hand-typed meeting note context; the model is meant
 /// to treat this as the user's running notes for the meeting.
 const FIXTURE_PARAGRAPH: &str = "\
-Internal sync covering the Q3 backlog re-prioritisation for the meeting-app \
+Internal sync covering the Q3 backlog re-prioritisation for the minutist \
 project. Andrew opened by reframing the goal: the team is shipping a \
 local-first desktop notes app that pairs hand-typed notes with a Whisper-style \
 transcript, and the v1 release must run end-to-end on a single laptop without \
@@ -74,7 +74,7 @@ last Friday. Next sync is the regular Thursday slot.";
 /// Five-segment fake transcript, JSON-array literal. Each segment carries
 /// `start_ms`, `end_ms`, a `speaker` label, and the `text`. This mirrors
 /// the production `Segment` shape closely enough for the spike — the real
-/// summariser in Phase 5 will receive `meeting_app_common::Segment` values
+/// summariser in Phase 5 will receive `minutist_common::Segment` values
 /// serialised with `serde_json`, not this exact shape.
 const FIXTURE_TRANSCRIPT_JSON: &str = r#"[
   {"start_ms":     0, "end_ms":  6800, "speaker": "Andrew",

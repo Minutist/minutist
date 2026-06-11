@@ -8,7 +8,7 @@
 //!    is dropped, and `persistence::read_meeting_state` (the `open_meeting`
 //!    backing) returns a `MeetingState` matching what was written.
 //! 2. **`re_transcribe` over the LibriSpeech fixture** (GATED on
-//!    `MEETING_APP_ASR_MODEL_PATH` + `MEETING_APP_ASR_MMPROJ_PATH`). Records a
+//!    `MINUTIST_ASR_MODEL_PATH` + `MINUTIST_ASR_MMPROJ_PATH`). Records a
 //!    real-speech meeting through the live pipeline so `audio.opus` exists, then
 //!    re-runs transcription offline and asserts `transcript.json` is rewritten
 //!    and at least one `AppEvent::TranscriptSegment` is emitted. Synthetic tones
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppEvent, AudioFormat, MeetingId, MeetingMeta, ModelFileEntry, ModelId, ModelKind,
     ModelManifestEntry, Segment,
 };
@@ -55,8 +55,8 @@ use tokio::sync::{broadcast, mpsc};
 fn model_env_vars() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     // Treat an EMPTY value as unset (skip) so `VAR=""` does not stage an empty
     // path and panic; only a non-empty path counts as "set".
-    let model = non_empty_env("MEETING_APP_ASR_MODEL_PATH")?;
-    let mmproj = non_empty_env("MEETING_APP_ASR_MMPROJ_PATH")?;
+    let model = non_empty_env("MINUTIST_ASR_MODEL_PATH")?;
+    let mmproj = non_empty_env("MINUTIST_ASR_MMPROJ_PATH")?;
     Some((
         std::path::PathBuf::from(model),
         std::path::PathBuf::from(mmproj),
@@ -359,7 +359,7 @@ async fn re_transcribe_rewrites_transcript_over_fixture() {
         None => {
             eprintln!(
                 "skipping re_transcribe_rewrites_transcript_over_fixture; ASR model env vars not set \
-                 (MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH)"
+                 (MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH)"
             );
             return;
         }
@@ -704,6 +704,6 @@ async fn transcribe_pcm_window_returns_segments_without_rewriting_transcript() {
     // The recorder is still Idle (no claim taken / released cycle wedged it).
     assert!(matches!(
         orch.state().await,
-        meeting_app_common::RecordingState::Idle
+        minutist_common::RecordingState::Idle
     ));
 }

@@ -16,7 +16,7 @@ pub mod clusterer;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use meeting_app_common::AppResult;
+use minutist_common::AppResult;
 use sherpa_rs::speaker_id::{EmbeddingExtractor, ExtractorConfig};
 
 use crate::{alpha_label, require_supported_sample_rate, Error, REQUIRED_SAMPLE_RATE};

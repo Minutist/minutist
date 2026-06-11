@@ -16,7 +16,7 @@ import type { Segment } from "../ipc/bindings";
 import type { TranscriptChipAttrs } from "./transcript-chip";
 
 /** Private MIME type carrying a dragged transcript segment. */
-export const TRANSCRIPT_SEGMENT_MIME = "application/x-meeting-app-segment";
+export const TRANSCRIPT_SEGMENT_MIME = "application/x-minutist-segment";
 
 /** The JSON payload written to `dataTransfer` for a dragged segment. */
 export type DraggedSegment = {

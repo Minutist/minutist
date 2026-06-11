@@ -40,10 +40,10 @@ $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
 $env:VULKAN_SDK    = 'C:\VulkanSDK\1.4.341.1'
 
 # Staged Qwen3-ASR Q8_0 model files (from prior transcribe-rs work).
-$env:MEETING_APP_ASR_MODEL_PATH  = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B-Q8_0-ggml-org.gguf'
-$env:MEETING_APP_ASR_MMPROJ_PATH = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B.mmproj-Q8_0.gguf'
+$env:MINUTIST_ASR_MODEL_PATH  = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B-Q8_0-ggml-org.gguf'
+$env:MINUTIST_ASR_MMPROJ_PATH = 'C:\Users\anl\qwen3-asr-gguf\Qwen3-ASR-0.6B.mmproj-Q8_0.gguf'
 
-foreach ($p in @($env:MEETING_APP_ASR_MODEL_PATH, $env:MEETING_APP_ASR_MMPROJ_PATH)) {
+foreach ($p in @($env:MINUTIST_ASR_MODEL_PATH, $env:MINUTIST_ASR_MMPROJ_PATH)) {
     if (-not (Test-Path $p)) { throw "Model file not found: $p" }
 }
 
@@ -118,8 +118,8 @@ if ($Ignored) { $cargoArgs += '--ignored' }
 $cargoArgs += @('--nocapture', '--test-threads=1')
 
 Write-Host ("==> cargo " + ($cargoArgs -join ' '))
-Write-Host "==> MODEL  = $env:MEETING_APP_ASR_MODEL_PATH"
-Write-Host "==> MMPROJ = $env:MEETING_APP_ASR_MMPROJ_PATH"
+Write-Host "==> MODEL  = $env:MINUTIST_ASR_MODEL_PATH"
+Write-Host "==> MMPROJ = $env:MINUTIST_ASR_MMPROJ_PATH"
 # cargo writes progress to stderr; with ErrorActionPreference=Stop PowerShell
 # treats the first stderr line as a terminating NativeCommandError and aborts
 # the build. Drop to Continue for the cargo invocation and gate on the exit

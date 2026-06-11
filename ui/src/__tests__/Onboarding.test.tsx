@@ -143,10 +143,10 @@ describe("onboarding gate (Phase 7)", () => {
 
     // The onboarding welcome surface appears.
     await waitFor(() =>
-      expect(screen.getByText("Welcome to meeting-app")).toBeInTheDocument(),
+      expect(screen.getByText("Welcome to Minutist")).toBeInTheDocument(),
     );
     // The main app chrome (wordmark) is NOT present.
-    expect(screen.queryByText("meeting-app")).not.toBeInTheDocument();
+    expect(screen.queryByText("Minutist")).not.toBeInTheDocument();
   });
 
   it("completed=true → main app renders, onboarding hidden", async () => {
@@ -158,11 +158,11 @@ describe("onboarding gate (Phase 7)", () => {
 
     // The main-window wordmark appears.
     await waitFor(() =>
-      expect(screen.getByText("meeting-app")).toBeInTheDocument(),
+      expect(screen.getByText("Minutist")).toBeInTheDocument(),
     );
     // The onboarding dialog is NOT present.
     expect(
-      screen.queryByText("Welcome to meeting-app"),
+      screen.queryByText("Welcome to Minutist"),
     ).not.toBeInTheDocument();
   });
 
@@ -175,8 +175,8 @@ describe("onboarding gate (Phase 7)", () => {
     const { container } = render(<App />);
 
     expect(container).toBeEmptyDOMElement();
-    expect(screen.queryByText("Welcome to meeting-app")).not.toBeInTheDocument();
-    expect(screen.queryByText("meeting-app")).not.toBeInTheDocument();
+    expect(screen.queryByText("Welcome to Minutist")).not.toBeInTheDocument();
+    expect(screen.queryByText("Minutist")).not.toBeInTheDocument();
   });
 });
 
@@ -195,7 +195,7 @@ describe("onboarding step progression (Phase 7)", () => {
     render(<Onboarding />);
 
     // Step 1: welcome.
-    expect(screen.getByText("Welcome to meeting-app")).toBeInTheDocument();
+    expect(screen.getByText("Welcome to Minutist")).toBeInTheDocument();
     expect(useOnboardingStore.getState().step).toBe("welcome");
 
     // → model. The two speech models (Parakeet primary + the broad-language
@@ -267,7 +267,7 @@ describe("onboarding finish (Phase 7)", () => {
     render(<App />);
 
     await waitFor(() =>
-      expect(screen.getByText("Welcome to meeting-app")).toBeInTheDocument(),
+      expect(screen.getByText("Welcome to Minutist")).toBeInTheDocument(),
     );
 
     // Walk to the final step and finish.
@@ -277,10 +277,10 @@ describe("onboarding finish (Phase 7)", () => {
 
     // The store snapshot now reads completed → the gate flips to the main app.
     await waitFor(() =>
-      expect(screen.getByText("meeting-app")).toBeInTheDocument(),
+      expect(screen.getByText("Minutist")).toBeInTheDocument(),
     );
     expect(
-      screen.queryByText("Welcome to meeting-app"),
+      screen.queryByText("Welcome to Minutist"),
     ).not.toBeInTheDocument();
   });
 

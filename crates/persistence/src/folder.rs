@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use meeting_app_common::{AppResult, MeetingId};
+use minutist_common::{AppResult, MeetingId};
 
 use crate::error::Error;
 
@@ -29,7 +29,7 @@ impl MeetingFolder {
 
         std::fs::create_dir_all(&path)
             .map_err(Error::Io)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         tracing::info!(
             target: "persistence",

@@ -37,7 +37,7 @@
 # Usage:
 #   uv run scripts/generate-update-manifest.py \
 #       --version 1.2.3 \
-#       --base-url https://releases.example.com/meeting-app/v1.2.3 \
+#       --base-url https://releases.example.com/minutist/v1.2.3 \
 #       --bundle-dir target/release/bundle \
 #       --notes "Bug fixes and improvements" \
 #       --output latest.json
@@ -315,36 +315,36 @@ def _self_test() -> int:
     # _platform_key: arch from filename tokens.
     check(
         "linux x86_64 from name",
-        _platform_key(Path("bundle/meeting-app_1.2.3_amd64.AppImage")),
+        _platform_key(Path("bundle/minutist_1.2.3_amd64.AppImage")),
         "linux-x86_64",
     )
     check(
         "windows aarch64 from name",
-        _platform_key(Path("bundle/meeting-app_1.2.3_arm64-setup.exe")),
+        _platform_key(Path("bundle/minutist_1.2.3_arm64-setup.exe")),
         "windows-aarch64",
     )
     # macOS .app.tar.gz has NO arch token in its name. Without a triple in the
     # path and without an override it must NOT silently key to x86_64.
     check(
         "macos no-arch refuses default",
-        _platform_key(Path("bundle/meeting-app.app.tar.gz")),
+        _platform_key(Path("bundle/minutist.app.tar.gz")),
         None,
     )
     # Arch from the Rust target triple in the path (the CI layout).
     check(
         "macos arm64 from triple path",
-        _platform_key(Path("target/aarch64-apple-darwin/release/bundle/meeting-app.app.tar.gz")),
+        _platform_key(Path("target/aarch64-apple-darwin/release/bundle/minutist.app.tar.gz")),
         "darwin-aarch64",
     )
     check(
         "macos x86_64 from triple path",
-        _platform_key(Path("target/x86_64-apple-darwin/release/bundle/meeting-app.app.tar.gz")),
+        _platform_key(Path("target/x86_64-apple-darwin/release/bundle/minutist.app.tar.gz")),
         "darwin-x86_64",
     )
     # Arch from an explicit override (the manual / no-triple path).
     check(
         "macos arm64 from override",
-        _platform_key(Path("bundle/meeting-app.app.tar.gz"), "aarch64"),
+        _platform_key(Path("bundle/minutist.app.tar.gz"), "aarch64"),
         "darwin-aarch64",
     )
     # Word-boundary: `x86_64` must not be mis-read as `x86`/`i686`.
@@ -362,9 +362,9 @@ def _self_test() -> int:
         intel_dir = root / "mac-intel"
         for d in (arm_dir, intel_dir):
             d.mkdir(parents=True)
-            art = d / "meeting-app.app.tar.gz"
+            art = d / "minutist.app.tar.gz"
             art.write_bytes(b"fake-bundle")
-            (d / "meeting-app.app.tar.gz.sig").write_text("SIG", encoding="utf-8")
+            (d / "minutist.app.tar.gz.sig").write_text("SIG", encoding="utf-8")
 
         manifest = build_manifest(
             version="1.2.3",
@@ -383,7 +383,7 @@ def _self_test() -> int:
                 check(
                     f"{k} url",
                     entry.get("url"),
-                    "https://example.com/v1.2.3/meeting-app.app.tar.gz",
+                    "https://example.com/v1.2.3/minutist.app.tar.gz",
                 )
         # Must round-trip as valid JSON.
         json.loads(json.dumps(manifest))

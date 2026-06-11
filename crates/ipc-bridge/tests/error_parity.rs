@@ -30,11 +30,11 @@
 //!    fields), and that each value round-trips back through its own type.
 //!
 //! This file lives in `tests/` (an integration test) so it sees both the public
-//! `AppError` re-exported by `meeting_app_common` and the public `IpcError`
+//! `AppError` re-exported by `minutist_common` and the public `IpcError`
 //! exported by `ipc_bridge`. It is hook-exempt (touches no `crates/*/src`).
 
 use ipc_bridge::IpcError;
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 /// Map an `AppError` to the `IpcError` the production `From` impl would produce,
 /// via an exhaustive match (no `_` arm). This duplicates the production mapping

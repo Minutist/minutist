@@ -89,7 +89,7 @@ jobs:
           fi
           for feat in $graph_features; do
             echo "::group::cargo tree -e features --features $feat"
-            cargo tree -p meeting-app --no-default-features \
+            cargo tree -p minutist --no-default-features \
               --features "$feat" -e features --locked
             echo "::endgroup::"
           done

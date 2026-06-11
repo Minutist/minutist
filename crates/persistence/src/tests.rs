@@ -14,7 +14,7 @@
 use std::io::Cursor;
 use std::time::Duration;
 
-use meeting_app_common::{AudioFormat, MeetingId, MeetingMeta, Segment};
+use minutist_common::{AudioFormat, MeetingId, MeetingMeta, Segment};
 use tempfile::TempDir;
 
 use crate::opus_encoder::{OggOpusEncoder, SAMPLE_RATE};
@@ -515,7 +515,7 @@ fn test_zero_segment_meeting_finalise_ok() {
 // 19. rebuild_from_disk repopulates from a synthetic meetings root.
 // 20. rename/delete meeting keep folder + index consistent.
 
-use meeting_app_common::{MeetingState, NotesDocument};
+use minutist_common::{MeetingState, NotesDocument};
 
 use crate::index::MeetingIndex;
 use crate::reader;
@@ -969,7 +969,7 @@ fn test_summary_write_read_round_trip() {
 /// (`audio.opus` / `transcript.json` / `notes.json`) or leaving `.tmp` residue.
 #[test]
 fn test_write_metadata_round_trip_leaves_siblings_untouched() {
-    use meeting_app_common::ModelDescriptor;
+    use minutist_common::ModelDescriptor;
 
     let tempdir = TempDir::new().expect("tempdir");
     let root = tempdir.path();
@@ -1124,8 +1124,8 @@ async fn test_index_prior_schema_migrates_without_data_loss() {
 // ---------------------------------------------------------------------------
 
 /// Build a `MeetingListEntry` for index tests.
-fn list_entry(title: &str, started_at: &str) -> meeting_app_common::MeetingListEntry {
-    meeting_app_common::MeetingListEntry {
+fn list_entry(title: &str, started_at: &str) -> minutist_common::MeetingListEntry {
+    minutist_common::MeetingListEntry {
         id: MeetingId::new(),
         title: title.to_string(),
         started_at: started_at.to_string(),

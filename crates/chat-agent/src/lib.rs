@@ -42,7 +42,7 @@
 //! the oaicompat APIs; a test stub returns canned text/tool-calls. The engine's
 //! turn logic (prompt assembly, outcome parsing, tool-call extraction, error
 //! mapping) is unit-tested with the stub (no model). `LlamaTurnBackend` is
-//! covered by a gated test (skip-on-unset `MEETING_APP_LLM_MODEL_PATH`).
+//! covered by a gated test (skip-on-unset `MINUTIST_LLM_MODEL_PATH`).
 
 mod backend;
 mod error;
@@ -57,7 +57,7 @@ pub use types::{CancelFlag, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutc
 pub use window::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
 
 use agent_tools::ToolDescriptor;
-use meeting_app_common::AppResult;
+use minutist_common::AppResult;
 
 /// The stateless chat turn engine.
 ///
@@ -146,7 +146,7 @@ impl<B: TurnBackend> ChatEngine for TurnEngine<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meeting_app_common::AppError;
+    use minutist_common::AppError;
     use serde_json::json;
     use std::sync::Mutex;
 

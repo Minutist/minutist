@@ -21,7 +21,7 @@ use cpal::{
     traits::{DeviceTrait, StreamTrait},
     Sample, SizedSample,
 };
-use meeting_app_common::{AppResult, AudioDevice, AudioMeterFrame};
+use minutist_common::{AppResult, AudioDevice, AudioMeterFrame};
 use tokio::sync::mpsc;
 
 use crate::device;

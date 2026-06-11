@@ -20,7 +20,7 @@
  * version. `package.json` sits outside the TS `src` include and JSON-module
  * resolution is not enabled, so a hand-kept constant is the pragmatic source.
  */
-export const APP_NAME = "meeting-app";
+export const APP_NAME = "Minutist";
 export const APP_VERSION = "0.0.0";
 
 /**

@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use audio_capture::test_source::DummyAudioSource;
-use meeting_app_common::{AppError, AppEvent, RecordingState};
+use minutist_common::{AppError, AppEvent, RecordingState};
 use tempfile::TempDir;
 
 use crate::test_support::test_orchestrator;
@@ -303,7 +303,7 @@ async fn stop_produces_valid_meeting_folder_with_expected_files() {
     let meta_path = meeting_dir.join("metadata.json");
     assert!(meta_path.exists(), "metadata.json should exist");
     let json = std::fs::read_to_string(&meta_path).expect("read metadata.json");
-    let loaded: meeting_app_common::MeetingMeta =
+    let loaded: minutist_common::MeetingMeta =
         serde_json::from_str(&json).expect("deserialise metadata.json");
 
     // 4. Verify expected fields.
@@ -383,7 +383,7 @@ async fn audio_meter_events_arrive_within_one_second() {
 
 mod diarization {
     use super::*;
-    use meeting_app_common::{
+    use minutist_common::{
         AppResult, AudioFormat, Diarizer, MeetingId, MeetingMeta, Segment,
     };
     use persistence::{MeetingIndex, MeetingWriter};

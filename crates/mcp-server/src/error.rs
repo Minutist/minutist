@@ -1,7 +1,7 @@
 //! `AppError -> McpError` mapping (Phase 10 §2.2).
 //!
 //! This is the ONE place `rmcp` error types are constructed from the shared
-//! [`meeting_app_common::AppError`]. The `agent-tools` registry returns
+//! [`minutist_common::AppError`]. The `agent-tools` registry returns
 //! `AppError`; the MCP `tools/call` handler maps it to a JSON-RPC / MCP
 //! [`rmcp::ErrorData`] per the Phase 10 mapping table.
 //!
@@ -10,7 +10,7 @@
 //! `-32602 invalid params` (the natural "your request could not be served as
 //! given" code).
 
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 use rmcp::ErrorData as McpError;
 
 /// Map an [`AppError`] to an MCP [`McpError`] (`rmcp::ErrorData`).

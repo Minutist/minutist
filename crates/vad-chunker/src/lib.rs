@@ -1,4 +1,4 @@
-//! VAD-based audio chunker for meeting-app.
+//! VAD-based audio chunker for minutist.
 //!
 //! Wraps the Silero VAD model (via `vad-rs`) with an onset/hangover smoother
 //! and a partial-frame accumulator. Accepts raw f32 samples at 16 kHz mono
@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use meeting_app_common::{AppError, AppResult};
+use minutist_common::{AppError, AppResult};
 use vad_rs::Vad;
 
 // ---------------------------------------------------------------------------
@@ -596,20 +596,20 @@ impl VadChunker {
 /// Resolve the bundled Silero VAD model path.
 ///
 /// Priority:
-/// 1. `MEETING_APP_SILERO_PATH` **runtime** environment variable. `app-main`
+/// 1. `MINUTIST_SILERO_PATH` **runtime** environment variable. `app-main`
 ///    resolves the bundled Tauri resource at startup and injects its absolute
 ///    path here (see `architecture/cross-cutting.md`, "Model lifecycle —
 ///    Exception: Silero VAD"), so an installed package finds the model.
-/// 2. `MEETING_APP_SILERO_PATH` **build-time** env var (`option_env!`), kept so
+/// 2. `MINUTIST_SILERO_PATH` **build-time** env var (`option_env!`), kept so
 ///    a build that bakes the path in still works.
 /// 3. `{CARGO_MANIFEST_DIR}/../../resources/silero/silero_vad_v4.onnx` so that
 ///    `cargo run` / `cargo test -p vad-chunker` find the source-tree file with
 ///    no env var set.
 pub fn default_model_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("MEETING_APP_SILERO_PATH") {
+    if let Ok(p) = std::env::var("MINUTIST_SILERO_PATH") {
         return std::path::PathBuf::from(p);
     }
-    if let Some(p) = option_env!("MEETING_APP_SILERO_PATH") {
+    if let Some(p) = option_env!("MINUTIST_SILERO_PATH") {
         return std::path::PathBuf::from(p);
     }
     std::path::PathBuf::from(concat!(
@@ -1096,14 +1096,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 8: runtime MEETING_APP_SILERO_PATH takes precedence over fallbacks
+    // Test 8: runtime MINUTIST_SILERO_PATH takes precedence over fallbacks
     // -----------------------------------------------------------------------
     // app-main injects the resolved bundled-resource path via this runtime env
     // var (see architecture/cross-cutting.md "Model lifecycle"). When set,
     // default_model_path() must return it verbatim; when unset, it must fall
     // back to the source-tree path so dev/cargo-test runs work unchanged.
     //
-    // MEETING_APP_SILERO_PATH is process-global and cargo runs tests in this
+    // MINUTIST_SILERO_PATH is process-global and cargo runs tests in this
     // binary on parallel threads, so other tests may call default_model_path()
     // (via test_chunker) while this test holds the var set. To avoid handing a
     // bogus path to a parallel chunker open, we set the var to the *real*
@@ -1113,7 +1113,7 @@ mod tests {
     #[test]
     fn test_runtime_env_overrides_default_model_path() {
         // Unset → source-tree fallback (the committed resources/ path).
-        std::env::remove_var("MEETING_APP_SILERO_PATH");
+        std::env::remove_var("MINUTIST_SILERO_PATH");
         let fallback = default_model_path();
         assert!(
             fallback.ends_with("resources/silero/silero_vad_v4.onnx"),
@@ -1129,7 +1129,7 @@ mod tests {
         // one returning it.
         let runtime_path = std::fs::canonicalize(&fallback)
             .expect("source-tree Silero model must exist for this test");
-        std::env::set_var("MEETING_APP_SILERO_PATH", &runtime_path);
+        std::env::set_var("MINUTIST_SILERO_PATH", &runtime_path);
         assert_eq!(
             default_model_path(),
             runtime_path,
@@ -1137,6 +1137,6 @@ mod tests {
         );
 
         // Restore: leave the process env clean for any other test ordering.
-        std::env::remove_var("MEETING_APP_SILERO_PATH");
+        std::env::remove_var("MINUTIST_SILERO_PATH");
     }
 }

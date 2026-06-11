@@ -25,7 +25,7 @@
 
 use std::path::{Path, PathBuf};
 
-use meeting_app_common::{AppResult, MeetingId, NoteBlock};
+use minutist_common::{AppResult, MeetingId, NoteBlock};
 
 use crate::error::Error;
 
@@ -85,7 +85,7 @@ impl NotesStore {
 
         let json_bytes = serde_json::to_vec_pretty(notes_json)
             .map_err(Error::Serialise)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         write_atomic(&json_path, &json_bytes)?;
         write_atomic(&md_path, notes_md.as_bytes())?;
@@ -118,7 +118,7 @@ impl NotesStore {
 
         let json: serde_json::Value = serde_json::from_slice(&json_bytes)
             .map_err(Error::Serialise)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         let markdown = match std::fs::read_to_string(&md_path) {
             Ok(s) => s,
@@ -141,7 +141,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     use std::io::Write;
 
     let parent = path.parent().ok_or_else(|| {
-        meeting_app_common::AppError::Internal {
+        minutist_common::AppError::Internal {
             context: format!("notes path has no parent: {}", path.display()),
         }
     })?;

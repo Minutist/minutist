@@ -19,7 +19,7 @@ cuda = ["summariser/cuda", "orchestrator/cuda", "chat-agent/cuda"]
 directml = ["orchestrator/directml"]
 
 [dependencies]
-meeting-app-common = { path = "../common", features = ["specta"] }
+minutist-common = { path = "../common", features = ["specta"] }
 orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }
 summariser = { path = "../summariser" }

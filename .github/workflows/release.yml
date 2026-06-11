@@ -129,7 +129,7 @@ jobs:
           args: --features ${{ matrix.features }}
           # The pushed tag, e.g. refs/tags/v1.2.3 -> v1.2.3.
           tagName: ${{ github.ref_name }}
-          releaseName: "meeting-app ${{ github.ref_name }}"
+          releaseName: "minutist ${{ github.ref_name }}"
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

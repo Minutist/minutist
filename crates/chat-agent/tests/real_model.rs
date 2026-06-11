@@ -1,10 +1,10 @@
 //! Gated real-model integration test for [`LlamaTurnBackend`] (SP1).
 //!
-//! Skips (no-op) unless `MEETING_APP_LLM_MODEL_PATH` points at a bundled GGUF,
+//! Skips (no-op) unless `MINUTIST_LLM_MODEL_PATH` points at a bundled GGUF,
 //! mirroring the `summariser` / `asr-runtime` gated tests. Run with:
 //!
 //! ```text
-//! MEETING_APP_LLM_MODEL_PATH=/path/to/model.gguf \
+//! MINUTIST_LLM_MODEL_PATH=/path/to/model.gguf \
 //!   cargo test -p chat-agent --test real_model -- --include-ignored
 //! ```
 //!
@@ -23,18 +23,18 @@ use agent_tools::ToolDescriptor;
 use serde_json::json;
 
 fn open_substrate() -> Option<LlamaSummariser> {
-    let path = match std::env::var("MEETING_APP_LLM_MODEL_PATH") {
+    let path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
         Ok(p) if !p.is_empty() => p,
         _ => return None,
     };
     Some(
         LlamaSummariser::open(PathBuf::from(&path), SummariserConfig::default())
-            .expect("model load must succeed with a valid MEETING_APP_LLM_MODEL_PATH"),
+            .expect("model load must succeed with a valid MINUTIST_LLM_MODEL_PATH"),
     )
 }
 
 #[test]
-#[ignore = "requires MEETING_APP_LLM_MODEL_PATH"]
+#[ignore = "requires MINUTIST_LLM_MODEL_PATH"]
 fn real_turn_produces_a_final_answer() {
     let Some(substrate) = open_substrate() else {
         return; // no-op skip
@@ -75,7 +75,7 @@ fn real_turn_produces_a_final_answer() {
 }
 
 #[test]
-#[ignore = "requires MEETING_APP_LLM_MODEL_PATH"]
+#[ignore = "requires MINUTIST_LLM_MODEL_PATH"]
 fn real_turn_can_request_a_tool() {
     let Some(substrate) = open_substrate() else {
         return;

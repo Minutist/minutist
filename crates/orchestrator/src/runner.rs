@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use asr_runtime::{AsrRuntime, AsrRuntimeConfig};
 use audio_capture::{AudioFrameBatch, AudioStreams};
 use diarizer::{OnlineDiarizer, OnlineDiarizerConfig};
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppEvent, AppResult, AsrBackend, AsrEngine, AudioChunk, AudioMeterFrame, MeetingId,
     MeetingMeta, ModelId, ModelStatusState, Segment,
 };
@@ -1894,7 +1894,7 @@ fn emit_retranscribe_progress(
 ) {
     let _ = event_tx.send(AppEvent::OperationProgress {
         meeting_id,
-        op: meeting_app_common::OperationKind::ReTranscribe,
+        op: minutist_common::OperationKind::ReTranscribe,
         fraction: Some(re_transcribe_fraction(samples_fed, total_kept_samples)),
         label: "Re-transcribing…".to_string(),
     });
@@ -2595,7 +2595,7 @@ mod tests {
     /// it must drop the OLDEST entry (front) and retain the newest (back).
     #[test]
     fn dispatch_flush_drops_oldest_when_queue_full() {
-        use meeting_app_common::MeetingId;
+        use minutist_common::MeetingId;
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<AppEvent>(16);
 
         let flush_queue = FlushQueue::new();
@@ -2727,7 +2727,7 @@ mod tests {
     /// empty tempdir, so the model is `Missing`.
     #[test]
     fn build_online_diarizer_returns_none_when_model_absent() {
-        use meeting_app_common::{ModelFileEntry, ModelKind, ModelManifestEntry};
+        use minutist_common::{ModelFileEntry, ModelKind, ModelManifestEntry};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);

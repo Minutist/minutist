@@ -2,7 +2,7 @@
 //! folders.
 //!
 //! `index.db` holds one row per meeting mirroring
-//! [`meeting_app_common::MeetingListEntry`], so the meeting-list view (FR-33)
+//! [`minutist_common::MeetingListEntry`], so the meeting-list view (FR-33)
 //! and search read straight from the index without loading any meeting's full
 //! transcript. The index is **rebuildable** from disk ([`MeetingIndex::rebuild_from_disk`])
 //! — it never holds authoritative state, only a fast-query projection of the
@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use libsql::{Builder, Connection, Database};
-use meeting_app_common::{AppResult, MeetingId, MeetingListEntry};
+use minutist_common::{AppResult, MeetingId, MeetingListEntry};
 
 use crate::error::Error;
 use crate::{migrations, reader};

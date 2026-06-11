@@ -1,16 +1,16 @@
 [package]
-name = "meeting-app"
+name = "minutist"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [lib]
-name = "meeting_app_lib"
+name = "minutist_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
-name = "meeting-app"
+name = "minutist"
 path = "src/main.rs"
 
 [[bin]]
@@ -33,7 +33,7 @@ directml = ["ipc-bridge/directml"]
 tauri-build = { workspace = true }
 
 [dependencies]
-meeting-app-common = { path = "../crates/common" }
+minutist-common = { path = "../crates/common" }
 ipc-bridge = { path = "../crates/ipc-bridge" }
 orchestrator = { path = "../crates/orchestrator" }
 model-registry = { path = "../crates/model-registry" }

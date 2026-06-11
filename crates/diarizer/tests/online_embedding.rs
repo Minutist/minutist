@@ -1,14 +1,14 @@
 //! Env-var-gated online-diarizer embedding tests.
 //!
 //! The live path needs only the real speaker-embedding ONNX model, so these are
-//! gated on `MEETING_APP_DIARIZE_EMB_PATH` alone (no segmentation model — VAD
+//! gated on `MINUTIST_DIARIZE_EMB_PATH` alone (no segmentation model — VAD
 //! upstream supplies the segment boundaries). When the var is unset the test
 //! logs a skip line and returns — the default `cargo test -p diarizer` suite
 //! (no model, no GPU) passes with these skipped, per
 //! `architecture/cross-cutting.md` "Automated-testing policy".
 //!
 //! To run:
-//!   MEETING_APP_DIARIZE_EMB_PATH=/path/to/embedding.onnx \
+//!   MINUTIST_DIARIZE_EMB_PATH=/path/to/embedding.onnx \
 //!   cargo test -p diarizer --test online_embedding
 //!
 //! Fixtures (committed, real speech — see `tests/fixtures/README.md`): two
@@ -20,14 +20,14 @@
 use std::path::{Path, PathBuf};
 
 use diarizer::{OnlineDiarizer, OnlineDiarizerConfig};
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 const SAMPLE_RATE: u32 = 16_000;
 
 /// Resolve the gated embedding-model path, or `None` (→ skip) when unset. An
 /// empty-string env var (`VAR=""`) is treated as unset → skip.
 fn embedding_path() -> Option<PathBuf> {
-    std::env::var("MEETING_APP_DIARIZE_EMB_PATH")
+    std::env::var("MINUTIST_DIARIZE_EMB_PATH")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -59,7 +59,7 @@ fn distinct_speakers_get_distinct_sticky_labels() {
     let Some(emb_path) = embedding_path() else {
         eprintln!(
             "skipping distinct_speakers_get_distinct_sticky_labels: set \
-             MEETING_APP_DIARIZE_EMB_PATH to run"
+             MINUTIST_DIARIZE_EMB_PATH to run"
         );
         return;
     };
@@ -100,7 +100,7 @@ fn single_speaker_yields_one_label() {
     let Some(emb_path) = embedding_path() else {
         eprintln!(
             "skipping single_speaker_yields_one_label: set \
-             MEETING_APP_DIARIZE_EMB_PATH to run"
+             MINUTIST_DIARIZE_EMB_PATH to run"
         );
         return;
     };
@@ -144,7 +144,7 @@ fn single_speaker_yields_one_label() {
 #[test]
 fn guard_rejects_bad_input() {
     let Some(emb_path) = embedding_path() else {
-        eprintln!("skipping guard_rejects_bad_input: set MEETING_APP_DIARIZE_EMB_PATH to run");
+        eprintln!("skipping guard_rejects_bad_input: set MINUTIST_DIARIZE_EMB_PATH to run");
         return;
     };
 

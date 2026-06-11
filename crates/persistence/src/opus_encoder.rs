@@ -131,7 +131,7 @@ impl<W: Write> OggOpusEncoder<W> {
         // --- OpusTags packet (RFC 7845 §5.2) ---
         let mut tags = Vec::new();
         tags.extend_from_slice(b"OpusTags");
-        let vendor = b"meeting-app persistence v0";
+        let vendor = b"minutist persistence v0";
         tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
         tags.extend_from_slice(vendor);
         tags.extend_from_slice(&0u32.to_le_bytes()); // user comment list length = 0

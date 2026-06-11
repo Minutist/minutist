@@ -7,12 +7,12 @@
 //! the bundled [`LlamaSummariser`](crate::LlamaSummariser) remains the default.
 //!
 //! Uses `reqwest`'s **blocking** client so the synchronous
-//! [`Summariser`](meeting_app_common::Summariser) trait is satisfied without an
+//! [`Summariser`](minutist_common::Summariser) trait is satisfied without an
 //! async runtime — mirroring the "called from `spawn_blocking`" contract.
 
 use std::time::Duration;
 
-use meeting_app_common::{AppResult, NoteBlock, Segment, Summariser};
+use minutist_common::{AppResult, NoteBlock, Segment, Summariser};
 use serde::{Deserialize, Serialize};
 
 use crate::{render_user_content, strip_think_block, Error};
@@ -146,7 +146,7 @@ impl Summariser for OllamaSummariser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meeting_app_common::AppError;
+    use minutist_common::AppError;
 
     /// A base URL without a trailing slash yields the `/api/chat` endpoint.
     #[test]

@@ -10,27 +10,27 @@
 //!
 //! It is gated on three env vars (any unset → skip + return `Ok`, so the default
 //! `cargo test -p diarizer` suite never touches the models or the user's audio):
-//!   * `MEETING_APP_DIARIZE_SEG_PATH`     — pyannote segmentation ONNX
-//!   * `MEETING_APP_DIARIZE_EMB_PATH`     — speaker-embedding ONNX
-//!   * `MEETING_APP_DIARIZE_EVAL_MEETING` — a meeting folder (audio.opus +
+//!   * `MINUTIST_DIARIZE_SEG_PATH`     — pyannote segmentation ONNX
+//!   * `MINUTIST_DIARIZE_EMB_PATH`     — speaker-embedding ONNX
+//!   * `MINUTIST_DIARIZE_EVAL_MEETING` — a meeting folder (audio.opus +
 //!     transcript.json)
 //!
 //! The recording is long (~26-31 min); to keep the sweep tractable the harness
-//! uses only a leading time-bounded slice (`MEETING_APP_DIARIZE_EVAL_SECS`,
+//! uses only a leading time-bounded slice (`MINUTIST_DIARIZE_EVAL_SECS`,
 //! default 360 s). The model is run ONCE per `cluster_threshold` (the expensive
 //! step), and the cheap pure `overlay_speakers` prune stage is re-swept over the
 //! cached turns without re-invoking the model.
 //!
 //! To run:
-//!   MEETING_APP_DIARIZE_SEG_PATH=/path/seg.onnx \
-//!   MEETING_APP_DIARIZE_EMB_PATH=/path/emb.onnx \
-//!   MEETING_APP_DIARIZE_EVAL_MEETING=/path/to/meetings/<uuid> \
+//!   MINUTIST_DIARIZE_SEG_PATH=/path/seg.onnx \
+//!   MINUTIST_DIARIZE_EMB_PATH=/path/emb.onnx \
+//!   MINUTIST_DIARIZE_EVAL_MEETING=/path/to/meetings/<uuid> \
 //!   cargo test -p diarizer --test oversplit_eval -- --nocapture
 
 use std::path::PathBuf;
 
 use diarizer::{overlay_speakers, DiarizerConfig};
-use meeting_app_common::Segment;
+use minutist_common::Segment;
 use sherpa_rs::diarize::{Diarize, DiarizeConfig};
 
 const SAMPLE_RATE: u32 = 16_000;
@@ -39,10 +39,10 @@ const DEFAULT_SLICE_SECS: u64 = 360;
 /// Resolve the gated inputs, or `None` (→ skip) when any required var is unset.
 fn eval_inputs() -> Option<(PathBuf, PathBuf, PathBuf, u64)> {
     let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-    let seg = non_empty("MEETING_APP_DIARIZE_SEG_PATH")?;
-    let emb = non_empty("MEETING_APP_DIARIZE_EMB_PATH")?;
-    let meeting = non_empty("MEETING_APP_DIARIZE_EVAL_MEETING")?;
-    let secs = non_empty("MEETING_APP_DIARIZE_EVAL_SECS")
+    let seg = non_empty("MINUTIST_DIARIZE_SEG_PATH")?;
+    let emb = non_empty("MINUTIST_DIARIZE_EMB_PATH")?;
+    let meeting = non_empty("MINUTIST_DIARIZE_EVAL_MEETING")?;
+    let secs = non_empty("MINUTIST_DIARIZE_EVAL_SECS")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_SLICE_SECS);
     Some((
@@ -95,8 +95,8 @@ fn count_with_prune(turns: &[sherpa_rs::diarize::Segment], base: &[Segment], sha
 fn oversplit_count_vs_knob_sweep() {
     let Some((seg_path, emb_path, meeting_dir, secs)) = eval_inputs() else {
         eprintln!(
-            "skipping oversplit_count_vs_knob_sweep: set MEETING_APP_DIARIZE_SEG_PATH, \
-             MEETING_APP_DIARIZE_EMB_PATH and MEETING_APP_DIARIZE_EVAL_MEETING to run"
+            "skipping oversplit_count_vs_knob_sweep: set MINUTIST_DIARIZE_SEG_PATH, \
+             MINUTIST_DIARIZE_EMB_PATH and MINUTIST_DIARIZE_EVAL_MEETING to run"
         );
         return;
     };

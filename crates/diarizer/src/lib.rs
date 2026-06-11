@@ -1,6 +1,6 @@
 //! `diarizer` — speaker diarization, offline (authoritative) + live (additive).
 //!
-//! The OFFLINE [`SherpaDiarizer`] implements [`meeting_app_common::Diarizer`]
+//! The OFFLINE [`SherpaDiarizer`] implements [`minutist_common::Diarizer`]
 //! over a sherpa-onnx (via `sherpa-rs`) two-model pipeline: a **segmentation**
 //! model + a **speaker-embedding** model + clustering. It assigns `speaker_id`
 //! to the ASR `Segment`s of a finished recording (a post-pass) and is the
@@ -61,7 +61,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use meeting_app_common::{AppResult, Diarizer, Segment};
+use minutist_common::{AppResult, Diarizer, Segment};
 use sherpa_rs::diarize::{Diarize, DiarizeConfig, Segment as SherpaSegment};
 
 mod error;
@@ -566,7 +566,7 @@ pub(crate) fn alpha_label(mut n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meeting_app_common::Segment;
+    use minutist_common::Segment;
 
     fn turn(start_s: f32, end_s: f32, speaker: i32) -> SherpaSegment {
         SherpaSegment {
@@ -612,7 +612,7 @@ mod tests {
             let err = require_supported_sample_rate(bad)
                 .expect_err("non-16 kHz must be rejected");
             assert!(
-                matches!(err, meeting_app_common::AppError::InvalidInput { .. }),
+                matches!(err, minutist_common::AppError::InvalidInput { .. }),
                 "expected InvalidInput for {bad} Hz, got {err}"
             );
         }

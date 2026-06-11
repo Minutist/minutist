@@ -31,7 +31,7 @@ use llama_cpp_2::model::LlamaChatMessage;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::sampling::LlamaSampler;
-use meeting_app_common::{AppError, AppResult, AsrBackend, AudioChunk, Segment};
+use minutist_common::{AppError, AppResult, AsrBackend, AudioChunk, Segment};
 
 // ---------------------------------------------------------------------------
 // Per-crate error
@@ -128,9 +128,9 @@ fn require_supported_sample_rate(sample_rate: u32) -> AppResult<()> {
 /// `OnceLock` here: `LlamaBackend::init()` is global (once per process), and
 /// `summariser` also loads a GGUF model in the same app process, so a private
 /// per-crate cell would make whichever crate inits second fail. See
-/// `meeting_app_common::llama_backend`.
+/// `minutist_common::llama_backend`.
 fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
-    meeting_app_common::llama_backend::shared_llama_backend()
+    minutist_common::llama_backend::shared_llama_backend()
         .map_err(|e| Error::BackendInit(e.to_string()))
 }
 
@@ -806,8 +806,8 @@ mod tests {
     // Gated integration tests — skip when model env vars are absent.
     //
     // To run:
-    //   MEETING_APP_ASR_MODEL_PATH=/path/to/model.gguf \
-    //   MEETING_APP_ASR_MMPROJ_PATH=/path/to/mmproj.gguf \
+    //   MINUTIST_ASR_MODEL_PATH=/path/to/model.gguf \
+    //   MINUTIST_ASR_MMPROJ_PATH=/path/to/mmproj.gguf \
     //   cargo test -p asr-runtime -- --include-ignored
     // -----------------------------------------------------------------------
 
@@ -819,8 +819,8 @@ mod tests {
     /// regression guard can exercise both the forced and auto-detect paths
     /// against the real model.
     fn gated_runtime_with_language(language: Option<String>) -> Option<AsrRuntime> {
-        let model_path = std::env::var("MEETING_APP_ASR_MODEL_PATH").ok()?;
-        let mmproj_path = std::env::var("MEETING_APP_ASR_MMPROJ_PATH").ok()?;
+        let model_path = std::env::var("MINUTIST_ASR_MODEL_PATH").ok()?;
+        let mmproj_path = std::env::var("MINUTIST_ASR_MMPROJ_PATH").ok()?;
         let config = AsrRuntimeConfig {
             language,
             ..AsrRuntimeConfig::default()
@@ -911,7 +911,7 @@ mod tests {
 
     /// (gated) — transcribe librispeech_0.wav and verify WER <= 5%.
     #[test]
-    #[ignore = "requires MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH"]
+    #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
     fn transcribe_librispeech_0_within_5pct_wer() {
         let mut runtime = match gated_runtime() {
             Some(r) => r,
@@ -942,7 +942,7 @@ mod tests {
 
     /// (gated) — verify that </asr_text> early-stop prevents max_tokens runaway.
     #[test]
-    #[ignore = "requires MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH"]
+    #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
     fn early_stop_fires_before_max_tokens() {
         let mut runtime = match gated_runtime() {
             Some(r) => r,
@@ -978,7 +978,7 @@ mod tests {
     /// (`language: Some("English")`), the English librispeech fixture must yield
     /// a non-empty transcript containing NO CJK codepoints.
     #[test]
-    #[ignore = "requires MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH"]
+    #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
     fn forced_english_output_has_no_cjk() {
         let mut runtime = match gated_runtime_with_language(Some("English".to_string())) {
             Some(r) => r,
@@ -1006,7 +1006,7 @@ mod tests {
     /// Pairs with the byte-identical unit guard so both the prompt-build and the
     /// end-to-end auto path are protected.
     #[test]
-    #[ignore = "requires MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH"]
+    #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
     fn auto_detect_unchanged() {
         let mut runtime = match gated_runtime_with_language(None) {
             Some(r) => r,

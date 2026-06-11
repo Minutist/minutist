@@ -303,7 +303,7 @@ onset 3 frames (90 ms), hangover 24 frames (720 ms), prefill 5 frames
 (150 ms pre-roll). `process_samples` accumulates a partial-frame buffer
 and only feeds the VAD complete 480-sample frames (Silero v4 panics on
 any other size). The bundled ONNX is resolved at build time via
-`option_env!("MEETING_APP_SILERO_PATH")` falling back to
+`option_env!("MINUTIST_SILERO_PATH")` falling back to
 `{CARGO_MANIFEST_DIR}/../../resources/silero/silero_vad_v4.onnx`.
 
 `VadChunker::reset()` restores the chunker to its just-opened state (Silero RNN
@@ -492,8 +492,8 @@ dev-dependencies. Tests: the default suite covers `overlay_speakers`
 (interval-join, no-overlap=None, tie-break, first-seen relabel, stale-label
 clearing) AND the prune/cap (tiny-share drop + reassign, genuine-speaker keep,
 segment-count floor, cap-to-largest, never-zero fallback) with no model; the
-env-var-gated `tests/accuracy.rs` (`MEETING_APP_DIARIZE_SEG_PATH` +
-`MEETING_APP_DIARIZE_EMB_PATH`, skip-on-unset) runs `assign_speakers` over
+env-var-gated `tests/accuracy.rs` (`MINUTIST_DIARIZE_SEG_PATH` +
+`MINUTIST_DIARIZE_EMB_PATH`, skip-on-unset) runs `assign_speakers` over
 committed fixtures (`tests/fixtures/two_speakers_synth.wav` = two distinct
 real-speech
 speaker clips concatenated, with self-authored ground truth;
@@ -539,7 +539,7 @@ trait is offline-only and unchanged). No new crate-dependency edge is introduced
 `src/online/clusterer.rs` (separation, stickiness, threshold split, centroid
 drift, lower-index tie-break, `max_speakers` force-join, dim-mismatch/degenerate
 rejection); the env-var-gated `tests/online_embedding.rs`
-(`MEETING_APP_DIARIZE_EMB_PATH` only — no segmentation model — skip-on-unset)
+(`MINUTIST_DIARIZE_EMB_PATH` only — no segmentation model — skip-on-unset)
 runs `assign_segment` over committed real-speech fixtures, asserting distinct
 sticky labels for two speakers, label reuse on a speaker's repeat, one label for
 the single-speaker control, and `InvalidInput` for a non-16 kHz or empty buffer.
@@ -1070,7 +1070,7 @@ and `false` return the meeting un-diarized (`speaker_id == None`, `speaker_count
 0`, and no `DiarizationComplete` from `stop()` itself — the background `rediarize`
 pass emits it), with `diarization_enabled()` surfacing the toggle for ipc; plus
 the env-var-gated `rediarize` integration test
-(`MEETING_APP_DIARIZE_SEG_PATH` + `MEETING_APP_DIARIZE_EMB_PATH`, skip-on-unset)
+(`MINUTIST_DIARIZE_SEG_PATH` + `MINUTIST_DIARIZE_EMB_PATH`, skip-on-unset)
 that stages the two real sherpa models into the registry cache and re-diarizes a
 meeting whose audio is the S1 two-speaker fixture.
 
@@ -1108,7 +1108,7 @@ label column (lockstep len invariant, drain reset, gap-cap correspondence), plus
 `build_online_diarizer_returns_none_when_model_absent` (the no-download guarantee
 over an empty cache); the `live_diarization` integration test asserts the None-path
 yields all-None `speaker_id` (the "must not break transcription" regression guard),
-with an env-var-gated (`MEETING_APP_DIARIZE_EMB_PATH`) positive case asserting
+with an env-var-gated (`MINUTIST_DIARIZE_EMB_PATH`) positive case asserting
 non-None live labels.
 
 **Phase 9 — `Orchestrator::transcribe_pcm_window(MeetingId, start_ms, end_ms,
@@ -1308,7 +1308,7 @@ assembly, outcome parsing, tool-call extraction, error mapping, the
 sliding-window trim, and the CI gate that compiles every registry schema through
 `json_schema_to_grammar`) is unit-tested with the stub (no model);
 `LlamaTurnBackend` gets a gated test (`#[ignore]` / skip-on-unset
-`MEETING_APP_LLM_MODEL_PATH`), mirroring the `summariser`/`asr-runtime` gated
+`MINUTIST_LLM_MODEL_PATH`), mirroring the `summariser`/`asr-runtime` gated
 tests.
 
 **Context budget (§6.2, "until context full").** A pure `trim_to_budget`
@@ -1812,15 +1812,15 @@ lifetime. Wires the components into a running app.
 The thinnest crate — code here should mostly be construction and
 plumbing.
 
-**Tracing:** file appender at `{app-data}/logs/meeting-app.log`, rotated
+**Tracing:** file appender at `{app-data}/logs/minutist.log`, rotated
 daily, 7-day retention via startup cleanup. Console layer in debug builds
 only. `RUST_LOG`-style filtering via `EnvFilter::from_default_env()`.
 
-**Tray menu:** "Open meeting-app" (show/focus main window) + "Quit"
+**Tray menu:** "Open minutist" (show/focus main window) + "Quit"
 (`app.exit(0)`). Left-click on the tray icon shows the main window.
 Window close intercepts `CloseRequested` and hides rather than exits.
 
-**Bindings harness:** `cargo run -p meeting-app --bin generate-bindings`
+**Bindings harness:** `cargo run -p minutist --bin generate-bindings`
 (alias: `cargo gen-bindings`) writes `ui/src/ipc/bindings.ts` without
 starting the GUI. Run after any `ipc-bridge` command/event surface change.
 
@@ -1990,7 +1990,7 @@ left, transcript right).
   `transcript-dnd.ts`, FR-24/25).** `TranscriptChip` is a first-class atom block
   node carrying `startMs` / `endMs` / `speakerId` / `text`, registered in
   `editor/extensions.ts`. Native HTML5 drag-and-drop (`transcript-dnd.ts`, MIME
-  `application/x-meeting-app-segment`) carries a dragged transcript segment; the
+  `application/x-minutist-segment`) carries a dragged transcript segment; the
   editor's `drop` handler inserts a chip (FR-24). The chip survives the
   `notes.json` `getJSON`↔`setContent` round-trip (relies on the Phase-3 opacity
   guarantee) and exports via tiptap-markdown's node `serialize` hook as a fenced

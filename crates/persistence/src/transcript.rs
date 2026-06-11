@@ -19,7 +19,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use meeting_app_common::{AppResult, Segment};
+use minutist_common::{AppResult, Segment};
 
 use crate::error::Error;
 use crate::folder::MeetingFolder;
@@ -154,19 +154,19 @@ impl TranscriptWriter {
     fn write_to_disk(&self) -> AppResult<()> {
         let json = serde_json::to_string_pretty(&self.buffer)
             .map_err(Error::Serialise)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         let mut file = std::fs::File::create(&self.path)
             .map_err(Error::Io)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         file.write_all(json.as_bytes())
             .map_err(Error::Io)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         file.flush()
             .map_err(Error::Io)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         tracing::debug!(
             target: "persistence",

@@ -17,7 +17,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use meeting_app_common::{AppResult, MeetingMeta};
+use minutist_common::{AppResult, MeetingMeta};
 
 use crate::error::{Error, Result};
 

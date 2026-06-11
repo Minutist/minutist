@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, watch, Mutex};
 
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppEvent, AppResult, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry,
     ModelStatus, ModelStatusState,
 };

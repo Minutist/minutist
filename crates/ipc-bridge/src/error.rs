@@ -22,7 +22,7 @@
 //! Downstream code converts via `IpcError::from(app_error)` or the `?`
 //! operator on `AppResult<T>`.
 
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use thiserror::Error;

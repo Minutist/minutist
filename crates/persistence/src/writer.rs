@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use meeting_app_common::{AppResult, AudioFormat, MeetingId, MeetingMeta, Segment};
+use minutist_common::{AppResult, AudioFormat, MeetingId, MeetingMeta, Segment};
 
 use crate::error::Error;
 use crate::folder::MeetingFolder;
@@ -44,10 +44,10 @@ impl MeetingWriter {
 
         let file = File::create(&audio_path)
             .map_err(Error::Io)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         let buffered = BufWriter::new(file);
-        let encoder = OggOpusEncoder::new(buffered).map_err(meeting_app_common::AppError::from)?;
+        let encoder = OggOpusEncoder::new(buffered).map_err(minutist_common::AppError::from)?;
 
         let transcript_writer = TranscriptWriter::open(&folder)?;
 
@@ -110,7 +110,7 @@ impl MeetingWriter {
         let tw = self
             .transcript_writer
             .as_mut()
-            .ok_or_else(|| meeting_app_common::AppError::Internal {
+            .ok_or_else(|| minutist_common::AppError::Internal {
                 context: "MeetingWriter already finalised".to_string(),
             })?;
         tw.append(segment)?;
@@ -123,13 +123,13 @@ impl MeetingWriter {
         let encoder =
             self.encoder
                 .take()
-                .ok_or_else(|| meeting_app_common::AppError::Internal {
+                .ok_or_else(|| minutist_common::AppError::Internal {
                     context: "MeetingWriter already finalised".to_string(),
                 })?;
 
         encoder
             .finalise()
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         tracing::info!(
             target: "persistence",
@@ -144,7 +144,7 @@ impl MeetingWriter {
 
         // Write metadata.json.
         write_metadata_to_path(&self.folder.metadata_path(), &meta)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         tracing::info!(
             target: "persistence",
@@ -160,7 +160,7 @@ impl MeetingWriter {
     fn encoder_mut(&mut self) -> AppResult<&mut OggOpusEncoder<BufWriter<File>>> {
         self.encoder
             .as_mut()
-            .ok_or_else(|| meeting_app_common::AppError::Internal {
+            .ok_or_else(|| minutist_common::AppError::Internal {
                 context: "MeetingWriter already finalised".to_string(),
             })
     }

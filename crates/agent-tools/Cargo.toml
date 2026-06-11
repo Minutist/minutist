@@ -13,7 +13,7 @@ authors.workspace = true
 # `Orchestrator::transcribe_pcm_window`).
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 persistence = { path = "../persistence" }
 orchestrator = { path = "../orchestrator" }
 async-trait = { workspace = true }

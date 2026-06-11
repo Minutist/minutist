@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use meeting_app_common::AppEvent;
+use minutist_common::AppEvent;
 use orchestrator::Orchestrator;
 use serde::{Deserialize, Serialize};
 use specta::Type;

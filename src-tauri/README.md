@@ -1,4 +1,4 @@
-# src-tauri — meeting-app Tauri binary
+# src-tauri — minutist Tauri binary
 
 The `app-main` crate. Wires every Phase 1 crate into a running Tauri desktop app.
 
@@ -9,7 +9,7 @@ regenerated after any command or event surface change in `ipc-bridge`.
 
 ```sh
 # From the workspace root:
-cargo run -p meeting-app --bin generate-bindings
+cargo run -p minutist --bin generate-bindings
 
 # Or using the cargo alias:
 cargo gen-bindings
@@ -21,10 +21,10 @@ The output path is always `<workspace-root>/ui/src/ipc/bindings.ts`.
 
 ```sh
 # Build the binary (no GUI — works on WSL/CI):
-cargo build -p meeting-app
+cargo build -p minutist
 
 # Lint:
-cargo clippy -p meeting-app -- -D warnings
+cargo clippy -p minutist -- -D warnings
 
 # Format check:
 cargo fmt --check

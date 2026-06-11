@@ -1,4 +1,4 @@
-//! `ipc-bridge` — Tauri command + event surface for meeting-app.
+//! `ipc-bridge` — Tauri command + event surface for minutist.
 //!
 //! This is the **only** crate in the workspace that imports `tauri::*`.
 //! Every other crate is free of Tauri imports, which keeps them testable
@@ -44,7 +44,7 @@
 //!
 //! The Phase-9 chat commands realise the granted `ipc-bridge → agent-tools` +
 //! `ipc-bridge → chat-agent` edges. `send_chat_message` creates/loads the chat
-//! [`meeting_app_common::ChatSession`], appends the user message, and spawns the
+//! [`minutist_common::ChatSession`], appends the user message, and spawns the
 //! turn on a background task; the turn streams via the chat `AppEvent`s and the
 //! session is persisted via `persistence::ChatStore` at turn end. The held LLM
 //! substrate ([`IpcState::summariser`], a lazily-loaded `Arc<LlamaSummariser>`)
@@ -111,7 +111,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_tools::ToolRegistry;
-use meeting_app_common::AppEvent;
+use minutist_common::AppEvent;
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use settings::SettingsHandle;
@@ -187,7 +187,7 @@ pub struct IpcState {
     /// non-awaiting insert/remove. SHARED with the Phase-10 inter-agent driver
     /// (so an external turn and a human turn cannot run on one session at once).
     pub chat_in_flight:
-        Arc<std::sync::Mutex<std::collections::HashSet<meeting_app_common::ChatSessionId>>>,
+        Arc<std::sync::Mutex<std::collections::HashSet<minutist_common::ChatSessionId>>>,
     /// Per-session chat-turn cancellation flags (P1). A running turn registers a
     /// `chat_agent::CancelFlag` here keyed by session id; `cancel_chat_turn`
     /// raises it, and the decode loop stops at the next between-token check. The
@@ -196,7 +196,7 @@ pub struct IpcState {
     /// remove, mirroring `chat_in_flight`.
     pub chat_cancel: Arc<
         std::sync::Mutex<
-            std::collections::HashMap<meeting_app_common::ChatSessionId, chat_agent::CancelFlag>,
+            std::collections::HashMap<minutist_common::ChatSessionId, chat_agent::CancelFlag>,
         >,
     >,
     /// The live MCP server endpoint, set by `app-main` after `mcp_server::serve`
@@ -257,8 +257,8 @@ impl IpcState {
     /// `architecture/cross-cutting.md` — "GPU portability".
     pub fn log_gpu_probe(&self) {
         let s = self.settings.current();
-        let probe = meeting_app_common::probe_primary_gpu();
-        let plan = meeting_app_common::resolve_gpu_plan(
+        let probe = minutist_common::probe_primary_gpu();
+        let plan = minutist_common::resolve_gpu_plan(
             probe.as_ref(),
             s.gpu_acceleration,
             s.prefer_large_asr_model,
@@ -382,8 +382,8 @@ pub struct ResolvedNoteAsset {
 pub fn resolve_note_asset(
     meetings_dir: &std::path::Path,
     request_path: &str,
-) -> Result<ResolvedNoteAsset, meeting_app_common::AppError> {
-    use meeting_app_common::{AppError, MeetingId};
+) -> Result<ResolvedNoteAsset, minutist_common::AppError> {
+    use minutist_common::{AppError, MeetingId};
 
     // Strip the leading '/', then split into exactly two non-empty segments.
     let trimmed = request_path.trim_start_matches('/');
@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn resolve_note_asset_serves_saved_image_with_content_type() {
-        use meeting_app_common::MeetingId;
+        use minutist_common::MeetingId;
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn resolve_note_asset_rejects_malformed_and_traversal_paths() {
-        use meeting_app_common::{AppError, MeetingId};
+        use minutist_common::{AppError, MeetingId};
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();

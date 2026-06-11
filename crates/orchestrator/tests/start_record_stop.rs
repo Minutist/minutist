@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
-use meeting_app_common::{AppError, AppEvent, AudioMeterFrame, MeetingId, RecordingState};
+use minutist_common::{AppError, AppEvent, AudioMeterFrame, MeetingId, RecordingState};
 use orchestrator::test_support::test_orchestrator;
 use tokio::sync::mpsc;
 
@@ -219,7 +219,7 @@ async fn start_record_stop_produces_valid_meeting_files() {
     assert!(meta_path.exists(), "metadata.json must exist");
 
     let json = std::fs::read_to_string(&meta_path).expect("read metadata.json");
-    let on_disk: meeting_app_common::MeetingMeta =
+    let on_disk: minutist_common::MeetingMeta =
         serde_json::from_str(&json).expect("deserialise metadata.json");
     assert_eq!(on_disk.uuid, meeting_id, "on-disk uuid must match");
     assert_eq!(on_disk.audio_format.codec, "opus");

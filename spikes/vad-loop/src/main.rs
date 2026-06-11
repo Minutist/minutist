@@ -41,7 +41,7 @@ use llama_cpp_2::mtmd::{
     mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
 };
 use llama_cpp_2::sampling::LlamaSampler;
-use meeting_app_common::Segment;
+use minutist_common::Segment;
 use vad_rs::Vad;
 
 // ---------------------------------------------------------------------------

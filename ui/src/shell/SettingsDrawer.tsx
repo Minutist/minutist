@@ -230,7 +230,7 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             aria-haspopup="dialog"
             onClick={onAbout}
           >
-            About meeting-app
+            About Minutist
           </button>
         </footer>
       </aside>

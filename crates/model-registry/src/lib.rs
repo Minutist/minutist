@@ -43,7 +43,7 @@ pub use error::Error;
 pub use manifest::{parse_manifest, ManifestFile};
 pub use registry::ModelRegistry;
 
-use meeting_app_common::{AppResult, ModelManifestEntry};
+use minutist_common::{AppResult, ModelManifestEntry};
 
 /// Convenience constructor: parse the bundled manifest bytes.
 ///

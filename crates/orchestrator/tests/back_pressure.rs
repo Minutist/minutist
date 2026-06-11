@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use audio_capture::test_source::DummyAudioSource;
-use meeting_app_common::{AppEvent, AppError};
+use minutist_common::{AppEvent, AppError};
 use orchestrator::test_support::{test_orchestrator, FlushBackpressureHarness};
 use tokio::sync::broadcast::error::RecvError;
 

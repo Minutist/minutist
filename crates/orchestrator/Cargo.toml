@@ -23,7 +23,7 @@ cuda = ["asr-runtime/cuda", "diarizer/cuda", "asr-parakeet/cuda"]
 directml = ["diarizer/directml", "asr-parakeet/directml"]
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 audio-capture = { path = "../audio-capture" }
 vad-chunker = { path = "../vad-chunker" }
 asr-runtime = { path = "../asr-runtime" }

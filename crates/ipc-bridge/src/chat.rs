@@ -34,7 +34,7 @@ use chat_agent::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
 use chat_agent::{
     CancelFlag, ChatEngine, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome,
 };
-use meeting_app_common::{AppError, AppEvent, AppResult, ChatSessionId};
+use minutist_common::{AppError, AppEvent, AppResult, ChatSessionId};
 
 /// The max number of tool-call iterations one turn may take before the driver
 /// forces a final answer (§6.1). A model that keeps requesting tools past this
@@ -401,8 +401,8 @@ pub fn initial_history(system_prompt: &str) -> Vec<ChatMessage> {
 /// the valid `assistant(tool_calls) → tool(result)` sequence), and a `Tool`
 /// message uses its persisted `tool_call_id` so it re-links to the matching
 /// call rather than a synthesised id.
-pub fn engine_message_from_wire(m: &meeting_app_common::ChatMessage) -> ChatMessage {
-    use meeting_app_common::ChatRole;
+pub fn engine_message_from_wire(m: &minutist_common::ChatMessage) -> ChatMessage {
+    use minutist_common::ChatRole;
     match m.role {
         ChatRole::System => ChatMessage::system(m.content.clone()),
         ChatRole::User => ChatMessage::user(m.content.clone()),
@@ -432,8 +432,8 @@ pub fn engine_message_from_wire(m: &meeting_app_common::ChatMessage) -> ChatMess
 }
 
 /// Map the engine's role to the persisted/wire `common::ChatRole`.
-pub fn wire_role(role: Role) -> meeting_app_common::ChatRole {
-    use meeting_app_common::ChatRole;
+pub fn wire_role(role: Role) -> minutist_common::ChatRole {
+    use minutist_common::ChatRole;
     match role {
         Role::System => ChatRole::System,
         Role::User => ChatRole::User,

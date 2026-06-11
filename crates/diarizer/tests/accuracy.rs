@@ -1,15 +1,15 @@
 //! Env-var-gated diarization accuracy tests.
 //!
 //! These need the two real ONNX models, so they are gated on
-//! `MEETING_APP_DIARIZE_SEG_PATH` (pyannote segmentation) and
-//! `MEETING_APP_DIARIZE_EMB_PATH` (speaker embedding). When either env var is
+//! `MINUTIST_DIARIZE_SEG_PATH` (pyannote segmentation) and
+//! `MINUTIST_DIARIZE_EMB_PATH` (speaker embedding). When either env var is
 //! unset the test logs a skip line and returns `Ok` — the default `cargo test
 //! -p diarizer` suite (no model, no GPU) passes with these skipped, per
 //! `architecture/cross-cutting.md` "Automated-testing policy".
 //!
 //! To run:
-//!   MEETING_APP_DIARIZE_SEG_PATH=/path/to/segmentation.onnx \
-//!   MEETING_APP_DIARIZE_EMB_PATH=/path/to/embedding.onnx \
+//!   MINUTIST_DIARIZE_SEG_PATH=/path/to/segmentation.onnx \
+//!   MINUTIST_DIARIZE_EMB_PATH=/path/to/embedding.onnx \
 //!   cargo test -p diarizer --test accuracy
 //!
 //! Fixtures (committed, real speech — see `tests/fixtures/README.md`): two
@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use diarizer::{DiarizerConfig, SherpaDiarizer};
-use meeting_app_common::{Diarizer, Segment};
+use minutist_common::{Diarizer, Segment};
 
 const SAMPLE_RATE: u32 = 16_000;
 /// Speaker A occupies `[0, A_END_MS)` of the two-speaker fixture; speaker B the
@@ -41,8 +41,8 @@ const SEGMENT_MS: u64 = 1_000;
 /// value does not turn into a bogus `PathBuf::from("")` that panics on open.
 fn model_paths() -> Option<(PathBuf, PathBuf)> {
     let non_empty = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
-    let seg = non_empty("MEETING_APP_DIARIZE_SEG_PATH")?;
-    let emb = non_empty("MEETING_APP_DIARIZE_EMB_PATH")?;
+    let seg = non_empty("MINUTIST_DIARIZE_SEG_PATH")?;
+    let emb = non_empty("MINUTIST_DIARIZE_EMB_PATH")?;
     Some((PathBuf::from(seg), PathBuf::from(emb)))
 }
 
@@ -142,7 +142,7 @@ fn two_speaker_accuracy_at_least_80pct() {
     let Some((seg_path, emb_path)) = model_paths() else {
         eprintln!(
             "skipping two_speaker_accuracy_at_least_80pct: set \
-             MEETING_APP_DIARIZE_SEG_PATH and MEETING_APP_DIARIZE_EMB_PATH to run"
+             MINUTIST_DIARIZE_SEG_PATH and MINUTIST_DIARIZE_EMB_PATH to run"
         );
         return;
     };
@@ -174,7 +174,7 @@ fn single_speaker_control_one_label() {
     let Some((seg_path, emb_path)) = model_paths() else {
         eprintln!(
             "skipping single_speaker_control_one_label: set \
-             MEETING_APP_DIARIZE_SEG_PATH and MEETING_APP_DIARIZE_EMB_PATH to run"
+             MINUTIST_DIARIZE_SEG_PATH and MINUTIST_DIARIZE_EMB_PATH to run"
         );
         return;
     };

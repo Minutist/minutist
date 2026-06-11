@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppResult, InterAgentRequest, MeetingId, MeetingMeta, RecordingState, Segment,
 };
 use serde_json::json;
@@ -1092,8 +1092,8 @@ impl Tool for SendToInternalAgent {
 
 /// Parse a `ChatSessionId` from its hyphenated-UUID wire string. `InvalidInput`
 /// on a malformed id (mirrors [`crate::parse_meeting_id`]).
-fn parse_session_id(s: &str) -> AppResult<meeting_app_common::ChatSessionId> {
-    serde_json::from_str::<meeting_app_common::ChatSessionId>(&format!("\"{s}\"")).map_err(|_| {
+fn parse_session_id(s: &str) -> AppResult<minutist_common::ChatSessionId> {
+    serde_json::from_str::<minutist_common::ChatSessionId>(&format!("\"{s}\"")).map_err(|_| {
         AppError::InvalidInput {
             context: format!("invalid session_id: {s}"),
         }

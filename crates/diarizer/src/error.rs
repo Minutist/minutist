@@ -2,7 +2,7 @@
 //! `From` impl below, so the public diarizer surface returns `AppResult`
 //! (no `diarizer::Error` leaks across the crate boundary).
 
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -51,7 +51,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use agent_tools::{InterAgentEnvelope, ToolContext, ToolRegistry};
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppResult, ChatMessage, ChatRole, ChatSession, ChatSessionId, InterAgentReply,
     MeetingId, Summariser,
 };
@@ -121,7 +121,7 @@ async fn handle_request(
     registry: &Arc<ToolRegistry>,
     chat_in_flight: &Arc<Mutex<HashSet<ChatSessionId>>>,
     allow_writes: bool,
-    request: meeting_app_common::InterAgentRequest,
+    request: minutist_common::InterAgentRequest,
 ) -> AppResult<InterAgentReply> {
     let meetings_dir = handles.meetings_dir.clone();
     let meeting_id: Option<MeetingId> = request.meeting_id;

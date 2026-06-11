@@ -5,7 +5,7 @@
 //! Run from the workspace root:
 //!
 //! ```sh
-//! cargo run -p meeting-app --bin generate-bindings
+//! cargo run -p minutist --bin generate-bindings
 //! ```
 //!
 //! Or via the cargo alias (see `.cargo/config.toml`):

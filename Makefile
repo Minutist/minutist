@@ -1,4 +1,4 @@
-# meeting-app developer task runner.
+# minutist developer task runner.
 #
 # Thin wrappers over the underlying cargo / npm / script commands so the common
 # build / test / clean tasks are one-liners with LIBCLANG_PATH (needed by
@@ -83,7 +83,7 @@ fmt-check: ## Check Rust formatting without writing (CI-style)
 
 # --- Codegen / docs --------------------------------------------------------
 bindings: ## Regenerate ui/src/ipc/bindings.ts from the Rust IPC surface
-	$(CARGO) run -p meeting-app --bin generate-bindings
+	$(CARGO) run -p minutist --bin generate-bindings
 
 render-arch: ## Re-render the C4 SVGs from workspace.dsl (needs Docker)
 	scripts/render-architecture.sh

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::{watch, RwLock};
 
-use meeting_app_common::AppResult;
+use minutist_common::AppResult;
 
 use crate::{error::Error, store::SettingsStore, Settings};
 
@@ -112,10 +112,10 @@ impl SettingsHandle {
         let value_for_save = new_value.clone();
         tokio::task::spawn_blocking(move || inner.store.save(&value_for_save))
             .await
-            .map_err(|e| meeting_app_common::AppError::Internal {
+            .map_err(|e| minutist_common::AppError::Internal {
                 context: format!("settings save task failed to join: {e}"),
             })?
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
 
         // Publish via `send_replace`, NOT `send`. `send` is a no-op (returns
         // `Err`, discarded) when there are no live subscribers, which would

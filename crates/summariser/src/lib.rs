@@ -1,6 +1,6 @@
 //! `summariser` — local-LLM text summarisation.
 //!
-//! Implements [`meeting_app_common::Summariser`] by driving a GGUF text model
+//! Implements [`minutist_common::Summariser`] by driving a GGUF text model
 //! through `llama-cpp-2`. The model is resolved + selected by the caller
 //! (settings `llm_model_id` → `model-registry`), so this crate is
 //! **model-agnostic**: it reads the GGUF's baked-in chat template rather than
@@ -49,7 +49,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 
-use meeting_app_common::{AppResult, NoteBlock, Segment, Summariser};
+use minutist_common::{AppResult, NoteBlock, Segment, Summariser};
 
 mod error;
 pub use error::Error;
@@ -125,9 +125,9 @@ impl Default for SummariserConfig {
 /// global (once per process) and `asr-runtime` also loads a GGUF model in the
 /// same app process, so a private per-crate `OnceLock` here would make
 /// whichever crate inits second fail — exactly the record-then-summarise bug
-/// this delegation fixes. See `meeting_app_common::llama_backend`.
+/// this delegation fixes. See `minutist_common::llama_backend`.
 fn get_or_init_backend() -> Result<&'static LlamaBackend, Error> {
-    meeting_app_common::llama_backend::shared_llama_backend().map_err(|e| Error::ModelLoad {
+    minutist_common::llama_backend::shared_llama_backend().map_err(|e| Error::ModelLoad {
         path: "llama-backend".to_string(),
         context: e.to_string(),
     })
@@ -856,7 +856,7 @@ mod tests {
     /// so the caller surfaces it as caller-input, never a panic.
     #[test]
     fn context_budget_error_maps_to_invalid_input() {
-        use meeting_app_common::AppError;
+        use minutist_common::AppError;
         let err = check_context_budget(950, 100, 1_000).unwrap_err();
         let app: AppError = err.into();
         assert!(matches!(app, AppError::InvalidInput { .. }));
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn template_error_maps_to_invalid_input() {
-        use meeting_app_common::AppError;
+        use minutist_common::AppError;
         let app: AppError = Error::Template("no chat template baked into GGUF".to_string()).into();
         match app {
             AppError::InvalidInput { context } => {
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn context_overflow_maps_to_invalid_input() {
-        use meeting_app_common::AppError;
+        use minutist_common::AppError;
         let app: AppError = Error::ContextOverflow("prompt too long".to_string()).into();
         assert!(matches!(app, AppError::InvalidInput { .. }));
     }
@@ -1066,7 +1066,7 @@ mod tests {
     /// `AppError::ModelLoad`, not panic.
     #[test]
     fn open_nonexistent_path_returns_model_load_error() {
-        use meeting_app_common::AppError;
+        use minutist_common::AppError;
         let result = LlamaSummariser::open(
             PathBuf::from("/nonexistent/model.gguf"),
             SummariserConfig::default(),
@@ -1092,10 +1092,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Gated real-model test — skips when MEETING_APP_LLM_MODEL_PATH is absent.
+    // Gated real-model test — skips when MINUTIST_LLM_MODEL_PATH is absent.
     //
     // To run:
-    //   MEETING_APP_LLM_MODEL_PATH=/path/to/model.gguf \
+    //   MINUTIST_LLM_MODEL_PATH=/path/to/model.gguf \
     //   cargo test -p summariser -- --include-ignored
     // -----------------------------------------------------------------------
 
@@ -1131,9 +1131,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires MEETING_APP_LLM_MODEL_PATH"]
+    #[ignore = "requires MINUTIST_LLM_MODEL_PATH"]
     fn summarise_synthetic_transcript_produces_markdown() {
-        let model_path = match std::env::var("MEETING_APP_LLM_MODEL_PATH") {
+        let model_path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
             Ok(p) => p,
             Err(_) => return, // no-op skip path
         };
@@ -1177,19 +1177,19 @@ mod tests {
     }
 
     /// Real-recording summary: load an actual meeting's `transcript.json` from
-    /// `MEETING_APP_RECORDINGS_DIR` and summarise it with the real LLM. This
+    /// `MINUTIST_RECORDINGS_DIR` and summarise it with the real LLM. This
     /// exercises the exact path that broke in the field (the Gemma chat-template
     /// render → `apply_chat_template` ffi -1) on GENUINE data, not a synthetic
     /// transcript — the regression guard for that bug. Skips cleanly when either
     /// env var is unset or no recording has usable transcript text.
     #[test]
-    #[ignore = "requires MEETING_APP_LLM_MODEL_PATH and MEETING_APP_RECORDINGS_DIR"]
+    #[ignore = "requires MINUTIST_LLM_MODEL_PATH and MINUTIST_RECORDINGS_DIR"]
     fn summarise_real_recording_produces_markdown() {
-        let model_path = match std::env::var("MEETING_APP_LLM_MODEL_PATH") {
+        let model_path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
             Ok(p) if !p.is_empty() => p,
             _ => return,
         };
-        let recordings_dir = match std::env::var("MEETING_APP_RECORDINGS_DIR") {
+        let recordings_dir = match std::env::var("MINUTIST_RECORDINGS_DIR") {
             Ok(p) if !p.is_empty() => p,
             _ => return,
         };

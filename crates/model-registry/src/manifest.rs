@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use meeting_app_common::ModelManifestEntry;
+use minutist_common::ModelManifestEntry;
 
 use crate::error::Error;
 

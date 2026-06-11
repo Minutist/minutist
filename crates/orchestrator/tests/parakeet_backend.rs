@@ -6,18 +6,18 @@
 //! timestamps (the gap the Qwen mtmd path has), and runs near real-time on CPU.
 //!
 //! Gated on env (skips otherwise):
-//!   MEETING_APP_PARAKEET_DIR   = extracted sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/
-//!   MEETING_APP_RECORDINGS_DIR = the app meetings/ dir
-//! Optional: MEETING_APP_SPIKE_MEETING_ID (defaults to the known test recording).
+//!   MINUTIST_PARAKEET_DIR   = extracted sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/
+//!   MINUTIST_RECORDINGS_DIR = the app meetings/ dir
+//! Optional: MINUTIST_SPIKE_MEETING_ID (defaults to the known test recording).
 //!
-//! Run: source tests-local.env, set MEETING_APP_PARAKEET_DIR, then
+//! Run: source tests-local.env, set MINUTIST_PARAKEET_DIR, then
 //!   cargo test -p orchestrator --test parakeet_backend -- --include-ignored --nocapture
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use asr_parakeet::{ParakeetBackend, ParakeetConfig};
-use meeting_app_common::{AsrBackend, AudioChunk};
+use minutist_common::{AsrBackend, AudioChunk};
 
 const DEFAULT_MEETING: &str = "f63ed109-f492-476a-ad71-fed93ae64669";
 
@@ -29,19 +29,19 @@ fn is_cjk(s: &str) -> bool {
 }
 
 #[test]
-#[ignore = "model-gated: set MEETING_APP_PARAKEET_DIR + MEETING_APP_RECORDINGS_DIR"]
+#[ignore = "model-gated: set MINUTIST_PARAKEET_DIR + MINUTIST_RECORDINGS_DIR"]
 fn parakeet_backend_transcribes_real_recording_with_timestamps() {
-    let Some(model_dir) = std::env::var("MEETING_APP_PARAKEET_DIR").ok().filter(|s| !s.is_empty())
+    let Some(model_dir) = std::env::var("MINUTIST_PARAKEET_DIR").ok().filter(|s| !s.is_empty())
     else {
-        eprintln!("skip: set MEETING_APP_PARAKEET_DIR to the extracted parakeet-tdt-0.6b-v3 dir");
+        eprintln!("skip: set MINUTIST_PARAKEET_DIR to the extracted parakeet-tdt-0.6b-v3 dir");
         return;
     };
-    let Some(recordings) = std::env::var("MEETING_APP_RECORDINGS_DIR").ok().filter(|s| !s.is_empty())
+    let Some(recordings) = std::env::var("MINUTIST_RECORDINGS_DIR").ok().filter(|s| !s.is_empty())
     else {
-        eprintln!("skip: set MEETING_APP_RECORDINGS_DIR");
+        eprintln!("skip: set MINUTIST_RECORDINGS_DIR");
         return;
     };
-    let meeting_id = std::env::var("MEETING_APP_SPIKE_MEETING_ID")
+    let meeting_id = std::env::var("MINUTIST_SPIKE_MEETING_ID")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_MEETING.to_string());

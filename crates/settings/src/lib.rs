@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use meeting_app_common::{GpuAcceleration, ModelId};
+use minutist_common::{GpuAcceleration, ModelId};
 use serde::{Deserialize, Serialize};
 
 pub mod error;

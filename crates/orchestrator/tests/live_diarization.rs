@@ -9,7 +9,7 @@
 //!    is unchanged when live diarization is off. This is the regression guard for
 //!    the "must not break transcription" hard constraint.
 //!
-//! 2. **Positive case (env-gated on `MEETING_APP_DIARIZE_EMB_PATH`, skip on
+//! 2. **Positive case (env-gated on `MINUTIST_DIARIZE_EMB_PATH`, skip on
 //!    unset — mirrors `diarizer/tests/online_embedding.rs`).** With a real
 //!    `OnlineDiarizer` built from the embedding model, the emitted segments carry
 //!    non-None sticky labels. The default `cargo test -p orchestrator` suite
@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
 use diarizer::{OnlineDiarizer, OnlineDiarizerConfig};
-use meeting_app_common::{AppEvent, Segment};
+use minutist_common::{AppEvent, Segment};
 use model_registry::ModelRegistry;
 use orchestrator::test_support::StubAsrBackend;
 use orchestrator::Orchestrator;
@@ -104,7 +104,7 @@ fn test_orchestrator(
 
 /// Resolve the gated embedding-model path, or `None` (→ skip) when unset.
 fn embedding_path() -> Option<PathBuf> {
-    std::env::var("MEETING_APP_DIARIZE_EMB_PATH")
+    std::env::var("MINUTIST_DIARIZE_EMB_PATH")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
@@ -206,7 +206,7 @@ async fn none_diarizer_yields_all_none_speaker_ids() {
 // ---------------------------------------------------------------------------
 
 /// With a real `OnlineDiarizer`, the emitted segments carry non-None sticky
-/// labels. Skipped (no failure) when `MEETING_APP_DIARIZE_EMB_PATH` is unset.
+/// labels. Skipped (no failure) when `MINUTIST_DIARIZE_EMB_PATH` is unset.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_diarizer_populates_speaker_ids() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -214,7 +214,7 @@ async fn live_diarizer_populates_speaker_ids() {
     let Some(emb_path) = embedding_path() else {
         eprintln!(
             "skipping live_diarizer_populates_speaker_ids: set \
-             MEETING_APP_DIARIZE_EMB_PATH to run"
+             MINUTIST_DIARIZE_EMB_PATH to run"
         );
         return;
     };

@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use agent_tools::{ToolContext, ToolOutput};
 use chat_agent::{LlamaTurnBackend, LlamaTurnConfig, TurnEngine};
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppEvent, AppResult, AudioDevice, ChatMessage, ChatRole, ChatSession, ChatSessionId,
     MeetingId, MeetingListEntry, MeetingMeta, MeetingState, ModelId, ModelStatus, NotesDocument,
     OperationKind, RecordingState, Summariser,
@@ -1819,7 +1819,7 @@ fn wire_produced_from_delta(
             tool_calls: m
                 .tool_calls
                 .iter()
-                .map(|c| meeting_app_common::ToolCallRecord {
+                .map(|c| minutist_common::ToolCallRecord {
                     id: c.id.clone(),
                     name: c.name.clone(),
                     arguments_json: c.arguments_json.clone(),
@@ -1863,7 +1863,7 @@ fn open_meeting_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meeting_app_common::{MeetingId, NoteBlock};
+    use minutist_common::{MeetingId, NoteBlock};
     use persistence::{MeetingFolder, MeetingIndex};
     use tempfile::TempDir;
 
@@ -1968,7 +1968,7 @@ mod tests {
     // no model — a synthetic meeting folder + in-memory libsql index).
     // -----------------------------------------------------------------------
 
-    use meeting_app_common::{AudioFormat, MeetingMeta, Segment};
+    use minutist_common::{AudioFormat, MeetingMeta, Segment};
 
     /// Write a synthetic meeting folder (`metadata.json` + optional
     /// `transcript.json`) under `root` and return its `MeetingId`. Mirrors the
@@ -2494,21 +2494,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Gated real-model test — skips when MEETING_APP_LLM_MODEL_PATH is unset.
+    // Gated real-model test — skips when MINUTIST_LLM_MODEL_PATH is unset.
     //
     // To run:
-    //   MEETING_APP_LLM_MODEL_PATH=/path/to/gemma-4-E4B-it-Q4_K_M.gguf \
+    //   MINUTIST_LLM_MODEL_PATH=/path/to/gemma-4-E4B-it-Q4_K_M.gguf \
     //   cargo test -p ipc-bridge -- --include-ignored
     // -----------------------------------------------------------------------
 
     /// End-to-end summarise over a synthetic meeting folder using the **real**
-    /// Gemma-4 GGUF pointed to by `MEETING_APP_LLM_MODEL_PATH`: open the model,
+    /// Gemma-4 GGUF pointed to by `MINUTIST_LLM_MODEL_PATH`: open the model,
     /// run `summarise_meeting_inner`, assert a non-empty markdown summary is
     /// written, and record latency. No-op skip when the env var is unset.
     #[test]
-    #[ignore = "requires MEETING_APP_LLM_MODEL_PATH"]
+    #[ignore = "requires MINUTIST_LLM_MODEL_PATH"]
     fn summarise_real_model_writes_non_empty_summary() {
-        let model_path = match std::env::var("MEETING_APP_LLM_MODEL_PATH") {
+        let model_path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
             Ok(p) => p,
             Err(_) => return, // no-op skip path
         };

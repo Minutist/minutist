@@ -25,7 +25,7 @@ pub use manager::{AudioCaptureManager, AudioFrameBatch, AudioStreams};
 // Integration-test modules that live alongside the source.
 #[cfg(test)]
 mod tests {
-    use meeting_app_common::AudioDevice;
+    use minutist_common::AudioDevice;
 
     use super::*;
 

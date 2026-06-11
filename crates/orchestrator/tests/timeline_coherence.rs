@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
-use meeting_app_common::{AppError, AudioFormat, MeetingId, MeetingMeta, Segment};
+use minutist_common::{AppError, AudioFormat, MeetingId, MeetingMeta, Segment};
 use orchestrator::test_support::{test_orchestrator, StubAsrBackend};
 use persistence::{MeetingIndex, MeetingWriter};
 use tokio::sync::mpsc;
@@ -49,7 +49,7 @@ fn load_fixture_wav() -> Vec<f32> {
 
 fn live_streams() -> (
     mpsc::Sender<AudioFrameBatch>,
-    mpsc::Sender<meeting_app_common::AudioMeterFrame>,
+    mpsc::Sender<minutist_common::AudioMeterFrame>,
     AudioStreams,
 ) {
     let (sample_tx, sample_rx) = mpsc::channel::<AudioFrameBatch>(256);

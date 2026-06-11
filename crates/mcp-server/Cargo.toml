@@ -17,7 +17,7 @@ authors.workspace = true
 # place rmcp types are allowed.
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 agent-tools = { path = "../agent-tools" }
 rmcp = { workspace = true }
 # rmcp's StreamableHttpService is a `tower_service::Service<Request<Body>>`; we

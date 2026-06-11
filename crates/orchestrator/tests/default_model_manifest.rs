@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use meeting_app_common::{ModelId, ModelKind};
+use minutist_common::{ModelId, ModelKind};
 
 /// Literal copies of `runner::DIARIZE_SEG_MODEL_ID` / `DIARIZE_EMB_MODEL_ID`
 /// (crate-private, so they cannot be imported here). If `runner.rs` renames a

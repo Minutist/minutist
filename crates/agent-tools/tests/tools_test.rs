@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agent_tools::{ToolContext, ToolRegistry};
-use meeting_app_common::{
+use minutist_common::{
     AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, NoteBlock, Segment, Summariser,
 };
 use orchestrator::test_support::test_orchestrator;
@@ -105,7 +105,7 @@ async fn seed_meeting(
     }
 
     // Index it so list/search tools see it.
-    let entry = meeting_app_common::MeetingListEntry {
+    let entry = minutist_common::MeetingListEntry {
         id,
         title: title.to_string(),
         started_at: meta.started_at.clone(),
@@ -356,7 +356,7 @@ async fn dispatch_unknown_tool_is_invalid_input() {
         .unwrap_err();
     assert!(matches!(
         err,
-        meeting_app_common::AppError::InvalidInput { .. }
+        minutist_common::AppError::InvalidInput { .. }
     ));
 }
 
@@ -372,7 +372,7 @@ async fn dispatch_missing_required_arg_is_invalid_input() {
         .unwrap_err();
     assert!(matches!(
         err,
-        meeting_app_common::AppError::InvalidInput { .. }
+        minutist_common::AppError::InvalidInput { .. }
     ));
 }
 
@@ -388,7 +388,7 @@ async fn dispatch_missing_meeting_without_default_is_invalid_input() {
         .unwrap_err();
     assert!(matches!(
         err,
-        meeting_app_common::AppError::InvalidInput { .. }
+        minutist_common::AppError::InvalidInput { .. }
     ));
 }
 
@@ -839,7 +839,7 @@ async fn set_speaker_name_rejects_overlong_name() {
         .await
         .expect_err("an over-length name must be rejected");
     match err {
-        meeting_app_common::AppError::InvalidInput { context } => {
+        minutist_common::AppError::InvalidInput { context } => {
             assert!(context.contains("too long"), "got: {context}");
         }
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -871,7 +871,7 @@ async fn set_speaker_name_rejects_overlong_speaker_id() {
         .expect_err("an over-length speaker_id must be rejected");
     assert!(matches!(
         err,
-        meeting_app_common::AppError::InvalidInput { .. }
+        minutist_common::AppError::InvalidInput { .. }
     ));
 }
 
@@ -891,7 +891,7 @@ async fn rename_meeting_rejects_overlong_title() {
         .await
         .expect_err("an over-length title must be rejected");
     match err {
-        meeting_app_common::AppError::InvalidInput { context } => {
+        minutist_common::AppError::InvalidInput { context } => {
             assert!(context.contains("too long"), "got: {context}");
         }
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -946,7 +946,7 @@ async fn send_to_internal_agent_unavailable_without_bridge() {
         .await
         .expect_err("no bridge → error");
     match err {
-        meeting_app_common::AppError::InvalidInput { context } => {
+        minutist_common::AppError::InvalidInput { context } => {
             assert!(context.contains("not available"), "got: {context}");
         }
         other => panic!("expected InvalidInput, got {other:?}"),
@@ -962,7 +962,7 @@ async fn send_to_internal_agent_busy_on_full_queue() {
     // Pre-fill the single slot so the tool's try_send fails as "Full".
     let (pre_reply_tx, _pre_reply_rx) = tokio::sync::oneshot::channel();
     tx.try_send((
-        meeting_app_common::InterAgentRequest {
+        minutist_common::InterAgentRequest {
             session_id: None,
             meeting_id: None,
             message: "prefill".into(),
@@ -982,7 +982,7 @@ async fn send_to_internal_agent_busy_on_full_queue() {
         .await
         .expect_err("full queue → busy");
     match err {
-        meeting_app_common::AppError::InvalidInput { context } => {
+        minutist_common::AppError::InvalidInput { context } => {
             assert!(context.contains("busy"), "got: {context}");
         }
         other => panic!("expected InvalidInput busy, got {other:?}"),
@@ -1014,7 +1014,7 @@ async fn stop_recording_dispatches_to_orchestrator_and_rejects_when_idle() {
         .expect_err("stop while idle must be rejected by the orchestrator");
     assert!(matches!(
         err,
-        meeting_app_common::AppError::InvalidInput { .. }
+        minutist_common::AppError::InvalidInput { .. }
     ));
 }
 
@@ -1029,7 +1029,7 @@ async fn pause_and_resume_recording_dispatch_to_orchestrator_and_reject_when_idl
         .expect_err("pause while idle must be rejected");
     assert!(matches!(
         pause_err,
-        meeting_app_common::AppError::InvalidInput { .. }
+        minutist_common::AppError::InvalidInput { .. }
     ));
 
     let resume_err = reg
@@ -1038,7 +1038,7 @@ async fn pause_and_resume_recording_dispatch_to_orchestrator_and_reject_when_idl
         .expect_err("resume while idle must be rejected");
     assert!(matches!(
         resume_err,
-        meeting_app_common::AppError::InvalidInput { .. }
+        minutist_common::AppError::InvalidInput { .. }
     ));
 }
 

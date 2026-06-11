@@ -42,7 +42,7 @@ const THEME_OPTIONS: { value: Theme; label: string }[] = [
 function WelcomeStep() {
   return (
     <div className="onboarding__body">
-      <h1 className="onboarding__title">Welcome to meeting-app</h1>
+      <h1 className="onboarding__title">Welcome to Minutist</h1>
       <p className="onboarding__lede">
         A calm, local-first place for meeting notes. Write as you would on
         paper; the transcript, speakers, and summary gather quietly alongside —

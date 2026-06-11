@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use meeting_app_common::{AppResult, MeetingId};
+use minutist_common::{AppResult, MeetingId};
 
 use crate::error::Error;
 use crate::index::MeetingIndex;
@@ -89,11 +89,11 @@ pub async fn delete_meeting(
 /// Shares the same projection as `rebuild_from_disk` and reuses the excerpt
 /// derivation (`crate::index::derive_excerpt`): a one-line `summary.md` blurb
 /// once a summary exists, else the first transcript segment (live-test UX T6).
-fn list_entry_from(folder: &Path) -> Result<meeting_app_common::MeetingListEntry, Error> {
+fn list_entry_from(folder: &Path) -> Result<minutist_common::MeetingListEntry, Error> {
     let meta = reader::read_metadata_inner(folder)?;
     let excerpt = crate::index::derive_excerpt(folder);
 
-    Ok(meeting_app_common::MeetingListEntry {
+    Ok(minutist_common::MeetingListEntry {
         id: meta.uuid,
         title: meta.title,
         started_at: meta.started_at,

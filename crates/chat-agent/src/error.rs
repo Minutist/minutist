@@ -3,7 +3,7 @@
 //! (no `chat_agent::Error` leaks across the crate boundary). Mirrors
 //! `summariser::Error`.
 
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 /// Errors raised inside the chat turn engine.
 #[derive(Debug, thiserror::Error)]

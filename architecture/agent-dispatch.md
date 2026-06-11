@@ -88,21 +88,21 @@ worktree needed.
 The Agent tool's `isolation: "worktree"` provides a separate working
 directory, but the agent's file-editing tools (Read, Edit, Write,
 Bash) operate on **absolute paths**. If the agent constructs absolute
-paths like `/home/anl/meeting-app/spikes/foo/...`, those resolve to
+paths like `/home/anl/minutist/spikes/foo/...`, those resolve to
 **main's working tree**, not the worktree — and isolation breaks
 silently.
 
 Phase 0 Spike 3 hit this: the agent's prompt referenced many absolute
 paths to `/home/anl/Handy/`, `/home/anl/transcribe-rs/`, and
 `/mnt/c/...` as read-only context, and the agent pattern-matched by
-constructing `/home/anl/meeting-app/spikes/vad-loop/...` for its own
+constructing `/home/anl/minutist/spikes/vad-loop/...` for its own
 edits. The work landed in main while the worktree branch stayed empty.
 
 To prevent the silent break:
 
 - Every dispatch prompt that uses `isolation: "worktree"` MUST include
   the worktree path explicitly:
-  > "Your worktree root is **/home/anl/meeting-app/.claude/worktrees/<id>/**. Use this as the prefix for all absolute paths into the repo, or use paths relative to the worktree root. Do NOT use `/home/anl/meeting-app/...` for editable files — that points to main."
+  > "Your worktree root is **/home/anl/minutist/.claude/worktrees/<id>/**. Use this as the prefix for all absolute paths into the repo, or use paths relative to the worktree root. Do NOT use `/home/anl/minutist/...` for editable files — that points to main."
 - The main session verifies after the agent returns: `git status` in
   main should be clean; the worktree's branch should be ahead of main
   with the expected diff. If main is dirty and the worktree is clean,
@@ -184,7 +184,7 @@ own brief (which agent type to invoke, scope, deliverables).
 ### Template — production-crate development
 
 ```
-You are implementing one crate of the meeting-app project: <CRATE_NAME>.
+You are implementing one crate of the minutist project: <CRATE_NAME>.
 
 Required reading before any edits:
 1. architecture/README.md
@@ -236,7 +236,7 @@ Commit before reporting completion:
 ### Template — webview component development
 
 ```
-You are implementing UI for the meeting-app project: <COMPONENT>.
+You are implementing UI for the minutist project: <COMPONENT>.
 
 Required reading:
 1. architecture/README.md

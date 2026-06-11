@@ -1,12 +1,12 @@
 /*
- * meeting-app — Structurizr workspace
+ * minutist — Structurizr workspace
  *
  * Authoritative source for the C4 model. Rendered SVGs in this directory are
  * derived; do not edit them directly. Edit this DSL and re-run
  * scripts/render-architecture.sh.
  *
  * Levels modelled:
- *   1. System Context — what the meeting-app system talks to.
+ *   1. System Context — what the minutist system talks to.
  *   2. Containers     — the deployable / runtime units that make up the app.
  *   3. Components     — the Rust crates inside the core container, with the
  *                       interfaces and traits that define their boundaries.
@@ -17,7 +17,7 @@
  * as findings.
  */
 
-workspace "meeting-app" "Local-first desktop meeting-notes application." {
+workspace "Minutist" "Local-first desktop meeting-notes application." {
 
     !identifiers hierarchical
 
@@ -49,10 +49,10 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         }
 
         // ----------------------------------------------------------------
-        // The meeting-app system
+        // The minutist system
         // ----------------------------------------------------------------
 
-        meetingApp = softwareSystem "meeting-app" "Tauri desktop application. Records audio, transcribes locally via llama.cpp, takes hand-typed notes alongside, summarises with a local LLM." {
+        minutist = softwareSystem "Minutist" "Tauri desktop application. Records audio, transcribes locally via llama.cpp, takes hand-typed notes alongside, summarises with a local LLM." {
 
             // ------------------------------------------------------------
             // Containers
@@ -131,28 +131,28 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // Relationships — System Context (Level 1)
         // ----------------------------------------------------------------
 
-        user -> meetingApp "Records meetings, types notes, runs summaries"
-        meetingApp -> microphone "Captures audio via OS audio API"
-        meetingApp -> modelHost "Reads GGUF + ONNX model files"
-        meetingApp -> updateServer "Fetches signed updates" "HTTPS"
-        meetingApp -> externalLlm "Optional: dispatches summary requests" "HTTP / loopback"
-        mcpClient -> meetingApp "Reads meetings + messages the internal agent over MCP" "Streamable HTTP / loopback"
+        user -> minutist "Records meetings, types notes, runs summaries"
+        minutist -> microphone "Captures audio via OS audio API"
+        minutist -> modelHost "Reads GGUF + ONNX model files"
+        minutist -> updateServer "Fetches signed updates" "HTTPS"
+        minutist -> externalLlm "Optional: dispatches summary requests" "HTTP / loopback"
+        mcpClient -> minutist "Reads meetings + messages the internal agent over MCP" "Streamable HTTP / loopback"
 
         // ----------------------------------------------------------------
         // Relationships — Container (Level 2)
         // ----------------------------------------------------------------
 
-        user -> meetingApp.webview "Interacts with editor + controls"
-        meetingApp.webview -> meetingApp.core "Tauri commands + events (typed via tauri-specta)"
-        meetingApp.core -> microphone "Captures audio frames"
-        meetingApp.core -> meetingApp.llamaNative "ASR + LLM inference" "FFI via llama-cpp-2"
-        meetingApp.core -> meetingApp.sherpaNative "Diarization + Parakeet ASR" "FFI via sherpa-rs"
-        meetingApp.core -> meetingApp.sqliteDb "Reads/writes meeting index" "libsql"
-        meetingApp.core -> meetingApp.meetingFs "Reads/writes per-meeting files" "std::fs"
-        meetingApp.core -> modelHost "Reads / downloads model files"
-        meetingApp.core -> updateServer "Polls + applies signed updates"
-        meetingApp.core -> externalLlm "Optional summary dispatch" "HTTP"
-        mcpClient -> meetingApp.core "tools/list + tools/call (bearer + Host/Origin)" "Streamable HTTP / loopback"
+        user -> minutist.webview "Interacts with editor + controls"
+        minutist.webview -> minutist.core "Tauri commands + events (typed via tauri-specta)"
+        minutist.core -> microphone "Captures audio frames"
+        minutist.core -> minutist.llamaNative "ASR + LLM inference" "FFI via llama-cpp-2"
+        minutist.core -> minutist.sherpaNative "Diarization + Parakeet ASR" "FFI via sherpa-rs"
+        minutist.core -> minutist.sqliteDb "Reads/writes meeting index" "libsql"
+        minutist.core -> minutist.meetingFs "Reads/writes per-meeting files" "std::fs"
+        minutist.core -> modelHost "Reads / downloads model files"
+        minutist.core -> updateServer "Polls + applies signed updates"
+        minutist.core -> externalLlm "Optional summary dispatch" "HTTP"
+        mcpClient -> minutist.core "tools/list + tools/call (bearer + Host/Origin)" "Streamable HTTP / loopback"
 
         // ----------------------------------------------------------------
         // Relationships — Component (Level 3) — INSIDE the Rust core
@@ -161,112 +161,112 @@ workspace "meeting-app" "Local-first desktop meeting-notes application." {
         // Every component (except common) depends on common. Drawn only once to
         // keep the diagram readable; the dependency rule is enforced by the
         // workspace conventions, not by every edge here.
-        meetingApp.core.orchestrator -> meetingApp.core.common "Uses interface types"
-        meetingApp.core.agentTools   -> meetingApp.core.common "Uses interface types"
-        meetingApp.core.chatAgent    -> meetingApp.core.common "Uses interface types"
-        meetingApp.core.appMain      -> meetingApp.core.common "Uses interface types"
-        meetingApp.core.ipcBridge    -> meetingApp.core.common "Uses interface types"
+        minutist.core.orchestrator -> minutist.core.common "Uses interface types"
+        minutist.core.agentTools   -> minutist.core.common "Uses interface types"
+        minutist.core.chatAgent    -> minutist.core.common "Uses interface types"
+        minutist.core.appMain      -> minutist.core.common "Uses interface types"
+        minutist.core.ipcBridge    -> minutist.core.common "Uses interface types"
 
         // Live pipeline. Orchestrator wires the dataflow.
-        meetingApp.core.audioCapture -> microphone "Captures audio" "cpal"
-        meetingApp.core.orchestrator -> meetingApp.core.audioCapture "Starts/stops capture; consumes frames"
-        meetingApp.core.orchestrator -> meetingApp.core.vadChunker "Feeds frames; consumes AudioChunks"
-        meetingApp.core.orchestrator -> meetingApp.core.asrRuntime "Dispatches chunks via AsrBackend trait (Qwen tiers; non-Parakeet languages)"
-        meetingApp.core.orchestrator -> meetingApp.core.asrParakeet "Dispatches chunks via AsrBackend trait (Parakeet languages; primary)"
-        meetingApp.core.orchestrator -> meetingApp.core.persistence "Streams audio + segments to disk"
-        meetingApp.core.orchestrator -> meetingApp.core.diarizer "On stop: assigns speakers via Diarizer trait (authoritative); during recording: live per-segment labels via OnlineDiarizer (additive)"
-        meetingApp.core.orchestrator -> meetingApp.core.ipcBridge "Emits transcript / meter / state events"
+        minutist.core.audioCapture -> microphone "Captures audio" "cpal"
+        minutist.core.orchestrator -> minutist.core.audioCapture "Starts/stops capture; consumes frames"
+        minutist.core.orchestrator -> minutist.core.vadChunker "Feeds frames; consumes AudioChunks"
+        minutist.core.orchestrator -> minutist.core.asrRuntime "Dispatches chunks via AsrBackend trait (Qwen tiers; non-Parakeet languages)"
+        minutist.core.orchestrator -> minutist.core.asrParakeet "Dispatches chunks via AsrBackend trait (Parakeet languages; primary)"
+        minutist.core.orchestrator -> minutist.core.persistence "Streams audio + segments to disk"
+        minutist.core.orchestrator -> minutist.core.diarizer "On stop: assigns speakers via Diarizer trait (authoritative); during recording: live per-segment labels via OnlineDiarizer (additive)"
+        minutist.core.orchestrator -> minutist.core.ipcBridge "Emits transcript / meter / state events"
 
         // Model lifecycle.
-        meetingApp.core.asrRuntime  -> meetingApp.core.modelRegistry "Resolves + loads ASR model"
-        meetingApp.core.asrParakeet -> meetingApp.core.modelRegistry "Resolves + loads Parakeet ONNX model"
-        meetingApp.core.modelRegistry -> modelHost "Reads / downloads model files"
+        minutist.core.asrRuntime  -> minutist.core.modelRegistry "Resolves + loads ASR model"
+        minutist.core.asrParakeet -> minutist.core.modelRegistry "Resolves + loads Parakeet ONNX model"
+        minutist.core.modelRegistry -> modelHost "Reads / downloads model files"
 
         // FFI boundaries.
-        meetingApp.core.asrRuntime  -> meetingApp.llamaNative "Inference" "llama-cpp-2 FFI"
-        meetingApp.core.summariser  -> meetingApp.llamaNative "Inference" "llama-cpp-2 FFI"
-        meetingApp.core.diarizer    -> meetingApp.sherpaNative "Inference" "sherpa-rs FFI"
+        minutist.core.asrRuntime  -> minutist.llamaNative "Inference" "llama-cpp-2 FFI"
+        minutist.core.summariser  -> minutist.llamaNative "Inference" "llama-cpp-2 FFI"
+        minutist.core.diarizer    -> minutist.sherpaNative "Inference" "sherpa-rs FFI"
 
         // Persistence.
-        meetingApp.core.persistence -> meetingApp.sqliteDb "Index reads/writes" "libsql"
-        meetingApp.core.persistence -> meetingApp.meetingFs "Per-meeting file I/O"
+        minutist.core.persistence -> minutist.sqliteDb "Index reads/writes" "libsql"
+        minutist.core.persistence -> minutist.meetingFs "Per-meeting file I/O"
 
         // Summarisation triggered by user action; orchestrator is bypassed once
         // the meeting is stopped — summariser reads from persistence directly.
-        meetingApp.core.summariser  -> meetingApp.core.persistence "Reads transcript + notes; writes summary.md"
-        meetingApp.core.summariser  -> externalLlm "Optional dispatch" "HTTP"
+        minutist.core.summariser  -> minutist.core.persistence "Reads transcript + notes; writes summary.md"
+        minutist.core.summariser  -> externalLlm "Optional dispatch" "HTTP"
 
         // Settings.
-        meetingApp.core.settings    -> meetingApp.meetingFs "Persists user preferences" "tauri-plugin-store"
-        meetingApp.core.orchestrator -> meetingApp.core.settings "Reads runtime config"
-        meetingApp.core.asrRuntime   -> meetingApp.core.settings "Reads model selection"
+        minutist.core.settings    -> minutist.meetingFs "Persists user preferences" "tauri-plugin-store"
+        minutist.core.orchestrator -> minutist.core.settings "Reads runtime config"
+        minutist.core.asrRuntime   -> minutist.core.settings "Reads model selection"
 
         // Shared tool layer (Phase 9). One Tool trait + ToolRegistry, driven by
         // both the chat agent and (Phase 10) the MCP server. Reads meeting
         // artefacts through persistence; runs re-transcribe / rediarize /
         // transcribe_pcm_window through the orchestrator (which keeps the
         // model-registry edge — agent-tools has none).
-        meetingApp.core.agentTools -> meetingApp.core.persistence "Reads meeting artefacts; writes via existing writers"
-        meetingApp.core.agentTools -> meetingApp.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
+        minutist.core.agentTools -> minutist.core.persistence "Reads meeting artefacts; writes via existing writers"
+        minutist.core.agentTools -> minutist.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
 
         // Chat agent (Phase 9). The stateless turn engine sits ABOVE both the
         // summariser substrate (borrows the loaded LlamaModel via the D5 seam)
         // and the agent-tools descriptors (for the oaicompat prompt + grammar).
         // The driver (ipc-bridge, a later phase) owns history + the loop + tool
         // dispatch.
-        meetingApp.core.chatAgent -> meetingApp.core.summariser "Reuses the loaded model substrate (LlamaSummariser::model)"
-        meetingApp.core.chatAgent -> meetingApp.core.agentTools "Reads tool descriptors for the prompt + grammar"
+        minutist.core.chatAgent -> minutist.core.summariser "Reuses the loaded model substrate (LlamaSummariser::model)"
+        minutist.core.chatAgent -> minutist.core.agentTools "Reads tool descriptors for the prompt + grammar"
 
         // MCP server (Phase 10). A SECOND consumer of the agent-tools registry —
         // projects it onto tools/list / tools/call; no chat-agent edge (the
         // inter-agent bridge tool reaches the chat engine via a common-typed
         // channel whose driver lives in ipc-bridge). app-main spawns the listener.
-        meetingApp.core.mcpServer -> meetingApp.core.common "Uses interface types"
-        meetingApp.core.mcpServer -> meetingApp.core.agentTools "Projects the registry; dispatches tools/call"
-        meetingApp.core.appMain   -> meetingApp.core.mcpServer  "Spawns the listener via tauri::async_runtime::spawn (settings-gated)"
+        minutist.core.mcpServer -> minutist.core.common "Uses interface types"
+        minutist.core.mcpServer -> minutist.core.agentTools "Projects the registry; dispatches tools/call"
+        minutist.core.appMain   -> minutist.core.mcpServer  "Spawns the listener via tauri::async_runtime::spawn (settings-gated)"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
-        meetingApp.core.ipcBridge -> meetingApp.core.orchestrator "Invokes commands; subscribes to events"
-        meetingApp.core.ipcBridge -> meetingApp.core.persistence "Meeting list / load / delete"
-        meetingApp.core.ipcBridge -> meetingApp.core.summariser  "Triggers Summarise; holds the LLM substrate"
-        meetingApp.core.ipcBridge -> meetingApp.core.settings    "Get / set settings"
-        meetingApp.core.ipcBridge -> meetingApp.core.agentTools  "Builds the registry + context; dispatches tools"
-        meetingApp.core.ipcBridge -> meetingApp.core.chatAgent   "Holds the engine; drives the turn loop"
-        meetingApp.core.appMain   -> meetingApp.core.ipcBridge   "Mounts command handlers"
-        meetingApp.core.appMain   -> meetingApp.core.orchestrator "Owns lifetime"
-        meetingApp.core.appMain   -> meetingApp.core.agentTools  "Wires the tool registry"
+        minutist.core.ipcBridge -> minutist.core.orchestrator "Invokes commands; subscribes to events"
+        minutist.core.ipcBridge -> minutist.core.persistence "Meeting list / load / delete"
+        minutist.core.ipcBridge -> minutist.core.summariser  "Triggers Summarise; holds the LLM substrate"
+        minutist.core.ipcBridge -> minutist.core.settings    "Get / set settings"
+        minutist.core.ipcBridge -> minutist.core.agentTools  "Builds the registry + context; dispatches tools"
+        minutist.core.ipcBridge -> minutist.core.chatAgent   "Holds the engine; drives the turn loop"
+        minutist.core.appMain   -> minutist.core.ipcBridge   "Mounts command handlers"
+        minutist.core.appMain   -> minutist.core.orchestrator "Owns lifetime"
+        minutist.core.appMain   -> minutist.core.agentTools  "Wires the tool registry"
 
         // Webview ↔ ipc-bridge.
-        meetingApp.webview.ipcClient -> meetingApp.core.ipcBridge "invoke + listen" "Tauri IPC"
-        meetingApp.webview.editor       -> meetingApp.webview.ipcClient
-        meetingApp.webview.transcriptUi -> meetingApp.webview.ipcClient
-        meetingApp.webview.meetingShell -> meetingApp.webview.ipcClient
-        meetingApp.webview.editor       -> meetingApp.webview.uiState
-        meetingApp.webview.transcriptUi -> meetingApp.webview.uiState
-        meetingApp.webview.meetingShell -> meetingApp.webview.uiState
+        minutist.webview.ipcClient -> minutist.core.ipcBridge "invoke + listen" "Tauri IPC"
+        minutist.webview.editor       -> minutist.webview.ipcClient
+        minutist.webview.transcriptUi -> minutist.webview.ipcClient
+        minutist.webview.meetingShell -> minutist.webview.ipcClient
+        minutist.webview.editor       -> minutist.webview.uiState
+        minutist.webview.transcriptUi -> minutist.webview.uiState
+        minutist.webview.meetingShell -> minutist.webview.uiState
     }
 
     views {
 
-        systemContext meetingApp "L1_SystemContext" {
+        systemContext minutist "L1_SystemContext" {
             include *
             autolayout lr
-            description "Level 1 — meeting-app and the things outside it."
+            description "Level 1 — minutist and the things outside it."
         }
 
-        container meetingApp "L2_Containers" {
+        container minutist "L2_Containers" {
             include *
             autolayout tb
             description "Level 2 — runtime containers and bundled native dependencies."
         }
 
-        component meetingApp.core "L3_CoreComponents" {
+        component minutist.core "L3_CoreComponents" {
             include *
             autolayout tb
             description "Level 3 — Rust crates inside the core process. One crate per component; each is the unit of agent ownership."
         }
 
-        component meetingApp.webview "L3_WebviewComponents" {
+        component minutist.webview "L3_WebviewComponents" {
             include *
             autolayout tb
             description "Level 3 — React components inside the webview. UI ownership."

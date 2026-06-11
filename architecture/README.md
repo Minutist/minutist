@@ -1,4 +1,4 @@
-# meeting-app — architecture
+# minutist — architecture
 
 Live architecture documentation. Authoritative for component boundaries,
 interfaces, and ownership.

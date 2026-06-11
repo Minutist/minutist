@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppEvent, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, ModelStatusState,
 };
 

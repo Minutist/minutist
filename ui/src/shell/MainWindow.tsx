@@ -194,7 +194,7 @@ export function MainWindow() {
           right) instead of a centre-anchored grid whose right cluster wraps.
         */}
         <div className="main-window__lead">
-          <span className="main-window__wordmark">meeting-app</span>
+          <span className="main-window__wordmark">Minutist</span>
           {/*
             When a finalised meeting is open (idle, not recording), show its
             editable name here so it can be seen + renamed from the meeting

@@ -8,8 +8,8 @@
 //! CI passes with the models absent.
 //!
 //! To run:
-//!   MEETING_APP_DIARIZE_SEG_PATH=/path/to/segmentation.onnx \
-//!   MEETING_APP_DIARIZE_EMB_PATH=/path/to/embedding.onnx \
+//!   MINUTIST_DIARIZE_SEG_PATH=/path/to/segmentation.onnx \
+//!   MINUTIST_DIARIZE_EMB_PATH=/path/to/embedding.onnx \
 //!   cargo test -p orchestrator --features test-source --test rediarize
 //!
 //! It stages the two diarize models into a tempdir model-registry cache (mirror
@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use meeting_app_common::{
+use minutist_common::{
     AppEvent, AudioFormat, MeetingId, MeetingMeta, ModelFileEntry, ModelId, ModelKind,
     ModelManifestEntry, Segment,
 };
@@ -44,8 +44,8 @@ const EMB_MODEL_ID: &str = "3dspeaker-campplus-zh-en-advanced";
 fn diarize_model_env_vars() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     // Treat an EMPTY value as unset (skip) so `VAR=""` does not stage an empty
     // path and panic; only a non-empty path counts as "set".
-    let seg = non_empty_env("MEETING_APP_DIARIZE_SEG_PATH")?;
-    let emb = non_empty_env("MEETING_APP_DIARIZE_EMB_PATH")?;
+    let seg = non_empty_env("MINUTIST_DIARIZE_SEG_PATH")?;
+    let emb = non_empty_env("MINUTIST_DIARIZE_EMB_PATH")?;
     Some((std::path::PathBuf::from(seg), std::path::PathBuf::from(emb)))
 }
 
@@ -216,7 +216,7 @@ async fn run_gated_rediarize_over_fixture(fixture_filename: &str, expected_speak
         None => {
             eprintln!(
                 "skipping gated rediarize over {fixture_filename}; diarize model env vars not set \
-                 (MEETING_APP_DIARIZE_SEG_PATH and MEETING_APP_DIARIZE_EMB_PATH)"
+                 (MINUTIST_DIARIZE_SEG_PATH and MINUTIST_DIARIZE_EMB_PATH)"
             );
             return;
         }

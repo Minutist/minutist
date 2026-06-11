@@ -196,7 +196,7 @@ describe("About dialog content (Phase 7 S6)", () => {
     render(<About onClose={() => {}} />);
 
     expect(
-      screen.getByRole("heading", { name: "meeting-app" }),
+      screen.getByRole("heading", { name: "Minutist" }),
     ).toBeInTheDocument();
     expect(
       screen.getByText(new RegExp(`Version ${APP_VERSION.replace(/\./g, "\\.")}`)),
@@ -242,7 +242,7 @@ describe("About affordance (Phase 7 S6)", () => {
     );
     act(() =>
       fireEvent.click(
-        screen.getByRole("button", { name: "About meeting-app" }),
+        screen.getByRole("button", { name: "About Minutist" }),
       ),
     );
     const dialog = screen.getByRole("dialog");

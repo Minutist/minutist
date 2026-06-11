@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 specta = { workspace = true, optional = true }
@@ -18,8 +18,8 @@ tracing = { workspace = true }
 default = []
 # When enabled, `Settings` and `Theme` derive `specta::Type` so the
 # generated TypeScript bindings can import them directly. Enabled by
-# `ipc-bridge` (which itself enables it on `meeting-app-common`).
-specta = ["dep:specta", "meeting-app-common/specta"]
+# `ipc-bridge` (which itself enables it on `minutist-common`).
+specta = ["dep:specta", "minutist-common/specta"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,4 +1,4 @@
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 /// Per-crate error type for the `persistence` crate.
 #[derive(Debug, thiserror::Error)]
@@ -25,7 +25,7 @@ pub enum Error {
     Index(#[from] libsql::Error),
 
     #[error("meeting not found: {}", .0 .0)]
-    MeetingNotFound(meeting_app_common::MeetingId),
+    MeetingNotFound(minutist_common::MeetingId),
 
     #[error("schema migration error: {0}")]
     Migration(String),

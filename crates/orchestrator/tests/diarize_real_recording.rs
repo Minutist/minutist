@@ -7,15 +7,15 @@
 //! synthetic fixture is too clean to catch this — a real recording's natural
 //! vocal variation is what over-splits at a low threshold.
 //!
-//! Gated on `MEETING_APP_RECORDINGS_DIR` + `MEETING_APP_DIARIZE_SEG_PATH` +
-//! `MEETING_APP_DIARIZE_EMB_PATH`; skips cleanly otherwise. Run via:
+//! Gated on `MINUTIST_RECORDINGS_DIR` + `MINUTIST_DIARIZE_SEG_PATH` +
+//! `MINUTIST_DIARIZE_EMB_PATH`; skips cleanly otherwise. Run via:
 //!   make test-integration-diarize ARGS=diarize_real_recording
 //! (add `-- --nocapture` to see the sweep).
 
 use std::path::{Path, PathBuf};
 
 use diarizer::{DiarizerConfig, SherpaDiarizer};
-use meeting_app_common::{Diarizer, Segment};
+use minutist_common::{Diarizer, Segment};
 use persistence::read_audio_pcm;
 
 fn env_ne(k: &str) -> Option<String> {
@@ -74,15 +74,15 @@ fn diarize_at(seg_path: &Path, emb_path: &Path, threshold: f32, audio: &[f32], s
 #[test]
 fn diarize_real_recording_threshold_sweep() {
     let (recordings, seg, emb) = match (
-        env_ne("MEETING_APP_RECORDINGS_DIR"),
-        env_ne("MEETING_APP_DIARIZE_SEG_PATH"),
-        env_ne("MEETING_APP_DIARIZE_EMB_PATH"),
+        env_ne("MINUTIST_RECORDINGS_DIR"),
+        env_ne("MINUTIST_DIARIZE_SEG_PATH"),
+        env_ne("MINUTIST_DIARIZE_EMB_PATH"),
     ) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => {
             eprintln!(
-                "skipping: set MEETING_APP_RECORDINGS_DIR + MEETING_APP_DIARIZE_SEG_PATH \
-                 + MEETING_APP_DIARIZE_EMB_PATH"
+                "skipping: set MINUTIST_RECORDINGS_DIR + MINUTIST_DIARIZE_SEG_PATH \
+                 + MINUTIST_DIARIZE_EMB_PATH"
             );
             return;
         }

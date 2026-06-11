@@ -4,7 +4,7 @@
 
 ## The system
 
-**meeting-app** is a single desktop application. It runs on the user's
+**minutist** is a single desktop application. It runs on the user's
 machine; nothing it does requires network access by default.
 
 ## Actors and external dependencies

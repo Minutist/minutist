@@ -1,6 +1,6 @@
 //! Per-crate error type for the `settings` crate.
 
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 /// Errors that can occur within the settings crate.
 #[derive(Debug, thiserror::Error)]

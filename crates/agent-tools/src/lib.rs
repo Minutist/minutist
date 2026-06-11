@@ -10,7 +10,7 @@
 //!
 //! Edges: `common`, `persistence`, `orchestrator`. Deliberately **no**
 //! `summariser` edge — the one LLM-using tool (`resummarise`) drives an
-//! `Arc<dyn meeting_app_common::Summariser>` held in [`ToolContext`],
+//! `Arc<dyn minutist_common::Summariser>` held in [`ToolContext`],
 //! constructed by `ipc-bridge`/`app-main` (which own the `summariser` edge).
 //! Deliberately **no** `model-registry` edge — `relisten_section` resolves and
 //! builds its ASR backend through [`orchestrator::Orchestrator::transcribe_pcm_window`],
@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppEvent, AppResult, InterAgentReply, InterAgentRequest, MeetingId, Summariser,
 };
 use orchestrator::Orchestrator;

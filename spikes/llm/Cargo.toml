@@ -14,7 +14,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-meeting-app-common = { path = "../../crates/common" }
+minutist-common = { path = "../../crates/common" }
 
 # Pin the same `llama-cpp-2` version Spike 1 validated so the workspace
 # Cargo.lock keeps a single major. Spike 2 needs only the text path; the

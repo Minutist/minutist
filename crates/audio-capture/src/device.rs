@@ -3,7 +3,7 @@
 //! Returns `common::AudioDevice` values; does not expose cpal types to callers.
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use meeting_app_common::AudioDevice;
+use minutist_common::AudioDevice;
 
 use crate::error::Error;
 

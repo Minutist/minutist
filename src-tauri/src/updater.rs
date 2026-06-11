@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use meeting_app_common::{AppError, AppEvent, AppResult};
+use minutist_common::{AppError, AppEvent, AppResult};
 use tauri::{AppHandle, Listener};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::broadcast::Sender;

@@ -27,7 +27,7 @@ use std::path::Path;
 
 use audiopus::coder::Decoder;
 use audiopus::{Channels, SampleRate};
-use meeting_app_common::{
+use minutist_common::{
     AppResult, MeetingMeta, MeetingState, NoteBlock, NotesDocument, Segment,
 };
 use ogg::PacketReader;

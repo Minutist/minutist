@@ -13,7 +13,7 @@
 //!   gated list) then runs [`ToolRegistry::dispatch`] — the SAME path the chat
 //!   loop uses.
 //!
-//! `agent-tools` returns [`meeting_app_common::AppError`]; the
+//! `agent-tools` returns [`minutist_common::AppError`]; the
 //! [`crate::error::app_error_to_mcp`] map turns it into an rmcp error here (the
 //! one place rmcp error types are constructed).
 

@@ -14,7 +14,7 @@ authors.workspace = true
 # the max-iteration cap; this crate runs ONE assistant turn per call.
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 summariser = { path = "../summariser" }
 agent-tools = { path = "../agent-tools" }
 llama-cpp-2 = { workspace = true }

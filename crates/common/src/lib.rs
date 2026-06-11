@@ -1,4 +1,4 @@
-//! Shared interface types and trait definitions for meeting-app.
+//! Shared interface types and trait definitions for minutist.
 //!
 //! This crate is the architectural contract. Every other crate depends on
 //! it; nothing here may depend on another crate in this workspace.

@@ -147,7 +147,7 @@ must abort the parent orchestrator task and surface as a recoverable
 
 `tracing` crate. Subscriber configured in `app-main`:
 
-- File appender at `{app-data}/logs/meeting-app.log`, rotated daily,
+- File appender at `{app-data}/logs/minutist.log`, rotated daily,
   7-day retention.
 - Console output in debug builds only.
 - `RUST_LOG`-style filtering honoured at startup.
@@ -437,12 +437,12 @@ Path plumbing: `app-main` resolves the bundled resource at startup (early in
 BaseDirectory::Resource)` — `PathResolver::resolve` applies the same `_up_`
 mangling to its input, so resolving the config-relative pattern yields the
 placed file. If it resolves to an existing file, app-main exports its absolute
-path as the **runtime** env var `MEETING_APP_SILERO_PATH`; otherwise (a dev run
+path as the **runtime** env var `MINUTIST_SILERO_PATH`; otherwise (a dev run
 with no bundle) it leaves the var unset.
 
 `vad-chunker::default_model_path()` reads, in order: (1) the **runtime**
-`MEETING_APP_SILERO_PATH` (app-main's injected bundled path); (2) the
-**build-time** `MEETING_APP_SILERO_PATH` (`option_env!`); (3) a source-tree path
+`MINUTIST_SILERO_PATH` (app-main's injected bundled path); (2) the
+**build-time** `MINUTIST_SILERO_PATH` (`option_env!`); (3) a source-tree path
 relative to `CARGO_MANIFEST_DIR` (so `cargo run` / `cargo test -p vad-chunker`
 work with no env var set). This keeps dev and test runs unchanged while letting
 an installed package find the bundled model.
@@ -827,6 +827,15 @@ downloaded per-kind / per-model files.
 Writes to a directory outside a component's owned scope are a review
 finding.
 
+**Legacy data-dir migration (2026-06-11 rename).** `{app-data}` is keyed by
+the bundle identifier, which changed `net.alelec.meeting-app` → `ai.minutist`
+when the product was renamed Minutist. `app-main` runs a one-time shim as the
+FIRST statement of `main()` (before the logging bootstrap creates
+`<new-root>/logs`): if the legacy root exists and the new one does not, the
+whole tree is moved (`std::fs::rename`). On failure the legacy tree is left
+untouched and the app starts fresh. The shim is the only code allowed to
+reference the legacy identifier.
+
 **`index.db` is a derived, rebuildable cache (binding — Phase 4, A6).** The
 per-meeting folders are the **source of truth**; `index.db` (the libsql
 meeting-list index) is a query cache derived from each meeting's
@@ -933,11 +942,11 @@ demonstrated.
   package's `vitest run` script) must pass on a machine with no model
   files, GPU, or microphone. Tests that need a real
   model, GPU, or native build are **gated behind env vars** (the Phase 2
-  `MEETING_APP_ASR_MODEL_PATH` pattern) with a no-op skip path. They are run on
+  `MINUTIST_ASR_MODEL_PATH` pattern) with a no-op skip path. They are run on
   demand either via `scripts/run-tests-windows.ps1` OR directly with
   `make test-integration` (and `-summary`/`-asr`/`-diarize`), which sources a
   git-excluded `tests-local.env` (copied from `tests-local.env.example`) holding
-  the real model paths + a `MEETING_APP_RECORDINGS_DIR`. Running these against
+  the real model paths + a `MINUTIST_RECORDINGS_DIR`. Running these against
   real models is how model-integration regressions (e.g. a chat template the
   bundled llama.cpp cannot render) are caught without a full app rebuild — the
   gated summariser test exercises `build_prompt`, and a real-recording variant
@@ -966,7 +975,7 @@ hardware (Phase 2 close-out):
   do not assert on VAD output.
 - **Event-collection deadlines must tolerate a saturated scheduler.** Cargo
   runs test *binaries* in parallel. When a model-loading test (gated on
-  `MEETING_APP_ASR_MODEL_PATH`) runs alongside a timing-sensitive one, CPU
+  `MINUTIST_ASR_MODEL_PATH`) runs alongside a timing-sensitive one, CPU
   saturation can starve a tight broadcast-drain loop. Size such deadlines in
   seconds, not hundreds of milliseconds.
 - **Wall-clock duration assertions compare against the *measured* elapsed, not
@@ -1100,7 +1109,7 @@ straight to the compile-time ceiling; the VRAM-aware plan now lets `Auto` keep
 each model on GPU only when it fits.)
 
 The features fan out through a single chain so the app binary is the only place
-a backend is chosen: `meeting-app` (src-tauri) → `ipc-bridge` → {`summariser`,
+a backend is chosen: `minutist` (src-tauri) → `ipc-bridge` → {`summariser`,
 `chat-agent`, `orchestrator` → {`asr-runtime`, `diarizer`}}. `ipc-bridge` is the
 fan-out point because it sits above `summariser` (direct dep), `chat-agent` (the
 held-model chat engine, which forwards `vulkan`/`metal`/`cuda`/`rocm` to its own

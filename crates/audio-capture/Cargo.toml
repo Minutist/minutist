@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 cpal = { workspace = true }
 rubato = { workspace = true }
 tokio = { workspace = true }

@@ -5,7 +5,7 @@
 
 use std::f32::consts::PI;
 
-use meeting_app_common::AudioMeterFrame;
+use minutist_common::AudioMeterFrame;
 use tokio::sync::mpsc;
 
 use crate::manager::{AudioFrameBatch, AudioStreams};

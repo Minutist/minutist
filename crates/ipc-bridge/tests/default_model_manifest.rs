@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use ipc_bridge::commands::DEFAULT_LLM_MODEL_ID;
-use meeting_app_common::{ModelId, ModelKind};
+use minutist_common::{ModelId, ModelKind};
 
 /// The bundled `DEFAULT_LLM_MODEL_ID` must exist in `resources/models.json` as
 /// an entry whose `kind` is `Llm`.

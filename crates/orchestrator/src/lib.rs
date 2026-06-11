@@ -52,7 +52,7 @@ use std::time::Duration;
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
 use diarizer::OnlineDiarizer;
-use meeting_app_common::{
+use minutist_common::{
     AppError, AppEvent, AppResult, AsrBackend, AsrEngine, AudioFormat, Diarizer, MeetingId,
     MeetingListEntry, MeetingMeta, ModelDescriptor, ModelId, ModelStatus, RecordingState, Segment,
 };
@@ -217,16 +217,16 @@ impl Orchestrator {
     /// remains the safety net), so prewarm can never fail a startup.
     /// VRAM-aware GPU plan for an ASR/model load, from the current settings.
     ///
-    /// Computes ONE [`meeting_app_common::GpuPlan`] from the live VRAM probe +
+    /// Computes ONE [`minutist_common::GpuPlan`] from the live VRAM probe +
     /// the user's `gpu_acceleration` mode + `prefer_large_asr_model`. Call it
     /// once per model-load decision and read `plan.asr_gpu` /
     /// `plan.effective_prefer_large`; probing twice in one decision would risk
     /// the two reads disagreeing. See `architecture/cross-cutting.md` — "GPU
     /// portability".
-    fn gpu_plan(&self) -> meeting_app_common::GpuPlan {
+    fn gpu_plan(&self) -> minutist_common::GpuPlan {
         let s = self.settings.current();
-        meeting_app_common::resolve_gpu_plan(
-            meeting_app_common::probe_primary_gpu().as_ref(),
+        minutist_common::resolve_gpu_plan(
+            minutist_common::probe_primary_gpu().as_ref(),
             s.gpu_acceleration,
             s.prefer_large_asr_model,
         )
@@ -234,7 +234,7 @@ impl Orchestrator {
 
     pub async fn prewarm_asr(&self) {
         let plan = self.gpu_plan();
-        let engine = meeting_app_common::asr_engine_for_language(
+        let engine = minutist_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
             plan.effective_prefer_large,
         );
@@ -408,7 +408,7 @@ impl Orchestrator {
         // only when it ALSO fits the VRAM budget), so a CPU-bound large request
         // downgrades to the 0.6B default. The `language` hint above only affects
         // the Qwen tiers. See `common::asr_engine_for_language`.
-        let engine = meeting_app_common::asr_engine_for_language(
+        let engine = minutist_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
             plan.effective_prefer_large,
         );
@@ -625,7 +625,7 @@ impl Orchestrator {
             // `AppEvent::MeetingFinalised` below clears the per-row indicator.
             self.emit(AppEvent::OperationProgress {
                 meeting_id,
-                op: meeting_app_common::OperationKind::Finalise,
+                op: minutist_common::OperationKind::Finalise,
                 fraction: None,
                 label: "Finalising…".to_string(),
             });
@@ -774,7 +774,7 @@ impl Orchestrator {
         // Hybrid ASR (Phase 8): same engine routing as the live path, so a
         // re-transcribe of an English/EU meeting uses Parakeet (timestamps) and
         // others use the resolved Qwen tier (`plan.effective_prefer_large`).
-        let engine = meeting_app_common::asr_engine_for_language(
+        let engine = minutist_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
             plan.effective_prefer_large,
         );
@@ -1038,7 +1038,7 @@ impl Orchestrator {
         let setting_language =
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
         let effective_language = language.or(setting_language);
-        let engine = meeting_app_common::asr_engine_for_language(
+        let engine = minutist_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
             plan.effective_prefer_large,
         );
@@ -1213,7 +1213,7 @@ impl Orchestrator {
         // "Identifying speakers…" wording (T5 — internal name unchanged).
         self.emit(AppEvent::OperationProgress {
             meeting_id,
-            op: meeting_app_common::OperationKind::Rediarize,
+            op: minutist_common::OperationKind::Rediarize,
             fraction: None,
             label: "Identifying speakers…".to_string(),
         });
@@ -1337,7 +1337,7 @@ impl Orchestrator {
     /// so that the IPC layer does not need a direct `audio-capture`
     /// dependency. Runs on `spawn_blocking` because cpal's device
     /// enumeration is FFI-bound (especially on Linux/PulseAudio cold-start).
-    pub async fn list_devices(&self) -> AppResult<Vec<meeting_app_common::AudioDevice>> {
+    pub async fn list_devices(&self) -> AppResult<Vec<minutist_common::AudioDevice>> {
         tokio::task::spawn_blocking(audio_capture::AudioCaptureManager::list_devices)
             .await
             .map_err(|join_err| AppError::Internal {
@@ -1452,7 +1452,7 @@ async fn run_diarization_blocking(
 /// directly.
 fn transcribe_pcm_window_blocking(
     pcm: &[f32],
-    backend: &mut dyn meeting_app_common::AsrBackend,
+    backend: &mut dyn minutist_common::AsrBackend,
     start_ms: u64,
     end_ms: u64,
 ) -> AppResult<Vec<Segment>> {
@@ -1467,7 +1467,7 @@ fn transcribe_pcm_window_blocking(
     // The clamp may shorten the window (a window straddling a pause stops at the
     // kept-region boundary); the chunk's `end_ms` reflects the actual slice.
     let slice_len_ms = (range.len() as u64 * 1000) / 16_000;
-    let chunk = meeting_app_common::AudioChunk {
+    let chunk = minutist_common::AudioChunk {
         samples: pcm[range].to_vec(),
         sample_rate: 16_000,
         start_ms,
@@ -1589,7 +1589,7 @@ impl Orchestrator {
         let language =
             runner::resolve_transcription_language(&self.settings.current().transcription_language);
         // Hybrid ASR (Phase 8): same engine routing as the production `start()`.
-        let engine = meeting_app_common::asr_engine_for_language(
+        let engine = minutist_common::asr_engine_for_language(
             &self.settings.current().transcription_language,
             plan.effective_prefer_large,
         );
@@ -1642,7 +1642,7 @@ impl Orchestrator {
     pub async fn start_with_streams_and_backend(
         &self,
         streams: audio_capture::AudioStreams,
-        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+        backend: Box<dyn minutist_common::AsrBackend + Send>,
         online_diarizer: Option<Arc<OnlineDiarizer>>,
     ) -> AppResult<MeetingId> {
         let mut guard = self.inner.lock().await;
@@ -1715,7 +1715,7 @@ impl Orchestrator {
         &self,
         index: &MeetingIndex,
         meeting_id: MeetingId,
-        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+        backend: Box<dyn minutist_common::AsrBackend + Send>,
     ) -> AppResult<()> {
         // Same atomic claim/release as the production path (TIMELINE-DRIFT #5).
         self.claim_offline(meeting_id).await?;
@@ -1732,7 +1732,7 @@ impl Orchestrator {
         &self,
         index: &MeetingIndex,
         meeting_id: MeetingId,
-        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+        backend: Box<dyn minutist_common::AsrBackend + Send>,
     ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
@@ -1806,7 +1806,7 @@ impl Orchestrator {
         meeting_id: MeetingId,
         start_ms: u64,
         end_ms: u64,
-        backend: Box<dyn meeting_app_common::AsrBackend + Send>,
+        backend: Box<dyn minutist_common::AsrBackend + Send>,
     ) -> AppResult<Vec<Segment>> {
         if end_ms <= start_ms {
             return Err(AppError::InvalidInput {

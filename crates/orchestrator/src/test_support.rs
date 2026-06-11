@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use meeting_app_common::{AppError, AppEvent, AppResult, AsrBackend, AudioChunk, MeetingId, Segment};
+use minutist_common::{AppError, AppEvent, AppResult, AsrBackend, AudioChunk, MeetingId, Segment};
 use model_registry::ModelRegistry;
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::broadcast;

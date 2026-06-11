@@ -256,7 +256,7 @@ set-overlap with the reference.
 | Segment-end via "silence > 700 ms after voice" (spec §14) | matches | implemented as hangover_frames=24 (720 ms). Onset is 3 frames (90 ms) plus 5 frames pre-roll (150 ms). |
 | "Pacing is unnecessary for Silero's internal state" | open | Confirmed. Feeding 480-sample frames back-to-back with no inter-frame delay produced clean segments. Silero's LSTM state advances per-frame, no wall-clock dependency. |
 | "Context-reuse vs context-rebuild per chunk" | open (drives threading) | One shared `MtmdContext`, fresh `LlamaContext` per flush. Confirmed cheap. |
-| `Segment { start_ms, end_ms, text, speaker_id: None }` JSON | matches | Emits the full `meeting-app-common::Segment` shape (speaker_id, confidence, words skipped when empty). |
+| `Segment { start_ms, end_ms, text, speaker_id: None }` JSON | matches | Emits the full `minutist-common::Segment` shape (speaker_id, confidence, words skipped when empty). |
 
 ## Reproducing the run
 

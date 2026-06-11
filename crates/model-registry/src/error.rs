@@ -1,6 +1,6 @@
 //! Per-crate error type with conversion to `AppError` at the crate boundary.
 
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

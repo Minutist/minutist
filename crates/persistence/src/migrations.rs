@@ -80,7 +80,7 @@ async fn write_version(conn: &Connection, version: i64) -> Result<(), Error> {
 /// Apply the DDL for a single migration step.
 ///
 /// Each arm is additive. Migration 1 creates the `meetings` index table — the
-/// columns mirror [`meeting_app_common::MeetingListEntry`] so a list query
+/// columns mirror [`minutist_common::MeetingListEntry`] so a list query
 /// reads straight from the index without touching a meeting folder.
 async fn apply_migration(conn: &Connection, version: i64) -> Result<(), Error> {
     match version {

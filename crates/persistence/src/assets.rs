@@ -28,7 +28,7 @@
 
 use std::path::Path;
 
-use meeting_app_common::{AppResult, MeetingId};
+use minutist_common::{AppResult, MeetingId};
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;
@@ -63,7 +63,7 @@ pub fn save_note_asset(
     let dir = assets_dir(root, meeting_id);
     std::fs::create_dir_all(&dir)
         .map_err(Error::Io)
-        .map_err(meeting_app_common::AppError::from)?;
+        .map_err(minutist_common::AppError::from)?;
 
     let hash = Sha256::digest(bytes);
     let filename = format!("{:x}.{ext}", hash);
@@ -102,7 +102,7 @@ pub fn save_note_asset(
 /// `assets/` directory. A missing file surfaces as [`AppError::Io`].
 pub fn read_note_asset(root: &Path, meeting_id: MeetingId, filename: &str) -> AppResult<Vec<u8>> {
     if !is_safe_asset_filename(filename) {
-        return Err(meeting_app_common::AppError::InvalidInput {
+        return Err(minutist_common::AppError::InvalidInput {
             context: format!("rejected unsafe asset filename: {filename:?}"),
         });
     }
@@ -110,7 +110,7 @@ pub fn read_note_asset(root: &Path, meeting_id: MeetingId, filename: &str) -> Ap
     let path = assets_dir(root, meeting_id).join(filename);
     let bytes = std::fs::read(&path)
         .map_err(Error::Io)
-        .map_err(meeting_app_common::AppError::from)?;
+        .map_err(minutist_common::AppError::from)?;
     Ok(bytes)
 }
 

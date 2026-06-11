@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use meeting_app_common::{AppResult, ChatSession, ChatSessionId, MeetingId};
+use minutist_common::{AppResult, ChatSession, ChatSessionId, MeetingId};
 
 use crate::error::Error;
 
@@ -63,7 +63,7 @@ impl ChatStore {
         let path = chat_dir.join(format!("{}.json", session.id.0));
         let bytes = serde_json::to_vec_pretty(session)
             .map_err(Error::Serialise)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
         write_atomic(&path, &bytes)?;
 
         tracing::debug!(
@@ -90,7 +90,7 @@ impl ChatStore {
         };
         let session: ChatSession = serde_json::from_slice(&bytes)
             .map_err(Error::Serialise)
-            .map_err(meeting_app_common::AppError::from)?;
+            .map_err(minutist_common::AppError::from)?;
         Ok(Some(session))
     }
 
@@ -163,7 +163,7 @@ impl ChatStore {
 fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     use std::io::Write;
 
-    let parent = path.parent().ok_or_else(|| meeting_app_common::AppError::Internal {
+    let parent = path.parent().ok_or_else(|| minutist_common::AppError::Internal {
         context: format!("chat session path has no parent: {}", path.display()),
     })?;
 
@@ -200,7 +200,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
 mod tests {
     use super::*;
     use crate::folder::MeetingFolder;
-    use meeting_app_common::{ChatMessage, ChatRole, ToolCallRecord};
+    use minutist_common::{ChatMessage, ChatRole, ToolCallRecord};
     use tempfile::TempDir;
 
     fn make_meeting() -> (TempDir, PathBuf, MeetingId) {

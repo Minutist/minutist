@@ -1,7 +1,7 @@
 # scripts/build-windows-app.ps1
 #
-# Build a PORTABLE, UNSIGNED native Windows build of meeting-app for local
-# testing. Produces target\release\meeting-app.exe with the frontend embedded
+# Build a PORTABLE, UNSIGNED native Windows build of minutist for local
+# testing. Produces target\release\minutist.exe with the frontend embedded
 # and the sherpa-onnx + onnxruntime DLLs beside it (Windows resolves same-dir
 # DLLs at runtime), then stages + zips the runnable folder.
 #
@@ -83,10 +83,10 @@ if ($Features) {
 }
 
 # Stop any running instance first. A live process (e.g. a smoke test or a
-# left-open window) locks target\release\meeting-app.exe, so the relink fails
-# with "failed to remove ...meeting-app.exe: Access is denied (os error 5)".
+# left-open window) locks target\release\minutist.exe, so the relink fails
+# with "failed to remove ...minutist.exe: Access is denied (os error 5)".
 # WebView2 child processes exit with the parent.
-Get-Process -Name meeting-app -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process -Name minutist -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 
 # Build the PRODUCTION app via the Tauri CLI (cargo-tauri), NOT a bare
@@ -114,7 +114,7 @@ Write-Host "==> cargo build exit $code"
 if ($code -ne 0) { exit $code }
 
 $rel = "$build\target\release"
-$exe = "$rel\meeting-app.exe"
+$exe = "$rel\minutist.exe"
 if (-not (Test-Path $exe)) { throw "build succeeded but $exe is missing" }
 
 Write-Host "==> Built: $exe"
@@ -126,7 +126,7 @@ Get-ChildItem "$rel\*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
 # gets a suffix so the CPU and GPU artifacts coexist (e.g. ...-x64-vulkan.zip).
 $suffix = ''
 if ($Features) { $suffix = '-' + ($Features -replace '[, ]+', '-') }
-$stage = "$build\dist-windows\meeting-app$suffix"
+$stage = "$build\dist-windows\minutist$suffix"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item $exe $stage
@@ -139,9 +139,9 @@ if (Test-Path "$rel\_up_") {
     Write-Host "    bundled: _up_\resources (Silero VAD)"
 }
 
-$zip = "$build\dist-windows\meeting-app-windows-x64$suffix.zip"
+$zip = "$build\dist-windows\minutist-windows-x64$suffix.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path "$stage\*" -DestinationPath $zip
 $zipMb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
 Write-Host ("==> Zipped: {0} ({1} MB)" -f $zip, $zipMb)
-Write-Host "==> Done. Unzip and run meeting-app.exe (first run downloads the ASR/LLM models)."
+Write-Host "==> Done. Unzip and run minutist.exe (first run downloads the ASR/LLM models)."

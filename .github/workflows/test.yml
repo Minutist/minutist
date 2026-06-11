@@ -196,7 +196,7 @@ jobs:
           set -euo pipefail
           for feat in ${{ matrix.graph_features }}; do
             echo "::group::cargo tree -e features --features $feat"
-            cargo tree -p meeting-app --no-default-features \
+            cargo tree -p minutist --no-default-features \
               --features "$feat" -e features --locked
             echo "::endgroup::"
           done
@@ -207,5 +207,5 @@ jobs:
       - name: cargo check (${{ matrix.check_features }})
         shell: bash
         run: |
-          cargo check -p meeting-app --no-default-features \
+          cargo check -p minutist --no-default-features \
             --features ${{ matrix.check_features }} --locked

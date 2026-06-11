@@ -81,7 +81,7 @@ intended-but-not-yet-wired. Productionising the rest of the bundle
 (per-platform native-lib staging) is open work.
 
 ```
-meeting-app(.exe)                          Tauri binary (Rust core + webview host)
+minutist(.exe)                          Tauri binary (Rust core + webview host)
 ├── resources/
 │   └── _up_/resources/silero/             Silero VAD ONNX (wired via bundle.resources)
 │       └── silero_vad_v4.onnx             (~1.8 MB; the `_up_` segment is Tauri's
@@ -97,6 +97,6 @@ meeting-app(.exe)                          Tauri binary (Rust core + webview hos
 The Silero VAD model is the one bundled model file (see
 `cross-cutting.md` "Model lifecycle — Exception: Silero VAD"): app-main resolves
 it at startup via `BaseDirectory::Resource` and plumbs the path to `vad-chunker`
-through `MEETING_APP_SILERO_PATH`. The large ASR / LLM / diarizer weights are
+through `MINUTIST_SILERO_PATH`. The large ASR / LLM / diarizer weights are
 **not** in the bundle. The installer is targeted at ~50-100 MB; the first-run
 flow downloads ~2-4 GB of model weights to the app data directory.

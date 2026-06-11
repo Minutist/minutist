@@ -94,7 +94,7 @@ impl<'m> LlamaTurnBackend<'m> {
     }
 
     fn backend() -> Result<&'static LlamaBackend, Error> {
-        meeting_app_common::llama_backend::shared_llama_backend()
+        minutist_common::llama_backend::shared_llama_backend()
             .map_err(|e| Error::Inference(format!("llama backend init: {e}")))
     }
 

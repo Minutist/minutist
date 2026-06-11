@@ -1,2 +1,2 @@
 [alias]
-gen-bindings = "run -p meeting-app --bin generate-bindings"
+gen-bindings = "run -p minutist --bin generate-bindings"

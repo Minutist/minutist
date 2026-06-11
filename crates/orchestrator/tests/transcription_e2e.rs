@@ -6,8 +6,8 @@
 //!
 //! # Gate
 //!
-//! The test is gated on the env vars `MEETING_APP_ASR_MODEL_PATH` and
-//! `MEETING_APP_ASR_MMPROJ_PATH`. When those are absent (e.g. CI without the
+//! The test is gated on the env vars `MINUTIST_ASR_MODEL_PATH` and
+//! `MINUTIST_ASR_MMPROJ_PATH`. When those are absent (e.g. CI without the
 //! ~1 GB model) the test emits an `eprintln!` and returns immediately so the
 //! no-op path compiles and passes.
 //!
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
-use meeting_app_common::{AppEvent, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, Segment};
+use minutist_common::{AppEvent, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, Segment};
 use orchestrator::Orchestrator;
 use model_registry::ModelRegistry;
 use settings::{JsonFileStore, SettingsHandle};
@@ -42,8 +42,8 @@ use tokio::sync::{broadcast, mpsc};
 fn model_env_vars() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     // Treat an EMPTY value as unset (skip) so `VAR=""` does not stage an empty
     // path and panic; only a non-empty path counts as "set".
-    let model = non_empty_env("MEETING_APP_ASR_MODEL_PATH")?;
-    let mmproj = non_empty_env("MEETING_APP_ASR_MMPROJ_PATH")?;
+    let model = non_empty_env("MINUTIST_ASR_MODEL_PATH")?;
+    let mmproj = non_empty_env("MINUTIST_ASR_MMPROJ_PATH")?;
     Some((std::path::PathBuf::from(model), std::path::PathBuf::from(mmproj)))
 }
 
@@ -271,7 +271,7 @@ fn e2e_orchestrator(
 
 /// Full pipeline: DummyAudioSource → orchestrator → VAD → ASR → transcript.
 ///
-/// Gated on `MEETING_APP_ASR_MODEL_PATH` + `MEETING_APP_ASR_MMPROJ_PATH`.
+/// Gated on `MINUTIST_ASR_MODEL_PATH` + `MINUTIST_ASR_MMPROJ_PATH`.
 /// When those are absent the test emits a diagnostic and returns immediately
 /// — the no-op path is what CI runs.
 ///
@@ -291,7 +291,7 @@ async fn live_pipeline_emits_transcript_segment_and_writes_transcript_json() {
         None => {
             eprintln!(
                 "skipping transcription_e2e; ASR model env vars not set \
-                 (MEETING_APP_ASR_MODEL_PATH and MEETING_APP_ASR_MMPROJ_PATH)"
+                 (MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH)"
             );
             return;
         }
@@ -300,12 +300,12 @@ async fn live_pipeline_emits_transcript_segment_and_writes_transcript_json() {
     // -- Validate paths before the expensive SHA-256 pass. --
     assert!(
         model_path.exists(),
-        "MEETING_APP_ASR_MODEL_PATH does not exist: {:?}",
+        "MINUTIST_ASR_MODEL_PATH does not exist: {:?}",
         model_path
     );
     assert!(
         mmproj_path.exists(),
-        "MEETING_APP_ASR_MMPROJ_PATH does not exist: {:?}",
+        "MINUTIST_ASR_MMPROJ_PATH does not exist: {:?}",
         mmproj_path
     );
 

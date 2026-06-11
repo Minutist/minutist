@@ -3,7 +3,7 @@
 //! Computes peak and RMS over a rolling window of ~33 ms (≈512 samples at
 //! 16 kHz). Emits one `AudioMeterFrame` per window.
 
-use meeting_app_common::AudioMeterFrame;
+use minutist_common::AudioMeterFrame;
 
 /// Accumulates samples and emits meter readings at a fixed window size.
 pub(crate) struct LevelMeter {

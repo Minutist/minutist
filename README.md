@@ -1,4 +1,4 @@
-# meeting-app
+# Minutist
 
 Local-first desktop meeting-notes application. Records meetings,
 transcribes them on-device, takes hand-typed notes alongside, summarises
@@ -99,9 +99,9 @@ make test-integration-summary ARGS=summarise_real_recording   # one test
 ```
 
 `tests-local.env` holds the model paths and a recordings directory
-(`MEETING_APP_RECORDINGS_DIR`, used by the real-recording summary test); it is
+(`MINUTIST_RECORDINGS_DIR`, used by the real-recording summary test); it is
 git-excluded (machine-specific). Models already downloaded by the app live under
-the app-data dir (`%APPDATA%/net.alelec.meeting-app/models` — reachable from WSL
+the app-data dir (`%APPDATA%/ai.minutist/models` — reachable from WSL
 via `/mnt/c`).
 
 ## CI
@@ -141,15 +141,15 @@ alongside [`architecture/workspace.dsl`](architecture/workspace.dsl).
 ## Native Windows builds + tests
 
 These run on the Windows side from WSL via `powershell.exe`. The scripts
-robocopy-mirror the repo to `C:\Users\anl\meeting-app`, set up the MSVC dev
+robocopy-mirror the repo to `C:\Users\anl\minutist`, set up the MSVC dev
 shell (vswhere + `Launch-VsDevShell.ps1`), and build/test there. The frontend is
 prebuilt in WSL and synced, so Node is not required on Windows.
 
 - **App build** — `make windows-build` (CPU) or `make windows-build-vulkan`
   (GPU), wrapping
   [`scripts/build-windows-app.ps1`](scripts/build-windows-app.ps1). Output is a
-  run-from-folder at `dist-windows\meeting-app[-vulkan]\` (the exe + native DLLs
-  + the bundled Silero model) plus a zip; run `meeting-app.exe` directly, no
+  run-from-folder at `dist-windows\minutist[-vulkan]\` (the exe + native DLLs
+  + the bundled Silero model) plus a zip; run `minutist.exe` directly, no
   install. It builds with `cargo tauri build --no-bundle` so the webview serves
   the embedded frontend over `tauri://` — a bare `cargo build` is dev-mode and
   points the webview at the (absent) Vite dev server.

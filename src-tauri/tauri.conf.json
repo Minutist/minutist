@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "meeting-app",
+  "productName": "Minutist",
   "version": "0.0.0",
-  "identifier": "net.alelec.meeting-app",
+  "identifier": "ai.minutist",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "meeting-app",
+        "title": "Minutist",
         "width": 1100,
         "height": 700,
         "resizable": true,

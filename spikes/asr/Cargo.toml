@@ -15,7 +15,7 @@ clap = { workspace = true }
 hound = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-meeting-app-common = { path = "../../crates/common" }
+minutist-common = { path = "../../crates/common" }
 
 # Pin llama-cpp-2 exactly. Feature `mtmd` enables the multimodal C++ bindings
 # (image + audio). CPU-only build on WSL Linux for Phase 0; Vulkan/CUDA are

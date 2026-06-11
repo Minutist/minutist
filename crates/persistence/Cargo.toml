@@ -10,7 +10,7 @@ authors.workspace = true
 # rename/delete meeting ops, summary.md I/O, and the MeetingState assembler.
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 audiopus = { workspace = true }
 chrono = { workspace = true }
 libsql = { workspace = true }

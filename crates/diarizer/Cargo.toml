@@ -14,7 +14,7 @@ cuda = ["sherpa-rs/cuda"]
 directml = ["sherpa-rs/directml"]
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # sherpa-onnx offline speaker diarization (segmentation + embedding + clustering).

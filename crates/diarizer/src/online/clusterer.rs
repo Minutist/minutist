@@ -24,7 +24,7 @@
 //! deterministic, FFI-free, and unit-testable. Sherpa is used ONLY for the
 //! embedding extraction, the one thing that genuinely needs the model.
 
-use meeting_app_common::AppResult;
+use minutist_common::AppResult;
 
 use crate::Error;
 
@@ -272,7 +272,7 @@ fn cosine_unit_vs_centroid(unit: &[f32], c: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use meeting_app_common::AppError;
+    use minutist_common::AppError;
 
     fn clusterer(threshold: f32, max: Option<usize>) -> OnlineClusterer {
         OnlineClusterer::new(OnlineClustererConfig {

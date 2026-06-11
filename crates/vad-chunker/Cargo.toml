@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-meeting-app-common = { path = "../common" }
+minutist-common = { path = "../common" }
 vad-rs = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

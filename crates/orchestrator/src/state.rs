@@ -15,7 +15,7 @@
 //! Stopping | Finalising → Idle  (finalise complete)
 //! ```
 
-use meeting_app_common::{AppError, AppResult, MeetingId, RecordingState};
+use minutist_common::{AppError, AppResult, MeetingId, RecordingState};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::Error;

@@ -3,7 +3,7 @@
 //! `From<Error> for AppError` lets errors cross the crate boundary toward
 //! the IPC bridge without leaking internal variants.
 
-use meeting_app_common::AppError;
+use minutist_common::AppError;
 
 /// Errors that can occur inside the `orchestrator` crate.
 #[derive(Debug, thiserror::Error)]

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use agent_tools::{ToolContext, ToolRegistry};
 use mcp_server::{serve, McpServerConfig};
-use meeting_app_common::{AppEvent, AppResult, NoteBlock, Segment, Summariser};
+use minutist_common::{AppEvent, AppResult, NoteBlock, Segment, Summariser};
 use orchestrator::test_support::test_orchestrator;
 use persistence::MeetingIndex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

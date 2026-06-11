@@ -20,7 +20,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "audio-capture",
- "meeting-app-common",
+ "minutist-common",
  "model-registry",
  "orchestrator",
  "persistence",
@@ -157,7 +157,7 @@ dependencies = [
 name = "asr-parakeet"
 version = "0.0.0"
 dependencies = [
- "meeting-app-common",
+ "minutist-common",
  "sherpa-rs",
  "thiserror 1.0.69",
  "tracing",
@@ -170,7 +170,7 @@ dependencies = [
  "encoding_rs",
  "hound",
  "llama-cpp-2",
- "meeting-app-common",
+ "minutist-common",
  "num_cpus",
  "thiserror 1.0.69",
  "tracing",
@@ -232,7 +232,7 @@ name = "audio-capture"
 version = "0.0.0"
 dependencies = [
  "cpal",
- "meeting-app-common",
+ "minutist-common",
  "rubato",
  "serde",
  "thiserror 1.0.69",
@@ -621,7 +621,7 @@ dependencies = [
  "agent-tools",
  "encoding_rs",
  "llama-cpp-2",
- "meeting-app-common",
+ "minutist-common",
  "serde",
  "serde_json",
  "summariser",
@@ -1025,7 +1025,7 @@ name = "diarizer"
 version = "0.0.0"
 dependencies = [
  "hound",
- "meeting-app-common",
+ "minutist-common",
  "persistence",
  "sherpa-rs",
  "thiserror 1.0.69",
@@ -2198,7 +2198,7 @@ dependencies = [
  "agent-tools",
  "chat-agent",
  "chrono",
- "meeting-app-common",
+ "minutist-common",
  "model-registry",
  "orchestrator",
  "persistence",
@@ -2655,7 +2655,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "meeting-app-common",
+ "minutist-common",
  "orchestrator",
  "persistence",
  "rmcp",
@@ -2667,46 +2667,6 @@ dependencies = [
  "tokio-util",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "meeting-app"
-version = "0.0.0"
-dependencies = [
- "agent-tools",
- "hex",
- "ipc-bridge",
- "mcp-server",
- "meeting-app-common",
- "model-registry",
- "orchestrator",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "settings",
- "specta-typescript",
- "tauri",
- "tauri-build",
- "tauri-plugin-fs",
- "tauri-plugin-store",
- "tauri-plugin-updater",
- "tauri-specta",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "meeting-app-common"
-version = "0.0.0"
-dependencies = [
- "llama-cpp-2",
- "serde",
- "serde_json",
- "specta",
- "thiserror 1.0.69",
- "uuid",
 ]
 
 [[package]]
@@ -2753,6 +2713,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "minutist"
+version = "0.0.0"
+dependencies = [
+ "agent-tools",
+ "hex",
+ "ipc-bridge",
+ "mcp-server",
+ "minutist-common",
+ "model-registry",
+ "orchestrator",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "settings",
+ "specta-typescript",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-fs",
+ "tauri-plugin-store",
+ "tauri-plugin-updater",
+ "tauri-specta",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "minutist-common"
+version = "0.0.0"
+dependencies = [
+ "llama-cpp-2",
+ "serde",
+ "serde_json",
+ "specta",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2768,7 +2768,7 @@ name = "model-registry"
 version = "0.0.0"
 dependencies = [
  "futures-util",
- "meeting-app-common",
+ "minutist-common",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3292,7 +3292,7 @@ dependencies = [
  "chrono",
  "diarizer",
  "hound",
- "meeting-app-common",
+ "minutist-common",
  "model-registry",
  "ogg",
  "persistence",
@@ -3434,7 +3434,7 @@ dependencies = [
  "audiopus",
  "chrono",
  "libsql",
- "meeting-app-common",
+ "minutist-common",
  "ogg",
  "serde",
  "serde_json",
@@ -4557,7 +4557,7 @@ dependencies = [
 name = "settings"
 version = "0.0.0"
 dependencies = [
- "meeting-app-common",
+ "minutist-common",
  "serde",
  "serde_json",
  "specta",
@@ -4788,7 +4788,7 @@ dependencies = [
  "encoding_rs",
  "hound",
  "llama-cpp-2",
- "meeting-app-common",
+ "minutist-common",
  "sha2",
  "tracing",
  "tracing-subscriber",
@@ -4801,7 +4801,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hound",
- "meeting-app-common",
+ "minutist-common",
  "serde_json",
  "sha2",
  "sherpa-rs",
@@ -4817,7 +4817,7 @@ dependencies = [
  "clap",
  "encoding_rs",
  "llama-cpp-2",
- "meeting-app-common",
+ "minutist-common",
  "serde_json",
  "sha2",
  "tracing",
@@ -4834,7 +4834,7 @@ dependencies = [
  "encoding_rs",
  "hound",
  "llama-cpp-2",
- "meeting-app-common",
+ "minutist-common",
  "serde",
  "serde_json",
  "tracing",
@@ -4909,7 +4909,7 @@ version = "0.0.0"
 dependencies = [
  "encoding_rs",
  "llama-cpp-2",
- "meeting-app-common",
+ "minutist-common",
  "num_cpus",
  "reqwest 0.12.28",
  "serde",
@@ -6043,7 +6043,7 @@ name = "vad-chunker"
 version = "0.0.0"
 dependencies = [
  "hound",
- "meeting-app-common",
+ "minutist-common",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

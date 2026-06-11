@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
-use meeting_app_common::{AppError, AppEvent, Segment};
+use minutist_common::{AppError, AppEvent, Segment};
 use model_registry::ModelRegistry;
 use orchestrator::test_support::{FailingAsrBackend, PanickingAsrBackend};
 use orchestrator::Orchestrator;

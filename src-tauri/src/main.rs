@@ -13,7 +13,47 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod updater;
 
+/// The bundle identifier, mirrored from `tauri.conf.json`. Used for the
+/// pre-Tauri log-dir resolution and the legacy data-dir migration below.
+const APP_IDENTIFIER: &str = "ai.minutist";
+
+/// The pre-rename bundle identifier (the app shipped as `meeting-app` until
+/// 2026-06-11). Referenced ONLY by `migrate_legacy_app_data`; this literal
+/// must keep the old name — do not "fix" it in any future rename sweep.
+const LEGACY_IDENTIFIER: &str = "net.alelec.meeting-app";
+
+/// One-time data-dir migration for the `meeting-app` → Minutist rename: the
+/// identifier change moves the per-app data root, which would silently orphan
+/// existing recordings/models/settings. If the legacy root exists and the new
+/// one does not, move the whole tree (same-volume rename).
+///
+/// MUST be the first thing `main` does: the logging bootstrap right below
+/// creates `<new-root>/logs`, which would make the new root exist and defeat
+/// the `!new.exists()` guard forever after.
+fn migrate_legacy_app_data() {
+    let old_root = app_data_root(LEGACY_IDENTIFIER);
+    let new_root = app_data_root(APP_IDENTIFIER);
+    if old_root.is_dir() && !new_root.exists() {
+        match std::fs::rename(&old_root, &new_root) {
+            Ok(()) => eprintln!(
+                "[app-main] migrated app data {} -> {}",
+                old_root.display(),
+                new_root.display()
+            ),
+            // Tracing is not initialised yet, so stderr is the only channel.
+            // On failure (e.g. the old dir is held open by another process)
+            // leave the legacy tree untouched and start fresh.
+            Err(e) => eprintln!(
+                "[app-main] app-data migration failed ({e}); leaving {} in place",
+                old_root.display()
+            ),
+        }
+    }
+}
+
 fn main() {
+    migrate_legacy_app_data();
+
     // ---------------------------------------------------------------------------
     // Logging — file appender + optional console.
     //
@@ -38,7 +78,7 @@ fn main() {
         eprintln!("[app-main] failed to create log dir {:?}: {e}", log_dir);
     }
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "meeting-app.log");
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "minutist.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     // Default to `info` when neither `RUST_LOG` nor the env is set, so shipped
@@ -80,14 +120,16 @@ fn main() {
 /// - macOS:   `~/Library/Application Support/<identifier>`
 /// - Windows: `%APPDATA%\<identifier>`
 fn resolve_log_dir() -> PathBuf {
-    let base = dirs_next();
-    base.join("logs")
+    app_data_root(APP_IDENTIFIER).join("logs")
 }
 
-fn dirs_next() -> PathBuf {
+/// The platform app-data root for `identifier`, mirroring Tauri's
+/// `BaseDirectory::AppData` resolution (see `resolve_log_dir` docs).
+/// Parameterised so the legacy-migration shim resolves BOTH the old and new
+/// identifiers' roots with identical platform logic.
+fn app_data_root(identifier: &str) -> PathBuf {
     // Attempt to use the same base path as Tauri's AppData directory.
     // tauri uses `dirs` crate internally; we use std env as a fallback.
-    let identifier = "net.alelec.meeting-app";
 
     #[cfg(target_os = "linux")]
     let base = std::env::var("XDG_DATA_HOME")
@@ -139,7 +181,7 @@ fn cleanup_old_logs(log_dir: &std::path::Path, max_days: u64) {
             Some(n) => n.to_owned(),
             None => continue,
         };
-        if !name.starts_with("meeting-app.log") {
+        if !name.starts_with("minutist.log") {
             continue;
         }
         let modified = match entry.metadata().and_then(|m| m.modified()) {
@@ -158,7 +200,7 @@ fn cleanup_old_logs(log_dir: &std::path::Path, max_days: u64) {
 }
 
 /// Resolve the bundled Silero VAD ONNX model and export its absolute path as
-/// `MEETING_APP_SILERO_PATH` so `vad-chunker::default_model_path()` finds it in
+/// `MINUTIST_SILERO_PATH` so `vad-chunker::default_model_path()` finds it in
 /// an installed package.
 ///
 /// The model is shipped via the `bundle.resources` entry
@@ -188,11 +230,11 @@ fn resolve_silero_model(app: &tauri::AppHandle) {
     for candidate in CANDIDATES {
         match app.path().resolve(candidate, BaseDirectory::Resource) {
             Ok(path) if path.is_file() => {
-                std::env::set_var("MEETING_APP_SILERO_PATH", &path);
+                std::env::set_var("MINUTIST_SILERO_PATH", &path);
                 tracing::info!(
                     target: "app-main",
                     path = %path.display(),
-                    "bundled Silero VAD model resolved; MEETING_APP_SILERO_PATH set"
+                    "bundled Silero VAD model resolved; MINUTIST_SILERO_PATH set"
                 );
                 return;
             }
@@ -217,7 +259,7 @@ fn resolve_silero_model(app: &tauri::AppHandle) {
 
     tracing::debug!(
         target: "app-main",
-        "no bundled Silero VAD model found (dev run); leaving MEETING_APP_SILERO_PATH unset \
+        "no bundled Silero VAD model found (dev run); leaving MINUTIST_SILERO_PATH unset \
          so vad-chunker uses its source-tree fallback"
     );
 }
@@ -349,7 +391,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             );
 
             // Resolve the bundled Silero VAD model and plumb its path to
-            // `vad-chunker` via `MEETING_APP_SILERO_PATH` (see
+            // `vad-chunker` via `MINUTIST_SILERO_PATH` (see
             // architecture/cross-cutting.md "Model lifecycle — Exception:
             // Silero VAD"). MUST run before the orchestrator is constructed and
             // before any recording, because `vad-chunker::default_model_path()`
@@ -590,7 +632,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                                 mcp_handles.orchestrator.clone(),
                                 mcp_handles.index.clone(),
                                 mcp_handles.meetings_dir.clone(),
-                                summariser as Arc<dyn meeting_app_common::Summariser>,
+                                summariser as Arc<dyn minutist_common::Summariser>,
                                 mcp_event_tx,
                                 None, // MCP callers pass meeting_id explicitly
                             )
@@ -631,7 +673,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                                 // MCP pane refreshes. The token is NOT carried on
                                 // the event (revealed only via get_mcp_server_info).
                                 let _ = listening_event_tx
-                                    .send(meeting_app_common::AppEvent::McpServerListening { url });
+                                    .send(minutist_common::AppEvent::McpServerListening { url });
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -681,7 +723,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error running meeting-app");
+        .expect("error running minutist");
 }
 
 /// Handle a `meetingasset:` URI-scheme request: serve a note image asset's
@@ -755,14 +797,14 @@ fn tray_icon() -> tauri::image::Image<'static> {
 
 /// Construct the tray icon and attach menu event + icon-click handlers.
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
-    let open_item = MenuItem::with_id(app, "open", "Open meeting-app", true, None::<&str>)?;
+    let open_item = MenuItem::with_id(app, "open", "Open minutist", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
     let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
 
     TrayIconBuilder::new()
         .icon(tray_icon())
-        .tooltip("meeting-app")
+        .tooltip("minutist")
         .menu(&menu)
         // Left-click shows the menu on platforms where that's conventional.
         // An explicit on_tray_icon_event handler below also shows the window

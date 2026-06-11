@@ -1038,17 +1038,20 @@ per platform built with a portable GPU backend (Vulkan on Windows/Linux, Metal
 on macOS) with runtime CPU fallback, so there is no per-backend update fan-out.
 
 The flow is driven entirely from Rust via `UpdaterExt` (no JS updater plugin):
-app-main checks on startup and emits `UpdateAvailable`; the webview prompts and,
-on accept, emits the `updater://apply` event back; app-main then downloads
-(emitting `UpdateProgress`), installs, and relaunches (`AppHandle::restart`).
-All updater calls are **guarded** — the committed default `plugins.updater`
-config is `{ "endpoints": [], "pubkey": "" }`, so `check()` is a logged no-op and
-dev/unsigned builds are unaffected. Enabling updates is a release step: set the
-real `endpoints` + minisign `pubkey` in `tauri.conf.json`, set
-`bundle.createUpdaterArtifacts` to `true` (it is **unset** today, so
-release builds currently emit no updater artefacts), keep the private key
-as the `TAURI_SIGNING_PRIVATE_KEY` CI secret, and enable updater-artefact
-signing in the release workflow. The app-wide Tauri 2 capability is `src-tauri/capabilities/default.json`
+app-main checks on startup and emits `UpdateAvailable`; the webview surfaces it
+through the `UpdateBanner` chrome strip (backed by the `update` store's
+idle → available → downloading → applying state machine) and, on accept, emits
+the `updater://apply` event back; app-main then downloads (emitting
+`UpdateProgress`), installs, and relaunches (`AppHandle::restart`). Apply
+failures emit `AppEvent::ErrorOccurred`. All updater calls are **guarded** —
+the committed `plugins.updater` config has the production `endpoints` URL
+(the GitHub releases `latest.json`) but an empty `pubkey`, so `check()` is a
+logged no-op until the minisign keypair is activated; dev/unsigned builds are
+unaffected. `bundle.createUpdaterArtifacts` is `true`, so release builds emit
+the `.sig` updater artefacts. Activation is a one-time maintainer step
+(documented in `RELEASING.md`): generate the minisign keypair, keep the
+private key as the `TAURI_SIGNING_PRIVATE_KEY` CI secret, and paste the
+public key into `tauri.conf.json` `pubkey`. The app-wide Tauri 2 capability is `src-tauri/capabilities/default.json`
 (`core:default` + `core:event:allow-emit`/`allow-listen`, scoped to the `main`
 window) — without a capability a Tauri 2 webview has no IPC access at all, so
 this is what lets the webview invoke the tauri-specta commands, receive

@@ -8,20 +8,14 @@
   hardened runtime also requires the com.apple.security.device.audio-input
   entitlement or the capture API returns a "no hardware" error.
 
-  JIT / unsigned executable memory: llama.cpp allocates executable memory
-  pages for its compute kernels. Without the allow-jit entitlement the
-  hardened runtime kills the process with SIGKILL on macOS 10.15+.
+  No JIT entitlements: GGML/llama.cpp is AOT-compiled (CPU SIMD
+  intrinsics; the Metal backend compiles shaders through the Metal
+  framework out-of-process), and WKWebView's JIT runs in Apple's separate
+  WebContent process with its own entitlements — the host app allocates
+  no executable memory at runtime.
 -->
 <plist version="1.0">
 <dict>
-  <!-- Hardened runtime: allow JIT (llama.cpp compute kernels). -->
-  <key>com.apple.security.cs.allow-jit</key>
-  <true/>
-
-  <!-- Hardened runtime: allow unsigned executable memory (llama.cpp GGML). -->
-  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-  <true/>
-
   <!-- Microphone capture (cpal + AVFoundation). -->
   <key>com.apple.security.device.audio-input</key>
   <true/>

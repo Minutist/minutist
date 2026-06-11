@@ -39,11 +39,13 @@ mod tests {
     #[cfg_attr(target_os = "linux", ignore)]
     fn device_list_shape() {
         let devices = AudioCaptureManager::list_devices().expect("list_devices failed");
-        // On a machine with at least one input device we expect a non-empty list.
-        assert!(
-            !devices.is_empty(),
-            "expected at least one audio input device"
-        );
+        // Headless machines (CI runners) legitimately expose zero input
+        // devices; the shape assertions below need at least one to verify,
+        // so an empty list is a skip, not a failure.
+        if devices.is_empty() {
+            eprintln!("skip: no audio input devices on this machine");
+            return;
+        }
         for d in &devices {
             assert!(!d.id.is_empty(), "device id must not be empty");
             assert!(!d.name.is_empty(), "device name must not be empty");

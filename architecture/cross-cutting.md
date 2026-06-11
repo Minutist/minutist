@@ -44,6 +44,19 @@ that.
 Bounded channels everywhere. Unbounded queues are not allowed — they
 hide back-pressure that the live pipeline needs to surface.
 
+`unsafe` Send/Sync assertions in the workspace (each documents its full
+safety argument at the impl site):
+
+- `summariser`: `unsafe impl Send + Sync` for the held `LlamaModel` (see
+  the summariser section in components.md).
+- `audio-capture`: `unsafe impl Send for StreamHandle`
+  (`#[cfg(target_os = "macos")]`) — cpal's CoreAudio stream is `!Send`
+  solely via its property-listener closure; every shared access,
+  including listener-vs-drop, is synchronised inside cpal
+  (`Arc<Mutex<StreamInner>>` + `Weak` upgrade on the listener thread), so
+  moving the owned handle across tokio worker threads is safe.
+  ALSA/WASAPI streams are `Send` natively; `Sync` is never asserted.
+
 **Live vs. offline diarization (Phase B).** There are two independent
 diarization paths. The offline `SherpaDiarizer` / `common::Diarizer`
 on-stop (and re-diarize) pass is the SOURCE OF TRUTH for the finished

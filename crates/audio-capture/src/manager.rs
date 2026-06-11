@@ -182,10 +182,30 @@ enum StreamState {
     Paused,
 }
 
+/// Newtype promoting `cpal::Stream` to `Send` where the backend does not
+/// provide it itself. On Linux (ALSA) and Windows (WASAPI) the stream is
+/// already `Send`, so the promotion below is macOS-only; on macOS
+/// (CoreAudio) the stream is `!Send` solely because its `StreamInner` holds
+/// an `AudioObjectPropertyListener` wrapping `Box<dyn FnMut()>`.
+struct StreamHandle(cpal::Stream);
+
+// SAFETY: cpal's macOS `Stream` is `Arc<Mutex<StreamInner>>`; it is `!Send`
+// only because `StreamInner` holds an `AudioObjectPropertyListener`
+// (`Box<dyn FnMut()>`). That listener is invoked on CoreAudio's own thread
+// and reaches `StreamInner` through a `Weak<Mutex<…>>` it locks, so every
+// shared access — including listener-vs-drop — is synchronised inside cpal,
+// independent of which thread owns the handle. We only ever *move* the
+// handle (never share `&StreamHandle` across threads), and
+// play/pause/drop carry no CoreAudio thread-affinity requirement, so
+// promoting `Send` is safe. `Sync` is deliberately NOT asserted.
+#[cfg(target_os = "macos")]
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for StreamHandle {}
+
 /// Live capture resources for one cpal source (mic OR loopback): the stream,
 /// its pause flag, and the cpal→forwarder channel closed on stop.
 struct SourceHandles {
-    stream: cpal::Stream,
+    stream: StreamHandle,
     paused: Arc<AtomicBool>,
     raw_ch: Arc<DropOldestChannel>,
 }
@@ -297,6 +317,7 @@ impl AudioCaptureManager {
             Arc::clone(&mic_raw_ch),
         )?;
         mic_stream.play().map_err(Error::from)?;
+        let mic_stream = StreamHandle(mic_stream);
 
         // --- Try to open the loopback source when requested ---
         // A failure (unsupported platform, no render device) degrades to
@@ -331,6 +352,7 @@ impl AudioCaptureManager {
                      (a starved/idle source is zero-filled so the mic keeps flowing)"
                 );
                 lb.stream.play().map_err(Error::from)?;
+                let lb_stream = StreamHandle(lb.stream);
 
                 // Per-source resampled batch channels feeding the mixer. Bounded
                 // so a slow mixer back-pressures without unbounded growth; the
@@ -355,7 +377,7 @@ impl AudioCaptureManager {
                 spawn_mixer(mic_batch_rx, sys_batch_rx, sample_tx, meter_tx);
 
                 self.loopback = Some(SourceHandles {
-                    stream: lb.stream,
+                    stream: lb_stream,
                     paused: lb.paused,
                     raw_ch: lb.raw_ch,
                 });
@@ -400,7 +422,7 @@ impl AudioCaptureManager {
 
         for src in [self.mic.as_ref(), self.loopback.as_ref()].into_iter().flatten() {
             src.paused.store(true, Ordering::Relaxed);
-            src.stream.pause().map_err(Error::from)?;
+            src.stream.0.pause().map_err(Error::from)?;
         }
         self.state = StreamState::Paused;
         tracing::info!(target = "audio-capture", "capture paused");
@@ -421,7 +443,7 @@ impl AudioCaptureManager {
 
         for src in [self.mic.as_ref(), self.loopback.as_ref()].into_iter().flatten() {
             src.paused.store(false, Ordering::Relaxed);
-            src.stream.play().map_err(Error::from)?;
+            src.stream.0.play().map_err(Error::from)?;
         }
         self.state = StreamState::Running;
         tracing::info!(target = "audio-capture", "capture resumed");

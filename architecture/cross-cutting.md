@@ -1212,7 +1212,7 @@ Two shipping artifacts are produced from one source tree:
 
 The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server_info` returns `None` unconditionally. The `mcp_*` fields in `Settings` remain (serde compatibility across tier switches — a user who switches from connected to free keeps their settings file intact with the MCP fields as inert no-ops).
 
-**Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` renders in the UI. In a free bundle the component is tree-shaken away by Vite. The default `vite.config.ts` sets `VITE_CONNECTED = "1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour.
+**Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` renders in the UI. `vite.config.ts` injects this as a `define`-replaced constant: in the free build the false branch of the `React.lazy()` dynamic import is dead-code-eliminated, dropping `McpSettingsPane`, `mcp-settings.ts`, and `mcp-server-info.ts` from the output bundle. The default is `"1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour without any explicit flag. Verification: `VITE_CONNECTED= npm run build && grep -r "Enable MCP server" dist/` must return no matches.
 
 **Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper".
 

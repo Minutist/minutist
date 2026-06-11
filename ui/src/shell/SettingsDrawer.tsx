@@ -15,7 +15,8 @@
  * open, Escape and a scrim click dismiss. Rendered in the Editorial Ink
  * language using `theme.css` tokens only.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, lazy, Suspense, Component } from "react";
+import type { ReactNode } from "react";
 import { useRecordingStore } from "../state/recording";
 import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
@@ -27,8 +28,44 @@ import type { GpuAcceleration, Theme } from "../ipc/bindings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
 import { OutputLanguagePicker } from "./OutputLanguagePicker";
-import { McpSettingsPane } from "./McpSettingsPane";
 import "./SettingsDrawer.css";
+
+// Error boundary for the lazy MCP pane. A chunk-load failure is silently
+// suppressed: the pane is omitted rather than unmounting the whole React tree.
+class McpPaneErrorBoundary extends Component<
+  { children: ReactNode },
+  { failed: boolean }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { failed: false };
+  }
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  override render() {
+    if (this.state.failed) return null;
+    return this.props.children;
+  }
+}
+
+// McpSettingsPane is present only in the connected build.  `import.meta.env.VITE_CONNECTED`
+// is replaced with a string literal by Vite's `define` at bundle time (see
+// vite.config.ts), so the false branch and its `import()` call are
+// dead-code-eliminated, dropping McpSettingsPane, mcp-settings.ts, and
+// mcp-server-info.ts from the free bundle.
+//
+// `npm run dev` and vitest both default to VITE_CONNECTED="1" (see
+// vite.config.ts), so the pane renders and tests pass unchanged.
+//
+// Verification: VITE_CONNECTED= npm run build && grep -r "Enable MCP server" dist/
+// → no matches expected in the free bundle.
+const LazyMcpSettingsPane =
+  import.meta.env.VITE_CONNECTED === "1"
+    ? lazy(() =>
+        import("./McpSettingsPane").then((m) => ({ default: m.McpSettingsPane })),
+      )
+    : null;
 
 export type SettingsDrawerProps = {
   /** Whether the drawer is shown. */
@@ -203,7 +240,13 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
           <OutputLanguagePicker />
         </section>
 
-        <McpSettingsPane />
+        {LazyMcpSettingsPane && (
+          <McpPaneErrorBoundary>
+            <Suspense fallback={null}>
+              <LazyMcpSettingsPane />
+            </Suspense>
+          </McpPaneErrorBoundary>
+        )}
 
         <footer className="settings-drawer__footer">
           <button

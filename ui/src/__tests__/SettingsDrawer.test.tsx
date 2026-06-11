@@ -7,12 +7,50 @@
  * persistence is unchanged and stays covered by the store-seam tests
  * (Diarization / GpuAcceleration / SystemAudio / TranscriptionLanguage /
  * DevicePersistence) — the drawer routes through those same seams.
+ *
+ * The lazy-wiring tests (describe "MCP pane lazy wiring") assert that the
+ * drawer mounts McpSettingsPane via the Suspense/lazy path in the connected
+ * build, and that the error boundary absorbs a render failure cleanly.
+ * VITE_CONNECTED is baked to "1" by vite.config.ts at transform time, so
+ * vi.stubEnv cannot change it after the module is loaded — the "gate hides
+ * pane when not connected" case cannot be exercised in the vitest suite
+ * (that property is verified by the free-build grep in CI instead).
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import { SettingsDrawer } from "../shell/SettingsDrawer";
 import { useRecordingStore } from "../state/recording";
 import type { Settings } from "../ipc/bindings";
+
+// ---------------------------------------------------------------------------
+// IPC mocks — required by the lazy McpSettingsPane which calls getMcpServerInfo
+// on mount via mcp-server-info.ts -> ipc/client.ts -> bindings.ts.
+// These mocks are hoisted by vitest and apply to all tests in this file.
+// The existing synchronous drawer tests are unaffected: they do not await any
+// IPC call.
+// ---------------------------------------------------------------------------
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(), Channel: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+  once: vi.fn().mockResolvedValue(() => {}),
+  emit: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@tauri-apps/api/webviewWindow", () => ({ WebviewWindow: vi.fn() }));
+vi.mock("../ipc/client", () => ({
+  commands: {
+    getMcpServerInfo: vi.fn(async () => ({
+      status: "ok",
+      data: { url: "http://127.0.0.1:8765/mcp", token: "tok" },
+    })),
+    updateSettings: vi.fn(async () => ({ status: "ok", data: null })),
+    getSettings: vi.fn(async () => ({ status: "ok", data: null })),
+  },
+  unwrap: <T,>(r: { status: string; data: T }) => {
+    if (r.status !== "ok") throw new Error("err");
+    return r.data;
+  },
+  ipcErrorMessage: (e: unknown) => String(e),
+}));
 
 const BASE_SETTINGS: Settings = {
   input_device_id: null,
@@ -89,5 +127,24 @@ describe("SettingsDrawer", () => {
     // Click the scrim (the overlay root) — dismisses.
     fireEvent.click(container.firstChild as Element);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("MCP pane lazy wiring", () => {
+  beforeEach(seedStore);
+
+  // In the connected build (VITE_CONNECTED="1", baked at transform time),
+  // LazyMcpSettingsPane is non-null and rendered inside Suspense/McpPaneErrorBoundary.
+  // This test verifies that the Suspense resolves and the pane appears in the DOM,
+  // catching a broken lazy/gate wiring before it reaches users.
+  //
+  // The "gate hides pane when not connected" case is not exercised here:
+  // VITE_CONNECTED is statically replaced by vite.config.ts `define` at transform
+  // time, so vi.stubEnv has no effect after the module is loaded. That property
+  // is verified by the free-build grep in the build-free CI job instead.
+  it("renders the MCP pane via the lazy path in the connected build", async () => {
+    render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
+    // The lazy chunk resolves asynchronously; findByText waits for it.
+    await screen.findByText("Enable MCP server (loopback)");
   });
 });

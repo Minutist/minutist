@@ -2015,17 +2015,28 @@ process — changing the setting requires a restart, and existing data is not
 migrated automatically. There is currently no UI for this field; it must be set
 by editing `settings.store` directly.
 
-**Phase 10 wiring (MCP).** Gated on `settings.mcp_enabled` (off by default), from
-`setup()`: `app-main` spawns `ipc_bridge::spawn_inter_agent_driver` (owns the
-inter-agent receiver + the internal `v1(false)` chat turn) to get the bridge
-SENDER, builds the MCP `ToolRegistry::v1(true)` + a `ToolContext` carrying that
-sender, resolves the bearer token (generate-on-first-enable, persisted to
-`{app-data}/mcp_token` with `0600`; OS-keychain hardening is a documented
-follow-up), and `tauri::async_runtime::spawn`s `mcp_server::serve` on
+**Phase 10 wiring (MCP).** Gated on `settings.mcp_enabled` (off by default).
+The shared spawn logic lives in `do_start_mcp_server` (private to `app-main`):
+it spawns `ipc_bridge::spawn_inter_agent_driver` (owns the inter-agent receiver
++ the internal `v1(false)` chat turn) to get the bridge SENDER, builds the MCP
+`ToolRegistry::v1(true)` + a `ToolContext` carrying that sender, resolves the
+bearer token (generate-on-first-enable, persisted to `{app-data}/mcp_token`
+with `0600`; OS-keychain hardening is a documented follow-up), stores the new
+`watch::Sender<bool>` in `McpShutdownState` (Tauri managed state, connected
+build only), and `tauri::async_runtime::spawn`s `mcp_server::serve` on
 `127.0.0.1:{mcp_port}`. On the bound addr it fills `IpcState.mcp_info` (URL +
-token, read by `get_mcp_server_info`) and emits `AppEvent::McpServerListening` on
-the shared bus. Toggling the setting at runtime is a documented restart-required
-for v1. Adds the `mcp-server` dependency row above.
+token, read by `get_mcp_server_info`) and emits `AppEvent::McpServerListening`.
+
+A settings-watcher task (spawned at startup) subscribes to
+`SettingsHandle::subscribe()` and reacts to `mcp_enabled` changes: on `true`,
+it calls `do_start_mcp_server` (a fresh inter-agent driver + new shutdown
+sender); on `false`, it fires the shutdown watch (stopping the accept loop and
+cancelling active sessions via rmcp's `CancellationToken`), clears
+`IpcState.mcp_info`, and emits `AppEvent::McpServerStopped`. Enable/disable
+therefore takes effect immediately with no restart. Port and `mcp_write_tools`
+changes are NOT reacted to by the watcher — those are restart-required (the
+running server was built with those values). Adds the `mcp-server` dependency
+row above.
 
 ## Webview components
 

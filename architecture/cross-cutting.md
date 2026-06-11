@@ -694,10 +694,19 @@ revision 2025-11-25). Binding controls:
   `ContextOverflow`; overflow + "recorder busy" surface as `InvalidInput`).
 
 - **Settings-gated, off by default.** `settings.mcp_enabled` (default `false`)
-  gates the listener, spawned once at startup from `app-main`'s `setup()` via
-  `tauri::async_runtime::spawn`. `settings.mcp_port` is a FIXED default loopback
-  port (8765, D1 — one instance runs, so a stable port keeps a saved client
-  URL valid). Toggling at runtime is restart-required for v1.
+  gates the listener. `app-main` watches the settings handle via
+  `SettingsHandle::subscribe()` and **starts or stops the server live** when
+  `mcp_enabled` flips — no restart required for the enable/disable toggle.
+  A `McpShutdownState` (Tauri managed state, connected build only) holds the
+  `watch::Sender<bool>` for the running server; the watcher fires it on
+  disable and spawns a fresh server (with a new inter-agent driver and a new
+  shutdown sender) on re-enable. `settings.mcp_port` is a FIXED default
+  loopback port (8765, D1 — one instance runs, so a stable port keeps a
+  saved client URL valid). Changing the port or `mcp_write_tools` IS
+  restart-required (the running server was built with those values at startup).
+  On stop, `AppEvent::McpServerStopped` is emitted so the Settings → MCP pane
+  clears the endpoint display; on start, `AppEvent::McpServerListening` is
+  emitted as before.
 
 - **In-process, not a subprocess.** The listener shares the same
   `Arc<Orchestrator>` / `Arc<MeetingIndex>` / `meetings_dir` / held model / registry

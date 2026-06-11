@@ -40,9 +40,14 @@ export const useMcpServerInfoStore = create<McpServerInfoStore>((set) => ({
   },
 
   handleEvent: (event) => {
+    if (event.kind === "mcp_server_stopped") {
+      // The server was disabled via settings toggle; clear the endpoint display.
+      set({ info: null });
+      return;
+    }
     if (event.kind !== "mcp_server_listening") return;
     // The listener just bound: re-fetch the full info (URL + token) so the pane
-    // reflects the live URL live. The token is not on the event.
+    // reflects the live endpoint. The token is not on the event.
     try {
       void (async () => {
         const fetched = unwrap(await commands.getMcpServerInfo());

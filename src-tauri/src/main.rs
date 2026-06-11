@@ -340,6 +340,143 @@ fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Live handle to the running MCP server's shutdown watch sender (connected
+/// build only). Held in Tauri's managed state so the settings watcher can
+/// stop the server on `mcp_enabled → false` without touching `IpcState`.
+///
+/// `None` when the server is not currently running. The settings watcher is
+/// the only writer; command handlers read `mcp_info` via `IpcState` instead.
+#[cfg(feature = "connected")]
+struct McpShutdownState(
+    Arc<std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+);
+
+/// Parameters passed to [`do_start_mcp_server`] to keep the signature
+/// manageable (all values are needed both at boot and on re-enable).
+#[cfg(feature = "connected")]
+struct McpStartParams {
+    orchestrator: Arc<orchestrator::Orchestrator>,
+    index: Arc<ipc_bridge::MeetingIndex>,
+    meetings_dir: std::path::PathBuf,
+    event_tx: tokio::sync::broadcast::Sender<minutist_common::AppEvent>,
+    settings: settings::SettingsHandle,
+    summariser: Arc<tokio::sync::OnceCell<Arc<ipc_bridge::LlamaSummariser>>>,
+    chat_in_flight:
+        Arc<std::sync::Mutex<std::collections::HashSet<minutist_common::ChatSessionId>>>,
+    app_data_dir: std::path::PathBuf,
+    /// A clone of `IpcState::mcp_info`; written on successful bind.
+    mcp_info: Arc<std::sync::Mutex<Option<ipc_bridge::McpServerInfo>>>,
+    /// Written with the new shutdown sender so the settings watcher can stop
+    /// the server later.
+    shutdown_state: Arc<std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+}
+
+/// Spawn the MCP server and inter-agent bridge for the current settings
+/// snapshot (`settings.mcp_port`, `settings.mcp_write_tools`).
+///
+/// Creates a new inter-agent driver, resolves the bearer token, creates a
+/// fresh shutdown watch pair (storing the sender in `params.shutdown_state`),
+/// and spawns `mcp_server::serve`. On a successful bind the caller-supplied
+/// `mcp_info` slot is filled and `McpServerListening` is emitted on the event
+/// bus. A bind failure is logged and leaves the slot empty.
+#[cfg(feature = "connected")]
+fn do_start_mcp_server(params: McpStartParams) {
+    let settings_now = params.settings.current();
+    let allow_writes = settings_now.mcp_write_tools;
+    let port = settings_now.mcp_port;
+
+    let chat_handles = ipc_bridge::ChatHandles {
+        orchestrator: params.orchestrator.clone(),
+        index: params.index.clone(),
+        meetings_dir: params.meetings_dir.clone(),
+        event_tx: params.event_tx.clone(),
+        settings: params.settings.clone(),
+        summariser: params.summariser.clone(),
+    };
+    let bridge_tx = ipc_bridge::spawn_inter_agent_driver(
+        chat_handles,
+        params.chat_in_flight,
+        allow_writes,
+    );
+
+    let mcp_registry = Arc::new(agent_tools::ToolRegistry::v1(true));
+    let token = resolve_mcp_token(&params.app_data_dir);
+
+    let mcp_handles = ipc_bridge::ChatHandles {
+        orchestrator: params.orchestrator.clone(),
+        index: params.index.clone(),
+        meetings_dir: params.meetings_dir.clone(),
+        event_tx: params.event_tx.clone(),
+        settings: params.settings.clone(),
+        summariser: params.summariser.clone(),
+    };
+
+    // Create a fresh shutdown watch. The sender is stored in McpShutdownState
+    // so the settings watcher can stop the server by sending `true`.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    *params
+        .shutdown_state
+        .lock()
+        .expect("mcp_shutdown poisoned") = Some(shutdown_tx);
+
+    let mcp_info_for_task = params.mcp_info;
+    let event_tx_for_task = params.event_tx;
+
+    tauri::async_runtime::spawn(async move {
+        let summariser = match mcp_handles.ensure_summariser().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    target: "app-main",
+                    "MCP server not started: held summariser load failed: {e}"
+                );
+                return;
+            }
+        };
+        let ctx = Arc::new(
+            agent_tools::ToolContext::new(
+                mcp_handles.orchestrator.clone(),
+                mcp_handles.index.clone(),
+                mcp_handles.meetings_dir.clone(),
+                summariser as Arc<dyn minutist_common::Summariser>,
+                mcp_handles.event_tx.clone(),
+                None, // MCP callers pass meeting_id explicitly
+            )
+            .with_inter_agent_bridge(bridge_tx),
+        );
+
+        let bind_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        match mcp_server::serve(
+            mcp_registry,
+            ctx,
+            mcp_server::McpServerConfig {
+                bind_addr,
+                bearer_token: token.clone(),
+                allow_writes,
+            },
+            shutdown_rx,
+        )
+        .await
+        {
+            Ok(bound) => {
+                let url = format!("http://{bound}{}", mcp_server::MCP_PATH);
+                *mcp_info_for_task.lock().expect("mcp_info poisoned") =
+                    Some(ipc_bridge::McpServerInfo {
+                        url: url.clone(),
+                        token,
+                    });
+                // Emit the listening event so the MCP pane refreshes.
+                // The token is NOT carried on the event.
+                let _ = event_tx_for_task
+                    .send(minutist_common::AppEvent::McpServerListening { url });
+            }
+            Err(e) => {
+                tracing::error!(target: "app-main", "MCP server failed to start: {e}");
+            }
+        }
+    });
+}
+
 /// The set of path roots derived from the platform app-data directory and an
 /// optional user-configured override, passed to the components that own each
 /// directory scope.
@@ -738,135 +875,116 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             //
             // Compiled only in the `connected` build (the free build elides the
             // entire block — no mcp-server crate, no rmcp, no listening socket).
-            // When the feature is present, the server is additionally gated on
-            // `settings.mcp_enabled` (off by default).  Toggling at runtime is a
-            // documented restart-required for v1.
+            // `settings.mcp_enabled` (off by default) gates the listener at
+            // startup; toggling it at runtime starts or stops the server live
+            // (the settings watcher task below drives that). Changing the port
+            // or write-tools setting is still restart-required (the running
+            // server was built with those values at start time).
             #[cfg(feature = "connected")]
             {
+                // Shutdown sender held in managed state so the settings watcher
+                // can stop the server without routing through IpcState.
+                let shutdown_inner: Arc<
+                    std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+                > = Arc::new(std::sync::Mutex::new(None));
+                app.manage(McpShutdownState(shutdown_inner.clone()));
+
                 let settings_now = settings_handle.current();
                 if settings_now.mcp_enabled {
-                    // The inter-agent driver owns the receiver + the chat turn
-                    // (keeping the chat dependency in `ipc-bridge`, not
-                    // `mcp-server`); it hands back the SENDER for the bridge tool.
-                    let chat_handles = ipc_bridge::ChatHandles {
+                    do_start_mcp_server(McpStartParams {
                         orchestrator: orchestrator.clone(),
                         index: index.clone(),
                         meetings_dir: notes_meetings_dir.clone(),
                         event_tx: ipc_event_tx.clone(),
                         settings: settings_handle.clone(),
                         summariser: summariser_cell.clone(),
-                    };
-                    // The bridged turn is bounded by the SAME MCP write gate as a
-                    // direct `tools/call` (S1), so an external caller cannot reach
-                    // a destructive op (retranscribe/rediarize) through the bridge.
-                    let allow_writes = settings_now.mcp_write_tools;
-                    let bridge_tx = ipc_bridge::spawn_inter_agent_driver(
-                        chat_handles,
-                        chat_in_flight.clone(),
-                        allow_writes,
-                    );
-
-                    // The MCP registry is `v1(true)` — includes
-                    // `send_to_internal_agent` — and its context carries the
-                    // bridge sender. Separate from the UI's `v1(false)` registry.
-                    let mcp_registry = Arc::new(agent_tools::ToolRegistry::v1(true));
-
-                    // The bearer token: resolve from the on-disk token file, or
-                    // generate + persist a fresh 256-bit one on first enable.
-                    let token = resolve_mcp_token(&app_data_dir);
-                    let port = settings_now.mcp_port;
-
-                    // The MCP ToolContext needs the held summariser. Build it
-                    // lazily inside the spawned task (so a slow first model load
-                    // does not block setup); resolve it via the chat handles.
-                    let mcp_handles = ipc_bridge::ChatHandles {
-                        orchestrator: orchestrator.clone(),
-                        index: index.clone(),
-                        meetings_dir: notes_meetings_dir.clone(),
-                        event_tx: ipc_event_tx.clone(),
-                        settings: settings_handle.clone(),
-                        summariser: summariser_cell.clone(),
-                    };
-                    let mcp_event_tx = ipc_event_tx.clone();
-                    // A second clone of the bus for the listening-event emit
-                    // (the existing forwarder relays it to the webview).
-                    let listening_event_tx = ipc_event_tx.clone();
-                    let mcp_info_for_task = mcp_info.clone();
-
-                    tauri::async_runtime::spawn(async move {
-                        // Build the ToolContext for MCP dispatch. The summariser
-                        // backs `resummarise`; load it (downloads on first use).
-                        let summariser = match mcp_handles.ensure_summariser().await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!(
-                                    target: "app-main",
-                                    "MCP server not started: held summariser load failed: {e}"
-                                );
-                                return;
-                            }
-                        };
-                        let ctx = Arc::new(
-                            agent_tools::ToolContext::new(
-                                mcp_handles.orchestrator.clone(),
-                                mcp_handles.index.clone(),
-                                mcp_handles.meetings_dir.clone(),
-                                summariser as Arc<dyn minutist_common::Summariser>,
-                                mcp_event_tx,
-                                None, // MCP callers pass meeting_id explicitly
-                            )
-                            .with_inter_agent_bridge(bridge_tx),
-                        );
-
-                        // A never-firing shutdown receiver for v1: the listener
-                        // lives for the process. (A future settings-toggle path
-                        // would flip this watch instead of restart-required.)
-                        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-                        // Keep the sender alive for the process so the watch is
-                        // not seen as "dropped" (which would trigger shutdown).
-                        std::mem::forget(_shutdown_tx);
-
-                        let bind_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-                        match mcp_server::serve(
-                            mcp_registry,
-                            ctx,
-                            mcp_server::McpServerConfig {
-                                bind_addr,
-                                bearer_token: token.clone(),
-                                allow_writes,
-                            },
-                            shutdown_rx,
-                        )
-                        .await
-                        {
-                            Ok(bound) => {
-                                let url = format!("http://{bound}{}", mcp_server::MCP_PATH);
-                                // Surface the live endpoint to the Settings pane.
-                                *mcp_info_for_task.lock().expect("mcp_info poisoned") =
-                                    Some(ipc_bridge::McpServerInfo {
-                                        url: url.clone(),
-                                        token,
-                                    });
-                                // Emit the listening event on the shared bus; the
-                                // event forwarder relays it to the webview so the
-                                // MCP pane refreshes. The token is NOT carried on
-                                // the event (revealed only via get_mcp_server_info).
-                                let _ = listening_event_tx
-                                    .send(minutist_common::AppEvent::McpServerListening { url });
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    target: "app-main",
-                                    "MCP server failed to start: {e}"
-                                );
-                            }
-                        }
+                        chat_in_flight: chat_in_flight.clone(),
+                        app_data_dir: app_data_dir.clone(),
+                        mcp_info: mcp_info.clone(),
+                        shutdown_state: shutdown_inner.clone(),
                     });
                 } else {
                     tracing::info!(
                         target: "app-main",
                         "MCP server disabled (settings.mcp_enabled = false)"
                     );
+                }
+
+                // Watch for `mcp_enabled` changes and start/stop the server
+                // live. Port and write-tools changes are not reacted to here —
+                // those still require a restart (the running server was built
+                // with the port/allow_writes values at start time).
+                {
+                    let mut settings_rx = settings_handle.subscribe();
+                    let mut prev_enabled = settings_now.mcp_enabled;
+
+                    let watcher_orchestrator = orchestrator.clone();
+                    let watcher_index = index.clone();
+                    let watcher_meetings_dir = notes_meetings_dir.clone();
+                    let watcher_event_tx = ipc_event_tx.clone();
+                    let watcher_settings = settings_handle.clone();
+                    let watcher_summariser = summariser_cell.clone();
+                    let watcher_chat_in_flight = chat_in_flight.clone();
+                    let watcher_app_data_dir = app_data_dir.clone();
+                    let watcher_mcp_info = mcp_info.clone();
+                    let watcher_shutdown = shutdown_inner.clone();
+
+                    tauri::async_runtime::spawn(async move {
+                        loop {
+                            if settings_rx.changed().await.is_err() {
+                                // SettingsHandle dropped (app exit).
+                                break;
+                            }
+                            let new_enabled =
+                                settings_rx.borrow_and_update().mcp_enabled;
+                            if new_enabled == prev_enabled {
+                                continue;
+                            }
+                            prev_enabled = new_enabled;
+
+                            if new_enabled {
+                                tracing::info!(
+                                    target: "app-main",
+                                    "MCP server enabled via settings toggle"
+                                );
+                                do_start_mcp_server(McpStartParams {
+                                    orchestrator: watcher_orchestrator.clone(),
+                                    index: watcher_index.clone(),
+                                    meetings_dir: watcher_meetings_dir.clone(),
+                                    event_tx: watcher_event_tx.clone(),
+                                    settings: watcher_settings.clone(),
+                                    summariser: watcher_summariser.clone(),
+                                    chat_in_flight: watcher_chat_in_flight.clone(),
+                                    app_data_dir: watcher_app_data_dir.clone(),
+                                    mcp_info: watcher_mcp_info.clone(),
+                                    shutdown_state: watcher_shutdown.clone(),
+                                });
+                            } else {
+                                // Fire the shutdown watch; the accept loop stops
+                                // and active sessions are cancelled.
+                                let maybe_tx = watcher_shutdown
+                                    .lock()
+                                    .expect("mcp_shutdown poisoned")
+                                    .take();
+                                if let Some(tx) = maybe_tx {
+                                    // `send` returns Err only when all receivers
+                                    // are dropped (server already gone).
+                                    let _ = tx.send(true);
+                                }
+                                // Clear the info slot and notify the UI.
+                                *watcher_mcp_info
+                                    .lock()
+                                    .expect("mcp_info poisoned") = None;
+                                let _ = watcher_event_tx.send(
+                                    minutist_common::AppEvent::McpServerStopped,
+                                );
+                                tracing::info!(
+                                    target: "app-main",
+                                    "MCP server stopped via settings toggle"
+                                );
+                            }
+                        }
+                    });
                 }
             }
 

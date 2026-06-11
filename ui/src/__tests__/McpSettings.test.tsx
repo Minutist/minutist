@@ -2,9 +2,10 @@
  * MCP settings pane tests (Phase 10).
  *
  * Covers the pane's own behaviour: the off-by-default reading, the enable +
- * port + write-tools controls routing through the store seams, and the live
- * endpoint reveal/copy. The `get_mcp_server_info` command is mocked so the
- * endpoint row renders without a backend.
+ * port + write-tools controls routing through the store seams, the live
+ * endpoint reveal/copy, and the restart-hint policy (enable/disable is live;
+ * port and write-tools require restart). The `get_mcp_server_info` command is
+ * mocked so the endpoint row renders without a backend.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
@@ -33,6 +34,7 @@ vi.mock("../ipc/client", () => ({
 
 import { McpSettingsPane } from "../shell/McpSettingsPane";
 import { useRecordingStore } from "../state/recording";
+import { useMcpServerInfoStore } from "../state/mcp-server-info";
 
 const BASE_SETTINGS: Settings = {
   input_device_id: null,
@@ -70,7 +72,7 @@ describe("McpSettingsPane", () => {
     });
   });
 
-  it("enabling the server persists mcp_enabled and shows a restart hint", async () => {
+  it("enabling the server persists mcp_enabled without showing a restart hint", async () => {
     seed();
     render(<McpSettingsPane />);
     const toggle = screen
@@ -81,6 +83,18 @@ describe("McpSettingsPane", () => {
     await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
     const next = updateSettings.mock.calls[0]![0];
     expect(next.mcp_enabled).toBe(true);
+    // Enable/disable takes effect live — no restart hint.
+    expect(
+      screen.queryByText(/Restart the app for MCP server changes/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("changing the port shows a restart hint", async () => {
+    seed({ mcp_enabled: true, mcp_port: 8765 });
+    render(<McpSettingsPane />);
+    const portInput = screen.getByLabelText("Port") as HTMLInputElement;
+    fireEvent.change(portInput, { target: { value: "9000" } });
+    await waitFor(() => expect(updateSettings).toHaveBeenCalled());
     expect(
       screen.getByText(/Restart the app for MCP server changes/i),
     ).toBeInTheDocument();
@@ -109,5 +123,52 @@ describe("McpSettingsPane", () => {
     await waitFor(() => expect(updateSettings).toHaveBeenCalled());
     const next = updateSettings.mock.calls.at(-1)![0];
     expect(next.mcp_write_tools).toBe(true);
+  });
+});
+
+describe("useMcpServerInfoStore event handling", () => {
+  beforeEach(() => {
+    // Reset the store to a known state before each test.
+    act(() => {
+      useMcpServerInfoStore.setState({ info: null });
+    });
+  });
+
+  it("mcp_server_stopped clears the info slot", () => {
+    // Seed a live endpoint.
+    act(() => {
+      useMcpServerInfoStore.setState({
+        info: { url: "http://127.0.0.1:8765/mcp", token: "tok" },
+      });
+    });
+    expect(useMcpServerInfoStore.getState().info).not.toBeNull();
+
+    act(() => {
+      useMcpServerInfoStore.getState().handleEvent({ kind: "mcp_server_stopped" });
+    });
+    expect(useMcpServerInfoStore.getState().info).toBeNull();
+  });
+
+  it("mcp_server_stopped on an already-empty store is a no-op", () => {
+    act(() => {
+      useMcpServerInfoStore.getState().handleEvent({ kind: "mcp_server_stopped" });
+    });
+    expect(useMcpServerInfoStore.getState().info).toBeNull();
+  });
+
+  it("other events do not clear the info slot", () => {
+    act(() => {
+      useMcpServerInfoStore.setState({
+        info: { url: "http://127.0.0.1:8765/mcp", token: "tok" },
+      });
+    });
+    act(() => {
+      // A non-MCP event should not affect the store.
+      useMcpServerInfoStore.getState().handleEvent({
+        kind: "state_changed",
+        state: { kind: "idle" },
+      });
+    });
+    expect(useMcpServerInfoStore.getState().info).not.toBeNull();
   });
 });

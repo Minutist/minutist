@@ -754,7 +754,13 @@ export type AppEvent =
  * `get_mcp_server_info` command on explicit user request); see
  * `architecture/cross-cutting.md` — "MCP transport".
  */
-{ kind: "mcp_server_listening"; url: string }
+{ kind: "mcp_server_listening"; url: string } | 
+/**
+ * The in-process MCP server stopped (disabled via settings toggle).
+ * `app-main` emits this after the shutdown watch fires so the
+ * Settings → MCP pane can clear the live endpoint display.
+ */
+{ kind: "mcp_server_stopped" }
 /**
  * Typed wrapper that gives `AppEvent` a stable tauri-specta event name.
  * 

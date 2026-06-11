@@ -755,6 +755,10 @@ pub enum AppEvent {
     /// `get_mcp_server_info` command on explicit user request); see
     /// `architecture/cross-cutting.md` — "MCP transport".
     McpServerListening { url: String },
+    /// The in-process MCP server stopped (disabled via settings toggle).
+    /// `app-main` emits this after the shutdown watch fires so the
+    /// Settings → MCP pane can clear the live endpoint display.
+    McpServerStopped,
 }
 
 // ---------------------------------------------------------------------------

@@ -5,12 +5,16 @@
  * toggle write-tool exposure, and reveal/copy the bearer token + endpoint URL to
  * paste into an external MCP client's config.
  *
- * The toggles round-trip through `update_settings` (via the recording store);
- * enabling/disabling and the port are restart-required for v1 (the listener is
- * spawned once at startup), so the pane advises a restart when a change is made.
- * The live endpoint URL + token come from `get_mcp_server_info` — the token is
- * sensitive, so it is masked by default and only the full value is copyable on
- * an explicit reveal.
+ * The toggles round-trip through `update_settings` (via the recording store).
+ * Enabling/disabling the server takes effect immediately (the backend watches
+ * `mcp_enabled` and starts/stops the listener live). Changing the port or
+ * write-tools setting is restart-required (the running server was built with
+ * those values at startup).
+ *
+ * The live endpoint URL + token come from `get_mcp_server_info` — the store
+ * also refreshes on `mcp_server_listening` (server started) and clears on
+ * `mcp_server_stopped` (server disabled). The token is sensitive, masked by
+ * default, and only the full value is copyable on an explicit reveal.
  *
  * Rendered in the Editorial Ink language using `theme.css` tokens only.
  */
@@ -47,7 +51,9 @@ export function McpSettingsPane() {
     void refreshInfo();
   }, [enabled, refreshInfo]);
 
-  // A change to enable/port/write-tools is restart-required for v1.
+  // A change to port or write-tools is restart-required (the running server
+  // was built with those values). Enabling/disabling is handled live by the
+  // backend and does NOT set the restart hint.
   const markRestart = () => setRestartHint(true);
 
   const copy = (text: string) => {
@@ -67,7 +73,7 @@ export function McpSettingsPane() {
           checked={enabled}
           disabled={settings === null}
           onChange={(e) => {
-            markRestart();
+            // No restart hint: enable/disable takes effect live.
             void setMcpEnabled(e.target.checked);
           }}
         />
@@ -165,8 +171,9 @@ export function McpSettingsPane() {
 
       {enabled && !info && (
         <p className="settings-drawer__hint">
-          The MCP server is enabled but not yet listening. If you just turned it
-          on, restart the app to start the server.
+          The MCP server is enabled but not yet listening. It starts
+          automatically in the background — this usually resolves in a few
+          seconds.
         </p>
       )}
 

@@ -117,9 +117,7 @@ use std::sync::Arc;
 use agent_tools::ToolRegistry;
 use minutist_common::AppEvent;
 use orchestrator::Orchestrator;
-use persistence::MeetingIndex;
 use settings::SettingsHandle;
-use summariser::LlamaSummariser;
 use tauri_specta::{collect_commands, collect_events, Builder};
 use tokio::sync::{broadcast, OnceCell};
 
@@ -127,6 +125,12 @@ pub use chat_runtime::ChatHandles;
 pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
 pub use inter_agent::spawn_inter_agent_driver;
+/// Re-exports so `app-main` can name these types without direct deps on
+/// `persistence` and `summariser`; both already appear in the public API
+/// (`open_meeting_index` returns `Arc<MeetingIndex>`; `IpcState::summariser`
+/// holds `Arc<OnceCell<Arc<LlamaSummariser>>>`).
+pub use persistence::MeetingIndex;
+pub use summariser::LlamaSummariser;
 
 // ---------------------------------------------------------------------------
 // IpcState — Tauri managed state

@@ -268,10 +268,9 @@ impl LlamaSummariser {
     /// expansion). The response is trimmed; if the model echoes a think block
     /// it is stripped.
     ///
-    /// Returns `AppError::Unsupported` when the local model is unavailable
-    /// (e.g. this `LlamaSummariser` is backed by an Ollama dispatcher — callers
-    /// must not attempt translation over an external backend). Only
-    /// `LlamaSummariser` exposes this method (not the `Summariser` trait), so
+    /// Only `LlamaSummariser` exposes this method (not the `Summariser` trait):
+    /// the method is concrete on a type that always holds a local `LlamaModel`,
+    /// so there is no remote-backend path and no remote-backend guard.
     /// `ipc-bridge` holds the concrete `Arc<LlamaSummariser>`.
     pub fn translate_segment(
         &self,

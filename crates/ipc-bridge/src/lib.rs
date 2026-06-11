@@ -591,7 +591,7 @@ mod tests {
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
-    /// than erroring.  This matches the Handy project's pattern per Phase 1
+    /// than erroring.  This matches the Handy project's pattern per Phase 1.
     #[test]
     fn bindings_builder_registers_expected_command_ledger() {
         use specta_typescript::{BigIntExportBehavior, Typescript};

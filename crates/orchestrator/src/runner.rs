@@ -9,7 +9,7 @@
 //! The runner:
 //! - Drains sample batches → `MeetingWriter::push_samples` (audio always saved).
 //! - Feeds each batch to `VadChunker::process_samples` → `Vec<VadEvent>`.
-//! - Maintains the **batched-VAD accumulator** described in Phase 2
+//! - Maintains the **batched-VAD accumulator** described in Phase 2.
 //! - Flushes the accumulator to the ASR worker on size/latency/end-of-stream.
 //! - Broadcasts meter frames via the shared `AppEvent` sender.
 //!

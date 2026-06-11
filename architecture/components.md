@@ -1525,6 +1525,17 @@ calls `ensure_summariser` so the first Summarise / chat is instant; when `false`
 the model loads on-demand on first use. It NEVER downloads at startup. See
 `cross-cutting.md` — "ASR prewarm".
 
+**Field — `output_language: String`.** Language for all LLM-generated text
+(summaries and chat replies). Does NOT affect transcription — the transcript is
+always left as-is. The sentinel `"auto"` instructs `ipc-bridge` to resolve the
+output language from the host system locale at generation time (via
+`sys-locale`); a full English language name (e.g. `"French"`, `"German"`)
+passes through verbatim. `#[serde(default = ...)]`-defaults to `"auto"`; an
+older store written before the field existed deserialises to `"auto"`. The
+resolved language name is appended to the summariser and chat system prompts by
+`ipc-bridge` — the transcript itself is never touched. No new dependency edge
+on the `settings` crate. See the `ipc-bridge` "Output-language resolution" note.
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates
@@ -1841,6 +1852,19 @@ directly behind their optional `specta` feature, which `ipc-bridge` enables.
 The Phase 1 mirror layer (`specta_types.rs`) was deleted; commands and events
 use the canonical types. `IpcError` remains a local `specta::Type` mirror of
 `AppError` at the boundary (harmless; may be removed in a later cleanup).
+
+**Output-language resolution (`sys-locale` external dependency).** `ipc-bridge`
+adds `sys-locale = "0.3"` as a direct external dependency (not a workspace
+component edge — it is a third-party crate, so the dependency table above is
+unchanged). The `output_language` module exposes `resolve_output_language(setting:
+&str) -> Option<String>`: the sentinel `"auto"` calls `sys_locale::get_locale()`,
+extracts the primary BCP-47 language subtag, and maps it through a static
+subtag→full-name table covering the 15 major languages (en, zh, es, fr, de, it,
+pt, ja, ko, ru, nl, ar, hi, pl, tr). An explicit language name passes through
+verbatim. Returns `None` for `"auto"` resolving to an unmapped subtag, for an
+empty setting, and for the empty string. The resolved name is appended to the
+summariser and chat system prompts as `"\n\nRespond entirely in {lang}."` (see
+"Summariser and chat injection" in `cross-cutting.md`).
 
 ### `app-main` (bin)
 **Crate:** `src-tauri/` (Tauri convention)

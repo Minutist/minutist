@@ -147,6 +147,17 @@ fn default_transcription_language() -> String {
     "English".to_string()
 }
 
+/// Default output language for generated text (summaries and chat replies).
+///
+/// The sentinel "auto" instructs `ipc-bridge` to resolve the output language
+/// from the host system locale at the time the text is generated. An explicit
+/// full English language name (e.g. "French", "German") bypasses locale
+/// resolution and uses that name directly. An older store written before this
+/// field existed deserialises to "auto" via `#[serde(default = ...)]`.
+fn default_output_language() -> String {
+    "auto".to_string()
+}
+
 /// Default summary system prompt (FR-28).
 ///
 /// A model-agnostic instruction asking for a structured meeting summary:
@@ -479,6 +490,17 @@ pub struct Settings {
     /// deserialises to `true`.
     #[serde(default = "default_preload_summariser")]
     pub preload_summariser: bool,
+
+    /// Output language for all generated text: summaries and chat replies.
+    ///
+    /// The transcript itself is never affected — this controls only the language
+    /// the LLM uses when generating output. The sentinel "auto" resolves to the
+    /// host system locale at generation time (via `sys-locale` in `ipc-bridge`);
+    /// a full English language name (e.g. "French", "German") passes through
+    /// verbatim. `#[serde(default = ...)]` defaults to "auto"; an older store
+    /// written before this field existed deserialises to "auto".
+    #[serde(default = "default_output_language")]
+    pub output_language: String,
 }
 
 impl Settings {
@@ -522,6 +544,7 @@ impl Default for Settings {
             mcp_write_tools: false,
             auto_summarise_on_stop: default_auto_summarise_on_stop(),
             preload_summariser: default_preload_summariser(),
+            output_language: default_output_language(),
         }
     }
 }
@@ -571,10 +594,12 @@ mod tests {
             mcp_write_tools: true,
             auto_summarise_on_stop: false,
             preload_summariser: false,
+            output_language: "German".to_string(),
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(restored.transcription_language, "Japanese");
+        assert_eq!(restored.output_language, "German");
         assert_eq!(original, restored);
     }
 
@@ -1179,6 +1204,48 @@ mod tests {
         assert!(
             !restored.mcp_write_tools,
             "missing mcp_write_tools must deserialise to false (read-only over MCP)"
+        );
+        assert_eq!(restored.theme, Theme::Dark);
+        assert!(restored.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 1m. output_language: default + round-trip + missing-field
+    //     deserialisation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn output_language_defaults_to_auto() {
+        assert_eq!(
+            Settings::default().output_language,
+            "auto",
+            "output_language must default to the sentinel \"auto\" (resolve from locale)"
+        );
+    }
+
+    #[test]
+    fn output_language_round_trips() {
+        let original = Settings {
+            output_language: "French".to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.output_language, "French");
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_output_language_field_defaults_to_auto() {
+        // A settings store written before `output_language` existed must
+        // deserialise to "auto" (the sentinel that resolves from the host
+        // system locale).
+        let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert_eq!(
+            restored.output_language,
+            "auto",
+            "missing output_language must deserialise to \"auto\""
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

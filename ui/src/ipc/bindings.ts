@@ -1037,7 +1037,26 @@ input_device_id?: string | null;
 theme?: Theme; 
 /**
  * Root directory for meeting data.  `None` means "use the platform
- * default app-data directory" (resolved by `app-main`).
+ * default app-data directory".
+ * 
+ * When `Some(path)`, `app-main` derives `meetings/`, `models/`, and
+ * `index.db` from this path rather than from the platform default.
+ * The value must be an absolute path; a relative or uncreatable path is
+ * logged and ignored (falls back to the platform default — startup is
+ * never aborted).
+ * 
+ * **Invariants (bootstrap constraints):**
+ * - `settings.store` always lives at the platform default root — it is
+ * how this override is found in the first place.
+ * - Logs always live at the platform default root — logging starts before
+ * settings load.
+ * 
+ * **Restart required.** Data roots are resolved once at startup.  Moving
+ * existing data after setting this field is the user's responsibility;
+ * the app does not migrate data automatically.
+ * 
+ * **No UI.** The settings pane does not currently render this field; it
+ * must be set by editing `settings.store` directly and restarting.
  * 
  * `specta` lacks a built-in `Type` impl for `PathBuf`; the explicit
  * `#[specta(type = Option<String>)]` hint preserves the same wire
@@ -1139,12 +1158,11 @@ capture_system_audio?: boolean;
  */
 transcription_language?: string; 
 /**
- * Opt into the larger Qwen3-ASR-1.7B tier for the Qwen branch (broader +
- * better-multilingual accuracy) instead of the 0.6B CPU default. Only
- * affects languages that route to Qwen (the Parakeet branch ignores it);
- * see `common::asr_engine_for_language`. Off by default — it is a larger
- * download with a GPU-class footprint. An older store deserialises to
- * `false`. See `architecture/cross-cutting.md` — "ASR engine routing".
+ * Retained for serde/wire compatibility; the value is no longer consulted.
+ * The large ASR tier is requested automatically and the VRAM clamp in
+ * `common::resolve_gpu_plan` decides whether it fits. An older store written
+ * before this field existed deserialises to `false`.
+ * See `architecture/cross-cutting.md` — "ASR engine routing".
  */
 prefer_large_asr_model?: boolean; 
 /**
@@ -1230,7 +1248,18 @@ auto_summarise_on_stop?: boolean;
  * defaults to `true`; an older store written before this field existed
  * deserialises to `true`.
  */
-preload_summariser?: boolean }
+preload_summariser?: boolean; 
+/**
+ * Output language for all generated text: summaries and chat replies.
+ * 
+ * The transcript itself is never affected — this controls only the language
+ * the LLM uses when generating output. The sentinel "auto" resolves to the
+ * host system locale at generation time (via `sys-locale` in `ipc-bridge`);
+ * a full English language name (e.g. "French", "German") passes through
+ * verbatim. `#[serde(default = ...)]` defaults to "auto"; an older store
+ * written before this field existed deserialises to "auto".
+ */
+output_language?: string }
 /**
  * Built-in summary prompt presets (Phase 9 — D4).
  * 

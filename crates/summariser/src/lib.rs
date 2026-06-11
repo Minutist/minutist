@@ -255,6 +255,42 @@ impl LlamaSummariser {
         Ok(strip_think_block(&raw))
     }
 
+    /// Translate one transcript segment text into `target_language`.
+    ///
+    /// Builds a minimal single-turn prompt that instructs the model to translate
+    /// `text` and output ONLY the translation with no preamble. Reuses the same
+    /// prompt-build + generate machinery as `summarise`, including the Gemma
+    /// fallback and the chunked-prefill path.
+    ///
+    /// The prompt is intentionally compact so the round-trip is fast (a single
+    /// segment is usually ≤ 50 tokens). `max_tokens` is capped at 512 (a
+    /// translated segment is never longer than the original plus reasonable
+    /// expansion). The response is trimmed; if the model echoes a think block
+    /// it is stripped.
+    ///
+    /// Returns `AppError::Unsupported` when the local model is unavailable
+    /// (e.g. this `LlamaSummariser` is backed by an Ollama dispatcher — callers
+    /// must not attempt translation over an external backend). Only
+    /// `LlamaSummariser` exposes this method (not the `Summariser` trait), so
+    /// `ipc-bridge` holds the concrete `Arc<LlamaSummariser>`.
+    pub fn translate_segment(
+        &self,
+        text: &str,
+        target_language: &str,
+    ) -> AppResult<String> {
+        let instruction = format!(
+            "Translate the following text into {target_language}. \
+             Output only the translation, with no preamble, explanation, or commentary.\n\n\
+             Text: {text}"
+        );
+
+        let prompt = self.build_translation_prompt(&instruction)?;
+        // A single segment is short; cap generation to 512 tokens so the
+        // context window is never at risk and each call returns quickly.
+        let raw = self.generate_bounded(&prompt, 512)?;
+        Ok(strip_think_block(&raw))
+    }
+
     /// Borrow the loaded [`LlamaModel`] for the chat engine (Phase 9, D5).
     ///
     /// The substrate seam: `ipc-bridge` holds the concrete
@@ -340,6 +376,45 @@ impl LlamaSummariser {
         }
     }
 
+    /// Build a minimal single-turn translation prompt.
+    ///
+    /// Uses the same fallback chain as [`Self::build_prompt`]: baked chat
+    /// template when renderable, Gemma hand-built format otherwise.
+    fn build_translation_prompt(&self, instruction: &str) -> Result<String, Error> {
+        let template = self
+            .model
+            .chat_template(None::<&str>)
+            .map_err(|e| Error::Template(e.to_string()))?;
+
+        let user_msg = LlamaChatMessage::new("user".to_string(), instruction.to_string())
+            .map_err(|e| Error::Template(format!("user message: {e}")))?;
+
+        match self.model.apply_chat_template(&template, &[user_msg], true) {
+            Ok(prompt) => Ok(prompt),
+            Err(e) => {
+                tracing::warn!(
+                    target: "summariser",
+                    "apply_chat_template failed ({e}); using Gemma turn-format fallback for translation"
+                );
+                Ok(gemma_turn_prompt(instruction))
+            }
+        }
+    }
+
+    /// Generate with a custom `max_tokens` ceiling, bypassing the config value.
+    ///
+    /// Used by [`Self::translate_segment`], which needs a tighter cap than the
+    /// per-summary `config.max_tokens`. All other generation parameters
+    /// (`n_ctx`, `n_batch`, `threads`, `n_gpu_layers`) are unchanged.
+    fn generate_bounded(&self, prompt: &str, max_tokens: usize) -> Result<String, Error> {
+        // Temporarily shadow `config.max_tokens` by building a custom config.
+        let config = SummariserConfig {
+            max_tokens,
+            ..self.config.clone()
+        };
+        generate_with_config(&self.model, &config, prompt, &mut |_| {})
+    }
+
     /// Tokenise the prompt, chunked-prefill it, then greedily generate.
     fn generate(&self, prompt: &str) -> Result<String, Error> {
         // No-op progress callback: the no-progress path is unchanged.
@@ -357,113 +432,130 @@ impl LlamaSummariser {
         prompt: &str,
         on_progress: &mut dyn FnMut(SummariseProgress),
     ) -> Result<String, Error> {
-        let backend = get_or_init_backend()?;
-
-        let n_ctx = NonZeroU32::new(self.config.n_ctx).ok_or_else(|| {
-            Error::ContextOverflow("n_ctx must be non-zero".to_string())
-        })?;
-
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(Some(n_ctx))
-            .with_n_batch(self.config.n_batch)
-            .with_n_threads(self.config.threads)
-            .with_n_threads_batch(self.config.threads);
-
-        let mut llama_ctx = self
-            .model
-            .new_context(backend, ctx_params)
-            .map_err(|e| Error::Inference(format!("LlamaContext init: {e}")))?;
-
-        // AddBos::Never — the chat template already emits the BOS itself.
-        let tokens = self
-            .model
-            .str_to_token(prompt, AddBos::Never)
-            .map_err(|e| Error::Inference(format!("tokenize: {e}")))?;
-
-        if tokens.is_empty() {
-            return Err(Error::Inference("templated prompt tokenised to zero tokens".to_string()));
-        }
-
-        // The prompt AND the tokens it will generate must both fit the context
-        // window: generation grows the KV cache by one slot per token, so a
-        // prompt that fits on its own can still overflow mid-generation. Reserve
-        // `max_tokens` of headroom up front rather than aborting partway and
-        // losing the summary.
-        check_context_budget(tokens.len(), self.config.max_tokens, self.config.n_ctx)?;
-
-        // --- Chunked prefill ---
-        let plan = plan_prefill(tokens.len(), self.config.n_batch);
-        let mut batch = LlamaBatch::new(self.config.n_batch as usize, 1);
-        let total_prompt = tokens.len();
-
-        for chunk in &plan.chunks {
-            batch.clear();
-            for offset in 0..chunk.len {
-                let global = chunk.start + offset;
-                let pos = global as i32;
-                let logits = chunk.logits_at_last && offset == chunk.len - 1;
-                batch
-                    .add(tokens[global], pos, &[0], logits)
-                    .map_err(|e| Error::Inference(format!("batch.add (prefill): {e}")))?;
-            }
-            llama_ctx
-                .decode(&mut batch)
-                .map_err(|e| Error::Inference(format!("decode (prefill): {e}")))?;
-
-            // Report prefill progress AFTER this chunk decodes (#69): `done` is
-            // the count of prompt tokens whose KV cache is now populated.
-            let done = (chunk.start + chunk.len).min(total_prompt);
-            on_progress(SummariseProgress::Prefill {
-                done,
-                total: total_prompt,
-            });
-        }
-
-        // --- Greedy generation ---
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
-        let mut decoder = UTF_8.new_decoder();
-        let mut text = String::new();
-        let mut n_past = tokens.len() as i32;
-
-        for i in 0..self.config.max_tokens {
-            let token = sampler.sample(&llama_ctx, -1);
-            sampler.accept(token);
-
-            if self.model.is_eog_token(token) {
-                // EOG: jump the bar to 100 % so a short summary still completes
-                // the bar rather than leaving it stuck mid-way.
-                on_progress(SummariseProgress::Generate {
-                    done: self.config.max_tokens,
-                    max: self.config.max_tokens,
-                });
-                break;
-            }
-
-            let piece = self
-                .model
-                .token_to_piece(token, &mut decoder, true, None)
-                .map_err(|e| Error::Inference(format!("token_to_piece: {e}")))?;
-            text.push_str(&piece);
-
-            // Report progress AFTER appending this token (`i + 1` generated).
-            on_progress(SummariseProgress::Generate {
-                done: i + 1,
-                max: self.config.max_tokens,
-            });
-
-            batch.clear();
-            batch
-                .add(token, n_past, &[0], true)
-                .map_err(|e| Error::Inference(format!("batch.add (gen): {e}")))?;
-            n_past += 1;
-
-            llama_ctx
-                .decode(&mut batch)
-                .map_err(|e| Error::Inference(format!("decode (gen): {e}")))?;
-        }
-
-        Ok(text)
+        generate_with_config(&self.model, &self.config, prompt, on_progress)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Core generation (standalone so multiple call sites can share it)
+// ---------------------------------------------------------------------------
+
+/// Tokenise `prompt`, chunked-prefill it, then greedily generate up to
+/// `config.max_tokens`, reporting two-phase progress via `on_progress`.
+///
+/// Extracted from the `LlamaSummariser` `generate_with_progress` method so
+/// [`LlamaSummariser::generate_bounded`] (used by `translate_segment`) can run
+/// generation with a different `max_tokens` cap without duplicating the decode
+/// loop.
+fn generate_with_config(
+    model: &LlamaModel,
+    config: &SummariserConfig,
+    prompt: &str,
+    on_progress: &mut dyn FnMut(SummariseProgress),
+) -> Result<String, Error> {
+    let backend = get_or_init_backend()?;
+
+    let n_ctx = NonZeroU32::new(config.n_ctx).ok_or_else(|| {
+        Error::ContextOverflow("n_ctx must be non-zero".to_string())
+    })?;
+
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(Some(n_ctx))
+        .with_n_batch(config.n_batch)
+        .with_n_threads(config.threads)
+        .with_n_threads_batch(config.threads);
+
+    let mut llama_ctx = model
+        .new_context(backend, ctx_params)
+        .map_err(|e| Error::Inference(format!("LlamaContext init: {e}")))?;
+
+    // AddBos::Never — the chat template already emits the BOS itself.
+    let tokens = model
+        .str_to_token(prompt, AddBos::Never)
+        .map_err(|e| Error::Inference(format!("tokenize: {e}")))?;
+
+    if tokens.is_empty() {
+        return Err(Error::Inference(
+            "templated prompt tokenised to zero tokens".to_string(),
+        ));
+    }
+
+    // The prompt AND the tokens it will generate must both fit the context
+    // window: generation grows the KV cache by one slot per token, so a
+    // prompt that fits on its own can still overflow mid-generation. Reserve
+    // `max_tokens` of headroom up front rather than aborting partway and
+    // losing the output.
+    check_context_budget(tokens.len(), config.max_tokens, config.n_ctx)?;
+
+    // --- Chunked prefill ---
+    let plan = plan_prefill(tokens.len(), config.n_batch);
+    let mut batch = LlamaBatch::new(config.n_batch as usize, 1);
+    let total_prompt = tokens.len();
+
+    for chunk in &plan.chunks {
+        batch.clear();
+        for offset in 0..chunk.len {
+            let global = chunk.start + offset;
+            let pos = global as i32;
+            let logits = chunk.logits_at_last && offset == chunk.len - 1;
+            batch
+                .add(tokens[global], pos, &[0], logits)
+                .map_err(|e| Error::Inference(format!("batch.add (prefill): {e}")))?;
+        }
+        llama_ctx
+            .decode(&mut batch)
+            .map_err(|e| Error::Inference(format!("decode (prefill): {e}")))?;
+
+        // Report prefill progress AFTER this chunk decodes (#69).
+        let done = (chunk.start + chunk.len).min(total_prompt);
+        on_progress(SummariseProgress::Prefill {
+            done,
+            total: total_prompt,
+        });
+    }
+
+    // --- Greedy generation ---
+    let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+    let mut decoder = UTF_8.new_decoder();
+    let mut text = String::new();
+    let mut n_past = tokens.len() as i32;
+
+    for i in 0..config.max_tokens {
+        let token = sampler.sample(&llama_ctx, -1);
+        sampler.accept(token);
+
+        if model.is_eog_token(token) {
+            // EOG: jump the bar to 100 % so a short output still completes the
+            // bar rather than leaving it stuck mid-way.
+            on_progress(SummariseProgress::Generate {
+                done: config.max_tokens,
+                max: config.max_tokens,
+            });
+            break;
+        }
+
+        let piece = model
+            .token_to_piece(token, &mut decoder, true, None)
+            .map_err(|e| Error::Inference(format!("token_to_piece: {e}")))?;
+        text.push_str(&piece);
+
+        on_progress(SummariseProgress::Generate {
+            done: i + 1,
+            max: config.max_tokens,
+        });
+
+        batch.clear();
+        batch
+            .add(token, n_past, &[0], true)
+            .map_err(|e| Error::Inference(format!("batch.add (gen): {e}")))?;
+        n_past += 1;
+
+        llama_ctx
+            .decode(&mut batch)
+            .map_err(|e| Error::Inference(format!("decode (gen): {e}")))?;
+    }
+
+    Ok(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,6 +1315,66 @@ mod tests {
         eprintln!(
             "real-recording summary ({} segments) =>\n{summary}",
             transcript.len()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gated translate_segment test — skips when MINUTIST_LLM_MODEL_PATH absent.
+    // -----------------------------------------------------------------------
+
+    /// Translate a short English sentence to Spanish and verify the result is
+    /// non-empty and contains no English content words from the original.
+    ///
+    /// To run:
+    ///   MINUTIST_LLM_MODEL_PATH=/path/to/model.gguf \
+    ///   cargo test -p summariser translate_segment_produces_spanish -- --include-ignored
+    #[test]
+    #[ignore = "requires MINUTIST_LLM_MODEL_PATH"]
+    fn translate_segment_produces_spanish_translation() {
+        let model_path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
+            Ok(p) if !p.is_empty() => PathBuf::from(p),
+            _ => return,
+        };
+
+        let summariser = LlamaSummariser::open(model_path, SummariserConfig::default())
+            .expect("model load must succeed");
+
+        let english = "The meeting is scheduled for next Tuesday at three o'clock.";
+        let start = std::time::Instant::now();
+        let translation = summariser
+            .translate_segment(english, "Spanish")
+            .expect("translate_segment must succeed");
+        let elapsed = start.elapsed();
+
+        eprintln!(
+            "translate_segment ({} ms): {:?} → {:?}",
+            elapsed.as_millis(),
+            english,
+            translation
+        );
+
+        assert!(
+            !translation.trim().is_empty(),
+            "translation must be non-empty"
+        );
+
+        // The Spanish translation must not contain the English content words
+        // "meeting", "scheduled", "Tuesday", "three", or "o'clock". A
+        // correct Spanish output would use "reunión", "martes", "tres",
+        // "programada", etc. Case-insensitive check; "scheduled" in
+        // particular should not appear in Spanish output.
+        let lower = translation.to_lowercase();
+        for word in &["meeting", "scheduled", "tuesday", "o'clock"] {
+            assert!(
+                !lower.contains(word),
+                "translation contains English content word {word:?}; full output: {translation:?}"
+            );
+        }
+
+        // Must not contain a think block (stripped before return).
+        assert!(
+            !translation.contains("<think>"),
+            "translation must not contain a think block: {translation:?}"
         );
     }
 

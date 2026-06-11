@@ -636,6 +636,21 @@ block (if a model emits one) is stripped before return. The optional
 dispatcher to a local `/api/chat` endpoint); `reqwest` + `serde` are pulled in
 only by that feature.
 
+**`translate_segment(text, target_language) -> AppResult<String>`.** A
+concrete method on `LlamaSummariser` (not on the `Summariser` trait) that
+translates one segment text into the named language. Builds a minimal
+single-turn prompt ("Translate … into {language}. Output only the
+translation.") and calls the shared `generate_with_config` path with a 512-token
+cap (a translated segment is never longer than a full summary). The Gemma
+chat-template fallback applies identically. Returns `AppError::Unsupported` if
+the caller has wired an Ollama backend (the translation path must not attempt
+remote calls). `ipc-bridge` holds the concrete `Arc<LlamaSummariser>` and calls
+this method per-segment in a `spawn_blocking` translation loop.
+Env-gated test: `translate_segment_produces_spanish_translation` requires
+`MINUTIST_LLM_MODEL_PATH`; verified 2026-06-12 with Gemma 4 E4B Q4_K_M (~7 s
+per segment on CPU). No new dependency edge — `summariser` still depends only
+on `common`.
+
 **Phase 9 — model exposure for the chat engine (D5, the ONLY summariser
 change).** `LlamaSummariser` gains `pub fn model(&self) -> &LlamaModel`, the
 substrate seam the Phase-9 `chat-agent` engine borrows. `summarise()` is

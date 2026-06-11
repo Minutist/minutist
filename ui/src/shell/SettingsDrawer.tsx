@@ -20,7 +20,6 @@ import { useRecordingStore } from "../state/recording";
 import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
 import { readPreloadSummariser } from "../state/preload-summariser-settings";
-import { readPreferLargeAsrModel } from "../state/large-asr-model-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
 import { readNotesPaperRules } from "../state/notes-paper-settings";
 import { readTheme } from "../state/onboarding-settings";
@@ -49,9 +48,6 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
   const setPreloadSummariser = useRecordingStore(
     (s) => s.setPreloadSummariser,
   );
-  const setPreferLargeAsrModel = useRecordingStore(
-    (s) => s.setPreferLargeAsrModel,
-  );
   const setCaptureSystemAudio = useRecordingStore(
     (s) => s.setCaptureSystemAudio,
   );
@@ -61,7 +57,6 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
   const diarizationEnabled = readDiarizationEnabled(settings);
   const gpuAcceleration = readGpuAcceleration(settings);
   const preloadSummariser = readPreloadSummariser(settings);
-  const preferLargeAsrModel = readPreferLargeAsrModel(settings);
   const captureSystemAudio = readCaptureSystemAudio(settings);
   const theme = readTheme(settings);
   const notesPaperRules = readNotesPaperRules(settings);
@@ -192,21 +187,6 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
               otherwise CPU.
             </p>
           </div>
-          <label
-            className="settings-drawer__toggle"
-            title="Use the larger Qwen3-ASR-1.7B model for languages handled by Qwen (Chinese, Japanese, Korean, Arabic, …). A larger download, best with a GPU. English and European languages use Parakeet regardless of this setting."
-          >
-            <input
-              type="checkbox"
-              checked={preferLargeAsrModel}
-              disabled={settings === null || gpuAcceleration === "off"}
-              onChange={(e) => void setPreferLargeAsrModel(e.target.checked)}
-            />
-            <span>Higher-accuracy speech model (GPU)</span>
-          </label>
-          {gpuAcceleration === "off" && (
-            <p className="settings-drawer__hint">Needs GPU acceleration.</p>
-          )}
           <label
             className="settings-drawer__toggle"
             title="Load the summary & chat model when the app starts (if it is already downloaded) and keep it ready, so the first Summarise or chat is instant. Turn off to load it on first use and keep idle memory lower."

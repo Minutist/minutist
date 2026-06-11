@@ -54,6 +54,8 @@ describe("SettingsDrawer", () => {
     expect(screen.getByText("Identify speakers")).toBeInTheDocument();
     expect(screen.getByText("GPU acceleration")).toBeInTheDocument();
     expect(screen.getByText("Capture call / system audio")).toBeInTheDocument();
+    // Output language dropdown (Processing section).
+    expect(screen.getByLabelText("Output language")).toBeInTheDocument();
   });
 
   it("reflects the persisted appearance defaults (system theme, ruled paper on)", () => {

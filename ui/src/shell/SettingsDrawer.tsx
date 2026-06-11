@@ -26,6 +26,7 @@ import { readTheme } from "../state/onboarding-settings";
 import type { GpuAcceleration, Theme } from "../ipc/bindings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
+import { OutputLanguagePicker } from "./OutputLanguagePicker";
 import { McpSettingsPane } from "./McpSettingsPane";
 import "./SettingsDrawer.css";
 
@@ -199,6 +200,7 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             />
             <span>Keep the summary &amp; chat model loaded</span>
           </label>
+          <OutputLanguagePicker />
         </section>
 
         <McpSettingsPane />

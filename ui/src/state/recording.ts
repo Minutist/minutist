@@ -22,6 +22,7 @@ import { withPreloadSummariser } from "./preload-summariser-settings";
 import { withCaptureSystemAudio } from "./system-audio-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
 import { withTranscriptionLanguage } from "./transcription-language-settings";
+import { withOutputLanguage } from "./output-language-settings";
 import { withNotesPaperRules } from "./notes-paper-settings";
 import {
   withSummaryPreset,
@@ -186,6 +187,14 @@ export type RecordingStore = {
    * heavy/destructive ops never do. Restart-required like `setMcpEnabled`.
    */
   setMcpWriteTools: (enabled: boolean) => Promise<void>;
+  /**
+   * Set the LLM output language, persisting via `commands.updateSettings` —
+   * the same round-trip-through-settings pattern as `setTranscriptionLanguage`.
+   * The sentinel "auto" resolves to the host system locale at generation time;
+   * a full English name forces that language for summaries and chat replies.
+   * The transcript is never affected.
+   */
+  setOutputLanguage: (language: string) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -546,6 +555,28 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withMcpWriteTools(current, enabled);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setOutputLanguage: async (language) => {
+    // Persist via `update_settings` so the choice survives an app restart, the
+    // same round-trip-through-settings pattern `setTranscriptionLanguage` uses.
+    // The sentinel "auto" reaches the store/Rust unchanged (the resolver maps
+    // it to the host locale at generation time, or to no instruction when the
+    // locale is unmapped). The transcript is never affected.
+    const current = get().settings;
+    if (current === null) {
+      // refreshSettings hasn't completed yet; skip the write to avoid
+      // clobbering with a partial object.
+      return;
+    }
+    const next = withOutputLanguage(current, language);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

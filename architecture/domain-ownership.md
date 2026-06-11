@@ -89,6 +89,13 @@ stay leaf-shaped.
 Owns everything under `ui/src/`. Knowledge expected: React 19, Tiptap +
 ProseMirror, Zustand, generated tauri-specta bindings.
 
+**Output-language UI.** The `OutputLanguagePicker` component and the
+`output-language-settings.ts` / `setOutputLanguage` store seam follow the
+`LanguagePicker` / `transcription-language-settings.ts` pattern exactly — a
+UI-side `OUTPUT_LANGUAGES` constant (15 full English names, alphabetical) plus
+the `"auto"` sentinel rendered as "Auto (system)". The picker lives in the
+Processing section of `SettingsDrawer`. No model names in user-facing copy.
+
 ## Parallel-work rules
 
 These rules let multiple agents work concurrently without coordination:

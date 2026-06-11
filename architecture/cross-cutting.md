@@ -1088,11 +1088,14 @@ failures emit `AppEvent::ErrorOccurred`. All updater calls are **guarded** —
 the committed `plugins.updater` config has the production `endpoints` URL
 (the GitHub releases `latest.json`) but an empty `pubkey`, so `check()` is a
 logged no-op until the minisign keypair is activated; dev/unsigned builds are
-unaffected. `bundle.createUpdaterArtifacts` is `true`, so release builds emit
-the `.sig` updater artefacts. Activation is a one-time maintainer step
-(documented in `RELEASING.md`): generate the minisign keypair, keep the
-private key as the `TAURI_SIGNING_PRIVATE_KEY` CI secret, and paste the
-public key into `tauri.conf.json` `pubkey`. The app-wide Tauri 2 capability is `src-tauri/capabilities/default.json`
+unaffected. `bundle.createUpdaterArtifacts` is `false` — with it on, the
+bundler hard-requires `TAURI_SIGNING_PRIVATE_KEY` at build time, which
+contradicts the deferred-keypair posture. Activation is a one-time
+maintainer step (documented in `RELEASING.md`): generate the minisign
+keypair, keep the private key as the `TAURI_SIGNING_PRIVATE_KEY` CI
+secret, paste the public key into `tauri.conf.json` `pubkey`, and set
+`createUpdaterArtifacts` to `true` so release builds emit the `.sig`
+updater artefacts. The app-wide Tauri 2 capability is `src-tauri/capabilities/default.json`
 (`core:default` + `core:event:allow-emit`/`allow-listen`, scoped to the `main`
 window) — without a capability a Tauri 2 webview has no IPC access at all, so
 this is what lets the webview invoke the tauri-specta commands, receive

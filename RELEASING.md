@@ -93,6 +93,11 @@ To activate the updater for a real release:
    }
    ```
 
+   In the same commit, set `bundle.createUpdaterArtifacts` to `true` in
+   `tauri.conf.json`. It is `false` until activation because with it on
+   the bundler hard-requires `TAURI_SIGNING_PRIVATE_KEY` at build time —
+   CI builds would fail on every push while the keypair does not exist.
+
    Commit this change. The updater becomes live on the next release tag.
 
 From that point on `release.yml` signs every bundle with

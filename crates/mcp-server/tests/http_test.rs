@@ -234,8 +234,17 @@ async fn shutdown_completion_and_port_rebind() {
         .expect("done_tx must not be dropped without sending");
 
     // Re-bind the SAME explicit port — must succeed immediately because the
-    // completion receiver confirms the listener was dropped.
+    // completion receiver confirms the listener was dropped. The re-bind uses
+    // the production bind path's socket options: serve() binds with
+    // SO_REUSEADDR, so a TIME_WAIT entry left by this test's own closed
+    // connection must not fail the re-bind (a raw bind here would be
+    // scheduling-dependent — whichever side closes the probe connection first
+    // decides whether a TIME_WAIT entry exists).
     let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let rebound = tokio::net::TcpListener::bind(bind_addr).await;
+    let rebound = tokio::net::TcpSocket::new_v4().and_then(|s| {
+        s.set_reuseaddr(true)?;
+        s.bind(bind_addr)?;
+        s.listen(16)
+    });
     assert!(rebound.is_ok(), "port {port} must be rebindable after completion: {rebound:?}");
 }

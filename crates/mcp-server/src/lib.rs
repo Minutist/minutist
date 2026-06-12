@@ -197,7 +197,11 @@ pub async fn serve(
                 }
             }
         }
-        // `listener` is dropped here, releasing the port. Signal completion.
+        // Release the port BEFORE signalling completion: a plain end-of-scope
+        // drop would run after the send, letting the awaiting side re-bind
+        // while this listener still exists (SO_REUSEADDR does not permit
+        // binding over a live listener).
+        drop(listener);
         let _ = done_tx.send(());
     });
 

@@ -271,6 +271,30 @@ jobs:
       # backend. Signing vars are set in the "Prepare signing env" step above
       # only when the corresponding secrets are populated, so the build completes
       # unsigned (and logs "unsigned bundle") when secrets are absent.
+      # Pre-build so the sherpa/onnxruntime libraries are downloaded into their
+      # caches BEFORE the lib-path export below globs for them — on a cold
+      # cache the download happens mid-build, after a too-early export step
+      # has already no-opped. The tauri-action build is incremental on top.
+      - name: Pre-build (Linux)
+        if: runner.os == 'Linux'
+        run: cargo build --release --features ${{ matrix.features }} --locked
+
+      # linuxdeploy resolves the binary's dynamic dependencies while bundling;
+      # the sherpa-onnx / onnxruntime shared libraries live in the build-time
+      # download caches, not on the default loader path. Exporting them lets
+      # linuxdeploy find AND EMBED them in the AppImage (required for the
+      # artifact to run on user machines).
+      - name: Export sherpa-rs lib path (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for d in ~/.cache/sherpa-rs/x86_64-unknown-linux-gnu/*/*/lib ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib; do
+            if [ -d "$d" ]; then
+              echo "LD_LIBRARY_PATH=${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+              export LD_LIBRARY_PATH="${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            fi
+          done
+
       - name: Build release bundle
         uses: tauri-apps/tauri-action@v0
         with:
@@ -380,6 +404,27 @@ jobs:
       # the ubuntu-latest runner via the SDK installed above).
       # tauri-action re-runs beforeBuildCommand (npm run build) from tauri.conf.json;
       # it inherits VITE_CONNECTED="" from the job env so the free UI is bundled.
+      # Pre-build for the same cold-cache reason as the connected leg: the
+      # lib-path export must run after the sherpa/onnxruntime downloads exist.
+      - name: Pre-build (free)
+        run: cargo build --release --no-default-features --features vulkan --locked
+
+      # linuxdeploy resolves the binary's dynamic dependencies while bundling;
+      # the sherpa-onnx / onnxruntime shared libraries live in the build-time
+      # download caches, not on the default loader path. Exporting them lets
+      # linuxdeploy find AND EMBED them in the AppImage (required for the
+      # artifact to run on user machines).
+      - name: Export sherpa-rs lib path (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for d in ~/.cache/sherpa-rs/x86_64-unknown-linux-gnu/*/*/lib ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib; do
+            if [ -d "$d" ]; then
+              echo "LD_LIBRARY_PATH=${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+              export LD_LIBRARY_PATH="${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            fi
+          done
+
       - name: Build free release bundle
         uses: tauri-apps/tauri-action@v0
         with:

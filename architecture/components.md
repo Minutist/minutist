@@ -2135,6 +2135,16 @@ left, transcript right).
   document with internal `data-anchor-ms` attributes stripped — so paste into
   Word retains formatting (FR-17). The editor overrides copy/cut via ProseMirror
   `editorProps.handleDOMEvents`.
+- **Issue-report builder (`ui/src/diagnostics/issueReport.ts`).** Pure builder
+  for the "Report a problem" flow (#0014, no-telemetry decision O1/U6): given a
+  redacted `DiagnosticReport` (version / platform / GPU / error-class / log
+  excerpt — by construction no meeting-content field), `buildIssueUrl` composes
+  a GitHub issue-form URL (`.github/ISSUE_TEMPLATE/bug-report.yml`) with the
+  field ids pre-filled, enforcing an ~8 KB cap by explicitly eliding the
+  diagnostics field (never silent) and steering to the clipboard fallback
+  (`buildClipboardReport`). `redactMeetingPaths` is the defensive boundary pass
+  for meeting-id UUIDs. Log-excerpt redaction proper is owned by the Rust side
+  that assembles the report.
 - **`MainWindow` (`ui/src/shell/`)** is a resizable, show/hide multi-column
   layout via `react-resizable-panels` (FR-21/FR-30): up to three columns —
   notes editor (primary), transcript, and the summary reading column. A

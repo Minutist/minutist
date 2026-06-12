@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a problem with Minutist. The app pre-fills this form from your browser; nothing is sent automatically.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. When the app opens this form it pre-fills the
+        fields below from a local diagnostic report — **review and edit it
+        before submitting**. The report never includes your meeting content
+        (transcripts, notes, titles, speaker names, or file paths); it is
+        version, platform, and error information only. Nothing is sent until
+        you click *Submit* here in your own browser.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What were you doing, what did you expect, and what happened instead?
+      placeholder: Steps to reproduce, expected vs actual behaviour.
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: Minutist version
+    validations:
+      required: false
+  - type: input
+    id: platform
+    attributes:
+      label: Platform (OS / arch / build)
+      description: Operating system, CPU architecture, and whether this is the free or connected build.
+    validations:
+      required: false
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU acceleration
+      description: The resolved GPU plan (backend / CPU fallback), if known.
+    validations:
+      required: false
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic report
+      description: |
+        Auto-filled with the error class, a short log excerpt, and (for a
+        crash) the backtrace. If the app told you the report was too large for
+        the URL, paste the full report it copied to your clipboard here.
+      render: text
+    validations:
+      required: false

@@ -158,10 +158,11 @@ pub fn read_note_blocks(meeting_dir: &Path) -> AppResult<Vec<NoteBlock>> {
 
 /// Decode an Ogg/Opus byte buffer into a 16 kHz mono f32 PCM vector.
 ///
-/// Skips the two header packets (`OpusHead`, `OpusTags`) and decodes every
-/// audio packet, appending the decoded samples. The silent frames written for
-/// pause gaps decode to genuine zero samples, so the returned buffer is
-/// pause-including.
+/// Header packets (`OpusHead`, `OpusTags`) are identified by their RFC 7845
+/// magic-byte prefixes and skipped regardless of position in the stream. This
+/// handles single streams, double-header sets, and chained logical bitstreams
+/// without passing a header packet to the audio decoder (which would return
+/// `OPUS_INVALID_PACKET`).
 ///
 /// # Pre-skip trimming
 ///
@@ -185,10 +186,7 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
     let mut pcm = Vec::<f32>::new();
     let mut frame_buf = vec![0.0f32; MAX_FRAME_SAMPLES];
 
-    // The first two packets are OpusHead and OpusTags. We parse `pre_skip` out
-    // of the OpusHead packet and skip OpusTags.
-    let mut header_packets_seen = 0;
-    // Pre-skip samples (16 kHz) still to be trimmed off the head of the stream.
+    // Pre-skip samples (16 kHz) still to be trimmed off the head of the audio.
     let mut pre_skip_remaining: u64 = 0;
 
     loop {
@@ -198,16 +196,15 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
             Err(e) => return Err(format!("ogg read error: {e}")),
         };
 
-        if header_packets_seen < 2 {
-            // Packet 0 is OpusHead; read its declared pre_skip (a 16-bit LE
-            // field at byte offset 10, after the 8-byte "OpusHead" magic,
-            // version, and channel-count bytes — RFC 7845 §5.1). The field is
-            // expressed at the Opus 48 kHz internal rate, so convert to the
-            // decoder's 16 kHz output rate.
-            if header_packets_seen == 0 {
-                pre_skip_remaining = parse_opus_head_pre_skip(&pkt.data);
-            }
-            header_packets_seen += 1;
+        // Identify header packets by magic-byte prefix (RFC 7845 §5.1 /§5.2).
+        // Skipping by count (formerly "skip first 2 packets") is fragile for
+        // chained streams and double-header sets; magic-byte identification is
+        // correct for any conformant Ogg/Opus stream.
+        if pkt.data.starts_with(b"OpusHead") {
+            pre_skip_remaining = parse_opus_head_pre_skip(&pkt.data);
+            continue;
+        }
+        if pkt.data.starts_with(b"OpusTags") {
             continue;
         }
 

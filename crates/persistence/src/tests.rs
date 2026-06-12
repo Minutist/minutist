@@ -846,6 +846,135 @@ fn test_decode_trims_pre_skip_so_sample_zero_is_recorded_sample_zero() {
 }
 
 // ---------------------------------------------------------------------------
+// Magic-byte header identification (WU2b — regression guard for the
+// count-based "skip first 2 packets" latent defect in decode_opus_ogg).
+// ---------------------------------------------------------------------------
+
+/// A stream with a double header set (OpusHead, OpusTags, OpusHead, OpusTags
+/// prepended before any audio) must decode without error using the magic-byte
+/// reader.  The old count-based skip would pass the SECOND OpusHead to
+/// `decode_float` and return OPUS_INVALID_PACKET; the magic-based reader skips
+/// all four header packets and decodes the audio correctly.
+#[test]
+fn test_decode_opus_ogg_handles_double_header_set() {
+    use crate::opus_encoder::{OggOpusEncoder, SAMPLE_RATE};
+    use ogg::{PacketWriteEndInfo, PacketWriter};
+
+    // Build a valid Ogg/Opus stream from the encoder.
+    let mut base = Vec::<u8>::new();
+    let mut enc = OggOpusEncoder::new(std::io::Cursor::new(&mut base)).expect("encoder");
+    enc.push_samples(&sine_samples(0.5)).expect("push");
+    enc.finalise().expect("finalise");
+
+    // Build a synthetic stream with an EXTRA OpusHead + OpusTags injected at the
+    // front (same serial as the encoder used, to stay a single logical bitstream
+    // in the Ogg sense). We write directly using PacketWriter rather than going
+    // through OggOpusEncoder so we can emit the headers without the encoder's
+    // `headers_written` guard.
+    let mut doubled = Vec::<u8>::new();
+    {
+        let extra_serial: u32 = 0xDEAD_C0DE;
+        let mut pw = PacketWriter::new(std::io::Cursor::new(&mut doubled));
+
+        // Extra OpusHead header (a second one before the real stream).
+        let mut head = Vec::new();
+        head.extend_from_slice(b"OpusHead");
+        head.push(1); // version
+        head.push(1); // channels
+        head.extend_from_slice(&3840u16.to_le_bytes()); // pre_skip
+        head.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+        head.extend_from_slice(&0u16.to_le_bytes()); // gain
+        head.push(0); // mapping family
+        pw.write_packet(head, extra_serial, PacketWriteEndInfo::EndPage, 0)
+            .expect("extra OpusHead");
+
+        // Extra OpusTags header.
+        let mut tags = Vec::new();
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&(b"test".len() as u32).to_le_bytes());
+        tags.extend_from_slice(b"test");
+        tags.extend_from_slice(&0u32.to_le_bytes()); // zero comments
+        pw.write_packet(tags, extra_serial, PacketWriteEndInfo::EndPage, 0)
+            .expect("extra OpusTags");
+    }
+    // Append the real stream after the extra headers.
+    doubled.extend_from_slice(&base);
+
+    // The magic-byte decoder must decode without error despite >2 header packets.
+    let result = reader::decode_opus_ogg_for_test(&doubled);
+    assert!(
+        result.is_ok(),
+        "magic-byte decoder must handle a double-header stream; got: {:?}",
+        result.err()
+    );
+    let pcm = result.unwrap();
+    assert!(!pcm.is_empty(), "decoded buffer must be non-empty");
+}
+
+/// A standard single-header stream (OpusHead, OpusTags, audio) still decodes
+/// correctly with the magic-byte reader — no regression.
+#[test]
+fn test_decode_opus_ogg_standard_stream_decodes() {
+    use crate::opus_encoder::OggOpusEncoder;
+
+    let mut buf = Vec::<u8>::new();
+    let mut enc = OggOpusEncoder::new(std::io::Cursor::new(&mut buf)).expect("encoder");
+    enc.push_samples(&sine_samples(0.2)).expect("push");
+    enc.finalise().expect("finalise");
+
+    let pcm = reader::decode_opus_ogg_for_test(&buf).expect("decode standard stream");
+    assert!(!pcm.is_empty(), "standard stream must produce samples");
+}
+
+/// A stream with MORE than two leading header packets (extra OpusTags after
+/// OpusHead + OpusTags) must decode without error — magic-byte identification
+/// skips any number of non-audio leading packets.
+#[test]
+fn test_decode_opus_ogg_extra_tags_packet_skipped() {
+    use crate::opus_encoder::{OggOpusEncoder, SAMPLE_RATE};
+    use ogg::{PacketWriteEndInfo, PacketWriter};
+
+    let mut base = Vec::<u8>::new();
+    let mut enc = OggOpusEncoder::new(std::io::Cursor::new(&mut base)).expect("encoder");
+    enc.push_samples(&sine_samples(0.3)).expect("push");
+    enc.finalise().expect("finalise");
+
+    // Prepend an extra OpusTags packet before the real stream.
+    let extra_serial: u32 = 0xFEED_FACE;
+    let mut with_extra = Vec::<u8>::new();
+    {
+        let mut pw = PacketWriter::new(std::io::Cursor::new(&mut with_extra));
+        let mut head = Vec::new();
+        head.extend_from_slice(b"OpusHead");
+        head.push(1);
+        head.push(1);
+        head.extend_from_slice(&3840u16.to_le_bytes());
+        head.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+        head.extend_from_slice(&0u16.to_le_bytes());
+        head.push(0);
+        pw.write_packet(head, extra_serial, PacketWriteEndInfo::EndPage, 0)
+            .expect("head");
+        // Write two OpusTags packets (one extra).
+        for _ in 0..2 {
+            let mut tags = Vec::new();
+            tags.extend_from_slice(b"OpusTags");
+            tags.extend_from_slice(&0u32.to_le_bytes()); // vendor length 0
+            tags.extend_from_slice(&0u32.to_le_bytes()); // zero comments
+            pw.write_packet(tags, extra_serial, PacketWriteEndInfo::EndPage, 0)
+                .expect("tags");
+        }
+    }
+    with_extra.extend_from_slice(&base);
+
+    let result = reader::decode_opus_ogg_for_test(&with_extra);
+    assert!(
+        result.is_ok(),
+        "extra-tags stream must decode without error; got: {:?}",
+        result.err()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 11/12/13: reader round-trips
 // ---------------------------------------------------------------------------
 

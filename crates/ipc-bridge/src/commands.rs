@@ -1045,7 +1045,11 @@ fn summarise_meeting_with_progress(
 ) -> Result<String, AppError> {
     let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
 
-    let transcript = persistence::read_transcript(&meeting_dir)?;
+    let mut transcript = persistence::read_transcript(&meeting_dir)?;
+    // Overlay user-set speaker names onto a copy before summarising (same as the
+    // non-progress path); the on-disk transcript keeps the raw labels.
+    let meta = persistence::read_metadata(&meeting_dir)?;
+    minutist_common::apply_speaker_overlay(&mut transcript, &meta.speaker_names);
     // #70: load the note paragraphs WITH their recording-clock anchors so the
     // summariser can weave them into the transcript at the time they were
     // written (rather than appending a flat markdown block).
@@ -1189,7 +1193,13 @@ fn summarise_meeting_inner(
 ) -> Result<String, AppError> {
     let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
 
-    let transcript = persistence::read_transcript(&meeting_dir)?;
+    let mut transcript = persistence::read_transcript(&meeting_dir)?;
+    // Summarise with the user-set speaker names ("Alice") rather than the raw
+    // diarizer labels ("A"), matching every agent read tool. Overlay a copy —
+    // the on-disk transcript keeps the raw labels. (A summary already on disk
+    // keeps whatever labels it was generated with until it is regenerated.)
+    let meta = persistence::read_metadata(&meeting_dir)?;
+    minutist_common::apply_speaker_overlay(&mut transcript, &meta.speaker_names);
     // Note paragraphs with recording-clock anchors (#70); empty when the meeting
     // has none.
     let notes = persistence::read_note_blocks(&meeting_dir)?;
@@ -2555,6 +2565,7 @@ mod tests {
     struct StubSummariser {
         fixed_markdown: String,
         seen_transcript_len: std::sync::Mutex<Option<usize>>,
+        seen_speaker_ids: std::sync::Mutex<Option<Vec<Option<String>>>>,
         seen_notes: std::sync::Mutex<Option<String>>,
         seen_prompt: std::sync::Mutex<Option<String>>,
     }
@@ -2564,6 +2575,7 @@ mod tests {
             Self {
                 fixed_markdown: markdown.to_string(),
                 seen_transcript_len: std::sync::Mutex::new(None),
+                seen_speaker_ids: std::sync::Mutex::new(None),
                 seen_notes: std::sync::Mutex::new(None),
                 seen_prompt: std::sync::Mutex::new(None),
             }
@@ -2578,6 +2590,10 @@ mod tests {
             system_prompt: &str,
         ) -> Result<String, AppError> {
             *self.seen_transcript_len.lock().unwrap() = Some(transcript.len());
+            // Capture the per-segment speaker labels the inner path handed us so
+            // a test can assert the speaker-name overlay was applied.
+            *self.seen_speaker_ids.lock().unwrap() =
+                Some(transcript.iter().map(|s| s.speaker_id.clone()).collect());
             // Capture the note text the inner path read (joined in document
             // order) — empty string when no notes were taken.
             let joined = notes
@@ -2650,6 +2666,45 @@ mod tests {
             loaded.as_deref(),
             Some("## Summary\n\nWe planned the sprint.\n"),
             "summary.md must be written by the inner path"
+        );
+    }
+
+    /// The summariser must see user-set speaker names, not the raw diarizer
+    /// labels: `summarise_meeting_inner` overlays `metadata.speaker_names` onto a
+    /// transcript copy before handing it to the summariser, while the on-disk
+    /// transcript keeps its raw labels.
+    #[test]
+    fn summarise_inner_overlays_speaker_names() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id =
+            write_synthetic_meeting(root, "Sync", "2026-06-12T15:00:00Z", Some("hello"));
+        let dir = root.join(meeting_id.0.to_string());
+
+        // Label the single segment "A" and map "A" -> "Alice".
+        let mut transcript = persistence::read_transcript(&dir).expect("read transcript");
+        transcript[0].speaker_id = Some("A".to_string());
+        persistence::write_transcript(&dir, &transcript).expect("write transcript");
+        let mut meta = persistence::read_metadata(&dir).expect("read metadata");
+        meta.speaker_names
+            .insert("A".to_string(), "Alice".to_string());
+        persistence::write_metadata(&dir, &meta).expect("write metadata");
+
+        let stub = StubSummariser::new("ok");
+        summarise_meeting_inner(root, meeting_id, &stub, "p").expect("summarise");
+
+        // The stub saw the overlaid name, not the raw label.
+        assert_eq!(
+            stub.seen_speaker_ids.lock().unwrap().clone(),
+            Some(vec![Some("Alice".to_string())]),
+            "the overlay must rewrite the segment label to the display name"
+        );
+        // The on-disk transcript is untouched — still the raw label.
+        let on_disk = persistence::read_transcript(&dir).expect("re-read transcript");
+        assert_eq!(
+            on_disk[0].speaker_id.as_deref(),
+            Some("A"),
+            "the overlay must not mutate the stored transcript"
         );
     }
 

@@ -83,7 +83,11 @@ used, not added here.
 `ModelStatus`, `MeetingListEntry`, `NotesDocument`, `NoteBlock`, `MeetingState`,
 `InterAgentRequest`, `InterAgentReply`),
 trait definitions (`AsrBackend`, `Diarizer`,
-`Summariser`), the shared `AppError` enum + `AppResult<T>` alias.
+`Summariser`), the shared `AppError` enum + `AppResult<T>` alias, and the
+`apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` helper — the
+single canonical speaker-name overlay (raw diarizer label → display name),
+shared by the agent read tools and the summariser input path so a summary
+refers to "Alice", not "A".
 `NoteBlock { at_ms: Option<u64>, text }` (#70) is a note paragraph for the
 summariser — anchored ones carry the `data-anchor-ms` recording-clock
 timestamp; `Summariser::summarise` takes `&[NoteBlock]` (not flat markdown) so

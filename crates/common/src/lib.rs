@@ -138,6 +138,29 @@ pub struct WordTimestamp {
     pub text: String,
 }
 
+/// Apply the `speaker_names` overlay to a transcript: rewrite each segment's
+/// `speaker_id` label to its configured display name where one exists. Labels
+/// without a configured name are left as-is. Presentation-only — operates on a
+/// caller-owned copy; the on-disk transcript is never mutated.
+///
+/// The single canonical overlay used by every read path that renders speaker
+/// labels (the agent tools, the summariser input, and any future consumer).
+pub fn apply_speaker_overlay(
+    segments: &mut [Segment],
+    speaker_names: &std::collections::BTreeMap<String, String>,
+) {
+    if speaker_names.is_empty() {
+        return;
+    }
+    for seg in segments.iter_mut() {
+        if let Some(label) = &seg.speaker_id {
+            if let Some(name) = speaker_names.get(label) {
+                seg.speaker_id = Some(name.clone());
+            }
+        }
+    }
+}
+
 /// One note paragraph handed to the summariser (#70).
 ///
 /// `at_ms` is `Some` when the paragraph was anchored to the recording clock:

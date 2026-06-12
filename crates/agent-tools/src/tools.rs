@@ -32,25 +32,10 @@ use crate::{
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Apply the `speaker_names` overlay to a transcript: rewrite each segment's
-/// `speaker_id` label to its configured display name where one exists. Labels
-/// without a configured name are left as-is. Presentation-only — the on-disk
-/// transcript is never mutated.
-pub(crate) fn apply_speaker_overlay(
-    segments: &mut [Segment],
-    speaker_names: &BTreeMap<String, String>,
-) {
-    if speaker_names.is_empty() {
-        return;
-    }
-    for seg in segments.iter_mut() {
-        if let Some(label) = &seg.speaker_id {
-            if let Some(name) = speaker_names.get(label) {
-                seg.speaker_id = Some(name.clone());
-            }
-        }
-    }
-}
+/// The `speaker_names` overlay is the canonical helper in `minutist_common`
+/// (`apply_speaker_overlay`), shared with the summariser input path; re-exported
+/// here so the read tools below call it unqualified.
+pub(crate) use minutist_common::apply_speaker_overlay;
 
 /// Read a meeting's metadata on a blocking thread.
 async fn read_metadata(ctx: &ToolContext, id: MeetingId) -> AppResult<MeetingMeta> {

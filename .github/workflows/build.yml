@@ -84,7 +84,7 @@ jobs:
       # as a buildable component (available: Vulkan-Headers, Vulkan-Loader,
       # SPIRV-Tools, Glslang — glslc is NOT included). The LunarG prebuilt
       # installer ships the complete SDK including glslc.exe at %VULKAN_SDK%\Bin\.
-      # Pinned to 1.4.321.0 (released 2025-03; stable, pre-dates 1.4.350.0).
+      # Pinned to 1.4.309.0 (latest available from sdk.lunarg.com as of 2026-06).
       # The installer is cached by actions/cache keyed on the pinned version so
       # re-runs do not re-download the ~250 MB exe.
       - name: Cache Vulkan SDK installer (Windows)
@@ -93,13 +93,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: C:\VulkanSDK
-          key: windows-vulkan-sdk-1.4.321.0
+          key: windows-vulkan-sdk-1.4.309.0
 
       - name: Install Vulkan SDK (Windows)
         if: runner.os == 'Windows' && steps.vulkan-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $version = "1.4.321.0"
+          $version = "1.4.309.0"
           $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
           $installer = "$env:TEMP\VulkanSDK-Installer.exe"
           Write-Host "Downloading LunarG Vulkan SDK $version..."
@@ -120,7 +120,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $version = "1.4.321.0"
+          $version = "1.4.309.0"
           $sdk = "C:\VulkanSDK\$version"
           "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
@@ -145,13 +145,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # sherpa-rs and ort download prebuilt shared libraries at build time into
-      # platform-specific cache dirs (Linux: ~/.cache/sherpa-rs,
-      # ~/.cache/ort.pyke.io; macOS: ~/Library/Caches equivalents). These are
-      # NOT inside the cargo target tree and are not captured by the default
-      # Swatinem/rust-cache scope. When a cargo cache hit restores compiled
-      # artifacts whose link-search paths reference those dirs, the linker fails
-      # if the .so/.dylib files are absent. Including them ties their lifetime to
-      # the cargo cache key. Non-existent paths are silently skipped by the action.
+      # platform-specific cache dirs outside the cargo target tree.
+      #
+      # sherpa-rs-sys (via dirs::cache_dir()):
+      #   Linux:   ~/.cache/sherpa-rs
+      #   macOS:   ~/Library/Caches/sherpa-rs
+      #   Windows: ~/AppData/Local/sherpa-rs   (LOCALAPPDATA)
+      #
+      # ort-sys (via its internal dirs module):
+      #   Linux:   ~/.cache/ort.pyke.io
+      #   macOS:   ~/Library/Caches/ort.pyke.io
+      #   Windows: ~/AppData/Local/ort.pyke.io
+      #
+      # When a cargo cache hit restores compiled artifacts whose link-search
+      # paths reference these dirs, the linker fails if the files are absent.
+      # Including them ties their lifetime to the cargo cache key. Non-existent
+      # paths are silently skipped by the action.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
         with:
@@ -160,6 +169,8 @@ jobs:
             ~/.cache/ort.pyke.io
             ~/Library/Caches/sherpa-rs
             ~/Library/Caches/ort.pyke.io
+            ~/AppData/Local/sherpa-rs
+            ~/AppData/Local/ort.pyke.io
 
       # GPU feature-graph guard for the backends NOT bundled on this leg
       # (cuda/rocm everywhere; directml on Windows — sherpa's DirectML backend).
@@ -244,6 +255,16 @@ jobs:
           set_if_nonempty APPLE_ID                          "${{ secrets.APPLE_ID }}"
           set_if_nonempty APPLE_PASSWORD                    "${{ secrets.APPLE_PASSWORD }}"
           set_if_nonempty APPLE_TEAM_ID                     "${{ secrets.APPLE_TEAM_ID }}"
+
+      # linuxdeploy is distributed as an AppImage and requires FUSE to mount
+      # itself. GitHub Actions Ubuntu runners do not expose /dev/fuse, so the
+      # AppImage cannot self-mount. APPIMAGE_EXTRACT_AND_RUN=1 makes linuxdeploy
+      # extract its squashfs to a temp dir and run from there instead, bypassing
+      # the FUSE requirement. Set it unconditionally: on macOS/Windows this var
+      # is inert; it is only read by the AppImage runtime on Linux.
+      - name: Set APPIMAGE_EXTRACT_AND_RUN (Linux)
+        if: runner.os == 'Linux'
+        run: echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
 
       # tauri-action runs the configured beforeBuildCommand (npm run build) and
       # bundles the app. `--features <gpu>` selects the single per-platform GPU
@@ -348,6 +369,11 @@ jobs:
       - name: Build free UI bundle
         working-directory: ui
         run: npm run build
+
+      # linuxdeploy (AppImage) needs APPIMAGE_EXTRACT_AND_RUN=1 on GitHub Actions
+      # because /dev/fuse is not available — same reason as the connected build.
+      - name: Set APPIMAGE_EXTRACT_AND_RUN
+        run: echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
 
       # Build the free Rust artifact. --no-default-features drops mcp-server/
       # rmcp; --features vulkan adds the GPU backend (Vulkan is available on

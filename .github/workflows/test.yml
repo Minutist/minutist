@@ -91,20 +91,33 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # sherpa-rs and ort download prebuilt shared libraries into ~/.cache on
-      # Linux at build time (the download-binaries feature). These directories
-      # are NOT part of the cargo target tree, so Swatinem/rust-cache does not
-      # capture them by default. When the cargo cache hits and restores compiled
-      # artifacts whose link-search paths point at ~/.cache/sherpa-rs/... and
-      # ~/.cache/ort.pyke.io/..., the linker fails if those directories are
-      # absent. Including them in cache-directories ties their lifetime to the
-      # cargo cache key so they are always present when the build artifacts are.
+      # sherpa-rs and ort download prebuilt shared libraries at build time into
+      # platform-specific cache dirs outside the cargo target tree.
+      #
+      # sherpa-rs-sys (via dirs::cache_dir()):
+      #   Linux:   ~/.cache/sherpa-rs
+      #   macOS:   ~/Library/Caches/sherpa-rs
+      #   Windows: ~/AppData/Local/sherpa-rs   (LOCALAPPDATA)
+      #
+      # ort-sys (via ORT_CACHE_DIR or its internal dirs module):
+      #   Linux:   ~/.cache/ort.pyke.io
+      #   macOS:   ~/Library/Caches/ort.pyke.io
+      #   Windows: ~/AppData/Local/ort.pyke.io
+      #
+      # When a cargo cache hit restores compiled artifacts whose link-search
+      # paths reference these dirs, the linker (and the runtime loader) fails if
+      # the .so/.dylib/.dll files are absent. Including them ties their lifetime
+      # to the cargo cache key. Non-existent paths are silently skipped.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
         with:
           cache-directories: |
             ~/.cache/sherpa-rs
             ~/.cache/ort.pyke.io
+            ~/Library/Caches/sherpa-rs
+            ~/Library/Caches/ort.pyke.io
+            ~/AppData/Local/sherpa-rs
+            ~/AppData/Local/ort.pyke.io
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -136,6 +149,42 @@ jobs:
           }
           "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
         shell: pwsh
+
+      # Export runtime library search paths so test binaries can dlopen
+      # sherpa-onnx shared libs when the cargo build script was skipped on a
+      # cache hit. The build script copies libs into target/.../deps/ on first
+      # build, but that copy is absent if only the compiled artifacts were
+      # restored from cache. The glob finds the versioned subdirectory without
+      # hardcoding the hash, and exports the path via GITHUB_ENV so it persists
+      # to the cargo test step.
+      - name: Export sherpa-rs lib path (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          lib=$(ls -d ~/.cache/sherpa-rs/x86_64-unknown-linux-gnu/*/*/lib 2>/dev/null | head -1)
+          if [ -n "$lib" ]; then
+            echo "LD_LIBRARY_PATH=${lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Export sherpa-rs lib path (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          lib=$(ls -d ~/Library/Caches/sherpa-rs/aarch64-apple-darwin/*/*/lib 2>/dev/null | head -1)
+          if [ -n "$lib" ]; then
+            echo "DYLD_FALLBACK_LIBRARY_PATH=${lib}${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Export sherpa-rs lib path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = "$env:LOCALAPPDATA\sherpa-rs"
+          $lib = Get-ChildItem -Path $root -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty DirectoryName
+          if ($lib) {
+            "$lib" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
 
       # CPU-only workspace tests. sherpa-rs pulls its prebuilt libs via the
       # `download-binaries` feature on first build (network access required).

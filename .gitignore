@@ -1,4 +1,7 @@
 /target
+# Isolated cargo target used by `make ci-local` (container build; incompatible
+# ABI with the host target/).
+/target-ci-local
 **/*.rs.bk
 *.pdb
 .DS_Store

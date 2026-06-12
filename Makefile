@@ -19,7 +19,8 @@ UI_DIR := ui
         windows-build windows-build-vulkan \
         build-free build-free-vulkan \
         test-integration test-integration-summary test-integration-asr \
-        test-integration-diarize
+        test-integration-diarize \
+        ci-local
 
 # Local integration-test config (real model + recording paths). Git-excluded;
 # copy tests-local.env.example to create it. Crates whose #[ignore]/env-gated
@@ -147,3 +148,6 @@ runner-down: ## Stop the self-hosted runner container
 
 runner-logs: ## Tail the self-hosted runner logs
 	docker logs -f minutist-github-runner
+
+ci-local: ## Run the Linux CI test suite in the local Docker image (no GitHub round-trip)
+	ci/scripts/ci-local.sh

@@ -41,6 +41,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Node.js 20 LTS via NodeSource. Ubuntu 24.04 noble ships Node 18 in its
+# default packages, which is below the ≥20 requirement in the workflow.
+# Adding NodeSource's node_20.x repo gives a version-locked 20.x package
+# that matches what actions/setup-node@v4 with node-version: 20 installs on
+# GitHub-hosted runners.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 # Docker CLI only (static binary) — the daemon is the host's, reached via the
 # bind-mounted socket. Needed for container actions (reuse-lint, cargo-deny).
 RUN curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \

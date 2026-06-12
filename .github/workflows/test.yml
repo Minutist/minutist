@@ -188,6 +188,16 @@ jobs:
             "$lib" | Out-File -FilePath $env:GITHUB_PATH -Append
           }
 
+      # Linux: the shared script runs cargo test + UI build + UI test in one
+      # step, keeping the commands in sync with `make ci-local`.
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: ci/scripts/run-linux-tests.sh
+
+      # Windows/macOS: run steps individually (Windows needs DLL staging; macOS
+      # can share the plain steps).
+      #
       # CPU-only workspace tests. sherpa-rs pulls its prebuilt libs via the
       # `download-binaries` feature on first build (network access required).
       #
@@ -217,17 +227,21 @@ jobs:
           Get-ChildItem -Path $deps -Filter "*.dll" | Select-Object -ExpandProperty Name
 
       - name: cargo test --workspace
+        if: runner.os != 'Linux'
         run: cargo test --workspace --locked
 
       - name: Install UI dependencies
+        if: runner.os != 'Linux'
         working-directory: ui
         run: npm ci
 
       - name: Build UI
+        if: runner.os != 'Linux'
         working-directory: ui
         run: npm run build
 
       - name: Test UI
+        if: runner.os != 'Linux'
         working-directory: ui
         run: npm run test
 

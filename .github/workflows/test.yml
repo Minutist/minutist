@@ -28,7 +28,7 @@ jobs:
   # the code licence by accident).
   reuse-lint:
     name: reuse lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +41,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Linux runs on the repo's self-hosted runner (ci/runner/) — free and
+        # fast; Windows/macOS stay on GitHub-hosted images.
+        os: [[self-hosted, linux, x64], windows-latest, macos-latest]
 
     steps:
       - name: Checkout
@@ -242,7 +244,7 @@ jobs:
   # are skipped).
   cargo-deny:
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -279,8 +281,8 @@ jobs:
       matrix:
         include:
           # Linux: vulkan SDK (including glslc from shaderc) installed ->
-          # full check; cuda/rocm graph-only.
-          - os: ubuntu-latest
+          # full check; cuda/rocm graph-only. Self-hosted (ci/runner/).
+          - os: [self-hosted, linux, x64]
             check_features: vulkan
             graph_features: cuda rocm
           # macOS: metal is in the OS -> full check. (cuda/rocm/directml N/A.)

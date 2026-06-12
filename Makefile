@@ -137,3 +137,13 @@ build-free: ## Free-tier debug build (no MCP server, CPU only)
 build-free-vulkan: ## Free-tier debug build (no MCP server, Vulkan GPU)
 	cd $(UI_DIR) && VITE_CONNECTED= npm run build
 	$(CARGO) build --no-default-features --features vulkan
+
+# --- Self-hosted CI runner (docker-managed; see ci/runner/README.md) --------
+runner-up: ## Build + start the self-hosted GitHub Actions runner
+	docker compose -f ci/runner/docker-compose.yml up -d --build
+
+runner-down: ## Stop the self-hosted runner container
+	docker compose -f ci/runner/docker-compose.yml down
+
+runner-logs: ## Tail the self-hosted runner logs
+	docker logs -f minutist-github-runner

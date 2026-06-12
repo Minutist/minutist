@@ -39,7 +39,7 @@ jobs:
       matrix:
         include:
           - platform: linux
-            os: ubuntu-latest
+            os: [self-hosted, linux, x64]
             features: vulkan
           - platform: windows
             os: windows-latest

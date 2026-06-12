@@ -1,0 +1,24 @@
+# Self-hosted Linux runner for Minutist CI. See README.md for setup.
+#
+# The state dir is mounted at the SAME path inside the container as on the
+# host: container actions are spawned as sibling containers via the docker
+# socket, and the bind paths the runner hands them must resolve on the host
+# daemon. Do not change one side of the mapping without the other.
+services:
+  github-runner:
+    build:
+      context: .
+      args:
+        UID: "1000"
+        GID: "1001"
+    image: minutist-ci-runner:local
+    container_name: minutist-github-runner
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      RUNNER_STATE_DIR: /mnt/bulk/srv/github-runner/state
+      RUNNER_TOOL_CACHE: /opt/hostedtoolcache
+    volumes:
+      - /mnt/bulk/srv/github-runner/state:/mnt/bulk/srv/github-runner/state
+      - /mnt/bulk/srv/github-runner/toolcache:/opt/hostedtoolcache
+      - /var/run/docker.sock:/var/run/docker.sock

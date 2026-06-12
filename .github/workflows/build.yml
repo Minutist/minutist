@@ -31,7 +31,7 @@ jobs:
       matrix:
         include:
           - platform: linux
-            os: ubuntu-latest
+            os: [self-hosted, linux, x64]
             features: vulkan
           - platform: windows
             os: windows-latest
@@ -311,7 +311,7 @@ jobs:
   # was actually bundled (tauri-action overwrites the dist built manually).
   build-free:
     name: build-free (linux)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     env:
       VITE_CONNECTED: ""
 

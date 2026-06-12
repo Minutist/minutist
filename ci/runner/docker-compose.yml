@@ -22,3 +22,25 @@ services:
       - /mnt/bulk/srv/github-runner/state:/mnt/bulk/srv/github-runner/state
       - /mnt/bulk/srv/github-runner/toolcache:/opt/hostedtoolcache
       - /var/run/docker.sock:/var/run/docker.sock
+
+  # Second replica: two sessions push concurrently and a single runner
+  # serializes ~6 Linux jobs per push, so queued validations get clawed back
+  # by the next push's cancel-in-progress group before they run. Same image;
+  # own state dir (same-path mount rule applies) and own registration.
+  github-runner-2:
+    build:
+      context: .
+      args:
+        UID: "1000"
+        GID: "1001"
+    image: minutist-ci-runner:local
+    container_name: minutist-github-runner-2
+    restart: unless-stopped
+    env_file: .env2
+    environment:
+      RUNNER_STATE_DIR: /mnt/bulk/srv/github-runner/state2
+      RUNNER_TOOL_CACHE: /opt/hostedtoolcache
+    volumes:
+      - /mnt/bulk/srv/github-runner/state2:/mnt/bulk/srv/github-runner/state2
+      - /mnt/bulk/srv/github-runner/toolcache:/opt/hostedtoolcache
+      - /var/run/docker.sock:/var/run/docker.sock

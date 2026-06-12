@@ -473,26 +473,36 @@ impl Orchestrator {
     ///
     /// `AppError::InvalidInput` if not in `Recording` state.
     pub async fn pause(&self) -> AppResult<()> {
-        let mut guard = self.inner.lock().await;
-        let _meeting_id = transition_pause(&mut guard.state)?;
+        // The cmd_tx sender is cloned while the lock is held (for the state
+        // transition), then the lock is released before awaiting the send. The
+        // runner thread never takes this mutex, so there is no deadlock risk,
+        // but holding the lock across an `await` would block every other async
+        // caller of the orchestrator for the duration of the send.
+        let (cmd_tx, new_state) = {
+            let mut guard = self.inner.lock().await;
+            let _meeting_id = transition_pause(&mut guard.state)?;
 
-        // Pause the audio capture stream first so no new samples arrive while
-        // the writer is transitioning.
-        if let Some(capture) = &mut guard.capture {
-            capture.pause()?;
+            // Pause the audio capture stream first so no new samples arrive while
+            // the writer is transitioning.
+            if let Some(capture) = &mut guard.capture {
+                capture.pause()?;
+            }
+
+            let cmd_tx = guard.runner.as_ref().map(|r| r.cmd_tx.clone());
+            let new_state = guard.state.as_public();
+            (cmd_tx, new_state)
+        };
+
+        // Send the WriterPause command with back-pressure: if the channel is
+        // full (runner busy under load), this yields until space is available
+        // rather than silently dropping the command. A dropped WriterPause would
+        // desynchronise the encoder-pause silence vs the pause-excluding timeline.
+        if let Some(tx) = cmd_tx {
+            if let Err(e) = tx.send(runner::RunnerCommand::WriterPause).await {
+                tracing::warn!(target: "orchestrator", "WriterPause send failed: {e}");
+            }
         }
 
-        // Instruct the runner to call `MeetingWriter::pause`.
-        if let Some(runner) = &guard.runner {
-            let _ = runner
-                .cmd_tx
-                .try_send(runner::RunnerCommand::WriterPause)
-                .map_err(
-                    |_| tracing::warn!(target: "orchestrator", "WriterPause command send failed"),
-                );
-        }
-
-        let new_state = guard.state.as_public();
         self.emit(AppEvent::StateChanged { state: new_state });
 
         tracing::info!(target: "orchestrator", "recording paused");
@@ -508,25 +518,34 @@ impl Orchestrator {
     ///
     /// `AppError::InvalidInput` if not in `Paused` state.
     pub async fn resume(&self) -> AppResult<()> {
-        let mut guard = self.inner.lock().await;
-        let _meeting_id = transition_resume(&mut guard.state)?;
+        let (cmd_tx, new_state) = {
+            let mut guard = self.inner.lock().await;
+            let _meeting_id = transition_resume(&mut guard.state)?;
 
-        // Instruct the runner to resume the writer before new samples arrive.
-        if let Some(runner) = &guard.runner {
-            let _ = runner
-                .cmd_tx
-                .try_send(runner::RunnerCommand::WriterResume)
-                .map_err(
-                    |_| tracing::warn!(target: "orchestrator", "WriterResume command send failed"),
-                );
+            let cmd_tx = guard.runner.as_ref().map(|r| r.cmd_tx.clone());
+            let new_state = guard.state.as_public();
+            (cmd_tx, new_state)
+        };
+
+        // Send WriterResume before resuming the capture stream so the writer is
+        // ready to accept samples before the capture callback pushes them. A
+        // dropped WriterResume would strand the encoder in Paused, causing every
+        // subsequent push_samples call to return Err (silently swallowed) and
+        // the audio tail to be lost. Using send().await makes delivery reliable.
+        if let Some(tx) = cmd_tx {
+            if let Err(e) = tx.send(runner::RunnerCommand::WriterResume).await {
+                tracing::warn!(target: "orchestrator", "WriterResume send failed: {e}");
+            }
         }
 
         // Resume audio capture so samples start flowing again.
-        if let Some(capture) = &mut guard.capture {
-            capture.resume()?;
+        {
+            let mut guard = self.inner.lock().await;
+            if let Some(capture) = &mut guard.capture {
+                capture.resume()?;
+            }
         }
 
-        let new_state = guard.state.as_public();
         self.emit(AppEvent::StateChanged { state: new_state });
 
         tracing::info!(target: "orchestrator", "recording resumed");

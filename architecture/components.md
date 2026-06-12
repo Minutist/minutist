@@ -1215,6 +1215,17 @@ yields all-None `speaker_id` (the "must not break transcription" regression guar
 with an env-var-gated (`MINUTIST_DIARIZE_EMB_PATH`) positive case asserting
 non-None live labels.
 
+**Pause/resume command delivery.** `Orchestrator::pause`, `resume`, and `stop`
+all deliver their writer commands (`WriterPause`/`WriterResume`/stop) onto the
+runner's `cmd_tx` channel via the awaiting `send()` — control commands are
+back-pressured, never dropped. The state lock is released before the await so it
+is never held across an async yield; the runner never takes the state mutex, so
+a busy or exited writer cannot deadlock the caller (a closed channel returns an
+error, which is logged). Reliable delivery is what keeps the encoder-pause
+silence aligned with the pause-excluding timeline: a lost `WriterPause` would
+leave the encoder running, and a lost `WriterResume` would strand it in Paused
+with every subsequent `push_samples` failing.
+
 **Phase 9 — `Orchestrator::transcribe_pcm_window(MeetingId, start_ms, end_ms,
 language) -> AppResult<Vec<Segment>>`.** Backs the `agent-tools`
 `relisten_section` tool. A **read-only** compute op — it does NOT rewrite

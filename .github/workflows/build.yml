@@ -275,7 +275,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: src-tauri
-          args: --features ${{ matrix.features }}
+          args: --verbose --features ${{ matrix.features }}
 
       # Collect every bundle tauri-action produced for this OS. The bundle
       # output lives under the workspace target dir; glob broadly so we capture
@@ -384,7 +384,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: src-tauri
-          args: -- --no-default-features --features vulkan
+          args: --verbose -- --no-default-features --features vulkan
 
       # Verify the MCP pane token-reveal label is absent from the dist that
       # tauri-action actually bundled (runs after tauri-action, not before).

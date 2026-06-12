@@ -161,7 +161,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          lib=$(ls -d ~/.cache/sherpa-rs/x86_64-unknown-linux-gnu/*/*/lib 2>/dev/null | head -1)
+          lib=$(ls -d ~/.cache/sherpa-rs/x86_64-unknown-linux-gnu/*/*/lib 2>/dev/null | head -1 || true)
           if [ -n "$lib" ]; then
             echo "LD_LIBRARY_PATH=${lib}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
           fi
@@ -170,7 +170,7 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          lib=$(ls -d ~/Library/Caches/sherpa-rs/aarch64-apple-darwin/*/*/lib 2>/dev/null | head -1)
+          lib=$(ls -d ~/Library/Caches/sherpa-rs/aarch64-apple-darwin/*/*/lib 2>/dev/null | head -1 || true)
           if [ -n "$lib" ]; then
             echo "DYLD_FALLBACK_LIBRARY_PATH=${lib}${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}" >> "$GITHUB_ENV"
           fi
@@ -188,6 +188,32 @@ jobs:
 
       # CPU-only workspace tests. sherpa-rs pulls its prebuilt libs via the
       # `download-binaries` feature on first build (network access required).
+      #
+      # Windows: build first, then copy the sherpa/onnxruntime DLLs next to the
+      # test executables. Windows DLL search resolves the application directory
+      # before PATH, and the runner image ships an older onnxruntime.dll in
+      # System32 that wins over PATH entries and lacks the C-API exports our
+      # build links (STATUS_ENTRYPOINT_NOT_FOUND at process start). Staging the
+      # correct DLLs beside the exes is the only placement that always wins.
+      - name: Build tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --workspace --tests --locked
+
+      - name: Stage sherpa/onnxruntime DLLs beside test executables (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $deps = "target\debug\deps"
+          $sources = @("$env:LOCALAPPDATA\sherpa-rs", "$env:LOCALAPPDATA\ort.pyke.io", "target\debug")
+          foreach ($root in $sources) {
+            if (Test-Path $root) {
+              Get-ChildItem -Path $root -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |
+                Where-Object { $_.DirectoryName -ne (Resolve-Path $deps -ErrorAction SilentlyContinue).Path } |
+                ForEach-Object { Copy-Item $_.FullName -Destination $deps -Force -ErrorAction SilentlyContinue }
+            }
+          }
+          Get-ChildItem -Path $deps -Filter "*.dll" | Select-Object -ExpandProperty Name
+
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 

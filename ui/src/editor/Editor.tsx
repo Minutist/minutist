@@ -75,6 +75,10 @@ export function Editor() {
   // U1: the restored notes of the open saved meeting (null while recording or on
   // the live entry surface). Hydrated into the editor by a production effect.
   const openMeetingState = useMeetingsStore((s) => s.openMeetingState);
+  // The open saved meeting's id — autosave targets it when no recording is
+  // active so edits to a finished/opened meeting persist (#0012). Reactive so
+  // the autosave interval re-binds when the open meeting changes.
+  const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
 
   // Holds the live editor instance for DOM-event handlers wired at construction
   // time (the `drop` handler), which cannot close over `editor` before it is
@@ -153,6 +157,7 @@ export function Editor() {
 
   const { flush } = useAutosave({
     state: recordingState,
+    openMeetingId,
     intervalSecs,
     getSnapshot: () => {
       if (!editor) return null;

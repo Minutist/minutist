@@ -180,4 +180,81 @@ describe("useAutosave", () => {
     });
     expect(saveNotes).not.toHaveBeenCalled();
   });
+
+  it("autosaves an open saved meeting while idle (#0012)", () => {
+    const { result } = renderHook(() =>
+      useAutosave({
+        state: idleState,
+        openMeetingId: "saved-77",
+        intervalSecs: 5,
+        getSnapshot: () => snapshot,
+      }),
+    );
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(saveNotes).toHaveBeenCalledWith({
+      meetingId: "saved-77",
+      notesJson: snapshot.notesJson,
+      notesMarkdown: snapshot.notesMarkdown,
+    });
+
+    // flush() (blur) targets the open meeting too.
+    vi.mocked(saveNotes).mockClear();
+    act(() => {
+      result.current.flush();
+    });
+    expect(saveNotes).toHaveBeenCalledWith({
+      meetingId: "saved-77",
+      notesJson: snapshot.notesJson,
+      notesMarkdown: snapshot.notesMarkdown,
+    });
+  });
+
+  it("recording takes precedence over an open meeting id", () => {
+    renderHook(() =>
+      useAutosave({
+        state: recordingState,
+        openMeetingId: "saved-77",
+        intervalSecs: 5,
+        getSnapshot: () => snapshot,
+      }),
+    );
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(saveNotes).toHaveBeenCalledWith(
+      expect.objectContaining({ meetingId: "meeting-123" }),
+    );
+  });
+
+  it("re-binds the interval to a newly opened meeting", () => {
+    const { rerender } = renderHook(
+      ({ openMeetingId }: { openMeetingId: string | null }) =>
+        useAutosave({
+          state: idleState,
+          openMeetingId,
+          intervalSecs: 5,
+          getSnapshot: () => snapshot,
+        }),
+      { initialProps: { openMeetingId: "saved-A" as string | null } },
+    );
+
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(saveNotes).toHaveBeenLastCalledWith(
+      expect.objectContaining({ meetingId: "saved-A" }),
+    );
+
+    rerender({ openMeetingId: "saved-B" });
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(saveNotes).toHaveBeenLastCalledWith(
+      expect.objectContaining({ meetingId: "saved-B" }),
+    );
+  });
 });

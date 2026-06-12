@@ -2124,8 +2124,12 @@ left, transcript right).
   injected as an `AnchorClockSource`, decoupling the extension from the store.
 - **Autosave (`ui/src/editor/useAutosave.ts`).** Interval autosave
   (`autosave_interval_secs`, default 5 s) plus flush-on-blur, persisting notes
-  through the `save_notes` IPC seam (`ui/src/ipc/notes.ts`). No-op when there is
-  no active recording / MeetingId (FR-18).
+  through the `save_notes` IPC seam (`ui/src/ipc/notes.ts`). The target meeting
+  is `activeMeetingId(state) ?? openMeetingId` — the active recording while
+  capturing, otherwise the open saved meeting being viewed (the same document
+  identity rule `active-transcript` uses), so edits to a finished/opened meeting
+  persist. No-op only when neither exists: the live entry surface with nothing
+  open (FR-18).
 - **HTML clipboard (`ui/src/editor/clipboard.ts`).** `buildClipboardPayload`
   produces a `text/html` (+ `text/plain`) copy payload — a self-contained UTF-8
   document with internal `data-anchor-ms` attributes stripped — so paste into

@@ -4,10 +4,12 @@
  * Persists the editor's notes on a fixed interval (`autosave_interval_secs`,
  * default 5 s) and on blur, via the `saveNotes` IPC seam (`../ipc/notes`).
  *
- * Hard rule: autosave is a **no-op when there is no active recording / no
- * MeetingId**. Notes are scoped to a meeting; with no meeting there is nowhere
- * to persist them. The active MeetingId is derived from the recording state
- * (`recording` / `paused` / `stopping` carry it; `idle` does not).
+ * The document the notes belong to is the active recording while capturing,
+ * otherwise the open saved meeting being viewed — the same identity rule the
+ * rest of the UI uses (`activeMeetingId(state) ?? openMeetingId`). Autosave is
+ * a no-op only when there is neither: the live entry surface with nothing open.
+ * Without the open-meeting fallback, edits to a finished/opened meeting are
+ * silently lost (idle carries no recording MeetingId).
  */
 import { useEffect, useRef } from "react";
 import type { RecordingState } from "../ipc/bindings";
@@ -41,8 +43,14 @@ export type NotesSnapshot = {
 };
 
 export type UseAutosaveArgs = {
-  /** Current recording state — gates whether autosave runs at all. */
+  /** Current recording state — supplies the MeetingId while capturing. */
   state: RecordingState;
+  /**
+   * The open saved meeting's id, used when no recording is active so edits to a
+   * finished/opened meeting persist. Recording takes precedence; absent/`null`
+   * with an idle recorder means no meeting → autosave is a no-op.
+   */
+  openMeetingId?: string | null;
   /** Autosave cadence in seconds; falls back to the default when null. */
   intervalSecs: number | null;
   /**
@@ -61,7 +69,7 @@ export type UseAutosaveArgs = {
  * notes are persisted immediately when focus leaves the editor.
  */
 export function useAutosave(args: UseAutosaveArgs): { flush: () => void } {
-  const { state, intervalSecs, getSnapshot, onError } = args;
+  const { state, openMeetingId, intervalSecs, getSnapshot, onError } = args;
 
   // Keep the latest snapshot/error callbacks in refs so the interval effect
   // does not re-subscribe on every keystroke (which would reset the timer).
@@ -70,7 +78,9 @@ export function useAutosave(args: UseAutosaveArgs): { flush: () => void } {
   getSnapshotRef.current = getSnapshot;
   onErrorRef.current = onError;
 
-  const meetingId = activeMeetingId(state);
+  // Recording (live) takes precedence; otherwise the open saved meeting. Null
+  // only on the live entry surface with nothing open → autosave no-ops.
+  const meetingId = activeMeetingId(state) ?? openMeetingId ?? null;
 
   const performSave = useRef((id: string) => {
     const snapshot = getSnapshotRef.current();

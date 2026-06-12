@@ -899,15 +899,38 @@ mod tests {
 
         let consumer = {
             let ch = Arc::clone(&ch);
+            let done = Arc::clone(&done);
             thread::spawn(move || {
                 let mut last = -1.0f32;
                 let mut count = 0usize;
-                while let Some(f) = ch.recv_timeout(Duration::from_millis(50)) {
-                    let t = tag(&f);
-                    // FIFO within the ring: ids only increase.
-                    assert!(t > last, "frames must arrive oldest-first: {t} after {last}");
-                    last = t;
-                    count += 1;
+                loop {
+                    match ch.recv_timeout(Duration::from_millis(50)) {
+                        Some(f) => {
+                            let t = tag(&f);
+                            // FIFO within the ring: ids only increase.
+                            assert!(
+                                t > last,
+                                "frames must arrive oldest-first: {t} after {last}"
+                            );
+                            last = t;
+                            count += 1;
+                        }
+                        // recv_timeout returns None on spurious timeout (queue
+                        // temporarily empty but producer still running) OR on
+                        // post-close drain-complete. Exit ONLY once the producer
+                        // has set `done` and a subsequent recv_timeout confirms the
+                        // channel is drained (returns None again after close).
+                        None => {
+                            if done.load(Ordering::Acquire) {
+                                // Channel is closed (producer set done and called
+                                // close()); the None confirms it is also drained.
+                                break;
+                            }
+                            // Spurious timeout: producer still running but the
+                            // small ring was momentarily empty under load. Keep
+                            // polling rather than exiting early.
+                        }
+                    }
                 }
                 (last, count)
             })

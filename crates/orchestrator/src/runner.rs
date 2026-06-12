@@ -650,7 +650,14 @@ fn run_drain_loop(
                         "runner: stop command received; draining remaining samples"
                     );
                     if !writer_paused {
-                        drain_samples(&mut streams.samples, &mut writer);
+                        drain_samples_through_vad(
+                            &mut streams.samples,
+                            &mut writer,
+                            &mut vad_opt,
+                            &mut acc,
+                            online_diarizer.as_ref(),
+                            "stop drain",
+                        );
                     }
                     drain_meter(&mut streams.meter, &event_tx);
 
@@ -699,13 +706,23 @@ fn run_drain_loop(
                     tracing::info!(
                         target: "orchestrator",
                         meeting_id = %meta.uuid.0,
-                        "runner: stop while writer paused; flushing and finalising"
+                        "runner: stop while writer paused; draining queued samples then finalising"
                     );
-                    // No live samples to drain while paused, but the VAD may
-                    // still hold an in-progress segment from before the pause —
-                    // run the SAME end-of-stream flush + accumulator drain the
-                    // Recording-stop path uses so the last utterance is not lost
-                    // (TIMELINE-DRIFT #6).
+                    // Drain any sample batches that were queued before the pause
+                    // arrived: push each to persistent audio AND feed it to the VAD.
+                    // Batches accepted by the channel before the WriterPause command
+                    // would otherwise be stranded here (the paused loop blocks on
+                    // cmd_rx and never reads streams.samples), so the VAD would
+                    // never build an in-progress segment for them. `finalise_on_stop`
+                    // then flushes the end-of-stream to close that segment.
+                    drain_samples_through_vad(
+                        &mut streams.samples,
+                        &mut writer,
+                        &mut vad_opt,
+                        &mut acc,
+                        online_diarizer.as_ref(),
+                        "paused-stop drain",
+                    );
                     drain_meter(&mut streams.meter, &event_tx);
                     finalise_on_stop(
                         meta,
@@ -2165,18 +2182,55 @@ pub(crate) fn emit_segments_proportional(
 // Helpers (unchanged from Phase 1)
 // ---------------------------------------------------------------------------
 
+/// Drain every queued sample batch through the writer AND the VAD so the
+/// end-of-stream flush in `finalise_on_stop` can close an in-progress segment
+/// from the tail audio. Shared by both stop paths (Recording and Paused) so
+/// their drain semantics cannot diverge: batches accepted by the channel
+/// before a pause would otherwise be stranded (the paused loop blocks on
+/// cmd_rx and never reads `streams.samples`).
+#[allow(clippy::too_many_arguments)]
+fn drain_samples_through_vad(
+    samples_rx: &mut mpsc::Receiver<AudioFrameBatch>,
+    writer: &mut MeetingWriter,
+    vad_opt: &mut Option<VadChunker>,
+    acc: &mut Accumulator,
+    online_diarizer: Option<&Arc<OnlineDiarizer>>,
+    context: &str,
+) {
+    while let Ok(batch) = samples_rx.try_recv() {
+        push_batch(writer, &batch);
+        if let Some(ref mut vad) = vad_opt {
+            match vad.process_samples(&batch.samples, batch.start_ms) {
+                Ok(events) => {
+                    for ev in events {
+                        if let VadEvent::SegmentEnd {
+                            start_ms,
+                            end_ms,
+                            samples,
+                        } = ev
+                        {
+                            let label = live_segment_label(online_diarizer, &samples);
+                            acc.append(start_ms, end_ms, &samples, label);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "orchestrator",
+                        "VAD process_samples during {context}: {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn push_batch(writer: &mut MeetingWriter, batch: &AudioFrameBatch) {
     if let Err(e) = writer.push_samples(&batch.samples) {
         tracing::error!(
             target: "orchestrator",
             "push_samples failed: {e}"
         );
-    }
-}
-
-fn drain_samples(rx: &mut mpsc::Receiver<AudioFrameBatch>, writer: &mut MeetingWriter) {
-    while let Ok(b) = rx.try_recv() {
-        push_batch(writer, &b);
     }
 }
 

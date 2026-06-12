@@ -1226,6 +1226,16 @@ silence aligned with the pause-excluding timeline: a lost `WriterPause` would
 leave the encoder running, and a lost `WriterResume` would strand it in Paused
 with every subsequent `push_samples` failing.
 
+**Stop drains queued samples through the VAD.** Both stop branches of the runner
+loop (Recording-stop and paused-stop) drain every sample batch still queued in
+`streams.samples` through the persistent writer (`push_batch`) AND the VAD
+(`process_samples`) — via the shared `drain_samples_through_vad` helper, so the
+two branches cannot diverge — before calling `finalise_on_stop`, whose
+end-of-stream flush then closes any in-progress segment from the tail audio.
+The paused branch otherwise blocks on `cmd_rx` and never reads
+`streams.samples`, so batches accepted before the pause would be stranded and
+the recording's final utterance lost.
+
 **Phase 9 — `Orchestrator::transcribe_pcm_window(MeetingId, start_ms, end_ms,
 language) -> AppResult<Vec<Segment>>`.** Backs the `agent-tools`
 `relisten_section` tool. A **read-only** compute op — it does NOT rewrite

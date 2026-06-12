@@ -538,6 +538,45 @@ fn seconds_to_ms(seconds: f32) -> u64 {
     }
 }
 
+/// Re-overlay a prior diarization onto a freshly ASR-transcribed segment slice
+/// by maximum-overlap interval-join.
+///
+/// For each new segment, the prior segment whose interval covers the most of the
+/// new segment's time wins; its `speaker_id` is copied onto the new segment. New
+/// segments with zero overlap against any prior segment keep `speaker_id = None`.
+///
+/// The join is pure (no FFI, no I/O) and does not re-letter: the prior `speaker_id`
+/// strings ("A", "B", …) are carried forward verbatim, so `MeetingMeta.speaker_names`
+/// remains valid without any key remapping.
+///
+/// # Parameters
+///
+/// - `new_segments` — the freshly produced ASR segments (mutated in place).
+/// - `prior` — `(start_ms, end_ms, speaker_id)` triples extracted from the
+///   transcript that existed before the re-transcribe. An empty slice leaves all
+///   new segments as `None` without error.
+pub fn overlay_speakers_from_prior(
+    new_segments: &mut [Segment],
+    prior: &[(u64, u64, Option<String>)],
+) {
+    for seg in new_segments.iter_mut() {
+        let seg_start = seg.start_ms;
+        let seg_end = seg.end_ms;
+        // Find the prior segment with the maximum overlap against this new
+        // segment. Among equal overlaps the FIRST prior segment in slice order
+        // wins (strict `>` keeps the earliest maximum) — the same earliest-wins
+        // tie orientation as the offline join's `ranked_overlaps`.
+        let mut winner: Option<(u64, &Option<String>)> = None;
+        for (p_start, p_end, label) in prior {
+            let ov = interval_overlap_ms(seg_start, seg_end, *p_start, *p_end);
+            if ov > 0 && winner.map_or(true, |(best, _)| ov > best) {
+                winner = Some((ov, label));
+            }
+        }
+        seg.speaker_id = winner.and_then(|(_, label)| label.clone());
+    }
+}
+
 /// `0 → "A"`, `1 → "B"`, …, `25 → "Z"`, `26 → "AA"`, `27 → "AB"`, …
 /// (FR-12 anonymous-label convention; mirrors the Spike-4 relabeller).
 ///
@@ -918,5 +957,90 @@ mod tests {
         }
         let count = overlay_speakers(&turns, &mut segs, &DiarizerConfig::default());
         assert_eq!(count, 1, "default prune collapses the tiny-cluster scatter");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for overlay_speakers_from_prior
+    // -----------------------------------------------------------------------
+
+    fn prior(start_ms: u64, end_ms: u64, label: &str) -> (u64, u64, Option<String>) {
+        (start_ms, end_ms, Some(label.to_string()))
+    }
+    fn prior_none(start_ms: u64, end_ms: u64) -> (u64, u64, Option<String>) {
+        (start_ms, end_ms, None)
+    }
+
+    /// A new segment that fully overlaps a prior "A" segment gets "A".
+    #[test]
+    fn from_prior_full_overlap() {
+        let prior_segs = vec![prior(0, 3000, "A")];
+        let mut new_segs = vec![seg(0, 3000)];
+        overlay_speakers_from_prior(&mut new_segs, &prior_segs);
+        assert_eq!(new_segs[0].speaker_id.as_deref(), Some("A"));
+    }
+
+    /// A new segment that partially overlaps two prior segments gets the one with
+    /// greater overlap.
+    #[test]
+    fn from_prior_max_overlap_wins() {
+        // Prior: A [0, 2000), B [2000, 5000)
+        // New: [1500, 4000) — 500 ms overlap with A, 2000 ms overlap with B → B wins.
+        let prior_segs = vec![prior(0, 2000, "A"), prior(2000, 5000, "B")];
+        let mut new_segs = vec![seg(1500, 4000)];
+        overlay_speakers_from_prior(&mut new_segs, &prior_segs);
+        assert_eq!(new_segs[0].speaker_id.as_deref(), Some("B"));
+    }
+
+    /// On an exact overlap tie, the earliest prior segment in slice order wins
+    /// (the documented orientation, matching the offline join).
+    #[test]
+    fn from_prior_tie_earliest_wins() {
+        // Prior: A [0, 1000), B [1000, 2000)
+        // New: [500, 1500) — 500 ms overlap with each → A (earlier) wins.
+        let prior_segs = vec![prior(0, 1000, "A"), prior(1000, 2000, "B")];
+        let mut new_segs = vec![seg(500, 1500)];
+        overlay_speakers_from_prior(&mut new_segs, &prior_segs);
+        assert_eq!(new_segs[0].speaker_id.as_deref(), Some("A"));
+    }
+
+    /// A new segment in a gap between prior segments (no overlap) stays None.
+    #[test]
+    fn from_prior_gap_stays_none() {
+        // Prior: A [0, 1000), B [2000, 3000) — gap at [1000, 2000).
+        let prior_segs = vec![prior(0, 1000, "A"), prior(2000, 3000, "B")];
+        let mut new_segs = vec![seg(1100, 1900)];
+        overlay_speakers_from_prior(&mut new_segs, &prior_segs);
+        assert_eq!(new_segs[0].speaker_id, None, "no prior overlap → None");
+    }
+
+    /// Labels from prior segments are preserved verbatim (no re-lettering).
+    #[test]
+    fn from_prior_label_survival() {
+        let prior_segs = vec![prior(0, 1000, "A"), prior(1000, 2000, "B")];
+        let mut new_segs = vec![seg(0, 1000), seg(1000, 2000)];
+        overlay_speakers_from_prior(&mut new_segs, &prior_segs);
+        assert_eq!(new_segs[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(new_segs[1].speaker_id.as_deref(), Some("B"));
+    }
+
+    /// An empty prior list leaves all new segments as None.
+    #[test]
+    fn from_prior_empty_old_list() {
+        let mut new_segs = vec![seg(0, 1000), seg(1000, 2000)];
+        overlay_speakers_from_prior(&mut new_segs, &[]);
+        assert!(
+            new_segs.iter().all(|s| s.speaker_id.is_none()),
+            "empty prior → all None"
+        );
+    }
+
+    /// A prior segment that itself had None (meeting was never diarized) leaves
+    /// new segments as None.
+    #[test]
+    fn from_prior_prior_was_none() {
+        let prior_segs = vec![prior_none(0, 3000)];
+        let mut new_segs = vec![seg(0, 3000)];
+        overlay_speakers_from_prior(&mut new_segs, &prior_segs);
+        assert_eq!(new_segs[0].speaker_id, None);
     }
 }

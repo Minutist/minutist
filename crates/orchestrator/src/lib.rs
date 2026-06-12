@@ -911,15 +911,25 @@ impl Orchestrator {
         )
     }
 
-    /// Rewrite `transcript.json` from the refreshed `segments` and refresh the
-    /// supplied index row so the meeting-list excerpt reflects the new first
-    /// segment.
+    /// Rewrite `transcript.json` from the refreshed `segments`, carry forward
+    /// any prior diarization via a time-overlap join so speaker names remain
+    /// valid, and refresh the supplied index row so the meeting-list excerpt
+    /// reflects the new first segment.
     ///
     /// Shared by the production [`Self::re_transcribe`] and the test-only
     /// `re_transcribe_with_backend`: both produce a `Vec<Segment>` via the same
     /// `runner::re_transcribe_buffer` machinery, then persist + index it
     /// identically. The blocking `std::fs` writes run on `spawn_blocking`; the
     /// async index `upsert` is awaited (never `block_on`).
+    ///
+    /// Before writing, the function reads the OLD `transcript.json` (if any) and
+    /// calls [`diarizer::overlay_speakers_from_prior`] to assign each new segment
+    /// the `speaker_id` of the prior segment that covers the majority of its time.
+    /// New segments with no prior overlap keep `speaker_id = None`. Because the
+    /// prior label strings ("A", "B", …) are carried verbatim, any user-set
+    /// `speaker_names` in metadata remain keyed correctly. A meeting that was never
+    /// diarized (all prior `speaker_id = None`) leaves the new transcript as `None`
+    /// with no regression.
     async fn finalise_retranscribe(
         &self,
         index: &MeetingIndex,
@@ -927,21 +937,50 @@ impl Orchestrator {
         meeting_dir: &std::path::Path,
         segments: Vec<Segment>,
     ) -> AppResult<()> {
-        // Rewrite transcript.json from the refreshed segments (blocking fs).
+        // Read the existing transcript (prior diarization) and apply its labels
+        // onto the new segments before writing. All done in one blocking task to
+        // avoid two round-trips.
         let meeting_dir_for_write = meeting_dir.to_path_buf();
-        let segments_for_write = segments.clone();
-        tokio::task::spawn_blocking(move || -> AppResult<()> {
-            persistence::write_transcript(&meeting_dir_for_write, &segments_for_write)
+        let (segments_written, speaker_count) = tokio::task::spawn_blocking(move || -> AppResult<(Vec<Segment>, u32)> {
+            // Build the prior (start_ms, end_ms, speaker_id) triples from the
+            // existing transcript.json, if present. Missing or unreadable transcript
+            // is treated as an empty prior (first-ever transcription).
+            let prior_triples: Vec<(u64, u64, Option<String>)> = persistence::read_transcript(&meeting_dir_for_write)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.start_ms, s.end_ms, s.speaker_id))
+                .collect();
+
+            let mut new_segments = segments;
+            diarizer::overlay_speakers_from_prior(&mut new_segments, &prior_triples);
+
+            // Count the distinct non-None labels now present in the new transcript.
+            let mut seen_labels: Vec<String> = Vec::new();
+            for seg in &new_segments {
+                if let Some(ref label) = seg.speaker_id {
+                    if !seen_labels.contains(label) {
+                        seen_labels.push(label.clone());
+                    }
+                }
+            }
+            let speaker_count = seen_labels.len() as u32;
+
+            persistence::write_transcript(&meeting_dir_for_write, &new_segments)?;
+            Ok((new_segments, speaker_count))
         })
         .await
         .map_err(|e| AppError::Internal {
             context: format!("re_transcribe transcript write join failed: {e}"),
         })??;
 
-        // Refresh the index row so the list excerpt reflects the new transcript.
+        // Update metadata.speaker_count to reflect the distinct labels in the new
+        // transcript (may differ from before if ASR boundary changes moved some
+        // segments off their prior speaker).
         let meeting_dir_for_meta = meeting_dir.to_path_buf();
         let entry: MeetingListEntry = tokio::task::spawn_blocking(move || -> AppResult<MeetingListEntry> {
-            let meta = persistence::read_metadata(&meeting_dir_for_meta)?;
+            let mut meta = persistence::read_metadata(&meeting_dir_for_meta)?;
+            meta.speaker_count = speaker_count;
+            persistence::write_metadata(&meeting_dir_for_meta, &meta)?;
             let transcript = persistence::read_transcript(&meeting_dir_for_meta)?;
             Ok(MeetingListEntry {
                 id: meta.uuid,
@@ -969,7 +1008,7 @@ impl Orchestrator {
         tracing::info!(
             target: "orchestrator",
             meeting_id = %meeting_id.0,
-            segments = segments.len(),
+            segments = segments_written.len(),
             "re_transcribe completed"
         );
 

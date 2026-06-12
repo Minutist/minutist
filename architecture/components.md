@@ -531,10 +531,20 @@ mapped to `Error::ModelLoad`/`Error::Inference` →
 arrives transitively via `sherpa-rs`; no separate `eyre` dep). `sherpa-rs =
 { workspace = true }` is added to `crates/diarizer/Cargo.toml`; `hound` and
 `persistence` (test-only, the over-split eval's audio/transcript decode) are
-dev-dependencies. Tests: the default suite covers `overlay_speakers`
+dev-dependencies. A second pure public function
+`overlay_speakers_from_prior(&mut [Segment], &[(u64, u64, Option<String>)])` carries
+the prior diarization onto a freshly ASR-transcribed segment slice by
+max-overlap interval-join: for each new segment the prior segment with the
+greatest time overlap wins and its `speaker_id` string is copied verbatim
+(no re-lettering), so `MeetingMeta.speaker_names` stays keyed correctly after
+a re-transcribe. New segments with no prior overlap keep `None`. The
+orchestrator's `finalise_retranscribe` calls this before writing the new
+`transcript.json`. Tests: the default suite covers `overlay_speakers`
 (interval-join, no-overlap=None, tie-break, first-seen relabel, stale-label
 clearing) AND the prune/cap (tiny-share drop + reassign, genuine-speaker keep,
-segment-count floor, cap-to-largest, never-zero fallback) with no model; the
+segment-count floor, cap-to-largest, never-zero fallback) AND
+`overlay_speakers_from_prior` (full-overlap, max-overlap-wins, gap→None,
+label-survival, empty-prior, prior-was-None) with no model; the
 env-var-gated `tests/accuracy.rs` (`MINUTIST_DIARIZE_SEG_PATH` +
 `MINUTIST_DIARIZE_EMB_PATH`, skip-on-unset) runs `assign_speakers` over
 committed fixtures (`tests/fixtures/two_speakers_synth.wav` = two distinct
@@ -1031,11 +1041,17 @@ Differences from the live path: no flush queue / ASR-worker
 thread — the work runs synchronously on one `spawn_blocking` thread, one
 accumulator flush at a time, so segments can be collected in order. As segments
 are produced it emits `AppEvent::TranscriptSegment` (the same event the live path
-emits), rewrites `transcript.json` via `persistence::write_transcript` (atomic
-tmp+rename; an empty result removes the file), and refreshes the index row
-(`MeetingIndex::upsert`) so the meeting-list excerpt reflects the new first
-segment, then emits `AppEvent::TranscriptReady { meeting_id }` so the webview
-re-reads the transcript (mirroring `DiarizationComplete`). The ASR run is wrapped
+emits), then `finalise_retranscribe` **carries the prior diarization onto the new
+segments** via `diarizer::overlay_speakers_from_prior` (time-overlap join against
+the old `transcript.json`; see `diarizer` section) so `MeetingMeta.speaker_names`
+stays valid without any key remapping — a meeting that was never diarized leaves
+all new segments as `None` with no regression. `metadata.json`'s `speaker_count`
+is updated to reflect the distinct labels in the new transcript. Then rewrites
+`transcript.json` via `persistence::write_transcript` (atomic tmp+rename; an empty
+result removes the file), and refreshes the index row (`MeetingIndex::upsert`) so
+the meeting-list excerpt reflects the new first segment, then emits
+`AppEvent::TranscriptReady { meeting_id }` so the webview re-reads the transcript
+(mirroring `DiarizationComplete`). The ASR run is wrapped
 in a length-relative timeout (`retranscribe_timeout`: ≈3× real-time, floored 5
 min / capped 30 min — generous, since ASR is slower than diarization), so a
 wedged run cannot hold the offline claim forever. Unlike the live path's

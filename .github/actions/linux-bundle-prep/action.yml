@@ -1,0 +1,55 @@
+# linux-bundle-prep — shared Linux AppImage bundling prerequisites.
+#
+# Used by both build.yml and release.yml so the steps that make linuxdeploy
+# EMBED the sherpa-onnx / onnxruntime shared libraries in the AppImage cannot
+# drift between the two workflows. Without these steps the bundled AppImage's
+# loader cannot resolve libsherpa-onnx-c-api.so and fails to start on a clean
+# machine.
+#
+# This action must run AFTER the Rust toolchain + system deps are installed and
+# BEFORE the tauri-action bundle step. It writes APPIMAGE_EXTRACT_AND_RUN and
+# LD_LIBRARY_PATH into $GITHUB_ENV so the following tauri-action step inherits
+# them. The caller is responsible for gating the whole action on Linux
+# (`if: runner.os == 'Linux'`); the steps themselves do not re-check the OS.
+name: Linux bundle prep
+description: Warm the sherpa/onnxruntime caches and export the loader path so linuxdeploy embeds them in the AppImage.
+
+inputs:
+  features:
+    description: Cargo feature flag selecting the GPU backend (e.g. vulkan).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # linuxdeploy is distributed as an AppImage and requires FUSE to mount
+    # itself. GitHub Actions Ubuntu runners do not expose /dev/fuse, so the
+    # AppImage cannot self-mount. APPIMAGE_EXTRACT_AND_RUN=1 makes linuxdeploy
+    # extract its squashfs to a temp dir and run from there instead, bypassing
+    # the FUSE requirement.
+    - name: Set APPIMAGE_EXTRACT_AND_RUN
+      shell: bash
+      run: echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+
+    # Pre-build so the sherpa/onnxruntime libraries are downloaded into their
+    # caches BEFORE the lib-path export below globs for them — on a cold
+    # cache the download happens mid-build, after a too-early export step
+    # has already no-opped. The tauri-action build is incremental on top.
+    - name: Pre-build
+      shell: bash
+      run: cargo build --release --features ${{ inputs.features }} --locked
+
+    # linuxdeploy resolves the binary's dynamic dependencies while bundling;
+    # the sherpa-onnx / onnxruntime shared libraries live in the build-time
+    # download caches, not on the default loader path. Exporting them lets
+    # linuxdeploy find AND EMBED them in the AppImage (required for the
+    # artifact to run on user machines).
+    - name: Export sherpa-rs lib path
+      shell: bash
+      run: |
+        for d in ~/.cache/sherpa-rs/x86_64-unknown-linux-gnu/*/*/lib ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib; do
+          if [ -d "$d" ]; then
+            echo "LD_LIBRARY_PATH=${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+            export LD_LIBRARY_PATH="${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          fi
+        done

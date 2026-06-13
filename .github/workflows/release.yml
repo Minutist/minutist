@@ -137,6 +137,18 @@ jobs:
           set_if_nonempty APPLE_PASSWORD                    "${{ secrets.APPLE_PASSWORD }}"
           set_if_nonempty APPLE_TEAM_ID                     "${{ secrets.APPLE_TEAM_ID }}"
 
+      # Warm the sherpa/onnxruntime caches and export the loader path so
+      # linuxdeploy embeds those libs in the published AppImage. Without this the
+      # downloaded artefact's loader cannot resolve libsherpa-onnx-c-api.so and
+      # fails to start on a clean machine. Shared with build.yml via the
+      # composite action so the two workflows cannot drift; see
+      # .github/actions/linux-bundle-prep/action.yml.
+      - name: Linux bundle prep
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-bundle-prep
+        with:
+          features: ${{ matrix.features }}
+
       # Build + sign + bundle, then create/attach to the GitHub Release named
       # after the pushed tag. includeUpdaterJson:true emits latest.json so
       # tauri-plugin-updater clients can pull this release. Signing vars are

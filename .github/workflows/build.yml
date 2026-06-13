@@ -256,45 +256,21 @@ jobs:
           set_if_nonempty APPLE_PASSWORD                    "${{ secrets.APPLE_PASSWORD }}"
           set_if_nonempty APPLE_TEAM_ID                     "${{ secrets.APPLE_TEAM_ID }}"
 
-      # linuxdeploy is distributed as an AppImage and requires FUSE to mount
-      # itself. GitHub Actions Ubuntu runners do not expose /dev/fuse, so the
-      # AppImage cannot self-mount. APPIMAGE_EXTRACT_AND_RUN=1 makes linuxdeploy
-      # extract its squashfs to a temp dir and run from there instead, bypassing
-      # the FUSE requirement. Set it unconditionally: on macOS/Windows this var
-      # is inert; it is only read by the AppImage runtime on Linux.
-      - name: Set APPIMAGE_EXTRACT_AND_RUN (Linux)
+      # Warm the sherpa/onnxruntime caches and export the loader path so
+      # linuxdeploy embeds those libs in the AppImage. Shared with release.yml
+      # via the composite action so the two workflows cannot drift; see
+      # .github/actions/linux-bundle-prep/action.yml.
+      - name: Linux bundle prep
         if: runner.os == 'Linux'
-        run: echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+        uses: ./.github/actions/linux-bundle-prep
+        with:
+          features: ${{ matrix.features }}
 
       # tauri-action runs the configured beforeBuildCommand (npm run build) and
       # bundles the app. `--features <gpu>` selects the single per-platform GPU
       # backend. Signing vars are set in the "Prepare signing env" step above
       # only when the corresponding secrets are populated, so the build completes
       # unsigned (and logs "unsigned bundle") when secrets are absent.
-      # Pre-build so the sherpa/onnxruntime libraries are downloaded into their
-      # caches BEFORE the lib-path export below globs for them — on a cold
-      # cache the download happens mid-build, after a too-early export step
-      # has already no-opped. The tauri-action build is incremental on top.
-      - name: Pre-build (Linux)
-        if: runner.os == 'Linux'
-        run: cargo build --release --features ${{ matrix.features }} --locked
-
-      # linuxdeploy resolves the binary's dynamic dependencies while bundling;
-      # the sherpa-onnx / onnxruntime shared libraries live in the build-time
-      # download caches, not on the default loader path. Exporting them lets
-      # linuxdeploy find AND EMBED them in the AppImage (required for the
-      # artifact to run on user machines).
-      - name: Export sherpa-rs lib path (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          for d in ~/.cache/sherpa-rs/x86_64-unknown-linux-gnu/*/*/lib ~/.cache/ort.pyke.io/dfbin/x86_64-unknown-linux-gnu/*/onnxruntime/lib; do
-            if [ -d "$d" ]; then
-              echo "LD_LIBRARY_PATH=${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-              export LD_LIBRARY_PATH="${d}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-            fi
-          done
-
       - name: Build release bundle
         uses: tauri-apps/tauri-action@v0
         with:
@@ -303,7 +279,8 @@ jobs:
 
       # Collect every bundle tauri-action produced for this OS. The bundle
       # output lives under the workspace target dir; glob broadly so we capture
-      # .deb/.AppImage/.rpm (Linux), .msi/.exe (Windows), .app/.dmg (macOS).
+      # .AppImage (Linux — the sole Linux target), .msi/.exe (Windows),
+      # .app/.dmg (macOS).
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
@@ -311,9 +288,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           path: |
-            target/release/bundle/**/*.deb
             target/release/bundle/**/*.AppImage
-            target/release/bundle/**/*.rpm
             target/release/bundle/**/*.msi
             target/release/bundle/**/*.exe
             target/release/bundle/**/*.dmg
@@ -449,6 +424,4 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           path: |
-            target/release/bundle/**/*.deb
             target/release/bundle/**/*.AppImage
-            target/release/bundle/**/*.rpm

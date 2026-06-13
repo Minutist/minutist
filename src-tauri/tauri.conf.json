@@ -32,7 +32,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["appimage", "nsis", "msi", "app", "dmg"],
     "createUpdaterArtifacts": false,
     "icon": [
       "icons/16x16.png",
@@ -58,16 +58,6 @@
         "installerIcon": "icons/icon.ico",
         "uninstallerIcon": "icons/icon.ico",
         "installMode": "currentUser"
-      }
-    },
-    "linux": {
-      "deb": {
-        "section": "utils",
-        "depends": [
-          "libwebkit2gtk-4.1-0",
-          "libgtk-3-0",
-          "libayatana-appindicator3-1"
-        ]
       }
     },
     "macOS": {

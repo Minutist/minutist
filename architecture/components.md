@@ -946,7 +946,11 @@ on `common`.
   `set_speaker_name(root, id, label, name) -> AppResult<speaker_names map>`
   is the third op: a read-modify-write of `metadata.json`'s `speaker_names`
   (empty `name` clears the entry). It touches no index row (speaker names are
-  not indexed), so unlike rename there is nothing to reconcile.
+  not indexed), so unlike rename there is nothing to reconcile. Privacy
+  invariant (#0014 audit): these ops log the meeting id (and the diarizer
+  `label`), never the `new_title` or speaker `name` — both are user content that
+  must not reach a log line (and thus the crash file / report excerpt, which
+  capture info+ log lines).
 - **Summary hook (`summary` module + `MeetingFolder::summary_path()`).**
   `write_summary(meeting_dir, &str)` (atomic tmp+rename) and
   `read_summary(meeting_dir) -> AppResult<Option<String>>` for `summary.md`.

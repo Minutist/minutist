@@ -45,10 +45,13 @@ pub async fn rename_meeting(
     let entry = list_entry_from(&folder)?;
     index.upsert(&entry).await?;
 
+    // Do NOT log `new_title` — a meeting title is user content (issue #0014
+    // privacy audit). The meeting id identifies the row for diagnostics; the
+    // title must never reach a log line (and thus the crash-file / report
+    // excerpt, which capture info+ log lines).
     tracing::info!(
         target: "persistence",
         meeting_id = %id.0,
-        new_title,
         "meeting renamed"
     );
 

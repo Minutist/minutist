@@ -247,9 +247,18 @@ fn read_node<T: ReadTxn>(txn: &T, node: &XmlOut, out: &mut Vec<Value>) {
 }
 
 /// Convert a text run's formatting attributes back into ProseMirror `marks`.
+///
+/// yrs stores a text run's formatting in an [`Attrs`] (a `HashMap`), whose
+/// iteration order is non-deterministic. Emit the marks sorted by type so the
+/// derived `notes.json` is stable across re-derives — a run with several marks
+/// (e.g. bold + italic) must not reorder on disk on every save. ProseMirror
+/// re-normalises mark order on import, so canonicalising to sorted order here is
+/// lossless for the editor and removes the on-disk churn.
 fn format_to_marks(format: &Attrs) -> Vec<Value> {
+    let mut entries: Vec<_> = format.iter().collect();
+    entries.sort_by(|a, b| a.0.as_ref().cmp(b.0.as_ref()));
     let mut marks = Vec::new();
-    for (key, value) in format.iter() {
+    for (key, value) in entries {
         let mut mark = Map::new();
         mark.insert("type".to_string(), Value::String(key.to_string()));
         let mark_attrs = any_to_json(value);
@@ -334,4 +343,218 @@ fn is_text_node(node: &Value) -> bool {
 
 fn node_type(node: &Value) -> &str {
     node.get("type").and_then(|t| t.as_str()).unwrap_or("")
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `JSON → yrs doc → re-derived JSON` for one document. The CRDT analogue
+    /// of the `NotesStore` opacity test.
+    fn round_trip(input: &Value) -> Value {
+        let doc = json_to_ydoc(input);
+        ydoc_to_json(&doc)
+    }
+
+    /// Assert a document survives `JSON → yrs → JSON` unchanged, and also
+    /// survives the durable v2 encode/decode hop (so the on-disk blob is faithful).
+    fn assert_round_trips(input: Value) {
+        assert_eq!(round_trip(&input), input, "JSON -> yrs -> JSON must be lossless");
+
+        // Encode to the durable blob, decode, re-derive — the on-disk path.
+        let doc = json_to_ydoc(&input);
+        let bytes = encode_ydoc(&doc);
+        let decoded = decode_ydoc(&bytes).expect("decode v2 blob");
+        assert_eq!(
+            ydoc_to_json(&decoded),
+            input,
+            "JSON -> yrs -> v2 blob -> yrs -> JSON must be lossless"
+        );
+    }
+
+    /// The full Tiptap editor schema in one document: StarterKit blocks +
+    /// marks, Link (a mark with attrs), lists, blockquote, code block, headings,
+    /// the ParagraphAnchor `data-anchor-ms` attr, the TranscriptChip atom, the
+    /// NoteImage node, and a Table with header/row/cell. The CRDT round-trip
+    /// must preserve all of it, including the custom node types (the analogue of
+    /// the opacity guarantee).
+    fn full_schema_doc() -> Value {
+        json!({
+            "type": "doc",
+            "content": [
+                { "type": "heading", "attrs": { "level": 1 },
+                  "content": [{ "type": "text", "text": "Heading one" }] },
+                // ParagraphAnchor: the data-anchor-ms paragraph attr, plus marks.
+                { "type": "paragraph", "attrs": { "data-anchor-ms": 12345 },
+                  "content": [
+                    { "type": "text", "text": "plain " },
+                    { "type": "text", "marks": [{ "type": "bold" }], "text": "bold" },
+                    { "type": "text", "text": " " },
+                    { "type": "text", "marks": [{ "type": "italic" }], "text": "italic" },
+                    { "type": "text",
+                      "marks": [{ "type": "bold" }, { "type": "italic" }],
+                      "text": "both" },
+                    { "type": "text", "text": " " },
+                    { "type": "text",
+                      "marks": [{ "type": "code" }], "text": "inline code" },
+                    { "type": "text", "text": " see " },
+                    { "type": "text",
+                      "marks": [{ "type": "link",
+                                  "attrs": { "href": "https://example.test",
+                                             "target": "_blank",
+                                             "rel": "noopener" } }],
+                      "text": "this link" }
+                  ] },
+                // Empty paragraph (no content key).
+                { "type": "paragraph" },
+                { "type": "bulletList", "content": [
+                    { "type": "listItem", "content": [
+                        { "type": "paragraph",
+                          "content": [{ "type": "text", "text": "bullet one" }] } ] },
+                    { "type": "listItem", "content": [
+                        { "type": "paragraph",
+                          "content": [{ "type": "text", "text": "bullet two" }] } ] }
+                ] },
+                { "type": "orderedList", "attrs": { "start": 1 }, "content": [
+                    { "type": "listItem", "content": [
+                        { "type": "paragraph",
+                          "content": [{ "type": "text", "text": "first" }] } ] }
+                ] },
+                { "type": "blockquote", "content": [
+                    { "type": "paragraph",
+                      "content": [{ "type": "text", "text": "quoted" }] } ] },
+                { "type": "codeBlock", "attrs": { "language": "rust" },
+                  "content": [{ "type": "text", "text": "fn main() {}" }] },
+                // TranscriptChip: an atom/leaf block node with rich custom attrs.
+                { "type": "transcriptChip",
+                  "attrs": { "segmentStartMs": 42000, "segmentEndMs": 45500,
+                             "speakerId": "A", "text": "spoken words",
+                             "nested": { "arr": [1, 2, 3], "flag": true, "none": null } } },
+                // NoteImage: references a content-hash asset by bare filename.
+                { "type": "noteImage",
+                  "attrs": { "src": "deadbeef.png", "alt": "a diagram", "title": null } },
+                // Table with a header row and a body row.
+                { "type": "table", "content": [
+                    { "type": "tableRow", "content": [
+                        { "type": "tableHeader",
+                          "attrs": { "colspan": 1, "rowspan": 1, "colwidth": null },
+                          "content": [{ "type": "paragraph",
+                            "content": [{ "type": "text", "text": "Name" }] }] },
+                        { "type": "tableHeader",
+                          "attrs": { "colspan": 1, "rowspan": 1, "colwidth": null },
+                          "content": [{ "type": "paragraph",
+                            "content": [{ "type": "text", "text": "Value" }] }] }
+                    ] },
+                    { "type": "tableRow", "content": [
+                        { "type": "tableCell",
+                          "attrs": { "colspan": 1, "rowspan": 1, "colwidth": null },
+                          "content": [{ "type": "paragraph",
+                            "content": [{ "type": "text", "text": "alpha" }] }] },
+                        { "type": "tableCell",
+                          "attrs": { "colspan": 2, "rowspan": 1, "colwidth": null },
+                          "content": [{ "type": "paragraph",
+                            "content": [{ "type": "text", "text": "beta" }] }] }
+                    ] }
+                ] }
+            ]
+        })
+    }
+
+    #[test]
+    fn full_editor_schema_round_trips_through_yrs() {
+        assert_round_trips(full_schema_doc());
+    }
+
+    #[test]
+    fn transcript_chip_atom_round_trips() {
+        assert_round_trips(json!({
+            "type": "doc",
+            "content": [
+                { "type": "transcriptChip",
+                  "attrs": { "segmentStartMs": 1000, "segmentEndMs": 2000,
+                             "speakerId": "B", "text": "hi" } }
+            ]
+        }));
+    }
+
+    #[test]
+    fn note_image_round_trips() {
+        assert_round_trips(json!({
+            "type": "doc",
+            "content": [
+                { "type": "noteImage",
+                  "attrs": { "src": "abc123.jpg", "alt": "x", "width": 640 } }
+            ]
+        }));
+    }
+
+    #[test]
+    fn paragraph_anchor_attr_round_trips() {
+        assert_round_trips(json!({
+            "type": "doc",
+            "content": [
+                { "type": "paragraph", "attrs": { "data-anchor-ms": 98765 },
+                  "content": [{ "type": "text", "text": "anchored" }] }
+            ]
+        }));
+    }
+
+    #[test]
+    fn table_round_trips() {
+        assert_round_trips(json!({
+            "type": "doc",
+            "content": [
+                { "type": "table", "content": [
+                    { "type": "tableRow", "content": [
+                        { "type": "tableHeader",
+                          "attrs": { "colspan": 1, "rowspan": 1, "colwidth": null },
+                          "content": [{ "type": "paragraph",
+                            "content": [{ "type": "text", "text": "h" }] }] },
+                        { "type": "tableCell",
+                          "attrs": { "colspan": 1, "rowspan": 1, "colwidth": null },
+                          "content": [{ "type": "paragraph",
+                            "content": [{ "type": "text", "text": "c" }] }] }
+                    ] }
+                ] }
+            ]
+        }));
+    }
+
+    #[test]
+    fn overlapping_and_adjacent_marks_round_trip() {
+        // Adjacent runs with distinct marks must stay distinct; a run that
+        // shares marks with its neighbour is one ProseMirror text node, exactly
+        // as ProseMirror itself normalises.
+        assert_round_trips(json!({
+            "type": "doc",
+            "content": [
+                { "type": "paragraph", "content": [
+                    { "type": "text", "marks": [{ "type": "bold" }], "text": "A" },
+                    { "type": "text", "marks": [{ "type": "italic" }], "text": "B" },
+                    { "type": "text",
+                      "marks": [{ "type": "link",
+                                  "attrs": { "href": "http://x" } }], "text": "C" }
+                ] }
+            ]
+        }));
+    }
+
+    #[test]
+    fn empty_document_round_trips() {
+        // An empty doc (no content) yields an empty fragment and the canonical
+        // `{ "type": "doc", "content": [] }` shape.
+        let out = round_trip(&json!({ "type": "doc" }));
+        assert_eq!(out, json!({ "type": "doc", "content": [] }));
+    }
+
+    #[test]
+    fn decode_rejects_garbage_blob() {
+        // A non-v2 blob must error, not panic.
+        assert!(decode_ydoc(&[0xff, 0x00, 0x13, 0x37]).is_err());
+    }
 }

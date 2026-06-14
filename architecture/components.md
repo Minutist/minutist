@@ -867,6 +867,12 @@ is the **authoritative** notes document; `notes.json` and `notes.md` are
   a derived projection rather than a verbatim store, it is normalised to valid
   ProseMirror shape — custom node *types and attributes* are preserved, which is
   exactly what the transcript-chip guarantee requires.
+- A round-trip test suite covers `JSON → yrs → JSON` (and the durable
+  `JSON → yrs → v2 blob → yrs → JSON` hop) over the full editor schema —
+  StarterKit blocks + marks, Link, lists, blockquote, code block, headings, the
+  ParagraphAnchor `data-anchor-ms` attr, the TranscriptChip atom, NoteImage, and
+  Table(+row/header/cell). It is the CRDT analogue of the `NotesStore` opacity
+  test.
 
 **Note image assets (`assets` module).** Images pasted/dropped into the notes
 editor are stored as **separate files** under `{root}/{meeting_id}/assets/`,

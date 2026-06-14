@@ -4,6 +4,7 @@ import { MainWindow } from "./shell/MainWindow";
 import { Onboarding } from "./shell/Onboarding";
 import { useRecordingStore } from "./state/recording";
 import { useModelsStore } from "./state/models";
+import { useReportProblemStore } from "./state/report-problem";
 import {
   isOnboardingResolved,
   readOnboardingCompleted,
@@ -32,11 +33,33 @@ export function App() {
   const settings = useRecordingStore((s) => s.settings);
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const refreshModels = useModelsStore((s) => s.refreshModels);
+  const captureWebviewError = useReportProblemStore((s) => s.captureWebviewError);
 
   useEffect(() => {
     void refreshSettings();
     void refreshModels();
   }, [refreshSettings, refreshModels]);
+
+  // Webview unhandled-error path (#0014): surface an uncaught error / promise
+  // rejection in the main-window error pane (which offers "Report a problem"),
+  // feeding the same report flow as a backend error. Mounted once at the root.
+  useEffect(() => {
+    const onError = (e: ErrorEvent) => {
+      captureWebviewError(e.message || String(e.error));
+    };
+    const onRejection = (e: PromiseRejectionEvent) => {
+      const reason = e.reason;
+      captureWebviewError(
+        reason instanceof Error ? reason.message : String(reason),
+      );
+    };
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
+  }, [captureWebviewError]);
 
   // Reflect the persisted colour-scheme preference onto the document root so
   // the `theme.css` `:root[data-theme="dark"]` overrides apply. `"dark"` /

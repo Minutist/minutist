@@ -2062,6 +2062,24 @@ plumbing.
 daily, 7-day retention via startup cleanup. Console layer in debug builds
 only. `RUST_LOG`-style filtering via `EnvFilter::from_default_env()`.
 
+**Crash capture (issue #0014).** `src-tauri/src/crash.rs` adds a `tracing`
+ring-buffer layer (last 200 log lines in a process-wide static) to the
+subscriber and installs a `std::panic::set_hook` that writes a REDACTED
+`last-crash.txt` to the logs dir on a panic (version, platform, configured GPU
+mode, panic message + location, backtrace, recent ring lines). Every line is
+passed through `crash::redact` (meeting-id-UUID strip). See `cross-cutting.md` —
+"Logging". `IpcState` is populated with `logs_dir` / `app_version` / `platform`
+so `ipc-bridge::get_diagnostic_report` can read the crash file + log tail.
+
+**Browser-open plugin (`tauri-plugin-opener`, #0014).** Registered on the Tauri
+builder so the webview's "Report a problem" flow can open the user's default
+browser at the pre-filled GitHub issue URL (`opener:allow-open-url` granted in
+`capabilities/default.json`). It is an external Tauri plugin (like
+`tauri-plugin-fs` / `-store` / `-updater`), not a workspace crate, so it adds no
+row to the workspace dependency table. Not an app network operation — the OS
+browser makes any request, at the user's click; the D4 no-telemetry claim is
+untouched.
+
 **Tray menu:** "Open minutist" (show/focus main window) + "Quit"
 (`app.exit(0)`). Left-click on the tray icon shows the main window.
 Window close intercepts `CloseRequested` and hides rather than exits.
@@ -2216,6 +2234,19 @@ left, transcript right).
   (`buildClipboardReport`). `redactMeetingPaths` is the defensive boundary pass
   for meeting-id UUIDs. Log-excerpt redaction proper is owned by the Rust side
   that assembles the report.
+- **Report-problem flow (`ui/src/diagnostics/reportProblem.ts` +
+  `ui/src/state/report-problem.ts`, #0014 part 2).** `reportProblem` ties the
+  pieces together: it calls `get_diagnostic_report`, maps the snake_case binding
+  onto the camelCase `issueReport.ts` shape (`fromBinding`), builds the URL, and
+  opens the browser via `tauri-plugin-opener`; on an elided URL it writes the
+  full report to the clipboard first. `useReportProblemStore` is the shared
+  surface seam (in-flight flag + status line) used by the About dialog row and
+  the main-window error pane (each error pane carries a "Report a problem"
+  button). The store also holds `webviewError`: a window-level
+  `error` / `unhandledrejection` handler mounted in `App` records the latest
+  uncaught webview error into it, so a frontend crash surfaces in the same error
+  pane and feeds the same report flow. No telemetry — the user submits from their
+  own browser.
 - **`MainWindow` (`ui/src/shell/`)** is a resizable, show/hide multi-column
   layout via `react-resizable-panels` (FR-21/FR-30): up to three columns —
   notes editor (primary), transcript, and the summary reading column. A

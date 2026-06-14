@@ -4,6 +4,7 @@ import { Group, Panel, Separator } from "react-resizable-panels";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
+import { useReportProblemStore } from "../state/report-problem";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
@@ -75,6 +76,11 @@ export function MainWindow() {
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const prewarmAsr = useRecordingStore((s) => s.prewarmAsr);
   const lastError = useRecordingStore((s) => s.lastError);
+  const report = useReportProblemStore((s) => s.report);
+  const reporting = useReportProblemStore((s) => s.reporting);
+  const reportStatus = useReportProblemStore((s) => s.status);
+  const webviewError = useReportProblemStore((s) => s.webviewError);
+  const clearWebviewError = useReportProblemStore((s) => s.clearWebviewError);
   const recordingState = useRecordingStore((s) => s.state);
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
@@ -316,7 +322,43 @@ export function MainWindow() {
         <ModelDownloadStatus />
         {lastError && (
           <div className="main-window__error" role="alert">
-            {lastError}
+            <span className="main-window__error-text">{lastError}</span>
+            <button
+              type="button"
+              className="main-window__error-report"
+              disabled={reporting}
+              onClick={() => void report(lastError)}
+            >
+              Report a problem
+            </button>
+          </div>
+        )}
+        {webviewError && (
+          <div className="main-window__error" role="alert">
+            <span className="main-window__error-text">
+              Something went wrong: {webviewError}
+            </span>
+            <button
+              type="button"
+              className="main-window__error-report"
+              disabled={reporting}
+              onClick={() => void report(`webview error: ${webviewError}`)}
+            >
+              Report a problem
+            </button>
+            <button
+              type="button"
+              className="main-window__error-dismiss"
+              aria-label="Dismiss"
+              onClick={clearWebviewError}
+            >
+              ×
+            </button>
+          </div>
+        )}
+        {reportStatus && (
+          <div className="main-window__report-status" role="status">
+            {reportStatus}
           </div>
         )}
       </div>

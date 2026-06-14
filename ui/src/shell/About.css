@@ -143,8 +143,29 @@
   border-radius: var(--radius);
   padding: 0.4rem 1.1rem;
   cursor: pointer;
+  /* Default (non-primary) treatment: a hairline-outlined accent control. */
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--accent);
   transition: color 120ms ease, border-color 120ms ease,
     background 120ms ease, transform 120ms ease;
+}
+
+.about__btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.about__report-note {
+  font-size: 0.82rem;
+  color: var(--ink-soft, var(--ink));
+  margin: 0 0 0.6rem;
+}
+
+.about__report-status {
+  font-size: 0.8rem;
+  color: var(--ink-soft, var(--ink));
+  margin: 0.5rem 0 0;
 }
 
 /* Primary action — the single strong oxblood control. */

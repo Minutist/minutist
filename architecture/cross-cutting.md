@@ -1107,8 +1107,12 @@ updater artefacts. The app-wide Tauri 2 capability is `src-tauri/capabilities/de
 (`core:default` + `core:event:allow-emit`/`allow-listen`, scoped to the `main`
 window) — without a capability a Tauri 2 webview has no IPC access at all, so
 this is what lets the webview invoke the tauri-specta commands, receive
-`AppEvent` payloads, and emit `updater://apply`. The build-time ACL
-(`gen/schemas/capabilities.json`) is generated from it.
+`AppEvent` payloads, and emit `updater://apply`. `opener:allow-open-url` is
+granted **URL-scoped** (least privilege): `allow: [{ url:
+"https://github.com/Minutist/*" }]` confines `openUrl` to the project's GitHub
+host (the only URL the app opens is the "Report a problem" issue link), so a
+compromised renderer cannot drive it to a `file:`/custom scheme. The build-time
+ACL (`gen/schemas/capabilities.json`) is generated from it.
 
 ## GPU portability
 

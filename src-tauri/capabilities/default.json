@@ -8,6 +8,10 @@
   "permissions": [
     "core:default",
     "core:event:allow-emit",
-    "core:event:allow-listen"
+    "core:event:allow-listen",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://github.com/Minutist/*" }]
+    }
   ]
 }

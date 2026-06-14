@@ -61,7 +61,7 @@ export function redactMeetingPaths(text: string): string {
 /** The full human-readable diagnostic block (clipboard fallback carries this). */
 export function buildDiagnosticsBlock(report: DiagnosticReport): string {
   const parts = [
-    `Error class: ${report.errorClass}`,
+    `Error class: ${redactMeetingPaths(report.errorClass)}`,
     "",
     "Recent log lines:",
     redactMeetingPaths(report.logExcerpt).trimEnd(),
@@ -104,7 +104,7 @@ export function buildIssueUrl(report: DiagnosticReport): {
   const base = (diagnostics: string) => {
     const params = new URLSearchParams();
     params.set("template", ISSUE_TEMPLATE);
-    params.set("title", `[bug] ${report.errorClass}`);
+    params.set("title", `[bug] ${redactMeetingPaths(report.errorClass)}`);
     params.set("app-version", report.appVersion);
     params.set("platform", report.platform);
     params.set("gpu", report.gpu);

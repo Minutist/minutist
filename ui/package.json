@@ -17,6 +17,7 @@
     "@fontsource-variable/newsreader": "^5.2.10",
     "@tauri-apps/api": "^2.4",
     "@tauri-apps/plugin-fs": "^2.4",
+    "@tauri-apps/plugin-opener": "^2.5",
     "@tauri-apps/plugin-store": "^2.4",
     "@tiptap/extension-image": "^3.24.0",
     "@tiptap/extension-link": "^3.24.0",

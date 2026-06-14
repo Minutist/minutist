@@ -31,6 +31,7 @@ import type {
   MeetingMeta,
   McpServerInfo,
   NotesDocument,
+  DiagnosticReport,
 } from "./bindings";
 import type { MeetingListEntry, MeetingState } from "./meetings";
 
@@ -565,6 +566,18 @@ export const devCommands = {
     _targetLanguage: string,
   ): Promise<Result<Record<number, string>, IpcError>> {
     return ok({});
+  },
+  // Issue #0014: a sample redacted report for visual QA of the "Report a
+  // problem" surfaces under `vite dev`.
+  async getDiagnosticReport(): Promise<Result<DiagnosticReport, IpcError>> {
+    return ok({
+      app_version: "0.0.0",
+      platform: "dev / x86_64 / connected",
+      gpu: "cpu (mode=Auto)",
+      error_class: "diagnostic report",
+      log_excerpt: "INFO app-main: started\nINFO ipc-bridge: meeting index opened",
+      backtrace: null,
+    });
   },
 };
 

@@ -60,6 +60,10 @@ ogg = "0.9"
 tauri = { version = "2.10", features = [] }
 tauri-build = "2.4"
 tauri-plugin-fs = "2.4"
+# Open the user's default browser at the pre-filled GitHub issue URL for the
+# "Report a problem" flow (issue #0014). No silent network — it hands the URL
+# to the OS browser at the user's click.
+tauri-plugin-opener = "2.5"
 tauri-plugin-store = "2.4"
 # Auto-update (Phase 7). Driven from Rust via UpdaterExt (no JS plugin needed);
 # see architecture/cross-cutting.md "Auto-update".

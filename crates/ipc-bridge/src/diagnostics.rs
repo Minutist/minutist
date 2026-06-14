@@ -122,6 +122,11 @@ pub fn parse_crash_file(body: &str) -> (Option<String>, String) {
 
 /// Extract the text between `start_label` and `end_label` (or end of string when
 /// `end_label` is empty / not found). `None` if `start_label` is absent.
+///
+/// Splits on the FIRST occurrence of each label. A log line that itself contained
+/// the literal label text would mis-section the report; the failure mode is benign
+/// (a still-redacted, slightly mis-split excerpt), and the labels are fixed crash-
+/// file headers we emit, so first-occurrence is sufficient here.
 fn section(body: &str, start_label: &str, end_label: &str) -> Option<String> {
     let start = body.find(start_label)? + start_label.len();
     let rest = &body[start..];

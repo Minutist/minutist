@@ -50,6 +50,7 @@ mcp-server = { path = "../crates/mcp-server", optional = true }
 settings = { path = "../crates/settings" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-fs = { workspace = true }
+tauri-plugin-opener = { workspace = true }
 tauri-plugin-store = { workspace = true }
 tauri-plugin-updater = { workspace = true }
 tauri-specta = { workspace = true }

@@ -467,6 +467,47 @@
   color: var(--accent);
   padding: 0.5rem 0.75rem;
   font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.main-window__error-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.main-window__error-report {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--accent);
+  padding: 0.15rem 0.5rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.main-window__error-report:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.main-window__error-dismiss {
+  flex: none;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0.25rem;
+}
+
+.main-window__report-status {
+  color: var(--ink-soft, var(--ink));
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
 }
 
 /* --- Two-pane body ------------------------------------------------------ */

@@ -664,6 +664,10 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_fs::init())
+        // Opens the user's default browser at the pre-filled GitHub issue URL
+        // for the "Report a problem" flow (#0014). Not an app network operation
+        // — the OS browser makes any request, at the user's click.
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Note-image asset protocol (`meetingasset:`). Serves the bytes of a
         // pasted/dropped note image from `{meetings_dir}/<uuid>/assets/<file>`

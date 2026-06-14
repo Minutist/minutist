@@ -127,6 +127,10 @@ export const commands: Commands = {
     callCommand("translateMeeting", [meetingId, targetLanguage]),
   getTranslations: (meetingId, targetLanguage) =>
     callCommand("getTranslations", [meetingId, targetLanguage]),
+  // Issue #0014: the redacted diagnostic snapshot the "Report a problem" flow
+  // pre-fills into a GitHub issue. No telemetry — the user reviews + submits it
+  // from their own browser. The dev shim returns sample data for visual QA.
+  getDiagnosticReport: () => callCommand("getDiagnosticReport", []),
 };
 
 // Re-export types that callers commonly need. `AppEvent` is the generated

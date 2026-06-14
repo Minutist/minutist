@@ -24,6 +24,7 @@ import {
   spdxDisplay,
 } from "./about-content";
 import { useModelsStore } from "../state/models";
+import { useReportProblemStore } from "../state/report-problem";
 import "./About.css";
 
 /** Stable ordering for the bundled-model list: by kind, then id. */
@@ -37,6 +38,9 @@ export type AboutProps = {
 export function About({ onClose }: AboutProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const models = useModelsStore((s) => s.models);
+  const report = useReportProblemStore((s) => s.report);
+  const reporting = useReportProblemStore((s) => s.reporting);
+  const reportStatus = useReportProblemStore((s) => s.status);
 
   // Derive the bundled-model rows from the manifest-backed store. Sorted
   // stably (kind, then id) so the list is deterministic across renders.
@@ -122,6 +126,30 @@ export function About({ onClose }: AboutProps) {
               </li>
             ))}
           </ul>
+        </section>
+
+        <section className="about__section" aria-labelledby="about-report">
+          <h2 className="about__section-title" id="about-report">
+            Report a problem
+          </h2>
+          <p className="about__report-note">
+            Opens a pre-filled issue in your browser. The report carries the app
+            version, platform, and a redacted log excerpt — never your meeting
+            content. Nothing is sent until you submit it yourself.
+          </p>
+          <button
+            type="button"
+            className="about__btn"
+            disabled={reporting}
+            onClick={() => void report()}
+          >
+            Report a problem
+          </button>
+          {reportStatus && (
+            <p className="about__report-status" role="status">
+              {reportStatus}
+            </p>
+          )}
         </section>
 
         <footer className="about__footer">

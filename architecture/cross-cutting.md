@@ -889,8 +889,9 @@ change.
 ├── meetings/{uuid}/            owned by `persistence` (and nobody else)
 │   ├── audio.opus
 │   ├── transcript.json
-│   ├── notes.json
-│   ├── notes.md
+│   ├── notes.ydoc                 Yjs/yrs CRDT state (authoritative when present)
+│   ├── notes.json                 ProseMirror JSON (derived from notes.ydoc)
+│   ├── notes.md                   markdown (derived)
 │   ├── summary.md
 │   ├── metadata.json
 │   ├── assets/                 pasted/dropped note images (content-hash files)

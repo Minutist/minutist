@@ -837,6 +837,37 @@ the editor autosave (FR-18/FR-35) run concurrently with an active recording.
   (`audio.opus` / `transcript.json` / `metadata.json`) untouched.
 - `MeetingFolder` exposes `notes_path()` / `notes_md_path()` helpers.
 
+**CRDT notes storage (`ydoc` module — O2, `planning/DESIGN_notes-crdt.md`).**
+When present, `notes.ydoc` (a single atomic lib0-v2 Yjs/`yrs` whole-state blob)
+is the **authoritative** notes document; `notes.json` and `notes.md` are
+**derived projections** (D-O2.1). The on-disk file set per meeting is therefore
+`notes.ydoc` (authoritative binary) + `notes.json` (derived ProseMirror JSON) +
+`notes.md` (derived markdown). `persistence` is the sole owner of all three.
+
+- `NotesStore::save` builds a `yrs` doc from the incoming document JSON, writes
+  `notes.ydoc` first (authoritative), then writes `notes.json` **derived from
+  that doc** plus the caller-supplied `notes.md` — all three atomically in the
+  one save call (D-O2.4). Markdown is caller-supplied because rendering it needs
+  the editor's typed schema, which this crate does not model.
+- `NotesStore::load` returns the JSON **derived from `notes.ydoc`** when it
+  exists (so the projection self-heals if `notes.json` is missing or stale,
+  exactly as the libsql index self-heals from the folders); it falls back to
+  reading `notes.json` directly when `notes.ydoc` is absent (a pre-CRDT meeting
+  not yet seeded). `Ok(None)` only when neither file exists.
+- The `ydoc` module owns the JSON↔Yjs conversion (`json_to_ydoc`,
+  `ydoc_to_json`, `encode_ydoc`, `decode_ydoc`). It is the **single, narrow**
+  relaxation of the notes opacity guarantee: deriving ProseMirror JSON from the
+  Yjs `XmlFragment` requires knowing the document is ProseMirror-shaped, but the
+  walk is **generic** — element tags, attributes (stored as typed `yrs::Any`),
+  text marks, and nesting all round-trip by structure, so unknown/custom nodes
+  (transcript-chip atom, note images, future nodes) survive losslessly. No typed
+  Tiptap node model is introduced. The mapping matches y-prosemirror (top-level
+  `XmlFragment` named `"prosemirror"`, the doc node's children as the fragment's
+  children) so the editor-side Yjs binding interops. Because `notes.json` is now
+  a derived projection rather than a verbatim store, it is normalised to valid
+  ProseMirror shape — custom node *types and attributes* are preserved, which is
+  exactly what the transcript-chip guarantee requires.
+
 **Note image assets (`assets` module).** Images pasted/dropped into the notes
 editor are stored as **separate files** under `{root}/{meeting_id}/assets/`,
 NOT embedded in `notes.json`. The `assets` module is the sole writer/reader of

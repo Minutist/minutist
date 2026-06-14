@@ -66,6 +66,7 @@ pub mod summary;
 pub mod transcript;
 pub mod translations;
 pub mod writer;
+pub mod ydoc;
 
 // Public re-exports for the crate's primary surface.
 pub use assets::{read_note_asset, save_note_asset};

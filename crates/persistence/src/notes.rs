@@ -14,14 +14,32 @@
 //! side does not model Tiptap's document shape: unknown or custom node types
 //! (e.g. the Phase-4 transcript-chip node) round-trip losslessly because the
 //! value is parsed and re-serialised verbatim, never coerced into a typed
-//! schema. Do **not** introduce a typed Tiptap document model here.
+//! schema. Do **not** introduce a typed Tiptap document model here. The Yjs
+//! derivation in [`crate::ydoc`] is the single, narrow relaxation of this rule
+//! (it walks the document generically; see that module's docs).
+//!
+//! # CRDT notes storage (O2 — `planning/DESIGN_notes-crdt.md`)
+//!
+//! `notes.ydoc` is the **authoritative** Yjs (yrs) document state when present;
+//! `notes.json` (ProseMirror JSON) and `notes.md` (markdown) are **derived
+//! projections** (D-O2.1). [`NotesStore::save`] builds a Yjs doc from the
+//! incoming document JSON, writes `notes.ydoc` (a single atomic lib0-v2 blob),
+//! then writes the JSON **derived from that doc** as `notes.json` plus the
+//! caller-supplied `notes.md` — all three in the one save call (D-O2.4). On
+//! [`NotesStore::load`], when `notes.ydoc` exists its derived JSON is returned
+//! (the projection self-heals if `notes.json` is missing or stale, exactly as
+//! the libsql index self-heals from the folders). A meeting that predates the
+//! groundwork has no `notes.ydoc`; it reads straight from `notes.json` and is
+//! seeded lazily on open by [`crate::reader::read_meeting_state`].
 //!
 //! # Atomic writes
 //!
 //! [`NotesStore::save`] writes each file to a sibling temp file in the meeting
 //! folder, then renames it into place. A crash mid-save leaves the previous
-//! `notes.json` / `notes.md` intact (the rename is atomic on the same
-//! filesystem) and leaves no `.tmp` residue on the success path.
+//! `notes.ydoc` / `notes.json` / `notes.md` intact (the rename is atomic on the
+//! same filesystem) and leaves no `.tmp` residue on the success path. `save`
+//! writes `notes.ydoc` first; if the process dies before the projections are
+//! rewritten, the next open re-derives them from `notes.ydoc` (self-healing).
 
 use std::path::{Path, PathBuf};
 
@@ -63,12 +81,23 @@ impl NotesStore {
         root.join(meeting_id.0.to_string())
     }
 
-    /// Atomically write `notes_json` to `notes.json` and `notes_md` to
-    /// `notes.md` inside the existing meeting folder.
+    /// Atomically persist a meeting's notes: write the authoritative
+    /// `notes.ydoc` (Yjs CRDT state) and its derived `notes.json` + the
+    /// caller-supplied `notes.md`.
     ///
-    /// Each file is written to a sibling temp file then renamed into place,
-    /// so an interrupted save never leaves a truncated notes file. The temp
-    /// files are removed by the rename; no `.tmp` residue remains on success.
+    /// `notes_json` is the editor's ProseMirror document. `save` builds a Yjs
+    /// doc from it (the CRDT becomes authoritative — D-O2.1), encodes that doc
+    /// as the single compacted lib0-v2 `notes.ydoc` blob, then writes
+    /// `notes.json` **derived from the doc** (a structural round-trip; see
+    /// [`crate::ydoc`]) and `notes.md` verbatim. `notes.ydoc` is written first
+    /// so that if the process dies before the projections are rewritten the
+    /// next open re-derives them (self-healing, D-O2.4). The markdown is
+    /// supplied by the caller because rendering it requires the editor's typed
+    /// schema, which this crate deliberately does not model.
+    ///
+    /// Each file is written to a sibling temp file then renamed into place, so
+    /// an interrupted save never leaves a truncated notes file. The temp files
+    /// are removed by the rename; no `.tmp` residue remains on success.
     ///
     /// This does **not** create the meeting folder — the folder is owned by
     /// [`crate::MeetingWriter`] and is expected to exist. Sibling files
@@ -80,13 +109,23 @@ impl NotesStore {
         notes_md: &str,
     ) -> AppResult<()> {
         let folder = Self::folder_path(root, meeting_id);
+        let ydoc_path = folder.join("notes.ydoc");
         let json_path = folder.join("notes.json");
         let md_path = folder.join("notes.md");
 
-        let json_bytes = serde_json::to_vec_pretty(notes_json)
+        // The Yjs doc is authoritative: build it from the incoming JSON and
+        // derive the JSON projection back from it so on-disk `notes.json`
+        // always matches `notes.ydoc` (D-O2.1).
+        let doc = crate::ydoc::json_to_ydoc(notes_json);
+        let ydoc_bytes = crate::ydoc::encode_ydoc(&doc);
+        let derived_json = crate::ydoc::ydoc_to_json(&doc);
+
+        let json_bytes = serde_json::to_vec_pretty(&derived_json)
             .map_err(Error::Serialise)
             .map_err(minutist_common::AppError::from)?;
 
+        // `notes.ydoc` first (authoritative), then the projections.
+        write_atomic(&ydoc_path, &ydoc_bytes)?;
         write_atomic(&json_path, &json_bytes)?;
         write_atomic(&md_path, notes_md.as_bytes())?;
 
@@ -94,31 +133,47 @@ impl NotesStore {
             target: "persistence",
             meeting_id = %meeting_id.0,
             folder = %folder.display(),
-            "notes.json + notes.md saved"
+            "notes.ydoc + derived notes.json + notes.md saved"
         );
 
         Ok(())
     }
 
-    /// Load `notes.json` + `notes.md` for `meeting_id` under `root`.
+    /// Load a meeting's notes for `meeting_id` under `root`.
     ///
-    /// Returns `Ok(None)` if `notes.json` does not exist (a meeting with no
-    /// notes yet). `notes.md` is read as a sibling; an absent `notes.md`
-    /// alongside an existing `notes.json` yields an empty markdown string.
+    /// When `notes.ydoc` is present it is **authoritative**: the returned JSON
+    /// is derived from it (D-O2.1), so the document reflects the CRDT state even
+    /// if `notes.json` is missing or stale (the projection self-heals — D-O2.4).
+    /// When `notes.ydoc` is absent the document is read straight from
+    /// `notes.json` (a pre-CRDT meeting not yet seeded — D-O2.7).
+    ///
+    /// Returns `Ok(None)` only when **neither** `notes.ydoc` nor `notes.json`
+    /// exists (a meeting with no notes yet). `notes.md` is read as a sibling; an
+    /// absent `notes.md` yields an empty markdown string.
     pub fn load(root: &Path, meeting_id: MeetingId) -> AppResult<Option<NotesData>> {
         let folder = Self::folder_path(root, meeting_id);
+        let ydoc_path = folder.join("notes.ydoc");
         let json_path = folder.join("notes.json");
         let md_path = folder.join("notes.md");
 
-        let json_bytes = match std::fs::read(&json_path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // `notes.ydoc` (authoritative) wins when present; derive the JSON from it.
+        let json = match std::fs::read(&ydoc_path) {
+            Ok(bytes) => {
+                let doc = crate::ydoc::decode_ydoc(&bytes)
+                    .map_err(|context| minutist_common::AppError::Internal { context })?;
+                crate::ydoc::ydoc_to_json(&doc)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::read(&json_path) {
+                    Ok(bytes) => serde_json::from_slice(&bytes)
+                        .map_err(Error::Serialise)
+                        .map_err(minutist_common::AppError::from)?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(Error::Io(e).into()),
+                }
+            }
             Err(e) => return Err(Error::Io(e).into()),
         };
-
-        let json: serde_json::Value = serde_json::from_slice(&json_bytes)
-            .map_err(Error::Serialise)
-            .map_err(minutist_common::AppError::from)?;
 
         let markdown = match std::fs::read_to_string(&md_path) {
             Ok(s) => s,
@@ -403,14 +458,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 2. Lossless round-trip of a doc with an UNKNOWN/custom node type.
-    //    Proves the Phase-4 transcript-chip opacity guarantee.
+    // 2. Lossless round-trip of a doc with UNKNOWN/custom node types.
+    //    Proves the transcript-chip opacity guarantee survives the CRDT
+    //    projection: a node type and attribute set the Rust side does not model
+    //    round-trips by structure (D-O2.1 — the Yjs derivation walks the
+    //    document generically). `notes.json` is now derived from `notes.ydoc`,
+    //    so the document is normalised to valid ProseMirror shape — custom
+    //    *node types and their attributes* survive, which is what the
+    //    transcript-chip / note-image / future-node guarantee requires.
     // -----------------------------------------------------------------------
 
     #[test]
     fn unknown_node_type_round_trips_losslessly() {
         let (_tempdir, root, id) = make_meeting();
-        // A custom node type the Rust side knows nothing about, carrying
+        // Custom node types the Rust side knows nothing about, carrying
         // arbitrary nested attrs. None of this is modelled in Rust.
         let doc = json!({
             "type": "doc",
@@ -426,8 +487,10 @@ mod tests {
                 },
                 {
                     "type": "someFutureNode",
-                    "marks": [{ "type": "weirdMark", "attrs": { "x": 1.5 } }],
-                    "content": []
+                    "attrs": { "weird": 1.5, "flag": true, "name": "x" },
+                    "content": [
+                        { "type": "text", "text": "future content" }
+                    ]
                 }
             ]
         });

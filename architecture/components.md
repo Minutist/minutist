@@ -778,6 +778,17 @@ tag is required at workspace level; Cargo's semver does not resolve
 pre-releases from a `"0.3"` constraint). Container is Ogg via the `ogg`
 crate. Phase 1 writes 16 kHz mono 32 kbps.
 
+**CRDT notes dependency — `yrs`.** `yrs = "0.26"` (the Rust port of the Yjs
+CRDT) is a direct dependency of `persistence`, used to store the authoritative
+per-meeting notes document `notes.ydoc` and derive `notes.json` / `notes.md`
+from it (see "CRDT notes storage" below). It is a **third-party** dependency
+— like `sha2` / `libsql` / `audiopus` — **not** a crate-to-crate edge, so the
+dependency table above is unchanged (`persistence` still depends only on
+`common`). `yrs` is pure-Rust with no network surface and is embedded in BOTH
+build variants; only the sync *transport* is `connected`-gated (a separate
+crate). Durable whole-state blobs use the lib0 v2 encoding. See
+`planning/DESIGN_notes-crdt.md` D-O2.1/D-O2.2/D-O2.4.
+
 **Inputs:** typed write commands from orchestrator and IPC bridge.
 **Outputs:** typed read responses; emits no events itself.
 

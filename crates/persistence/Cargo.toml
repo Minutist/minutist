@@ -27,6 +27,12 @@ thiserror = { workspace = true }
 # never calls `block_on`.
 tokio = { workspace = true }
 tracing = { workspace = true }
+# yrs: the Yjs CRDT port. `persistence` stores the authoritative per-meeting
+# notes document as `notes.ydoc` (lib0 v2 whole-state blob) and derives
+# `notes.json` / `notes.md` from it. A third-party dependency (like sha2 /
+# libsql / audiopus), not a crate-to-crate edge. See
+# `planning/DESIGN_notes-crdt.md` D-O2.1/D-O2.2/D-O2.4.
+yrs = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

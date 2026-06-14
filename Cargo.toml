@@ -159,3 +159,16 @@ hex = "0.4"
 # `http::HeaderMap` rmcp surfaces; `http` is the shared header/types crate the
 # whole hyper stack already uses (no new major).
 http = "1"
+
+# CRDT additions (O2 notes-CRDT groundwork — planning/DESIGN_notes-crdt.md).
+# yrs — the Rust port of the Yjs CRDT, used by `persistence` to store the
+# authoritative per-meeting notes document (`notes.ydoc`) and derive
+# `notes.json`/`notes.md` from it. Pure-Rust, no network surface (the sync
+# transport is a separate `connected`-gated crate), so it is embedded in BOTH
+# build variants (D-O2.2). Durable whole-state blobs use the lib0 v2 encoding
+# (`encode_state_as_update_v2`), the size-optimised whole-document form (OQ-C /
+# D-O2.4). Pinned to the 0.26 line: 0.27+ uses `if let` guards, which are not
+# stable on the current `stable` toolchain (rust-toolchain.toml tracks floating
+# `stable`), so 0.26 is the latest release that builds here. Revisit when the
+# toolchain has advanced enough to compile 0.27+.
+yrs = "0.26"

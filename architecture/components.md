@@ -1796,6 +1796,43 @@ relay-encoder's hex for a known frame set) that a unit test asserts this crate's
 encoding equals AND decodes back. Regenerating the fixture after a
 `PROTOCOL_VERSION` bump is a coordinated both-repos change.
 
+**Public API.** `run_tunnel(TunnelConfig) -> Result<(), TunnelError>` performs
+one connect attempt and runs until close. `TunnelConfig { relay_url,
+device_credential, account_id, loopback: LoopbackTarget }`. `LoopbackTarget {
+base_url, internal_bearer: InternalBearer }` carries the loopback origin (e.g.
+`http://127.0.0.1:8765`) and the app's internal bearer; `app-main` builds it from
+`ipc-bridge::McpServerInfo` (URL stripped to origin + the token). Reconnection,
+pairing, lifecycle, and the IPC/settings surface are **S5** — `run_tunnel` is a
+single connect-and-run so the S5 reconnect seam is a `loop { run_tunnel().await;
+backoff().await }` wrapper.
+
+**Handshake + demux.** Dial → send `Hello{version, device_credential,
+account_id}` → await `HelloAck` (or fail on `HelloErr` with the reason). Then a
+single writer task drains a bounded outbound channel onto the socket; the read
+loop receives `Request` frames and spawns a bounded per-request task (a
+`Semaphore`-capped pool, `MAX_INFLIGHT_REQUESTS`) that replays the request
+against `loopback_base + path`, attaching the internal bearer as `Authorization`,
+and streams the HTTP response back as `ResponseStart → ResponseChunk* →
+ResponseEnd` (or a single `ResponseError` on a local failure). Concurrent
+requests multiplex by `request_id`, echoed unchanged on every response frame.
+`Ping` is answered with `Pong`. No unbounded channels or task spawning (the
+inflight semaphore + the bounded outbound channel bound the work). Inbound
+messages are capped at 4 MiB, matching the relay.
+
+**Security (binding).** The internal loopback bearer is held in `InternalBearer`,
+whose `Debug` redacts the value. It is attached only to the outbound loopback
+HTTP request and is **never** serialised into a tunnel frame nor logged. Response
+bodies are streamed (`reqwest::Response::bytes_stream`), not buffered whole. Logs
+carry `request_id`/method/path/status only — never bodies, never the bearer. A
+test asserts the bearer does not appear in any frame sent to the relay.
+Loopback **response headers are allowlisted** before they cross to the untrusted
+relay (`FORWARDED_RESPONSE_HEADERS` — content-type/length, cache-control, and the
+SSE/MCP session headers), mirroring the relay's inbound request-header filtering
+so a future `set-cookie`/`authorization` echo cannot transit the trust boundary.
+`run_tunnel` **refuses a non-`wss://` relay** (`TunnelError::Config`) before
+dialing — `ws://` is tolerated only for a loopback host, where cleartext never
+leaves the machine.
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates

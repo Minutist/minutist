@@ -947,7 +947,15 @@ on `common`.
   - `read_meeting_state(meeting_dir) -> AppResult<MeetingState>` — assembles
     `meta` + `transcript` + optional `notes` (via `NotesStore::load`, mapped to
     `common::NotesDocument`; the opaque `notes.json` value is re-serialised to
-    the wire-facing string). This is the `open_meeting` restore payload.
+    the wire-facing string). This is the `open_meeting` restore payload. It is
+    also the **lazy notes-CRDT migration trigger** (D-O2.7): on open, when
+    `notes.ydoc` is absent but `notes.json` exists, it seeds `notes.ydoc` from
+    the JSON (`NotesStore::seed_ydoc_if_needed`) and flips
+    `MeetingMeta::notes_format` to `1` (rewriting `metadata.json`). The seed is
+    idempotent (a no-op once `notes.ydoc` exists), build-invariant (the free
+    build seeds too; only the sync transport is gated), and per-meeting — a
+    never-opened meeting is never touched and stays JSON-readable. After
+    seeding, `notes.ydoc` is authoritative.
   - `read_note_blocks(meeting_dir) -> AppResult<Vec<NoteBlock>>` (#70) —
     projects `notes.json` into `common::NoteBlock`s for the summariser via the
     pure `note_blocks_from_json(&Value)`. A best-effort READ projection (one

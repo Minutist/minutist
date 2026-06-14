@@ -106,11 +106,19 @@ pub fn read_audio_pcm(meeting_dir: &Path) -> AppResult<Vec<f32>> {
 /// opaque Tiptap document re-serialised to a string, `notes_markdown` the
 /// `notes.md` body. A meeting with no saved notes yields `notes: None`.
 ///
+/// **Lazy notes-CRDT seed (D-O2.7).** Opening a meeting is also the migration
+/// trigger: when `notes.ydoc` is absent but `notes.json` exists, this seeds
+/// `notes.ydoc` from the JSON and flips `MeetingMeta::notes_format` to `1`
+/// (rewriting `metadata.json`). It is idempotent (a no-op once seeded),
+/// build-invariant, and per-meeting — a never-opened meeting is never touched.
+/// After seeding, `notes.ydoc` is authoritative and the returned notes are
+/// derived from it.
+///
 /// `meeting_dir` must be `{root}/{uuid}/`; `read_meeting_state` derives the
 /// `(root, meeting_id)` pair `NotesStore` expects from `meta.uuid` and the
 /// folder's parent, so the same on-disk layout is honoured.
 pub fn read_meeting_state(meeting_dir: &Path) -> AppResult<MeetingState> {
-    let meta = read_metadata_inner(meeting_dir)?;
+    let mut meta = read_metadata_inner(meeting_dir)?;
     let transcript = read_transcript_inner(meeting_dir)?;
 
     // `NotesStore::load` resolves `{root}/{uuid}/` itself, so recover the
@@ -118,6 +126,16 @@ pub fn read_meeting_state(meeting_dir: &Path) -> AppResult<MeetingState> {
     let root = meeting_dir.parent().ok_or(Error::InvalidState(
         "meeting_dir has no parent; cannot resolve notes root",
     ))?;
+
+    // Lazy one-time migration: seed notes.ydoc from notes.json on first open,
+    // then record notes_format = 1 in metadata.json. The seed is idempotent;
+    // the metadata flip also self-corrects a meeting whose notes.ydoc was
+    // written (e.g. by a prior save) while notes_format still read 0.
+    let seeded = NotesStore::seed_ydoc_if_needed(root, meta.uuid)?;
+    if (seeded || meeting_dir.join("notes.ydoc").exists()) && meta.notes_format == 0 {
+        meta.notes_format = 1;
+        crate::metadata::write_metadata(meeting_dir, &meta)?;
+    }
 
     let notes = NotesStore::load(root, meta.uuid)?.map(|data| {
         let notes_json = serde_json::to_string(&data.json)

@@ -183,6 +183,58 @@ impl NotesStore {
 
         Ok(Some(NotesData { json, markdown }))
     }
+
+    /// Lazily seed `notes.ydoc` from an existing `notes.json` for a pre-CRDT
+    /// meeting, returning `true` when a seed was written (so the caller flips
+    /// `MeetingMeta::notes_format` to `1` and rewrites `metadata.json`).
+    ///
+    /// The one notes-CRDT migration (D-O2.7), triggered lazily per meeting on
+    /// open. It runs when `notes.ydoc` is **absent** and `notes.json` is
+    /// present: it reads the JSON, builds a fresh `yrs` doc from it, and writes
+    /// `notes.ydoc` (atomically). It is **idempotent** — once `notes.ydoc`
+    /// exists this is a no-op — and **build-invariant** (the same path in both
+    /// build variants; the free build seeds too, only the sync transport is
+    /// gated). A meeting with no `notes.json` is left untouched (nothing to
+    /// seed; it stays JSON-readable and migrates the day it first gets notes).
+    ///
+    /// Seeding a `yrs` doc from JSON gives it a fresh client history — safe only
+    /// as a one-time origin for a never-synced document, which is exactly the
+    /// migration case (a pre-CRDT meeting has no peer to share ancestry with).
+    /// After seeding, `notes.ydoc` is authoritative.
+    pub fn seed_ydoc_if_needed(root: &Path, meeting_id: MeetingId) -> AppResult<bool> {
+        let folder = Self::folder_path(root, meeting_id);
+        let ydoc_path = folder.join("notes.ydoc");
+        let json_path = folder.join("notes.json");
+
+        // Idempotent: an existing `notes.ydoc` is already authoritative.
+        if ydoc_path.exists() {
+            return Ok(false);
+        }
+
+        // Nothing to seed when the meeting has never had notes.
+        let json_bytes = match std::fs::read(&json_path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(Error::Io(e).into()),
+        };
+
+        let json: serde_json::Value = serde_json::from_slice(&json_bytes)
+            .map_err(Error::Serialise)
+            .map_err(minutist_common::AppError::from)?;
+
+        let doc = crate::ydoc::json_to_ydoc(&json);
+        let ydoc_bytes = crate::ydoc::encode_ydoc(&doc);
+        write_atomic(&ydoc_path, &ydoc_bytes)?;
+
+        tracing::info!(
+            target: "persistence",
+            meeting_id = %meeting_id.0,
+            folder = %folder.display(),
+            "seeded notes.ydoc from notes.json (pre-CRDT migration)"
+        );
+
+        Ok(true)
+    }
 }
 
 /// Write `bytes` to `path` atomically: write to a sibling temp file, fsync,
@@ -616,5 +668,69 @@ mod tests {
         assert!(folder.notes_md_path().ends_with("notes.md"));
         assert_eq!(folder.notes_path().parent(), Some(folder.path()));
         assert_eq!(folder.notes_md_path().parent(), Some(folder.path()));
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. notes.ydoc is written by save, and the lazy seed migration (D-O2.7).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_writes_authoritative_notes_ydoc() {
+        let (_tempdir, root, id) = make_meeting();
+        let folder = root.join(id.0.to_string());
+
+        NotesStore::save(&root, id, &representative_doc(), "body").expect("save");
+
+        // All three files exist; notes.ydoc is the authoritative blob.
+        assert!(folder.join("notes.ydoc").exists(), "notes.ydoc must be written");
+        assert!(folder.join("notes.json").exists(), "derived notes.json must be written");
+        assert!(folder.join("notes.md").exists(), "notes.md must be written");
+        let ydoc = std::fs::read(folder.join("notes.ydoc")).expect("read ydoc");
+        assert!(!ydoc.is_empty(), "notes.ydoc must carry the encoded state");
+    }
+
+    #[test]
+    fn seed_is_idempotent_and_skips_meetings_without_notes() {
+        // A meeting with no notes at all: nothing to seed.
+        let (_tempdir, root, id) = make_meeting();
+        assert!(
+            !NotesStore::seed_ydoc_if_needed(&root, id).expect("seed"),
+            "a meeting with no notes.json must not be seeded"
+        );
+        assert!(!root.join(id.0.to_string()).join("notes.ydoc").exists());
+    }
+
+    #[test]
+    fn seed_builds_ydoc_from_legacy_json_and_is_idempotent() {
+        let (_tempdir, root, id) = make_meeting();
+        let folder = root.join(id.0.to_string());
+
+        // Simulate a pre-CRDT meeting: notes.json on disk, no notes.ydoc.
+        let doc = representative_doc();
+        std::fs::write(
+            folder.join("notes.json"),
+            serde_json::to_vec_pretty(&doc).unwrap(),
+        )
+        .expect("seed legacy notes.json");
+        std::fs::write(folder.join("notes.md"), "# legacy").expect("seed notes.md");
+        assert!(!folder.join("notes.ydoc").exists());
+
+        // First seed writes notes.ydoc.
+        assert!(
+            NotesStore::seed_ydoc_if_needed(&root, id).expect("seed"),
+            "first seed must write notes.ydoc"
+        );
+        assert!(folder.join("notes.ydoc").exists());
+
+        // After seeding, notes.ydoc is authoritative: the load derives the same
+        // document (structural round-trip).
+        let loaded = NotesStore::load(&root, id).expect("load").expect("present");
+        assert_eq!(loaded.json, doc, "seeded notes.ydoc must derive the same doc");
+
+        // Idempotent: a second seed is a no-op.
+        assert!(
+            !NotesStore::seed_ydoc_if_needed(&root, id).expect("seed"),
+            "second seed must be a no-op once notes.ydoc exists"
+        );
     }
 }

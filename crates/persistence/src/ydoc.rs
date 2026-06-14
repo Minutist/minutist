@@ -41,7 +41,7 @@ use yrs::types::text::YChange;
 use yrs::types::Attrs;
 use yrs::updates::decoder::Decode;
 use yrs::{
-    Any, Doc, GetString, Out, ReadTxn, StateVector, Text, Transact, TransactionMut, Update, Xml,
+    Any, Doc, Out, ReadTxn, StateVector, Text, Transact, TransactionMut, Update, Xml,
     XmlElementPrelim, XmlFragment, XmlTextPrelim, XmlTextRef,
 };
 

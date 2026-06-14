@@ -1040,6 +1040,73 @@ fn test_read_meeting_state_without_notes_yields_none() {
 }
 
 #[test]
+fn test_read_meeting_state_seeds_legacy_notes_and_flips_format() {
+    // A pre-CRDT meeting: notes.json on disk, notes_format == 0, no notes.ydoc.
+    // Opening it must seed notes.ydoc and flip notes_format to 1 (D-O2.7).
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = MeetingId::new();
+    let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
+    let mut meta = dummy_meta(id, 5_000);
+    meta.notes_format = 0;
+    crate::metadata::write_metadata(folder.path(), &meta).expect("write metadata");
+
+    let notes_json = serde_json::json!({
+        "type": "doc",
+        "content": [{
+            "type": "paragraph",
+            "attrs": { "data-anchor-ms": 100 },
+            "content": [{ "type": "text", "text": "legacy notes" }]
+        }]
+    });
+    // Write notes.json directly (legacy path), bypassing NotesStore::save so no
+    // notes.ydoc exists yet.
+    std::fs::write(
+        folder.path().join("notes.json"),
+        serde_json::to_vec_pretty(&notes_json).unwrap(),
+    )
+    .expect("write legacy notes.json");
+    std::fs::write(folder.path().join("notes.md"), "# legacy").expect("write notes.md");
+    assert!(!folder.path().join("notes.ydoc").exists());
+
+    let folder_dir = root.join(id.0.to_string());
+    let state = reader::read_meeting_state(&folder_dir).expect("read state");
+
+    // Seed happened: notes.ydoc now exists and metadata records format 1.
+    assert!(folder.path().join("notes.ydoc").exists(), "open must seed notes.ydoc");
+    assert_eq!(state.meta.notes_format, 1, "notes_format must flip to 1 on seed");
+    let on_disk = reader::read_metadata(&folder_dir).expect("re-read metadata");
+    assert_eq!(on_disk.notes_format, 1, "metadata.json must persist notes_format = 1");
+
+    // The notes survive (now derived from notes.ydoc).
+    let notes = state.notes.expect("notes present");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&notes.notes_json).expect("parse notes_json");
+    assert_eq!(parsed, notes_json, "seeded notes must derive the original document");
+}
+
+#[test]
+fn test_read_meeting_state_seed_is_noop_when_no_notes() {
+    // A never-noted meeting at notes_format == 0 stays at 0 (nothing to seed).
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = MeetingId::new();
+    let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
+    let mut meta = dummy_meta(id, 5_000);
+    meta.notes_format = 0;
+    crate::metadata::write_metadata(folder.path(), &meta).expect("write metadata");
+
+    let folder_dir = root.join(id.0.to_string());
+    let state = reader::read_meeting_state(&folder_dir).expect("read state");
+
+    assert!(!folder.path().join("notes.ydoc").exists(), "no notes => no seed");
+    assert_eq!(state.meta.notes_format, 0, "no-notes meeting stays at format 0");
+    assert!(state.notes.is_none());
+}
+
+#[test]
 fn test_read_transcript_absent_is_empty() {
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();

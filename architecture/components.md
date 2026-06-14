@@ -102,7 +102,13 @@ driver's sliding window evicts older turns, P2) that ride the existing
 registration — no new event registration;
 `MeetingMeta.speaker_names: BTreeMap<String, String>` (diarizer-label →
 display-name overlay, `#[serde(default, skip_serializing_if = …)]` so existing
-`metadata.json` still deserialises and the wire shape only grows); and the
+`metadata.json` still deserialises and the wire shape only grows);
+`MeetingMeta.notes_format: u8` (O2 notes-CRDT groundwork — `0` = JSON-only
+pre-CRDT, `1` = Yjs `notes.ydoc` authoritative with derived projections;
+`#[serde(default)]` so existing `metadata.json` reads as `0`, the same
+defaulted-field pattern `speaker_names` used; see
+`planning/DESIGN_notes-crdt.md` D-O2.7 and the `persistence` "CRDT notes
+storage" section); and the
 in-process bridge types `InterAgentRequest` / `InterAgentReply` (referencing
 `ChatSessionId`), landed now so Phase 10's MCP `send_to_internal_agent` adds no
 `common` change. `ChatToken` is a lossy hint — `ChatTurnComplete.final_text`

@@ -338,6 +338,20 @@ pub struct MeetingMeta {
     /// only grows when the map is non-empty.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub speaker_names: std::collections::BTreeMap<String, String>,
+    /// Notes-document storage format for this meeting (O2 notes-CRDT
+    /// groundwork). `0` = "JSON only, pre-CRDT": `notes.json` is authoritative
+    /// and no `notes.ydoc` exists. `1` = "Yjs authoritative, projections
+    /// derived": `notes.ydoc` is the source of truth and `notes.json` /
+    /// `notes.md` are derived from it on every save (see
+    /// `planning/DESIGN_notes-crdt.md` D-O2.7). The lazy on-open seed flips a
+    /// `0` meeting to `1` the first time it is opened under a build that carries
+    /// the CRDT groundwork.
+    ///
+    /// `#[serde(default)]` so existing `metadata.json` (written before the field
+    /// existed) reads as `0` — the same defaulted-field pattern `speaker_names`
+    /// used.
+    #[serde(default)]
+    pub notes_format: u8,
     pub app_version: String,
 }
 
@@ -1616,6 +1630,7 @@ mod tests {
             llm_model: None,
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
+            notes_format: 0,
             app_version: "0.0.0".to_string(),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -1661,6 +1676,7 @@ mod tests {
             llm_model: None,
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
+            notes_format: 0,
             app_version: "0.0.0".to_string(),
         };
         let segment = Segment {
@@ -1690,7 +1706,11 @@ mod tests {
             notes: None,
         };
         let json = serde_json::to_string(&without_notes).unwrap();
-        assert!(!json.contains("notes"), "absent notes must be omitted");
+        // The `notes` field is `Option` with `skip_serializing_if`, so it is
+        // omitted when `None`. Match the `"notes":` key precisely — a bare
+        // substring search would false-positive on `meta.notes_format`, which
+        // legitimately serialises and contains "notes".
+        assert!(!json.contains("\"notes\":"), "absent notes must be omitted");
         let back: MeetingState = serde_json::from_str(&json).unwrap();
         assert!(back.notes.is_none());
     }

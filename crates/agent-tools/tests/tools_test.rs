@@ -97,6 +97,7 @@ async fn seed_meeting(
         llm_model: None,
         diarizer: None,
         speaker_names,
+        notes_format: 0,
         app_version: "0.0.0".to_string(),
     };
     persistence::write_metadata(&dir, &meta).expect("write metadata");

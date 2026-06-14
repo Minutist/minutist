@@ -606,6 +606,7 @@ impl Orchestrator {
             llm_model: None,
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
+            notes_format: 0,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 

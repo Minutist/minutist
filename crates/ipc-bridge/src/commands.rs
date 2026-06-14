@@ -2335,6 +2335,7 @@ mod tests {
             llm_model: None,
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
+            notes_format: 0,
             app_version: "0.0.0".into(),
         };
         let meta_json = serde_json::to_vec_pretty(&meta).expect("serialise metadata");

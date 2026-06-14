@@ -1028,7 +1028,22 @@ export type MeetingMeta = { uuid: MeetingId; title: string; started_at: string; 
  * (written before the field existed) still deserialises and the wire shape
  * only grows when the map is non-empty.
  */
-speaker_names: Partial<{ [key in string]: string }>; app_version: string }
+speaker_names: Partial<{ [key in string]: string }>; 
+/**
+ * Notes-document storage format for this meeting (O2 notes-CRDT
+ * groundwork). `0` = "JSON only, pre-CRDT": `notes.json` is authoritative
+ * and no `notes.ydoc` exists. `1` = "Yjs authoritative, projections
+ * derived": `notes.ydoc` is the source of truth and `notes.json` /
+ * `notes.md` are derived from it on every save (see
+ * `planning/DESIGN_notes-crdt.md` D-O2.7). The lazy on-open seed flips a
+ * `0` meeting to `1` the first time it is opened under a build that carries
+ * the CRDT groundwork.
+ * 
+ * `#[serde(default)]` so existing `metadata.json` (written before the field
+ * existed) reads as `0` — the same defaulted-field pattern `speaker_names`
+ * used.
+ */
+notes_format?: number; app_version: string }
 /**
  * The full restorable state of a meeting, assembled by `persistence` for
  * `open_meeting`: metadata, transcript segments, and the notes document

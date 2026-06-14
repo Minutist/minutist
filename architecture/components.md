@@ -35,13 +35,36 @@ appears in:
 | `agent-tools` | 9 | `common`, `persistence`, `orchestrator` |
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
+| `tunnel-client` | WS4-A | (nothing in this workspace) |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`† |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
 Cargo feature (default ON). The free artifact is built with
 `--no-default-features` and omits `mcp-server` and its transitive rmcp stack.
 See `cross-cutting.md` — "Build variants".
+
+‡ `tunnel-client` is an **optional** edge of `app-main`, gated by the same
+`connected` Cargo feature as `mcp-server` (it is part of the connected-tier
+surface — the free build has no relay). The edge is added in WS4-A S5 when the
+tunnel is wired into `app-main`; the S3b crate-add lands the crate in the
+workspace unconditionally (compiled by `cargo test`/workspace build) without the
+`app-main` edge, exactly as `mcp-server` did before Phase 10 wired it. The free
+artifact omits it. See `cross-cutting.md` — "Build variants".
+
+The `tunnel-client` row's "May depend on" is empty by design: the crate takes
+**no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)
+and re-implements the relay's postcard wire frames locally rather than sharing a
+crate (the relay lives in a separate private repo — EXECUTION.md X9), and it
+bridges to the loopback `mcp-server` over HTTP like any external client. The
+loopback URL + internal bearer + relay URL + device credential are injected by
+`app-main` (from `ipc-bridge::McpServerInfo`) as configuration, so the crate
+needs no `common` types. Third-party deps: `tokio-tungstenite` (WSS dial-out,
+pinned to the relay's 0.29 line, rustls), `postcard` (default-features=false +
+alloc — the relay's frame codec, byte-for-byte), `reqwest` (the workspace
+loopback HTTP client, response streamed not buffered), `tokio`, `futures-util`,
+`serde`, `thiserror`, `tracing`. None introduces a workspace-component edge. See
+the `tunnel-client` component section below and `planning/WS4A_BUILD_PLAN.md` §2.
 
 Any PR adding an edge not in this table requires an architecture-doc
 update in the same commit. The table tracks **runtime** edges only;
@@ -1746,6 +1769,20 @@ older store written before the field existed deserialises to `"auto"`. The
 resolved language name is appended to the summariser and chat system prompts by
 `ipc-bridge` — the transcript itself is never touched. No new dependency edge
 on the `settings` crate. See the `ipc-bridge` "Output-language resolution" note.
+
+### `tunnel-client`
+**Crate:** `crates/tunnel-client`
+**Owns:** the app-side half of the connected-tier relay tunnel (WS4-A S3b): the
+outbound WSS dial to the hosted relay, the device handshake, and the
+request/response demux loop that replays relayed MCP requests against the app's
+own loopback `mcp-server`.
+
+**Dependency edges:** none in the workspace (see the dependency-table note). The
+crate is a near-leaf consumer of third-party crates only. It is part of the
+**connected** feature surface (D5 — the free build has no relay) and is wired
+into `app-main` behind the `connected` feature in S5; the S3b crate-add lands it
+in the workspace unconditionally (like `mcp-server` before its app-main wiring)
+without that edge.
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

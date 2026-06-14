@@ -1,0 +1,42 @@
+[package]
+name = "tunnel-client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# WS4-A S3b: the app-side half of the connected-tier tunnel. It dials the hosted
+# relay over WSS, receives framed MCP HTTP requests, and replays them against the
+# app's own loopback `mcp-server`, streaming the response back. It is a near-leaf:
+# it takes no workspace edge (the wire types are re-implemented here to match the
+# SEPARATE relay repo byte-for-byte, NOT shared as a crate — see X9), and it
+# bridges to the loopback server over the network like any external client (the
+# loopback URL + internal bearer are injected by app-main from
+# `ipc-bridge::McpServerInfo`, never imported). Part of the CONNECTED feature
+# surface: the crate lives in the workspace unconditionally (like `mcp-server`)
+# but is only wired into app-main behind the `connected` feature in S5.
+
+[dependencies]
+# Async runtime + WSS transport. tokio-tungstenite is pinned to the same 0.29
+# line the relay uses so the WebSocket framing is interoperable; rustls-tls keeps
+# the client off OpenSSL on Linux/Windows, matching the rest of the workspace.
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
+# Wire encoding. postcard with default-features=false + alloc is the exact build
+# the relay uses; the on-wire layout MUST match (variant order is the contract).
+postcard = { workspace = true }
+serde = { workspace = true }
+# Loopback HTTP client for replaying requests against the in-process mcp-server.
+# Reuses the workspace reqwest (rustls + stream) so the response body is consumed
+# as a chunk stream rather than buffered whole.
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util", "net"] }
+# The integration test stands up a fake relay (a tokio-tungstenite SERVER accept)
+# and a fake loopback HTTP server (a raw tokio TcpListener speaking minimal
+# HTTP/1.1), so no extra server framework is pulled in.
+tokio-tungstenite = { workspace = true, features = ["handshake"] }

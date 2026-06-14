@@ -103,6 +103,8 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 mcpServer = component "mcp-server" "In-process Streamable HTTP MCP server (loopback). Projects the agent-tools registry onto tools/list / tools/call; bearer + Host/Origin auth. Settings-gated, off by default." "Rust crate: crates/mcp-server"
 
+                tunnelClient = component "tunnel-client" "App-side half of the connected-tier relay tunnel (WS4-A). Dials the hosted relay OUTBOUND over WSS, re-implements the relay's postcard wire frames, and replays relayed MCP requests against the loopback mcp-server with the internal bearer. No workspace edge; connected-feature gated; wired into app-main in S5." "Rust crate: crates/tunnel-client"
+
                 settings = component "settings" "Settings schema, validation, change notifications. Persists via tauri-plugin-store." "Rust crate: crates/settings"
 
                 ipcBridge = component "ipc-bridge" "Tauri command + event surface. tauri-specta generates the TypeScript bindings consumed by the webview's IPC client. The only crate that knows about Tauri APIs." "Rust crate: crates/ipc-bridge"

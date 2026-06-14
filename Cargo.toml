@@ -15,6 +15,7 @@ members = [
     "crates/agent-tools",
     "crates/chat-agent",
     "crates/mcp-server",
+    "crates/tunnel-client",
     "crates/ipc-bridge",
     "src-tauri",
     "spikes/asr",
@@ -172,3 +173,17 @@ http = "1"
 # `stable`), so 0.26 is the latest release that builds here. Revisit when the
 # toolchain has advanced enough to compile 0.27+.
 yrs = "0.26"
+
+# WS4-A S3b additions — the app-side tunnel-client (connected tier).
+# tokio-tungstenite is the async WSS transport the client dials OUT on; pinned to
+# the 0.29 line the relay uses so WebSocket framing is interoperable.
+# rustls-tls-webpki-roots keeps it off OpenSSL on Linux/Windows, matching the
+# rest of the workspace's rustls posture. Feature sets differ per consumer
+# (`connect` for the client, `handshake` for the test fake-relay server), so the
+# crate's dev-dependency restates them; the version pin lives here.
+tokio-tungstenite = { version = "0.29", default-features = false }
+# postcard with default-features=false + alloc is the exact build the relay's
+# frame codec uses; the on-wire layout MUST match byte-for-byte (the
+# tunnel-client re-implements the relay's `Frame` enum — variant order is the
+# contract). Same workspace pin as the relay repo.
+postcard = { version = "1", default-features = false, features = ["alloc"] }

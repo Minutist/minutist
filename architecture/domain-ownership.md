@@ -28,6 +28,7 @@ role when work is parallel.
 | `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator` |
 | `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
+| `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |
@@ -84,6 +85,15 @@ events, tauri-specta, error-propagation conventions.
 This role has the broadest read access; it imports every other crate.
 That's by design — orchestration is centralised so the other crates
 stay leaf-shaped.
+
+`tunnel-client` (WS4-A) is systems-engineer for the same reason as
+`mcp-server`: it is transport/IPC-adjacent connective tissue (the app-side
+relay tunnel that bridges to the loopback `mcp-server`), it shares the
+`connected`-feature gating and the internal-bearer handoff with `mcp-server`,
+and `app-main` (systems-engineer) is the assembler that injects its config and
+wires it behind the feature in S5. It owns no domain logic of another crate — it
+re-implements the relay's wire frames and forwards HTTP — so it stays a near-leaf
+under one role.
 
 ### `frontend-engineer`
 Owns everything under `ui/src/`. Knowledge expected: React 19, Tiptap +

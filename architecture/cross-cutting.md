@@ -1281,6 +1281,8 @@ The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server
 
 **Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper".
 
+**Connected-tier tunnel (`tunnel-client`).** The `connected`-feature gating extends to the app-side relay tunnel (WS4-A): `tunnel-client` is part of the connected surface (the free build has no relay), so `app-main`'s optional edge on it is gated by the same `connected` feature as `mcp-server`, added when the tunnel is wired in WS4-A S5. The crate itself lives in the workspace unconditionally (compiled by the workspace build / `cargo test`) and is simply not pulled into the free binary — the same pattern `mcp-server` followed before Phase 10. The tunnel does **not** add a listening socket: it dials OUTBOUND to the relay (no inbound port), and replays relayed requests against the existing loopback `mcp-server`. The internal `mcp_token` bearer doubles as the relay↔app secret here, applied app-side to the loopback replay only and never sent outbound to the relay (see the "Token storage and file permissions" / "Token lifetime and the connected-relay path" notes above). The tunnel **device credential** secret (`tunnel_device.json`, 0600) is introduced by S5 pairing, not S3b.
+
 ## What's not decided here
 
 These need decisions but are not yet binding:

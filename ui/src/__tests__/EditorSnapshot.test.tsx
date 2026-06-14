@@ -1,20 +1,22 @@
 /**
- * Behaviour test for the Editor's autosave snapshot payload (FR-18).
+ * Behaviour test for the Editor's collab persistence payload (FR-18, B6 WU7).
  *
  * Mounts the REAL `Editor` component (not a stubbed snapshot) so the production
- * `getSnapshot` closure in `editor/Editor.tsx` actually runs. That closure reads
+ * markdown renderer in `editor/Editor.tsx` actually runs. That renderer reads
  * the persisted markdown via an untyped reach into Tiptap storage —
- * `editor.storage["markdown"].getMarkdown()` — with a `?? ""` fallback. The
- * existing autosave tests inject a stub snapshot and never execute this closure,
- * so a drift of the `"markdown"` storage key or `getMarkdown` method would
- * silently persist an empty `notes.md` while staying green.
+ * `editor.storage["markdown"].getMarkdown()` — with a `?? ""` fallback. With an
+ * active recording the editor binds a per-meeting Y.Doc, so the content flows
+ * through `apply_notes_update` (the binary Yjs update + the rendered markdown),
+ * not the legacy `save_notes` JSON path. A drift of the `"markdown"` storage key
+ * or `getMarkdown` method would silently persist an empty `notes.md` while
+ * staying green.
  *
  * This test pins that access end-to-end: with an active recording, real typed
- * content, and autosave triggered through the real path (interval timer and
- * blur), it asserts on the payload actually handed to the `saveNotes` IPC seam
- * (mocked at `../ipc/notes`). `notesMarkdown` must contain the typed heading
+ * content, and persistence triggered through the real path (debounced timer and
+ * blur), it asserts on the payload actually handed to the `applyNotesUpdate` IPC
+ * seam (mocked at `../ipc/notes`). The markdown must contain the typed heading
  * text — proving `getMarkdown()` resolved rather than the `?? ""` fallback — and
- * `notesJson` must round-trip the typed content.
+ * the update must be non-empty bytes (the editor's edit reached the Y.Doc).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, cleanup, fireEvent } from "@testing-library/react";
@@ -44,10 +46,12 @@ vi.mock("../ipc/bindings", () => ({
 vi.mock("../ipc/notes", () => ({
   saveNotes: vi.fn().mockResolvedValue(undefined),
   loadNotes: vi.fn().mockResolvedValue(null),
+  applyNotesUpdate: vi.fn().mockResolvedValue(undefined),
+  loadNotesYdoc: vi.fn().mockResolvedValue(null),
 }));
 
 import type { Editor as TiptapEditor } from "@tiptap/core";
-import { saveNotes } from "../ipc/notes";
+import { applyNotesUpdate } from "../ipc/notes";
 import { Editor } from "../editor/Editor";
 import { useRecordingStore } from "../state/recording";
 import { typeText, placeCursorAtEnd } from "./editor-test-utils";
@@ -92,17 +96,22 @@ async function mountActiveEditor(): Promise<{
   return { editor, content };
 }
 
-/** The single payload `saveNotes` was called with; fails if not called once. */
-function soleSavePayload() {
-  const calls = vi.mocked(saveNotes).mock.calls;
-  expect(calls).toHaveLength(1);
-  return calls[0][0];
+/**
+ * The arguments of the LAST `applyNotesUpdate` call: `(meetingId, update,
+ * notesMarkdown)`. Fails if it was never called. The collab sync may coalesce a
+ * burst into one or more whole-state sends; the last one carries the final
+ * document, so assert on it rather than on a single-call count.
+ */
+function lastUpdateArgs() {
+  const calls = vi.mocked(applyNotesUpdate).mock.calls;
+  expect(calls.length).toBeGreaterThanOrEqual(1);
+  return calls[calls.length - 1];
 }
 
 describe("Editor autosave snapshot payload", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    vi.mocked(saveNotes).mockClear();
+    vi.mocked(applyNotesUpdate).mockClear();
     useRecordingStore.setState({
       state: { kind: "recording", meeting_id: "meeting-xyz", started_at_ms: 1_000 },
       devices: [],
@@ -127,7 +136,7 @@ describe("Editor autosave snapshot payload", () => {
     useRecordingStore.setState({ state: { kind: "idle" } });
   });
 
-  it("persists typed markdown + JSON via the real getSnapshot on the interval", async () => {
+  it("ships the typed update + rendered markdown via apply_notes_update on the debounce", async () => {
     const { editor } = await mountActiveEditor();
     act(() => {
       placeCursorAtEnd(editor);
@@ -135,33 +144,27 @@ describe("Editor autosave snapshot payload", () => {
       vi.advanceTimersToNextFrame();
     });
 
-    expect(saveNotes).not.toHaveBeenCalled();
+    expect(applyNotesUpdate).not.toHaveBeenCalled();
     act(() => {
       vi.advanceTimersByTime(5_000);
     });
 
-    const payload = soleSavePayload();
-    expect(payload.meetingId).toBe("meeting-xyz");
+    const [meetingId, update, notesMarkdown] = lastUpdateArgs();
+    expect(meetingId).toBe("meeting-xyz");
+
+    // The Yjs update is non-empty bytes — the keystroke reached the bound Y.Doc.
+    expect(update).toBeInstanceOf(Uint8Array);
+    expect((update as Uint8Array).length).toBeGreaterThan(0);
 
     // `notesMarkdown` proves `editor.storage["markdown"].getMarkdown()` really
     // resolved — it is non-empty (NOT the `?? ""` fallback) and the `# ` input
     // rule produced a markdown heading carrying the typed text.
-    expect(payload.notesMarkdown).not.toBe("");
-    expect(payload.notesMarkdown).toContain("Agenda heading");
-    expect(payload.notesMarkdown).toContain("#");
-
-    // `notesJson` round-trips the typed content as a ProseMirror heading node.
-    const doc = JSON.parse(payload.notesJson) as {
-      type: string;
-      content: Array<{ type: string; content?: Array<{ text?: string }> }>;
-    };
-    expect(doc.type).toBe("doc");
-    const heading = doc.content.find((n) => n.type === "heading");
-    expect(heading).toBeDefined();
-    expect(heading?.content?.[0]?.text).toBe("Agenda heading");
+    expect(notesMarkdown).not.toBe("");
+    expect(notesMarkdown).toContain("Agenda heading");
+    expect(notesMarkdown).toContain("#");
   });
 
-  it("persists the same real snapshot on blur", async () => {
+  it("flushes the pending update on blur", async () => {
     const { editor, content } = await mountActiveEditor();
     act(() => {
       placeCursorAtEnd(editor);
@@ -170,15 +173,15 @@ describe("Editor autosave snapshot payload", () => {
     });
 
     // A real DOM blur on the contenteditable drives ProseMirror's `blur` emit,
-    // which fires the production on-blur flush handler — exercising the same
-    // real `getSnapshot` path the interval uses, just triggered immediately.
+    // which fires the production on-blur flush handler — flushing the collab
+    // sync's pending update immediately rather than waiting for the debounce.
     act(() => {
       fireEvent.blur(content);
     });
 
-    const payload = soleSavePayload();
-    expect(payload.notesMarkdown).not.toBe("");
-    expect(payload.notesMarkdown).toContain("Blur heading");
-    expect(JSON.parse(payload.notesJson).type).toBe("doc");
+    const [, update, notesMarkdown] = lastUpdateArgs();
+    expect((update as Uint8Array).length).toBeGreaterThan(0);
+    expect(notesMarkdown).not.toBe("");
+    expect(notesMarkdown).toContain("Blur heading");
   });
 });

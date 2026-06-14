@@ -54,6 +54,13 @@ export type UseAutosaveArgs = {
   /** Autosave cadence in seconds; falls back to the default when null. */
   intervalSecs: number | null;
   /**
+   * Whether this legacy JSON autosave path is active. Defaults to `true`. The
+   * collaboration binding (B6 WU7) sets this `false` when a Y.Doc is bound, so
+   * the Y.Doc → `apply_notes_update` path is the single writer and this autosave
+   * does not race it on the same files.
+   */
+  enabled?: boolean;
+  /**
    * Reads the latest notes to persist. Returns `null` when there is nothing
    * worth saving (e.g. the editor is not ready yet).
    */
@@ -70,6 +77,7 @@ export type UseAutosaveArgs = {
  */
 export function useAutosave(args: UseAutosaveArgs): { flush: () => void } {
   const { state, openMeetingId, intervalSecs, getSnapshot, onError } = args;
+  const enabled = args.enabled ?? true;
 
   // Keep the latest snapshot/error callbacks in refs so the interval effect
   // does not re-subscribe on every keystroke (which would reset the timer).
@@ -79,8 +87,11 @@ export function useAutosave(args: UseAutosaveArgs): { flush: () => void } {
   onErrorRef.current = onError;
 
   // Recording (live) takes precedence; otherwise the open saved meeting. Null
-  // only on the live entry surface with nothing open → autosave no-ops.
-  const meetingId = activeMeetingId(state) ?? openMeetingId ?? null;
+  // only on the live entry surface with nothing open → autosave no-ops. Also
+  // null when this path is disabled (collab binding owns persistence).
+  const meetingId = enabled
+    ? activeMeetingId(state) ?? openMeetingId ?? null
+    : null;
 
   const performSave = useRef((id: string) => {
     const snapshot = getSnapshotRef.current();

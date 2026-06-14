@@ -8,8 +8,11 @@
  *   - the ParagraphAnchor extension stamping `data-anchor-ms` from the store's
  *     `recordingClockMs` (the pause-excluding capture clock) on first keystroke
  *     while recording,
- *   - interval + on-blur autosave through the `save_notes` IPC seam, no-op when
- *     no meeting is active,
+ *   - a per-meeting local Yjs document (via `@tiptap/extension-collaboration`)
+ *     that the content flows through: hydrated from `load_notes_ydoc` on open and
+ *     persisted by debounced (autosave cadence + on-blur) `apply_notes_update`
+ *     calls — local-only, no network (B6 WU7). The legacy `save_notes` JSON path
+ *     remains as the single writer only when no collaboration doc is bound,
  *   - copy that writes an HTML clipboard payload so paste into Word retains
  *     formatting.
  */
@@ -22,6 +25,7 @@ import { useCrossRefStore } from "../state/cross-ref";
 import { activeTranscript } from "../state/active-transcript";
 import { buildEditorExtensions } from "./extensions";
 import { useAutosave, activeMeetingId } from "./useAutosave";
+import { useNotesCollab } from "./useNotesCollab";
 import { buildClipboardPayload } from "./clipboard";
 import { handleSegmentDrop } from "./transcript-dnd";
 import { handleImagePaste, handleImageDrop } from "./image-paste";
@@ -85,8 +89,33 @@ export function Editor() {
   // assigned. Populated by the effect below once `useEditor` returns.
   const editorRef = useRef<TiptapEditor | null>(null);
 
-  const editor = useEditor({
+  const intervalSecs = readAutosaveInterval(settings);
+
+  // The meeting whose notes are open, computed REACTIVELY (recording takes
+  // precedence, else the open saved meeting) so the collaboration binding
+  // re-creates its Y.Doc when the meeting changes. `currentMeetingId()` (read
+  // non-reactively below) stays for paste/drop handlers that need the latest
+  // value without re-rendering.
+  const collabMeetingId = activeMeetingId(recordingState) ?? openMeetingId ?? null;
+
+  // B6 WU7: bind the editor to a per-meeting local Y.Doc. The hook hydrates it
+  // from the stored notes.ydoc (`load_notes_ydoc`) and debounces local edits to
+  // `apply_notes_update`. The markdown is rendered lazily from the live editor
+  // for the `notes.md` projection. No network — the IPC save seam is the only
+  // transport.
+  const collabMarkdownRef = useRef<() => string>(() => "");
+  const { doc: collabDoc, flush: flushCollab } = useNotesCollab({
+    meetingId: collabMeetingId,
+    intervalSecs,
+    getMarkdown: () => collabMarkdownRef.current(),
+  });
+
+  const editor = useEditor(
+    {
     extensions: buildEditorExtensions({
+      // Per-meeting Yjs document the content flows through (B6 WU7). When
+      // present, Collaboration owns undo/redo and StarterKit history is off.
+      collabDoc: collabDoc ?? undefined,
       // Read the recording clock lazily on each keystroke from the store so the
       // anchor value is always the latest pause-excluding capture clock — never
       // a wall-clock delta. `getState()` avoids re-creating the editor when the
@@ -151,14 +180,35 @@ export function Editor() {
         },
       },
     },
-  });
+    },
+    // Re-create the editor when the bound Y.Doc changes (a meeting open/close or
+    // switch). The Collaboration extension binds to a specific Y.Doc at
+    // construction, so a swap requires a fresh editor — keyed on the doc
+    // identity. `null` (no meeting) also re-creates a plain, unbound editor.
+    [collabDoc],
+  );
 
-  const intervalSecs = readAutosaveInterval(settings);
+  // The collab sync renders `notes.md` from the live editor; keep the renderer
+  // in a ref so the hook (created before `editor` exists) always reads the
+  // current instance.
+  collabMarkdownRef.current = () => {
+    if (!editor) return "";
+    const markdownStorage = (
+      editor.storage as unknown as Record<string, unknown>
+    )["markdown"] as { getMarkdown: () => string } | undefined;
+    return markdownStorage?.getMarkdown() ?? "";
+  };
 
+  // Legacy JSON autosave path (`save_notes`). It is the SINGLE WRITER only when
+  // there is no collaboration doc bound (e.g. the editor unit tests, or a
+  // never-collab context); when `collabDoc` is present the Y.Doc → `apply_notes_
+  // update` path is authoritative and this autosave is disabled so the two never
+  // race on the same files (D-O2.1 single-writer story).
   const { flush } = useAutosave({
     state: recordingState,
     openMeetingId,
     intervalSecs,
+    enabled: collabDoc === null,
     getSnapshot: () => {
       if (!editor) return null;
       const markdownStorage = (
@@ -176,10 +226,16 @@ export function Editor() {
   // sheet (SPEC Phase-4 acceptance: "load a past meeting fully restores notes,
   // transcript, audio, and cross-reference"). Keyed on the open meeting's notes
   // so re-opening a different meeting re-hydrates; an open meeting with no saved
-  // notes resets the editor to empty. NOT DEV-gated — this is the real restore
-  // path the DEV shim previously stood in for.
+  // notes resets the editor to empty.
+  //
+  // GATED ON `collabDoc === null`: when a collaboration doc is bound (B6 WU7),
+  // the Y.Doc is the source of truth and is hydrated from `load_notes_ydoc` by
+  // `useNotesCollab` — the editor's content is already populated from it. Calling
+  // `setContent`/`clearContent` here would bypass the CRDT (and its history) and
+  // race the Y.Doc, so this legacy JSON hydration only runs in the non-collab
+  // fallback (e.g. tests that don't bind a doc).
   useEffect(() => {
-    if (!editor) return;
+    if (!editor || collabDoc !== null) return;
     const notes = openMeetingState?.notes ?? null;
     if (!notes) {
       // Open meeting with no notes (or no meeting open): start from an empty
@@ -192,7 +248,7 @@ export function Editor() {
     } catch {
       /* malformed stored notes — leave the editor empty */
     }
-  }, [editor, openMeetingState]);
+  }, [editor, openMeetingState, collabDoc]);
 
   // DEV-only: in a plain `vite dev` browser (no Tauri backend, no open meeting)
   // seed the editor with sample notes so the themed sheet renders populated for
@@ -202,7 +258,8 @@ export function Editor() {
   // Skips when a saved meeting is open so the production restore effect above
   // owns the content.
   useEffect(() => {
-    if (!editor || !import.meta.env.DEV || !shouldUseDevShim()) return;
+    if (!editor || collabDoc !== null) return;
+    if (!import.meta.env.DEV || !shouldUseDevShim()) return;
     if (useMeetingsStore.getState().openMeetingState !== null) return;
     let cancelled = false;
     void loadNotes("dev-meeting-0001").then((doc) => {
@@ -216,7 +273,7 @@ export function Editor() {
     return () => {
       cancelled = true;
     };
-  }, [editor]);
+  }, [editor, collabDoc]);
 
   // Keep the editor ref current for the construction-time `drop` handler.
   editorRef.current = editor;
@@ -234,8 +291,15 @@ export function Editor() {
   }, [editor, scrollRequest]);
 
   // Flush on blur so notes are persisted the instant focus leaves the editor.
-  const flushRef = useRef(flush);
-  flushRef.current = flush;
+  // Flushes BOTH writers: the collab sync (when a doc is bound — the active
+  // path) and the legacy autosave (otherwise). Only one is doing real work at a
+  // time (the other's meeting id / dirty state is null), so flushing both is
+  // safe and keeps the blur handler agnostic of which path is live.
+  const flushRef = useRef<() => void>(() => {});
+  flushRef.current = () => {
+    flushCollab();
+    flush();
+  };
   useEffect(() => {
     if (!editor) return;
     const handleBlur = () => flushRef.current();

@@ -70,6 +70,12 @@ export const commands: Commands = {
   saveNotes: (meetingId, notesJson, notesMarkdown) =>
     callCommand("saveNotes", [meetingId, notesJson, notesMarkdown]),
   loadNotes: (meetingId) => callCommand("loadNotes", [meetingId]),
+  // CRDT editor binding (B6 WU7): merge an editor-produced lib0-v1 Yjs update
+  // onto the meeting's notes.ydoc; read the stored doc as a v1 state update for
+  // the editor to hydrate on open. The DEV shim no-ops them (no backend).
+  applyNotesUpdate: (meetingId, update, notesMarkdown) =>
+    callCommand("applyNotesUpdate", [meetingId, update, notesMarkdown]),
+  loadNotesYdoc: (meetingId) => callCommand("loadNotesYdoc", [meetingId]),
   // Persist a pasted/dropped note image; returns the portable filename ref the
   // editor stores into notes.json. The DEV shim no-ops it (no backend).
   saveNoteImage: (meetingId, bytes, ext) =>

@@ -9,6 +9,8 @@
  */
 import { Editor } from "@tiptap/core";
 import { TextSelection } from "@tiptap/pm/state";
+import * as Y from "yjs";
+import { buildEditorExtensions } from "../editor/extensions";
 
 /** Type a single character at the current selection, firing input rules. */
 export function typeChar(editor: Editor, ch: string): void {
@@ -41,6 +43,33 @@ export function placeCursorAtEnd(editor: Editor): void {
 /** Press Enter (split the current block into a new paragraph). */
 export function pressEnter(editor: Editor): void {
   editor.commands.splitBlock();
+}
+
+/**
+ * Build a lib0 **v1** Yjs update encoding `docJson` (a ProseMirror document),
+ * exactly as the backend's `load_notes_ydoc` would hand it to the editor.
+ *
+ * Drives the REAL collaboration binding: a throwaway Collaboration-bound editor
+ * is constructed against a scratch `Y.Doc`, its content set to `docJson`, and
+ * the resulting whole state encoded with `Y.encodeStateAsUpdate` (v1). This
+ * produces bytes structurally identical to what the editor itself emits, so a
+ * test that feeds them back through `loadNotesYdoc` exercises the genuine
+ * hydrate path. Returns the `Uint8Array` update.
+ */
+export function buildNotesYdocV1Update(docJson: unknown): Uint8Array {
+  const ydoc = new Y.Doc();
+  const editor = new Editor({
+    extensions: buildEditorExtensions({
+      clockSource: () => ({ recording: false, clockMs: null }),
+      collabDoc: ydoc,
+    }),
+  });
+  // `setContent` (NOT the `content` option, which Collaboration ignores) routes
+  // through the binding and mutates the Y.Doc; encode its whole state as v1.
+  editor.commands.setContent(docJson as Record<string, unknown>);
+  const update = Y.encodeStateAsUpdate(ydoc);
+  editor.destroy();
+  return update;
 }
 
 /**

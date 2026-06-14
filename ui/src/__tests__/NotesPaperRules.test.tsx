@@ -24,6 +24,8 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({ WebviewWindow: vi.fn() }));
 vi.mock("../ipc/notes", () => ({
   saveNotes: vi.fn().mockResolvedValue(undefined),
   loadNotes: vi.fn().mockResolvedValue(null),
+  applyNotesUpdate: vi.fn().mockResolvedValue(undefined),
+  loadNotesYdoc: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock("../ipc/bindings", () => {

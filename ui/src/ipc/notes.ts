@@ -53,3 +53,43 @@ export async function saveNotes(payload: SaveNotesPayload): Promise<void> {
 export async function loadNotes(meetingId: string): Promise<NotesDoc | null> {
   return unwrap(await commands.loadNotes(meetingId));
 }
+
+/**
+ * Apply an incremental Yjs update from the editor's local `Y.Doc` to the
+ * meeting's authoritative `notes.ydoc` (B6 WU7).
+ *
+ * `update` is a lib0 **v1** update (the bytes from a `Y.Doc` `'update'` event /
+ * `Y.encodeStateAsUpdate`), passed as a plain number array — the wire shape the
+ * `apply_notes_update` command expects (`Vec<u8>` ↔ `number[]`). The backend
+ * merges it onto the stored doc, preserving CRDT history, then re-derives
+ * `notes.json` and writes the supplied `notes.md`. This is the editor's primary
+ * write path once the collaboration binding is active.
+ */
+export async function applyNotesUpdate(
+  meetingId: string,
+  update: Uint8Array,
+  notesMarkdown: string,
+): Promise<void> {
+  unwrap(
+    await commands.applyNotesUpdate(
+      meetingId,
+      Array.from(update),
+      notesMarkdown,
+    ),
+  );
+}
+
+/**
+ * Read the meeting's stored `notes.ydoc` as a lib0 **v1** state update for the
+ * editor to apply with `Y.applyUpdate` on open, or `null` when the meeting has
+ * no CRDT-backed notes yet (B6 WU7).
+ *
+ * The bytes come over the wire as a `number[]`; this returns them as a
+ * `Uint8Array` ready for `Y.applyUpdate`.
+ */
+export async function loadNotesYdoc(
+  meetingId: string,
+): Promise<Uint8Array | null> {
+  const state = unwrap(await commands.loadNotesYdoc(meetingId));
+  return state === null ? null : Uint8Array.from(state);
+}

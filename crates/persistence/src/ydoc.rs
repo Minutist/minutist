@@ -55,8 +55,11 @@ use yrs::{
     XmlElementPrelim, XmlFragment, XmlTextPrelim, XmlTextRef,
 };
 
-/// The top-level `XmlFragment` name holding the notes document. Matches
-/// y-prosemirror's default (`"prosemirror"`) so the editor-side binding interops.
+/// The top-level `XmlFragment` name holding the notes document. The editor-side
+/// Yjs binding (`@tiptap/extension-collaboration`) is pinned to this same name
+/// via its `field` option so both sides read/write one fragment; this is the
+/// y-prosemirror fragment-name convention (the @tiptap extension's own default
+/// `field` is `"default"`, hence the explicit pin on the editor side).
 pub const PROSEMIRROR_FRAGMENT: &str = "prosemirror";
 
 /// Build a fresh, empty Yjs [`Doc`] with the [`PROSEMIRROR_FRAGMENT`] fragment

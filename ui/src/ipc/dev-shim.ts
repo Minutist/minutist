@@ -425,6 +425,21 @@ export const devCommands = {
   ): Promise<Result<NotesDocument | null, IpcError>> {
     return ok({ notes_json: DEV_NOTES_JSON, notes_markdown: DEV_NOTES_MD });
   },
+  // CRDT editor binding (B6 WU7): no backend in a `vite dev` browser, so the
+  // update sink no-ops and there is no stored ydoc to hydrate from (the editor
+  // falls back to the JSON dev-seed path).
+  async applyNotesUpdate(
+    _meetingId: MeetingId,
+    _update: number[],
+    _notesMarkdown: string,
+  ): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async loadNotesYdoc(
+    _meetingId: MeetingId,
+  ): Promise<Result<number[] | null, IpcError>> {
+    return ok(null);
+  },
   // No backend in a `vite dev` browser; return a plausible content-hash-style
   // filename so the paste path doesn't throw during visual QA (the resulting
   // `meetingasset:` URL won't resolve to bytes, which is expected in dev).

@@ -14,6 +14,11 @@
  * was called:
  *   - the editor content reflects the restored notes (the heading text shows),
  *   - the transcript pane renders the restored segments (their text shows).
+ *
+ * Under the CRDT editor binding (B6 WU7) the notes restore flows through the
+ * editor's Y.Doc, hydrated from `load_notes_ydoc` — so this test returns a real
+ * v1 Yjs update (built from the restored notes JSON via the genuine binding) and
+ * asserts the hydrated content renders.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
@@ -50,9 +55,13 @@ vi.mock("../ipc/bindings", () => ({
 vi.mock("../ipc/notes", () => ({
   saveNotes: vi.fn().mockResolvedValue(undefined),
   loadNotes: vi.fn().mockResolvedValue(null),
+  applyNotesUpdate: vi.fn().mockResolvedValue(undefined),
+  loadNotesYdoc: vi.fn().mockResolvedValue(null),
 }));
 
 import { openMeeting } from "../ipc/meetings";
+import { loadNotesYdoc } from "../ipc/notes";
+import { buildNotesYdocV1Update } from "./editor-test-utils";
 import type { MeetingState } from "../ipc/meetings";
 import type { Segment } from "../ipc/bindings";
 
@@ -125,6 +134,13 @@ describe("opening a saved meeting restores notes + transcript (U1)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(openMeeting).mockResolvedValue(RESTORED_STATE);
+    // Production restore now hydrates the editor's Y.Doc from `load_notes_ydoc`
+    // (B6 WU7), not the notes.json `setContent` path. Return a real v1 Yjs
+    // update encoding the restored notes so the collab binding hydrates and the
+    // restored heading/body render.
+    vi.mocked(loadNotesYdoc).mockResolvedValue(
+      buildNotesYdocV1Update(JSON.parse(RESTORED_NOTES_JSON)),
+    );
     act(() => {
       useRecordingStore.setState({
         state: { kind: "idle" },

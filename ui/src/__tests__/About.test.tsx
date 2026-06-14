@@ -62,6 +62,8 @@ vi.mock("../ipc/meetings", () => ({
 vi.mock("../ipc/notes", () => ({
   saveNotes: vi.fn().mockResolvedValue(undefined),
   loadNotes: vi.fn().mockResolvedValue(null),
+  applyNotesUpdate: vi.fn().mockResolvedValue(undefined),
+  loadNotesYdoc: vi.fn().mockResolvedValue(null),
 }));
 
 import { About } from "../shell/About";

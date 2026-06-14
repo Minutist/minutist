@@ -30,6 +30,8 @@
  *     no attrs and dispatches no transactions, so it cannot affect anchoring.
  */
 import StarterKit from "@tiptap/starter-kit";
+import { Collaboration } from "@tiptap/extension-collaboration";
+import type * as Y from "yjs";
 import { Link } from "@tiptap/extension-link";
 import { Typography } from "@tiptap/extension-typography";
 import { Table } from "@tiptap/extension-table";
@@ -46,6 +48,7 @@ import { NotesHoverBridge } from "./hover-bridge";
 import type { HoverAnchorReporter } from "./hover-bridge";
 import { NoteImage } from "./note-image";
 import type { MeetingIdSource } from "./note-image";
+import { NOTES_FRAGMENT } from "./notes-collab";
 
 export type BuildExtensionsOptions = {
   /** Supplies the recording state + pause-excluding clock to ParagraphAnchor. */
@@ -62,6 +65,17 @@ export type BuildExtensionsOptions = {
    * no-op (`null`) when omitted; bare refs then render as-is (unresolved).
    */
   meetingIdSource?: MeetingIdSource;
+  /**
+   * The per-meeting Yjs document the editor binds to via
+   * `@tiptap/extension-collaboration` (B6 WU7). When supplied, the document
+   * flows through this `Y.Doc` rather than `getJSON()` → `save_notes`, and the
+   * Collaboration extension owns undo/redo — so StarterKit's built-in history
+   * is DISABLED to avoid a double/broken undo stack.
+   *
+   * When omitted (e.g. editor unit tests that don't exercise collaboration),
+   * StarterKit's history is kept and content flows through the legacy JSON path.
+   */
+  collabDoc?: Y.Doc;
 };
 
 /**
@@ -74,11 +88,22 @@ export type BuildExtensionsOptions = {
 export function buildEditorExtensions(
   options: BuildExtensionsOptions,
 ): Extensions {
+  const collab = options.collabDoc;
   return [
     StarterKit.configure({
       // The standalone Link extension owns linking; disable the bundled one.
       link: false,
+      // When collaborating, the Collaboration extension provides undo/redo via
+      // the Yjs UndoManager; StarterKit's own history would fight it (a broken,
+      // doubled undo stack), so disable it. Without a collab doc, keep history.
+      ...(collab ? { undoRedo: false as const } : {}),
     }),
+    // Bind the editor to the per-meeting Y.Doc (B6 WU7). y-prosemirror binds at
+    // the ProseMirror schema level, so the custom nodes round-trip unchanged.
+    // The fragment name is pinned to match `persistence::ydoc`.
+    ...(collab
+      ? [Collaboration.configure({ document: collab, field: NOTES_FRAGMENT })]
+      : []),
     Link.configure({
       openOnClick: false,
       autolink: true,

@@ -2454,6 +2454,41 @@ mod tests {
         assert_eq!(rows[0].title, "New title");
     }
 
+    /// `set_speaker_name` writes the label→name mapping into `metadata.json` and
+    /// returns the updated map; clearing with an empty name removes the entry.
+    /// The index is not touched (speaker names live only in `metadata.json`).
+    #[tokio::test]
+    async fn set_speaker_name_persists_and_clears() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = write_synthetic_meeting(root, "Speakers", "2026-06-14T10:00:00Z", None);
+
+        // Upsert label "A" → "Alice".
+        let names = meeting_ops::set_speaker_name(root, meeting_id, "A", "Alice")
+            .await
+            .expect("set A");
+        assert_eq!(names.get("A").map(String::as_str), Some("Alice"));
+
+        // Confirm on-disk metadata reflects the name.
+        let folder = root.join(meeting_id.0.to_string());
+        let meta = persistence::read_metadata(&folder).expect("read metadata");
+        assert_eq!(meta.speaker_names.get("A").map(String::as_str), Some("Alice"));
+
+        // Add a second speaker name without clobbering the first.
+        let names2 = meeting_ops::set_speaker_name(root, meeting_id, "B", "Bob")
+            .await
+            .expect("set B");
+        assert_eq!(names2.get("A").map(String::as_str), Some("Alice"));
+        assert_eq!(names2.get("B").map(String::as_str), Some("Bob"));
+
+        // Clear "A" with an empty name.
+        let names3 = meeting_ops::set_speaker_name(root, meeting_id, "A", "")
+            .await
+            .expect("clear A");
+        assert!(!names3.contains_key("A"));
+        assert_eq!(names3.get("B").map(String::as_str), Some("Bob"));
+    }
+
     /// Stop-upsert (FR-33): after a meeting folder is written and its index row
     /// is upserted (the stop-equivalent the `stop_recording` command performs),
     /// `list_meetings` returns it **in the same session** — without a

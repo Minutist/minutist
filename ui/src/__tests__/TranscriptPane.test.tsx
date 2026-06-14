@@ -33,6 +33,7 @@ vi.mock("../ipc/meetings", () => ({
   deleteMeeting: vi.fn(),
   reTranscribe: vi.fn().mockResolvedValue(undefined),
   rediarize: vi.fn().mockResolvedValue(undefined),
+  setSpeakerName: vi.fn().mockResolvedValue({}),
 }));
 
 import { TranscriptPane, formatTimestamp } from "../transcript/TranscriptPane";
@@ -444,5 +445,151 @@ describe("TranscriptPane action toolbar (#67)", () => {
     expect(
       screen.getByRole("button", { name: "Re-identify speakers" }),
     ).not.toBeDisabled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Speaker chip rename (issue #0001)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a two-segment meeting state with two speakers so SpeakerChip
+ * renders for both (the chip shows only at speaker-run boundaries).
+ */
+function makeSpeakerSegments(): Segment[] {
+  return [
+    {
+      start_ms: 0,
+      end_ms: 2_000,
+      text: "Hello from A.",
+      speaker_id: "A",
+      words: [],
+    },
+    {
+      start_ms: 2_000,
+      end_ms: 4_000,
+      text: "Hello from B.",
+      speaker_id: "B",
+      words: [],
+    },
+  ];
+}
+
+describe("SpeakerChip rename (issue #0001)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Return the updated map from the mock so the store can reflect it.
+    (meetingsIpc.setSpeakerName as ReturnType<typeof vi.fn>).mockResolvedValue(
+      { A: "Alice" },
+    );
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" } });
+      useMeetingsStore.setState({
+        openMeetingId: "saved-chip",
+        openMeetingState: {
+          transcript: makeSpeakerSegments(),
+          meta: { speaker_names: {} },
+        } as unknown as MeetingState,
+      });
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    act(() => {
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+    });
+  });
+
+  it("renders speaker chips as buttons (click-to-rename) on a saved idle meeting", () => {
+    render(<TranscriptPane />);
+    // Each speaker-run boundary gets a chip button; query by visible text.
+    expect(screen.getByRole("button", { name: "Speaker A" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Speaker B" })).toBeInTheDocument();
+    // Both chip buttons carry the rename tooltip.
+    const titleEls = screen.getAllByTitle("Click to rename this speaker");
+    expect(titleEls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("shows the display name from speaker_names when one is set", () => {
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "saved-chip2",
+        openMeetingState: {
+          transcript: makeSpeakerSegments(),
+          meta: { speaker_names: { A: "Alice" } },
+        } as unknown as MeetingState,
+      });
+    });
+    render(<TranscriptPane />);
+    expect(screen.getByRole("button", { name: "Alice" })).toBeInTheDocument();
+    // Raw label must not appear when a display name is set.
+    expect(screen.queryByText("Speaker A")).not.toBeInTheDocument();
+  });
+
+  it("opens an inline input when the chip is clicked", () => {
+    render(<TranscriptPane />);
+    const chipA = screen.getByRole("button", { name: "Speaker A" });
+    act(() => {
+      fireEvent.click(chipA);
+    });
+    // The button is replaced by an inline input.
+    expect(screen.getByRole("textbox")).toBeInTheDocument();
+  });
+
+  it("calls setSpeakerName and closes the input on Enter", async () => {
+    render(<TranscriptPane />);
+    const chipA = screen.getByRole("button", { name: "Speaker A" });
+    act(() => {
+      fireEvent.click(chipA);
+    });
+    const input = screen.getByRole("textbox");
+    act(() => {
+      fireEvent.change(input, { target: { value: "Alice" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    // setSpeakerName must have been called (via the store's setSpeakerName action).
+    expect(meetingsIpc.setSpeakerName).toHaveBeenCalled();
+    // The input should no longer be visible after commit.
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  it("cancels the rename and restores the chip on Escape", () => {
+    render(<TranscriptPane />);
+    const chipA = screen.getByRole("button", { name: "Speaker A" });
+    act(() => {
+      fireEvent.click(chipA);
+    });
+    const input = screen.getByRole("textbox");
+    act(() => {
+      fireEvent.change(input, { target: { value: "Ignored name" } });
+      fireEvent.keyDown(input, { key: "Escape" });
+    });
+    // The IPC call must NOT have been made.
+    expect(meetingsIpc.setSpeakerName).not.toHaveBeenCalled();
+    // The chip button is restored.
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Speaker A" })).toBeInTheDocument();
+  });
+
+  it("renders chips as read-only spans (not buttons) during a live recording", () => {
+    act(() => {
+      useRecordingStore.setState({
+        state: {
+          kind: "recording",
+          meeting_id: "live",
+          started_at_ms: Date.now(),
+        },
+        transcript: makeSpeakerSegments(),
+      });
+      useMeetingsStore.setState({
+        openMeetingId: null,
+        openMeetingState: null,
+      });
+    });
+    render(<TranscriptPane />);
+    // Speaker label renders, but as a non-interactive span — no rename button.
+    expect(screen.getByText("Speaker A")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Speaker A" })).not.toBeInTheDocument();
   });
 });

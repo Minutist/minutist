@@ -11,6 +11,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Manager, WindowEvent};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod crash;
 mod updater;
 
 /// The bundle identifier, mirrored from `tauri.conf.json`. Used for the
@@ -56,6 +57,12 @@ fn main() {
         .with_writer(non_blocking)
         .with_ansi(false);
 
+    // The crash-capture ring buffer (issue #0014): retain the last N log lines
+    // in a static so the panic hook + the on-demand diagnostic report can attach
+    // recent context. Sits under the same `filter`, so it sees the same info+
+    // lines the file appender does.
+    let ring_layer = crash::RingBufferLayer;
+
     #[cfg(debug_assertions)]
     let subscriber = {
         let console_layer = tracing_subscriber::fmt::layer()
@@ -64,11 +71,15 @@ fn main() {
         tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
+            .with(ring_layer)
             .with(console_layer)
     };
 
     #[cfg(not(debug_assertions))]
-    let subscriber = tracing_subscriber::registry().with(filter).with(file_layer);
+    let subscriber = tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer)
+        .with(ring_layer);
 
     subscriber.init();
 
@@ -122,6 +133,24 @@ fn app_data_root(identifier: &str) -> PathBuf {
 #[allow(dead_code)]
 fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+/// `"{os} / {arch} / {build}"` — the platform string for the crash file header
+/// and (identically constructed) the diagnostic report. The build variant is
+/// derived from the `connected` Cargo feature, so the free and connected builds
+/// self-identify. Carries no machine-identifying detail (no hostname / user).
+fn platform_string() -> String {
+    let build = if cfg!(feature = "connected") {
+        "connected"
+    } else {
+        "free"
+    };
+    format!(
+        "{} / {} / {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        build
+    )
 }
 
 /// Clean up log files older than `max_days` in `log_dir`.
@@ -696,6 +725,22 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 SettingsHandle::new(settings_store).expect("failed to initialise settings");
 
             tracing::info!(target: "app-main", "settings handle constructed");
+
+            // Install the crash-capture panic hook (issue #0014): on a panic it
+            // writes a REDACTED last-crash.txt under logs/ (version, platform,
+            // best-effort GPU plan, panic message, backtrace, and the recent
+            // ring lines). The hook chains the previous one so the default
+            // print/abort behaviour is preserved. The "Report a problem" flow
+            // reads this file; nothing is sent — the user submits from their own
+            // browser. GPU here is the configured acceleration mode (a live
+            // probe would block / need a backend init); the resolved plan is
+            // logged at startup by `log_gpu_probe` and rides the ring lines.
+            crash::install_panic_hook(
+                &logs_dir,
+                app_handle.package_info().version.to_string(),
+                platform_string(),
+                format!("{:?}", settings_handle.current().gpu_acceleration),
+            );
 
             // Resolve the effective data roots for meetings, models, and the
             // index DB.  When `settings.data_directory` is set to a valid

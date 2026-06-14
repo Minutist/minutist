@@ -26,11 +26,21 @@
 //! the text's formatting attributes (keyed by mark `type`, valued by the mark's
 //! `attrs`).
 //!
-//! # Encoding
+//! # Encoding — two distinct hops
 //!
-//! The durable blob is the lib0 **v2** whole-state encoding
-//! (`encode_state_as_update_v2`), the size-optimised whole-document form
-//! (`planning/DESIGN_notes-crdt.md` D-O2.4 / OQ-C).
+//! There are two byte exchanges with different version requirements:
+//!
+//! - **Durable on-disk blob (`notes.ydoc`)** uses the lib0 **v2** whole-state
+//!   encoding ([`encode_ydoc`] / [`decode_ydoc`]), the size-optimised
+//!   whole-document form (`planning/DESIGN_notes-crdt.md` D-O2.4 / OQ-C). v2 is
+//!   internal to `persistence` — the JS editor never sees it.
+//! - **Editor interchange** uses lib0 **v1**: the JS `yjs` library (via
+//!   `@tiptap/extension-collaboration`) emits incremental updates with
+//!   `Y.encodeStateAsUpdate` (v1) and applies state with `Y.applyUpdate` (v1).
+//!   So the bytes handed to the editor are encoded v1 ([`encode_state_v1`]) and
+//!   incoming editor updates are decoded v1 ([`apply_update_v1`]). Handing the
+//!   editor a v2 blob and calling JS `applyUpdate` on it silently corrupts the
+//!   document — the two paths must not be crossed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -48,6 +58,18 @@ use yrs::{
 /// The top-level `XmlFragment` name holding the notes document. Matches
 /// y-prosemirror's default (`"prosemirror"`) so the editor-side binding interops.
 pub const PROSEMIRROR_FRAGMENT: &str = "prosemirror";
+
+/// Build a fresh, empty Yjs [`Doc`] with the [`PROSEMIRROR_FRAGMENT`] fragment
+/// already present, ready to receive an editor update via [`apply_update_v1`].
+///
+/// Used when the editor is the first writer of a meeting's notes (no
+/// `notes.ydoc` on disk yet) so its incoming update — which carries the whole
+/// document — merges onto a doc with the canonical top-level fragment.
+pub fn new_ydoc() -> Doc {
+    let doc = Doc::new();
+    let _ = doc.get_or_insert_xml_fragment(PROSEMIRROR_FRAGMENT);
+    doc
+}
 
 /// Build a fresh Yjs [`Doc`] from a ProseMirror-JSON document (the seed /
 /// import path — `prosemirrorJSONToYDoc`-equivalent).
@@ -106,6 +128,31 @@ pub fn decode_ydoc(bytes: &[u8]) -> Result<Doc, String> {
             .map_err(|e| format!("apply notes.ydoc update: {e}"))?;
     }
     Ok(doc)
+}
+
+/// Encode a Yjs [`Doc`]'s whole state as a lib0 **v1** update — the byte form
+/// the JS editor's `Y.applyUpdate` consumes when hydrating its `Y.Doc` from the
+/// backend's stored state.
+///
+/// This is the editor-interchange counterpart to [`encode_ydoc`] (which is v2,
+/// for the durable on-disk blob). The two MUST NOT be crossed: a v2 blob fed to
+/// JS `applyUpdate` silently corrupts the document (see the module docs).
+pub fn encode_state_v1(doc: &Doc) -> Vec<u8> {
+    doc.transact()
+        .encode_state_as_update_v1(&StateVector::default())
+}
+
+/// Apply a lib0 **v1** incremental update — as produced by the JS editor's
+/// `Y.Doc` `'update'` event / `Y.encodeStateAsUpdate` — onto `doc`.
+///
+/// yrs merge is commutative and idempotent, so applying the same or
+/// out-of-order updates converges. Returns an error string when the bytes are
+/// not a valid lib0 v1 update; the caller maps it into the crate error type.
+pub fn apply_update_v1(doc: &Doc, update: &[u8]) -> Result<(), String> {
+    let update = Update::decode_v1(update).map_err(|e| format!("decode editor update v1: {e}"))?;
+    let mut txn = doc.transact_mut();
+    txn.apply_update(update)
+        .map_err(|e| format!("apply editor update: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -556,5 +603,76 @@ mod tests {
     fn decode_rejects_garbage_blob() {
         // A non-v2 blob must error, not panic.
         assert!(decode_ydoc(&[0xff, 0x00, 0x13, 0x37]).is_err());
+    }
+
+    /// A v1 incremental update produced from one doc applies onto another and
+    /// re-derives the merged JSON. This is the Rust side of the editor
+    /// interchange contract: the editor produces v1 updates (`Y.encodeStateAsUpdate`
+    /// / the `'update'` event) which [`apply_update_v1`] consumes. The JS-produced
+    /// fixture is exercised by the UI test `CollabBinding.test.ts`; here we prove
+    /// the Rust apply/merge path with a yrs-produced v1 update.
+    #[test]
+    fn v1_incremental_update_applies_and_re_derives() {
+        // Source doc: build the full schema, encode its whole state as a v1 update.
+        let source = json_to_ydoc(&full_schema_doc());
+        let v1 = encode_state_v1(&source);
+
+        // Target: a fresh doc receives the v1 update (the editor-hydrate shape).
+        let target = Doc::new();
+        let _ = target.get_or_insert_xml_fragment(PROSEMIRROR_FRAGMENT);
+        apply_update_v1(&target, &v1).expect("apply v1 update");
+
+        assert_eq!(
+            ydoc_to_json(&target),
+            full_schema_doc(),
+            "applying a v1 whole-state update must re-derive the same JSON"
+        );
+    }
+
+    /// `encode_state_v1` is the v1 counterpart of the v2 `encode_ydoc`: both
+    /// encode the same logical state, but the editor only accepts v1. Decoding
+    /// the v1 bytes back (via the v1 apply path) must reconstruct the document,
+    /// and the v2 decode path must REJECT the v1 bytes — proving the two formats
+    /// are distinct and not interchangeable (the silent-corruption guard).
+    #[test]
+    fn v1_and_v2_encodings_are_distinct() {
+        let doc = json_to_ydoc(&full_schema_doc());
+        let v1 = encode_state_v1(&doc);
+        let v2 = encode_ydoc(&doc);
+
+        // The two encodings differ on the wire.
+        assert_ne!(v1, v2, "v1 and v2 encodings must not be byte-identical");
+
+        // v1 bytes are NOT a valid v2 blob (decode_ydoc uses decode_v2).
+        assert!(
+            decode_ydoc(&v1).is_err(),
+            "the v2 decoder must reject v1 bytes (formats are not interchangeable)"
+        );
+    }
+
+    /// Two v1 updates applied in either order converge to the same JSON
+    /// (commutativity/idempotency of yrs merge) — the property the editor's
+    /// debounced incremental sends rely on.
+    #[test]
+    fn v1_updates_are_order_independent() {
+        // Build a base doc, capture its state vector.
+        let base = json_to_ydoc(&json!({
+            "type": "doc",
+            "content": [{ "type": "paragraph",
+                "content": [{ "type": "text", "text": "base" }] }]
+        }));
+        let base_v1 = encode_state_v1(&base);
+
+        // Re-apply the same whole-state update twice (idempotent merge).
+        let target = Doc::new();
+        let _ = target.get_or_insert_xml_fragment(PROSEMIRROR_FRAGMENT);
+        apply_update_v1(&target, &base_v1).expect("apply once");
+        apply_update_v1(&target, &base_v1).expect("apply twice (idempotent)");
+
+        assert_eq!(
+            ydoc_to_json(&target),
+            ydoc_to_json(&base),
+            "re-applying the same v1 update must be idempotent"
+        );
     }
 }

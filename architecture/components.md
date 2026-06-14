@@ -854,8 +854,25 @@ is the **authoritative** notes document; `notes.json` and `notes.md` are
   exactly as the libsql index self-heals from the folders); it falls back to
   reading `notes.json` directly when `notes.ydoc` is absent (a pre-CRDT meeting
   not yet seeded). `Ok(None)` only when neither file exists.
+- **Incremental editor write path (B6 WU7 — CRDT editor binding).**
+  `NotesStore::apply_update(root, meeting_id, update: &[u8], notes_md: &str)`
+  MERGES a lib0-**v1** Yjs update (as produced by the editor's `Y.Doc`
+  `'update'` event) onto the stored `notes.ydoc`, then re-derives `notes.json` /
+  `notes.md` and writes all three atomically (same tmp+fsync+rename path as
+  `save`, `notes.ydoc` first). This is the **primary write for an open
+  Yjs-native editor** — it preserves the CRDT history that `save`'s
+  rebuild-from-JSON discards; `save` is retained for back-compat / non-collab
+  callers. `NotesStore::read_ydoc_state(root, meeting_id) -> Option<Vec<u8>>`
+  returns the stored doc encoded as a v1 state update for the editor to
+  `Y.applyUpdate` on open (`None` when no `notes.ydoc` exists). The durable blob
+  stays v2; only the editor interchange is v1 — the two encodings are NOT
+  interchangeable (a v2 blob fed to JS `applyUpdate` silently corrupts the doc),
+  so `ydoc` exposes `encode_state_v1` / `apply_update_v1` distinct from the v2
+  `encode_ydoc` / `decode_ydoc`. See `planning/DESIGN_notes-crdt.md` §8.
 - The `ydoc` module owns the JSON↔Yjs conversion (`json_to_ydoc`,
-  `ydoc_to_json`, `encode_ydoc`, `decode_ydoc`). It is the **single, narrow**
+  `ydoc_to_json`, `encode_ydoc`, `decode_ydoc`) plus the editor-interchange v1
+  hops (`encode_state_v1`, `apply_update_v1`, `new_ydoc`). It is the
+  **single, narrow**
   relaxation of the notes opacity guarantee: deriving ProseMirror JSON from the
   Yjs `XmlFragment` requires knowing the document is ProseMirror-shaped, but the
   walk is **generic** — element tags, attributes (stored as typed `yrs::Any`),
@@ -1764,6 +1781,21 @@ type directly rather than a local mirror) because a bare `serde_json::Value`
 does not derive `specta::Type`; `save_notes` parses the string to a
 `serde_json::Value` before handing it to `NotesStore` and `load_notes`
 re-serialises the loaded value back to a string.
+
+**CRDT editor binding commands — `apply_notes_update` / `load_notes_ydoc` (B6
+WU7, 35 commands total).** `apply_notes_update(meeting_id, update: Vec<u8>,
+notes_markdown: String) -> ()` merges an editor-produced lib0-**v1** Yjs update
+onto the meeting's authoritative `notes.ydoc` and re-derives the projections;
+`load_notes_ydoc(meeting_id) -> Option<Vec<u8>>` returns the stored doc as a v1
+state update (`number[] | null` on the wire) for the editor to `Y.applyUpdate`
+on open. Both route **directly** to `persistence::NotesStore`
+(`apply_update` / `read_ydoc_state`) on `spawn_blocking`, no orchestrator — same
+seam as `save_notes`/`load_notes`. For an open Yjs-native editor
+`apply_notes_update` is the PRIMARY write (it preserves CRDT history, whereas
+`save_notes` rebuilds the doc from JSON and is kept for back-compat). The binary
+update crosses the wire as `Vec<u8>` (exported `number[]`), matching
+`save_note_image`'s `bytes` — no base64 hop. The durable on-disk blob stays v2;
+only the editor interchange is v1. See `planning/DESIGN_notes-crdt.md` §8.
 
 **Note image command — `save_note_image` (29 commands total).**
 `save_note_image(meeting_id, bytes: Vec<u8>, ext: String) -> String` persists a

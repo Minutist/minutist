@@ -212,6 +212,48 @@ async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDocument | null, Ipc
 }
 },
 /**
+ * Apply an incremental Yjs update from the editor's local `Y.Doc` (the
+ * `'update'` event) onto the meeting's authoritative `notes.ydoc`, then
+ * re-derive `notes.json` + write the caller-supplied `notes.md`.
+ * 
+ * This is the **primary write path for an open editor** (D-O2.1): with
+ * `@tiptap/extension-collaboration` the editor is Yjs-native, so its edits
+ * arrive as CRDT updates that MERGE onto the stored doc — preserving the CRDT
+ * history that the JSON-rebuild `save_notes` discards. `update` is a lib0 **v1**
+ * update (the format the JS `yjs` library emits); the wire type is `Vec<u8>`,
+ * exported as `number[]` (matching `save_note_image`'s `bytes` — no base64
+ * hop). Routes directly to `persistence::NotesStore::apply_update` on
+ * `spawn_blocking`, mirroring `save_notes`.
+ */
+async applyNotesUpdate(meetingId: MeetingId, update: number[], notesMarkdown: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("apply_notes_update", { meetingId, update, notesMarkdown }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read the meeting's current `notes.ydoc` state as a lib0 **v1** update for the
+ * editor to apply with `Y.applyUpdate` on open.
+ * 
+ * Returns `None` when the meeting has no `notes.ydoc` (the editor then starts
+ * empty and its first edit seeds the doc). The wire type is `Option<Vec<u8>>`,
+ * exported as `number[] | null`. The stored blob is v2 (durable); persistence
+ * re-encodes it as v1 because the JS `yjs` library only accepts v1 over
+ * `applyUpdate` (the v1/v2 hops must not be crossed — see
+ * `persistence::ydoc`). Routes directly to
+ * `persistence::NotesStore::read_ydoc_state` on `spawn_blocking`.
+ */
+async loadNotesYdoc(meetingId: MeetingId) : Promise<Result<number[] | null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_notes_ydoc", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Persist a pasted/dropped note image to the meeting's `assets/` directory and
  * return its **portable** reference (the bare `<contenthash>.<ext>` filename)
  * for the frontend to store into `notes.json`.

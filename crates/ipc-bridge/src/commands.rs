@@ -559,6 +559,62 @@ pub async fn load_notes(
         .map_err(IpcError::from)
 }
 
+/// Apply an incremental Yjs update from the editor's local `Y.Doc` (the
+/// `'update'` event) onto the meeting's authoritative `notes.ydoc`, then
+/// re-derive `notes.json` + write the caller-supplied `notes.md`.
+///
+/// This is the **primary write path for an open editor** (D-O2.1): with
+/// `@tiptap/extension-collaboration` the editor is Yjs-native, so its edits
+/// arrive as CRDT updates that MERGE onto the stored doc — preserving the CRDT
+/// history that the JSON-rebuild `save_notes` discards. `update` is a lib0 **v1**
+/// update (the format the JS `yjs` library emits); the wire type is `Vec<u8>`,
+/// exported as `number[]` (matching `save_note_image`'s `bytes` — no base64
+/// hop). Routes directly to `persistence::NotesStore::apply_update` on
+/// `spawn_blocking`, mirroring `save_notes`.
+#[tauri::command]
+#[specta::specta]
+pub async fn apply_notes_update(
+    meeting_id: MeetingId,
+    update: Vec<u8>,
+    notes_markdown: String,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        NotesStore::apply_update(&meetings_dir, meeting_id, &update, &notes_markdown)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("apply_notes_update task join failed: {e}"),
+    })?
+    .map_err(IpcError::from)
+}
+
+/// Read the meeting's current `notes.ydoc` state as a lib0 **v1** update for the
+/// editor to apply with `Y.applyUpdate` on open.
+///
+/// Returns `None` when the meeting has no `notes.ydoc` (the editor then starts
+/// empty and its first edit seeds the doc). The wire type is `Option<Vec<u8>>`,
+/// exported as `number[] | null`. The stored blob is v2 (durable); persistence
+/// re-encodes it as v1 because the JS `yjs` library only accepts v1 over
+/// `applyUpdate` (the v1/v2 hops must not be crossed — see
+/// `persistence::ydoc`). Routes directly to
+/// `persistence::NotesStore::read_ydoc_state` on `spawn_blocking`.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_notes_ydoc(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<Option<Vec<u8>>, IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || NotesStore::read_ydoc_state(&meetings_dir, meeting_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("load_notes_ydoc task join failed: {e}"),
+        })?
+        .map_err(IpcError::from)
+}
+
 // ---------------------------------------------------------------------------
 // Notes command bodies — extracted so they can be unit-tested without a
 // running Tauri runtime (the round-trip test calls these directly).

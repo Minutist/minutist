@@ -139,6 +139,98 @@ impl NotesStore {
         Ok(())
     }
 
+    /// Apply an incremental Yjs **v1** update (as produced by the editor's
+    /// `Y.Doc` `'update'` event) onto the meeting's stored `notes.ydoc`, then
+    /// atomically rewrite the authoritative blob and its derived `notes.json` +
+    /// `notes.md`.
+    ///
+    /// This is the **primary write path for an open editor** (D-O2.1): the
+    /// editor is Yjs-native, so its edits arrive as CRDT updates rather than as
+    /// whole-document JSON. The stored `notes.ydoc` is loaded (decoded v2), the
+    /// editor's v1 update is merged via [`crate::ydoc::apply_update_v1`] — which
+    /// preserves the CRDT history rather than rebuilding the doc from JSON the way
+    /// [`NotesStore::save`] does — and the merged doc is re-encoded as the durable
+    /// v2 blob. `notes.json` is derived from the merged doc; `notes.md` is the
+    /// caller-supplied markdown rendering.
+    ///
+    /// When `notes.ydoc` is absent the update is applied onto a fresh doc — the
+    /// editor is the first writer, so its update carries the whole document. (The
+    /// lazy seed in [`NotesStore::seed_ydoc_if_needed`] normally runs on open
+    /// before any edit, so a legacy meeting already has a `notes.ydoc` to merge
+    /// onto.)
+    ///
+    /// Writes are atomic (sibling temp + fsync + rename), `notes.ydoc` first, so
+    /// a mid-save crash leaves the prior files intact and the projections
+    /// self-heal on next open. Like [`NotesStore::save`] this does **not** create
+    /// the meeting folder.
+    pub fn apply_update(
+        root: &Path,
+        meeting_id: MeetingId,
+        update: &[u8],
+        notes_md: &str,
+    ) -> AppResult<()> {
+        let folder = Self::folder_path(root, meeting_id);
+        let ydoc_path = folder.join("notes.ydoc");
+        let json_path = folder.join("notes.json");
+        let md_path = folder.join("notes.md");
+
+        // Load the authoritative doc (or start fresh when the editor is the first
+        // writer) and MERGE the editor's incremental update onto it — preserving
+        // CRDT history, unlike `save`'s rebuild-from-JSON.
+        let doc = match std::fs::read(&ydoc_path) {
+            Ok(bytes) => crate::ydoc::decode_ydoc(&bytes)
+                .map_err(|context| minutist_common::AppError::Internal { context })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::ydoc::new_ydoc(),
+            Err(e) => return Err(Error::Io(e).into()),
+        };
+
+        crate::ydoc::apply_update_v1(&doc, update)
+            .map_err(|context| minutist_common::AppError::Internal { context })?;
+
+        let ydoc_bytes = crate::ydoc::encode_ydoc(&doc);
+        let derived_json = crate::ydoc::ydoc_to_json(&doc);
+        let json_bytes = serde_json::to_vec_pretty(&derived_json)
+            .map_err(Error::Serialise)
+            .map_err(minutist_common::AppError::from)?;
+
+        write_atomic(&ydoc_path, &ydoc_bytes)?;
+        write_atomic(&json_path, &json_bytes)?;
+        write_atomic(&md_path, notes_md.as_bytes())?;
+
+        tracing::debug!(
+            target: "persistence",
+            meeting_id = %meeting_id.0,
+            folder = %folder.display(),
+            update_len = update.len(),
+            "applied editor Yjs update; rewrote notes.ydoc + derived notes.json + notes.md"
+        );
+
+        Ok(())
+    }
+
+    /// Read the meeting's current `notes.ydoc` state encoded as a lib0 **v1**
+    /// update — the byte form the editor's `Y.applyUpdate` consumes to hydrate
+    /// its `Y.Doc` on open.
+    ///
+    /// Returns `Ok(None)` when `notes.ydoc` is absent (a meeting with no
+    /// CRDT-backed notes yet — the editor then starts empty and its first edit
+    /// becomes the seed). The stored blob is v2 (durable); this decodes it and
+    /// re-encodes as v1 because the JS `yjs` library only accepts v1 over
+    /// `applyUpdate` (see [`crate::ydoc`] module docs — the v1/v2 hops must not
+    /// be crossed).
+    pub fn read_ydoc_state(root: &Path, meeting_id: MeetingId) -> AppResult<Option<Vec<u8>>> {
+        let ydoc_path = Self::folder_path(root, meeting_id).join("notes.ydoc");
+        match std::fs::read(&ydoc_path) {
+            Ok(bytes) => {
+                let doc = crate::ydoc::decode_ydoc(&bytes)
+                    .map_err(|context| minutist_common::AppError::Internal { context })?;
+                Ok(Some(crate::ydoc::encode_state_v1(&doc)))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e).into()),
+        }
+    }
+
     /// Load a meeting's notes for `meeting_id` under `root`.
     ///
     /// When `notes.ydoc` is present it is **authoritative**: the returned JSON
@@ -731,6 +823,84 @@ mod tests {
         assert!(
             !NotesStore::seed_ydoc_if_needed(&root, id).expect("seed"),
             "second seed must be a no-op once notes.ydoc exists"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Incremental editor-update path (WU7 — apply_update / read_ydoc_state).
+    // -----------------------------------------------------------------------
+
+    /// Applying a v1 update produced by `save`'s doc round-trips through the
+    /// incremental path: write a doc via `save`, read its v1 state, apply that
+    /// onto a fresh meeting via `apply_update`, and confirm the derived JSON
+    /// matches. This exercises the full incremental seam end to end on the Rust
+    /// side (the JS-produced-update interop is in the UI test).
+    #[test]
+    fn apply_update_merges_and_re_derives_json() {
+        let (_tempdir, root, id) = make_meeting();
+        let doc = representative_doc();
+
+        // Establish a notes.ydoc via the legacy save, then read its v1 state.
+        NotesStore::save(&root, id, &doc, "md").expect("save");
+        let v1 = NotesStore::read_ydoc_state(&root, id)
+            .expect("read state")
+            .expect("state present");
+        assert!(!v1.is_empty(), "v1 state must be non-empty");
+
+        // A second meeting receives that same v1 update as its first write.
+        let (_t2, root2, id2) = make_meeting();
+        NotesStore::apply_update(&root2, id2, &v1, "md2").expect("apply update");
+
+        let loaded = NotesStore::load(&root2, id2).expect("load").expect("present");
+        assert_eq!(loaded.json, doc, "apply_update must derive the same document");
+        assert_eq!(loaded.markdown, "md2");
+        assert!(root2.join(id2.0.to_string()).join("notes.ydoc").exists());
+    }
+
+    /// `read_ydoc_state` returns `None` for a meeting with no notes.ydoc, so the
+    /// editor knows to start empty.
+    #[test]
+    fn read_ydoc_state_absent_is_none() {
+        let (_tempdir, root, id) = make_meeting();
+        assert!(
+            NotesStore::read_ydoc_state(&root, id).expect("read").is_none(),
+            "a meeting with no notes.ydoc must yield None"
+        );
+    }
+
+    /// The migration interaction (#6): a legacy meeting (notes.json, no
+    /// notes.ydoc) is seeded on open, then the editor reads the seeded state and
+    /// the legacy content appears. This pins seed-then-read.
+    #[test]
+    fn legacy_meeting_seeds_then_editor_reads_seeded_state() {
+        let (_tempdir, root, id) = make_meeting();
+        let folder = root.join(id.0.to_string());
+
+        // Legacy on-disk: notes.json only.
+        let doc = representative_doc();
+        std::fs::write(
+            folder.join("notes.json"),
+            serde_json::to_vec_pretty(&doc).unwrap(),
+        )
+        .expect("seed legacy notes.json");
+
+        // No notes.ydoc yet → editor would have no state to load.
+        assert!(NotesStore::read_ydoc_state(&root, id).expect("read").is_none());
+
+        // The on-open seed (D-O2.7) writes notes.ydoc from the legacy JSON.
+        assert!(NotesStore::seed_ydoc_if_needed(&root, id).expect("seed"));
+
+        // Now the editor can hydrate from the seeded state, and it carries the
+        // legacy content.
+        let v1 = NotesStore::read_ydoc_state(&root, id)
+            .expect("read")
+            .expect("seeded state present");
+        let target = crate::ydoc::new_ydoc();
+        crate::ydoc::apply_update_v1(&target, &v1).expect("apply seeded state");
+        assert_eq!(
+            crate::ydoc::ydoc_to_json(&target),
+            doc,
+            "the seeded state handed to the editor must carry the legacy content"
         );
     }
 }

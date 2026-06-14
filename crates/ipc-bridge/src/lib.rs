@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (33 total)
+//! ## Commands (35 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -21,6 +21,8 @@
 //! | `ensure_model` | `()` | 2 |
 //! | `save_notes` | `()` | 3 |
 //! | `load_notes` | `Option<NotesDocument>` | 3 |
+//! | `apply_notes_update` | `()` | CRDT editor binding (B6 WU7) |
+//! | `load_notes_ydoc` | `Option<Vec<u8>>` (v1 state) | CRDT editor binding (B6 WU7) |
 //! | `save_note_image` | `String` (portable asset ref) | notes images |
 //! | `list_meetings` | `Vec<MeetingListEntry>` | 4 |
 //! | `open_meeting` | `MeetingState` | 4 |
@@ -61,6 +63,18 @@
 //! against `IpcState::meetings_dir`, bypassing the orchestrator: notes I/O is
 //! independent of the live recording pipeline and may run concurrently with an
 //! active recording.
+//!
+//! The CRDT editor binding (B6 WU7, `planning/DESIGN_notes-crdt.md` §8) adds two
+//! more notes commands on the same direct `persistence::NotesStore` route:
+//! `apply_notes_update` (merge an editor-produced lib0-v1 Yjs update onto the
+//! authoritative `notes.ydoc`, then re-derive `notes.json` / `notes.md`) and
+//! `load_notes_ydoc` (read the stored doc as a v1 state update for the editor to
+//! `Y.applyUpdate` on open). For an open Yjs-native editor `apply_notes_update`
+//! is the PRIMARY write path — it preserves CRDT history, whereas `save_notes`
+//! rebuilds the doc from JSON (kept for back-compat / non-collab callers). The
+//! binary update crosses the wire as `Vec<u8>` (`number[]`), matching
+//! `save_note_image`. The on-disk durable blob stays v2; only the editor
+//! interchange is v1 (the two must not be crossed — see `persistence::ydoc`).
 //!
 //! The Phase-4 read/action commands route directly to `persistence`
 //! (`list_meetings` / `rename_meeting` / `delete_meeting` via the shared
@@ -512,6 +526,8 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::ensure_model,
             commands::save_notes,
             commands::load_notes,
+            commands::apply_notes_update,
+            commands::load_notes_ydoc,
             commands::save_note_image,
             commands::list_meetings,
             commands::open_meeting,
@@ -617,7 +633,8 @@ mod tests {
     /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
     /// → P10 26 → P9 review-fix 27 → +prewarm_asr 28 → +save_note_image 29 → P4
     /// transcript-rename adds `set_speaker_name` 30 → +translate_meeting
-    /// +get_translations 32 → +get_diagnostic_report 33 (#0014) (P5 removes
+    /// +get_translations 32 → +get_diagnostic_report 33 (#0014) →
+    /// +apply_notes_update +load_notes_ydoc 35 (B6 WU7 — CRDT editor binding) (P5 removes
     /// `re_summarise` and adds `summarise_meeting`
     /// / `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6 adds
     /// `rediarize_meeting`: 20 + 1 = 21; P9 adds `send_chat_message` /
@@ -627,7 +644,9 @@ mod tests {
     /// `prewarm_asr` (live-test UX T2): 27 + 1 = 28; `save_note_image` (note image
     /// paste/drop): 28 + 1 = 29; `set_speaker_name` (transcript speaker rename):
     /// 29 + 1 = 30; translation commands: 30 + 2 = 32; `get_diagnostic_report`
-    /// (#0014 — the "Report a problem" snapshot): 32 + 1 = 33).
+    /// (#0014 — the "Report a problem" snapshot): 32 + 1 = 33;
+    /// `apply_notes_update` + `load_notes_ydoc` (B6 WU7 — CRDT editor binding):
+    /// 33 + 2 = 35).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -656,6 +675,8 @@ mod tests {
             "ensure_model",
             "save_notes",
             "load_notes",
+            "apply_notes_update",
+            "load_notes_ydoc",
             "save_note_image",
             "list_meetings",
             "open_meeting",
@@ -680,8 +701,8 @@ mod tests {
 
         assert_eq!(
             expected.len(),
-            33,
-            "command ledger must be 33 (32 + get_diagnostic_report, #0014)"
+            35,
+            "command ledger must be 35 (33 + apply_notes_update + load_notes_ydoc, B6 WU7)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

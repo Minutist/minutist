@@ -1,0 +1,54 @@
+{
+  "type": "doc",
+  "content": [
+    {
+      "type": "heading",
+      "attrs": {
+        "level": 2
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "Interop heading"
+        }
+      ]
+    },
+    {
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "text",
+          "text": "plain "
+        },
+        {
+          "type": "text",
+          "marks": [
+            {
+              "type": "bold"
+            },
+            {
+              "type": "italic"
+            }
+          ],
+          "text": "bold-italic"
+        },
+        {
+          "type": "text",
+          "text": " end"
+        }
+      ]
+    },
+    {
+      "type": "transcriptChip",
+      "attrs": {
+        "endMs": 21300,
+        "speakerId": "A",
+        "startMs": 12400,
+        "text": "a quoted segment"
+      }
+    },
+    {
+      "type": "paragraph"
+    }
+  ]
+}

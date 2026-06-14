@@ -1967,11 +1967,29 @@ omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
 `chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
 per-session cancel flags `cancel_chat_turn` raises, P1).
 
-The command ledger is now **32** (P6 21 + the four P9 chat commands = 25; P10's
+The command ledger is now **33** (P6 21 + the four P9 chat commands = 25; P10's
 `get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27;
 `prewarm_asr` = 28; `save_note_image` = 29; `set_speaker_name` = 30;
-`translate_meeting` + `get_translations` = 32), asserted by the
-`bindings_builder_registers_expected_command_ledger` test.
+`translate_meeting` + `get_translations` = 32; `get_diagnostic_report` = 33),
+asserted by the `bindings_builder_registers_expected_command_ledger` test.
+
+**Diagnostic report (`get_diagnostic_report`, issue #0014).** Assembles + REDACTS
+the `common::DiagnosticReport` the no-telemetry "Report a problem" flow pre-fills
+into a GitHub issue (the webview maps the snake_case binding onto its camelCase
+`issueReport.ts` shape and opens the user's browser; nothing is sent
+automatically). Log-excerpt / backtrace redaction is owned HERE (`diagnostics`
+module), where the data is read: it reads `{logs}/last-crash.txt` when present
+(supplying the backtrace + recent-lines excerpt, error class `"panic"`) else the
+tail of the rolling `minutist.log*` file (error class `"diagnostic report"`, no
+backtrace), and strips meeting-id UUIDs from every text field via a local
+`redact` (mirroring `app-main`'s `crash::redact` and the webview's
+`redactMeetingPaths` — each crate owns its copy; `ipc-bridge` cannot import
+`app-main`). `IpcState` gains `logs_dir` (read-only; `app-main` owns writes),
+`app_version`, and `platform` (`"{os} / {arch} / {build}"`, constructed by
+`app-main` which owns the `connected` feature), all set by `app-main`. The
+`probe_primary_gpu` call (it can block) runs on `spawn_blocking`. No new
+dependency edge — `common::probe_primary_gpu` / `resolve_gpu_plan` are already
+reached by `log_gpu_probe`.
 
 **Event forwarding:** `spawn_event_forwarder` starts a tokio task that subscribes
 to the orchestrator broadcast and emits `AppEventPayload` (event name

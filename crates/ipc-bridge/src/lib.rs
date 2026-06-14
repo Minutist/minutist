@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (32 total)
+//! ## Commands (33 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -40,6 +40,7 @@
 //! | `get_mcp_server_info` | `Option<McpServerInfo>` | 10 |
 //! | `translate_meeting` | `()` | translation |
 //! | `get_translations` | `HashMap<usize, String>` | translation |
+//! | `get_diagnostic_report` | `DiagnosticReport` | report (#0014) |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
@@ -106,6 +107,7 @@
 pub mod chat;
 pub mod chat_runtime;
 pub mod commands;
+pub mod diagnostics;
 pub mod error;
 pub mod events;
 pub mod inter_agent;
@@ -221,6 +223,20 @@ pub struct IpcState {
     /// token is held here (not on the event bus) and revealed only on explicit
     /// user request.
     pub mcp_info: Arc<std::sync::Mutex<Option<McpServerInfo>>>,
+    /// The logs directory (`{app-data}/logs/`), owned by `app-main` but its path
+    /// is shared here so `get_diagnostic_report` (#0014) can read the rolling
+    /// `minutist.log` tail and the `last-crash.txt` written by the panic hook.
+    /// `ipc-bridge` only READS this directory; `app-main` owns writes to it.
+    pub logs_dir: PathBuf,
+    /// The application version (e.g. `"0.0.0"`), resolved by `app-main` from the
+    /// Tauri package info and shared here so `get_diagnostic_report` (#0014) can
+    /// label the report without a `tauri`-version dependency in this crate.
+    pub app_version: String,
+    /// `"{os} / {arch} / {build}"`, constructed by `app-main` (which owns the
+    /// `connected` Cargo feature that distinguishes the free / connected build)
+    /// and shared here for `get_diagnostic_report` (#0014). Carries no
+    /// machine-identifying detail (no hostname / user).
+    pub platform: String,
 }
 
 /// The live MCP endpoint surfaced to the Settings → MCP pane via
@@ -515,6 +531,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::get_mcp_server_info,
             commands::translate_meeting,
             commands::get_translations,
+            diagnostics::get_diagnostic_report,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -600,7 +617,8 @@ mod tests {
     /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
     /// → P10 26 → P9 review-fix 27 → +prewarm_asr 28 → +save_note_image 29 → P4
     /// transcript-rename adds `set_speaker_name` 30 → +translate_meeting
-    /// +get_translations 32 (P5 removes `re_summarise` and adds `summarise_meeting`
+    /// +get_translations 32 → +get_diagnostic_report 33 (#0014) (P5 removes
+    /// `re_summarise` and adds `summarise_meeting`
     /// / `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6 adds
     /// `rediarize_meeting`: 20 + 1 = 21; P9 adds `send_chat_message` /
     /// `get_chat_session` / `list_chat_sessions` / `delete_chat_session`: 21 + 4
@@ -608,7 +626,8 @@ mod tests {
     /// adds `cancel_chat_turn` (P1 — turn cancellation): 26 + 1 = 27;
     /// `prewarm_asr` (live-test UX T2): 27 + 1 = 28; `save_note_image` (note image
     /// paste/drop): 28 + 1 = 29; `set_speaker_name` (transcript speaker rename):
-    /// 29 + 1 = 30; translation commands: 30 + 2 = 32).
+    /// 29 + 1 = 30; translation commands: 30 + 2 = 32; `get_diagnostic_report`
+    /// (#0014 — the "Report a problem" snapshot): 32 + 1 = 33).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -656,12 +675,13 @@ mod tests {
             "get_mcp_server_info",
             "translate_meeting",
             "get_translations",
+            "get_diagnostic_report",
         ];
 
         assert_eq!(
             expected.len(),
-            32,
-            "command ledger must be 32 (30 + translate_meeting + get_translations)"
+            33,
+            "command ledger must be 33 (32 + get_diagnostic_report, #0014)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

@@ -578,6 +578,22 @@ async getTranslations(meetingId: MeetingId, targetLanguage: string) : Promise<Re
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Assemble the diagnostic report (#0014). See the module docs for the source
+ * priority (`last-crash.txt` then the rolling log tail) and the privacy
+ * invariant.
+ * 
+ * `probe_primary_gpu` can block (it inits the llama backend), so the work runs
+ * on `spawn_blocking` rather than the async command thread.
+ */
+async getDiagnosticReport() : Promise<Result<DiagnosticReport, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_diagnostic_report") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -889,6 +905,49 @@ export type ChatSession = { id: ChatSessionId; meeting_id?: MeetingId | null; ti
  * the right session.
  */
 export type ChatSessionId = string
+/**
+ * A redacted diagnostic snapshot for the user-driven "Report a problem" flow.
+ * 
+ * Assembled and **redacted** by `ipc-bridge` (`get_diagnostic_report`), it
+ * crosses the IPC boundary so the webview can pre-fill a GitHub issue form the
+ * user reviews and submits from their own browser. There is **no telemetry**:
+ * nothing leaves the machine except by the user's explicit browser action.
+ * 
+ * Privacy by construction: this carries only structured environment fields plus
+ * an already-redacted log excerpt / backtrace. There is **no field for meeting
+ * content** (transcripts, notes, titles, speaker names). The producer redacts
+ * meeting-id paths out of `log_excerpt` / `backtrace`; this type cannot carry
+ * raw meeting text because no such field exists.
+ * 
+ * snake_case fields map onto the camelCase `DiagnosticReport` TS shape in
+ * `ui/src/diagnostics/issueReport.ts` (tauri-specta camelCases the binding).
+ */
+export type DiagnosticReport = { 
+/**
+ * Application version (e.g. `"0.0.0"`).
+ */
+app_version: string; 
+/**
+ * OS / arch / build, e.g. `"Windows 11 / x86_64 / connected"`.
+ */
+platform: string; 
+/**
+ * Resolved GPU plan (backend or CPU fallback), best-effort.
+ */
+gpu: string; 
+/**
+ * Short error class, e.g. `"panic"` or `"diagnostic report"`.
+ */
+error_class: string; 
+/**
+ * Recent log lines, already redacted (meeting-id paths stripped).
+ */
+log_excerpt: string; 
+/**
+ * Backtrace from the last captured crash, already redacted; absent when no
+ * crash report is present.
+ */
+backtrace?: string | null }
 /**
  * GPU-acceleration mode (replaces the old `gpu_acceleration: bool`).
  * 

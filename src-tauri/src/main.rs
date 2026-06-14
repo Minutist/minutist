@@ -887,6 +887,9 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                     std::collections::HashSet::new(),
                 )),
                 mcp_info: mcp_info.clone(),
+                logs_dir: logs_dir.clone(),
+                app_version: app_handle.package_info().version.to_string(),
+                platform: platform_string(),
             });
 
             // Log the GPU probe + the resolved default plan at startup so the

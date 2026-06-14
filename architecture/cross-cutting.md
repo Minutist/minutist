@@ -194,7 +194,10 @@ behaviour is preserved. Every line written passes through a meeting-id-UUID
 redaction pass (`crash::redact`, mirroring the webview's `redactMeetingPaths`).
 By the #0014 privacy audit, no meeting *content* (transcript / notes / title /
 speaker text) is logged at any level, so the ring never holds it; the UUID strip
-is the defensive boundary for paths. The file is read by
+is the defensive boundary for paths. This invariant is enforced at the source:
+the ASR backends (`asr-runtime`, `asr-parakeet`) log `text_chars`/`words`
+counts, never the transcribed text, and `persistence` logs meeting ids, never
+titles. Re-introducing a content-bearing log field would breach this guarantee. The file is read by
 `ipc-bridge::get_diagnostic_report` for the "Report a problem" flow — nothing is
 sent off the machine; the user reviews + submits from their own browser. This is
 NOT telemetry (see "Telemetry" below): there is no automatic transmission and no

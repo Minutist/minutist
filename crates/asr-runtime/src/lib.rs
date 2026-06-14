@@ -606,11 +606,14 @@ impl AsrBackend for AsrRuntime {
             auto_text
         };
 
+        // Log the length, never the text: transcript content must not enter the
+        // log stream, because the crash-capture ring buffer lifts log lines into
+        // a user-facing diagnostic report (see cross-cutting.md "Crash capture").
         tracing::debug!(
             target = "asr-runtime",
             start_ms = chunk.start_ms,
             end_ms = chunk.end_ms,
-            text = %final_text,
+            text_chars = final_text.chars().count(),
             "transcribed chunk"
         );
 

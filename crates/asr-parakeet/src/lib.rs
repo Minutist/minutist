@@ -213,12 +213,15 @@ impl minutist_common::AsrBackend for ParakeetBackend {
         }
         let words = aggregate_words(&tokens, &timestamps, chunk.start_ms, chunk.end_ms);
 
+        // Log the length, never the text: transcript content must not enter the
+        // log stream, because the crash-capture ring buffer lifts log lines into
+        // a user-facing diagnostic report (see cross-cutting.md "Crash capture").
         tracing::debug!(
             target = "asr-parakeet",
             start_ms = chunk.start_ms,
             end_ms = chunk.end_ms,
             words = words.len(),
-            text = %text,
+            text_chars = text.chars().count(),
             "transcribed chunk"
         );
 

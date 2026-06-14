@@ -1784,6 +1784,18 @@ into `app-main` behind the `connected` feature in S5; the S3b crate-add lands it
 in the workspace unconditionally (like `mcp-server` before its app-main wiring)
 without that edge.
 
+**Wire contract (the binding constraint).** The relay lives in a separate
+private repo (EXECUTION.md X9), so the two ends do **not** share a crate. The
+`frame` module re-implements the relay's `Frame` enum
+(`minutist-relay/crates/mcp-relay/src/tunnel/frame.rs`) **byte-for-byte**:
+`PROTOCOL_VERSION = 1` carried in `Hello`; postcard (default-features=false +
+alloc) one-frame-per-binary-WebSocket-message; the variant ORDER is the contract
+because postcard encodes the enum discriminant by index. The match is pinned by
+a committed cross-impl fixture (`tests/fixtures/relay_frames.txt` = the
+relay-encoder's hex for a known frame set) that a unit test asserts this crate's
+encoding equals AND decodes back. Regenerating the fixture after a
+`PROTOCOL_VERSION` bump is a coordinated both-repos change.
+
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
 **Owns:** the Tauri command + event surface. tauri-specta generates

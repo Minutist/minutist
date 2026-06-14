@@ -14,6 +14,11 @@
 //! `ipc-bridge::McpServerInfo`; this crate never imports `mcp-server` or
 //! `ipc-bridge` — it talks to the loopback server over HTTP like any client.
 
+mod frame;
 mod loopback;
 
+pub use frame::{
+    Frame, FrameError, Hello, HelloAck, HelloErr, HelloErrReason, RequestFrame, RequestId,
+    ResponseChunk, ResponseEnd, ResponseError, ResponseStart, PROTOCOL_VERSION,
+};
 pub use loopback::{InternalBearer, LoopbackTarget};

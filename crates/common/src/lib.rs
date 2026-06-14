@@ -1114,6 +1114,44 @@ pub fn resolve_gpu_plan(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic report (issue #0014 — crash capture + "Report a problem")
+// ---------------------------------------------------------------------------
+
+/// A redacted diagnostic snapshot for the user-driven "Report a problem" flow.
+///
+/// Assembled and **redacted** by `ipc-bridge` (`get_diagnostic_report`), it
+/// crosses the IPC boundary so the webview can pre-fill a GitHub issue form the
+/// user reviews and submits from their own browser. There is **no telemetry**:
+/// nothing leaves the machine except by the user's explicit browser action.
+///
+/// Privacy by construction: this carries only structured environment fields plus
+/// an already-redacted log excerpt / backtrace. There is **no field for meeting
+/// content** (transcripts, notes, titles, speaker names). The producer redacts
+/// meeting-id paths out of `log_excerpt` / `backtrace`; this type cannot carry
+/// raw meeting text because no such field exists.
+///
+/// snake_case fields map onto the camelCase `DiagnosticReport` TS shape in
+/// `ui/src/diagnostics/issueReport.ts` (tauri-specta camelCases the binding).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct DiagnosticReport {
+    /// Application version (e.g. `"0.0.0"`).
+    pub app_version: String,
+    /// OS / arch / build, e.g. `"Windows 11 / x86_64 / connected"`.
+    pub platform: String,
+    /// Resolved GPU plan (backend or CPU fallback), best-effort.
+    pub gpu: String,
+    /// Short error class, e.g. `"panic"` or `"diagnostic report"`.
+    pub error_class: String,
+    /// Recent log lines, already redacted (meeting-id paths stripped).
+    pub log_excerpt: String,
+    /// Backtrace from the last captured crash, already redacted; absent when no
+    /// crash report is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backtrace: Option<String>,
+}
+
 /// Choose the ASR engine deterministically from the user's transcription-language
 /// setting (never by inspecting the audio — the language isn't known before
 /// transcription). Pure so the orchestrator and any future UI surface agree.
@@ -1201,6 +1239,36 @@ pub trait Summariser: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_report_serde_shape_and_no_meeting_field() {
+        // snake_case fields, and `backtrace: None` is omitted from the wire so
+        // a non-crash report carries no `backtrace` key. There is no field for
+        // meeting content by construction.
+        let r = DiagnosticReport {
+            app_version: "0.0.0".to_string(),
+            platform: "Linux / x86_64 / connected".to_string(),
+            gpu: "cpu".to_string(),
+            error_class: "diagnostic report".to_string(),
+            log_excerpt: "INFO app-main: started".to_string(),
+            backtrace: None,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"app_version\""));
+        assert!(json.contains("\"log_excerpt\""));
+        assert!(json.contains("\"error_class\""));
+        // Omitted when absent.
+        assert!(!json.contains("backtrace"), "absent backtrace must be omitted: {json}");
+        // Present when set.
+        let with_bt = DiagnosticReport {
+            backtrace: Some("0: minutist::panic".to_string()),
+            ..r.clone()
+        };
+        let json = serde_json::to_string(&with_bt).unwrap();
+        assert!(json.contains("\"backtrace\""));
+        let back: DiagnosticReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_bt);
+    }
 
     #[test]
     fn asr_routing_picker_languages_map_to_expected_engine() {

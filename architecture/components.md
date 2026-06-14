@@ -206,6 +206,18 @@ to this function. (A private `OnceLock` per crate made whichever initialised
 second fail — the record-then-summarise bug fixed in the Phase-7 review pass.)
 This adds no workspace dependency edge; `llama-cpp-2` is an external FFI dep.
 
+**Diagnostic report (issue #0014).** `DiagnosticReport { app_version, platform,
+gpu, error_class, log_excerpt, backtrace: Option<String> }` (serde, snake_case,
+`specta::Type` behind the `specta` feature) is the redacted snapshot the
+"Report a problem" flow crosses IPC. Assembled and redacted by `ipc-bridge`'s
+`get_diagnostic_report` (log-excerpt / backtrace redaction is owned there, where
+the data lives) and pre-filled into a GitHub issue form by the webview's
+`issueReport.ts` (the snake_case fields map onto its camelCase `DiagnosticReport`
+shape). **No meeting-content field by construction** (no transcript / notes /
+title / speaker-name field exists), so meeting content cannot ride this type. No
+telemetry: nothing is sent except by the user's explicit browser action. No
+dependency-table edge changes — the type lives in `common`.
+
 **Phase 4 precursors.** `MeetingListEntry` (meeting-list row, FR-33),
 `NotesDocument { notes_json, notes_markdown }` (the canonical wire-facing
 notes carrier — `String` fields because `serde_json::Value` has no

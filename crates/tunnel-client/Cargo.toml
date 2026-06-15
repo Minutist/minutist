@@ -27,10 +27,12 @@ futures-util = { workspace = true }
 # the relay uses; the on-wire layout MUST match (variant order is the contract).
 postcard = { workspace = true }
 serde = { workspace = true }
-# Loopback HTTP client for replaying requests against the in-process mcp-server.
-# Reuses the workspace reqwest (rustls + stream) so the response body is consumed
-# as a chunk stream rather than buffered whole.
-reqwest = { workspace = true }
+# Loopback HTTP client for replaying requests against the in-process mcp-server,
+# AND the device-code pairing client against the account-service (S5b). Reuses
+# the workspace reqwest (rustls + stream) so the tunnel response body is consumed
+# as a chunk stream rather than buffered whole; the `json` feature is added here
+# for the pairing client's small request/response bodies.
+reqwest = { workspace = true, features = ["json"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

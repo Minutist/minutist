@@ -79,6 +79,24 @@ pub enum TunnelError {
 /// until the connection closes. One connect attempt; returns on clean close or
 /// the first transport/protocol error. Reconnection is the caller's concern (S5).
 pub async fn run_tunnel(config: TunnelConfig) -> Result<(), TunnelError> {
+    run_tunnel_with_observer(config, || {}).await
+}
+
+/// As [`run_tunnel`], but calls `on_handshake` exactly once the moment the
+/// relay acknowledges the `Hello` (before the demux loop runs).
+///
+/// The S5 reconnect supervisor uses this to learn that *this credential has
+/// worked*: an `AuthFailed` after a handshake means the device was revoked
+/// (re-pair), whereas an `AuthFailed` before any handshake is a bad credential.
+/// It is also the precise point to report the UI `Online` state, rather than
+/// inferring it from a session that merely ran for a while.
+pub async fn run_tunnel_with_observer<F>(
+    config: TunnelConfig,
+    on_handshake: F,
+) -> Result<(), TunnelError>
+where
+    F: FnOnce(),
+{
     // Refuse a cleartext relay before dialing: the tunnel carries the loopback
     // bearer and MCP content, so an encrypted wss:// channel is required for any
     // off-machine relay. A ws:// URL is tolerated only for a loopback host (a
@@ -111,6 +129,7 @@ pub async fn run_tunnel(config: TunnelConfig) -> Result<(), TunnelError> {
     match read_handshake_reply(&mut ws_rx).await? {
         HandshakeReply::Ack => {
             tracing::info!(account = %config.account_id, "tunnel: handshake acknowledged");
+            on_handshake();
         }
         HandshakeReply::Err(reason) => {
             tracing::warn!(?reason, "tunnel: relay rejected the device");

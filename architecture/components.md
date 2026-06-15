@@ -1809,10 +1809,41 @@ one connect attempt and runs until close. `TunnelConfig { relay_url,
 device_credential, account_id, loopback: LoopbackTarget }`. `LoopbackTarget {
 base_url, internal_bearer: InternalBearer }` carries the loopback origin (e.g.
 `http://127.0.0.1:8765`) and the app's internal bearer; `app-main` builds it from
-`ipc-bridge::McpServerInfo` (URL stripped to origin + the token). Reconnection,
-pairing, lifecycle, and the IPC/settings surface are **S5** — `run_tunnel` is a
-single connect-and-run so the S5 reconnect seam is a `loop { run_tunnel().await;
-backoff().await }` wrapper.
+`ipc-bridge::McpServerInfo` (URL stripped to origin + the token).
+`run_tunnel_with_observer(config, on_handshake)` is the same connect-and-run plus
+a one-shot callback fired the instant the relay acknowledges the `Hello` — the
+reconnect supervisor uses it to learn "this credential has worked".
+
+**Pairing + reconnect + lifecycle (S5b).** Three modules build the connected-tier
+lifecycle on top of `run_tunnel`:
+
+- **`pairing`** — the app-side RFC 8628 device-code client. `DeviceCodeClient::new(api_base_url)`
+  (refuses a non-`https` off-machine api URL, mirroring the relay-scheme check)
+  exposes `start(label) -> PairingStart` (`POST /pair/start`: `user_code` +
+  `verification_uri[_complete]` to show/open + `device_code` + `interval`) and
+  `poll_once(device_code) -> PollOutcome` (`POST /pair/poll`: `Pending` /
+  `SlowDown` / `Authorised(IssuedDeviceCredential)`, with `Expired` /
+  `AccessDenied` / `MalformedAuthorisation` as terminal `PairingError`s). The
+  pure `next_interval` applies the RFC §3.5 +5 s `slow_down` rule. The issued
+  `device_credential` (`mdc_<device_id>.<secret>`) is returned once and presented
+  verbatim as the tunnel `Hello.device_credential`. `PairingError` is `thiserror`
+  (no `anyhow` in the public signature).
+- **`reconnect`** — `reconnect_loop(config, cancel, on_state) -> ReconnectExit`
+  supervises `run_tunnel_with_observer` with capped exponential backoff + jitter
+  (`BACKOFF_INITIAL` 1 s → `BACKOFF_MAX` 60 s). It reports `ConnectionState`
+  (`Connecting` / `Online` / `Reconnecting`) and treats a tunnel `AuthFailed`
+  **after** a session that handshook as `ReconnectExit::NeedsRepair` (device
+  revoked → re-pair, no hot-loop) versus `ReconnectExit::AuthFailed` (credential
+  never worked). All other errors are transient and redial. Cancellation is a
+  `watch` receiver, checked during the session and the backoff (S5a OQ#2).
+- **`lifecycle`** — `TunnelHandle::start(config, on_state)` spawns the loop;
+  `stop()` raises the cancel and awaits the task (completion-handle discipline,
+  mirroring the MCP server's stop), so teardown — including `run_tunnel`'s
+  `JoinSet` abort of in-flight requests — completes before `stop` returns.
+
+The IPC/settings surface (the commands the webview drives, the `connected`-gated
+wiring, and the device-credential storage) is owned by `ipc-bridge` + `app-main`;
+see those sections.
 
 **Handshake + demux.** Dial → send `Hello{version, device_credential,
 account_id}` → await `HelloAck` (or fail on `HelloErr` with the reason). Then a

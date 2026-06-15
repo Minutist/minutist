@@ -31,12 +31,21 @@
 //! are traced.
 
 mod frame;
+mod lifecycle;
 mod loopback;
+mod pairing;
+mod reconnect;
 mod run;
 
 pub use frame::{
     Frame, FrameError, Hello, HelloAck, HelloErr, HelloErrReason, RequestFrame, RequestId,
     ResponseChunk, ResponseEnd, ResponseError, ResponseStart, PROTOCOL_VERSION,
 };
+pub use lifecycle::TunnelHandle;
 pub use loopback::{InternalBearer, LoopbackTarget};
-pub use run::{run_tunnel, TunnelConfig, TunnelError};
+pub use pairing::{
+    next_interval, DeviceCodeClient, IssuedDeviceCredential, PairingError, PairingStart,
+    PollOutcome, MIN_POLL_INTERVAL_SECS, SLOW_DOWN_INCREMENT_SECS,
+};
+pub use reconnect::{reconnect_loop, ConnectionState, ReconnectExit, BACKOFF_INITIAL, BACKOFF_MAX};
+pub use run::{run_tunnel, run_tunnel_with_observer, TunnelConfig, TunnelError};

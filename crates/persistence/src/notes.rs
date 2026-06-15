@@ -102,6 +102,16 @@ impl NotesStore {
     /// This does **not** create the meeting folder — the folder is owned by
     /// [`crate::MeetingWriter`] and is expected to exist. Sibling files
     /// (`audio.opus`, `transcript.json`, `metadata.json`) are left untouched.
+    ///
+    /// # Refusal when `notes.ydoc` already exists
+    ///
+    /// Rebuilding the Yjs doc from JSON mints a fresh client history, so calling
+    /// `save` over an existing `notes.ydoc` would sever its CRDT merge ancestry.
+    /// `save` therefore refuses with [`minutist_common::AppError::InvalidInput`]
+    /// when `notes.ydoc` is present: an open editor's edits must flow through
+    /// [`NotesStore::apply_update`] (which merges, preserving history) instead.
+    /// `save` remains the legitimate writer only for the **first** write of a
+    /// meeting that has no `notes.ydoc` yet.
     pub fn save(
         root: &Path,
         meeting_id: MeetingId,
@@ -112,6 +122,17 @@ impl NotesStore {
         let ydoc_path = folder.join("notes.ydoc");
         let json_path = folder.join("notes.json");
         let md_path = folder.join("notes.md");
+
+        // `notes.ydoc` is authoritative once it exists; rebuilding it from JSON
+        // here would discard its CRDT history. Refuse and route the caller to
+        // `apply_update`, which merges.
+        if ydoc_path.exists() {
+            return Err(minutist_common::AppError::InvalidInput {
+                context:
+                    "notes.ydoc is authoritative; use apply_update to edit existing CRDT notes"
+                        .to_string(),
+            });
+        }
 
         // The Yjs doc is authoritative: build it from the incoming JSON and
         // derive the JSON projection back from it so on-disk `notes.json`
@@ -153,11 +174,11 @@ impl NotesStore {
     /// v2 blob. `notes.json` is derived from the merged doc; `notes.md` is the
     /// caller-supplied markdown rendering.
     ///
-    /// When `notes.ydoc` is absent the update is applied onto a fresh doc — the
-    /// editor is the first writer, so its update carries the whole document. (The
-    /// lazy seed in [`NotesStore::seed_ydoc_if_needed`] normally runs on open
-    /// before any edit, so a legacy meeting already has a `notes.ydoc` to merge
-    /// onto.)
+    /// When `notes.ydoc` is absent a legacy `notes.json` is seeded first (via
+    /// [`NotesStore::seed_ydoc_if_needed`]) so the editor's update merges onto the
+    /// existing content rather than discarding it. Only when there is **no**
+    /// `notes.json` either — a meeting that has never had notes — is the update
+    /// applied onto a fresh doc, the editor being the genuine first writer.
     ///
     /// Writes are atomic (sibling temp + fsync + rename), `notes.ydoc` first, so
     /// a mid-save crash leaves the prior files intact and the projections
@@ -174,9 +195,16 @@ impl NotesStore {
         let json_path = folder.join("notes.json");
         let md_path = folder.join("notes.md");
 
+        // Seed from a legacy `notes.json` before merging so a pre-CRDT meeting's
+        // content is not dropped on the first incremental write (this is the same
+        // migration the on-open seed performs; calling it here closes the gap
+        // when an edit reaches `apply_update` before any open-seed has run).
+        Self::seed_ydoc_if_needed(root, meeting_id)?;
+
         // Load the authoritative doc (or start fresh when the editor is the first
-        // writer) and MERGE the editor's incremental update onto it — preserving
-        // CRDT history, unlike `save`'s rebuild-from-JSON.
+        // writer and there is no legacy `notes.json` to seed from) and MERGE the
+        // editor's incremental update onto it — preserving CRDT history, unlike
+        // `save`'s rebuild-from-JSON.
         let doc = match std::fs::read(&ydoc_path) {
             Ok(bytes) => crate::ydoc::decode_ydoc(&bytes)
                 .map_err(|context| minutist_common::AppError::Internal { context })?,
@@ -193,6 +221,9 @@ impl NotesStore {
             .map_err(Error::Serialise)
             .map_err(minutist_common::AppError::from)?;
 
+        // notes.ydoc first (authoritative), then the projections. notes.json
+        // self-heals from notes.ydoc on load; notes.md is a best-effort export
+        // and may lag if the process dies between these renames.
         write_atomic(&ydoc_path, &ydoc_bytes)?;
         write_atomic(&json_path, &json_bytes)?;
         write_atomic(&md_path, notes_md.as_bytes())?;
@@ -734,8 +765,12 @@ mod tests {
             "expected no .tmp residue after save, found: {residue:?}"
         );
 
-        // And re-saving over an existing pair stays clean too.
-        NotesStore::save(&root, id, &representative_doc(), "body2").expect("re-save");
+        // A subsequent write over the existing notes.ydoc goes through
+        // apply_update (save would refuse); it stays clean too.
+        let v1 = NotesStore::read_ydoc_state(&root, id)
+            .expect("read state")
+            .expect("state present");
+        NotesStore::apply_update(&root, id, &v1, "body2").expect("apply update");
         let residue_after: Vec<_> = std::fs::read_dir(&folder)
             .expect("read dir")
             .filter_map(|e| e.ok())
@@ -779,6 +814,53 @@ mod tests {
         assert!(folder.join("notes.md").exists(), "notes.md must be written");
         let ydoc = std::fs::read(folder.join("notes.ydoc")).expect("read ydoc");
         assert!(!ydoc.is_empty(), "notes.ydoc must carry the encoded state");
+    }
+
+    #[test]
+    fn save_refuses_when_notes_ydoc_already_exists() {
+        // The first save establishes notes.ydoc.
+        let (_tempdir, root, id) = make_meeting();
+        NotesStore::save(&root, id, &representative_doc(), "body").expect("first save");
+
+        // A second save would rebuild the doc from JSON, severing CRDT history;
+        // it must refuse rather than clobber the authoritative blob.
+        let err = NotesStore::save(&root, id, &representative_doc(), "body2")
+            .expect_err("save over an existing notes.ydoc must refuse");
+        assert!(
+            matches!(err, minutist_common::AppError::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+
+        // The refusal left notes.md (and the rest) at the first-save content.
+        let loaded = NotesStore::load(&root, id).expect("load").expect("present");
+        assert_eq!(loaded.markdown, "body", "refused save must not touch notes.md");
+    }
+
+    #[test]
+    fn apply_update_seeds_legacy_json_before_merging() {
+        // A pre-CRDT meeting: notes.json on disk, no notes.ydoc. An edit reaches
+        // apply_update before any on-open seed has run.
+        let (_tempdir, root, id) = make_meeting();
+        let folder = root.join(id.0.to_string());
+        let legacy = representative_doc();
+        std::fs::write(
+            folder.join("notes.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .expect("seed legacy notes.json");
+        assert!(!folder.join("notes.ydoc").exists());
+
+        // Apply an empty (no-op) update from a fresh doc: nothing is added, so if
+        // the legacy content survives it can only be because apply_update seeded
+        // notes.ydoc from notes.json before merging.
+        let empty = crate::ydoc::encode_state_v1(&crate::ydoc::new_ydoc());
+        NotesStore::apply_update(&root, id, &empty, "md").expect("apply update");
+
+        let loaded = NotesStore::load(&root, id).expect("load").expect("present");
+        assert_eq!(
+            loaded.json, legacy,
+            "apply_update must seed legacy notes.json before merging, not drop it"
+        );
     }
 
     #[test]

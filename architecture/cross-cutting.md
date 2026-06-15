@@ -891,7 +891,7 @@ change.
 │   ├── transcript.json
 │   ├── notes.ydoc                 Yjs/yrs CRDT state (authoritative when present)
 │   ├── notes.json                 ProseMirror JSON (derived from notes.ydoc)
-│   ├── notes.md                   markdown (derived)
+│   ├── notes.md                   markdown (derived, best-effort)
 │   ├── summary.md
 │   ├── metadata.json
 │   ├── assets/                 pasted/dropped note images (content-hash files)
@@ -910,6 +910,17 @@ downloaded per-kind / per-model files.
 
 Writes to a directory outside a component's owned scope are a review
 finding.
+
+**Notes write paths (binding).** Once `notes.ydoc` exists it is authoritative
+and only `NotesStore::apply_update` may write it — that path MERGES the editor's
+incremental Yjs update, preserving CRDT history. `NotesStore::save` rebuilds the
+doc from whole-document JSON (minting a fresh client history) and is therefore
+the **first-write-only** writer: it refuses with `AppError::InvalidInput` when a
+`notes.ydoc` already exists. `apply_update` seeds a legacy `notes.json` (via
+`seed_ydoc_if_needed`) before merging so a pre-CRDT meeting's content is not
+dropped on its first incremental write. `notes.json` self-heals from
+`notes.ydoc` on load; `notes.md` is a best-effort export that can lag the
+authoritative doc after a crash between its rename and the rest.
 
 **`settings.data_directory` override.** `app-main` reads
 `settings.data_directory` after loading settings and calls `resolve_data_roots`

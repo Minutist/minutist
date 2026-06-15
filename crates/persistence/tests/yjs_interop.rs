@@ -142,9 +142,7 @@ fn normalize_numbers(v: Value) -> Value {
             if let Some(f) = n.as_f64() {
                 if f.fract() == 0.0 && f.abs() < 9.007_199_254_740_992e15 {
                     // Whole integer within safe-integer range → use i64 form.
-                    if let Some(i) = n.as_i64().or_else(|| Some(f as i64)) {
-                        return Value::Number(i.into());
-                    }
+                    return Value::Number((f as i64).into());
                 }
             }
             Value::Number(n)

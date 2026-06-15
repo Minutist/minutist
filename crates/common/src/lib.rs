@@ -1080,7 +1080,7 @@ pub fn resolve_gpu_plan(
             // Force GPU on for both models, but still apply the VRAM clamp for
             // the large ASR tier — a no-probe `On` cannot know whether the 1.7B
             // fits, so it falls back to the small tier.
-            let effective_prefer_large = probe.map_or(false, |p| {
+            let effective_prefer_large = probe.is_some_and(|p| {
                 // `On` forces the summariser on GPU; deduct its cost before
                 // checking whether the large ASR tier also fits.
                 let asr_headroom = probe_budget(p).saturating_sub(SUMMARISER_VRAM_BYTES);

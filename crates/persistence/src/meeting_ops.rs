@@ -125,6 +125,25 @@ pub async fn delete_meeting(
     Ok(())
 }
 
+/// Build a `MeetingListEntry` from a meeting folder's metadata + excerpt.
+///
+/// Shares the same projection as `rebuild_from_disk` and reuses the excerpt
+/// derivation (`crate::index::derive_excerpt`): a one-line `summary.md` blurb
+/// once a summary exists, else the first transcript segment (live-test UX T6).
+fn list_entry_from(folder: &Path) -> Result<minutist_common::MeetingListEntry, Error> {
+    let meta = reader::read_metadata_inner(folder)?;
+    let excerpt = crate::index::derive_excerpt(folder);
+
+    Ok(minutist_common::MeetingListEntry {
+        id: meta.uuid,
+        title: meta.title,
+        started_at: meta.started_at,
+        duration_ms: meta.duration_ms,
+        speaker_count: meta.speaker_count,
+        excerpt,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -215,23 +234,4 @@ mod tests {
             .expect_err("missing meeting must error");
         assert!(matches!(err, minutist_common::AppError::InvalidInput { .. }));
     }
-}
-
-/// Build a `MeetingListEntry` from a meeting folder's metadata + excerpt.
-///
-/// Shares the same projection as `rebuild_from_disk` and reuses the excerpt
-/// derivation (`crate::index::derive_excerpt`): a one-line `summary.md` blurb
-/// once a summary exists, else the first transcript segment (live-test UX T6).
-fn list_entry_from(folder: &Path) -> Result<minutist_common::MeetingListEntry, Error> {
-    let meta = reader::read_metadata_inner(folder)?;
-    let excerpt = crate::index::derive_excerpt(folder);
-
-    Ok(minutist_common::MeetingListEntry {
-        id: meta.uuid,
-        title: meta.title,
-        started_at: meta.started_at,
-        duration_ms: meta.duration_ms,
-        speaker_count: meta.speaker_count,
-        excerpt,
-    })
 }

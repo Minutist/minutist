@@ -883,7 +883,7 @@ fn test_decode_opus_ogg_handles_double_header_set() {
         head.push(1); // version
         head.push(1); // channels
         head.extend_from_slice(&3840u16.to_le_bytes()); // pre_skip
-        head.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+        head.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
         head.extend_from_slice(&0u16.to_le_bytes()); // gain
         head.push(0); // mapping family
         pw.write_packet(head, extra_serial, PacketWriteEndInfo::EndPage, 0)
@@ -950,7 +950,7 @@ fn test_decode_opus_ogg_extra_tags_packet_skipped() {
         head.push(1);
         head.push(1);
         head.extend_from_slice(&3840u16.to_le_bytes());
-        head.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+        head.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
         head.extend_from_slice(&0u16.to_le_bytes());
         head.push(0);
         pw.write_packet(head, extra_serial, PacketWriteEndInfo::EndPage, 0)

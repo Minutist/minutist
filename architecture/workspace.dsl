@@ -124,7 +124,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
                 tags "Container" "Storage"
             }
 
-            meetingFs = container "Meeting filesystem" "Per-meeting directory under {app-data}/meetings/{uuid}/. Holds audio.opus, transcript.json, notes.json, notes.md, summary.md, metadata.json." "Filesystem" {
+            meetingFs = container "Meeting filesystem" "Per-meeting directory under {app-data}/meetings/{uuid}/. Holds audio.opus, transcript.json, notes.ydoc (authoritative CRDT), notes.json + notes.md (derived), summary.md, metadata.json." "Filesystem" {
                 tags "Container" "Storage"
             }
         }

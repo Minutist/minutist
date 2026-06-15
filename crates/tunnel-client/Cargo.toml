@@ -35,8 +35,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util", "net"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util", "net", "signal"] }
 # The integration test stands up a fake relay (a tokio-tungstenite SERVER accept)
 # and a fake loopback HTTP server (a raw tokio TcpListener speaking minimal
 # HTTP/1.1), so no extra server framework is pulled in.
 tokio-tungstenite = { workspace = true, features = ["handshake"] }
+# WS4-A S4 live-smoke driver only (examples/dial.rs): logging for the standalone
+# tunnel dialer. Not used by the library.
+tracing-subscriber = { workspace = true }

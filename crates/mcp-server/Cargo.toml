@@ -50,3 +50,8 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 orchestrator = { path = "../orchestrator", features = ["test-source"] }
 persistence = { path = "../persistence" }
 tempfile = "3"
+# WS4-A S4 live-smoke harness only (examples/serve.rs): a standalone loopback
+# mcp-server with env-driven bind/bearer for the relay<->app bridge smoke. Brings
+# in the workspace tracing-subscriber so the harness can emit logs; not used by
+# the library or the shipped app.
+tracing-subscriber = { workspace = true }

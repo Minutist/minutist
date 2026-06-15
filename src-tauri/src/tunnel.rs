@@ -341,6 +341,11 @@ impl ConnectedTunnel {
             .handle
             .take();
         if let Some(handle) = handle {
+            // Raise the cancel SYNCHRONOUSLY first so the old loop has observed
+            // it before start_tunnel proceeds to spawn a replacement and dial —
+            // otherwise the spawned stop().await below only raises the cancel
+            // once first polled, leaving a brief two-loop window for the account.
+            handle.signal_cancel();
             tauri::async_runtime::spawn(async move {
                 let _ = handle.stop().await;
             });
@@ -401,7 +406,13 @@ impl TunnelControl for ConnectedTunnel {
         match client.poll_once(&device_code).await {
             Ok(PollOutcome::Pending) => Ok(TunnelStatus::Pairing),
             Ok(PollOutcome::SlowDown) => {
-                // Bump the stored interval so the UI's next poll backs off.
+                // Track the RFC 8628 §3.5 backed-off interval. NOTE: the UI polls
+                // at a fixed floor (PAIRING_POLL_INTERVAL_MS) and does not yet read
+                // this value back over IPC, so the bump is not surfaced to the
+                // client cadence — acceptable because the floor already spaces
+                // polls and the relay enforces its own rate limit. Surfacing the
+                // interval to the UI is a deferred refinement (would add a field to
+                // the poll response / bindings).
                 let mut rt = self.runtime.lock().expect("tunnel runtime poisoned");
                 if let Some(p) = rt.pairing.as_mut() {
                     p.interval = next_interval(p.interval);

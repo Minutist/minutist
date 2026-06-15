@@ -69,6 +69,16 @@ impl TunnelHandle {
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
     }
+
+    /// Raise the cancel signal immediately, WITHOUT awaiting the task. For a
+    /// synchronous restart path that must guarantee the old loop has observed the
+    /// cancel before a replacement loop is spawned and dials — closing the brief
+    /// window where two loops for one account could momentarily coexist. The task
+    /// is still awaited separately (via [`stop`](Self::stop)) to finish teardown;
+    /// `send(true)` is idempotent, so the later `stop` is harmless.
+    pub fn signal_cancel(&self) {
+        let _ = self.cancel_tx.send(true);
+    }
 }
 
 #[cfg(test)]

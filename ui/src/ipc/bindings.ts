@@ -1551,7 +1551,35 @@ preload_summariser?: boolean;
  * verbatim. `#[serde(default = ...)]` defaults to "auto"; an older store
  * written before this field existed deserialises to "auto".
  */
-output_language?: string }
+output_language?: string; 
+/**
+ * Whether the connected-tier relay connector is enabled (WS4-A S5b).
+ * **Off by default**, mirroring `mcp_enabled`. When `true` AND a device
+ * credential is stored (the device is paired), `app-main` (connected build
+ * only) starts the tunnel lifecycle: it dials the relay so an external MCP
+ * client (Claude web/Desktop, ChatGPT, Codex) can reach this app's tools
+ * over the relay. The connector channel transits meeting content to the AI
+ * vendor BY DESIGN (the user asked for it) — it is never described as
+ * private (D5). `#[serde(default)]` defaults to `false`; an older store
+ * deserialises to `false`. The free build ignores this field entirely (no
+ * `tunnel-client`). See `architecture/cross-cutting.md` — "Build variants".
+ */
+connector_enabled?: boolean; 
+/**
+ * The relay tunnel WSS rendezvous URL (WS4-A S5b). User-overridable for
+ * self-hosting / testing; defaults to the minutist.ai endpoint. Must be
+ * `wss://` for an off-machine host (`ws://` only for a loopback host, the
+ * tunnel-client scheme check). `#[serde(default = ...)]` defaults to the
+ * minutist.ai endpoint; an older store deserialises to it.
+ */
+relay_url?: string; 
+/**
+ * The account-service API base URL the device-code pairing client posts
+ * `/pair/start` + `/pair/poll` against (WS4-A S5b). User-overridable;
+ * defaults to the minutist.ai endpoint. Must be `https://` for an off-machine
+ * host. `#[serde(default = ...)]` defaults to the minutist.ai endpoint.
+ */
+relay_api_url?: string }
 /**
  * Built-in summary prompt presets (Phase 9 — D4).
  * 

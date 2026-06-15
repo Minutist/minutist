@@ -44,6 +44,11 @@ vi.mock("../ipc/client", () => ({
     })),
     updateSettings: vi.fn(async () => ({ status: "ok", data: null })),
     getSettings: vi.fn(async () => ({ status: "ok", data: null })),
+    // The lazy ConnectionSettingsPane calls tunnel_status on mount.
+    tunnelStatus: vi.fn(async () => ({
+      status: "ok",
+      data: { enabled: false, status: "disconnected", account_id: null },
+    })),
   },
   unwrap: <T,>(r: { status: string; data: T }) => {
     if (r.status !== "ok") throw new Error("err");
@@ -146,5 +151,14 @@ describe("MCP pane lazy wiring", () => {
     render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
     // The lazy chunk resolves asynchronously; findByText waits for it.
     await screen.findByText("Enable MCP server (loopback)");
+  });
+
+  // The Connection (connector / relay tunnel) pane is gated the same way; verify
+  // it resolves via the lazy path in the connected build. The free-build absence
+  // is verified by the CI grep, not here (VITE_CONNECTED is baked at transform
+  // time, so vi.stubEnv cannot toggle it after module load).
+  it("renders the Connection pane via the lazy path in the connected build", async () => {
+    render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
+    await screen.findByText("Enable the connector");
   });
 });

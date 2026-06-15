@@ -2395,6 +2395,31 @@ handles it in `useMcpServerInfoStore` (drops the "starting…" hint, shows the
 reason) and in `McpSettingsPane` (renders a `--warn` hint with the reason and
 retry guidance). Adds the `mcp-server` dependency row above.
 
+**Connected-tier tunnel wiring (WS4-A S5b).** Behind `#[cfg(feature = "connected")]`,
+`app-main` builds a `ConnectedTunnel` (in `src-tauri/src/tunnel.rs`) that
+implements `ipc_bridge::TunnelControl` and injects it as `IpcState.tunnel`; the
+free build injects `ipc_bridge::disabled_tunnel()` instead. `ConnectedTunnel`
+owns the `tunnel-client` pairing + reconnect + lifecycle types (this is the
+optional `app-main → tunnel-client` edge, gated by the same `connected` feature
+as `mcp-server`): `begin_pairing` / `poll_pairing` drive the device-code client,
+`set_enabled` persists `settings.connector_enabled` and starts/stops the
+`TunnelHandle`, and the reconnect loop's `ConnectionState` callback maps to
+`TunnelStatus` emitted as `AppEvent::TunnelStatusChanged`. The tunnel replays
+relayed requests against the loopback `mcp-server`, so its `LoopbackTarget` is
+built from `IpcState.mcp_info` (the `McpServerInfo` URL stripped to origin + the
+internal bearer — the relay's request never carries the user bearer; the app
+applies its own internal bearer, D5); the MCP-server boot/enable path calls
+`ConnectedTunnel::retry_start_if_enabled` once the loopback target exists so a
+paired+enabled device that launched before the MCP server bound connects as soon
+as it does. The issued device credential + account/device ids are stored at
+`{app-data}/tunnel_device.json` with owner-only `0600` via the shared
+`write_secret_file` (renamed from `write_token_file`; the same helper writes
+`mcp_token`), carrying the same Windows-ACL gap noted there. The relay/api URLs
+default to the minutist.ai endpoints (`settings.relay_url` / `relay_api_url`,
+user-overridable). Adds the `tunnel-client` (optional, connected) dependency
+edge; the free build omits it (verified by `cargo build -p minutist
+--no-default-features`).
+
 ## Webview components
 
 The webview is small enough that ownership maps to directories rather

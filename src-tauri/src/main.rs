@@ -12,6 +12,8 @@ use tauri::{Manager, WindowEvent};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod crash;
+#[cfg(feature = "connected")]
+mod tunnel;
 mod updater;
 
 /// The bundle identifier, mirrored from `tauri.conf.json`. Used for the
@@ -289,7 +291,7 @@ fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let token = hex::encode(bytes);
 
-    if let Err(e) = write_token_file(&token_path, &token) {
+    if let Err(e) = write_secret_file(&token_path, &token) {
         tracing::warn!(
             target: "app-main",
             "failed to persist MCP token to {:?}: {e}; using a per-run token",
@@ -301,12 +303,15 @@ fn resolve_mcp_token(app_data_dir: &std::path::Path) -> String {
     token
 }
 
-/// Write the token to `path`, creating the file with owner-only mode `0o600`
+/// Write a secret to `path`, creating the file with owner-only mode `0o600`
 /// atomically on Unix (no write-then-chmod window). On Windows the file
 /// inherits the parent directory's ACL; per-file ACL tightening via
 /// `SetNamedSecurityInfoW` is not yet implemented (see `resolve_mcp_token`).
+///
+/// Shared by the MCP bearer token (`mcp_token`) and the connected-tier device
+/// credential (`tunnel_device.json`, S5b) so both get the same 0600 discipline.
 #[cfg(feature = "connected")]
-fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+pub(crate) fn write_secret_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
     use std::io::Write;
 
     let mut opts = std::fs::OpenOptions::new();
@@ -478,11 +483,10 @@ async fn do_start_mcp_server(params: McpStartParams) {
                 shutdown_tx,
                 done_rx,
             });
-            *params.mcp_info.lock().expect("mcp_info poisoned") =
-                Some(ipc_bridge::McpServerInfo {
-                    url: url.clone(),
-                    token,
-                });
+            *params.mcp_info.lock().expect("mcp_info poisoned") = Some(ipc_bridge::McpServerInfo {
+                url: url.clone(),
+                token,
+            });
             // Emit the listening event so the MCP pane refreshes.
             // The token is NOT carried on the event.
             let _ = params
@@ -753,10 +757,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // platform root (bootstrap constraint — see `resolve_data_roots`).
             let data_roots = {
                 let current = settings_handle.current();
-                resolve_data_roots(
-                    &app_data_dir,
-                    current.data_directory.as_deref(),
-                )
+                resolve_data_roots(&app_data_dir, current.data_directory.as_deref())
             };
 
             let meetings_dir = data_roots.meetings;
@@ -875,6 +876,25 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             let mcp_info: Arc<std::sync::Mutex<Option<ipc_bridge::McpServerInfo>>> =
                 Arc::new(std::sync::Mutex::new(None));
 
+            // The connected-tier tunnel control (WS4-A S5b). In the connected
+            // build this is the ConnectedTunnel (pairing + reconnect + lifecycle,
+            // backed by tunnel-client) and it auto-starts if the connector is
+            // enabled AND a credential is stored AND the loopback MCP server is
+            // up; in the free build it is the no-op DisabledTunnel. A clone of the
+            // connected control is held so the MCP-server boot path can retry the
+            // tunnel start once the loopback target exists.
+            #[cfg(feature = "connected")]
+            let connected_tunnel = tunnel::ConnectedTunnel::new(
+                settings_handle.clone(),
+                ipc_event_tx.clone(),
+                app_data_dir.clone(),
+                mcp_info.clone(),
+            );
+            #[cfg(feature = "connected")]
+            let tunnel_control: Arc<dyn ipc_bridge::TunnelControl> = connected_tunnel.clone();
+            #[cfg(not(feature = "connected"))]
+            let tunnel_control: Arc<dyn ipc_bridge::TunnelControl> = ipc_bridge::disabled_tunnel();
+
             // Register the IPC state so command handlers can access it.
             app.manage(IpcState {
                 orchestrator: orchestrator.clone(),
@@ -891,6 +911,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                     std::collections::HashSet::new(),
                 )),
                 mcp_info: mcp_info.clone(),
+                tunnel: tunnel_control,
                 logs_dir: logs_dir.clone(),
                 app_version: app_handle.package_info().version.to_string(),
                 platform: platform_string(),
@@ -967,6 +988,10 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 let watcher_app_data_dir = app_data_dir.clone();
                 let watcher_mcp_info = mcp_info.clone();
                 let watcher_shutdown = shutdown_state.clone();
+                // The connected tunnel control, so the watcher can (re)start the
+                // tunnel once the loopback MCP server has bound (the tunnel
+                // replays relayed requests against it).
+                let watcher_tunnel = connected_tunnel.clone();
 
                 // Whether the server is desired on at the point the watcher
                 // last acted. Seeded to `false` so a boot with `mcp_enabled =
@@ -1009,6 +1034,10 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                             shutdown_state: watcher_shutdown.clone(),
                         })
                         .await;
+                        // The loopback target now exists (if the bind
+                        // succeeded); start the tunnel if the connector is
+                        // enabled + paired.
+                        watcher_tunnel.retry_start_if_enabled();
                     }
 
                     // Watch for `mcp_enabled` changes and start/stop the server
@@ -1047,6 +1076,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                                 shutdown_state: watcher_shutdown.clone(),
                             })
                             .await;
+                            watcher_tunnel.retry_start_if_enabled();
                         } else {
                             // desired=off. Take the handles (if any) and stop.
                             let maybe_handles = watcher_shutdown
@@ -1088,12 +1118,9 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                             // Clear the info slot and notify the UI. Done after
                             // awaiting completion so the UI clears only once the
                             // port is actually free.
-                            *watcher_mcp_info
-                                .lock()
-                                .expect("mcp_info poisoned") = None;
-                            let _ = watcher_event_tx.send(
-                                minutist_common::AppEvent::McpServerStopped,
-                            );
+                            *watcher_mcp_info.lock().expect("mcp_info poisoned") = None;
+                            let _ =
+                                watcher_event_tx.send(minutist_common::AppEvent::McpServerStopped);
                             tracing::info!(
                                 target: "app-main",
                                 "MCP server stopped via settings toggle"
@@ -1169,7 +1196,10 @@ fn serve_note_asset(
             .header(header::CONTENT_TYPE, asset.content_type)
             // The asset is immutable (content-addressed filename), so it is
             // safe for the webview to cache aggressively.
-            .header(header::CACHE_CONTROL, "private, max-age=31536000, immutable")
+            .header(
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            )
             .body(asset.bytes)
             .unwrap_or_else(|_| Response::new(Vec::new())),
         Err(e) => {

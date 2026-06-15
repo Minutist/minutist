@@ -226,6 +226,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.mcpServer -> minutist.core.common "Uses interface types"
         minutist.core.mcpServer -> minutist.core.agentTools "Projects the registry; dispatches tools/call"
         minutist.core.appMain   -> minutist.core.mcpServer  "Spawns the listener via tauri::async_runtime::spawn (settings-gated)"
+        minutist.core.appMain   -> minutist.core.tunnelClient "Runs device pairing + the reconnect/lifecycle (connected-gated, WS4-A S5b); injects ConnectedTunnel as IpcState.tunnel"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
         minutist.core.ipcBridge -> minutist.core.orchestrator "Invokes commands; subscribes to events"

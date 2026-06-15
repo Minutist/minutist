@@ -2980,6 +2980,7 @@ name = "minutist"
 version = "0.0.0"
 dependencies = [
  "agent-tools",
+ "async-trait",
  "hex",
  "ipc-bridge",
  "mcp-server",
@@ -2998,10 +2999,12 @@ dependencies = [
  "tauri-plugin-store",
  "tauri-plugin-updater",
  "tauri-specta",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "tunnel-client",
 ]
 
 [[package]]

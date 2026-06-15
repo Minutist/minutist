@@ -773,7 +773,12 @@ revision 2025-11-25). Binding controls:
   Windows-platform hardening commit. Until then the owner-only guarantee is
   Unix-scoped; the Windows per-user app-data directory is the operative
   control. OS-keychain migration (`keyring` crate) is a separate documented
-  follow-up.
+  follow-up. The same writer (`write_secret_file`, formerly `write_token_file`)
+  persists the WS4-A S5b **device credential** at `{app-data}/tunnel_device.json`
+  with the identical 0600 discipline — and the identical Windows-ACL gap; the
+  device credential (`mdc_<device_id>.<secret>`, the long-lived relay device
+  identity returned once at pairing) is stored alongside its `account_id` /
+  `device_id`, never logged, and never crosses to the webview.
 
   **Token lifetime and the connected-relay path.** The token is stable across
   restarts: `app-main` reads the existing file on start and reuses it so that
@@ -880,6 +885,8 @@ change.
 │                               (always at platform root — logging bootstraps
 │                               before settings load)
 ├── mcp_token                   MCP bearer token (Phase 10); owned by `app-main`
+├── tunnel_device.json          relay device credential (WS4-A S5b, connected
+│                               build only); owned by `app-main`; 0600
 │
 │   The four entries below are placed at {app-data} by default.
 │   When settings.data_directory is set to a valid absolute path they move
@@ -1274,19 +1281,21 @@ Two shipping artifacts are produced from one source tree:
 
 | Artifact | Cargo invocation | Vite | Contents |
 |---|---|---|---|
-| **Connected** (default) | `cargo build` (or `--features connected`) | `VITE_CONNECTED=1` | MCP server, bearer-token generation, MCP settings pane |
-| **Free** | `cargo build --no-default-features [--features <gpu>]` | `VITE_CONNECTED` unset | No MCP server, no rmcp, no listening socket, no MCP pane in the UI bundle |
+| **Connected** (default) | `cargo build` (or `--features connected`) | `VITE_CONNECTED=1` | MCP server, bearer-token generation, MCP settings pane, the relay tunnel (device pairing + connector) + Connection settings pane |
+| **Free** | `cargo build --no-default-features [--features <gpu>]` | `VITE_CONNECTED` unset | No MCP server, no rmcp, no listening socket, no tunnel-client, no MCP/Connection panes in the UI bundle |
 
 **Single identifier.** Both artifacts share `ai.minutist` as the bundle identifier and product name. Artifact names in CI are distinguished by a `-free` suffix on the artifact upload name only — no `productName` change.
 
 **Cargo feature.** `connected` is a default feature in `src-tauri/Cargo.toml`. It gates:
 - `dep:mcp-server` — the entire MCP server crate + rmcp transitive stack.
+- `dep:tunnel-client` — the app-side relay tunnel (pairing + reconnect + lifecycle).
+- `dep:async-trait` — the `ConnectedTunnel` impl of `ipc_bridge::TunnelControl`.
 - `dep:rand` and `dep:hex` — CSPRNG bearer-token generation (`resolve_mcp_token` in `app-main`).
-- The MCP spawn block in `app-main`'s `setup()` (`#[cfg(feature = "connected")]`).
+- The MCP spawn block AND the `ConnectedTunnel` construction + `src-tauri/src/tunnel.rs` module in `app-main`'s `setup()` (`#[cfg(feature = "connected")]`).
 
-The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server_info` returns `None` unconditionally. The `mcp_*` fields in `Settings` remain (serde compatibility across tier switches — a user who switches from connected to free keeps their settings file intact with the MCP fields as inert no-ops).
+The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server_info` returns `None` unconditionally. `IpcState.tunnel` is `ipc_bridge::disabled_tunnel()` (reports `Disconnected`, rejects pairing as `Unsupported`), so the four tunnel commands compile and behave gracefully with no relay present. The `mcp_*` and `connector_enabled` / `relay_url` / `relay_api_url` fields in `Settings` remain (serde compatibility across tier switches — a user who switches from connected to free keeps their settings file intact with the connected fields as inert no-ops).
 
-**Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` renders in the UI. `vite.config.ts` injects this as a `define`-replaced constant: in the free build the false branch of the `React.lazy()` dynamic import is dead-code-eliminated, dropping `McpSettingsPane`, `mcp-settings.ts`, and `mcp-server-info.ts` from the output bundle. The default is `"1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour without any explicit flag. Verification: `VITE_CONNECTED= npm run build && grep -r "Enable MCP server" dist/` must return no matches.
+**Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` and `ConnectionSettingsPane` render in the UI. `vite.config.ts` injects this as a `define`-replaced constant: in the free build the false branch of each `React.lazy()` dynamic import is dead-code-eliminated, dropping `McpSettingsPane` / `mcp-settings.ts` / `mcp-server-info.ts` AND `ConnectionSettingsPane` / `connector-settings.ts` / `tunnel-status.ts` from the output bundle. The default is `"1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour without any explicit flag. Verification: `VITE_CONNECTED= npm run build && grep -r "Enable MCP server" dist/` must return no matches.
 
 **Windows build script.** `scripts/build-windows-app.ps1 -Features vulkan` builds the **connected** Vulkan artifact (the `connected` feature is default, so `--features vulkan` implicitly includes it). The free Windows Vulkan build would require `--no-default-features --features vulkan` passed via `$Features`. The `Makefile` `build-free` / `build-free-vulkan` targets show the canonical free invocation on Linux/macOS.
 

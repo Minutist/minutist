@@ -110,6 +110,21 @@ const fn default_mcp_port() -> u16 {
     8765
 }
 
+/// Default connector relay tunnel URL (WS4-A S5b). The hosted relay's WSS
+/// rendezvous endpoint the device dials. User-overridable (for self-hosting /
+/// testing); defaults to the minutist.ai endpoint. An older store deserialises
+/// to this via `#[serde(default = ...)]`.
+fn default_relay_url() -> String {
+    "wss://mcp.minutist.ai/tunnel".to_string()
+}
+
+/// Default connector account-service API base URL (WS4-A S5b). The base the
+/// device-code pairing client posts `/pair/start` + `/pair/poll` against.
+/// User-overridable; defaults to the minutist.ai endpoint.
+fn default_relay_api_url() -> String {
+    "https://api.minutist.ai".to_string()
+}
+
 /// Default for `auto_summarise_on_stop`: ON (#68). After a meeting is stopped and
 /// finalised, the post-stop background chain auto-runs summarisation (the third
 /// step, after any re-transcribe / re-identify-speakers pass) so the summary is
@@ -501,6 +516,34 @@ pub struct Settings {
     /// written before this field existed deserialises to "auto".
     #[serde(default = "default_output_language")]
     pub output_language: String,
+
+    /// Whether the connected-tier relay connector is enabled (WS4-A S5b).
+    /// **Off by default**, mirroring `mcp_enabled`. When `true` AND a device
+    /// credential is stored (the device is paired), `app-main` (connected build
+    /// only) starts the tunnel lifecycle: it dials the relay so an external MCP
+    /// client (Claude web/Desktop, ChatGPT, Codex) can reach this app's tools
+    /// over the relay. The connector channel transits meeting content to the AI
+    /// vendor BY DESIGN (the user asked for it) — it is never described as
+    /// private (D5). `#[serde(default)]` defaults to `false`; an older store
+    /// deserialises to `false`. The free build ignores this field entirely (no
+    /// `tunnel-client`). See `architecture/cross-cutting.md` — "Build variants".
+    #[serde(default)]
+    pub connector_enabled: bool,
+
+    /// The relay tunnel WSS rendezvous URL (WS4-A S5b). User-overridable for
+    /// self-hosting / testing; defaults to the minutist.ai endpoint. Must be
+    /// `wss://` for an off-machine host (`ws://` only for a loopback host, the
+    /// tunnel-client scheme check). `#[serde(default = ...)]` defaults to the
+    /// minutist.ai endpoint; an older store deserialises to it.
+    #[serde(default = "default_relay_url")]
+    pub relay_url: String,
+
+    /// The account-service API base URL the device-code pairing client posts
+    /// `/pair/start` + `/pair/poll` against (WS4-A S5b). User-overridable;
+    /// defaults to the minutist.ai endpoint. Must be `https://` for an off-machine
+    /// host. `#[serde(default = ...)]` defaults to the minutist.ai endpoint.
+    #[serde(default = "default_relay_api_url")]
+    pub relay_api_url: String,
 }
 
 impl Settings {
@@ -545,6 +588,9 @@ impl Default for Settings {
             auto_summarise_on_stop: default_auto_summarise_on_stop(),
             preload_summariser: default_preload_summariser(),
             output_language: default_output_language(),
+            connector_enabled: false,
+            relay_url: default_relay_url(),
+            relay_api_url: default_relay_api_url(),
         }
     }
 }
@@ -595,11 +641,16 @@ mod tests {
             auto_summarise_on_stop: false,
             preload_summariser: false,
             output_language: "German".to_string(),
+            connector_enabled: true,
+            relay_url: "wss://relay.example/tunnel".to_string(),
+            relay_api_url: "https://api.example".to_string(),
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(restored.transcription_language, "Japanese");
         assert_eq!(restored.output_language, "German");
+        assert!(restored.connector_enabled);
+        assert_eq!(restored.relay_url, "wss://relay.example/tunnel");
         assert_eq!(original, restored);
     }
 
@@ -1243,8 +1294,7 @@ mod tests {
         let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
         let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
         assert_eq!(
-            restored.output_language,
-            "auto",
+            restored.output_language, "auto",
             "missing output_language must deserialise to \"auto\""
         );
         assert_eq!(restored.theme, Theme::Dark);

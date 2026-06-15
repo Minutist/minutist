@@ -51,7 +51,7 @@ import type { Segment } from "../ipc/bindings";
 // ---------------------------------------------------------------------------
 
 function makeSegment(start_ms: number, text: string): Segment {
-  return { start_ms, end_ms: start_ms + 1000, text, words: [] };
+  return { start_ms, end_ms: start_ms + 1000, text, words: [], shared_speakers: [] };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ describe("TranscriptPane cross-reference interactions", () => {
       end_ms: 6_000,
       text: "second",
       speaker_id: "spk_2",
-      words: [],
+      words: [], shared_speakers: [],
     };
     act(() => {
       useRecordingStore.setState({
@@ -463,14 +463,14 @@ function makeSpeakerSegments(): Segment[] {
       end_ms: 2_000,
       text: "Hello from A.",
       speaker_id: "A",
-      words: [],
+      words: [], shared_speakers: [],
     },
     {
       start_ms: 2_000,
       end_ms: 4_000,
       text: "Hello from B.",
       speaker_id: "B",
-      words: [],
+      words: [], shared_speakers: [],
     },
   ];
 }

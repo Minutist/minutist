@@ -125,6 +125,12 @@ pub struct DiarizerConfig {
     /// more than this many clusters remain, keep the N largest by speech mass and
     /// reassign the rest to their nearest survivor. `None` → uncapped.
     pub max_speakers: Option<usize>,
+    /// Multi-speaker flag (#0002): a SURVIVING cluster other than a segment's
+    /// chosen primary contributes its label to `Segment::shared_speakers` when it
+    /// overlaps at least this fraction (`[0.0, 1.0]`) of the segment's duration —
+    /// and only when the primary is itself that substantial. `0.0` disables the
+    /// flag. Presentation only; the segment is not split.
+    pub multi_speaker_min_share: f32,
 }
 
 impl Default for DiarizerConfig {
@@ -165,6 +171,12 @@ impl Default for DiarizerConfig {
             // floor-free cap would only mask a still-misbehaving prune. Callers
             // that need a guaranteed ceiling set this explicitly.
             max_speakers: None,
+            // Flag a segment as multi-speaker when a second surviving speaker
+            // covers ≥ 30% of it (and the primary does too). 0.30 keeps the flag
+            // to genuinely shared segments — a brief interjection (a short
+            // back-channel "mm-hm") stays below it, so single-speaker rows are
+            // not noised up.
+            multi_speaker_min_share: 0.30,
         }
     }
 }
@@ -396,6 +408,52 @@ pub fn overlay_speakers(
         });
     }
 
+    // #0002: flag segments that span more than one speaker. A surviving cluster
+    // other than the segment's chosen primary contributes its label to
+    // `shared_speakers` when its overlap reaches `multi_speaker_min_share` of the
+    // segment duration — and only when the primary is itself that substantial
+    // (else the segment is weakly attributed and not meaningfully "shared").
+    // Restricted to clusters in `seen`, so every shared label matches a
+    // `speaker_id` shown elsewhere in the transcript. A speaker that only ever
+    // overlaps (never wins a segment) has no label and is not flagged — rare and
+    // acceptable for a presentation hint. The label index map is the same
+    // first-seen `seen` order used for `speaker_id`.
+    let min_share = config.multi_speaker_min_share;
+    for ((seg, chosen_id), r) in segments
+        .iter_mut()
+        .zip(chosen.iter())
+        .zip(ranked.iter())
+    {
+        seg.shared_speakers = Vec::new();
+        if min_share <= 0.0 {
+            continue;
+        }
+        let Some(primary) = *chosen_id else { continue };
+        let dur = seg.end_ms.saturating_sub(seg.start_ms);
+        if dur == 0 {
+            continue;
+        }
+        let threshold = (min_share as f64 * dur as f64) as u64;
+        let primary_overlap = r
+            .iter()
+            .find(|(id, _)| *id == primary)
+            .map(|&(_, ov)| ov)
+            .unwrap_or(0);
+        if primary_overlap < threshold {
+            continue;
+        }
+        seg.shared_speakers = r
+            .iter()
+            .filter(|(id, ov)| {
+                *id != primary && *ov >= threshold && seen.contains(id)
+            })
+            .map(|&(id, _)| {
+                let idx = seen.iter().position(|s| *s == id).expect("survivor in seen");
+                alpha_label(idx)
+            })
+            .collect();
+    }
+
     seen.len() as u32
 }
 
@@ -623,6 +681,7 @@ mod tests {
             speaker_id: None,
             confidence: None,
             words: Vec::new(),
+            shared_speakers: Vec::new(),
         }
     }
 
@@ -638,6 +697,9 @@ mod tests {
             min_cluster_share: 0.0,
             min_cluster_segments: 0,
             max_speakers: None,
+            // Disabled here so the relabel/prune tests are unaffected; the
+            // multi-speaker flag has its own dedicated test with a set share.
+            multi_speaker_min_share: 0.0,
         }
     }
 
@@ -810,6 +872,68 @@ mod tests {
         }];
         overlay_speakers(&turns, &mut segs, &no_prune());
         assert_eq!(segs[0].speaker_id, None);
+    }
+
+    /// #0002: a config with the multi-speaker flag enabled at the default share.
+    fn flag_share() -> DiarizerConfig {
+        DiarizerConfig {
+            multi_speaker_min_share: 0.30,
+            ..no_prune()
+        }
+    }
+
+    #[test]
+    fn overlay_flags_a_segment_spanning_two_speakers() {
+        // Segment 0 [0,1000): cluster 0 covers all 1000 ms, cluster 1 covers the
+        // last 600 ms (60% ≥ 30%). Segment 1 [1000,2000): cluster 1 alone — this
+        // is what gives cluster 1 a label ("B") so it can appear in segment 0's
+        // shared list.
+        let turns = vec![
+            turn(0.0, 1.0, 0),
+            turn(0.4, 1.0, 1),
+            turn(1.0, 2.0, 1),
+        ];
+        let mut segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
+        overlay_speakers(&turns, &mut segs, &flag_share());
+
+        // Primary labels by first-seen order.
+        assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
+        // Segment 0 is flagged shared with B; segment 1 is single-speaker.
+        assert_eq!(segs[0].shared_speakers, vec!["B".to_string()]);
+        assert!(segs[1].shared_speakers.is_empty());
+    }
+
+    #[test]
+    fn overlay_does_not_flag_a_brief_secondary_overlap() {
+        // Cluster 1 covers only the last 200 ms of segment 0 (20% < 30%), so the
+        // segment is NOT flagged shared even though a second speaker is present.
+        let turns = vec![
+            turn(0.0, 1.0, 0),
+            turn(0.8, 1.0, 1),
+            turn(1.0, 2.0, 1),
+        ];
+        let mut segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
+        overlay_speakers(&turns, &mut segs, &flag_share());
+
+        assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
+        assert!(
+            segs[0].shared_speakers.is_empty(),
+            "a 20% secondary overlap is below the 30% share threshold"
+        );
+    }
+
+    #[test]
+    fn overlay_does_not_flag_when_disabled() {
+        // `multi_speaker_min_share == 0.0` (no_prune default) disables the flag.
+        let turns = vec![
+            turn(0.0, 1.0, 0),
+            turn(0.4, 1.0, 1),
+            turn(1.0, 2.0, 1),
+        ];
+        let mut segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
+        overlay_speakers(&turns, &mut segs, &no_prune());
+        assert!(segs[0].shared_speakers.is_empty());
     }
 
     // -----------------------------------------------------------------------

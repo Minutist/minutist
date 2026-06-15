@@ -90,6 +90,7 @@ fn build_segments(total_ms: u64) -> (Vec<Segment>, Vec<&'static str>) {
             speaker_id: None,
             confidence: None,
             words: Vec::new(),
+            shared_speakers: Vec::new(),
         });
         truth.push(label);
         start = end;
@@ -193,6 +194,7 @@ fn single_speaker_control_one_label() {
             speaker_id: None,
             confidence: None,
             words: Vec::new(),
+            shared_speakers: Vec::new(),
         });
         start += SEGMENT_MS;
     }

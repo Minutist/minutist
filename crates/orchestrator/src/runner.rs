@@ -2172,6 +2172,7 @@ pub(crate) fn emit_segments_proportional(
             speaker_id: speaker_ids.get(i).cloned().flatten(),
             confidence: None,
             words: Vec::new(),
+            shared_speakers: Vec::new(),
         });
     }
 

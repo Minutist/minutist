@@ -234,6 +234,7 @@ impl minutist_common::AsrBackend for ParakeetBackend {
             speaker_id: None,
             confidence: None,
             words,
+            shared_speakers: Vec::new(),
         }])
     }
 }

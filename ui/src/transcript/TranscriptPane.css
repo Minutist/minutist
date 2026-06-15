@@ -95,6 +95,20 @@
   letter-spacing: 0.02em;
 }
 
+/* #0002: quiet "N speakers" hint on a segment the diarizer found multi-speaker. */
+.transcript-pane__multi-speaker {
+  margin-left: 0.4em;
+  padding: 0 0.3em;
+  font-size: 0.62rem;
+  font-family: var(--font-mono);
+  letter-spacing: 0.03em;
+  color: var(--stone);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  vertical-align: 0.08em;
+  white-space: nowrap;
+}
+
 .transcript-pane__empty {
   color: var(--stone);
   text-align: center;

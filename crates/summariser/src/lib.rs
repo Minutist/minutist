@@ -1008,6 +1008,7 @@ mod tests {
             speaker_id: speaker.map(|s| s.to_string()),
             confidence: None,
             words: vec![],
+            shared_speakers: Vec::new(),
         }
     }
 
@@ -1216,6 +1217,7 @@ mod tests {
                 speaker_id: Some(format!("Speaker {}", (i % 3) + 1)),
                 confidence: None,
                 words: vec![],
+                shared_speakers: Vec::new(),
             });
         }
         segments

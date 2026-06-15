@@ -163,6 +163,7 @@ impl AsrBackend for StubAsrBackend {
             speaker_id: None,
             confidence: None,
             words: vec![],
+            shared_speakers: Vec::new(),
         }])
     }
 }
@@ -222,6 +223,7 @@ impl AsrBackend for FailingAsrBackend {
                 speaker_id: None,
                 confidence: None,
                 words: vec![],
+                shared_speakers: Vec::new(),
             }])
         }
     }
@@ -280,6 +282,7 @@ impl AsrBackend for PanickingAsrBackend {
             speaker_id: None,
             confidence: None,
             words: vec![],
+            shared_speakers: Vec::new(),
         }])
     }
 }

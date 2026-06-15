@@ -1075,6 +1075,7 @@ fn emit_segments_proportional(
                 speaker_id: None,
                 confidence: None,
                 words: Vec::new(),
+                shared_speakers: Vec::new(),
             };
             println!("{}", serde_json::to_string(&seg)?);
         }
@@ -1104,6 +1105,7 @@ fn emit_segments_proportional(
             speaker_id: None,
             confidence: None,
             words: Vec::new(),
+            shared_speakers: Vec::new(),
         };
         if first_segment_latency_s.is_none() {
             if let Some(anchor) = first_segment_anchor {

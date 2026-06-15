@@ -418,6 +418,21 @@ export function TranscriptPane() {
                       </span>
                     )}
                     {/*
+                    #0002: a quiet marker when the diarizer found this segment
+                    spans more than one speaker (it is not split). Count only —
+                    naming the co-speakers would clash with the display-name
+                    overlay on the chip. Guarded for older/un-diarized segments
+                    that predate the field (it is omitted from their JSON).
+                  */}
+                    {(seg.shared_speakers?.length ?? 0) > 0 && (
+                      <span
+                        className="transcript-pane__multi-speaker"
+                        title="This segment overlaps more than one speaker; it was not split."
+                      >
+                        {(seg.shared_speakers?.length ?? 0) + 1} speakers
+                      </span>
+                    )}
+                    {/*
                     Translation overlay: when a translated view is active, show
                     the translated text instead of `seg.text`. If this segment
                     has no translation yet (partial pass, gap), fall back to the

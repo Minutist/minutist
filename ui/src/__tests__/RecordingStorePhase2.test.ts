@@ -48,7 +48,7 @@ import { useModelsStore } from "../state/models";
 import type { AppEvent, Segment } from "../ipc/bindings";
 
 function makeSegment(start_ms: number, text: string): Segment {
-  return { start_ms, end_ms: start_ms + 500, text, words: [] };
+  return { start_ms, end_ms: start_ms + 500, text, words: [], shared_speakers: [] };
 }
 
 describe("recording store — Phase 2 extensions", () => {

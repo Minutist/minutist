@@ -54,7 +54,7 @@ const SEGMENT: Segment = {
   end_ms: 21_300,
   text: "First item is the launch checklist.",
   speaker_id: "A",
-  words: [],
+  words: [], shared_speakers: [],
 };
 
 /** Read the chip node (if any) from the editor's current JSON doc. */

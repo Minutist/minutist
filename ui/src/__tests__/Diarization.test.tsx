@@ -90,7 +90,7 @@ function makeSegment(
   text: string,
   speaker_id?: string | null,
 ): Segment {
-  return { start_ms, end_ms: start_ms + 1000, text, speaker_id, words: [] };
+  return { start_ms, end_ms: start_ms + 1000, text, speaker_id, words: [], shared_speakers: [] };
 }
 
 const okVoid = Promise.resolve({ status: "ok" as const, data: null });
@@ -180,6 +180,29 @@ describe("TranscriptPane speaker chip (Phase 6)", () => {
     });
     render(<TranscriptPane />);
     expect(screen.getByText("Speaker A")).toBeInTheDocument();
+  });
+
+  it("flags a multi-speaker segment with a count marker (#0002)", () => {
+    act(() => {
+      useRecordingStore.setState({
+        transcript: [
+          { ...makeSegment(0, "overlapping talk", "A"), shared_speakers: ["B"] },
+        ],
+      });
+    });
+    render(<TranscriptPane />);
+    // primary + 1 shared = "2 speakers".
+    expect(screen.getByText("2 speakers")).toBeInTheDocument();
+  });
+
+  it("does not flag a single-speaker segment", () => {
+    act(() => {
+      useRecordingStore.setState({
+        transcript: [makeSegment(0, "solo", "A")],
+      });
+    });
+    render(<TranscriptPane />);
+    expect(screen.queryByText(/\bspeakers$/)).not.toBeInTheDocument();
   });
 
   it("hides the speaker chip when speaker_id is null/absent", () => {

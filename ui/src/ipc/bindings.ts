@@ -1218,7 +1218,17 @@ export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id:
  * Speaker is populated by the `Diarizer` impl post-hoc; ASR backends
  * leave it `None`.
  */
-export type Segment = { start_ms: number; end_ms: number; text: string; speaker_id?: string | null; confidence?: number | null; words: WordTimestamp[] }
+export type Segment = { start_ms: number; end_ms: number; text: string; speaker_id?: string | null; confidence?: number | null; words: WordTimestamp[]; 
+/**
+ * Additional speaker labels (beyond `speaker_id`) that also speak
+ * substantially within this segment's time span — set only by the offline
+ * diarization pass (#0002) when a segment overlaps more than one surviving
+ * speaker turn above the share threshold. Each label is one that appears as
+ * a `speaker_id` elsewhere in the transcript. Empty for the common
+ * single-speaker case and for live / un-diarized / re-transcribed segments.
+ * Presentation only — a "multiple speakers" hint; the segment is NOT split.
+ */
+shared_speakers: string[] }
 /**
  * Application settings.
  * 

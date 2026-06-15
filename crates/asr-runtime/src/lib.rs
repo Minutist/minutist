@@ -624,6 +624,7 @@ impl AsrBackend for AsrRuntime {
             speaker_id: None,
             confidence: None,
             words: vec![],
+            shared_speakers: Vec::new(),
         }])
     }
 }

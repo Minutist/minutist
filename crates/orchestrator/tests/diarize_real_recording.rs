@@ -64,6 +64,7 @@ fn diarize_at(seg_path: &Path, emb_path: &Path, threshold: f32, audio: &[f32], s
             min_cluster_share: 0.0,
             min_cluster_segments: 0,
             max_speakers: None,
+            multi_speaker_min_share: 0.0,
         },
     )
     .expect("open diarizer");

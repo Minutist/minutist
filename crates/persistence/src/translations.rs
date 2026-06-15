@@ -263,6 +263,7 @@ mod tests {
             speaker_id: None,
             confidence: None,
             words: vec![],
+            shared_speakers: Vec::new(),
         }];
         crate::transcript::write_transcript(dir.path(), &segments).expect("write_transcript");
 

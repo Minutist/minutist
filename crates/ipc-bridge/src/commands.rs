@@ -2405,6 +2405,7 @@ mod tests {
                 speaker_id: None,
                 confidence: None,
                 words: Vec::new(),
+                shared_speakers: Vec::new(),
             }];
             let seg_json = serde_json::to_vec_pretty(&segments).expect("serialise transcript");
             std::fs::write(folder.transcript_path(), seg_json).expect("write transcript.json");
@@ -3045,9 +3046,9 @@ mod tests {
 
         // Write a 3-segment transcript.
         let segments = vec![
-            Segment { start_ms: 0,    end_ms: 1000, text: "Hello world.".into(),        speaker_id: None, confidence: None, words: vec![] },
-            Segment { start_ms: 1000, end_ms: 2000, text: "This is a test.".into(),     speaker_id: None, confidence: None, words: vec![] },
-            Segment { start_ms: 2000, end_ms: 3000, text: "Goodbye for now.".into(),    speaker_id: None, confidence: None, words: vec![] },
+            Segment { start_ms: 0,    end_ms: 1000, text: "Hello world.".into(),        speaker_id: None, confidence: None, words: vec![], shared_speakers: vec![] },
+            Segment { start_ms: 1000, end_ms: 2000, text: "This is a test.".into(),     speaker_id: None, confidence: None, words: vec![], shared_speakers: vec![] },
+            Segment { start_ms: 2000, end_ms: 3000, text: "Goodbye for now.".into(),    speaker_id: None, confidence: None, words: vec![], shared_speakers: vec![] },
         ];
         let seg_json = serde_json::to_vec_pretty(&segments).expect("serialise");
         std::fs::write(folder.transcript_path(), seg_json).expect("write transcript");

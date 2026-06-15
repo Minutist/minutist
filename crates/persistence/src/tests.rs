@@ -368,6 +368,7 @@ fn make_segment(start_ms: u64, end_ms: u64, text: &str) -> Segment {
         speaker_id: None,
         confidence: None,
         words: vec![],
+        shared_speakers: Vec::new(),
     }
 }
 

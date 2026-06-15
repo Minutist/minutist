@@ -83,13 +83,13 @@ const RESTORED_SEGMENTS: Segment[] = [
     start_ms: 4_200,
     end_ms: 9_800,
     text: "Restored first transcript segment.",
-    words: [],
+    words: [], shared_speakers: [],
   },
   {
     start_ms: 12_400,
     end_ms: 21_300,
     text: "Restored second transcript segment.",
-    words: [],
+    words: [], shared_speakers: [],
   },
 ];
 

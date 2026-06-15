@@ -563,7 +563,15 @@ drop clusters below `min_cluster_share` of the attributed speech duration — or
 below the off-by-default `min_cluster_segments` / above the off-by-default
 `max_speakers` — and reassign their segments to the nearest surviving cluster),
 relabels the surviving `i32` cluster ids to first-seen-order `A`/`B`/… across
-segment slice order, and returns the distinct-label count. The prune is the
+segment slice order, and returns the distinct-label count. It also fills
+`Segment::shared_speakers` (#0002): a SURVIVING cluster other than a segment's
+chosen primary whose overlap reaches `DiarizerConfig::multi_speaker_min_share`
+(default 0.30) of the segment duration — and only when the primary is itself
+that substantial — contributes its first-seen label, so a segment spanning more
+than one speaker is flagged (not split). Restricted to clusters that win some
+segment (so every shared label matches a `speaker_id` shown elsewhere);
+`0.0` disables. `overlay_speakers_from_prior` (the re-transcribe path) leaves
+`shared_speakers` empty — only the full re-diarize pass flags. The prune is the
 robust lever against the long-recording over-split (a single distance threshold
 cannot separate a drifted same-speaker embedding from a distinct speaker); see
 `cross-cutting.md` — "Offline over-split prune". The sherpa `eyre::Result` is
@@ -2595,7 +2603,13 @@ left, transcript right).
   display-only span, because the live labels are provisional (re-lettered on
   stop, which also clears `speaker_names`) and there is no finalised metadata to
   write. The timestamp — not the chip — is the row's drag handle, so the chip
-  stops click propagation to avoid triggering the row's jump.
+  stops click propagation to avoid triggering the row's jump. A row whose
+  `Segment::shared_speakers` is non-empty also shows a quiet "N speakers" count
+  marker (#0002, `N = shared_speakers.length + 1`) — a presentation hint that the
+  diarizer found the segment spans more than one speaker; the segment is not
+  split, and the marker is count-only (naming the co-speakers would clash with
+  the display-name overlay). Guarded for older/un-diarized segments that omit
+  the field.
 - **`diarization_complete` re-read (`ui/src/state/meetings.ts`).** The meetings
   store gains a `handleEvent` (dispatched alongside the recording / models /
   summary stores from `useAppEventBridge`) that, on

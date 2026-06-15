@@ -113,6 +113,7 @@ fn write_synthetic_meeting(root: &Path, title: &str, first_text: &str) -> Meetin
         speaker_id: None,
         confidence: None,
         words: Vec::new(),
+        shared_speakers: Vec::new(),
     }];
     std::fs::write(
         folder.join("transcript.json"),

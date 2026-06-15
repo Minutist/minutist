@@ -133,6 +133,7 @@ fn seg(start_ms: u64, end_ms: u64, text: &str, speaker: Option<&str>) -> Segment
         speaker_id: speaker.map(|s| s.to_string()),
         confidence: None,
         words: vec![],
+        shared_speakers: Vec::new(),
     }
 }
 

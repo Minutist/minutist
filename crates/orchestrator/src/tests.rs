@@ -465,6 +465,7 @@ mod diarization {
                 speaker_id: None,
                 confidence: None,
                 words: Vec::new(),
+                shared_speakers: Vec::new(),
             })
             .collect();
         std::fs::write(
@@ -594,6 +595,7 @@ mod diarization {
                 speaker_id: None,
                 confidence: None,
                 words: Vec::new(),
+                shared_speakers: Vec::new(),
             })
             .collect();
         persistence::write_transcript(&meeting_dir, &seeded).expect("seed transcript");

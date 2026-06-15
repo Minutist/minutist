@@ -33,11 +33,11 @@ import type { MeetingState } from "../state/meetings";
 import type { Segment } from "../ipc/bindings";
 
 const LIVE: Segment[] = [
-  { start_ms: 0, end_ms: 1_000, text: "live segment", words: [] },
+  { start_ms: 0, end_ms: 1_000, text: "live segment", words: [], shared_speakers: [] },
 ];
 const SAVED: Segment[] = [
-  { start_ms: 5_000, end_ms: 6_000, text: "saved segment one", words: [] },
-  { start_ms: 7_000, end_ms: 8_000, text: "saved segment two", words: [] },
+  { start_ms: 5_000, end_ms: 6_000, text: "saved segment one", words: [], shared_speakers: [] },
+  { start_ms: 7_000, end_ms: 8_000, text: "saved segment two", words: [], shared_speakers: [] },
 ];
 
 function setSavedMeetingOpen() {

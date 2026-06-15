@@ -263,6 +263,7 @@ async fn run_gated_rediarize_over_fixture(fixture_filename: &str, expected_speak
             speaker_id: None,
             confidence: None,
             words: Vec::new(),
+            shared_speakers: Vec::new(),
         });
         start += 1000;
     }

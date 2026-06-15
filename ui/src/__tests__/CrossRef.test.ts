@@ -23,10 +23,10 @@ import { ANCHOR_ATTR } from "../editor/paragraph-anchor";
 import type { Segment } from "../ipc/bindings";
 
 const SEGMENTS: Segment[] = [
-  { start_ms: 4_200, end_ms: 9_800, text: "one", words: [] },
-  { start_ms: 12_400, end_ms: 21_300, text: "two", words: [] },
-  { start_ms: 24_100, end_ms: 33_900, text: "three", words: [] },
-  { start_ms: 51_000, end_ms: 61_700, text: "four", words: [] },
+  { start_ms: 4_200, end_ms: 9_800, text: "one", words: [], shared_speakers: [] },
+  { start_ms: 12_400, end_ms: 21_300, text: "two", words: [], shared_speakers: [] },
+  { start_ms: 24_100, end_ms: 33_900, text: "three", words: [], shared_speakers: [] },
+  { start_ms: 51_000, end_ms: 61_700, text: "four", words: [], shared_speakers: [] },
 ];
 
 // A wall-clock value far from any segment start, so a Date.now()-based mapping
@@ -107,9 +107,9 @@ describe("segmentRangeForAnchors (FR-22 RANGE mapping is on Segment.start_ms)", 
     // paragraph anchored at 1000 highlights the first TWO segments
     // (start_ms ∈ [1000, 5000) → 1200 and 3000), not just the nearest one.
     const segments: Segment[] = [
-      { start_ms: 1_200, end_ms: 2_000, text: "a", words: [] },
-      { start_ms: 3_000, end_ms: 4_000, text: "b", words: [] },
-      { start_ms: 6_000, end_ms: 7_000, text: "c", words: [] },
+      { start_ms: 1_200, end_ms: 2_000, text: "a", words: [], shared_speakers: [] },
+      { start_ms: 3_000, end_ms: 4_000, text: "b", words: [], shared_speakers: [] },
+      { start_ms: 6_000, end_ms: 7_000, text: "c", words: [], shared_speakers: [] },
     ];
     expect(segmentRangeForAnchors(segments, 1_000, 5_000)).toEqual({
       startIndex: 0,

@@ -127,6 +127,15 @@ pub struct Segment {
     pub confidence: Option<f32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<WordTimestamp>,
+    /// Additional speaker labels (beyond `speaker_id`) that also speak
+    /// substantially within this segment's time span — set only by the offline
+    /// diarization pass (#0002) when a segment overlaps more than one surviving
+    /// speaker turn above the share threshold. Each label is one that appears as
+    /// a `speaker_id` elsewhere in the transcript. Empty for the common
+    /// single-speaker case and for live / un-diarized / re-transcribed segments.
+    /// Presentation only — a "multiple speakers" hint; the segment is NOT split.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_speakers: Vec<String>,
 }
 
 /// Optional per-word timestamp data when the ASR model supports it.
@@ -1456,6 +1465,7 @@ mod tests {
             speaker_id: Some("A".to_string()),
             confidence: Some(0.92),
             words: vec![],
+            shared_speakers: Vec::new(),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Segment = serde_json::from_str(&json).unwrap();
@@ -1686,6 +1696,7 @@ mod tests {
             speaker_id: None,
             confidence: None,
             words: Vec::new(),
+            shared_speakers: Vec::new(),
         };
         let with_notes = MeetingState {
             meta: meta.clone(),

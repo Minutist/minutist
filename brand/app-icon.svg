@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <!-- Minutist app icon — paper rounded-tile + oxblood nib mark (master, open
-       slit). Mark scaled to ~62% of the tile (icon safe-area padding). For sizes
-       >= 48px; small sizes use app-icon-small.svg (bolder baseline). -->
+       slit). Mark scaled to ~62% of the tile (icon safe-area padding). Single
+       source for every OS icon size; scripts/render-icons.sh renders each size
+       natively from this vector (no size-specific geometry). -->
   <defs>
     <path id="spade" d="M 533 293
              C 461 345 384 384 296 408

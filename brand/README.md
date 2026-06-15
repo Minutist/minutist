@@ -17,9 +17,7 @@ is **open** (the two tines separate at the writing point).
 |------|-----|
 | `logo.svg` | Master mark, transparent, oxblood. The canonical vector. |
 | `logo-dark.svg` | Same mark in clay `#c06a5f` for dark backgrounds. |
-| `logo-icon16.svg` | Small-size mark — open slit kept, bolder/shorter baseline for ≤24px. |
-| `app-icon.svg` | Paper rounded-tile + oxblood mark (≥48px). Source for OS app icons. |
-| `app-icon-small.svg` | Tile + mark, tighter framing + bold baseline for 16/32px. |
+| `app-icon.svg` | Paper rounded-tile + oxblood mark. Single source for every OS app-icon size. |
 | `favicon.svg` | Web favicon — transparent, **adaptive** fill (oxblood light / clay dark). |
 | `favicon.ico` | Web fallback, 16/32/48, paper tile. |
 | `apple-touch-icon.png` | 180px paper-tile, for iOS home-screen. |
@@ -32,5 +30,9 @@ OS app-icon set (paper tile) lives in `../src-tauri/icons/` (`16/32/48/64/128/
 Design history, mocks, the live preview harness, the idealization workflow
 and its instruments are kept outside the repository. The master is `logo-v2`
 from that workflow (IoU 0.983 vs the chosen reference, 26 anchors, 5 named elements).
-Render any SVG with `rsvg-convert`; rebuild `.ico`/`.icns` with ImageMagick
-`convert`.
+
+Rebuild the OS app-icon set and web favicons with `scripts/render-icons.sh`. It
+renders every size natively from `app-icon.svg` at its target pixel size — so the
+small sizes are faithful scale-downs of the full-size mark (no thickened baseline)
+and the `.ico` carries native 16/20/24/32/40/48/64/128/256 entries for crisp
+Windows taskbar rendering, including "small taskbar buttons".

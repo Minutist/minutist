@@ -2186,11 +2186,32 @@ omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
 `chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
 per-session cancel flags `cancel_chat_turn` raises, P1).
 
-The command ledger is now **33** (P6 21 + the four P9 chat commands = 25; P10's
+The command ledger is now **39** (P6 21 + the four P9 chat commands = 25; P10's
 `get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27;
 `prewarm_asr` = 28; `save_note_image` = 29; `set_speaker_name` = 30;
-`translate_meeting` + `get_translations` = 32; `get_diagnostic_report` = 33),
-asserted by the `bindings_builder_registers_expected_command_ledger` test.
+`translate_meeting` + `get_translations` = 32; `get_diagnostic_report` = 33; the
+B6 WU7 CRDT editor binding's `apply_notes_update` + `load_notes_ydoc` = 35; the
+WS4-A S5b tunnel surface's `tunnel_begin_pairing` + `tunnel_poll_pairing` +
+`set_connector_enabled` + `tunnel_status` = 39), asserted by the
+`bindings_builder_registers_expected_command_ledger` test.
+
+**Connected-tier tunnel surface (`tunnel_begin_pairing` / `tunnel_poll_pairing` /
+`set_connector_enabled` / `tunnel_status`, WS4-A S5b).** The webview drives device
+pairing and the connector toggle through these four commands; the live tunnel
+state rides `AppEvent::TunnelStatusChanged { status: TunnelStatus }` on the
+existing event bus (no second event registration). The commands call through a
+`TunnelControl` async-trait object held in `IpcState.tunnel` — `ipc-bridge` takes
+**no** `tunnel-client` dependency edge (the dependency table keeps the tunnel
+crate a near-leaf); `app-main` injects the connected implementation (which owns
+the `tunnel-client` pairing + lifecycle types), and the free build (or a
+connected build before a credential is stored) gets `DisabledTunnel`, which
+reports `Disconnected` and rejects pairing as `Unsupported`. `tunnel_begin_pairing`
+returns the `PairingPrompt { user_code, verification_uri }` for the UI to show +
+open; the issued device credential never crosses to the webview — `app-main`
+stores it securely. `tunnel_status` / `set_connector_enabled` return a
+`TunnelSnapshot { enabled, status, account_id }` (the paired account is the
+non-secret rauthy `sub`). No `tunnel-client` edge is added to `ipc-bridge` in the
+dependency table.
 
 **Diagnostic report (`get_diagnostic_report`, issue #0014).** Assembles + REDACTS
 the `common::DiagnosticReport` the no-telemetry "Report a problem" flow pre-fills

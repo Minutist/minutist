@@ -43,6 +43,10 @@
 //! | `translate_meeting` | `()` | translation |
 //! | `get_translations` | `HashMap<usize, String>` | translation |
 //! | `get_diagnostic_report` | `DiagnosticReport` | report (#0014) |
+//! | `tunnel_begin_pairing` | `PairingPrompt` | WS4-A S5b |
+//! | `tunnel_poll_pairing` | `TunnelStatus` | WS4-A S5b |
+//! | `set_connector_enabled` | `TunnelSnapshot` | WS4-A S5b |
+//! | `tunnel_status` | `TunnelSnapshot` | WS4-A S5b |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
@@ -126,6 +130,7 @@ pub mod error;
 pub mod events;
 pub mod inter_agent;
 pub mod output_language;
+pub mod tunnel;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,6 +152,7 @@ pub use inter_agent::spawn_inter_agent_driver;
 /// holds `Arc<OnceCell<Arc<LlamaSummariser>>>`).
 pub use persistence::MeetingIndex;
 pub use summariser::LlamaSummariser;
+pub use tunnel::{disabled_tunnel, DisabledTunnel, PairingPrompt, TunnelControl, TunnelSnapshot};
 
 // ---------------------------------------------------------------------------
 // IpcState — Tauri managed state
@@ -237,6 +243,15 @@ pub struct IpcState {
     /// token is held here (not on the event bus) and revealed only on explicit
     /// user request.
     pub mcp_info: Arc<std::sync::Mutex<Option<McpServerInfo>>>,
+    /// The connected-tier relay tunnel control surface (WS4-A S5b). `app-main`
+    /// injects a `connected`-gated implementation (holding the `tunnel-client`
+    /// pairing + lifecycle types); the free build (and a connected build with no
+    /// relay wiring) gets [`DisabledTunnel`], which reports `Disconnected` and
+    /// rejects pairing as unsupported. The tunnel IPC commands
+    /// (`tunnel_begin_pairing`, `tunnel_poll_pairing`, `set_connector_enabled`,
+    /// `tunnel_status`) call through this trait so `ipc-bridge` takes no
+    /// `tunnel-client` dependency edge.
+    pub tunnel: Arc<dyn TunnelControl>,
     /// The logs directory (`{app-data}/logs/`), owned by `app-main` but its path
     /// is shared here so `get_diagnostic_report` (#0014) can read the rolling
     /// `minutist.log` tail and the `last-crash.txt` written by the panic hook.
@@ -548,6 +563,10 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::translate_meeting,
             commands::get_translations,
             diagnostics::get_diagnostic_report,
+            tunnel::tunnel_begin_pairing,
+            tunnel::tunnel_poll_pairing,
+            tunnel::set_connector_enabled,
+            tunnel::tunnel_status,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -595,7 +614,10 @@ mod tests {
         // Malformed (not <uuid>/<file>) → InvalidInput.
         for bad in ["", "/", "/only-one-segment", "/not-a-uuid/file.png"] {
             assert!(
-                matches!(resolve_note_asset(root, bad), Err(AppError::InvalidInput { .. })),
+                matches!(
+                    resolve_note_asset(root, bad),
+                    Err(AppError::InvalidInput { .. })
+                ),
                 "path {bad:?} should be rejected as InvalidInput"
             );
         }
@@ -606,7 +628,10 @@ mod tests {
         assert!(resolve_note_asset(root, &traversal).is_err());
         let nested = format!("/{}/sub/dir.png", id.0);
         assert!(
-            matches!(resolve_note_asset(root, &nested), Err(AppError::InvalidInput { .. })),
+            matches!(
+                resolve_note_asset(root, &nested),
+                Err(AppError::InvalidInput { .. })
+            ),
             "nested path should be rejected"
         );
     }
@@ -646,7 +671,9 @@ mod tests {
     /// 29 + 1 = 30; translation commands: 30 + 2 = 32; `get_diagnostic_report`
     /// (#0014 — the "Report a problem" snapshot): 32 + 1 = 33;
     /// `apply_notes_update` + `load_notes_ydoc` (B6 WU7 — CRDT editor binding):
-    /// 33 + 2 = 35).
+    /// 33 + 2 = 35; the WS4-A S5b tunnel surface adds `tunnel_begin_pairing` /
+    /// `tunnel_poll_pairing` / `set_connector_enabled` / `tunnel_status`:
+    /// 35 + 4 = 39).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -697,12 +724,17 @@ mod tests {
             "translate_meeting",
             "get_translations",
             "get_diagnostic_report",
+            "tunnel_begin_pairing",
+            "tunnel_poll_pairing",
+            "set_connector_enabled",
+            "tunnel_status",
         ];
 
         assert_eq!(
             expected.len(),
-            35,
-            "command ledger must be 35 (33 + apply_notes_update + load_notes_ydoc, B6 WU7)"
+            39,
+            "command ledger must be 39 (35 + the WS4-A S5b tunnel surface: \
+             tunnel_begin_pairing / tunnel_poll_pairing / set_connector_enabled / tunnel_status)"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

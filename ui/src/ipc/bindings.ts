@@ -636,6 +636,61 @@ async getDiagnosticReport() : Promise<Result<DiagnosticReport, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Begin device pairing. Returns the `user_code` + verification URL for the UI
+ * to display and open in the browser. The user approves in rauthy; the UI then
+ * calls [`tunnel_poll_pairing`] until the status is terminal.
+ * 
+ * In the free build (or before any relay wiring) this returns an `Unsupported`
+ * error — the Connection pane is absent from that bundle, so the command is
+ * never invoked there.
+ */
+async tunnelBeginPairing() : Promise<Result<PairingPrompt, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tunnel_begin_pairing") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Poll the in-progress pairing once, returning the current [`TunnelStatus`].
+ * The UI polls this on the server's `interval` until the status leaves
+ * `Pairing` (reaching `Connecting`/`Online` on success, or `Disconnected` on a
+ * declined/expired pairing).
+ */
+async tunnelPollPairing() : Promise<Result<TunnelStatus, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tunnel_poll_pairing") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Enable or disable the connector. Enabling with a stored credential starts the
+ * tunnel; disabling stops it cleanly. Returns the resulting snapshot.
+ */
+async setConnectorEnabled(enabled: boolean) : Promise<Result<TunnelSnapshot, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_connector_enabled", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The connector snapshot for the Settings → Connection pane: the enabled flag,
+ * the live tunnel status, and the paired account (if any).
+ */
+async tunnelStatus() : Promise<Result<TunnelSnapshot, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("tunnel_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -826,7 +881,16 @@ export type AppEvent =
  * The `reason` field is a concise human-readable English string; it is not
  * a serialised `AppError` variant (the pane shows it verbatim).
  */
-{ kind: "mcp_server_start_failed"; reason: string }
+{ kind: "mcp_server_start_failed"; reason: string } | 
+/**
+ * The relay tunnel's live state changed. `app-main` (connected build only)
+ * emits this from the reconnect loop's state callback and the pairing /
+ * lifecycle transitions, so the Settings → Connection pane reflects the live
+ * status without polling. Carries no credential / account material — the
+ * account label and pairing codes cross only the pairing command's return
+ * value, never the bus.
+ */
+{ kind: "tunnel_status_changed"; status: TunnelStatus }
 /**
  * Typed wrapper that gives `AppEvent` a stable tauri-specta event name.
  * 
@@ -1181,6 +1245,24 @@ export type OperationKind =
  */
 "translate"
 /**
+ * The codes + URL to show the user when a pairing begins. Returned by
+ * [`tunnel_begin_pairing`]. The webview displays `user_code` and opens
+ * `verification_uri` in the browser (via `tauri-plugin-opener`).
+ * 
+ * Carries no credential — the issued device credential is stored securely by
+ * `app-main` on a successful poll and never crosses to the webview.
+ */
+export type PairingPrompt = { 
+/**
+ * The short code the user types into the verification page.
+ */
+user_code: string; 
+/**
+ * The URL to open in the browser — the pre-filled one when the server
+ * provided it, else the bare verification URL.
+ */
+verification_uri: string }
+/**
  * Top-level state of the recording pipeline. Emitted to the webview on
  * transitions via `AppEvent::StateChanged`.
  * 
@@ -1528,6 +1610,55 @@ name: string;
  * The tool arguments as a JSON-object string.
  */
 arguments_json: string }
+/**
+ * A snapshot of the connector for the Settings → Connection pane. Returned by
+ * [`tunnel_status`]. The `account_id` is shown so the user can confirm which
+ * account the device is paired to; it is not a secret (it is the rauthy `sub`).
+ */
+export type TunnelSnapshot = { 
+/**
+ * Whether the user has enabled the connector (`settings.connector_enabled`).
+ */
+enabled: boolean; 
+/**
+ * The live tunnel state.
+ */
+status: TunnelStatus; 
+/**
+ * The account the device is paired to, if a credential is stored. `None`
+ * when unpaired. Never carries the credential itself.
+ */
+account_id: string | null }
+/**
+ * The connected-tier relay tunnel's live state, surfaced to the Settings →
+ * Connection pane (WS4-A S5b). A pure status enum — it carries no credential or
+ * account material (those cross only the pairing command's return / secure
+ * storage, never the event bus). The connector channel transits meeting content
+ * to the AI vendor by design and is never described as private (D5).
+ */
+export type TunnelStatus = 
+/**
+ * No device credential stored, or the connector is disabled. The app works
+ * fully locally; nothing is reachable over the relay.
+ */
+"disconnected" | 
+/**
+ * A device-code pairing is in progress (the user is approving in a browser).
+ */
+"pairing" | 
+/**
+ * A credential is stored and the tunnel is dialing / handshaking the relay.
+ */
+"connecting" | 
+/**
+ * The tunnel is established — the account is reachable over the relay.
+ */
+"online" | 
+/**
+ * The stored credential was rejected after having worked: the device was
+ * revoked (or rotated). The user must re-pair; the loop is not retrying.
+ */
+"needs_repair"
 /**
  * Optional per-word timestamp data when the ASR model supports it.
  */

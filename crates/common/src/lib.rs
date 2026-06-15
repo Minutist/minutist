@@ -630,6 +630,29 @@ pub enum OperationKind {
     Translate,
 }
 
+/// The connected-tier relay tunnel's live state, surfaced to the Settings →
+/// Connection pane (WS4-A S5b). A pure status enum — it carries no credential or
+/// account material (those cross only the pairing command's return / secure
+/// storage, never the event bus). The connector channel transits meeting content
+/// to the AI vendor by design and is never described as private (D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum TunnelStatus {
+    /// No device credential stored, or the connector is disabled. The app works
+    /// fully locally; nothing is reachable over the relay.
+    Disconnected,
+    /// A device-code pairing is in progress (the user is approving in a browser).
+    Pairing,
+    /// A credential is stored and the tunnel is dialing / handshaking the relay.
+    Connecting,
+    /// The tunnel is established — the account is reachable over the relay.
+    Online,
+    /// The stored credential was rejected after having worked: the device was
+    /// revoked (or rotated). The user must re-pair; the loop is not retrying.
+    NeedsRepair,
+}
+
 /// Events emitted from the Rust core to the webview via tauri-specta.
 ///
 /// Adding a variant requires updating `ipc-bridge` (encoder), the webview
@@ -811,6 +834,15 @@ pub enum AppEvent {
     /// The `reason` field is a concise human-readable English string; it is not
     /// a serialised `AppError` variant (the pane shows it verbatim).
     McpServerStartFailed { reason: String },
+
+    // --- Connected-tier relay tunnel (WS4-A S5b) -------------------------
+    /// The relay tunnel's live state changed. `app-main` (connected build only)
+    /// emits this from the reconnect loop's state callback and the pairing /
+    /// lifecycle transitions, so the Settings → Connection pane reflects the live
+    /// status without polling. Carries no credential / account material — the
+    /// account label and pairing codes cross only the pairing command's return
+    /// value, never the bus.
+    TunnelStatusChanged { status: TunnelStatus },
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,8 +1151,11 @@ pub fn resolve_gpu_plan(
             // When the summariser fits on GPU it is deducted from the budget
             // before the ASR decision; when it runs on CPU the full budget is
             // available for ASR.
-            let asr_headroom =
-                budget.saturating_sub(if summariser_gpu { SUMMARISER_VRAM_BYTES } else { 0 });
+            let asr_headroom = budget.saturating_sub(if summariser_gpu {
+                SUMMARISER_VRAM_BYTES
+            } else {
+                0
+            });
             let effective_prefer_large = large_asr_fits(asr_headroom, prefer_large_asr);
             let asr_need = if effective_prefer_large {
                 ASR_LARGE_VRAM_BYTES
@@ -1281,7 +1316,10 @@ mod tests {
         assert!(json.contains("\"log_excerpt\""));
         assert!(json.contains("\"error_class\""));
         // Omitted when absent.
-        assert!(!json.contains("backtrace"), "absent backtrace must be omitted: {json}");
+        assert!(
+            !json.contains("backtrace"),
+            "absent backtrace must be omitted: {json}"
+        );
         // Present when set.
         let with_bt = DiagnosticReport {
             backtrace: Some("0: minutist::panic".to_string()),
@@ -1376,8 +1414,14 @@ mod tests {
         // `On` with no probe: GPU is forced for both models, but the large ASR
         // tier is clamped to false (no probe → cannot confirm the 1.7B fits).
         let on = resolve_gpu_plan(None, GpuAcceleration::On, true);
-        assert!(on.summariser_gpu && on.asr_gpu, "GPU forced for both models");
-        assert!(!on.effective_prefer_large, "no probe → large ASR clamped off");
+        assert!(
+            on.summariser_gpu && on.asr_gpu,
+            "GPU forced for both models"
+        );
+        assert!(
+            !on.effective_prefer_large,
+            "no probe → large ASR clamped off"
+        );
     }
 
     #[test]
@@ -1393,8 +1437,14 @@ mod tests {
         // `On` with a 12 GB card: 12 × 0.90 = 10.8 GiB; summariser (8) leaves
         // 2.8 — below the large ASR threshold (3.5), so clamped to small tier.
         let on = resolve_gpu_plan(Some(&probe(12, false)), GpuAcceleration::On, true);
-        assert!(on.summariser_gpu && on.asr_gpu, "GPU forced for both models");
-        assert!(!on.effective_prefer_large, "large ASR clamped on 12 GB card");
+        assert!(
+            on.summariser_gpu && on.asr_gpu,
+            "GPU forced for both models"
+        );
+        assert!(
+            !on.effective_prefer_large,
+            "large ASR clamped on 12 GB card"
+        );
     }
 
     #[test]
@@ -1423,7 +1473,10 @@ mod tests {
         let p = resolve_gpu_plan(Some(&probe(8, false)), GpuAcceleration::Auto, true);
         assert!(!p.summariser_gpu, "8 GB cannot host the summariser");
         assert!(p.asr_gpu, "ASR fits when the summariser is on CPU");
-        assert!(p.effective_prefer_large, "7.2 GiB headroom fits the large ASR");
+        assert!(
+            p.effective_prefer_large,
+            "7.2 GiB headroom fits the large ASR"
+        );
     }
 
     #[test]
@@ -1433,7 +1486,10 @@ mod tests {
         let p = resolve_gpu_plan(Some(&probe(12, false)), GpuAcceleration::Auto, true);
         assert!(p.summariser_gpu);
         assert!(p.asr_gpu);
-        assert!(!p.effective_prefer_large, "large ASR downgraded to fit beside summariser");
+        assert!(
+            !p.effective_prefer_large,
+            "large ASR downgraded to fit beside summariser"
+        );
     }
 
     #[test]
@@ -1443,7 +1499,10 @@ mod tests {
         let mut p = probe(24, false);
         p.free_bytes = 4 * GPU_PLAN_GIB;
         let plan = resolve_gpu_plan(Some(&p), GpuAcceleration::Auto, false);
-        assert!(!plan.summariser_gpu, "low free VRAM tightens the budget below the summariser need");
+        assert!(
+            !plan.summariser_gpu,
+            "low free VRAM tightens the budget below the summariser need"
+        );
         assert!(plan.asr_gpu);
     }
 

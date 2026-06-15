@@ -2438,6 +2438,7 @@ name = "ipc-bridge"
 version = "0.0.0"
 dependencies = [
  "agent-tools",
+ "async-trait",
  "chat-agent",
  "chrono",
  "minutist-common",

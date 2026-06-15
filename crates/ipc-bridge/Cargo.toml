@@ -19,6 +19,7 @@ cuda = ["summariser/cuda", "orchestrator/cuda", "chat-agent/cuda"]
 directml = ["orchestrator/directml"]
 
 [dependencies]
+async-trait = { workspace = true }
 minutist-common = { path = "../common", features = ["specta"] }
 orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }

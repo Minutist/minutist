@@ -1452,6 +1452,87 @@ mod tests {
         );
     }
 
+    /// (gated, DIAGNOSTIC — issue 0015) — Qwen short-clip behaviour sweep.
+    ///
+    /// Measures how Qwen3-ASR degrades as the audio clip shrinks, to decide the
+    /// re-ASR floor for splitting a mixed segment into per-speaker sub-clips.
+    /// Cuts the first N ms of VOICED audio from librispeech_0 (skipping the
+    /// ~570 ms leading silence) and transcribes each, printing words / loop-rep
+    /// / fraction-of-words-in-reference vs duration. No hard assertions beyond a
+    /// sanity check that the longest clip transcribes — read the printed table.
+    /// Run with `--ignored --nocapture` (the Windows runner does both).
+    #[test]
+    #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]
+    fn short_clip_floor_sweep_0015() {
+        let mut runtime = match gated_runtime() {
+            Some(r) => r,
+            None => return,
+        };
+        let full = load_librispeech_0();
+        let sr = full.sample_rate as usize;
+
+        let normalise = |text: &str| -> Vec<String> {
+            text.chars()
+                .map(|c| if c.is_alphanumeric() || c.is_whitespace() { c.to_ascii_lowercase() } else { ' ' })
+                .collect::<String>()
+                .split_whitespace()
+                .map(|w| w.to_string())
+                .collect()
+        };
+        let reference: std::collections::HashSet<String> = normalise(
+            "mister quilter is the apostle of the middle classes and we are glad to welcome his gospel",
+        )
+        .into_iter()
+        .collect();
+
+        let transcribe = |rt: &mut AsrRuntime, samples: Vec<f32>, dur_ms: u64| -> String {
+            let chunk = AudioChunk { samples, sample_rate: sr as u32, start_ms: 0, end_ms: dur_ms };
+            rt.transcribe_chunk(&chunk)
+                .expect("transcription must succeed")
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        // Baseline: the full fixture, full context — the "good" end of the curve.
+        let baseline = transcribe(&mut runtime, full.samples.clone(), full.end_ms);
+        eprintln!("\n=== Qwen short-clip sweep (issue 0015) ===");
+        eprintln!("baseline (full {} ms): {:?}", full.end_ms, baseline);
+        assert!(!baseline.trim().is_empty(), "baseline transcription must be non-empty");
+        eprintln!(
+            "{:>7} | {:>5} | {:>7} | {:>8} | text",
+            "dur_ms", "words", "max_rep", "in_ref%"
+        );
+
+        // Skip leading silence so short clips actually contain speech.
+        const LEAD_SILENCE_MS: usize = 570;
+        let start = (LEAD_SILENCE_MS * sr) / 1000;
+        for dur_ms in [3000usize, 2000, 1500, 1000, 750, 500, 300] {
+            let n = (dur_ms * sr) / 1000;
+            let end = (start + n).min(full.samples.len());
+            if end <= start {
+                continue;
+            }
+            let text = transcribe(&mut runtime, full.samples[start..end].to_vec(), dur_ms as u64);
+            let words = normalise(&text);
+            let wc = words.len();
+            // Crude loop detector: highest count of any single word.
+            let max_rep = words
+                .iter()
+                .map(|w| words.iter().filter(|x| *x == w).count())
+                .max()
+                .unwrap_or(0);
+            let in_ref = if wc == 0 {
+                0.0
+            } else {
+                100.0 * words.iter().filter(|w| reference.contains(*w)).count() as f64 / wc as f64
+            };
+            eprintln!("{:>7} | {:>5} | {:>7} | {:>7.0}% | {:?}", dur_ms, wc, max_rep, in_ref, text);
+        }
+        eprintln!("=== end sweep ===\n");
+    }
+
     /// (gated) — forced English must yield no CJK codepoints.
     #[test]
     #[ignore = "requires MINUTIST_ASR_MODEL_PATH and MINUTIST_ASR_MMPROJ_PATH"]

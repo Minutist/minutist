@@ -128,12 +128,16 @@ pub struct Segment {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub words: Vec<WordTimestamp>,
     /// Additional speaker labels (beyond `speaker_id`) that also speak
-    /// substantially within this segment's time span — set only by the offline
+    /// substantially within this segment's time span — set by the offline
     /// diarization pass (#0002) when a segment overlaps more than one surviving
-    /// speaker turn above the share threshold. Each label is one that appears as
-    /// a `speaker_id` elsewhere in the transcript. Empty for the common
-    /// single-speaker case and for live / un-diarized / re-transcribed segments.
-    /// Presentation only — a "multiple speakers" hint; the segment is NOT split.
+    /// speaker turn above the share threshold AND the segment cannot be split
+    /// (the no-word-timestamp / Qwen path). A mixed segment that carries per-word
+    /// timestamps is instead split at the turn boundary (#0015) into
+    /// single-speaker segments, each with empty `shared_speakers`. Each label is
+    /// one that appears as a `speaker_id` elsewhere in the transcript. Empty for
+    /// the common single-speaker case and for live / un-diarized / re-transcribed
+    /// segments. Presentation only — a "multiple speakers" hint on an unsplit
+    /// segment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_speakers: Vec<String>,
 }
@@ -1245,20 +1249,24 @@ pub fn asr_engine_for_language(transcription_language: &str, prefer_gpu_qwen: bo
 ///
 /// Threading: sync, called from `spawn_blocking`.
 pub trait Diarizer: Send {
-    /// Assign `speaker_id` to each segment in place by clustering speaker
-    /// embeddings extracted from `audio` over each segment's `[start_ms,
-    /// end_ms]` window.
+    /// Assign `speaker_id` to each segment by clustering speaker embeddings
+    /// extracted from `audio` over each segment's `[start_ms, end_ms]` window,
+    /// returning the (possibly longer) segment list plus the distinct-speaker
+    /// count.
     ///
-    /// `audio` is the entire buffered recording at `sample_rate` Hz. The
-    /// `segments` slice is the ASR output for the same recording.
+    /// `audio` is the entire buffered recording at `sample_rate` Hz. `segments`
+    /// is the ASR output for the same recording, consumed by value: a segment
+    /// spanning a speaker change is split at the turn boundary, which GROWS the
+    /// list — an in-place `&mut [Segment]` slice cannot add elements, so the
+    /// owned list is taken in and returned out.
     ///
-    /// Returns the number of distinct speakers found.
+    /// Returns `(segments, speaker_count)`.
     fn assign_speakers(
         &self,
         audio: &[f32],
         sample_rate: u32,
-        segments: &mut [Segment],
-    ) -> AppResult<u32>;
+        segments: Vec<Segment>,
+    ) -> AppResult<(Vec<Segment>, u32)>;
 }
 
 /// Synchronous summariser. Implementations live in `summariser`

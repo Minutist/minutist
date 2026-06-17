@@ -299,14 +299,14 @@ impl Diarizer for SherpaDiarizer {
         &self,
         audio: &[f32],
         sample_rate: u32,
-        segments: &mut [Segment],
-    ) -> AppResult<u32> {
+        segments: Vec<Segment>,
+    ) -> AppResult<(Vec<Segment>, u32)> {
         require_supported_sample_rate(sample_rate)?;
 
         // Nothing to assign — empty transcript or empty audio. Don't invoke
         // sherpa (its `compute` bail!s on zero-length input).
         if segments.is_empty() || audio.is_empty() {
-            return Ok(0);
+            return Ok((segments, 0));
         }
 
         let turns = {
@@ -325,8 +325,9 @@ impl Diarizer for SherpaDiarizer {
 }
 
 /// Overlay first-seen-relabelled speaker ids onto `segments` by max-overlap
-/// interval-join, applying the `config`'s post-cluster prune + cap, and return
-/// the distinct-label count.
+/// interval-join, applying the `config`'s post-cluster prune + cap, splitting a
+/// mixed word-timestamped segment at its turn boundaries, and return the owned
+/// (possibly longer) segment list plus the distinct-label count.
 ///
 /// For each ASR `segment`, the sherpa cluster (turns are in **seconds**) with
 /// the greatest total temporal overlap over `[start_ms, end_ms)` wins; its `i32`
@@ -345,17 +346,28 @@ impl Diarizer for SherpaDiarizer {
 /// 2. **Cap** — if more clusters still survive than `max_speakers`, keep the N
 ///    largest by speech duration and reassign the rest the same way.
 ///
-/// The surviving cluster ids are then relabelled to first-seen order `"A"`,
-/// `"B"`, … across `segments` in slice order. The return value is the number of
-/// distinct surviving labels actually assigned (segments left `None` do not
-/// count).
+/// A segment that spans two or more surviving clusters above
+/// `multi_speaker_min_share` is **mixed** ([`is_mixed_segment`]). #0015 phase 3
+/// resolves a mixed segment by its backend:
+/// - **Parakeet** (non-empty `words`) — [`split_segment_by_words`] regroups the
+///   words into one sub-segment per contiguous same-cluster run (no re-ASR, no
+///   audio cut). The split grows the list, which is why the owned `Vec` is taken
+///   in and returned out.
+/// - **Qwen** (empty `words`) — kept as one segment on its dominant cluster and
+///   flagged via `shared_speakers` (#0002); Phase 4 will re-ASR it.
+///
+/// The surviving cluster ids (per kept segment and per split sub-segment) are
+/// relabelled to first-seen order `"A"`, `"B"`, … across the OUTPUT segments in
+/// order — so a split's sub-segments letter in transcript order. The return
+/// value is the number of distinct labels actually assigned (segments left
+/// `None` do not count).
 ///
 /// Pure (no FFI, no I/O) so the default test suite covers it without a model.
 pub fn overlay_speakers(
     turns: &[SherpaSegment],
-    segments: &mut [Segment],
+    segments: Vec<Segment>,
     config: &DiarizerConfig,
-) -> u32 {
+) -> (Vec<Segment>, u32) {
     // Per-segment ranked overlaps: (cluster_id, overlap_ms) sorted descending by
     // overlap, lower cluster id breaking ties. Lets the prune/cap reassign a
     // segment to its next-best SURVIVING cluster without re-touching the turns.
@@ -371,90 +383,122 @@ pub fn overlay_speakers(
         .collect();
 
     // Determine the surviving set after prune + cap, then reassign pruned
-    // segments to their next-best survivor.
+    // segments to their next-best survivor. `survivor_set` is the surviving
+    // cluster ids whether or not the prune ran (the distinct chosen ids when
+    // nothing was pruned), as `is_mixed_segment` needs it either way.
     let survivors = surviving_clusters(&chosen, &ranked, config);
-    if let Some(survivors) = survivors {
-        for (slot, r) in chosen.iter_mut().zip(ranked.iter()) {
-            let drop = match *slot {
-                Some(id) => !survivors.contains(&id),
-                None => false,
-            };
-            if drop {
-                *slot = r
-                    .iter()
-                    .find(|(id, _)| survivors.contains(id))
-                    .map(|&(id, _)| id);
+    let survivor_set: Vec<i32> = match &survivors {
+        Some(survivors) => {
+            for (slot, r) in chosen.iter_mut().zip(ranked.iter()) {
+                let drop = match *slot {
+                    Some(id) => !survivors.contains(&id),
+                    None => false,
+                };
+                if drop {
+                    *slot = r
+                        .iter()
+                        .find(|(id, _)| survivors.contains(id))
+                        .map(|&(id, _)| id);
+                }
             }
+            survivors.clone()
+        }
+        None => {
+            let mut ids: Vec<i32> = Vec::new();
+            for id in chosen.iter().flatten() {
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+            ids
+        }
+    };
+
+    // Build the intermediate output by consuming the input segments. A mixed
+    // Parakeet segment (has words) splits into one sub-segment per same-cluster
+    // word run; everything else is kept as one segment on its chosen cluster.
+    // `out_cluster[j]` is the cluster id (pre-relabel) backing `out[j]`;
+    // `mixed_kept[j]` flags an out segment that is a kept (un-split) mixed
+    // segment — the no-words/Qwen case that still needs a `shared_speakers` fill,
+    // carrying its original `ranked` index for the fill below.
+    let min_share = config.multi_speaker_min_share;
+    let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
+    let mut out_cluster: Vec<Option<i32>> = Vec::with_capacity(segments.len());
+    let mut mixed_kept: Vec<Option<usize>> = Vec::with_capacity(segments.len());
+    for (i, mut seg) in segments.into_iter().enumerate() {
+        let dur = seg.end_ms.saturating_sub(seg.start_ms);
+        let mixed = is_mixed_segment(&ranked[i], &survivor_set, dur, min_share);
+        if mixed && !seg.words.is_empty() {
+            for (mut sub, cluster) in split_segment_by_words(&seg, turns, &survivor_set) {
+                sub.shared_speakers = Vec::new();
+                out.push(sub);
+                out_cluster.push(Some(cluster));
+                mixed_kept.push(None);
+            }
+        } else {
+            // Cleared here; a kept-MIXED (no-words/Qwen) segment may have this
+            // re-filled by the #0002 loop below, after the relabel.
+            seg.shared_speakers = Vec::new();
+            out.push(seg);
+            out_cluster.push(chosen[i]);
+            mixed_kept.push(if mixed { Some(i) } else { None });
         }
     }
 
-    // Build first-seen-order label map over the (post-prune) chosen cluster ids,
-    // in segment slice order (so labels read top-to-bottom of the transcript).
+    // First-seen-order label map over the OUTPUT cluster ids, in output order
+    // (so a split's sub-segments letter in transcript order, top-to-bottom).
     let mut seen: Vec<i32> = Vec::new();
-    for id in chosen.iter().flatten() {
+    for id in out_cluster.iter().flatten() {
         if !seen.contains(id) {
             seen.push(*id);
         }
     }
+    let label_for = |cluster: i32| -> String {
+        let idx = seen
+            .iter()
+            .position(|s| *s == cluster)
+            .expect("seen contains every out cluster id");
+        alpha_label(idx)
+    };
+    for (seg, cluster) in out.iter_mut().zip(out_cluster.iter()) {
+        seg.speaker_id = cluster.map(|c| label_for(c));
+    }
 
-    // Stamp the relabelled id onto each segment.
-    for (seg, id) in segments.iter_mut().zip(chosen.iter()) {
-        seg.speaker_id = id.map(|cluster| {
-            let idx = seen
+    // #0002 `shared_speakers` fill — AFTER the relabel (it needs the label map),
+    // and ONLY for kept mixed (no-words/Qwen) segments: a split Parakeet segment
+    // is already resolved per-speaker and keeps `shared_speakers` empty. A
+    // surviving cluster other than the segment's chosen primary contributes its
+    // label when its overlap reaches `multi_speaker_min_share` of the segment
+    // duration — and only when the primary is itself that substantial. Restricted
+    // to clusters in `seen`, so every shared label matches a `speaker_id` shown
+    // elsewhere in the transcript.
+    if min_share > 0.0 {
+        for (seg, orig) in out.iter_mut().zip(mixed_kept.iter()) {
+            let Some(i) = *orig else { continue };
+            let Some(primary) = chosen[i] else { continue };
+            let dur = seg.end_ms.saturating_sub(seg.start_ms);
+            if dur == 0 {
+                continue;
+            }
+            let threshold = (min_share as f64 * dur as f64) as u64;
+            let r = &ranked[i];
+            let primary_overlap = r
                 .iter()
-                .position(|s| *s == cluster)
-                .expect("seen contains every chosen cluster id");
-            alpha_label(idx)
-        });
+                .find(|(id, _)| *id == primary)
+                .map(|&(_, ov)| ov)
+                .unwrap_or(0);
+            if primary_overlap < threshold {
+                continue;
+            }
+            seg.shared_speakers = r
+                .iter()
+                .filter(|(id, ov)| *id != primary && *ov >= threshold && seen.contains(id))
+                .map(|&(id, _)| label_for(id))
+                .collect();
+        }
     }
 
-    // #0002: flag segments that span more than one speaker. A surviving cluster
-    // other than the segment's chosen primary contributes its label to
-    // `shared_speakers` when its overlap reaches `multi_speaker_min_share` of the
-    // segment duration — and only when the primary is itself that substantial
-    // (else the segment is weakly attributed and not meaningfully "shared").
-    // Restricted to clusters in `seen`, so every shared label matches a
-    // `speaker_id` shown elsewhere in the transcript. A speaker that only ever
-    // overlaps (never wins a segment) has no label and is not flagged — rare and
-    // acceptable for a presentation hint. The label index map is the same
-    // first-seen `seen` order used for `speaker_id`.
-    let min_share = config.multi_speaker_min_share;
-    for ((seg, chosen_id), r) in segments
-        .iter_mut()
-        .zip(chosen.iter())
-        .zip(ranked.iter())
-    {
-        seg.shared_speakers = Vec::new();
-        if min_share <= 0.0 {
-            continue;
-        }
-        let Some(primary) = *chosen_id else { continue };
-        let dur = seg.end_ms.saturating_sub(seg.start_ms);
-        if dur == 0 {
-            continue;
-        }
-        let threshold = (min_share as f64 * dur as f64) as u64;
-        let primary_overlap = r
-            .iter()
-            .find(|(id, _)| *id == primary)
-            .map(|&(_, ov)| ov)
-            .unwrap_or(0);
-        if primary_overlap < threshold {
-            continue;
-        }
-        seg.shared_speakers = r
-            .iter()
-            .filter(|(id, ov)| {
-                *id != primary && *ov >= threshold && seen.contains(id)
-            })
-            .map(|&(id, _)| {
-                let idx = seen.iter().position(|s| *s == id).expect("survivor in seen");
-                alpha_label(idx)
-            })
-            .collect();
-    }
-
-    seen.len() as u32
+    (out, seen.len() as u32)
 }
 
 /// Decide the surviving cluster set after the `config`'s prune + cap, or `None`
@@ -590,10 +634,6 @@ fn ranked_overlaps(turns: &[SherpaSegment], start_ms: u64, end_ms: u64) -> Vec<(
 /// cluster-id set (so a pruned drift-cluster never counts); `dur_ms` is the
 /// segment duration. `min_share <= 0.0` or a zero-duration segment is never
 /// mixed.
-//
-// Phase 2 lands the tested predicate; the split (#0015 phase 3) is its first
-// caller, so it is `dead_code` until then.
-#[allow(dead_code)]
 fn is_mixed_segment(ranked: &[(i32, u64)], survivors: &[i32], dur_ms: u64, min_share: f32) -> bool {
     if min_share <= 0.0 || dur_ms == 0 {
         return false;
@@ -604,6 +644,109 @@ fn is_mixed_segment(ranked: &[(i32, u64)], survivors: &[i32], dur_ms: u64, min_s
         .filter(|(id, overlap)| *overlap >= threshold && survivors.contains(id))
         .count();
     qualifying >= 2
+}
+
+/// Winning sherpa cluster for a word: the SURVIVING cluster with the greatest
+/// total overlap of the word's `[word_start_ms, word_end_ms)` against the `turns`,
+/// lower cluster id breaking a tie. `None` when no surviving cluster overlaps the
+/// word.
+///
+/// Reuses [`ranked_overlaps`]' per-cluster summing (via [`interval_overlap_ms`] +
+/// [`seconds_to_ms`]), then skips any cluster the issue-63 prune dropped from
+/// `survivors` — so the split path respects the prune exactly as the kept-segment
+/// reassignment does: a word whose top overlap is a pruned drift-cluster
+/// attributes to its next-best surviving cluster, not the dropped one. Parakeet
+/// word ENDS are approximate (taken as the next word's start), so a word that
+/// straddles a turn boundary attributes by max overlap — the right call.
+fn word_turn(
+    word_start_ms: u64,
+    word_end_ms: u64,
+    turns: &[SherpaSegment],
+    survivors: &[i32],
+) -> Option<i32> {
+    ranked_overlaps(turns, word_start_ms, word_end_ms)
+        .into_iter()
+        .find(|(id, _)| survivors.contains(id))
+        .map(|(id, _)| id)
+}
+
+/// Split one segment's words into maximal contiguous same-cluster runs, emitting
+/// one `(Segment, cluster_id)` per run.
+///
+/// Each emitted segment's `text` is its run's words joined by a single space;
+/// `words` is the run's [`WordTimestamp`] slice; `start_ms`/`end_ms` are the
+/// run's first/last word bounds; `confidence` is carried from `seg`;
+/// `speaker_id` is left `None` (the caller relabels in output order) and
+/// `shared_speakers` is empty.
+///
+/// A word whose [`word_turn`] is `None` (no SURVIVING cluster overlaps it) joins
+/// the PRECEDING run (no orphan sub-segment); when the FIRST word is `None` it
+/// seeds a run with the segment's dominant surviving cluster (max overlap over the
+/// whole segment). `survivors` is the post-prune surviving cluster set, threaded
+/// in so the split never mints a run on a cluster the prune dropped. If `seg.words`
+/// is empty or every word maps to ONE cluster, a single (rebuilt) segment is
+/// returned, so the caller can split unconditionally on a mixed Parakeet segment.
+fn split_segment_by_words(
+    seg: &Segment,
+    turns: &[SherpaSegment],
+    survivors: &[i32],
+) -> Vec<(Segment, i32)> {
+    // Build a sub-segment from a run of words on one cluster: bounds from the
+    // first/last word, text space-joined, words cloned, confidence carried.
+    let build = |words: &[minutist_common::WordTimestamp], cluster: i32| -> (Segment, i32) {
+        let start_ms = words.first().map(|w| w.start_ms).unwrap_or(seg.start_ms);
+        let end_ms = words.last().map(|w| w.end_ms).unwrap_or(seg.end_ms);
+        let text = words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sub = Segment {
+            start_ms,
+            end_ms,
+            text,
+            speaker_id: None,
+            confidence: seg.confidence,
+            words: words.to_vec(),
+            shared_speakers: Vec::new(),
+        };
+        (sub, cluster)
+    };
+
+    if seg.words.is_empty() {
+        // No words to regroup — rebuild the whole segment on its dominant cluster
+        // (cluster 0 if nothing overlaps, which a mixed segment never hits).
+        let cluster = word_turn(seg.start_ms, seg.end_ms, turns, survivors).unwrap_or(0);
+        return vec![build(&seg.words, cluster)];
+    }
+
+    // The segment's dominant cluster seeds a leading None word (and is the
+    // fallback if every word maps to None).
+    let dominant = word_turn(seg.start_ms, seg.end_ms, turns, survivors).unwrap_or(0);
+
+    let mut out: Vec<(Segment, i32)> = Vec::new();
+    let mut run_cluster: Option<i32> = None;
+    let mut run_start: usize = 0;
+    for (k, w) in seg.words.iter().enumerate() {
+        // A word that maps to no turn joins the current run; the first word seeds
+        // the run with the segment's dominant cluster.
+        let cluster = word_turn(w.start_ms, w.end_ms, turns, survivors).unwrap_or_else(|| match run_cluster {
+            Some(c) => c,
+            None => dominant,
+        });
+        match run_cluster {
+            Some(c) if c == cluster => {}
+            Some(c) => {
+                out.push(build(&seg.words[run_start..k], c));
+                run_start = k;
+                run_cluster = Some(cluster);
+            }
+            None => run_cluster = Some(cluster),
+        }
+    }
+    let last = run_cluster.unwrap_or(dominant);
+    out.push(build(&seg.words[run_start..], last));
+    out
 }
 
 /// Overlap length in milliseconds of two half-open intervals `[a0, a1)` and
@@ -875,12 +1018,12 @@ mod tests {
             turn(2.0, 4.0, 3),
             turn(4.0, 6.0, 7),
         ];
-        let mut segs = vec![
+        let segs = vec![
             seg(0, 1_900),     // overlaps the 7-turn → A
             seg(2_100, 3_900), // overlaps the 3-turn → B
             seg(4_100, 5_900), // overlaps the 7-turn → A
         ];
-        let count = overlay_speakers(&turns, &mut segs, &no_prune());
+        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -891,8 +1034,8 @@ mod tests {
     fn overlay_no_overlap_yields_none() {
         let turns = vec![turn(0.0, 1.0, 0)];
         // Segment sits entirely after the only turn → no overlap → None.
-        let mut segs = vec![seg(5_000, 6_000)];
-        let count = overlay_speakers(&turns, &mut segs, &no_prune());
+        let segs = vec![seg(5_000, 6_000)];
+        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 0);
         assert_eq!(segs[0].speaker_id, None);
     }
@@ -904,8 +1047,8 @@ mod tests {
             turn(0.0, 1.2, 0), // 0..1200 ms : overlaps [1000,2000) by 200 ms
             turn(1.2, 3.0, 1), // 1200..3000 ms : overlaps [1000,2000) by 800 ms
         ];
-        let mut segs = vec![seg(1_000, 2_000)];
-        let count = overlay_speakers(&turns, &mut segs, &no_prune());
+        let segs = vec![seg(1_000, 2_000)];
+        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 1);
         // Cluster id 1 is the only chosen id → first-seen → "A".
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -919,8 +1062,8 @@ mod tests {
             turn(0.0, 1.5, 9), // overlaps [1000,2000) by 500 ms (1000..1500)
             turn(1.5, 3.0, 4), // overlaps [1000,2000) by 500 ms (1500..2000)
         ];
-        let mut segs = vec![seg(1_000, 2_000)];
-        let count = overlay_speakers(&turns, &mut segs, &no_prune());
+        let segs = vec![seg(1_000, 2_000)];
+        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 1);
         // Cluster 4 (the lower id) wins the tie; as the only chosen id it
         // first-seen-relabels to "A".
@@ -944,8 +1087,8 @@ mod tests {
     #[test]
     fn overlay_single_speaker_one_label() {
         let turns = vec![turn(0.0, 10.0, 2)];
-        let mut segs = vec![seg(0, 2_000), seg(3_000, 5_000), seg(6_000, 9_000)];
-        let count = overlay_speakers(&turns, &mut segs, &no_prune());
+        let segs = vec![seg(0, 2_000), seg(3_000, 5_000), seg(6_000, 9_000)];
+        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 1);
         for s in &segs {
             assert_eq!(s.speaker_id.as_deref(), Some("A"));
@@ -962,13 +1105,13 @@ mod tests {
             // gap 2.0..4.0 — no turn
             turn(4.0, 5.0, 1),
         ];
-        let mut segs = vec![
+        let segs = vec![
             seg(0, 900),       // A
             seg(1_100, 1_900), // B
             seg(2_500, 3_500), // gap → None
             seg(4_100, 4_900), // C
         ];
-        let count = overlay_speakers(&turns, &mut segs, &no_prune());
+        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 3);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -979,8 +1122,10 @@ mod tests {
     #[test]
     fn overlay_empty_segments_is_zero() {
         let turns = vec![turn(0.0, 1.0, 0)];
-        let mut segs: Vec<Segment> = Vec::new();
-        assert_eq!(overlay_speakers(&turns, &mut segs, &no_prune()), 0);
+        let segs: Vec<Segment> = Vec::new();
+        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        assert_eq!(count, 0);
+        assert!(segs.is_empty());
     }
 
     #[test]
@@ -988,11 +1133,11 @@ mod tests {
         // A re-diarize pass must overwrite a previously-set label, including
         // back to None when the new turns no longer cover the segment.
         let turns = vec![turn(0.0, 1.0, 0)];
-        let mut segs = vec![Segment {
+        let segs = vec![Segment {
             speaker_id: Some("Z".to_string()),
             ..seg(5_000, 6_000)
         }];
-        overlay_speakers(&turns, &mut segs, &no_prune());
+        let (segs, _count) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(segs[0].speaker_id, None);
     }
 
@@ -1015,8 +1160,10 @@ mod tests {
             turn(0.4, 1.0, 1),
             turn(1.0, 2.0, 1),
         ];
-        let mut segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        overlay_speakers(&turns, &mut segs, &flag_share());
+        // Empty `words` (the Qwen path): a mixed segment is NOT split — it keeps
+        // its dominant label + the `shared_speakers` flag.
+        let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
+        let (segs, _count) = overlay_speakers(&turns, segs, &flag_share());
 
         // Primary labels by first-seen order.
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -1035,8 +1182,8 @@ mod tests {
             turn(0.8, 1.0, 1),
             turn(1.0, 2.0, 1),
         ];
-        let mut segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        overlay_speakers(&turns, &mut segs, &flag_share());
+        let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
+        let (segs, _count) = overlay_speakers(&turns, segs, &flag_share());
 
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert!(
@@ -1053,8 +1200,8 @@ mod tests {
             turn(0.4, 1.0, 1),
             turn(1.0, 2.0, 1),
         ];
-        let mut segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        overlay_speakers(&turns, &mut segs, &no_prune());
+        let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
+        let (segs, _count) = overlay_speakers(&turns, segs, &no_prune());
         assert!(segs[0].shared_speakers.is_empty());
     }
 
@@ -1096,7 +1243,7 @@ mod tests {
         // blip cluster only ever wins via a turn no segment maxes on — exercise
         // the share prune with a segment that DOES max on the blip.
         segs[1] = seg(5_000, 5_150); // overlaps cluster 1 by 100 ms, cluster 0 by 50 ms
-        let count = overlay_speakers(&turns, &mut segs, &pruned(0.02, 0, None));
+        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None));
         assert_eq!(count, 1, "tiny-share cluster must be pruned away");
         // The straddling segment reassigned to the surviving cluster 0 → "A".
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1112,13 +1259,13 @@ mod tests {
         // the share floor). Both must survive — the prune must not collapse
         // genuine speakers.
         let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 10.0, 1)];
-        let mut segs = vec![
+        let segs = vec![
             seg(0, 2_400),
             seg(2_500, 4_900),
             seg(5_100, 7_400),
             seg(7_500, 9_900),
         ];
-        let count = overlay_speakers(&turns, &mut segs, &pruned(0.02, 2, None));
+        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.02, 2, None));
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1137,7 +1284,7 @@ mod tests {
             turn(2.9, 3.6, 1), // cluster-1 turn, mostly in the 3.0..3.5 gap
             turn(3.5, 8.0, 0),
         ];
-        let mut segs = vec![
+        let segs = vec![
             seg(0, 1_000),
             seg(1_000, 2_000),
             // Overlaps cluster 1 by 650 ms (2900..3550) and cluster 0 by 150 ms
@@ -1146,7 +1293,7 @@ mod tests {
             seg(2_900, 3_550),
             seg(4_100, 5_000),
         ];
-        let count = overlay_speakers(&turns, &mut segs, &pruned(0.0, 2, None));
+        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.0, 2, None));
         assert_eq!(count, 1, "single-segment cluster pruned by the count floor");
         assert_eq!(segs[2].speaker_id.as_deref(), Some("A"));
     }
@@ -1161,12 +1308,12 @@ mod tests {
             turn(6.0, 10.0, 1),
             turn(10.0, 12.0, 2), // smallest → capped out
         ];
-        let mut segs = vec![
+        let segs = vec![
             seg(0, 5_900),
             seg(6_100, 9_900),
             seg(10_100, 11_900), // overlaps only cluster 2; after cap, reassigns
         ];
-        let count = overlay_speakers(&turns, &mut segs, &pruned(0.0, 0, Some(2)));
+        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)));
         assert_eq!(count, 2, "cap must keep exactly the two largest speakers");
         // The capped-out segment had no overlap with a survivor → None (no
         // surviving turn covers [10100,11900)).
@@ -1180,8 +1327,8 @@ mod tests {
         // No — 1.0 is not < 1.0). Use > 1.0 to force the all-pruned branch and
         // confirm the largest cluster is retained.
         let turns = vec![turn(0.0, 5.0, 0)];
-        let mut segs = vec![seg(0, 4_900)];
-        let count = overlay_speakers(&turns, &mut segs, &pruned(2.0, 0, None));
+        let segs = vec![seg(0, 4_900)];
+        let (segs, count) = overlay_speakers(&turns, segs, &pruned(2.0, 0, None));
         assert_eq!(count, 1, "the largest cluster is retained when all prune");
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
     }
@@ -1201,7 +1348,7 @@ mod tests {
             let start = (t * 1000.0) as u64;
             segs.push(seg(start, start + 200));
         }
-        let count = overlay_speakers(&turns, &mut segs, &DiarizerConfig::default());
+        let (_segs, count) = overlay_speakers(&turns, segs, &DiarizerConfig::default());
         assert_eq!(count, 1, "default prune collapses the tiny-cluster scatter");
     }
 
@@ -1523,5 +1670,206 @@ mod tests {
         let ranked = vec![(0i32, 1000u64), (1, 600)];
         assert!(!is_mixed_segment(&ranked, &[0, 1], 1000, 0.0));
         assert!(!is_mixed_segment(&ranked, &[0, 1], 0, 0.30));
+    }
+
+    // -----------------------------------------------------------------------
+    // word_turn + split_segment_by_words + the overlay split path (#0015 phase 3)
+    // -----------------------------------------------------------------------
+
+    /// A segment carrying per-word timestamps (the Parakeet path); `text` is the
+    /// words space-joined.
+    fn seg_words(words: Vec<minutist_common::WordTimestamp>) -> Segment {
+        let start_ms = words.first().map(|w| w.start_ms).unwrap_or(0);
+        let end_ms = words.last().map(|w| w.end_ms).unwrap_or(0);
+        let text = words
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Segment {
+            start_ms,
+            end_ms,
+            text,
+            speaker_id: None,
+            confidence: None,
+            words,
+            shared_speakers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn word_turn_picks_max_overlap_cluster() {
+        // The word [1000,2000) overlaps cluster 0 by 200 ms and cluster 1 by
+        // 800 ms → cluster 1.
+        let turns = vec![turn(0.0, 1.2, 0), turn(1.2, 3.0, 1)];
+        assert_eq!(word_turn(1_000, 2_000, &turns, &[0, 1, 4, 9]), Some(1));
+    }
+
+    #[test]
+    fn word_turn_tie_breaks_to_lower_cluster_id() {
+        // Equal 500 ms overlap each → the lower cluster id (4) wins.
+        let turns = vec![turn(0.0, 1.5, 9), turn(1.5, 3.0, 4)];
+        assert_eq!(word_turn(1_000, 2_000, &turns, &[0, 1, 4, 9]), Some(4));
+    }
+
+    #[test]
+    fn word_turn_none_when_no_overlap() {
+        let turns = vec![turn(0.0, 1.0, 0)];
+        assert_eq!(word_turn(5_000, 6_000, &turns, &[0, 1, 4, 9]), None);
+    }
+
+    #[test]
+    fn split_three_runs_a_a_b_b_a() {
+        // Words A A B B A; turns put [0,200)+[400,500) on cluster 0 and
+        // [200,400) on cluster 1 → 3 contiguous runs.
+        let turns = vec![turn(0.0, 0.2, 0), turn(0.2, 0.4, 1), turn(0.4, 0.5, 0)];
+        let seg = seg_words(vec![
+            word(0, 100, "a1"),
+            word(100, 200, "a2"),
+            word(200, 300, "b1"),
+            word(300, 400, "b2"),
+            word(400, 500, "a3"),
+        ]);
+        let runs = split_segment_by_words(&seg, &turns, &[0, 1]);
+        assert_eq!(runs.len(), 3);
+        // Run 0: cluster 0, words a1 a2, [0,200).
+        assert_eq!(runs[0].1, 0);
+        assert_eq!(runs[0].0.text, "a1 a2");
+        assert_eq!((runs[0].0.start_ms, runs[0].0.end_ms), (0, 200));
+        // Run 1: cluster 1, words b1 b2, [200,400).
+        assert_eq!(runs[1].1, 1);
+        assert_eq!(runs[1].0.text, "b1 b2");
+        assert_eq!((runs[1].0.start_ms, runs[1].0.end_ms), (200, 400));
+        // Run 2: cluster 0 again, word a3, [400,500).
+        assert_eq!(runs[2].1, 0);
+        assert_eq!(runs[2].0.text, "a3");
+        assert_eq!((runs[2].0.start_ms, runs[2].0.end_ms), (400, 500));
+        // Sub-segments carry no label (the caller relabels) and no flag.
+        assert!(runs.iter().all(|(s, _)| s.speaker_id.is_none()));
+        assert!(runs.iter().all(|(s, _)| s.shared_speakers.is_empty()));
+    }
+
+    #[test]
+    fn split_empty_words_is_single_segment() {
+        let turns = vec![turn(0.0, 1.0, 0)];
+        let seg = seg(0, 1_000); // no words
+        let runs = split_segment_by_words(&seg, &turns, &[0, 1]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1, 0);
+    }
+
+    #[test]
+    fn split_single_cluster_words_is_one_segment() {
+        // Every word maps to cluster 0 → a single rebuilt segment.
+        let turns = vec![turn(0.0, 1.0, 0)];
+        let seg = seg_words(vec![word(0, 300, "one"), word(300, 600, "two")]);
+        let runs = split_segment_by_words(&seg, &turns, &[0, 1]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1, 0);
+        assert_eq!(runs[0].0.text, "one two");
+    }
+
+    #[test]
+    fn split_first_word_none_seeds_with_dominant_cluster() {
+        // The first word [0,100) overlaps no turn (None) → it seeds the run with
+        // the segment's dominant cluster (1, which owns most of [0,500)). The
+        // remaining words are all cluster 1, so the whole segment stays one run
+        // labelled 1.
+        let turns = vec![turn(0.1, 0.5, 1)];
+        let seg = seg_words(vec![
+            word(0, 100, "lead"),
+            word(100, 300, "mid"),
+            word(300, 500, "end"),
+        ]);
+        let runs = split_segment_by_words(&seg, &turns, &[0, 1]);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1, 1, "leading None word seeds with the dominant cluster");
+        assert_eq!(runs[0].0.text, "lead mid end");
+    }
+
+    #[test]
+    fn split_mid_run_none_word_joins_preceding_run() {
+        // Words: cluster 0, NONE, cluster 0 — the middle word overlaps no turn so
+        // it joins the preceding (cluster 0) run; no orphan run is emitted.
+        let turns = vec![turn(0.0, 0.2, 0), turn(0.4, 0.6, 0)];
+        let seg = seg_words(vec![
+            word(0, 200, "a"),
+            word(250, 350, "gap"), // [250,350) overlaps neither turn → None
+            word(400, 600, "b"),
+        ]);
+        let runs = split_segment_by_words(&seg, &turns, &[0, 1]);
+        assert_eq!(runs.len(), 1, "the None word folds into the preceding run");
+        assert_eq!(runs[0].1, 0);
+        assert_eq!(runs[0].0.text, "a gap b");
+    }
+
+    #[test]
+    fn word_turn_skips_pruned_non_survivor_cluster() {
+        // Cluster 1 has the larger overlap but was pruned (not a survivor), so the
+        // word attributes to the only survivor (0) — the split path respects the
+        // issue-63 prune. With both surviving, the max-overlap cluster (1) wins.
+        let turns = vec![turn(0.0, 1.2, 0), turn(1.2, 3.0, 1)];
+        assert_eq!(word_turn(1_000, 2_000, &turns, &[0]), Some(0));
+        assert_eq!(word_turn(1_000, 2_000, &turns, &[0, 1]), Some(1));
+    }
+
+    #[test]
+    fn split_respects_prune_pruned_cluster_word_joins_survivor() {
+        // Cluster 5 owns [250,500) but was pruned; only cluster 0 survives. The
+        // word on [250,500) maps to no survivor, so it folds into the surviving
+        // run instead of resurrecting the pruned drift-cluster.
+        let turns = vec![turn(0.0, 0.25, 0), turn(0.25, 0.5, 5)];
+        let seg = seg_words(vec![word(0, 250, "a"), word(250, 500, "b")]);
+        let runs = split_segment_by_words(&seg, &turns, &[0]); // cluster 5 pruned
+        assert_eq!(runs.len(), 1, "pruned cluster 5 must not mint its own run");
+        assert_eq!(runs[0].1, 0);
+        assert_eq!(runs[0].0.text, "a b");
+    }
+
+    #[test]
+    fn overlay_splits_a_mixed_parakeet_segment() {
+        // VAD segment 0 [0,2000) hands over A→B mid-segment; segment 1 [2000,3000)
+        // is cluster 1 alone (so cluster 1 wins a top slot and counts as a
+        // surviving cluster). Turns: cluster 0 owns [0,1000), cluster 1 owns
+        // [1000,3000). Segment 0 is mixed (each cluster 50% ≥ 30%) AND has words →
+        // it splits into two single-speaker sub-segments, lettered in transcript
+        // order A then B; segment 1 reuses B.
+        let turns = vec![turn(0.0, 1.0, 0), turn(1.0, 3.0, 1)];
+        let segs = vec![
+            seg_words(vec![
+                word(0, 400, "hello"),
+                word(400, 1_000, "there"),
+                word(1_000, 1_500, "general"),
+                word(1_500, 2_000, "kenobi"),
+            ]),
+            seg(2_000, 3_000), // cluster 1 alone (no words)
+        ];
+        let (out, count) = overlay_speakers(&turns, segs, &flag_share());
+        assert_eq!(count, 2, "the split yields two distinct speakers");
+        assert_eq!(out.len(), 3, "the mixed segment split into two, plus segment 1");
+        assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(out[0].text, "hello there");
+        assert_eq!(out[1].speaker_id.as_deref(), Some("B"));
+        assert_eq!(out[1].text, "general kenobi");
+        assert_eq!(out[2].speaker_id.as_deref(), Some("B"));
+        // A split segment is resolved per-speaker — never flagged shared.
+        assert!(out[0].shared_speakers.is_empty());
+        assert!(out[1].shared_speakers.is_empty());
+    }
+
+    #[test]
+    fn overlay_does_not_split_a_mixed_qwen_segment() {
+        // Same mixed geometry but EMPTY words (the Qwen path): the segment is NOT
+        // split — it keeps its dominant label and the shared_speakers flag.
+        let turns = vec![
+            turn(0.0, 1.0, 0),
+            turn(0.4, 1.0, 1),
+            turn(1.0, 2.0, 1),
+        ];
+        let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
+        let (out, _count) = overlay_speakers(&turns, segs, &flag_share());
+        assert_eq!(out.len(), 2, "no split on the no-words path");
+        assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(out[0].shared_speakers, vec!["B".to_string()]);
     }
 }

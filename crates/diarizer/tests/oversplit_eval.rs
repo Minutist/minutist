@@ -87,8 +87,15 @@ fn count_with_prune(turns: &[sherpa_rs::diarize::Segment], base: &[Segment], sha
         max_speakers: None,
         ..DiarizerConfig::default()
     };
+    // Clear words so the #0015 word-split path is inert here: this eval isolates
+    // the over-split PRUNE (the split is covered by the diarizer unit tests, and
+    // with words present it could move the count in either direction).
     let mut segs = base.to_vec();
-    overlay_speakers(turns, &mut segs, &cfg)
+    for s in &mut segs {
+        s.words.clear();
+    }
+    let (_segs, count) = overlay_speakers(turns, segs, &cfg);
+    count
 }
 
 #[test]
@@ -166,16 +173,20 @@ fn oversplit_count_vs_knob_sweep() {
     let old_count = count_with_prune(&old_turns, &base, 0.0);
     let new_turns = compute_turns(&seg_path, &emb_path, &pcm, 0.75, 0.3, 0.5);
     let mut new_segs = base.clone();
-    let new_count = overlay_speakers(&new_turns, &mut new_segs, &DiarizerConfig::default());
+    for s in &mut new_segs {
+        s.words.clear();
+    }
+    let (_new_segs, new_count) = overlay_speakers(&new_turns, new_segs, &DiarizerConfig::default());
     eprintln!(
         "\n-- BEFORE/AFTER on this slice --\n  OLD (thr 0.75, no smoothing, no prune): {old_count}\
          \n  NEW (DiarizerConfig::default()):        {new_count}"
     );
 
     // The eval is diagnostic; the only hard invariant is that the new default
-    // does not produce MORE speakers than the old config (the prune + smoothing
-    // can only merge, never split, relative to the unsmoothed/unpruned baseline
-    // at the same threshold).
+    // does not produce MORE speakers than the old config. Both sides run with
+    // words cleared (above), so the #0015 word-split is inert and this compares
+    // the prune + smoothing in isolation — which can only merge, never split,
+    // relative to the unsmoothed/unpruned baseline at the same threshold.
     assert!(
         new_count <= old_count,
         "new default ({new_count}) must not over-split worse than the old config ({old_count})"

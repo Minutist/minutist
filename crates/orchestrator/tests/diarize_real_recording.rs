@@ -68,8 +68,9 @@ fn diarize_at(seg_path: &Path, emb_path: &Path, threshold: f32, audio: &[f32], s
         },
     )
     .expect("open diarizer");
-    let mut copy = segs.to_vec();
-    d.assign_speakers(audio, 16_000, &mut copy).expect("assign_speakers")
+    let copy = segs.to_vec();
+    let (_segs, count) = d.assign_speakers(audio, 16_000, copy).expect("assign_speakers");
+    count
 }
 
 #[test]

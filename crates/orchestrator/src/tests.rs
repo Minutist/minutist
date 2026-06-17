@@ -402,19 +402,19 @@ mod diarization {
             &self,
             audio: &[f32],
             sample_rate: u32,
-            segments: &mut [Segment],
-        ) -> AppResult<u32> {
+            mut segments: Vec<Segment>,
+        ) -> AppResult<(Vec<Segment>, u32)> {
             assert_eq!(sample_rate, 16_000, "orchestrator must call with 16 kHz");
             assert!(!audio.is_empty(), "orchestrator must decode non-empty PCM");
             if segments.is_empty() || self.speakers == 0 {
-                return Ok(0);
+                return Ok((segments, 0));
             }
             let labels = ["A", "B", "C", "D"];
             let used = (self.speakers as usize).min(labels.len()).min(segments.len());
             for (i, seg) in segments.iter_mut().enumerate() {
                 seg.speaker_id = Some(labels[i % used].to_string());
             }
-            Ok(used as u32)
+            Ok((segments, used as u32))
         }
     }
 

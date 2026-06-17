@@ -1174,9 +1174,10 @@ impl Orchestrator {
     /// decodes the meeting's `audio.opus` (pause-INCLUDING 16 kHz mono PCM via
     /// `persistence::reader::read_audio_pcm`), reads `transcript.json`
     /// (`persistence::read_transcript`), and runs the bundled `SherpaDiarizer`
-    /// over the segment array. The diarizer overlays `speaker_id` onto the
-    /// segments in place (`Diarizer::assign_speakers`, returning the distinct
-    /// speaker count); the refreshed transcript replaces `transcript.json`
+    /// over the segment array. `Diarizer::assign_speakers` consumes the segments
+    /// and returns the speaker-labelled (and, on the Parakeet path, turn-split)
+    /// list plus the distinct speaker count; the refreshed transcript replaces
+    /// `transcript.json`
     /// (`persistence::write_transcript`), `metadata.json` is updated
     /// (`persistence::write_metadata`, setting `speaker_count` + the `diarizer`
     /// [`ModelDescriptor`]), the supplied [`MeetingIndex`] row's `speaker_count`
@@ -1241,8 +1242,9 @@ impl Orchestrator {
     /// `StubDiarizer`). On a `spawn_blocking` thread it decodes the meeting's
     /// pause-INCLUDING PCM (`persistence::read_audio_pcm`), reads
     /// `transcript.json` (`persistence::read_transcript`), and runs the supplied
-    /// diarizer's `assign_speakers` (which overlays `speaker_id` in place and
-    /// returns the distinct speaker count). It then calls
+    /// diarizer's `assign_speakers` (which returns the speaker-labelled,
+    /// possibly turn-split segment list plus the distinct speaker count). It then
+    /// calls
     /// [`Self::finalise_diarization`] to rewrite `transcript.json` + update
     /// `metadata.json`, and finally refreshes the supplied index row's
     /// `speaker_count` (`upsert`).
@@ -1496,8 +1498,10 @@ async fn run_diarization_blocking(
 ) -> AppResult<(Vec<Segment>, u32)> {
     tokio::task::spawn_blocking(move || -> AppResult<(Vec<Segment>, u32)> {
         let pcm = persistence::read_audio_pcm(&meeting_dir)?;
-        let mut segments = persistence::read_transcript(&meeting_dir)?;
-        let _ = diarizer.assign_speakers(&pcm, 16_000, &mut segments)?;
+        let segments = persistence::read_transcript(&meeting_dir)?;
+        // `assign_speakers` consumes and returns the segment list: a mixed
+        // Parakeet segment splits at the turn boundary, so the list may grow.
+        let (mut segments, _count) = diarizer.assign_speakers(&pcm, 16_000, segments)?;
         // #0015 phase 1: collapse a speaker fragmented by VAD silence-gaps or the
         // 10 s force-split into one segment so a turn reads as one row.
         diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);

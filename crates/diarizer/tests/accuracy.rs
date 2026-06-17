@@ -150,7 +150,7 @@ fn two_speaker_accuracy_at_least_80pct() {
 
     let pcm = read_fixture_pcm("two_speakers_synth.wav");
     let total_ms = (pcm.len() as u64 * 1000) / SAMPLE_RATE as u64;
-    let (mut segments, truth) = build_segments(total_ms);
+    let (segments, truth) = build_segments(total_ms);
 
     // Production config: threshold/auto-count mode (the shipped app does not
     // know the speaker count at record time). The diarizer must DISCOVER that
@@ -158,8 +158,10 @@ fn two_speaker_accuracy_at_least_80pct() {
     let diarizer = SherpaDiarizer::open(&seg_path, &emb_path, DiarizerConfig::default())
         .expect("open diarizer with valid models");
 
-    let count = diarizer
-        .assign_speakers(&pcm, SAMPLE_RATE, &mut segments)
+    // The fixture segments carry no per-word timestamps, so no turn-split occurs;
+    // `assign_speakers` returns the same segments, speaker-labelled.
+    let (segments, count) = diarizer
+        .assign_speakers(&pcm, SAMPLE_RATE, segments)
         .expect("assign_speakers succeeds with valid models");
     assert_eq!(count, 2, "expected exactly 2 distinct speakers, got {count}");
 
@@ -206,8 +208,8 @@ fn single_speaker_control_one_label() {
     let diarizer = SherpaDiarizer::open(&seg_path, &emb_path, DiarizerConfig::default())
         .expect("open diarizer with valid models");
 
-    let count = diarizer
-        .assign_speakers(&pcm, SAMPLE_RATE, &mut segments)
+    let (_segments, count) = diarizer
+        .assign_speakers(&pcm, SAMPLE_RATE, segments)
         .expect("assign_speakers succeeds with valid models");
     assert_eq!(
         count, 1,

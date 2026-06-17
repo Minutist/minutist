@@ -378,13 +378,35 @@ re-transcribe would. The `≥4 s-pause` clock-regression unit test
 forward↔inverse round-trip.
 
 **Offline ops are serialized — but a new recording preempts them.**
-`re_transcribe` and `rediarize` atomically CLAIM an internal `Offline` state
-under the orchestrator lock (rejecting a concurrent re-transcribe / re-diarize
-with `AppError::InvalidInput`) and release it on every exit path, so two offline
-ops can't race and clobber the SAME meeting's `transcript.json`. However,
-**`start` PREEMPTS the `Offline` claim** (`transition_start` accepts `Idle |
-Offline`): a new recording is a different `meeting_id`/file, so the clobber
-hazard does not apply, and the user must never be blocked from recording the next
+`re_transcribe`, `rediarize`, and the merged `reprocess` atomically CLAIM an
+internal `Offline` state under the orchestrator lock (rejecting a concurrent
+offline op with `AppError::InvalidInput`) and release it on every exit path, so
+two offline ops can't race and clobber the SAME meeting's `transcript.json`.
+
+**`reprocess` (#0015 phase 5) takes ONE claim for a re-transcribe + diarize
+pass.** It merges `re_transcribe` and `rediarize` into a single offline op under
+ONE `claim_offline`/`release_offline`, never re-claiming between the two
+sub-steps: it drives their CLAIMED bodies (the post-claim logic, factored out so
+the standalone commands and `reprocess` share it) so NO `Idle` window opens
+mid-pass. The internal order is **re-transcribe FIRST, then diarize/split/merge
+over the fresh transcript, then finalise ONCE** with `finalise_diarization`
+semantics (write transcript + `speaker_count` + diarizer descriptor +
+`speaker_names` clear). Order matters: a diarize-first order is a guaranteed
+lost-update — the re-transcribe finalise's `write_transcript` would clobber the
+just-written split. The fresh transcript is persisted between the steps because
+the diarize funnel (`run_diarization_blocking`) re-reads `transcript.json` from
+disk; that intermediate write is overwritten by the single diarize finalise, so
+the re-transcribe is never separately finalised. The timeout budget is NOT
+collapsed into one watchdog: each sub-step keeps its own
+`retranscribe_timeout(duration_ms)` bound (the ASR run, and the diarize+split
+run), and because the two run serially the budgets compose additively — neither
+blocking pass is cut off mid-run. `reprocess` does NOT summarise (parity with
+the standalone ops; `Summarise` stays a separate post-stop pass gated by
+`recorder_is_live`).
+
+However, **`start` PREEMPTS the `Offline` claim** (`transition_start` accepts
+`Idle | Offline`): a new recording is a different `meeting_id`/file, so the
+clobber hazard does not apply, and the user must never be blocked from recording the next
 meeting while the previous one's best-effort repair runs. On preempt the
 in-flight op finishes on its own thread (writing the OLD meeting's files —
 harmless) and its release is a no-op (`transition_offline_release` returns
@@ -654,7 +676,12 @@ constraints are binding on them):
   re-clusters and can re-letter speakers, a `rediarize` pass CLEARS `speaker_names`
   (the old label→name mapping is no longer valid); the `set_speaker_name` tool
   re-establishes names afterward. Names are an overlay applied at read time, never
-  baked into `transcript.json`.
+  baked into `transcript.json`. The merged `reprocess` (#0015 phase 5) ALWAYS
+  diarizes, so it clears `speaker_names` on EVERY run — even a text-only repair
+  loses user-assigned names. This is the accepted product default (accept-and-warn,
+  2026-06-17): consistent with re-diarize's existing behaviour; the merged
+  reprocess tool carries the "RESETS speaker names" warning, and the durable fix is
+  embedding-anchored retention (#0003 voiceprints).
 
 - **The driver loop (`ipc-bridge`, on `spawn_blocking`).** `chat-agent`'s
   `ChatEngine` is stateless per call; the driver owns the conversation history and

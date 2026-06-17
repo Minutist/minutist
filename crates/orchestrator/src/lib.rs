@@ -775,14 +775,32 @@ impl Orchestrator {
         meeting_id: MeetingId,
     ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+        let segments = self.re_transcribe_segments(meeting_id, &meeting_dir).await?;
+        self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
+            .await
+    }
 
+    /// Decode `audio.opus` + run VAD + ASR and return the FRESH segment list,
+    /// WITHOUT persisting or finalising it.
+    ///
+    /// This is the post-claim re-transcribe COMPUTE step, factored out so it is
+    /// shared, with no re-claim, by both [`Self::re_transcribe_claimed`] (which
+    /// finalises the result on its own) and [`Self::reprocess_claimed`] (which
+    /// feeds the fresh transcript straight into the diarize/split step before a
+    /// single finalise). The caller owns persistence + the offline claim; this
+    /// method neither writes `transcript.json` nor touches the claim.
+    async fn re_transcribe_segments(
+        &self,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+    ) -> AppResult<Vec<Segment>> {
         // Decode audio + run VAD + ASR on a blocking thread. Build the ASR
         // backend inside the blocking closure so the heavy model load is off the
         // async worker threads. The model is resolved via the same registry path
         // the live pipeline uses.
         let registry = Arc::clone(&self.model_registry);
         let event_tx = self.event_tx.clone();
-        let meeting_dir_for_blocking = meeting_dir.clone();
+        let meeting_dir_for_blocking = meeting_dir.to_path_buf();
         // Resolve the VRAM-aware GPU plan before entering the blocking closure
         // (it cannot read `self.settings`). The offline re-transcribe honours the
         // same GPU policy + ASR tier as the live path.
@@ -809,7 +827,7 @@ impl Orchestrator {
         // the next recording — without bound. On timeout we return before any
         // transcript write; the abandoned `spawn_blocking` thread's result is
         // discarded (tokio cannot cancel it).
-        let duration_dir = meeting_dir.clone();
+        let duration_dir = meeting_dir.to_path_buf();
         let duration_ms = tokio::task::spawn_blocking(move || {
             persistence::read_metadata(&duration_dir).map(|m| m.duration_ms)
         })
@@ -866,8 +884,131 @@ impl Orchestrator {
             }
         };
 
-        self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
+        Ok(segments)
+    }
+
+    /// Re-run transcription THEN speaker diarization for a previously-recorded
+    /// meeting in ONE offline operation (#0015 phase 5).
+    ///
+    /// Merges [`Self::re_transcribe`] + [`Self::rediarize`] under a SINGLE
+    /// `claim_offline`/`release_offline`: a concurrent `start` / re-transcribe /
+    /// re-diarize is rejected for the WHOLE pass (no `Idle` window opens between
+    /// the two sub-steps), so the fresh transcript can never be clobbered by a
+    /// racing op.
+    ///
+    /// Internal order is **re-transcribe FIRST, then diarize/split/merge over the
+    /// fresh transcript, then finalise ONCE** (with `finalise_diarization`
+    /// semantics). Diarize-first would be a guaranteed lost-update: the
+    /// re-transcribe finalise's `write_transcript` would clobber the just-written
+    /// split.
+    ///
+    /// **Clears `speaker_names` on every call.** The merged op always diarizes, so
+    /// `finalise_diarization` clears `MeetingMeta.speaker_names` (a re-diarize can
+    /// re-letter speakers, invalidating the old label→name map) every time — even
+    /// a text-only repair loses user-assigned names. This is the accepted product
+    /// default (accept-and-warn, 2026-06-17): consistent with re-diarize's existing
+    /// behaviour; the durable fix is embedding-anchored retention (#0003
+    /// voiceprints). The merged tool carries the "RESETS speaker names" warning
+    /// (WU4). See `architecture/cross-cutting.md` — "Offline reprocessing".
+    ///
+    /// Does NOT summarise (parity with today; `Summarise` stays a separate
+    /// post-stop pass, gated by `recorder_is_live`).
+    ///
+    /// # Errors
+    ///
+    /// - `AppError::InvalidInput` if a recording is in progress / another offline
+    ///   op holds the claim.
+    /// - `AppError::ModelLoad` / `AppError::Inference` if the ASR or diarize model
+    ///   is unavailable or fails (the re-transcribe model is required, as in
+    ///   [`Self::re_transcribe`]; the re-ASR split backend degrades to keep-whole
+    ///   when absent, as in [`Self::rediarize`]).
+    pub async fn reprocess(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
+        // ONE claim for the whole serial pass (re-transcribe → diarize). Both
+        // sub-steps share it: the standalone commands each take their own claim,
+        // but `reprocess` claims once and drives their CLAIMED bodies so no `Idle`
+        // window opens mid-pass (TIMELINE-DRIFT #5). Released on every exit.
+        self.claim_offline(meeting_id).await?;
+        let result = self.reprocess_claimed(index, meeting_id).await;
+        self.release_offline().await;
+        result
+    }
+
+    /// The reprocess body, run while the SINGLE offline claim is held. Split out
+    /// so [`Self::reprocess`] can guarantee the claim is released on every exit
+    /// path (success and error).
+    ///
+    /// Composes the re-transcribe + diarize CLAIMED bodies WITHOUT re-claiming:
+    /// 1. [`Self::re_transcribe_segments`] — decode + VAD + ASR → the FRESH
+    ///    transcript (no finalise here).
+    /// 2. Persist the fresh transcript so the diarize funnel reads it from disk;
+    ///    `run_diarization_blocking` re-reads `transcript.json`, so the fresh text
+    ///    must land on disk before the diarize step (NOT the stale one).
+    /// 3. The re-diarize path ([`Self::rediarize_inner`] over a
+    ///    `DiarizationJob::Production`) diarizes/splits/merges over THAT fresh
+    ///    transcript and finalises ONCE via [`Self::finalise_diarization`] (write
+    ///    transcript + `speaker_count` + diarizer descriptor + `speaker_names`
+    ///    clear), then refreshes the index row.
+    async fn reprocess_claimed(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+    ) -> AppResult<()> {
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        // Timeout budget under the single claim: each sub-step keeps its own
+        // `retranscribe_timeout(duration_ms)` watchdog (the ASR run inside
+        // `re_transcribe_segments`, and the diarize+split run inside
+        // `rediarize_inner` — already on `retranscribe_timeout` from WU2). They
+        // run SERIALLY, so the budgets compose additively (≈2× the per-step ASR
+        // budget) and neither blocking pass is cut off mid-run; no single
+        // watchdog straddles both. A wedged sub-step still releases the claim
+        // (each `spawn_blocking` is individually bounded).
+
+        // (a) Re-transcribe FIRST: produce the fresh segment list (no finalise).
+        let segments = self.re_transcribe_segments(meeting_id, &meeting_dir).await?;
+
+        // (b) Persist the fresh transcript so the diarize funnel — which re-reads
+        // `transcript.json` from disk in `run_diarization_blocking` — diarizes the
+        // re-transcribed text, not the stale one. This intermediate write is the
+        // ONLY transcript write before the diarize finalise; the diarize step
+        // rewrites it once more with the speaker labels (so the re-transcribe is
+        // not separately finalised — that would clobber the split).
+        let meeting_dir_for_write = meeting_dir.clone();
+        tokio::task::spawn_blocking(move || -> AppResult<()> {
+            persistence::write_transcript(&meeting_dir_for_write, &segments)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("reprocess transcript write join failed: {e}"),
+        })??;
+
+        // (c) Diarize/split/merge over the fresh transcript, then finalise ONCE
+        // (write transcript + speaker_count + diarizer + speaker_names.clear()).
+        // Build the production diarizer + best-effort re-ASR split backend off the
+        // async worker threads, exactly as `rediarize_claimed` does.
+        let registry = Arc::clone(&self.model_registry);
+        let diarizer =
+            tokio::task::spawn_blocking(move || -> AppResult<diarizer::SherpaDiarizer> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AppError::Internal {
+                        context: format!("reprocess diarizer runtime build failed: {e}"),
+                    })?;
+                rt.block_on(runner::build_diarizer(&registry))
+            })
             .await
+            .map_err(|e| AppError::Internal {
+                context: format!("reprocess diarizer-build join failed: {e}"),
+            })??;
+        let backend = self.build_split_backend().await;
+
+        self.rediarize_inner(
+            index,
+            meeting_id,
+            DiarizationJob::Production { diarizer, backend },
+        )
+        .await
     }
 
     /// Atomically claim the recorder for an offline operation (re-transcribe /
@@ -2227,11 +2368,29 @@ impl Orchestrator {
         backend: Box<dyn minutist_common::AsrBackend + Send>,
     ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+        let segments = self
+            .re_transcribe_segments_with_backend(meeting_id, &meeting_dir, backend)
+            .await?;
+        self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
+            .await
+    }
 
+    /// Stub-backend mirror of [`Self::re_transcribe_segments`]: decode + VAD +
+    /// ASR (via the injected `backend`) → the FRESH segment list, WITHOUT
+    /// persisting or finalising. Shared by [`Self::re_transcribe_with_backend`]
+    /// and the [`Self::reprocess_with_inputs`] test seam so the model-free
+    /// reprocess test drives the SAME re-transcribe → diarize composition the
+    /// production [`Self::reprocess`] does.
+    async fn re_transcribe_segments_with_backend(
+        &self,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+        backend: Box<dyn minutist_common::AsrBackend + Send>,
+    ) -> AppResult<Vec<Segment>> {
         let event_tx = self.event_tx.clone();
-        let meeting_dir_for_blocking = meeting_dir.clone();
+        let meeting_dir_for_blocking = meeting_dir.to_path_buf();
 
-        let segments: Vec<Segment> = tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
+        tokio::task::spawn_blocking(move || -> AppResult<Vec<Segment>> {
             let pcm = persistence::read_audio_pcm(&meeting_dir_for_blocking)?;
             let mut backend = backend;
             runner::re_transcribe_buffer(&pcm, backend.as_mut(), &event_tx, meeting_id)
@@ -2239,10 +2398,7 @@ impl Orchestrator {
         .await
         .map_err(|e| AppError::Internal {
             context: format!("re_transcribe_with_backend spawn_blocking join failed: {e}"),
-        })??;
-
-        self.finalise_retranscribe(index, meeting_id, &meeting_dir, segments)
-            .await
+        })?
     }
 
     /// Offline re-diarize driven by caller-supplied turns + re-ASR backend,
@@ -2286,6 +2442,85 @@ impl Orchestrator {
             .await;
         self.release_offline().await;
         result
+    }
+
+    /// Model-free reprocess driven by stub inputs (#0015 phase 5).
+    ///
+    /// The stub-injectable seam for [`Self::reprocess`]: it takes ONE
+    /// `claim_offline`/`release_offline` and drives the SAME re-transcribe →
+    /// diarize/split/merge → finalise-once composition [`Self::reprocess_claimed`]
+    /// uses, but with stub inputs instead of real models:
+    /// - `asr_backend` re-transcribes (via `runner::re_transcribe_buffer`, real
+    ///   VAD + accumulator) → the FRESH segment list, which is persisted so the
+    ///   diarize step reads it;
+    /// - `turns` + `split_backend` + `config` drive the diarize/split via the
+    ///   `DiarizationJob::Stub` path, finalising ONCE
+    ///   ([`Self::finalise_diarization`] — transcript + `speaker_count` + diarizer
+    ///   + `speaker_names` clear) and refreshing the index row.
+    ///
+    /// No `Idle` window opens between the two sub-steps (a concurrent op is
+    /// rejected until the single release), exactly as production. This is the seam
+    /// the order + one-claim + names-cleared tests use — no real ASR model, no
+    /// sherpa model, no Qwen GGUF.
+    ///
+    /// Available only under the `test-source` feature.
+    pub async fn reprocess_with_inputs(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        asr_backend: Box<dyn minutist_common::AsrBackend + Send>,
+        turns: Vec<SpeakerTurn>,
+        split_backend: Option<Box<dyn minutist_common::AsrBackend + Send>>,
+        config: diarizer::DiarizerConfig,
+    ) -> AppResult<()> {
+        // ONE claim for the whole serial pass, exactly as production `reprocess`.
+        self.claim_offline(meeting_id).await?;
+        let result = self
+            .reprocess_with_inputs_claimed(index, meeting_id, asr_backend, turns, split_backend, config)
+            .await;
+        self.release_offline().await;
+        result
+    }
+
+    /// The `reprocess_with_inputs` body, run while the SINGLE offline claim is
+    /// held — the model-free mirror of [`Self::reprocess_claimed`].
+    async fn reprocess_with_inputs_claimed(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        asr_backend: Box<dyn minutist_common::AsrBackend + Send>,
+        turns: Vec<SpeakerTurn>,
+        split_backend: Option<Box<dyn minutist_common::AsrBackend + Send>>,
+        config: diarizer::DiarizerConfig,
+    ) -> AppResult<()> {
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        // (a) Re-transcribe FIRST via the stub backend (no finalise).
+        let segments = self
+            .re_transcribe_segments_with_backend(meeting_id, &meeting_dir, asr_backend)
+            .await?;
+
+        // (b) Persist the fresh transcript so the diarize funnel reads it.
+        let meeting_dir_for_write = meeting_dir.clone();
+        tokio::task::spawn_blocking(move || -> AppResult<()> {
+            persistence::write_transcript(&meeting_dir_for_write, &segments)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("reprocess_with_inputs transcript write join failed: {e}"),
+        })??;
+
+        // (c) Diarize/split/merge over the fresh transcript, finalise ONCE.
+        self.rediarize_inner(
+            index,
+            meeting_id,
+            DiarizationJob::Stub {
+                turns,
+                backend: split_backend,
+                config,
+            },
+        )
+        .await
     }
 
     /// Borrow the orchestrator's `SettingsHandle` so a test can flip a setting

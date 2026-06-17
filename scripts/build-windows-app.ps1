@@ -80,6 +80,17 @@ $null = & "$vsPath\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -SkipAutomat
 $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -ne '' } | Select-Object -Unique) -join ';'
 Write-Host ("==> PATH length after dedup: " + $env:PATH.Length)
 
+# Build under a short target dir. The Vulkan feature build's llama-cpp-sys-2
+# nested ExternalProject (vulkan-shaders-gen) runs a CMake compiler-detection
+# try_compile; CMake 3.31's CMakeScratch\TryCompile-<id>\CMakeFiles\cmTC_<id>.dir
+# scratch layout, under the already-deep target\release\build\<pkg>-<hash>\out\
+# build\ggml\src\ggml-vulkan\... tree, pushes the generated manifest.rc path past
+# rc.exe's 260-char MAX_PATH (rc.exe does not honour the LongPathsEnabled opt-in)
+# and fails with "RC2136: missing '=' in EXSTYLE". A short root keeps every path
+# well under 260. Set for both builds so the CPU and feature caches share it.
+$env:CARGO_TARGET_DIR = 'C:\mt'
+Write-Host "==> CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR (short path; avoids rc.exe MAX_PATH in nested CMake)"
+
 Set-Location $build
 
 # GPU/feature builds: use the Ninja generator. llama.cpp's vulkan-shaders-gen
@@ -124,7 +135,7 @@ $ErrorActionPreference = 'Stop'
 Write-Host "==> cargo build exit $code"
 if ($code -ne 0) { exit $code }
 
-$rel = "$build\target\release"
+$rel = "$env:CARGO_TARGET_DIR\release"
 $exe = "$rel\minutist.exe"
 if (-not (Test-Path $exe)) { throw "build succeeded but $exe is missing" }
 

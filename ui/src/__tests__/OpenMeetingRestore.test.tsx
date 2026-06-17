@@ -70,8 +70,7 @@ vi.mock("../ipc/meetings", () => ({
   openMeeting: vi.fn(),
   renameMeeting: vi.fn(),
   deleteMeeting: vi.fn(),
-  reTranscribe: vi.fn(),
-  rediarize: vi.fn(),
+  reprocess: vi.fn(),
 }));
 
 import { MainWindow } from "../shell/MainWindow";

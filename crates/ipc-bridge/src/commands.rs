@@ -230,23 +230,24 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
     // visible, so any heavy passes run OFF the stop path (a slow/hung pass can
     // never wedge stop or hide the meeting). Up to two passes run, in order, in
     // one fire-and-forget task:
-    //   1. Re-transcribe (FR — ASR repair): if the live transcript fell behind
-    //      (drop-oldest loss during recording, or a stop-drain timeout), re-run
-    //      ASR over the COMPLETE `audio.opus` — the authoritative transcript,
-    //      since the audio is captured in full regardless of live-ASR speed.
-    //   2. Diarize (FR-11): if enabled, run AFTER any re-transcribe so it labels
-    //      the repaired transcript (`rediarize` carries its own length-relative
-    //      timeout). Emits `AppEvent::DiarizationComplete` when done.
-    // Both claim the offline slot internally and run sequentially; errors are
-    // logged (the recording is safely on disk). NOTE: `take_transcript_incomplete`
-    // is consumed here, so a re-transcribe that fails or is skipped (recorder
-    // busy with another op) is NOT auto-retried — the user-triggered re-transcribe
-    // action is the recovery path. (Only the meeting INDEX self-heals, via
+    //   1. Reprocess (FR — ASR repair + FR-11 diarize): pushed when the live
+    //      transcript fell behind (drop-oldest loss during recording, or a
+    //      stop-drain timeout) OR diarization is enabled. `Orchestrator::reprocess`
+    //      takes ONE offline claim and re-runs ASR over the COMPLETE `audio.opus`
+    //      — the authoritative transcript, since the audio is captured in full
+    //      regardless of live-ASR speed — then (when diarization is on) diarizes
+    //      the repaired transcript and emits `AppEvent::DiarizationComplete`. It
+    //      carries its own length-relative timeout budget for the whole pass.
+    // The reprocess pass claims the offline slot internally; errors are logged
+    // (the recording is safely on disk). NOTE: `take_transcript_incomplete`
+    // is consumed here, so a reprocess that fails or is skipped (recorder busy
+    // with another op) is NOT auto-retried — the user-triggered reprocess action
+    // is the recovery path. (Only the meeting INDEX self-heals, via
     // `reconcile_orphans` on `list_meetings`.)
     //
     //   3. Auto-summarise (#68): if `settings.auto_summarise_on_stop` is on (the
-    //      default), run AFTER any re-transcribe / re-diarize so it summarises the
-    //      FINAL transcript. Uses the held-summariser path ([`run_held_summarise`])
+    //      default), run AFTER any reprocess so it summarises the FINAL
+    //      transcript. Uses the held-summariser path ([`run_held_summarise`])
     //      and emits the determinate `OperationProgress` + `SummaryReady` events,
     //      exactly like the user-triggered `summarise_meeting`. Best-effort: an
     //      error is logged, the recording is on disk regardless.
@@ -271,17 +272,16 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
                 let handles = handles.clone();
                 async move {
                     match pass {
-                        PostStopPass::ReTranscribe => {
-                            orchestrator.re_transcribe(&index, meeting_id).await
+                        PostStopPass::Reprocess => {
+                            orchestrator.reprocess(&index, meeting_id).await
                         }
-                        PostStopPass::Rediarize => orchestrator.rediarize(&index, meeting_id).await,
                         // Map the held-summarise `IpcError` back to `AppError` for
                         // the shared per-pass error logging; the markdown result is
                         // discarded (the summary is persisted + `SummaryReady`
                         // emitted inside `run_held_summarise`).
                         //
-                        // Unlike re-transcribe / re-diarize, this pass does NOT take
-                        // the orchestrator's offline claim, so it cannot self-skip
+                        // Unlike reprocess, this pass does NOT take the
+                        // orchestrator's offline claim, so it cannot self-skip
                         // when a new recording preempts the slot. Gate it explicitly:
                         // if the user has started the next meeting, defer this
                         // meeting's auto-summarise (recoverable via the manual
@@ -313,33 +313,33 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
 /// A background pass `stop_recording` may run after a stop, off the stop path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PostStopPass {
-    /// Re-run ASR over the complete `audio.opus` (the live transcript fell behind).
-    ReTranscribe,
-    /// Run speaker diarization (`settings.diarization_enabled`).
-    Rediarize,
+    /// Re-run ASR over the complete `audio.opus` (the live transcript fell
+    /// behind) and/or diarize, under one offline claim. Pushed when the live
+    /// transcript is incomplete OR diarization is enabled; the merged
+    /// `Orchestrator::reprocess` re-transcribes then diarizes the repaired
+    /// transcript in a single pass.
+    Reprocess,
     /// Auto-summarise the meeting (`settings.auto_summarise_on_stop`, #68). Runs
-    /// LAST so it summarises the final (re-transcribed + re-diarized) transcript.
+    /// LAST so it summarises the final (reprocessed) transcript.
     Summarise,
 }
 
 /// The ordered post-stop passes to run, derived from the three gating flags.
 ///
-/// Re-transcribe always precedes diarize so diarization labels the **repaired**
-/// transcript rather than a truncated one; auto-summarise (#68) runs LAST so it
-/// summarises the final transcript after any re-transcribe / re-diarize. An empty
-/// result means no background task is spawned. Pure + unit-tested so the
-/// gating/ordering is verified without a Tauri runtime.
+/// A single `Reprocess` pass is pushed when the transcript needs repair OR
+/// diarization is enabled — `Orchestrator::reprocess` re-transcribes first so
+/// diarization labels the **repaired** transcript rather than a truncated one.
+/// Auto-summarise (#68) runs LAST so it summarises the final transcript after
+/// any reprocess. An empty result means no background task is spawned. Pure +
+/// unit-tested so the gating/ordering is verified without a Tauri runtime.
 fn post_stop_passes(
     needs_retranscribe: bool,
     needs_diarize: bool,
     needs_summarise: bool,
 ) -> Vec<PostStopPass> {
-    let mut passes = Vec::with_capacity(3);
-    if needs_retranscribe {
-        passes.push(PostStopPass::ReTranscribe);
-    }
-    if needs_diarize {
-        passes.push(PostStopPass::Rediarize);
+    let mut passes = Vec::with_capacity(2);
+    if needs_retranscribe || needs_diarize {
+        passes.push(PostStopPass::Reprocess);
     }
     if needs_summarise {
         passes.push(PostStopPass::Summarise);
@@ -352,10 +352,10 @@ fn post_stop_passes(
 /// Each pass's error is caught and logged — `AppError::InvalidInput` (the offline
 /// slot is held by another op, e.g. the user started a new recording) at info as
 /// a skip, anything else at warn — and **never aborts the remaining passes**: the
-/// recording is already safely persisted, so a failed re-transcribe must not
-/// prevent the diarize pass (or vice versa). `run_pass` is a closure (rather than
-/// a direct `Orchestrator` call) so a stub can drive the gating/ordering/error
-/// tolerance in tests without models or audio.
+/// recording is already safely persisted, so a failed reprocess must not prevent
+/// the auto-summarise pass. `run_pass` is a closure (rather than a direct
+/// `Orchestrator` call) so a stub can drive the gating/ordering/error tolerance
+/// in tests without models or audio.
 async fn run_post_stop_passes<F, Fut>(
     passes: &[PostStopPass],
     meeting_id: MeetingId,
@@ -368,26 +368,16 @@ async fn run_post_stop_passes<F, Fut>(
         if let Err(e) = run_pass(pass).await {
             let busy = matches!(e, AppError::InvalidInput { .. });
             match (pass, busy) {
-                (PostStopPass::ReTranscribe, true) => tracing::info!(
+                (PostStopPass::Reprocess, true) => tracing::info!(
                     target: "ipc-bridge",
                     meeting_id = %meeting_id.0,
-                    "background re-transcribe skipped: recorder busy with another op"
+                    "background reprocess skipped: recorder busy with another op"
                 ),
-                (PostStopPass::ReTranscribe, false) => tracing::warn!(
+                (PostStopPass::Reprocess, false) => tracing::warn!(
                     target: "ipc-bridge",
                     meeting_id = %meeting_id.0,
-                    "background re-transcribe after stop failed: {e}; keeping the live \
-                     transcript (not auto-retried — use the re-transcribe action)"
-                ),
-                (PostStopPass::Rediarize, true) => tracing::info!(
-                    target: "ipc-bridge",
-                    meeting_id = %meeting_id.0,
-                    "background diarization skipped: recorder busy with another op"
-                ),
-                (PostStopPass::Rediarize, false) => tracing::warn!(
-                    target: "ipc-bridge",
-                    meeting_id = %meeting_id.0,
-                    "background on-stop diarization failed: {e}; meeting left un-diarized"
+                    "background reprocess after stop failed: {e}; keeping the live \
+                     transcript (not auto-retried — use the reprocess action)"
                 ),
                 // #68 — auto-summarise is best-effort: a failure (model load, an
                 // empty/unsummarisable transcript, etc.) leaves the meeting without
@@ -832,54 +822,36 @@ pub async fn delete_meeting(
         .map_err(IpcError::from)
 }
 
-/// Re-run transcription for a meeting offline (FR-33 action).
+/// Reprocess a meeting offline (FR-33 + FR-11 action): re-transcribe THEN
+/// re-diarize under a single offline claim.
 ///
-/// Routes to `Orchestrator::re_transcribe`, which decodes the meeting audio and
-/// drives the same batched-VAD + ASR pipeline the live recorder uses, rewrites
-/// `transcript.json`, refreshes the index row, and emits
-/// `AppEvent::TranscriptSegment` events. Refused while a recording is in
-/// progress (the orchestrator returns `AppError::InvalidInput`). The index
-/// handle is shared from `IpcState` so the orchestrator need not own one.
+/// Routes to `Orchestrator::reprocess`, which takes ONE `claim_offline`, re-runs
+/// the live ASR pipeline over the complete `audio.opus` (rewriting the
+/// transcript), then diarizes/splits/merges over that FRESH transcript and
+/// finalises ONCE — rewriting `transcript.json` with overlaid `speaker_id`s,
+/// updating `metadata.json`'s `{ speaker_count, diarizer }`, refreshing the
+/// index row, and emitting the same `AppEvent::TranscriptSegment` +
+/// `AppEvent::DiarizationComplete` events the two former passes emitted (the
+/// `DiarizationComplete` is emitted by the **orchestrator**, on the shared bus
+/// the forwarder subscribes to). The re-diarize step clears
+/// `metadata.json`'s `speaker_names` (re-lettering can change who each label
+/// is), so any user-assigned speaker names are reset.
+///
+/// Refused while a recording is in progress (the orchestrator returns
+/// `AppError::InvalidInput`). The `model-registry` edge stays inside the
+/// orchestrator (both the ASR backend and the diarizer are built there) — there
+/// is **no** `ipc-bridge → diarizer` Cargo edge; `ipc-bridge` routes via the
+/// orchestrator. The shared `IpcState::index` handle is passed into the call so
+/// the orchestrator refreshes the index row without owning one.
 #[tauri::command]
 #[specta::specta]
-pub async fn re_transcribe(
+pub async fn reprocess(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
     state
         .orchestrator
-        .re_transcribe(&state.index, meeting_id)
-        .await
-        .map_err(IpcError::from)
-}
-
-/// Re-run speaker diarization for a meeting offline (Phase 6, FR-11 action).
-///
-/// Routes to `Orchestrator::rediarize`, which decodes the meeting's
-/// pause-INCLUDING PCM, runs the bundled `SherpaDiarizer` over the stored
-/// transcript segments (resolving both diarize model directories via
-/// `model-registry`), rewrites `transcript.json` with the overlaid
-/// `speaker_id`s, updates `metadata.json`'s `{ speaker_count, diarizer }`,
-/// refreshes the index row's `speaker_count`, and emits
-/// `AppEvent::DiarizationComplete { meeting_id, speaker_count }` — the event is
-/// emitted by the **orchestrator** (not here), on the shared bus the forwarder
-/// subscribes to. Refused while a recording is in progress (the orchestrator
-/// returns `AppError::InvalidInput`).
-///
-/// The `model-registry` edge stays inside the orchestrator (the diarizer is
-/// built there) — there is **no** `ipc-bridge → diarizer` Cargo edge;
-/// `ipc-bridge` routes via the orchestrator. The shared `IpcState::index` handle
-/// is passed into the call so the orchestrator refreshes the index row without
-/// owning an index of its own.
-#[tauri::command]
-#[specta::specta]
-pub async fn rediarize_meeting(
-    meeting_id: MeetingId,
-    state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
-    state
-        .orchestrator
-        .rediarize(&state.index, meeting_id)
+        .reprocess(&state.index, meeting_id)
         .await
         .map_err(IpcError::from)
 }
@@ -2066,8 +2038,8 @@ pub(crate) async fn persist_session(
 /// (`mcp_tool_descriptors_gated` / `mcp_call_allowed`):
 /// - `None` — the internal UI chat: the full registry tool set, no gate.
 /// - `Some(allow_writes)` — the Phase-10 inter-agent bridge: the model sees ONLY
-///   the gated descriptors (so destructive ops like `retranscribe_meeting` /
-///   `rediarize_meeting` are never offered), AND a non-allowed tool requested
+///   the gated descriptors (so destructive ops like `reprocess_meeting` are never
+///   offered), AND a non-allowed tool requested
 ///   anyway is rejected before dispatch as defence in depth — mirroring the
 ///   direct MCP `tools/call` path so a bridged external caller gets NO broader a
 ///   write surface than a direct MCP call under the same `mcp_write_tools`.
@@ -3088,19 +3060,26 @@ mod tests {
     // by a recording closure that injects per-pass results.
     // -----------------------------------------------------------------------
 
-    /// Gating + ordering: no flags → no passes; each flag adds its pass; all →
-    /// re-transcribe BEFORE diarize BEFORE summarise (so diarize labels the
-    /// repaired transcript and summarise sees the final, #68).
+    /// Gating + ordering: no flags → no passes; a transcript-incomplete OR a
+    /// diarize-enabled flag adds the ONE reprocess pass (the merged op
+    /// re-transcribes then diarizes internally); all → reprocess BEFORE summarise
+    /// (so summarise sees the final transcript, #68).
     #[test]
     fn post_stop_passes_gates_and_orders() {
         assert_eq!(post_stop_passes(false, false, false), vec![]);
+        // Either reprocess trigger alone collapses to the single pass.
         assert_eq!(
             post_stop_passes(true, false, false),
-            vec![PostStopPass::ReTranscribe]
+            vec![PostStopPass::Reprocess]
         );
         assert_eq!(
             post_stop_passes(false, true, false),
-            vec![PostStopPass::Rediarize]
+            vec![PostStopPass::Reprocess]
+        );
+        // Both triggers still yield exactly one reprocess pass (no duplicate).
+        assert_eq!(
+            post_stop_passes(true, true, false),
+            vec![PostStopPass::Reprocess]
         );
         assert_eq!(
             post_stop_passes(false, false, true),
@@ -3108,20 +3087,16 @@ mod tests {
         );
         assert_eq!(
             post_stop_passes(true, true, true),
-            vec![
-                PostStopPass::ReTranscribe,
-                PostStopPass::Rediarize,
-                PostStopPass::Summarise
-            ],
-            "re-transcribe → diarize → summarise (summarise sees the final transcript)"
+            vec![PostStopPass::Reprocess, PostStopPass::Summarise],
+            "reprocess → summarise (summarise sees the final transcript)"
         );
     }
 
     /// #68 — when auto-summarise is on, the plan ends with `Summarise` (after any
-    /// re-transcribe / diarize), and when off it is absent.
+    /// reprocess), and when off it is absent.
     #[test]
     fn post_stop_passes_appends_summarise_when_enabled() {
-        // Auto-summarise alone (no re-transcribe, no diarize).
+        // Auto-summarise alone (no reprocess trigger).
         assert_eq!(
             post_stop_passes(false, false, true),
             vec![PostStopPass::Summarise],
@@ -3151,8 +3126,8 @@ mod tests {
         assert!(calls.is_empty(), "no passes → run_pass never called");
     }
 
-    /// All planned passes run, in order, when each succeeds — including the #68
-    /// auto-summarise pass running LAST.
+    /// All planned passes run, in order, when each succeeds — the reprocess pass
+    /// then the #68 auto-summarise pass LAST.
     #[tokio::test]
     async fn run_post_stop_passes_runs_all_in_order() {
         let passes = post_stop_passes(true, true, true);
@@ -3164,11 +3139,7 @@ mod tests {
         .await;
         assert_eq!(
             calls,
-            vec![
-                PostStopPass::ReTranscribe,
-                PostStopPass::Rediarize,
-                PostStopPass::Summarise
-            ]
+            vec![PostStopPass::Reprocess, PostStopPass::Summarise]
         );
     }
 
@@ -3249,9 +3220,9 @@ mod tests {
         assert_eq!(summarise_calls, 0, "summarise pass must not run when disabled");
     }
 
-    /// A failed re-transcribe (InvalidInput = busy, OR any other error) is
-    /// tolerated and does NOT prevent the diarize pass from being attempted —
-    /// the recording is already safely persisted.
+    /// A failed reprocess (InvalidInput = busy, OR any other error) is tolerated
+    /// and does NOT prevent the auto-summarise pass from being attempted — the
+    /// recording is already safely persisted.
     #[tokio::test]
     async fn run_post_stop_passes_failure_does_not_abort_later_passes() {
         for first_err in [
@@ -3262,25 +3233,30 @@ mod tests {
                 context: "boom".into(),
             },
         ] {
-            let passes = post_stop_passes(true, true, false);
+            // Reprocess trigger + auto-summarise on → reprocess THEN summarise.
+            let passes = post_stop_passes(true, true, true);
+            assert_eq!(
+                passes,
+                vec![PostStopPass::Reprocess, PostStopPass::Summarise]
+            );
             let mut calls: Vec<PostStopPass> = Vec::new();
             // Move the error into the closure via an Option taken on first call.
             let mut first_err = Some(first_err);
             run_post_stop_passes(&passes, MeetingId::new(), |pass| {
                 calls.push(pass);
                 let result = match pass {
-                    PostStopPass::ReTranscribe => {
-                        Err(first_err.take().expect("one re-transcribe call"))
+                    PostStopPass::Reprocess => {
+                        Err(first_err.take().expect("one reprocess call"))
                     }
-                    PostStopPass::Rediarize | PostStopPass::Summarise => Ok(()),
+                    PostStopPass::Summarise => Ok(()),
                 };
                 async move { result }
             })
             .await;
             assert_eq!(
                 calls,
-                vec![PostStopPass::ReTranscribe, PostStopPass::Rediarize],
-                "diarize must still be attempted after a failed re-transcribe"
+                vec![PostStopPass::Reprocess, PostStopPass::Summarise],
+                "summarise must still be attempted after a failed reprocess"
             );
         }
     }

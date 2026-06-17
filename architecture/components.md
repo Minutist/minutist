@@ -1541,17 +1541,17 @@ inter-agent bridge SENDER (`mpsc::Sender<(InterAgentRequest, oneshot)>`, set via
 internal agent so it cannot message itself). The bridge uses only `common` types
 + tokio channels — no `chat-agent` edge.
 
-**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 17 base v1
+**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 20 base v1
 tools in insertion order; `ipc-bridge` passes `false` (the internal agent must
 not message itself) and `app-main` passes `true` for the MCP registry instance,
-which APPENDS `send_to_internal_agent` (18 tools). `descriptors()` /
+which APPENDS `send_to_internal_agent` (21 tools). `descriptors()` /
 `mcp_tool_descriptors()` are pure name/description/schema projections (single
 source of truth); `mcp_tool_descriptors()` honours `expose_over_mcp()`.
 **`mcp_tool_descriptors_gated(allow_writes)`** (Phase 10) composes the
 `mcp_write_tools` setting (D3) on TOP of `expose_over_mcp()`: with it off, write
 tools are dropped (reads + the inter-agent tool only); with it on, the reversible
-writes join; `retranscribe`/`rediarize` are never `expose_over_mcp` and so never
-appear regardless. `mcp_call_allowed(name, allow_writes)` mirrors that gate on
+writes join; `reprocess_meeting` is never `expose_over_mcp` and so never
+appears regardless. `mcp_call_allowed(name, allow_writes)` mirrors that gate on
 `tools/call` (defence in depth). `dispatch(ctx, name, args)` is the one routing
 path: unknown name → `InvalidInput`; shallow arg-shape validation → `InvalidInput`;
 then `execute`.
@@ -1561,8 +1561,10 @@ then `execute`.
 `get_metadata`, `get_recording_state`, `search_within_transcript`,
 `relisten_section`, `resummarise`, `speaker_talk_time`. Writes:
 `set_speaker_name`, `rename_meeting` (both MCP-allowlisted — reversible, low
-blast radius), `retranscribe_meeting`, `rediarize_meeting` (internal-only — heavy;
-holding the offline claim via MCP would block the user's ability to record).
+blast radius), `reprocess_meeting` (internal-only — heavy; re-transcribes then
+re-diarizes under one claim; #0015 merged the former `retranscribe_meeting` +
+`rediarize_meeting`; holding the offline claim via MCP would block the user's
+ability to record).
 Record-control writes (#62): `start_recording` (optional `device_id`, returns the
 new `MeetingId`), `stop_recording` (returns the finished meeting's id + title +
 duration), `pause_recording`, `resume_recording` — each dispatches to the
@@ -1582,10 +1584,11 @@ message to the internal chat agent over the bridge channel and returns its reply
 `MeetingMeta.speaker_names` map at read time, rewriting a segment's `speaker_id`
 label (`"A"`) to its display name (`"Alice"`) where one is set. Presentation-only
 — the on-disk transcript is never mutated. `set_speaker_name` writes the map via
-`persistence::write_metadata`; `rediarize_meeting` resets it (orchestrator §4.4).
+`persistence::write_metadata`; `reprocess_meeting` resets it in its diarize phase
+(orchestrator §4.4).
 
 **Write serialization (§4).** `persistence` stays the sole writer under
-`meetings/`. `retranscribe_meeting`/`rediarize_meeting` inherit the orchestrator's
+`meetings/`. `reprocess_meeting` inherits the orchestrator's
 offline claim for free (`InvalidInput` when busy). `set_speaker_name` and
 `rename_meeting` are read-modify-writes of `metadata.json` that bypass that
 claim, so they take a `ToolContext`-owned **per-meeting async mutex** across the
@@ -2044,36 +2047,36 @@ the index: the index handle lives in `ipc-bridge` (`IpcState`), so the upsert
 lives at the command boundary, not in the orchestrator.
 
 **Decoupled background post-processing + self-healing list (drift + truncation
-fix).** After the upsert, `stop_recording` runs up to three heavy passes OFF the
+fix).** After the upsert, `stop_recording` runs up to two heavy passes OFF the
 stop path, in order, in one fire-and-forget `tokio::spawn` (cloned
 `Arc<Orchestrator>` + `Arc<MeetingIndex>` + a `ChatHandles` for the held
-summariser), so none can wedge the stop response or hide the meeting: (1) if
-`orchestrator.take_transcript_incomplete()`
+summariser), so none can wedge the stop response or hide the meeting: (1) a
+single `reprocess` pass is pushed when `orchestrator.take_transcript_incomplete()`
 is true — the live ASR dropped audio (drop-oldest flush queue) or its stop-drain
-timed out — `re_transcribe` re-runs ASR over the complete `audio.opus`, the
-authoritative transcript (the audio is captured in full regardless of live-ASR
-speed); (2) if `orchestrator.diarization_enabled()`, `rediarize` runs AFTER any
-re-transcribe so it labels the repaired transcript — each with its own
-length-relative timeout (`retranscribe_timeout` / `diarize_timeout`); (3) if
+timed out — OR `orchestrator.diarization_enabled()` is set. `Orchestrator::reprocess`
+takes ONE offline claim and re-runs ASR over the complete `audio.opus` (the
+authoritative transcript, since the audio is captured in full regardless of
+live-ASR speed), then (when diarization is on) diarizes the repaired transcript
+in the same pass, under one length-relative timeout budget; (2) if
 `settings.auto_summarise_on_stop` (default `true`, #68), `run_held_summarise`
-auto-summarises the meeting AFTER any re-transcribe / re-diarize so the summary is
+auto-summarises the meeting AFTER the reprocess so the summary is
 generated from the FINAL transcript, emitting the determinate
 `OperationProgress { op: Summarise }` + `SummaryReady` exactly as the
 user-triggered `summarise_meeting` does (the summarise body is shared — both call
 `run_held_summarise`, which resolves the held `LlamaSummariser`, runs the heavy
 `summarise_with_progress` on `spawn_blocking`, refreshes the index excerpt, and
-emits `SummaryReady`). Passes (1)/(2) refresh the index row and emit their events
-on completion (`TranscriptReady` / `DiarizationComplete`); all passes are
+emits `SummaryReady`). The reprocess pass refreshes the index row and emits its
+events on completion (`TranscriptReady` / `DiarizationComplete`); both passes are
 best-effort (errors logged, claim-skips logged at info — auto-summarise leaves the
 meeting without a summary on failure, recoverable via the Summarise action). While
-a re-transcribe / re-diarize pass holds the offline claim the recorder reports the
+the reprocess pass holds the offline claim the recorder reports the
 public **`Idle`** state (`Offline → Idle` in `as_public`), so the transport leaves
 Start ENABLED: a `start` here PREEMPTS the pass (`transition_start` accepts `Idle |
 Offline`) rather than being refused, because the next meeting is a different
 `transcript.json` and the user must never be blocked from recording it. The
 preempted pass finishes on its thread (writing the old meeting's files) and its
 release is a no-op (preemption-safe `transition_offline_release`); the remaining
-chain passes self-skip — re-transcribe/re-diarize because a fresh claim now fails
+chain self-skips — reprocess because a fresh claim now fails
 against `Recording`, auto-summarise (which takes no claim) because it checks
 `recorder_is_live()`. And because a derived cache can always drift from
 disk, `list_meetings` first calls
@@ -2130,11 +2133,14 @@ regenerated.
   updated map so the webview re-renders the transcript overlay without a
   reload. The same write is also reachable as the `set_speaker_name` agent
   tool; this is its direct UI path. Label + name capped at 512 chars.
-- `re_transcribe(meeting_id) -> ()` — the **only** Phase-4 read/action command
-  that routes through the orchestrator (`Orchestrator::re_transcribe`): an
-  offline re-run of the live ASR pipeline (see `orchestrator` below). The shared
-  `IpcState::index` handle is passed into the call so the orchestrator refreshes
-  the index row without owning an index of its own.
+- `reprocess(meeting_id) -> ()` — the **only** read/action command that routes
+  through the orchestrator (`Orchestrator::reprocess`): an offline re-run of the
+  live ASR pipeline FOLLOWED BY re-diarization, under one offline claim (#0015
+  merged the former Phase-4 `re_transcribe` + Phase-6 `rediarize_meeting`
+  commands into this one — see `orchestrator` below). The re-diarize step clears
+  `metadata.json`'s `speaker_names`. The shared `IpcState::index` handle is
+  passed into the call so the orchestrator refreshes the index row without owning
+  an index of its own.
 - `re_summarise(meeting_id) -> ()` — **a Phase-4 stub, removed in Phase 5.**
   It returned `AppError::Unsupported` as a placeholder until the `summariser`
   landed. Phase 5 replaced it with `summarise_meeting` (below); the meeting-list
@@ -2201,19 +2207,18 @@ through `Orchestrator` at runtime, so there is no production `model-registry`
 edge in the dependency table above (mirroring `orchestrator`'s test-only
 dev-dependencies).
 
-**Phase 6 addition (21 commands total) — re-diarize (FR-11).** One command lands:
-
-- `rediarize_meeting(meeting_id) -> ()` — routes to `Orchestrator::rediarize`
-  (the offline re-diarize): decode → `SherpaDiarizer::assign_speakers` →
-  `transcript.json` rewrite with `speaker_id`s → `metadata.json` `speaker_count`
-  update → index-row refresh → `AppEvent::DiarizationComplete`. The shared
-  `IpcState::index` handle is passed into the call so the orchestrator refreshes
-  the index row without owning one. The diarizer is built **inside the
-  orchestrator** (which holds the granted `orchestrator → diarizer` edge and
-  resolves the diarize models via `model-registry`), so there is **no**
-  `ipc-bridge → diarizer` Cargo edge — `ipc-bridge` routes via the orchestrator,
-  mirroring how the ASR/summariser model-registry edges stay out of `ipc-bridge`.
-  `AppEvent::DiarizationComplete` is emitted by the **orchestrator**, not here.
+**Phase 6 — re-diarize (FR-11).** Phase 6 originally added a separate
+`rediarize_meeting(meeting_id) -> ()` command. #0015 merged it (and the Phase-4
+`re_transcribe`) into the single `reprocess` command above: re-diarization is the
+second phase of `Orchestrator::reprocess`, running `SherpaDiarizer` over the
+fresh transcript → `transcript.json` rewrite with `speaker_id`s →
+`metadata.json` `{ speaker_count, diarizer }` update + `speaker_names` clear →
+index-row refresh → `AppEvent::DiarizationComplete`. The diarizer is built
+**inside the orchestrator** (which holds the granted `orchestrator → diarizer`
+edge and resolves the diarize models via `model-registry`), so there is **no**
+`ipc-bridge → diarizer` Cargo edge — `ipc-bridge` routes via the orchestrator,
+mirroring how the ASR/summariser model-registry edges stay out of `ipc-bridge`.
+`AppEvent::DiarizationComplete` is emitted by the **orchestrator**, not here.
 
 **Phase 9 additions (25 commands total) — the chat agent + the held model.**
 Four commands land, realising the granted `ipc-bridge → agent-tools` +
@@ -2698,16 +2703,16 @@ left, transcript right).
   store) that picks the live vs. saved-meeting transcript for the panes (U1).
 - **IPC seam (`ui/src/ipc/meetings.ts`).** A thin client (mirroring the Phase-3
   `notes.ts`) over the shim-aware `commands` from `./client` — NOT raw
-  `./bindings` — for the six Phase-4 commands (`list_meetings`, `open_meeting`,
-  `rename_meeting`, `delete_meeting`, `re_transcribe`, `re_summarise`). These
+  `./bindings` — for the meeting-list/open commands (`list_meetings`,
+  `open_meeting`, `rename_meeting`, `delete_meeting`, `reprocess`). These
   commands are generated into `bindings.ts` (the `ipc-bridge`/orchestrator JOIN
   added them and regenerated), so `client.ts` routes them uniformly through
   `callCommand` like every other command — the earlier "pending generation"
   raw-`TAURI_INVOKE` shim path was collapsed once the bindings regenerated. The
   DEV shim (`dev-shim.ts`) supplies sample meetings + an opened-meeting payload
-  so the list and an open meeting render under `vite dev`. `re_transcribe`
-  reuses `AppEvent::TranscriptSegment`; `re_summarise` reuses
-  `AppEvent::SummaryReady`.
+  so the list and an open meeting render under `vite dev`. `reprocess`
+  reuses `AppEvent::TranscriptSegment` + `AppEvent::DiarizationComplete` (#0015
+  merged the former `re_transcribe` + `rediarize_meeting` seams).
 
 **Phase 5 additions (Stream S4 — summary view).**
 
@@ -2798,23 +2803,22 @@ left, transcript right).
   `SettingsWithDiarization` only as a named alias of `Settings` so existing call
   sites and tests need no change. It gates the orchestrator's on-stop
   diarization pass; re-diarize is independent of it.
-- **Re-diarize action + IPC seam (`ui/src/ipc/meetings.ts::rediarize` +
-  `MeetingList.tsx` row action + `MainWindow.tsx` open-meeting workspace menu).**
-  `rediarize(meeting_id)` calls the generated `rediarizeMeeting` command, which
-  is present on the generated `commands` surface and routes through `callCommand`
-  in `ui/src/ipc/client.ts` like every other command (the earlier shim-aware
-  `callPendingCommand` raw-`invoke` path was collapsed — A9 — and survives only
-  in past-tense comments). The DEV shim (`dev-shim.ts`) supplies sample
-  speaker-tagged transcript segments, a `rediarize_meeting` handler, and a
-  `diarization_complete` fan-out so the chips and re-read render under
-  `vite dev`. Tests mock the `../ipc/meetings` seam. The command is the
-  snake-case `rediarize_meeting(meeting_id: MeetingId) -> ()` (camelCase
-  `rediarizeMeeting` on the generated surface); it decodes the meeting's
-  pause-INCLUDING PCM, runs the `SherpaDiarizer` over the stored segments,
-  rewrites `transcript.json` with the overlaid `speaker_id`s, refreshes the
-  index row's `speaker_count`, emits
-  `AppEvent::DiarizationComplete { meeting_id, speaker_count }`, and (like
-  `re_transcribe`) refuses unless the recorder is `Idle`.
+- **Reprocess action + IPC seam (`ui/src/ipc/meetings.ts::reprocess` +
+  `TranscriptPane.tsx` toolbar action).** #0015 merged the former re-transcribe +
+  re-diarize UI actions into one Reprocess control. `reprocess(meeting_id)` calls
+  the generated `reprocess` command, which is present on the generated `commands`
+  surface and routes through `callCommand` in `ui/src/ipc/client.ts` like every
+  other command. The DEV shim (`dev-shim.ts`) supplies sample speaker-tagged
+  transcript segments, a `reprocess` handler, and a `diarization_complete`
+  fan-out so the chips and re-read render under `vite dev`. Tests mock the
+  `../ipc/meetings` seam. The command is the snake-case
+  `reprocess(meeting_id: MeetingId) -> ()` (camelCase `reprocess` on the
+  generated surface); it re-runs ASR over the complete `audio.opus`, then runs
+  the `SherpaDiarizer` over the fresh segments, rewrites `transcript.json` with
+  the overlaid `speaker_id`s, clears `speaker_names`, refreshes the index row's
+  `speaker_count`, emits
+  `AppEvent::TranscriptSegment` + `AppEvent::DiarizationComplete { meeting_id, speaker_count }`,
+  and refuses unless the recorder is `Idle`.
 
 **Phase 7 additions (first-run onboarding gate).** `App.tsx` is the gate point:
 it fetches `settings` (via the recording store's `refreshSettings`) + the model
@@ -2983,7 +2987,7 @@ A warm-paper, document-centric **light** theme applied across the webview.
   from `OutputLanguagePicker`); a Translate button (disabled while any op is
   in-flight, label changes to "Translating…" during the pass); a "Show original"
   button that replaces the selector + Translate pair once a translated view is
-  active. A thin `transcript-pane__toolbar-sep` rule divides the reprocess actions
+  active. A thin `transcript-pane__toolbar-sep` rule divides the Reprocess action
   from the translation controls.
 - **Per-segment overlay (updated in `TranscriptPane.tsx`).** When
   `selectedLanguage !== null`, each row renders the translated text from the

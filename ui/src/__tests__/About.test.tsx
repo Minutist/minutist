@@ -56,8 +56,7 @@ vi.mock("../ipc/meetings", () => ({
   openMeeting: vi.fn(),
   renameMeeting: vi.fn().mockResolvedValue(undefined),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
-  reTranscribe: vi.fn().mockResolvedValue(undefined),
-  rediarize: vi.fn().mockResolvedValue(undefined),
+  reprocess: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("../ipc/notes", () => ({
   saveNotes: vi.fn().mockResolvedValue(undefined),

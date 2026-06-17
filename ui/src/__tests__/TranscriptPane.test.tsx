@@ -31,8 +31,7 @@ vi.mock("../ipc/meetings", () => ({
   openMeeting: vi.fn(),
   renameMeeting: vi.fn(),
   deleteMeeting: vi.fn(),
-  reTranscribe: vi.fn().mockResolvedValue(undefined),
-  rediarize: vi.fn().mockResolvedValue(undefined),
+  reprocess: vi.fn().mockResolvedValue(undefined),
   setSpeakerName: vi.fn().mockResolvedValue({}),
 }));
 
@@ -340,8 +339,10 @@ describe("TranscriptPane cross-reference interactions", () => {
 });
 
 // ---------------------------------------------------------------------------
-// #67 — Re-transcribe / Re-identify-speakers action toolbar at the top of the
-// transcript pane (moved out of the meeting heading).
+// #67 — the Reprocess action toolbar at the top of the transcript pane (moved
+// out of the meeting heading). #0015 merged the former Re-transcribe +
+// Re-identify-speakers actions into one Reprocess button (re-transcribe then
+// re-diarize under a single backend claim).
 // ---------------------------------------------------------------------------
 
 describe("TranscriptPane action toolbar (#67)", () => {
@@ -375,11 +376,11 @@ describe("TranscriptPane action toolbar (#67)", () => {
       screen.queryByRole("toolbar", { name: "Transcript actions" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Re-transcribe" }),
+      screen.queryByRole("button", { name: "Reprocess" }),
     ).not.toBeInTheDocument();
   });
 
-  it("shows the toolbar with both actions when a saved meeting is open + idle", () => {
+  it("shows the toolbar with the Reprocess action when a saved meeting is open + idle", () => {
     act(() => {
       useMeetingsStore.setState({
         openMeetingId: "saved-1",
@@ -391,14 +392,11 @@ describe("TranscriptPane action toolbar (#67)", () => {
       screen.getByRole("toolbar", { name: "Transcript actions" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Re-transcribe" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Re-identify speakers" }),
+      screen.getByRole("button", { name: "Reprocess" }),
     ).toBeInTheDocument();
   });
 
-  it("Re-transcribe / Re-identify-speakers invoke their meetings-store seams with the open meeting id", () => {
+  it("Reprocess invokes the meetings-store reprocess seam with the open meeting id", () => {
     act(() => {
       useMeetingsStore.setState({
         openMeetingId: "saved-2",
@@ -408,25 +406,18 @@ describe("TranscriptPane action toolbar (#67)", () => {
     render(<TranscriptPane />);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Re-transcribe" }));
+      fireEvent.click(screen.getByRole("button", { name: "Reprocess" }));
     });
-    expect(meetingsIpc.reTranscribe).toHaveBeenCalledWith("saved-2");
-
-    act(() => {
-      fireEvent.click(
-        screen.getByRole("button", { name: "Re-identify speakers" }),
-      );
-    });
-    expect(meetingsIpc.rediarize).toHaveBeenCalledWith("saved-2");
+    expect(meetingsIpc.reprocess).toHaveBeenCalledWith("saved-2");
   });
 
-  it("disables a reprocess action while its own op is in flight for the open meeting", () => {
+  it("disables Reprocess and shows the in-flight label while the re-transcribe phase runs", () => {
     act(() => {
       useMeetingsStore.setState({
         openMeetingId: "saved-3",
         openMeetingState: { transcript: [] } as unknown as MeetingState,
       });
-      // A re-transcribe is in flight for the open meeting.
+      // The reprocess op surfaces progress under its re-transcribe phase.
       useOperationProgressStore.setState({
         operations: {
           "saved-3": {
@@ -438,13 +429,35 @@ describe("TranscriptPane action toolbar (#67)", () => {
       });
     });
     render(<TranscriptPane />);
+    const button = screen.getByRole("button", { name: "Reprocessing…" });
+    expect(button).toBeDisabled();
     expect(
-      screen.getByRole("button", { name: "Re-transcribe" }),
+      screen.queryByRole("button", { name: "Reprocess" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("disables Reprocess while the re-diarize phase of the same op runs", () => {
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "saved-4",
+        openMeetingState: { transcript: [] } as unknown as MeetingState,
+      });
+      // The merged op surfaces progress under its re-diarize phase too; the
+      // button must stay disabled for either phase.
+      useOperationProgressStore.setState({
+        operations: {
+          "saved-4": {
+            op: "rediarize",
+            fraction: null,
+            label: "Identifying speakers…",
+          },
+        },
+      });
+    });
+    render(<TranscriptPane />);
+    expect(
+      screen.getByRole("button", { name: "Reprocessing…" }),
     ).toBeDisabled();
-    // The other action is unaffected (its op is not in flight).
-    expect(
-      screen.getByRole("button", { name: "Re-identify speakers" }),
-    ).not.toBeDisabled();
   });
 });
 

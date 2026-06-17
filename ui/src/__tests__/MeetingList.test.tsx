@@ -26,8 +26,7 @@ vi.mock("../ipc/meetings", () => ({
   openMeeting: vi.fn().mockResolvedValue({}),
   renameMeeting: vi.fn().mockResolvedValue(undefined),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
-  reTranscribe: vi.fn().mockResolvedValue(undefined),
-  rediarize: vi.fn().mockResolvedValue(undefined),
+  reprocess: vi.fn().mockResolvedValue(undefined),
 }));
 
 // The Phase-5 row Summarise action routes through the summary store, which
@@ -179,10 +178,7 @@ describe("MeetingList view (FR-33)", () => {
   it("does not surface re-processing actions on the list (open is the primary action; re-processing lives in the opened meeting)", async () => {
     await renderList();
     expect(
-      screen.queryByRole("button", { name: "Re-transcribe" }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Re-identify speakers" }),
+      screen.queryByRole("button", { name: "Reprocess" }),
     ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Summarise" }),

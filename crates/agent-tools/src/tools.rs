@@ -721,22 +721,25 @@ impl Tool for RenameMeeting {
 }
 
 // ---------------------------------------------------------------------------
-// retranscribe_meeting (WRITE — internal-only)
+// reprocess_meeting (WRITE — internal-only)
 // ---------------------------------------------------------------------------
 
-pub struct RetranscribeMeeting;
+pub struct ReprocessMeeting;
 
 #[async_trait]
-impl Tool for RetranscribeMeeting {
+impl Tool for ReprocessMeeting {
     fn name(&self) -> &'static str {
-        "retranscribe_meeting"
+        "reprocess_meeting"
     }
     fn title(&self) -> &'static str {
-        "Re-transcribe meeting"
+        "Reprocess meeting"
     }
     fn description(&self) -> &'static str {
-        "Re-run full ASR over the recording, replacing the stored transcript. \
-         Fails if a recording or another offline pass is in progress."
+        "Re-run full ASR over the recording, then re-run speaker diarization over \
+         the fresh transcript, replacing the stored transcript and speaker \
+         labels. This RESETS any configured speaker names (re-lettering can \
+         change who each label is). Fails if a recording or another offline pass \
+         is in progress."
     }
     fn input_schema(&self) -> serde_json::Value {
         meeting_id_schema()
@@ -749,47 +752,14 @@ impl Tool for RetranscribeMeeting {
     /// `false` (the `is_write` default).
     async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
         let id = resolve_meeting(ctx, &args)?;
-        // Inherits the orchestrator's offline claim: InvalidInput when busy.
-        ctx.orchestrator.re_transcribe(&ctx.index, id).await?;
-        Ok(ToolOutput::new(json!({ "ok": true }), "re-transcribed"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// rediarize_meeting (WRITE — internal-only)
-// ---------------------------------------------------------------------------
-
-pub struct RediarizeMeeting;
-
-#[async_trait]
-impl Tool for RediarizeMeeting {
-    fn name(&self) -> &'static str {
-        "rediarize_meeting"
-    }
-    fn title(&self) -> &'static str {
-        "Re-diarize meeting"
-    }
-    fn description(&self) -> &'static str {
-        "Re-run speaker diarization, re-assigning speaker labels. This RESETS any \
-         configured speaker names (re-lettering can change who each label is). \
-         Fails if a recording or another offline pass is in progress."
-    }
-    fn input_schema(&self) -> serde_json::Value {
-        meeting_id_schema()
-    }
-    fn is_write(&self) -> bool {
-        true
-    }
-    /// Internal-only (heavy; holding the offline claim via MCP would block the
-    /// user's ability to record — §4.3). `expose_over_mcp` stays `false`.
-    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
-        let id = resolve_meeting(ctx, &args)?;
-        // Inherits the orchestrator's offline claim. The rediarize path clears
-        // `speaker_names` in its metadata write (orchestrator §4.4).
-        ctx.orchestrator.rediarize(&ctx.index, id).await?;
+        // Inherits the orchestrator's offline claim: InvalidInput when busy. The
+        // reprocess path re-transcribes then re-diarizes under one claim and
+        // clears `speaker_names` in its finalise metadata write (orchestrator
+        // §4.4).
+        ctx.orchestrator.reprocess(&ctx.index, id).await?;
         Ok(ToolOutput::new(
             json!({ "ok": true }),
-            "re-diarized (speaker names reset)",
+            "reprocessed (speaker names reset)",
         ))
     }
 }

@@ -18,8 +18,7 @@ import {
   renameMeeting,
   setSpeakerName,
   deleteMeeting,
-  reTranscribe,
-  rediarize,
+  reprocess,
 } from "../ipc/meetings";
 import type { MeetingListEntry, MeetingState } from "../ipc/meetings";
 import type { MeetingId } from "../ipc/bindings";
@@ -55,10 +54,11 @@ export type MeetingsStore = {
   setSpeakerName: (label: string, name: string) => Promise<void>;
   /** Delete a meeting, then refresh the list. */
   remove: (meetingId: MeetingId) => Promise<void>;
-  /** Re-run transcription for a meeting. */
-  reTranscribe: (meetingId: MeetingId) => Promise<void>;
-  /** Re-run speaker diarization for a meeting (Phase 6). */
-  rediarize: (meetingId: MeetingId) => Promise<void>;
+  /**
+   * Reprocess a meeting (#0015): re-transcribe THEN re-diarize under one offline
+   * claim. Resets any user-assigned speaker names (the diarize step re-letters).
+   */
+  reprocess: (meetingId: MeetingId) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -148,18 +148,9 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
     }
   },
 
-  reTranscribe: async (meetingId) => {
+  reprocess: async (meetingId) => {
     try {
-      await reTranscribe(meetingId);
-      set({ lastError: null });
-    } catch (err) {
-      set({ lastError: errorMessage(err) });
-    }
-  },
-
-  rediarize: async (meetingId) => {
-    try {
-      await rediarize(meetingId);
+      await reprocess(meetingId);
       set({ lastError: null });
     } catch (err) {
       set({ lastError: errorMessage(err) });

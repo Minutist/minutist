@@ -95,11 +95,11 @@ mod tests {
     #[test]
     fn unsupported_maps_to_internal_error_with_prefix() {
         let e = app_error_to_mcp(&AppError::Unsupported {
-            context: "rediarize over MCP".into(),
+            context: "reprocess over MCP".into(),
         });
         assert_eq!(e.code, ErrorCode::INTERNAL_ERROR);
         assert!(e.message.contains("unsupported"));
-        assert!(e.message.contains("rediarize over MCP"));
+        assert!(e.message.contains("reprocess over MCP"));
     }
 
     #[test]

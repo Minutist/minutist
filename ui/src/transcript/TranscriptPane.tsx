@@ -14,16 +14,18 @@ import "./TranscriptPane.css";
 /**
  * Action toolbar at the top of the transcript pane (#67).
  *
- * Holds the two offline reprocessing actions (Re-transcribe / Re-identify
- * speakers) and the translation controls (language selector + Translate /
- * Show original button). All actions operate on the OPEN saved meeting and are
- * shown only when one is open and nothing is recording — an offline op must not
- * contend with the live pipeline (the backend refuses unless `Idle`).
+ * Holds the offline Reprocess action (one button that re-transcribes THEN
+ * re-diarizes under a single backend claim, #0015) and the translation controls
+ * (language selector + Translate / Show original button). All actions operate on
+ * the OPEN saved meeting and are shown only when one is open and nothing is
+ * recording — an offline op must not contend with the live pipeline (the backend
+ * refuses unless `Idle`).
  *
- * Each action is disabled while a recording is live OR while its own op is
+ * Each action is disabled while a recording is live OR while an offline op is
  * already in flight for the open meeting (read from the operation-progress
  * store, keyed on `meeting_id` + op), so a double-press cannot re-claim the
- * offline slot.
+ * offline slot. The merged backend op still reports two progress phases
+ * (`re_transcribe` then `rediarize`); the button treats either as "reprocessing".
  *
  * The translation controls:
  *   - A `<select>` pre-seeded to the first language in OUTPUT_LANGUAGES when
@@ -35,8 +37,7 @@ import "./TranscriptPane.css";
  */
 function TranscriptToolbar() {
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
-  const reTranscribe = useMeetingsStore((s) => s.reTranscribe);
-  const reDiarize = useMeetingsStore((s) => s.rediarize);
+  const reprocess = useMeetingsStore((s) => s.reprocess);
   const recordingState = useRecordingStore((s) => s.state);
   const operation = useOperationProgressStore((s) =>
     openMeetingId !== null ? s.operations[openMeetingId] : undefined,
@@ -57,17 +58,20 @@ function TranscriptToolbar() {
   // with the live pipeline). Render nothing otherwise.
   if (openMeetingId === null || recordingState.kind !== "idle") return null;
 
-  const retranscribeInFlight = operation?.op === "re_transcribe";
-  const rediarizeInFlight = operation?.op === "rediarize";
+  // The merged reprocess op surfaces progress under both phases the backend runs
+  // (`re_transcribe` then `rediarize`); treat either as the reprocess in flight.
+  const reprocessInFlight =
+    operation?.op === "re_transcribe" || operation?.op === "rediarize";
   const translateOpInFlight = operation?.op === "translate";
-  // Disable the Translate button if any op is in flight (the backend rejects
-  // re-transcribe / re-diarize while a translate runs and vice versa), or if
-  // the translate store already considers the call in-flight.
-  const translateDisabled =
-    translateInFlight ||
-    translateOpInFlight ||
-    retranscribeInFlight ||
-    rediarizeInFlight;
+  // Every offline op contends for the same backend claim — reprocess and
+  // translate each refuse while the other runs. Disable BOTH buttons whenever
+  // any offline op is in flight (the translate store may also consider its call
+  // in-flight before the first progress event lands). The Reprocess button shows
+  // its "Reprocessing…" label only while the reprocess op itself runs.
+  const anyOfflineOpInFlight =
+    reprocessInFlight || translateOpInFlight || translateInFlight;
+  const reprocessDisabled = anyOfflineOpInFlight;
+  const translateDisabled = anyOfflineOpInFlight;
 
   return (
     <div
@@ -78,20 +82,11 @@ function TranscriptToolbar() {
       <button
         type="button"
         className="transcript-pane__action"
-        disabled={retranscribeInFlight}
-        onClick={() => void reTranscribe(openMeetingId)}
-        title="Re-run speech recognition on this recording (rare; e.g. after changing the language or model)."
+        disabled={reprocessDisabled}
+        onClick={() => void reprocess(openMeetingId)}
+        title="Re-run speech recognition and speaker identification on this recording (rare; e.g. after changing the language or model). Resets any speaker names you have set."
       >
-        Re-transcribe
-      </button>
-      <button
-        type="button"
-        className="transcript-pane__action"
-        disabled={rediarizeInFlight}
-        onClick={() => void reDiarize(openMeetingId)}
-        title="Re-run speaker identification on this recording (rare)."
-      >
-        Re-identify speakers
+        {reprocessInFlight ? "Reprocessing…" : "Reprocess"}
       </button>
       <span className="transcript-pane__toolbar-sep" aria-hidden="true" />
       {selectedLanguage !== null ? (

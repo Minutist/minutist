@@ -1067,7 +1067,7 @@ mod tests {
     /// for EITHER `mcp_write_tools` value. This is the FIRST line of the gate
     /// (the model never sees them), mirroring the direct MCP `tools/list`.
     #[test]
-    fn bridge_gated_descriptors_never_offer_retranscribe_or_rediarize() {
+    fn bridge_gated_descriptors_never_offer_reprocess() {
         // The bridge drives an INTERNAL registry (`v1(false)`), exactly as the
         // production driver does.
         let registry = agent_tools::ToolRegistry::v1(false);
@@ -1078,12 +1078,8 @@ mod tests {
                 .map(|d| d.name)
                 .collect();
             assert!(
-                !names.contains(&"retranscribe_meeting"),
-                "retranscribe_meeting must never be offered over the bridge (allow_writes={allow_writes})"
-            );
-            assert!(
-                !names.contains(&"rediarize_meeting"),
-                "rediarize_meeting must never be offered over the bridge (allow_writes={allow_writes})"
+                !names.contains(&"reprocess_meeting"),
+                "reprocess_meeting must never be offered over the bridge (allow_writes={allow_writes})"
             );
             // A read is still offered (the bridge is otherwise functional).
             assert!(names.contains(&"get_transcript"));
@@ -1091,16 +1087,15 @@ mod tests {
     }
 
     /// End-to-end through the SAME `run_chat_turn` loop the bridge runs: even
-    /// when the (stub) model REQUESTS `retranscribe_meeting`/`rediarize_meeting`
-    /// by name, the gated dispatch (the production `commands::mcp_gate_check`
-    /// → `mcp_call_allowed` path) rejects them WITHOUT dispatching — for either
-    /// `mcp_write_tools` value (S1). This is the defence-in-depth second line of
-    /// the gate.
+    /// when the (stub) model REQUESTS `reprocess_meeting` by name, the gated
+    /// dispatch (the production `commands::mcp_gate_check` → `mcp_call_allowed`
+    /// path) rejects it WITHOUT dispatching — for either `mcp_write_tools` value
+    /// (S1). This is the defence-in-depth second line of the gate.
     #[test]
     fn bridge_turn_cannot_dispatch_destructive_tools_even_when_model_requests_them() {
-        // The two destructive ops the direct MCP path keeps unreachable, asked
-        // for one per turn, under both `mcp_write_tools` values.
-        for blocked in ["retranscribe_meeting", "rediarize_meeting"] {
+        // The destructive op the direct MCP path keeps unreachable, asked for
+        // one per turn, under both `mcp_write_tools` values.
+        for blocked in ["reprocess_meeting"] {
             for allow_writes in [false, true] {
                 let registry = agent_tools::ToolRegistry::v1(false);
                 // Step 1: the model asks for the destructive op. The gate rejects

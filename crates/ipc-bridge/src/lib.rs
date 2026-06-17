@@ -29,11 +29,10 @@
 //! | `rename_meeting` | `()` | 4 |
 //! | `set_speaker_name` | `()` | transcript speaker rename |
 //! | `delete_meeting` | `()` | 4 |
-//! | `re_transcribe` | `()` | 4 |
+//! | `reprocess` | `()` | 4/6 (re-transcribe + re-diarize, #0015) |
 //! | `summarise_meeting` | `()` | 5 |
 //! | `get_summary` | `Option<String>` | 5 |
 //! | `save_summary` | `()` | 5 |
-//! | `rediarize_meeting` | `()` | 6 |
 //! | `send_chat_message` | `ChatSessionId` | 9 |
 //! | `cancel_chat_turn` | `()` | 9 |
 //! | `get_chat_session` | `Option<ChatSession>` | 9 |
@@ -83,8 +82,8 @@
 //! The Phase-4 read/action commands route directly to `persistence`
 //! (`list_meetings` / `rename_meeting` / `delete_meeting` via the shared
 //! `IpcState::index`; `open_meeting` via `read_meeting_state`), except
-//! `re_transcribe`, which routes to `Orchestrator::re_transcribe` (offline
-//! re-run of the live ASR pipeline).
+//! `reprocess`, which routes to `Orchestrator::reprocess` (offline re-run of the
+//! live ASR pipeline followed by re-diarization, #0015).
 //!
 //! The Phase-5 summary commands (`summarise_meeting` / `get_summary` /
 //! `save_summary`) realise the granted `ipc-bridge → summariser` edge.
@@ -96,13 +95,14 @@
 //! and emits `AppEvent::SummaryReady` on `IpcState::event_tx`. `get_summary` /
 //! `save_summary` route directly to `persistence::{read_summary, write_summary}`.
 //!
-//! The Phase-6 `rediarize_meeting` command routes to `Orchestrator::rediarize`
-//! (the offline re-diarize). The diarizer is built **inside the orchestrator**
-//! (which holds the granted `orchestrator → diarizer` edge and resolves the
-//! diarize models via `model-registry`), so there is **no**
-//! `ipc-bridge → diarizer` edge — `ipc-bridge` routes via the orchestrator. The
-//! `AppEvent::DiarizationComplete` event is emitted by the **orchestrator**, not
-//! here.
+//! The `reprocess` command merges the former `re_transcribe` (Phase 4) and
+//! `rediarize_meeting` (Phase 6) commands (#0015): one `Orchestrator::reprocess`
+//! re-transcribes then re-diarizes under a single offline claim. The diarizer
+//! and the ASR backend are built **inside the orchestrator** (which holds the
+//! granted `orchestrator → diarizer` edge and resolves models via
+//! `model-registry`), so there is **no** `ipc-bridge → diarizer` edge —
+//! `ipc-bridge` routes via the orchestrator. The `AppEvent::DiarizationComplete`
+//! event is emitted by the **orchestrator**, not here.
 //!
 //! ## Specta types
 //!
@@ -549,11 +549,10 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::rename_meeting,
             commands::set_speaker_name,
             commands::delete_meeting,
-            commands::re_transcribe,
+            commands::reprocess,
             commands::summarise_meeting,
             commands::get_summary,
             commands::save_summary,
-            commands::rediarize_meeting,
             commands::send_chat_message,
             commands::cancel_chat_turn,
             commands::get_chat_session,
@@ -673,7 +672,8 @@ mod tests {
     /// `apply_notes_update` + `load_notes_ydoc` (B6 WU7 — CRDT editor binding):
     /// 33 + 2 = 35; the WS4-A S5b tunnel surface adds `tunnel_begin_pairing` /
     /// `tunnel_poll_pairing` / `set_connector_enabled` / `tunnel_status`:
-    /// 35 + 4 = 39).
+    /// 35 + 4 = 39; #0015 merges `re_transcribe` + `rediarize_meeting` into one
+    /// `reprocess`: 39 − 2 + 1 = 38).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -710,11 +710,10 @@ mod tests {
             "rename_meeting",
             "set_speaker_name",
             "delete_meeting",
-            "re_transcribe",
+            "reprocess",
             "summarise_meeting",
             "get_summary",
             "save_summary",
-            "rediarize_meeting",
             "send_chat_message",
             "cancel_chat_turn",
             "get_chat_session",
@@ -732,9 +731,24 @@ mod tests {
 
         assert_eq!(
             expected.len(),
-            39,
-            "command ledger must be 39 (35 + the WS4-A S5b tunnel surface: \
-             tunnel_begin_pairing / tunnel_poll_pairing / set_connector_enabled / tunnel_status)"
+            38,
+            "command ledger must be 38 (39 − the #0015 merge of re_transcribe + \
+             rediarize_meeting into one reprocess command)"
+        );
+
+        // #0015 — the two former offline commands merged into `reprocess`; assert
+        // both are gone from the COMMAND surface. Match the `TAURI_INVOKE("name"`
+        // call, NOT a raw substring: `OperationKind::ReTranscribe` legitimately
+        // serialises to `"re_transcribe"` in the generated TS union (the reprocess
+        // op still emits a re-transcribe progress phase), so a bare `contains`
+        // would false-positive on that progress variant.
+        assert!(
+            !ts.contains("TAURI_INVOKE(\"re_transcribe\""),
+            "the re_transcribe command must be merged into reprocess in #0015"
+        );
+        assert!(
+            !ts.contains("TAURI_INVOKE(\"rediarize_meeting\""),
+            "the rediarize_meeting command must be merged into reprocess in #0015"
         );
 
         // `re_summarise` was removed in Phase 5 (no caller once

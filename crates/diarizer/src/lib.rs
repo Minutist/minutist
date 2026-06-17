@@ -578,6 +578,34 @@ fn ranked_overlaps(turns: &[SherpaSegment], start_ms: u64, end_ms: u64) -> Vec<(
     totals
 }
 
+/// True when a segment spans **two or more distinct surviving speakers**, each
+/// covering at least `min_share` of the segment's duration — the predicate the
+/// #0015 split uses to decide a segment is "mixed" and must be cut at the turn
+/// boundary (rather than collapsed onto one label + flagged).
+///
+/// It is the same arithmetic as the `shared_speakers` fill in
+/// [`overlay_speakers`], factored out so the split and the flag agree by
+/// construction. `ranked` is one segment's per-cluster overlaps (descending, as
+/// [`ranked_overlaps`] returns); `survivors` is the post-prune surviving
+/// cluster-id set (so a pruned drift-cluster never counts); `dur_ms` is the
+/// segment duration. `min_share <= 0.0` or a zero-duration segment is never
+/// mixed.
+//
+// Phase 2 lands the tested predicate; the split (#0015 phase 3) is its first
+// caller, so it is `dead_code` until then.
+#[allow(dead_code)]
+fn is_mixed_segment(ranked: &[(i32, u64)], survivors: &[i32], dur_ms: u64, min_share: f32) -> bool {
+    if min_share <= 0.0 || dur_ms == 0 {
+        return false;
+    }
+    let threshold = (min_share as f64 * dur_ms as f64) as u64;
+    let qualifying = ranked
+        .iter()
+        .filter(|(id, overlap)| *overlap >= threshold && survivors.contains(id))
+        .count();
+    qualifying >= 2
+}
+
 /// Overlap length in milliseconds of two half-open intervals `[a0, a1)` and
 /// `[b0, b1)`. Zero when they do not overlap.
 fn interval_overlap_ms(a0: u64, a1: u64, b0: u64, b1: u64) -> u64 {
@@ -594,6 +622,100 @@ fn seconds_to_ms(seconds: f32) -> u64 {
     } else {
         (seconds * 1000.0).round() as u64
     }
+}
+
+/// Merge runs of adjacent segments that share the same `speaker_id` into one
+/// segment (#0015 phase 1), so a single speaker fragmented by the VAD — a
+/// sub-`gap_threshold_ms` silence, or the 10 s force-split that abuts segments
+/// with no gap — reads as one continuous turn rather than several rows.
+///
+/// Two neighbours fold together when BOTH hold:
+/// - identical `speaker_id` (`Some(a) == Some(b)` by string); a `None` label is
+///   an opaque hard boundary, never merged with anything — two un-attributable
+///   gaps could span a real turn the diarizer did not cover; and
+/// - the inter-segment gap `next.start_ms - cur.end_ms` is `<= gap_threshold_ms`
+///   (`saturating_sub`, so an abutting/overlapping force-split pair gaps to `0`
+///   and always folds).
+///
+/// Fold mechanics: `text` joins with a single space (an empty side contributes
+/// nothing, so no stray padding); `words` concatenate in order (Qwen segments
+/// carry none, so the one rule is correct for both backends); `end_ms` takes the
+/// union upper bound while `start_ms` stays the first member's; `shared_speakers`
+/// is the de-duplicated union minus the run's own label; `confidence` is the
+/// member-duration-weighted mean of the `Some` members (an all-`None` run — the
+/// only case the live backends produce — stays `None`).
+///
+/// Segments are assumed start-sorted (the offline transcript is) and are not
+/// re-sorted. Pure (no FFI/IO), so the default test suite covers it without a
+/// model. The caller recomputes `speaker_count` afterwards; the merge preserves
+/// labels, so the count is invariant, but recomputing is the robust choice.
+pub fn merge_adjacent_speakers(segments: &mut Vec<Segment>, gap_threshold_ms: u64) {
+    if segments.len() < 2 {
+        return;
+    }
+
+    // Finalise a completed run: resolve the duration-weighted confidence and drop
+    // the run's own label from `shared_speakers` (a label is never its own
+    // "additional" speaker).
+    fn finish_run(seg: &mut Segment, conf_weighted_sum: f64, conf_weight: u64) {
+        seg.confidence = if conf_weight > 0 {
+            Some((conf_weighted_sum / conf_weight as f64) as f32)
+        } else {
+            None
+        };
+        if let Some(own) = seg.speaker_id.clone() {
+            seg.shared_speakers.retain(|s| *s != own);
+        }
+    }
+
+    let dur = |s: &Segment| s.end_ms.saturating_sub(s.start_ms);
+
+    let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
+    let mut iter = std::mem::take(segments).into_iter();
+    let mut cur = iter.next().expect("len >= 2 checked above");
+    let mut conf_sum = cur.confidence.map_or(0.0, |c| c as f64 * dur(&cur) as f64);
+    let mut conf_w = cur.confidence.map_or(0, |_| dur(&cur));
+
+    for next in iter {
+        let same_speaker =
+            matches!((&cur.speaker_id, &next.speaker_id), (Some(a), Some(b)) if a == b);
+        let gap = next.start_ms.saturating_sub(cur.end_ms);
+        if same_speaker && gap <= gap_threshold_ms {
+            // Fold `next` into the running segment.
+            let head = cur.text.trim_end();
+            let tail = next.text.trim_start();
+            let merged_text = if head.is_empty() {
+                tail.to_string()
+            } else if tail.is_empty() {
+                head.to_string()
+            } else {
+                format!("{head} {tail}")
+            };
+            cur.text = merged_text;
+            cur.end_ms = next.end_ms.max(cur.end_ms);
+            cur.words.extend(next.words);
+            for label in next.shared_speakers {
+                if !cur.shared_speakers.contains(&label) {
+                    cur.shared_speakers.push(label);
+                }
+            }
+            if let Some(c) = next.confidence {
+                // Copy fields only — `next` is partially moved (words/shared) above.
+                let w = next.end_ms.saturating_sub(next.start_ms);
+                conf_sum += c as f64 * w as f64;
+                conf_w += w;
+            }
+        } else {
+            finish_run(&mut cur, conf_sum, conf_w);
+            out.push(cur);
+            cur = next;
+            conf_sum = cur.confidence.map_or(0.0, |c| c as f64 * dur(&cur) as f64);
+            conf_w = cur.confidence.map_or(0, |_| dur(&cur));
+        }
+    }
+    finish_run(&mut cur, conf_sum, conf_w);
+    out.push(cur);
+    *segments = out;
 }
 
 /// Re-overlay a prior diarization onto a freshly ASR-transcribed segment slice
@@ -1166,5 +1288,240 @@ mod tests {
         let mut new_segs = vec![seg(0, 3000)];
         overlay_speakers_from_prior(&mut new_segs, &prior_segs);
         assert_eq!(new_segs[0].speaker_id, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_adjacent_speakers (#0015 phase 1)
+    // -----------------------------------------------------------------------
+
+    fn seg_sp(start_ms: u64, end_ms: u64, text: &str, speaker: Option<&str>) -> Segment {
+        Segment {
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+            speaker_id: speaker.map(|s| s.to_string()),
+            confidence: None,
+            words: Vec::new(),
+            shared_speakers: Vec::new(),
+        }
+    }
+    fn word(start_ms: u64, end_ms: u64, text: &str) -> minutist_common::WordTimestamp {
+        minutist_common::WordTimestamp {
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn merge_force_split_zero_gap() {
+        // The 10 s force-split abuts segments (end_ms == next.start_ms) for one
+        // speaker → one merged segment; text space-joined, end_ms unioned.
+        let mut segs = vec![
+            seg_sp(0, 10_000, "first half", Some("A")),
+            seg_sp(10_000, 18_000, "second half", Some("A")),
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].start_ms, 0);
+        assert_eq!(segs[0].end_ms, 18_000);
+        assert_eq!(segs[0].text, "first half second half");
+    }
+
+    #[test]
+    fn merge_hangover_gap_below_threshold() {
+        let mut below = vec![
+            seg_sp(0, 1_000, "one", Some("A")),
+            seg_sp(2_400, 3_000, "two", Some("A")), // 1400 ms gap <= 1500
+        ];
+        merge_adjacent_speakers(&mut below, 1500);
+        assert_eq!(below.len(), 1, "1400 ms gap is below threshold");
+
+        let mut above = vec![
+            seg_sp(0, 1_000, "one", Some("A")),
+            seg_sp(2_600, 3_000, "two", Some("A")), // 1600 ms gap > 1500
+        ];
+        merge_adjacent_speakers(&mut above, 1500);
+        assert_eq!(above.len(), 2, "1600 ms gap exceeds threshold");
+    }
+
+    #[test]
+    fn merge_stops_at_speaker_change() {
+        let mut segs = vec![
+            seg_sp(0, 1_000, "a1", Some("A")),
+            seg_sp(1_000, 2_000, "a2", Some("A")),
+            seg_sp(2_000, 3_000, "b1", Some("B")),
+            seg_sp(3_000, 4_000, "b2", Some("B")),
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(segs[0].text, "a1 a2");
+        assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
+        assert_eq!(segs[1].text, "b1 b2");
+    }
+
+    #[test]
+    fn merge_none_is_a_hard_boundary() {
+        // A None segment never merges and never bridges the two A's around it.
+        let mut segs = vec![
+            seg_sp(0, 1_000, "a1", Some("A")),
+            seg_sp(1_000, 2_000, "gap", None),
+            seg_sp(2_000, 3_000, "a2", Some("A")),
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[1].speaker_id, None);
+    }
+
+    #[test]
+    fn merge_words_concatenated_in_order() {
+        let mut segs = vec![
+            Segment {
+                words: vec![word(0, 500, "hello"), word(500, 1000, "there")],
+                ..seg_sp(0, 1_000, "hello there", Some("A"))
+            },
+            Segment {
+                words: vec![word(1000, 1500, "general"), word(1500, 2000, "kenobi")],
+                ..seg_sp(1_000, 2_000, "general kenobi", Some("A"))
+            },
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 1);
+        let texts: Vec<&str> = segs[0].words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["hello", "there", "general", "kenobi"]);
+    }
+
+    #[test]
+    fn merge_qwen_empty_words_stay_empty() {
+        let mut segs = vec![
+            seg_sp(0, 1_000, "one", Some("A")),
+            seg_sp(1_000, 2_000, "two", Some("A")),
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].words.is_empty());
+    }
+
+    #[test]
+    fn merge_text_join_handles_empty_sides() {
+        let mut segs = vec![
+            seg_sp(0, 1_000, "", Some("A")),
+            seg_sp(1_000, 2_000, "spoken", Some("A")),
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "spoken", "no stray leading space from the empty side");
+    }
+
+    #[test]
+    fn merge_shared_speakers_union_dedup_self_removed() {
+        let mut segs = vec![
+            Segment {
+                shared_speakers: vec!["B".to_string(), "A".to_string()],
+                ..seg_sp(0, 1_000, "x", Some("A"))
+            },
+            Segment {
+                shared_speakers: vec!["B".to_string(), "C".to_string()],
+                ..seg_sp(1_000, 2_000, "y", Some("A"))
+            },
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 1);
+        // Union {B, A, C} minus the run's own label A, first-seen order.
+        assert_eq!(segs[0].shared_speakers, vec!["B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
+    fn merge_confidence_duration_weighted_mean() {
+        // None + None stays None (the only case live backends produce).
+        let mut none_run = vec![
+            seg_sp(0, 1_000, "a", Some("A")),
+            seg_sp(1_000, 2_000, "b", Some("A")),
+        ];
+        merge_adjacent_speakers(&mut none_run, 1500);
+        assert_eq!(none_run[0].confidence, None);
+
+        // Equal-duration Some(0.8) + Some(0.4) → mean 0.6.
+        let mut conf_run = vec![
+            Segment {
+                confidence: Some(0.8),
+                ..seg_sp(0, 1_000, "a", Some("A"))
+            },
+            Segment {
+                confidence: Some(0.4),
+                ..seg_sp(1_000, 2_000, "b", Some("A"))
+            },
+        ];
+        merge_adjacent_speakers(&mut conf_run, 1500);
+        assert_eq!(conf_run.len(), 1);
+        let c = conf_run[0].confidence.expect("some");
+        assert!((c - 0.6).abs() < 1e-5, "duration-weighted mean = 0.6, got {c}");
+    }
+
+    #[test]
+    fn merge_single_segment_and_empty_are_noops() {
+        let mut one = vec![seg_sp(0, 1_000, "solo", Some("A"))];
+        merge_adjacent_speakers(&mut one, 1500);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].text, "solo");
+
+        let mut empty: Vec<Segment> = Vec::new();
+        merge_adjacent_speakers(&mut empty, 1500);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn merge_preserves_start_and_unions_end() {
+        // A later fragment whose end_ms is < the running end (overlap) must not
+        // shrink the merged end_ms; start stays the first fragment's.
+        let mut segs = vec![
+            seg_sp(100, 5_000, "long", Some("A")),
+            seg_sp(5_000, 4_000, "weird", Some("A")), // degenerate end < run end
+        ];
+        merge_adjacent_speakers(&mut segs, 1500);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].start_ms, 100);
+        assert_eq!(segs[0].end_ms, 5_000, "union upper bound, not the smaller end");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_mixed_segment (#0015 phase 2) — mirrors the shared_speakers flag tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_mixed_true_for_two_substantial_survivors() {
+        // dur 1000 ms → 30% threshold = 300 ms; clusters 0 (1000) and 1 (600)
+        // both clear it and both survive → mixed.
+        let ranked = vec![(0i32, 1000u64), (1, 600)];
+        assert!(is_mixed_segment(&ranked, &[0, 1], 1000, 0.30));
+    }
+
+    #[test]
+    fn is_mixed_false_for_brief_secondary() {
+        // Secondary covers only 200 ms (< 300 ms) → single substantial speaker.
+        let ranked = vec![(0i32, 1000u64), (1, 200)];
+        assert!(!is_mixed_segment(&ranked, &[0, 1], 1000, 0.30));
+    }
+
+    #[test]
+    fn is_mixed_false_for_single_speaker() {
+        let ranked = vec![(0i32, 1000u64)];
+        assert!(!is_mixed_segment(&ranked, &[0], 1000, 0.30));
+    }
+
+    #[test]
+    fn is_mixed_ignores_pruned_non_survivor() {
+        // Cluster 1 clears the threshold but was pruned (not a survivor) → the
+        // segment is attributed to the one survivor, not mixed.
+        let ranked = vec![(0i32, 1000u64), (1, 600)];
+        assert!(!is_mixed_segment(&ranked, &[0], 1000, 0.30));
+    }
+
+    #[test]
+    fn is_mixed_disabled_when_share_zero_or_zero_duration() {
+        let ranked = vec![(0i32, 1000u64), (1, 600)];
+        assert!(!is_mixed_segment(&ranked, &[0, 1], 1000, 0.0));
+        assert!(!is_mixed_segment(&ranked, &[0, 1], 0, 0.30));
     }
 }

@@ -51,9 +51,9 @@ use std::time::Duration;
 
 use audio_capture::AudioCaptureManager;
 use chrono::{DateTime, Utc};
-use diarizer::OnlineDiarizer;
+use diarizer::{OnlineDiarizer, SpeakerTurn};
 use minutist_common::{
-    AppError, AppEvent, AppResult, AsrBackend, AsrEngine, AudioFormat, Diarizer, MeetingId,
+    AppError, AppEvent, AppResult, AsrBackend, AsrEngine, AudioFormat, MeetingId,
     MeetingListEntry, MeetingMeta, ModelDescriptor, ModelId, ModelStatus, RecordingState, Segment,
 };
 use model_registry::ModelRegistry;
@@ -1173,21 +1173,23 @@ impl Orchestrator {
     /// contend with the live pipeline), then on a `spawn_blocking` thread it
     /// decodes the meeting's `audio.opus` (pause-INCLUDING 16 kHz mono PCM via
     /// `persistence::reader::read_audio_pcm`), reads `transcript.json`
-    /// (`persistence::read_transcript`), and runs the bundled `SherpaDiarizer`
-    /// over the segment array. `Diarizer::assign_speakers` consumes the segments
-    /// and returns the speaker-labelled (and, on the Parakeet path, turn-split)
-    /// list plus the distinct speaker count; the refreshed transcript replaces
-    /// `transcript.json`
+    /// (`persistence::read_transcript`), runs the bundled `SherpaDiarizer`'s
+    /// `compute_turns` over the audio, overlays first-seen speaker labels, and
+    /// (#0015 phase 4) re-ASRs each kept mixed Qwen segment into single-speaker
+    /// sub-clips via the best-effort routed Qwen backend. The result is the
+    /// speaker-labelled, possibly split segment list plus the distinct speaker
+    /// count; the refreshed transcript replaces `transcript.json`
     /// (`persistence::write_transcript`), `metadata.json` is updated
     /// (`persistence::write_metadata`, setting `speaker_count` + the `diarizer`
     /// [`ModelDescriptor`]), the supplied [`MeetingIndex`] row's `speaker_count`
     /// is refreshed (`upsert`), and `AppEvent::DiarizationComplete` is emitted on
     /// the shared bus.
     ///
-    /// The diarizer is built lazily inside the blocking closure (resolving both
-    /// model directories via `model-registry` and opening sherpa over the two
-    /// `.onnx` files), mirroring the re-transcribe lazy ASR-runtime pattern so
-    /// the heavy model load is off the async worker threads.
+    /// The diarizer + re-ASR backend are built lazily off the async worker
+    /// threads (resolving model directories via `model-registry`), mirroring the
+    /// re-transcribe lazy ASR-runtime pattern so the heavy model loads do not
+    /// stall the runtime. An absent re-ASR model degrades the split to
+    /// keep-whole-and-flag (no regression).
     ///
     /// # Errors
     ///
@@ -1213,38 +1215,112 @@ impl Orchestrator {
         meeting_id: MeetingId,
     ) -> AppResult<()> {
         // Build the production diarizer off the async worker threads (the model
-        // load is heavy). It is then handed to the shared inner path as an owned
-        // `Box<dyn Diarizer>`, exactly like the test seam supplies a StubDiarizer.
+        // load is heavy). It is handed to the shared inner path inside a
+        // `DiarizationJob::Production`, alongside the best-effort routed Qwen
+        // re-ASR backend used to split kept mixed Qwen segments (#0015 phase 4).
         let registry = Arc::clone(&self.model_registry);
-        let diarizer: Box<dyn Diarizer + Send> =
-            tokio::task::spawn_blocking(move || -> AppResult<Box<dyn Diarizer + Send>> {
+        let diarizer =
+            tokio::task::spawn_blocking(move || -> AppResult<diarizer::SherpaDiarizer> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| AppError::Internal {
                         context: format!("rediarize runtime build failed: {e}"),
                     })?;
-                let diarizer = rt.block_on(runner::build_diarizer(&registry))?;
-                Ok(Box::new(diarizer))
+                rt.block_on(runner::build_diarizer(&registry))
             })
             .await
             .map_err(|e| AppError::Internal {
                 context: format!("rediarize diarizer-build join failed: {e}"),
             })??;
 
-        self.rediarize_inner(index, meeting_id, diarizer).await
+        // Build the routed Qwen re-ASR backend best-effort (honours `gpu_plan` +
+        // the same engine routing + language hint as `re_transcribe`). An absent
+        // model yields `None` → the split degrades to keep-whole-and-flag (no
+        // regression vs. the pre-split behaviour). The VRAM cost is bounded: the
+        // backend is dropped at the end of the split loop (Qwen GGUF co-resident
+        // with the sherpa diarizer models).
+        let backend = self.build_split_backend().await;
+
+        self.rediarize_inner(
+            index,
+            meeting_id,
+            DiarizationJob::Production { diarizer, backend },
+        )
+        .await
+    }
+
+    /// Build the routed re-ASR backend for the #0015-phase-4 split, best-effort.
+    ///
+    /// Resolves the same GPU plan + ASR engine + language hint as the live and
+    /// re-transcribe paths (so a split re-ASRs with the same tier the meeting was
+    /// transcribed with) and builds the backend off the async worker threads.
+    /// Returns `None` on ANY failure (model absent, build error, join failure) so
+    /// a split simply degrades to keep-whole — a missing re-ASR model must never
+    /// fail the whole diarization pass.
+    async fn build_split_backend(&self) -> Option<Box<dyn AsrBackend + Send>> {
+        let plan = self.gpu_plan();
+        let n_gpu_layers = runner::resolve_gpu_layers(plan.asr_gpu);
+        let language =
+            runner::resolve_transcription_language(&self.settings.current().transcription_language);
+        let engine = minutist_common::asr_engine_for_language(
+            &self.settings.current().transcription_language,
+            plan.effective_prefer_large,
+        );
+        let registry = Arc::clone(&self.model_registry);
+
+        let built = tokio::task::spawn_blocking(
+            move || -> Option<Box<dyn AsrBackend + Send>> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                match rt.block_on(runner::build_asr_backend_for_retranscribe(
+                    &registry,
+                    engine,
+                    n_gpu_layers,
+                    language,
+                )) {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "orchestrator",
+                            "split re-ASR backend build failed ({e}); keeping mixed Qwen segments whole"
+                        );
+                        None
+                    }
+                }
+            },
+        )
+        .await;
+
+        match built {
+            Ok(opt) => opt,
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    "split re-ASR backend build join failed ({join_err}); keeping mixed Qwen segments whole"
+                );
+                None
+            }
+        }
     }
 
     /// Shared diarization-and-persist core for the user-triggered re-diarize.
     ///
-    /// Driven by the production [`Self::rediarize`] (with the bundled
-    /// `SherpaDiarizer`) and the test-only `rediarize_with_diarizer` (with a
-    /// `StubDiarizer`). On a `spawn_blocking` thread it decodes the meeting's
+    /// Driven by the production [`Self::rediarize`] (a
+    /// `DiarizationJob::Production` with the bundled `SherpaDiarizer` + Qwen
+    /// backend) and the test-only `rediarize_with_split_inputs` (a
+    /// `DiarizationJob::Stub` with caller-supplied turns + backend). On a
+    /// `spawn_blocking` thread it decodes the meeting's
     /// pause-INCLUDING PCM (`persistence::read_audio_pcm`), reads
-    /// `transcript.json` (`persistence::read_transcript`), and runs the supplied
-    /// diarizer's `assign_speakers` (which returns the speaker-labelled,
-    /// possibly turn-split segment list plus the distinct speaker count). It then
-    /// calls
+    /// `transcript.json` (`persistence::read_transcript`), and resolves the
+    /// turns + re-ASR backend from `job` (production `SherpaDiarizer` +
+    /// best-effort Qwen backend, or stub-supplied turns + backend) to drive the
+    /// [`diarize_split_merge`] core — which overlays speaker labels, splits each
+    /// kept mixed Qwen segment into single-speaker sub-clips by re-ASR (#0015
+    /// phase 4), and returns the (possibly longer) segment list plus the distinct
+    /// speaker count. It then calls
     /// [`Self::finalise_diarization`] to rewrite `transcript.json` + update
     /// `metadata.json`, and finally refreshes the supplied index row's
     /// `speaker_count` (`upsert`).
@@ -1252,12 +1328,12 @@ impl Orchestrator {
         &self,
         index: &MeetingIndex,
         meeting_id: MeetingId,
-        diarizer: Box<dyn Diarizer + Send>,
+        job: DiarizationJob,
     ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
-        // Read the recording length to size the diarization timeout (a small
-        // metadata read on a blocking thread).
+        // Read the recording length to size the timeout (a small metadata read on
+        // a blocking thread).
         let duration_dir = meeting_dir.clone();
         let duration_ms = tokio::task::spawn_blocking(move || {
             persistence::read_metadata(&duration_dir).map(|m| m.duration_ms)
@@ -1266,7 +1342,11 @@ impl Orchestrator {
         .map_err(|e| AppError::Internal {
             context: format!("diarize metadata read join failed: {e}"),
         })??;
-        let budget = diarize_timeout(duration_ms);
+        // #0015 phase 4: the pass now budgets for the sherpa compute AND the N
+        // `transcribe_chunk` re-ASR passes of the split, so a split-heavy meeting
+        // is not cut off mid-split. Sized like `retranscribe_timeout` (ASR is the
+        // slow part once the split runs) rather than the diarize-only budget.
+        let budget = retranscribe_timeout(duration_ms);
 
         // Live-test UX T4(c): the sherpa diarization compute is one opaque FFI
         // call with no progress callback, so emit a single INDETERMINATE
@@ -1281,9 +1361,9 @@ impl Orchestrator {
             label: "Identifying speakers…".to_string(),
         });
 
-        // Bound the (uninterruptible) sherpa `compute`: a pathologically slow or
-        // hung diarization on a long recording must not block forever (the
-        // original on-stop hang). On timeout we return BEFORE
+        // Bound the (uninterruptible) sherpa `compute` + re-ASR split: a
+        // pathologically slow or hung pass on a long recording must not block
+        // forever (the original on-stop hang). On timeout we return BEFORE
         // `finalise_diarization`, so nothing is written — the meeting is left
         // un-diarized and the abandoned blocking thread's result (if it ever
         // completes) is dropped. `tokio` cannot cancel a `spawn_blocking` thread,
@@ -1291,7 +1371,7 @@ impl Orchestrator {
         // bounds the wait, not the thread.
         let (segments, speaker_count) = match tokio::time::timeout(
             budget,
-            run_diarization_blocking(meeting_dir.clone(), diarizer),
+            run_diarization_blocking(meeting_dir.clone(), job, self.event_tx.clone(), meeting_id),
         )
         .await
         {
@@ -1486,43 +1566,366 @@ impl Orchestrator {
 /// the 720 ms VAD hangover and the zero-gap 10 s force-split.
 const MERGE_GAP_MS: u64 = 1500;
 
-/// Decode the meeting's PCM + transcript and run `diarizer` over the segments,
-/// all on a `spawn_blocking` thread.
+/// How a diarization+split pass obtains its turns + re-ASR backend (#0015 phase
+/// 4). Both variants converge on [`diarize_split_merge`] (the model-free core);
+/// the variant only decides where the turns + backend come from.
 ///
-/// Returns the segments with `speaker_id` overlaid and the distinct speaker
-/// count `assign_speakers` reported. The diarizer is consumed (moved into the
-/// blocking closure) so a `SherpaDiarizer` or a test `StubDiarizer` both work.
+/// `Production` carries the bundled `SherpaDiarizer` (its `compute_turns` runs on
+/// the decoded PCM, on the blocking thread) + the best-effort routed Qwen
+/// backend (`None` when the model is absent → degrade to keep-whole). `Stub`
+/// supplies the turns + backend + config directly, the seam the default suite
+/// uses to exercise the split with no `SherpaDiarizer` and no Qwen GGUF.
+enum DiarizationJob {
+    Production {
+        diarizer: diarizer::SherpaDiarizer,
+        backend: Option<Box<dyn minutist_common::AsrBackend + Send>>,
+    },
+    #[cfg(any(test, feature = "test-source"))]
+    Stub {
+        turns: Vec<SpeakerTurn>,
+        backend: Option<Box<dyn minutist_common::AsrBackend + Send>>,
+        config: diarizer::DiarizerConfig,
+    },
+}
+
+/// Decode the meeting's PCM + transcript, resolve the turns + config + backend
+/// from `job`, and run the [`diarize_split_merge`] core, all on a
+/// `spawn_blocking` thread.
+///
+/// Returns the (possibly split) segments with `speaker_id` overlaid and the
+/// distinct speaker count. The `job` carries either the production
+/// `SherpaDiarizer` (+ best-effort Qwen backend) or stub-supplied turns + backend
+/// (the default-suite seam), so a `SherpaDiarizer` and a model-free stub both
+/// drive the SAME split core.
 async fn run_diarization_blocking(
     meeting_dir: PathBuf,
-    diarizer: Box<dyn Diarizer + Send>,
+    job: DiarizationJob,
+    event_tx: broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
 ) -> AppResult<(Vec<Segment>, u32)> {
     tokio::task::spawn_blocking(move || -> AppResult<(Vec<Segment>, u32)> {
         let pcm = persistence::read_audio_pcm(&meeting_dir)?;
         let segments = persistence::read_transcript(&meeting_dir)?;
-        // `assign_speakers` consumes and returns the segment list: a mixed
-        // Parakeet segment splits at the turn boundary, so the list may grow.
-        let (mut segments, _count) = diarizer.assign_speakers(&pcm, 16_000, segments)?;
-        // #0015 phase 1: collapse a speaker fragmented by VAD silence-gaps or the
-        // 10 s force-split into one segment so a turn reads as one row.
-        diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);
-        // Recompute the distinct-label count from the merged segments (the merge
-        // preserves labels, so it is invariant, but recomputing is robust and
-        // self-documenting — do not trust the pre-merge count).
-        let mut seen: Vec<String> = Vec::new();
-        for seg in &segments {
-            if let Some(ref label) = seg.speaker_id {
-                if !seen.contains(label) {
-                    seen.push(label.clone());
-                }
+
+        let (turns, config, backend): (
+            Vec<SpeakerTurn>,
+            diarizer::DiarizerConfig,
+            Option<Box<dyn minutist_common::AsrBackend + Send>>,
+        ) = match job {
+            DiarizationJob::Production { diarizer, backend } => {
+                // `compute_turns` runs over the pause-INCLUDING PCM → turn ms are
+                // on the INCLUDING clock the split funnel maps onto.
+                let turns = diarizer.compute_turns(&pcm, 16_000)?;
+                (turns, diarizer.config().clone(), backend)
             }
-        }
-        Ok((segments, seen.len() as u32))
+            #[cfg(any(test, feature = "test-source"))]
+            DiarizationJob::Stub {
+                turns,
+                backend,
+                config,
+            } => (turns, config, backend),
+        };
+
+        // `Box<dyn AsrBackend + Send>` → `Box<dyn AsrBackend>` for the core (the
+        // split runs on this one thread; the `Send` bound is only needed to move
+        // the backend into the closure).
+        let backend = backend.map(|b| b as Box<dyn minutist_common::AsrBackend>);
+        diarize_split_merge(
+            &turns,
+            segments,
+            &pcm,
+            backend,
+            &config,
+            &event_tx,
+            meeting_id,
+        )
     })
     .await
     .map_err(|e| AppError::Internal {
         context: format!("diarization spawn_blocking join failed: {e}"),
     })?
 }
+
+/// Distinct-label count over the segments (`speaker_id` first-seen order).
+///
+/// The merge + split preserve labels, but recomputing from the final list is
+/// robust and self-documenting — never trust an upstream count after the list
+/// has been transformed.
+fn distinct_label_count(segments: &[Segment]) -> u32 {
+    let mut seen: Vec<&str> = Vec::new();
+    for seg in segments {
+        if let Some(label) = seg.speaker_id.as_deref() {
+            if !seen.contains(&label) {
+                seen.push(label);
+            }
+        }
+    }
+    seen.len() as u32
+}
+
+/// Dominant cluster of `turns` over `[start_ms, end_ms)`: the cluster id with the
+/// greatest total temporal overlap, lower id breaking a tie (matching
+/// `diarizer::overlay_speakers`' tie orientation). `None` when no turn overlaps.
+///
+/// Used to letter a re-ASR'd sub-clip via the WU1 cluster→letter map. The
+/// orchestrator computes this from the public [`SpeakerTurn`] fields rather than
+/// reaching into the diarizer's private overlap helper.
+fn dominant_cluster(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> Option<i32> {
+    if end_ms <= start_ms {
+        return None;
+    }
+    // Per-cluster overlap totals, then argmax (greatest overlap; lower id on a tie).
+    let mut totals: Vec<(i32, u64)> = Vec::new();
+    for t in turns {
+        let lo = start_ms.max(t.start_ms);
+        let hi = end_ms.min(t.end_ms);
+        let overlap = hi.saturating_sub(lo);
+        if overlap == 0 {
+            continue;
+        }
+        match totals.iter_mut().find(|(id, _)| *id == t.cluster) {
+            Some((_, sum)) => *sum += overlap,
+            None => totals.push((t.cluster, overlap)),
+        }
+    }
+    totals
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+        .map(|(id, _)| id)
+}
+
+/// Re-ASR split core (#0015 phase 4) — the BLOCKING, model-free-testable funnel.
+///
+/// A free fn taking EXPLICIT params (mirroring [`transcribe_pcm_window_blocking`]
+/// rather than dispatching through the `common::Diarizer` trait) so the default
+/// suite can drive the whole split with a stub-supplied `turns` + stub `AsrBackend` —
+/// no `SherpaDiarizer`, no Qwen GGUF:
+/// - `turns` are the raw [`SpeakerTurn`]s from `compute_turns`, on the
+///   pause-INCLUDING clock the `pcm` shares.
+/// - `segments` is the ASR transcript (pause-EXCLUDING `start_ms`).
+/// - `pcm` is the pause-INCLUDING decoded audio.
+/// - `backend` is the routed Qwen re-ASR backend, or `None` (model absent /
+///   degrade to keep-whole — no regression vs. the pre-split behaviour).
+/// - `config` is the `DiarizerConfig` the overlay + flag use.
+///
+/// Steps:
+/// 1. [`diarizer::overlay_speakers`] labels segments + flags mixed Qwen segments
+///    (keep-whole, `shared_speakers` set, empty `words`) + returns the
+///    cluster→letter map.
+/// 2. [`diarizer::merge_adjacent_speakers`] collapses VAD/force-split fragments.
+/// 3. For each KEPT mixed Qwen segment (non-empty `shared_speakers` AND empty
+///    `words`) with a `backend`: take [`diarizer::turn_boundaries_within`] cuts
+///    on the SAME pause-INCLUDING clock (mapped via
+///    [`runner::pcm_window_for_excluding_range`]), energy-snap each cut, slice the
+///    PCM, re-ASR each single-speaker sub-clip, letter it from the map by its
+///    dominant [`SpeakerTurn`] cluster, and stamp its `start_ms` on the EXCLUDING
+///    clock via [`runner::excluding_ms_for_pcm_sample`]. Keep-whole if the cuts
+///    are empty, any snap returns `None`, or `backend` is `None`.
+/// 4. Re-run [`diarizer::merge_adjacent_speakers`] (the split may have produced
+///    adjacent same-letter sub-clips across segments) and recompute the count.
+///
+/// The clock discipline is the #1 blocking fix: turn cuts are taken on the
+/// pause-INCLUDING clock the turns + PCM share, and a sub-clip's `start_ms` is
+/// mapped back to the EXCLUDING transcript clock by the inverse. INCLUDING-clock
+/// turns are NEVER compared against EXCLUDING-clock segment bounds.
+fn diarize_split_merge(
+    turns: &[SpeakerTurn],
+    segments: Vec<Segment>,
+    pcm: &[f32],
+    mut backend: Option<Box<dyn minutist_common::AsrBackend>>,
+    config: &diarizer::DiarizerConfig,
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+) -> AppResult<(Vec<Segment>, u32)> {
+    // 1. Overlay labels + flag mixed Qwen segments; keep the cluster→letter map.
+    let (mut segments, _count, cluster_letters) = diarizer::overlay_speakers(turns, segments, config);
+
+    // 2. Collapse fragments so a turn reads as one row (#0015 phase 1).
+    diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);
+
+    // 3. Re-ASR split, only when a backend is present.
+    if backend.is_some() {
+        let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
+        for seg in segments.into_iter() {
+            // A kept mixed Qwen segment: flagged by `overlay_speakers` with
+            // non-empty `shared_speakers` and no per-word timestamps. Everything
+            // else passes through unchanged.
+            let is_kept_mixed_qwen = !seg.shared_speakers.is_empty() && seg.words.is_empty();
+            if !is_kept_mixed_qwen {
+                out.push(seg);
+                continue;
+            }
+
+            match split_mixed_qwen_segment(
+                &seg,
+                turns,
+                pcm,
+                backend.as_deref_mut().expect("backend present in this branch"),
+                &cluster_letters,
+                event_tx,
+                meeting_id,
+            )? {
+                Some(sub_segments) => out.extend(sub_segments),
+                // Keep-whole: empty cuts, a snap with no clear minimum, or a
+                // re-ASR that produced nothing — leave the overlay's dominant
+                // label + `shared_speakers` flag intact.
+                None => out.push(seg),
+            }
+        }
+        segments = out;
+    }
+
+    // 4. Re-merge (the split can yield adjacent same-letter sub-clips that should
+    // read as one row) and recompute the distinct-label count.
+    diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);
+    let count = distinct_label_count(&segments);
+
+    // Drop the re-ASR backend promptly: the Qwen GGUF is co-resident with the
+    // sherpa diarizer models, so free its VRAM as soon as the split loop is done
+    // (it lives no longer than this fn).
+    drop(backend);
+
+    Ok((segments, count))
+}
+
+/// Split one kept mixed Qwen segment into single-speaker sub-segments by
+/// re-ASR'ing each speaker turn's audio (#0015 phase 4), or `None` to keep-whole.
+///
+/// Returns `None` (caller keeps the segment whole) when:
+/// - the segment maps to no pause-INCLUDING PCM range, or
+/// - [`diarizer::turn_boundaries_within`] yields no interior cut, or
+/// - any cut's [`runner::snap_to_energy_min`] finds no clear minimum (continuous
+///   / overlapping speech), or
+/// - the resulting sub-clips re-ASR to nothing.
+///
+/// Otherwise returns one sub-segment per single-speaker slice, lettered from
+/// `cluster_letters` by its dominant [`SpeakerTurn`] cluster, with empty
+/// `shared_speakers` (no longer mixed) and `start_ms` on the EXCLUDING clock.
+fn split_mixed_qwen_segment(
+    seg: &Segment,
+    turns: &[SpeakerTurn],
+    pcm: &[f32],
+    backend: &mut dyn minutist_common::AsrBackend,
+    cluster_letters: &[(i32, String)],
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+) -> AppResult<Option<Vec<Segment>>> {
+    // Map the segment's pause-EXCLUDING [start_ms, end_ms) to the single
+    // pause-INCLUDING PCM range the turns share (the clamp matches the offline
+    // pause model — a mixed Qwen segment never straddles a ≥4 s pause).
+    let seg_range = match runner::pcm_window_for_excluding_range(pcm, seg.start_ms, seg.end_ms) {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    // Interior speaker-change cuts on the SAME pause-INCLUDING clock the turns +
+    // PCM share. `turn_boundaries_within` takes a synthetic segment whose bounds
+    // are on the INCLUDING clock (the PCM range's ms), NEVER the excluding bounds.
+    let incl_start_ms = (seg_range.start as u64 * 1000) / 16_000;
+    let incl_end_ms = (seg_range.end as u64 * 1000) / 16_000;
+    let incl_seg = Segment {
+        start_ms: incl_start_ms,
+        end_ms: incl_end_ms,
+        ..seg.clone()
+    };
+    let cut_ms = diarizer::turn_boundaries_within(&incl_seg, turns);
+    if cut_ms.is_empty() {
+        return Ok(None);
+    }
+
+    // Convert each interior cut (INCLUDING ms) to a PCM sample, then energy-snap
+    // it. Any snap with no clear minimum abandons the whole split (keep-whole).
+    let mut cut_samples: Vec<usize> = Vec::with_capacity(cut_ms.len());
+    for ms in &cut_ms {
+        let sample = (*ms as usize * 16_000) / 1000;
+        match runner::snap_to_energy_min(pcm, sample, SNAP_SEARCH_WINDOW_MS) {
+            Some(snapped) => cut_samples.push(snapped),
+            None => return Ok(None),
+        }
+    }
+    cut_samples.sort_unstable();
+    cut_samples.dedup();
+
+    // Slice boundaries inside the segment's PCM range: [seg_start, c0, c1, …, seg_end].
+    let mut bounds: Vec<usize> = Vec::with_capacity(cut_samples.len() + 2);
+    bounds.push(seg_range.start);
+    for c in &cut_samples {
+        // A snapped cut can land just outside the segment range; clamp + skip a
+        // degenerate slice.
+        let c = (*c).clamp(seg_range.start, seg_range.end);
+        if c > *bounds.last().unwrap() && c < seg_range.end {
+            bounds.push(c);
+        }
+    }
+    bounds.push(seg_range.end);
+    if bounds.len() < 3 {
+        // No usable interior cut survived the clamp — keep-whole.
+        return Ok(None);
+    }
+
+    let mut sub_segments: Vec<Segment> = Vec::with_capacity(bounds.len() - 1);
+    for pair in bounds.windows(2) {
+        let (lo, hi) = (pair[0], pair[1]);
+        if hi <= lo {
+            continue;
+        }
+        // Stamp each sub-clip's start on the EXCLUDING transcript clock (the
+        // inverse map); the chunk's own clock is the INCLUDING ms so the backend's
+        // word offsets stay self-consistent within the clip.
+        let excl_start_ms = runner::excluding_ms_for_pcm_sample(pcm, lo);
+        let chunk_incl_start_ms = (lo as u64 * 1000) / 16_000;
+        let chunk_incl_end_ms = (hi as u64 * 1000) / 16_000;
+        let chunk = minutist_common::AudioChunk {
+            samples: pcm[lo..hi].to_vec(),
+            sample_rate: 16_000,
+            start_ms: chunk_incl_start_ms,
+            end_ms: chunk_incl_end_ms,
+        };
+        let re_asr = backend.transcribe_chunk(&chunk)?;
+
+        // Letter this sub-clip by its dominant turn cluster via the WU1 map, so it
+        // lands in the EXISTING scheme (no rename). A cluster the overlay pruned
+        // away has no map entry → leave `None`.
+        let cluster = dominant_cluster(turns, chunk_incl_start_ms, chunk_incl_end_ms);
+        let letter = cluster.and_then(|c| {
+            cluster_letters
+                .iter()
+                .find(|(id, _)| *id == c)
+                .map(|(_, l)| l.clone())
+        });
+
+        let text: String = re_asr
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let sub = Segment {
+            start_ms: excl_start_ms,
+            // The sub-clip's excluding end is the next slice's excluding start;
+            // compute it from `hi` directly (the inverse clamps a trailing edge).
+            end_ms: runner::excluding_ms_for_pcm_sample(pcm, hi),
+            text,
+            speaker_id: letter,
+            confidence: seg.confidence,
+            words: Vec::new(),
+            shared_speakers: Vec::new(),
+        };
+        let _ = event_tx.send(AppEvent::TranscriptSegment {
+            meeting_id,
+            segment: sub.clone(),
+        });
+        sub_segments.push(sub);
+    }
+
+    if sub_segments.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(sub_segments))
+}
+
+/// `± window_ms` energy-snap search span for a speaker-change cut (#0015 phase 4).
+const SNAP_SEARCH_WINDOW_MS: u64 = 150;
 
 /// Slice the decoded `pcm` to the requested pause-EXCLUDING window, run the
 /// `backend` over the slice, and re-map the chunk-relative timestamps back onto
@@ -1563,18 +1966,21 @@ fn transcribe_pcm_window_blocking(
     backend.transcribe_chunk(&chunk)
 }
 
-/// Length-relative timeout budget for a diarization pass.
+/// Length-relative timeout budget for a diarize-only pass (no re-ASR split).
 ///
 /// The offline sherpa `compute` is a single uninterruptible FFI call with no
 /// progress callback, so a true per-progress watchdog isn't available at that
 /// boundary; instead we bound it by wall-clock relative to the recording
 /// length: ≈1× real-time, floored at `FLOOR_SECS` (so short meetings still get
-/// a sane minimum) and capped at `CAP_SECS` (so a hang on a long recording
-/// can't hold the offline claim — and thereby block starting a new recording —
-/// for too long). A normal diarization runs well under real-time, so this only
-/// fires on a pathologically slow or wedged pass; because visibility is
-/// decoupled the meeting is already indexed, so a fired timeout merely leaves it
-/// un-diarized for a manual re-diarize.
+/// a sane minimum) and capped at `CAP_SECS`. A normal diarization runs well
+/// under real-time, so this only fires on a pathologically slow or wedged pass.
+///
+/// The production re-diarize pass now also re-ASRs split sub-clips (#0015 phase
+/// 4), so it budgets with [`retranscribe_timeout`] (ASR is the slow part) rather
+/// than this diarize-only curve. This curve is retained as the documented
+/// diarize-compute baseline its `timeout_helpers_clamp_to_documented_bounds`
+/// test guards.
+#[cfg_attr(not(test), allow(dead_code))]
 fn diarize_timeout(recording_duration_ms: u64) -> Duration {
     const FLOOR_SECS: u64 = 120; // 2 min
     const CAP_SECS: u64 = 600; // 10 min
@@ -1839,30 +2245,45 @@ impl Orchestrator {
             .await
     }
 
-    /// Offline re-diarize driven by a caller-supplied [`Diarizer`], mirroring
-    /// [`Self::re_transcribe_with_backend`] for the diarization path.
+    /// Offline re-diarize driven by caller-supplied turns + re-ASR backend,
+    /// mirroring [`Self::re_transcribe_with_backend`] for the diarization path.
     ///
-    /// This is the stub-injectable seam for the re-diarize pipeline: it drives
-    /// the **same** [`Self::rediarize_inner`] core the production
-    /// [`Self::rediarize`] uses (decode PCM + transcript → `assign_speakers` →
-    /// `transcript.json` rewrite + `metadata.json` `{ speaker_count, diarizer }`
-    /// update → index `upsert` → `AppEvent::DiarizationComplete`), but with the
-    /// injected `diarizer` instead of building a real `SherpaDiarizer`. This lets
-    /// the DEFAULT test suite exercise the whole wiring with a `StubDiarizer`
-    /// (NO model).
+    /// This is the stub-injectable seam for the re-diarize + #0015-phase-4 split
+    /// pipeline: it drives the **same** [`Self::rediarize_inner`] →
+    /// [`diarize_split_merge`] core the production [`Self::rediarize`] uses
+    /// (decode PCM + transcript → `overlay_speakers` → merge → re-ASR split →
+    /// re-merge → `transcript.json` rewrite + `metadata.json` `{ speaker_count,
+    /// diarizer }` update → index `upsert` → `AppEvent::DiarizationComplete`), but
+    /// with caller-supplied `turns` + `config` instead of a real
+    /// `SherpaDiarizer::compute_turns`, and a caller-supplied `backend`
+    /// (`Some(stub)` to exercise the split, `None` to assert keep-whole). This
+    /// lets the DEFAULT test suite cover the whole split with NO sherpa model and
+    /// NO Qwen GGUF.
     ///
     /// Honours the same `Idle`-only invariant as the production path.
     ///
     /// Available only under the `test-source` feature.
-    pub async fn rediarize_with_diarizer(
+    pub async fn rediarize_with_split_inputs(
         &self,
         index: &MeetingIndex,
         meeting_id: MeetingId,
-        diarizer: Box<dyn Diarizer + Send>,
+        turns: Vec<SpeakerTurn>,
+        backend: Option<Box<dyn minutist_common::AsrBackend + Send>>,
+        config: diarizer::DiarizerConfig,
     ) -> AppResult<()> {
         // Same atomic claim/release as the production path (TIMELINE-DRIFT #5).
         self.claim_offline(meeting_id).await?;
-        let result = self.rediarize_inner(index, meeting_id, diarizer).await;
+        let result = self
+            .rediarize_inner(
+                index,
+                meeting_id,
+                DiarizationJob::Stub {
+                    turns,
+                    backend,
+                    config,
+                },
+            )
+            .await;
         self.release_offline().await;
         result
     }

@@ -375,57 +375,71 @@ async fn audio_meter_events_arrive_within_one_second() {
 // ---------------------------------------------------------------------------
 // Phase 6 — diarization wiring (DEFAULT suite, no model)
 //
-// A `StubDiarizer` (a `common::Diarizer` that assigns speaker_ids
-// deterministically, no sherpa model) drives the re-diarize inner path over a
-// synthetic meeting folder, and a toggle-OFF `stop()` test proves the on-stop
-// pass is gated.
+// The model-free `rediarize_with_split_inputs` seam supplies synthetic
+// `SpeakerTurn`s + a stub `AsrBackend` to drive the re-diarize + #0015-phase-4
+// re-ASR split over a synthetic meeting folder, and a toggle-OFF `stop()` test
+// proves the on-stop pass is gated. No sherpa model, no Qwen GGUF.
 // ---------------------------------------------------------------------------
 
 mod diarization {
     use super::*;
+    use diarizer::{DiarizerConfig, SpeakerTurn};
     use minutist_common::{
-        AppResult, AudioFormat, Diarizer, MeetingId, MeetingMeta, Segment,
+        AppResult, AsrBackend, AudioChunk, AudioFormat, MeetingId, MeetingMeta, Segment,
     };
     use persistence::{MeetingIndex, MeetingWriter};
 
-    /// A `common::Diarizer` with no model: it assigns first-seen-order labels
-    /// `"A"`, `"B"`, … round-robin across the segments and reports the distinct
-    /// count, so the orchestrator's persistence + index + event wiring can be
-    /// exercised without sherpa or any ONNX file.
-    struct StubDiarizer {
-        /// Number of distinct speakers to spread across the segments.
-        speakers: u32,
+    /// A model-free [`AsrBackend`]: returns one segment per chunk whose text
+    /// encodes the chunk's INCLUDING-clock window, so a split test can assert each
+    /// sub-clip was re-ASR'd over the expected audio slice. Records every chunk it
+    /// was handed so a test can count the re-ASR passes.
+    struct RecordingStubBackend {
+        chunks: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
     }
 
-    impl Diarizer for StubDiarizer {
-        fn assign_speakers(
-            &self,
-            audio: &[f32],
-            sample_rate: u32,
-            mut segments: Vec<Segment>,
-        ) -> AppResult<(Vec<Segment>, u32)> {
-            assert_eq!(sample_rate, 16_000, "orchestrator must call with 16 kHz");
-            assert!(!audio.is_empty(), "orchestrator must decode non-empty PCM");
-            if segments.is_empty() || self.speakers == 0 {
-                return Ok((segments, 0));
-            }
-            let labels = ["A", "B", "C", "D"];
-            let used = (self.speakers as usize).min(labels.len()).min(segments.len());
-            for (i, seg) in segments.iter_mut().enumerate() {
-                seg.speaker_id = Some(labels[i % used].to_string());
-            }
-            Ok((segments, used as u32))
+    impl AsrBackend for RecordingStubBackend {
+        fn transcribe_chunk(&mut self, chunk: &AudioChunk) -> AppResult<Vec<Segment>> {
+            self.chunks
+                .lock()
+                .unwrap()
+                .push((chunk.start_ms, chunk.end_ms));
+            Ok(vec![Segment {
+                start_ms: chunk.start_ms,
+                end_ms: chunk.end_ms,
+                text: format!("reasr[{}-{}]", chunk.start_ms, chunk.end_ms),
+                speaker_id: None,
+                confidence: None,
+                words: Vec::new(),
+                shared_speakers: Vec::new(),
+            }])
+        }
+    }
+
+    /// A `DiarizerConfig` whose multi-speaker flag is the only post-processing
+    /// active: no prune, no cap, flag a segment as mixed when a second cluster
+    /// covers ≥ 30% of it. This makes `overlay_speakers` flag a two-cluster Qwen
+    /// segment without folding away a small cluster the split needs.
+    fn split_config() -> DiarizerConfig {
+        DiarizerConfig {
+            num_clusters: None,
+            cluster_threshold: 0.75,
+            min_duration_on: 0.0,
+            min_duration_off: 0.0,
+            min_cluster_share: 0.0,
+            min_cluster_segments: 0,
+            max_speakers: None,
+            multi_speaker_min_share: 0.30,
         }
     }
 
     /// Build a synthetic meeting folder on disk: `audio.opus` encoded from
     /// `samples` via the production `MeetingWriter`, a `metadata.json` with
-    /// `speaker_count = 0` / `diarizer = None`, and a `transcript.json` with
-    /// `segment_texts.len()` segments (all `speaker_id = None`). Returns the id.
-    fn build_meeting(
+    /// `speaker_count = 0` / `diarizer = None`, and a `transcript.json` of the
+    /// supplied `segments`. Returns the id.
+    fn build_meeting_with_segments(
         root: &std::path::Path,
         samples: &[f32],
-        segment_texts: &[&str],
+        segments: &[Segment],
     ) -> MeetingId {
         let meeting_id = MeetingId::new();
         let format = AudioFormat {
@@ -455,30 +469,48 @@ mod diarization {
         };
         let folder = writer.finalise(meta).expect("finalise");
 
-        let segments: Vec<Segment> = segment_texts
-            .iter()
-            .enumerate()
-            .map(|(i, t)| Segment {
-                start_ms: i as u64 * 1000,
-                end_ms: i as u64 * 1000 + 800,
-                text: (*t).to_string(),
-                speaker_id: None,
-                confidence: None,
-                words: Vec::new(),
-                shared_speakers: Vec::new(),
-            })
-            .collect();
         std::fs::write(
             folder.path().join("transcript.json"),
-            serde_json::to_vec_pretty(&segments).unwrap(),
+            serde_json::to_vec_pretty(segments).unwrap(),
         )
         .expect("write transcript.json");
 
         meeting_id
     }
 
-    /// The re-diarize inner path (driven via the `rediarize_with_diarizer` stub
-    /// seam) rewrites `transcript.json` with overlaid `speaker_id`s, updates
+    /// A single ASR segment with no words (the Qwen shape) covering `[s, e)`.
+    fn qwen_seg(s: u64, e: u64, text: &str) -> Segment {
+        Segment {
+            start_ms: s,
+            end_ms: e,
+            text: text.to_string(),
+            speaker_id: None,
+            confidence: None,
+            words: Vec::new(),
+            shared_speakers: Vec::new(),
+        }
+    }
+
+    /// Two-speaker speech buffer with a low-energy gap at the boundary so the
+    /// energy-snap finds a clear minimum: `[0, gap_ms)` loud, `[gap_ms-pad,
+    /// gap_ms+pad)` near-silent, `[gap_ms, total_ms)` loud. No ≥4 s pause, so the
+    /// whole buffer is one kept region (excluding clock == including clock).
+    fn two_speaker_pcm(gap_ms: u64, total_ms: u64) -> Vec<f32> {
+        let n = (total_ms as usize * 16_000) / 1000;
+        let gap = (gap_ms as usize * 16_000) / 1000;
+        let pad = (20 * 16_000) / 1000; // ±20 ms quiet around the boundary
+        let mut pcm = vec![0.5f32; n];
+        let lo = gap.saturating_sub(pad);
+        let hi = (gap + pad).min(n);
+        for s in pcm.iter_mut().take(hi).skip(lo) {
+            *s = 0.0;
+        }
+        pcm
+    }
+
+    /// The re-diarize + split inner path (driven via the
+    /// `rediarize_with_split_inputs` seam) overlays first-seen labels onto
+    /// single-speaker Qwen segments, rewrites `transcript.json`, updates
     /// `metadata.json`'s `speaker_count` + `diarizer`, refreshes the index row,
     /// and emits `DiarizationComplete` — all without a sherpa model.
     #[tokio::test]
@@ -489,14 +521,23 @@ mod diarization {
         let orch = test_orchestrator(root.clone());
         let mut event_rx = orch.subscribe_events();
 
-        // Non-zero PCM (the stub asserts non-empty; content is irrelevant).
-        let samples = vec![0.25f32; 16_000];
-        let meeting_id = build_meeting(&root, &samples, &["hello", "there", "again"]);
+        // 3 s of loud PCM; three single-speaker Qwen segments, one per second.
+        let samples = vec![0.5f32; 16_000 * 3];
+        let segs = vec![
+            qwen_seg(0, 900, "hello"),
+            qwen_seg(1_000, 1_900, "there"),
+            qwen_seg(2_000, 2_900, "again"),
+        ];
+        let meeting_id = build_meeting_with_segments(&root, &samples, &segs);
         let meeting_dir = root.join(meeting_id.0.to_string());
 
-        // Before: every segment is unlabelled, metadata speaker_count is 0.
-        let before = persistence::read_transcript(&meeting_dir).expect("read transcript");
-        assert!(before.iter().all(|s| s.speaker_id.is_none()));
+        // Turns: speaker 7 → seg0 + seg2, speaker 3 → seg1. Each segment overlaps
+        // exactly one cluster, so none is mixed; first-seen order 7→A, 3→B.
+        let turns = vec![
+            SpeakerTurn { start_ms: 0, end_ms: 900, cluster: 7 },
+            SpeakerTurn { start_ms: 1_000, end_ms: 1_900, cluster: 3 },
+            SpeakerTurn { start_ms: 2_000, end_ms: 2_900, cluster: 7 },
+        ];
 
         // Seed a user-set speaker_names map (mapping the OLD letters). A
         // re-diarization can re-letter speakers, so the map must be cleared by
@@ -510,12 +551,25 @@ mod diarization {
         let index = MeetingIndex::open(":memory:").await.expect("open index");
         index.rebuild_from_disk(&root).await.expect("seed index");
 
-        let stub = Box::new(StubDiarizer { speakers: 2 });
-        orch.rediarize_with_diarizer(&index, meeting_id, stub)
-            .await
-            .expect("rediarize_with_diarizer must succeed");
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Box::new(RecordingStubBackend { chunks: chunks.clone() });
+        orch.rediarize_with_split_inputs(
+            &index,
+            meeting_id,
+            turns,
+            Some(backend),
+            split_config(),
+        )
+        .await
+        .expect("rediarize_with_split_inputs must succeed");
 
-        // 1. transcript.json rewritten with speaker_ids (A/B round-robin).
+        // No mixed Qwen segment → the re-ASR backend is never invoked.
+        assert!(
+            chunks.lock().unwrap().is_empty(),
+            "single-speaker segments must not be re-ASR'd"
+        );
+
+        // 1. transcript.json rewritten with first-seen speaker_ids (7→A, 3→B).
         let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
         assert_eq!(after.len(), 3);
         assert_eq!(after[0].speaker_id.as_deref(), Some("A"));
@@ -554,6 +608,250 @@ mod diarization {
             }
         }
         assert!(got, "DiarizationComplete must be emitted");
+    }
+
+    /// A mixed Qwen segment (two clusters, no words) is split at the
+    /// speaker-change boundary: each single-speaker sub-clip is re-ASR'd, lettered
+    /// from the cluster→letter map, carries an EXCLUDING-clock `start_ms`, and has
+    /// empty `shared_speakers`.
+    #[tokio::test]
+    async fn rediarize_splits_mixed_qwen_segment_via_stub_backend() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        // 6 s buffer with a gap at 2 s (the mixed segment's interior cut). A mixed
+        // Qwen segment over [0, 4000) plus a solo speaker-9 segment near the end,
+        // so cluster 9 is a primary somewhere and earns letter B in the map.
+        let samples = two_speaker_pcm(2_000, 6_000);
+        let segs = vec![
+            qwen_seg(0, 4_000, "alpha beta"),
+            qwen_seg(5_600, 6_000, "tail"),
+        ];
+        let meeting_id = build_meeting_with_segments(&root, &samples, &segs);
+        let meeting_dir = root.join(meeting_id.0.to_string());
+
+        // Turns: cluster 5 on [0, 2000), cluster 9 on [2000, 6000). The mixed
+        // segment overlaps both ≥ 30%, so `overlay_speakers` flags it mixed; the
+        // interior cut is at 2000 ms. First-seen order 5→A, 9→B.
+        let turns = vec![
+            SpeakerTurn { start_ms: 0, end_ms: 2_000, cluster: 5 },
+            SpeakerTurn { start_ms: 2_000, end_ms: 6_000, cluster: 9 },
+        ];
+
+        let index = MeetingIndex::open(":memory:").await.expect("open index");
+        index.rebuild_from_disk(&root).await.expect("seed index");
+
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Box::new(RecordingStubBackend { chunks: chunks.clone() });
+        orch.rediarize_with_split_inputs(
+            &index,
+            meeting_id,
+            turns,
+            Some(backend),
+            split_config(),
+        )
+        .await
+        .expect("split must succeed");
+
+        // The mixed segment splits into A then B; the trailing solo-B row stays
+        // separate (gap > MERGE_GAP_MS) → three rows A, B, B.
+        let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
+        assert_eq!(after.len(), 3, "mixed segment splits; trailing solo-B is kept");
+        assert_eq!(after[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(after[1].speaker_id.as_deref(), Some("B"));
+        assert_eq!(after[2].speaker_id.as_deref(), Some("B"));
+        // The two split sub-clips have empty shared_speakers (no longer mixed) and
+        // are re-ASR'd text.
+        assert!(after[0].shared_speakers.is_empty());
+        assert!(after[1].shared_speakers.is_empty());
+        assert!(after[0].text.starts_with("reasr["));
+        assert!(after[1].text.starts_with("reasr["));
+
+        // Two re-ASR passes, one per split sub-clip (the solo-B row is untouched).
+        assert_eq!(chunks.lock().unwrap().len(), 2);
+
+        // EXCLUDING-clock start_ms: no ≥4 s pause, so excluding == including. The
+        // first sub-clip starts at 0; the second at the snapped ~2000 ms boundary.
+        assert_eq!(after[0].start_ms, 0);
+        assert!(
+            (1_800..=2_050).contains(&after[1].start_ms),
+            "second sub-clip starts at the snapped boundary (~2000 ms; the Opus \
+             round-trip shifts the energy valley earlier), got {}",
+            after[1].start_ms
+        );
+
+        assert_eq!(meta_speaker_count(&meeting_dir), 2);
+    }
+
+    /// Keep-whole when the backend is `None` (no re-ASR model): the mixed Qwen
+    /// segment stays one segment on its dominant label with `shared_speakers`
+    /// retained — the documented no-regression degrade.
+    #[tokio::test]
+    async fn rediarize_keeps_mixed_segment_whole_when_backend_absent() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        // The mixed [0,4000) segment needs the secondary cluster 9 to be a
+        // survivor, so add a trailing solo-9 segment (mirroring the split test);
+        // otherwise the segment is never flagged mixed and never reaches the
+        // keep-whole branch.
+        let samples = two_speaker_pcm(2_000, 6_000);
+        let segs = vec![qwen_seg(0, 4_000, "alpha beta"), qwen_seg(5_600, 6_000, "tail")];
+        let meeting_id = build_meeting_with_segments(&root, &samples, &segs);
+        let meeting_dir = root.join(meeting_id.0.to_string());
+
+        let turns = vec![
+            SpeakerTurn { start_ms: 0, end_ms: 2_000, cluster: 5 },
+            SpeakerTurn { start_ms: 2_000, end_ms: 6_000, cluster: 9 },
+        ];
+
+        let index = MeetingIndex::open(":memory:").await.expect("open index");
+        index.rebuild_from_disk(&root).await.expect("seed index");
+
+        orch.rediarize_with_split_inputs(&index, meeting_id, turns, None, split_config())
+            .await
+            .expect("keep-whole must succeed");
+
+        // backend None → the mixed [0,4000) is kept whole (dominant A + the B
+        // shared flag); the trailing solo-B stays its own row → two rows.
+        let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
+        assert_eq!(after.len(), 2, "backend None → keep-whole, no split");
+        assert_eq!(after[0].speaker_id.as_deref(), Some("A"));
+        assert!(
+            !after[0].shared_speakers.is_empty(),
+            "the mixed flag is retained when kept whole"
+        );
+    }
+
+    /// Keep-whole when the energy-snap finds no clear minimum: a constant-energy
+    /// buffer at the boundary means no real gap, so the split is abandoned and the
+    /// mixed segment stays whole even with a backend present.
+    #[tokio::test]
+    async fn rediarize_keeps_mixed_segment_whole_when_snap_finds_no_minimum() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        // Constant-energy buffer (no gap) → snap_to_energy_min returns None. The
+        // trailing solo-9 segment makes cluster 9 a survivor so [0,4000) is
+        // genuinely flagged mixed and reaches the split branch (where snap then
+        // abandons it).
+        let samples = vec![0.5f32; 16_000 * 6];
+        let segs = vec![qwen_seg(0, 4_000, "alpha beta"), qwen_seg(5_600, 6_000, "tail")];
+        let meeting_id = build_meeting_with_segments(&root, &samples, &segs);
+        let meeting_dir = root.join(meeting_id.0.to_string());
+
+        let turns = vec![
+            SpeakerTurn { start_ms: 0, end_ms: 2_000, cluster: 5 },
+            SpeakerTurn { start_ms: 2_000, end_ms: 6_000, cluster: 9 },
+        ];
+
+        let index = MeetingIndex::open(":memory:").await.expect("open index");
+        index.rebuild_from_disk(&root).await.expect("seed index");
+
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Box::new(RecordingStubBackend { chunks: chunks.clone() });
+        orch.rediarize_with_split_inputs(
+            &index,
+            meeting_id,
+            turns,
+            Some(backend),
+            split_config(),
+        )
+        .await
+        .expect("keep-whole must succeed");
+
+        // snap None at the interior cut abandons the split BEFORE any re-ASR; the
+        // mixed [0,4000) stays whole + flagged, the trailing solo-B is its own row.
+        let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
+        assert_eq!(after.len(), 2, "no clear energy minimum → keep-whole");
+        assert!(
+            chunks.lock().unwrap().is_empty(),
+            "an abandoned split must not re-ASR anything"
+        );
+        assert!(!after[0].shared_speakers.is_empty());
+    }
+
+    /// The post-split re-merge collapses an adjacent SAME-speaker pair but never
+    /// bridges the NEW speaker-change boundary the split introduced.
+    ///
+    /// Layout: a leading A segment immediately before a mixed A/B Qwen segment.
+    /// The split turns the mixed segment into A then B; the re-merge folds the
+    /// leading A into the split's leading A (same label, sub-`MERGE_GAP_MS` gap)
+    /// but leaves the A|B boundary intact → exactly two rows, A then B.
+    #[tokio::test]
+    async fn merge_after_split_does_not_bridge_the_new_boundary() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        // 8 s buffer: a clear gap at 4 s (the mixed segment's interior cut). The
+        // 0-2 s leading-A region and the 2-4 s first half of the mixed segment are
+        // the same speaker, so they re-merge. A trailing solo-9 segment makes
+        // cluster 9 a primary so it earns letter B in the cluster→letter map.
+        let samples = two_speaker_pcm(4_000, 8_000);
+        let segs = vec![
+            // Leading single-speaker A segment [0, 2000).
+            qwen_seg(0, 2_000, "intro"),
+            // Mixed A/B Qwen segment [2000, 6000), cut at 4000.
+            qwen_seg(2_000, 6_000, "alpha beta"),
+            // Trailing solo-B segment, far enough not to re-merge.
+            qwen_seg(7_600, 8_000, "tail"),
+        ];
+        let meeting_id = build_meeting_with_segments(&root, &samples, &segs);
+        let meeting_dir = root.join(meeting_id.0.to_string());
+
+        // Cluster 5 (→A) spans [0, 4000); cluster 9 (→B) spans [4000, 8000).
+        let turns = vec![
+            SpeakerTurn { start_ms: 0, end_ms: 4_000, cluster: 5 },
+            SpeakerTurn { start_ms: 4_000, end_ms: 8_000, cluster: 9 },
+        ];
+
+        let index = MeetingIndex::open(":memory:").await.expect("open index");
+        index.rebuild_from_disk(&root).await.expect("seed index");
+
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = Box::new(RecordingStubBackend { chunks: chunks.clone() });
+        orch.rediarize_with_split_inputs(
+            &index,
+            meeting_id,
+            turns,
+            Some(backend),
+            split_config(),
+        )
+        .await
+        .expect("split + merge must succeed");
+
+        let after = persistence::read_transcript(&meeting_dir).expect("read transcript after");
+        // Rows: A (leading A folded into the split's leading A) | B (split's
+        // second half) | B (trailing solo, gap > MERGE_GAP_MS so not folded). The
+        // A|B boundary the split introduced is never bridged.
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].speaker_id.as_deref(), Some("A"));
+        assert_eq!(after[1].speaker_id.as_deref(), Some("B"));
+        assert_eq!(after[2].speaker_id.as_deref(), Some("B"));
+        // The leading A row spans [0, ~4000): the leading-A segment merged with
+        // the split's leading-A sub-clip (no boundary between them).
+        assert_eq!(after[0].start_ms, 0);
+        assert!(
+            after[0].end_ms >= 3_700,
+            "leading A must extend through the split's first sub-clip (~4000 ms; \
+             Opus smear pulls the snapped boundary earlier), got {}",
+            after[0].end_ms
+        );
+    }
+
+    /// Read `metadata.json`'s `speaker_count`.
+    fn meta_speaker_count(meeting_dir: &std::path::Path) -> u32 {
+        persistence::read_metadata(meeting_dir)
+            .expect("read metadata")
+            .speaker_count
     }
 
     /// With `diarization_enabled = true`, `stop()` is now DECOUPLED from

@@ -588,7 +588,15 @@ greatest time overlap wins and its `speaker_id` string is copied verbatim
 (no re-lettering), so `MeetingMeta.speaker_names` stays keyed correctly after
 a re-transcribe. New segments with no prior overlap keep `None`. The
 orchestrator's `finalise_retranscribe` calls this before writing the new
-`transcript.json`. Tests: the default suite covers `overlay_speakers`
+`transcript.json`. A third pure public function
+`merge_adjacent_speakers(&mut Vec<Segment>, gap_threshold_ms)` collapses a run of
+adjacent segments sharing one `speaker_id` (gap `<=` threshold; a `None` label is
+a hard boundary) into a single segment — `text` space-joined, `words` concatenated
+in order, `[start_ms, end_ms)` unioned, `shared_speakers` the de-duplicated union
+minus the run's own label, `confidence` duration-weighted — so a speaker
+fragmented by the VAD hangover or the 10 s force-split reads as one turn
+(#0015 phase 1). `run_diarization_blocking` calls it after `assign_speakers` and
+recomputes the distinct-label count from the merged segments. Tests: the default suite covers `overlay_speakers`
 (interval-join, no-overlap=None, tie-break, first-seen relabel, stale-label
 clearing) AND the prune/cap (tiny-share drop + reassign, genuine-speaker keep,
 segment-count floor, cap-to-largest, never-zero fallback) AND

@@ -1477,6 +1477,13 @@ impl Orchestrator {
 // Diarization helpers (shared by the user-triggered re-diarize + on-stop pass)
 // ---------------------------------------------------------------------------
 
+/// #0015 phase 1 merge threshold: a same-speaker inter-segment gap up to this
+/// many ms is rejoined into one segment. Kept strictly below the live
+/// accumulator's `MAX_GAP_MS` (3 s) and far below `PAUSE_MIN_MS` (4 s) so a merge
+/// never bridges a region the timeline treats as a pause; it comfortably covers
+/// the 720 ms VAD hangover and the zero-gap 10 s force-split.
+const MERGE_GAP_MS: u64 = 1500;
+
 /// Decode the meeting's PCM + transcript and run `diarizer` over the segments,
 /// all on a `spawn_blocking` thread.
 ///
@@ -1490,8 +1497,22 @@ async fn run_diarization_blocking(
     tokio::task::spawn_blocking(move || -> AppResult<(Vec<Segment>, u32)> {
         let pcm = persistence::read_audio_pcm(&meeting_dir)?;
         let mut segments = persistence::read_transcript(&meeting_dir)?;
-        let speaker_count = diarizer.assign_speakers(&pcm, 16_000, &mut segments)?;
-        Ok((segments, speaker_count))
+        let _ = diarizer.assign_speakers(&pcm, 16_000, &mut segments)?;
+        // #0015 phase 1: collapse a speaker fragmented by VAD silence-gaps or the
+        // 10 s force-split into one segment so a turn reads as one row.
+        diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);
+        // Recompute the distinct-label count from the merged segments (the merge
+        // preserves labels, so it is invariant, but recomputing is robust and
+        // self-documenting — do not trust the pre-merge count).
+        let mut seen: Vec<String> = Vec::new();
+        for seg in &segments {
+            if let Some(ref label) = seg.speaker_id {
+                if !seen.contains(label) {
+                    seen.push(label.clone());
+                }
+            }
+        }
+        Ok((segments, seen.len() as u32))
     })
     .await
     .map_err(|e| AppError::Internal {

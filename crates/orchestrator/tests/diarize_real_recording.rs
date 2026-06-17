@@ -90,24 +90,58 @@ fn diarize_real_recording_threshold_sweep() {
         }
     };
 
-    let Some(meeting) = find_recording(&recordings) else {
-        eprintln!("no recording with audio.opus + usable transcript under {recordings}; skipping");
-        return;
+    // `MINUTIST_RECORDING_ID` targets a specific meeting; else auto-pick the first.
+    let meeting = match env_ne("MINUTIST_RECORDING_ID") {
+        Some(id) => {
+            let p = Path::new(&recordings).join(&id);
+            if !p.join("audio.opus").is_file() {
+                eprintln!("MINUTIST_RECORDING_ID={id}: no audio.opus under {recordings}; skipping");
+                return;
+            }
+            p
+        }
+        None => match find_recording(&recordings) {
+            Some(m) => m,
+            None => {
+                eprintln!("no recording with audio.opus + usable transcript under {recordings}; skipping");
+                return;
+            }
+        },
     };
     let audio = read_audio_pcm(&meeting).expect("decode audio.opus");
     let segs: Vec<Segment> =
         serde_json::from_slice(&std::fs::read(meeting.join("transcript.json")).unwrap()).unwrap();
 
+    let old_speakers = {
+        let mut s: Vec<&String> = segs.iter().filter_map(|x| x.speaker_id.as_ref()).collect();
+        s.sort();
+        s.dedup();
+        s.len()
+    };
     eprintln!(
-        "recording {:?}: {:.1}s audio, {} segments",
+        "recording {:?}: {:.1}s audio, {} segments, {} distinct speaker_id in the old transcript",
         meeting.file_name().unwrap(),
         audio.len() as f32 / 16_000.0,
-        segs.len()
+        segs.len(),
+        old_speakers
     );
     let seg_p = PathBuf::from(&seg);
     let emb_p = PathBuf::from(&emb);
-    for t in [0.30f32, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95] {
+
+    // Threshold sweep with the prune + smoothing OFF, so this isolates the
+    // agglomerative count vs `cluster_threshold` alone.
+    for t in [0.30f32, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.90, 0.95] {
         let n = diarize_at(&seg_p, &emb_p, t, &audio, &segs);
-        eprintln!("  cluster_threshold={t:.2} -> {n} speaker(s)");
+        eprintln!("  cluster_threshold={t:.2} (no prune) -> {n} speaker(s)");
     }
+
+    // The SHIPPED default (0.75 + smoothing 0.3/0.5 + prune 0.02). Comparing this
+    // to the no-prune count at 0.75 above isolates the prune's effect: if the
+    // no-prune 0.75 count is higher, the prune collapsed those clusters; if it
+    // already matches, the threshold/embedding did the merging.
+    let d = SherpaDiarizer::open(&seg_p, &emb_p, DiarizerConfig::default()).expect("open default");
+    let (_s, def_count) = d
+        .assign_speakers(&audio, 16_000, segs.clone())
+        .expect("assign default");
+    eprintln!("  DEFAULT config (0.75 + smoothing + prune 0.02) -> {def_count} speaker(s)");
 }

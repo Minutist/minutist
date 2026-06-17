@@ -1688,6 +1688,156 @@ pub(crate) fn pcm_window_for_excluding_range(
     None
 }
 
+/// Inverse of [`pcm_window_for_excluding_range`]: map a pause-INCLUDING PCM
+/// sample index back to its position on the pause-EXCLUDING transcript clock,
+/// in milliseconds (#0015 phase 4).
+///
+/// [`pcm_window_for_excluding_range`] is forward-only (excluding-ms → PCM
+/// range), so the re-ASR split needs this inverse to stamp each single-speaker
+/// sub-clip's `start_ms` on the transcript clock. Without it a sub-clip cut at a
+/// pause-INCLUDING sample would inherit the cumulative pre-segment pause padding
+/// and drift forward by every pause before it.
+///
+/// Walks the SAME [`pause_excluding_segments`] kept regions the forward map uses
+/// and inverts the per-region accounting: for the kept region that contains
+/// `sample`, the excluding-clock position is the region's `excl_start_ms` plus
+/// the kept-audio duration from the region start up to `sample`. A `sample` that
+/// falls inside a skipped pause (between two kept regions) clamps to the END of
+/// the preceding kept region — the same instant the excluding clock froze when
+/// the pause began — so a cut energy-snapped a few ms into pause padding still
+/// lands coherently. A `sample` past the last kept region clamps to the total
+/// kept duration. Pure (no FFI/IO) so the inverse round-trips under unit test.
+pub(crate) fn excluding_ms_for_pcm_sample(pcm: &[f32], sample: usize) -> u64 {
+    let regions = pause_excluding_segments(pcm);
+
+    let mut last_region_excl_end_ms: u64 = 0;
+    for region in &regions {
+        let region_kept_samples = region.src_end - region.src_start;
+        let region_excl_len_ms = (region_kept_samples as u64 * 1000) / SAMPLE_RATE_HZ;
+        let region_excl_end_ms = region.excl_start_ms + region_excl_len_ms;
+
+        if sample < region.src_start {
+            // The sample sits in the pause that precedes this kept region (or in
+            // the leading pause before the first region): the excluding clock was
+            // frozen at the previous region's end (0 before the first region).
+            return last_region_excl_end_ms;
+        }
+        if sample < region.src_end {
+            // Inside this kept region: excluding position = region start +
+            // kept-audio duration from the region start to `sample`.
+            let into_region = sample - region.src_start;
+            let into_region_ms = (into_region as u64 * 1000) / SAMPLE_RATE_HZ;
+            return region.excl_start_ms + into_region_ms;
+        }
+        last_region_excl_end_ms = region_excl_end_ms;
+    }
+    // Past the last kept region (trailing pause or out of range): the total kept
+    // duration.
+    last_region_excl_end_ms
+}
+
+/// Length of an RMS analysis window when snapping a cut to a local energy
+/// minimum (~5 ms at 16 kHz).
+const SNAP_RMS_WINDOW_MS: u64 = 5;
+
+/// Relative-RMS floor below which a candidate cut is accepted as a genuine
+/// low-energy boundary. The argmin window's RMS must be at most this fraction of
+/// the search span's mean RMS; otherwise the span is continuous/overlapping
+/// speech with no clear gap and [`snap_to_energy_min`] returns `None` so the
+/// caller keeps the segment whole.
+///
+/// Calibrated conservatively: a real inter-speaker boundary in meeting audio
+/// dips well under half the local mean energy, while a hand-off mid-phrase with
+/// no breath does not. Too strict here silently forces keep-whole; the abandon
+/// is logged so a real mixed clip can recalibrate it.
+const SNAP_REL_FLOOR: f32 = 0.5;
+
+/// Snap a speaker-change cut to the lowest-energy sample near `cut_sample`,
+/// searching `± window_ms` (#0015 phase 4).
+///
+/// `samples` is the pause-INCLUDING PCM the cut indexes. The search slides a
+/// `SNAP_RMS_WINDOW_MS` RMS window across `[cut_sample - window_ms, cut_sample +
+/// window_ms]` (clamped to the buffer) and returns the start sample of the
+/// minimum-RMS window — the quietest instant, where cutting the audio least
+/// disturbs either speaker's words.
+///
+/// Returns `None` when there is **no clear minimum**: if the argmin window's RMS
+/// is not at most [`SNAP_REL_FLOOR`] of the search span's mean RMS, the span is
+/// continuous or overlapping speech with no real gap, and the caller keeps the
+/// segment whole rather than cutting mid-word. Also `None` when the search span
+/// is degenerate (empty or shorter than one RMS window). Emits `tracing::debug`
+/// when a snap is abandoned. Pure (no FFI/IO).
+pub(crate) fn snap_to_energy_min(
+    samples: &[f32],
+    cut_sample: usize,
+    window_ms: u64,
+) -> Option<usize> {
+    let rms_win = (SNAP_RMS_WINDOW_MS as usize * SAMPLE_RATE_HZ as usize) / 1000;
+    if rms_win == 0 || samples.is_empty() {
+        return None;
+    }
+    let window_samples = (window_ms as usize * SAMPLE_RATE_HZ as usize) / 1000;
+
+    let lo = cut_sample.saturating_sub(window_samples);
+    // The last valid RMS-window start keeps the whole window inside the span.
+    let hi = (cut_sample + window_samples).min(samples.len());
+    if hi <= lo || hi - lo < rms_win {
+        tracing::debug!(
+            target: "orchestrator",
+            cut_sample,
+            window_ms,
+            "snap_to_energy_min: search span too short; keeping segment whole"
+        );
+        return None;
+    }
+
+    let rms_at = |start: usize| -> f32 {
+        let end = (start + rms_win).min(samples.len());
+        let win = &samples[start..end];
+        if win.is_empty() {
+            return f32::MAX;
+        }
+        let sum_sq: f32 = win.iter().map(|s| s * s).sum();
+        (sum_sq / win.len() as f32).sqrt()
+    };
+
+    let last_start = hi - rms_win;
+    let mut best_start = lo;
+    let mut best_rms = f32::MAX;
+    let mut rms_sum = 0.0f32;
+    let mut rms_count = 0u32;
+    for start in lo..=last_start {
+        let rms = rms_at(start);
+        rms_sum += rms;
+        rms_count += 1;
+        if rms < best_rms {
+            best_rms = rms;
+            best_start = start;
+        }
+    }
+
+    let mean_rms = if rms_count > 0 {
+        rms_sum / rms_count as f32
+    } else {
+        0.0
+    };
+    // A genuine boundary dips well below the local mean; continuous/overlapping
+    // speech does not. `mean_rms == 0` (digital silence everywhere) is itself a
+    // clear minimum, so accept it.
+    if mean_rms > 0.0 && best_rms > SNAP_REL_FLOOR * mean_rms {
+        tracing::debug!(
+            target: "orchestrator",
+            cut_sample,
+            best_rms,
+            mean_rms,
+            "snap_to_energy_min: no clear minimum (continuous speech); keeping segment whole"
+        );
+        return None;
+    }
+
+    Some(best_start)
+}
+
 /// Re-run transcription over a fully-decoded PCM buffer, reusing the live
 /// pipeline's batched-VAD [`Accumulator`] + ASR-dispatch machinery.
 ///
@@ -2895,5 +3045,98 @@ mod tests {
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].src_start, pause, "leading pause must be skipped");
         assert_eq!(regions[0].excl_start_ms, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // snap_to_energy_min (#0015 phase 4)
+    // -----------------------------------------------------------------------
+
+    /// A speech–silence–speech buffer snaps the cut into the silent valley: the
+    /// returned argmin window sits inside the near-silent run, not in either
+    /// speech burst.
+    #[test]
+    fn snap_finds_the_silence_valley() {
+        // 200 ms speech, 60 ms silence, 200 ms speech.
+        let a = ms_to_samples(200);
+        let gap = ms_to_samples(60);
+        let b = ms_to_samples(200);
+        let mut pcm = vec![0.5f32; a];
+        pcm.extend(std::iter::repeat_n(0.0f32, gap));
+        pcm.extend(std::iter::repeat_n(0.5f32, b));
+
+        // Cut nominally at the speech/silence boundary; search ±150 ms.
+        let cut = a;
+        let snapped = snap_to_energy_min(&pcm, cut, 150).expect("a clear minimum exists");
+        // The argmin window must fall within the silent run [a, a + gap).
+        assert!(
+            snapped >= a && snapped < a + gap,
+            "snap {snapped} must land in the silent valley [{a}, {})",
+            a + gap
+        );
+    }
+
+    /// Constant-energy audio has no clear minimum → `None` (keep-whole). The
+    /// relative-RMS floor rejects a flat span as continuous/overlapping speech.
+    #[test]
+    fn snap_returns_none_on_constant_energy() {
+        let pcm = vec![0.5f32; ms_to_samples(500)];
+        let cut = ms_to_samples(250);
+        assert!(
+            snap_to_energy_min(&pcm, cut, 150).is_none(),
+            "a flat-energy span has no boundary to snap to"
+        );
+    }
+
+    /// A degenerate search span (window shorter than one RMS window) → `None`.
+    #[test]
+    fn snap_returns_none_on_tiny_span() {
+        let pcm = vec![0.5f32; ms_to_samples(100)];
+        // window_ms = 1 → ±1 ms span (16 samples each side), below the 5 ms RMS
+        // window, so there is no usable analysis window.
+        assert!(snap_to_energy_min(&pcm, ms_to_samples(50), 1).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // excluding_ms_for_pcm_sample — the PCM→excluding-ms inverse (#0015 phase 4)
+    // -----------------------------------------------------------------------
+
+    /// Inside a single kept region (no pause) the inverse is the straight
+    /// sample→ms conversion: PCM sample N maps to N/16 ms on the excluding clock.
+    #[test]
+    fn inverse_maps_within_single_region() {
+        let pcm = vec![0.5f32; ms_to_samples(5000)];
+        assert_eq!(excluding_ms_for_pcm_sample(&pcm, ms_to_samples(1500)), 1500);
+        assert_eq!(excluding_ms_for_pcm_sample(&pcm, 0), 0);
+    }
+
+    /// CLOCK REGRESSION GUARD: with a ≥4 s pause, the forward map and the inverse
+    /// round-trip. A post-pause excluding-ms maps to a pause-INCLUDING PCM sample
+    /// (forward), and that sample maps back to the SAME excluding-ms (inverse) —
+    /// proving a split sub-clip's `start_ms` lands on the transcript clock, not
+    /// inflated by the skipped pause padding.
+    #[test]
+    fn inverse_round_trips_across_a_long_pause() {
+        // 2 s speech, 6 s pause (> PAUSE_MIN_MS = 4 s), 3 s speech.
+        let speech_a = ms_to_samples(2000);
+        let pause = ms_to_samples(6000);
+        let speech_b = ms_to_samples(3000);
+        let mut pcm = vec![0.5f32; speech_a];
+        pcm.extend(std::iter::repeat_n(0.0f32, pause));
+        pcm.extend(std::iter::repeat_n(0.5f32, speech_b));
+
+        // Post-pause excluding clock: region 2 starts at excluding 2000 ms. Pick a
+        // point 1000 ms into it → excluding 3000 ms.
+        let excl_ms = 3000u64;
+        let range =
+            pcm_window_for_excluding_range(&pcm, excl_ms, excl_ms + 100).expect("forward range");
+        // The forward map lands on pause-INCLUDING samples AFTER the pause.
+        assert_eq!(range.start, speech_a + pause + ms_to_samples(1000));
+        // The inverse takes that PCM sample back to the SAME excluding ms.
+        assert_eq!(excluding_ms_for_pcm_sample(&pcm, range.start), excl_ms);
+
+        // A sample INSIDE the skipped pause clamps to the pre-pause region end
+        // (excluding 2000 ms — the instant the clock froze).
+        let mid_pause = speech_a + ms_to_samples(3000);
+        assert_eq!(excluding_ms_for_pcm_sample(&pcm, mid_pause), 2000);
     }
 }

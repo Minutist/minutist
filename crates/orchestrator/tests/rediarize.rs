@@ -1,11 +1,12 @@
 //! GATED integration test for the Phase 6 offline `Orchestrator::rediarize`.
 //!
 //! Per `architecture/cross-cutting.md` — Automated-testing policy, the
-//! default-suite (no-model) wiring of the diarization path is covered by the
-//! `StubDiarizer` test in `src/tests.rs` (the re-diarize inner path + the
-//! toggle-OFF `stop()` pass). This file holds the **env-var-gated** end-to-end
-//! run over real models + the S1 2-speaker fixture, with a no-op skip path so
-//! CI passes with the models absent.
+//! default-suite (no-model) wiring of the diarization + #0015-phase-4 re-ASR
+//! split is covered by the `rediarize_with_split_inputs` tests in `src/tests.rs`
+//! (synthetic turns + a stub `AsrBackend` drive the re-diarize inner path, the
+//! split, and the toggle-OFF `stop()` pass). This file holds the
+//! **env-var-gated** end-to-end run over real models + the S1 2-speaker fixture,
+//! with a no-op skip path so CI passes with the models absent.
 //!
 //! To run:
 //!   MINUTIST_DIARIZE_SEG_PATH=/path/to/segmentation.onnx \

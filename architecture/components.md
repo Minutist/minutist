@@ -1285,24 +1285,56 @@ depend on `persistence` (the orchestrator sources audio through
 
 - `Orchestrator::rediarize(&MeetingIndex, MeetingId)` — the offline
   user-triggered re-diarize, copying `re_transcribe`'s one-shot idiom: it refuses
-  unless `Idle` (`AppError::InvalidInput`), then on `spawn_blocking` decodes the
-  pause-INCLUDING PCM (`read_audio_pcm`) + reads `transcript.json`
-  (`read_transcript`) and runs `Diarizer::assign_speakers(&audio, 16000,
-  segments)` (returning the labelled, possibly turn-split segment list +
-  distinct-count). It rewrites `transcript.json` with the overlaid
-  `speaker_id`s (`write_transcript`), updates `metadata.json`'s `{ speaker_count,
-  diarizer: Some(ModelDescriptor{..}) }` (`persistence::write_metadata`), refreshes
-  the supplied index row's `speaker_count` (`MeetingIndex::upsert`), and emits
-  `AppEvent::DiarizationComplete { meeting_id, speaker_count }` on the shared
-  `event_tx`. The index handle is passed in by `ipc-bridge` (the orchestrator does
-  not own one), exactly as for `re_transcribe`. The (uninterruptible) sherpa
-  `compute` is wrapped in a **length-relative timeout** (`diarize_timeout`: ≈1×
-  real-time, floored at 2 min / capped at 10 min — sized from `metadata.duration_ms`);
-  on timeout `rediarize_inner` returns `AppError::Inference` BEFORE any write, so a
+  unless `Idle` (`AppError::InvalidInput`), then decodes the pause-INCLUDING PCM
+  (`read_audio_pcm`) + reads `transcript.json` (`read_transcript`), runs the
+  bundled `SherpaDiarizer::compute_turns(&audio, 16000)`, overlays first-seen
+  speaker labels (`diarizer::overlay_speakers`), and (#0015 phase 4) re-ASRs each
+  kept mixed Qwen segment into single-speaker sub-clips. It rewrites
+  `transcript.json` with the overlaid `speaker_id`s (`write_transcript`), updates
+  `metadata.json`'s `{ speaker_count, diarizer: Some(ModelDescriptor{..}) }`
+  (`persistence::write_metadata`), refreshes the supplied index row's
+  `speaker_count` (`MeetingIndex::upsert`), and emits `AppEvent::DiarizationComplete
+  { meeting_id, speaker_count }` on the shared `event_tx`. The index handle is
+  passed in by `ipc-bridge` (the orchestrator does not own one), exactly as for
+  `re_transcribe`. The (uninterruptible) sherpa `compute` + the N re-ASR
+  `transcribe_chunk` passes are wrapped in a **length-relative timeout** sized
+  like `retranscribe_timeout` (≈3× real-time, floored 5 min / capped 30 min —
+  ASR is the slow part once the split runs, so the diarize-only `diarize_timeout`
+  curve would cut a split-heavy meeting off mid-split); on timeout
+  `rediarize_inner` returns `AppError::Inference` BEFORE any write, so a
   pathologically slow or wedged pass leaves the meeting un-diarized instead of
   blocking forever. (`tokio` cannot cancel the `spawn_blocking` thread, so a true
   infinite hang leaks one thread until exit; the budget bounds the wait, not the
   thread.)
+- **#0015 phase 4 — re-ASR split of mixed Qwen segments.** The blocking core is
+  the free fn `diarize_split_merge(turns, segments, pcm, Option<backend>, config,
+  …)` — turns + backend are EXPLICIT params (it does NOT dispatch through the
+  `common::Diarizer` trait), so the default suite drives the whole split with
+  stub-supplied turns + a stub `AsrBackend` (no `SherpaDiarizer`, no Qwen GGUF),
+  mirroring `transcribe_pcm_window_blocking`'s stub seam. The async caller builds
+  the `SherpaDiarizer` + the routed Qwen backend best-effort
+  (`runner::build_asr_backend_for_retranscribe`; absent model → `None` → degrade
+  to the prior keep-whole-and-flag, no regression), honouring `gpu_plan`, and
+  drops the backend at the end of the split loop (the Qwen GGUF is co-resident
+  with the sherpa diarizer models). The core: `overlay_speakers` (labels +
+  flags mixed Qwen segments + returns the cluster→letter map) → `merge_adjacent_speakers`
+  → for each kept mixed Qwen segment (non-empty `shared_speakers` AND empty
+  `words`) take `diarizer::turn_boundaries_within` cuts on the SAME
+  pause-INCLUDING clock the turns + PCM share (the segment's pause-EXCLUDING
+  `[start_ms,end_ms)` is mapped to PCM via `runner::pcm_window_for_excluding_range`),
+  energy-snap each cut (`runner::snap_to_energy_min`, ±150 ms RMS argmin; `None`
+  on continuous speech → keep-whole), slice the PCM, re-ASR each single-speaker
+  sub-clip via `backend.transcribe_chunk`, letter it from the cluster→letter map
+  by its dominant `SpeakerTurn.cluster`, and stamp its `start_ms` on the EXCLUDING
+  transcript clock via the inverse `runner::excluding_ms_for_pcm_sample` →
+  re-run `merge_adjacent_speakers` + recompute the count. Keep-whole when the cuts
+  are empty, any snap returns `None`, or the backend is `None`. The single-clock
+  discipline (INCLUDING turns are NEVER compared against EXCLUDING bounds) +
+  the inverse map are the two phase-4 clock blockers; see `cross-cutting.md` —
+  "Notes paragraph-anchor clock". Each re-ASR'd sub-clip is also emitted as
+  `AppEvent::TranscriptSegment` (it is genuinely fresh ASR text — the same event
+  the re-transcribe path uses); the final `write_transcript` + `DiarizationComplete`
+  refetch remains authoritative.
 - **On-stop pass — decoupled, background.** Diarization is NOT run inline in
   `stop()`. `stop()` finalises the meeting and returns it **un-diarized**
   (`speaker_count 0`, `diarizer None`) the instant it is on disk and the recorder
@@ -1317,14 +1349,16 @@ depend on `persistence` (the orchestrator sources audio through
   `stop()` ran this pass INLINE/awaited; a hung 30-min diarization then blocked the
   whole stop flow and left the meeting unindexed until the next launch — fixed by
   this decoupling.)
-- **Test seam — `rediarize_with_diarizer(&MeetingIndex, MeetingId, Box<dyn
-  Diarizer + Send>)`.** A `#[cfg(any(test, feature = "test-source"))]`-gated
-  sibling of `rediarize` (mirroring `re_transcribe_with_backend`): both `rediarize`
-  and this seam delegate to a shared `rediarize_inner` taking an owned
-  `Box<dyn Diarizer + Send>`, so the default suite exercises the full
-  decode → assign → `transcript.json` rewrite → `metadata.json` update →
-  index-upsert → `DiarizationComplete` wiring with a `StubDiarizer` (NO model).
-  `DiarizationComplete` is emitted by the **orchestrator**, not `ipc-bridge`.
+- **Test seam — `rediarize_with_split_inputs(&MeetingIndex, MeetingId,
+  Vec<SpeakerTurn>, Option<Box<dyn AsrBackend + Send>>, DiarizerConfig)`.** A
+  `#[cfg(any(test, feature = "test-source"))]`-gated sibling of `rediarize`
+  (mirroring `re_transcribe_with_backend`): both delegate to a shared
+  `rediarize_inner` taking a `DiarizationJob` (production `SherpaDiarizer` + Qwen
+  backend, or stub turns + backend), so the default suite exercises the full
+  decode → overlay → split → merge → `transcript.json` rewrite → `metadata.json`
+  update → index-upsert → `DiarizationComplete` wiring with caller-supplied turns
+  + a stub `AsrBackend` (NO sherpa model, NO Qwen GGUF). `DiarizationComplete` is
+  emitted by the **orchestrator**, not `ipc-bridge`.
 
 **Integration tests** live in `crates/orchestrator/tests/` (per
 `cross-cutting.md` — Testing). Phase 1 integration tests:
@@ -1342,10 +1376,14 @@ the committed LibriSpeech fixture into `audio.opus` via the persistence Opus
 encoder, empties `transcript.json`, then runs `re_transcribe_with_backend` with a
 `StubAsrBackend` so the real Silero VAD + offline accumulator + transcript
 rewrite + index-excerpt refresh are exercised in CI without a model. Phase 6
-diarization tests: the **default-suite, model-free** `StubDiarizer` lib tests
-(`tests::diarization`) drive the re-diarize inner path
-(`rediarize_with_diarizer` → `transcript.json` rewrite with `speaker_id`s +
-`metadata.json` `speaker_count` + `DiarizationComplete`); two `stop()` tests
+diarization tests: the **default-suite, model-free** lib tests
+(`tests::diarization`) drive the re-diarize + #0015-phase-4 split inner path via
+`rediarize_with_split_inputs` (synthetic turns + a stub `AsrBackend`):
+`transcript.json` rewrite with `speaker_id`s, the mixed-Qwen-segment split into
+single-speaker sub-clips with correct letters + EXCLUDING-clock `start_ms`, the
+keep-whole fallbacks (backend `None` / no clear energy minimum), the
+no-re-merge-across-the-new-boundary guard, `metadata.json` `speaker_count`, and
+`DiarizationComplete`; two `stop()` tests
 assert diarization is now **decoupled** from `stop()` — both
 `diarization_enabled = true` (`stop_with_diarization_enabled_is_decoupled_from_stop`)
 and `false` return the meeting un-diarized (`speaker_id == None`, `speaker_count

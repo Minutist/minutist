@@ -357,6 +357,26 @@ by the pause). Limitation: a ≥ 4 s run of genuinely-silent *input* would be
 misclassified; a persisted pause-interval map (a `common`/schema change) would
 make this exact rather than heuristic — tracked for a later phase.
 
+**Re-diarize re-ASR split must stay on a single clock (#0015 phase 4).** The
+offline re-diarize pass re-ASRs each kept mixed Qwen segment into single-speaker
+sub-clips at its speaker-change boundaries. The two clocks must never be
+compared directly: `SherpaDiarizer::compute_turns` runs over the pause-INCLUDING
+PCM, so `SpeakerTurn` ms are pause-INCLUDING, whereas `Segment::start_ms` is
+pause-EXCLUDING. The split therefore (1) maps the segment's pause-EXCLUDING
+`[start_ms,end_ms)` to a pause-INCLUDING PCM range via
+`runner::pcm_window_for_excluding_range`, (2) takes
+`diarizer::turn_boundaries_within` cuts on the SAME pause-INCLUDING clock the
+turns + PCM share, energy-snaps each cut (`runner::snap_to_energy_min`), slices
+the PCM, and re-ASRs each sub-clip, then (3) stamps each sub-clip's `start_ms`
+back onto the pause-EXCLUDING transcript clock via the inverse
+`runner::excluding_ms_for_pcm_sample` (the forward map is one-way). Without the
+inverse, a post-pause sub-clip would inherit the cumulative pre-segment pause
+padding and drift forward by every pause before it — breaking the FR-22/23
+cross-reference and the notes-anchor join the same way an unconverted
+re-transcribe would. The `≥4 s-pause` clock-regression unit test
+(`runner::tests::inverse_round_trips_across_a_long_pause`) guards the
+forward↔inverse round-trip.
+
 **Offline ops are serialized — but a new recording preempts them.**
 `re_transcribe` and `rediarize` atomically CLAIM an internal `Offline` state
 under the orchestrator lock (rejecting a concurrent re-transcribe / re-diarize

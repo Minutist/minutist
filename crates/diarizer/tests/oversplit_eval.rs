@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 
-use diarizer::{overlay_speakers, DiarizerConfig};
+use diarizer::{overlay_speakers, DiarizerConfig, SpeakerTurn};
 use minutist_common::Segment;
 use sherpa_rs::diarize::{Diarize, DiarizeConfig};
 
@@ -54,7 +54,9 @@ fn eval_inputs() -> Option<(PathBuf, PathBuf, PathBuf, u64)> {
 }
 
 /// Run sherpa `Diarize::compute` once with the given threshold + smoothing,
-/// returning the raw turns. The model loads + computes here (the expensive part).
+/// returning the turns as diarizer [`SpeakerTurn`]s (seconds → ms, mirroring
+/// `SherpaDiarizer::compute_turns`). The model loads + computes here (the
+/// expensive part).
 fn compute_turns(
     seg_path: &std::path::Path,
     emb_path: &std::path::Path,
@@ -62,7 +64,7 @@ fn compute_turns(
     cluster_threshold: f32,
     min_duration_on: f32,
     min_duration_off: f32,
-) -> Vec<sherpa_rs::diarize::Segment> {
+) -> Vec<SpeakerTurn> {
     let config = DiarizeConfig {
         num_clusters: Some(-1), // threshold mode (production sentinel)
         threshold: Some(cluster_threshold),
@@ -73,14 +75,21 @@ fn compute_turns(
     };
     let mut engine =
         Diarize::new(seg_path, emb_path, config).expect("open Diarize with the real models");
-    engine
+    let raw = engine
         .compute(pcm.to_vec(), None)
-        .expect("Diarize::compute on the meeting slice")
+        .expect("Diarize::compute on the meeting slice");
+    raw.into_iter()
+        .map(|s| SpeakerTurn {
+            start_ms: (s.start.max(0.0) * 1000.0).round() as u64,
+            end_ms: (s.end.max(0.0) * 1000.0).round() as u64,
+            cluster: s.speaker,
+        })
+        .collect()
 }
 
 /// Count the distinct speakers `overlay_speakers` reports for a given prune
 /// `share` over already-computed `turns`. Pure + cheap (no model).
-fn count_with_prune(turns: &[sherpa_rs::diarize::Segment], base: &[Segment], share: f32) -> u32 {
+fn count_with_prune(turns: &[SpeakerTurn], base: &[Segment], share: f32) -> u32 {
     let cfg = DiarizerConfig {
         min_cluster_share: share,
         min_cluster_segments: 0,
@@ -94,7 +103,7 @@ fn count_with_prune(turns: &[sherpa_rs::diarize::Segment], base: &[Segment], sha
     for s in &mut segs {
         s.words.clear();
     }
-    let (_segs, count) = overlay_speakers(turns, segs, &cfg);
+    let (_segs, count, _map) = overlay_speakers(turns, segs, &cfg);
     count
 }
 
@@ -176,7 +185,8 @@ fn oversplit_count_vs_knob_sweep() {
     for s in &mut new_segs {
         s.words.clear();
     }
-    let (_new_segs, new_count) = overlay_speakers(&new_turns, new_segs, &DiarizerConfig::default());
+    let (_new_segs, new_count, _map) =
+        overlay_speakers(&new_turns, new_segs, &DiarizerConfig::default());
     eprintln!(
         "\n-- BEFORE/AFTER on this slice --\n  OLD (thr 0.75, no smoothing, no prune): {old_count}\
          \n  NEW (DiarizerConfig::default()):        {new_count}"

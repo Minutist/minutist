@@ -28,20 +28,29 @@
 //!
 //! [`SherpaDiarizer::open`] constructs the sherpa `Diarize` engine once, holding
 //! it behind a `Mutex` (the `common::Diarizer` trait takes `&self` but sherpa's
-//! `compute` takes `&mut self`). [`SherpaDiarizer::assign_speakers`] then:
+//! `compute` takes `&mut self`). The work splits across two public seams:
 //!
+//! [`SherpaDiarizer::compute_turns`]:
 //! 1. asserts the input is 16 kHz (sherpa's pyannote segmentation is fixed at
 //!    16 kHz; anything else is `AppError::InvalidInput`),
 //! 2. runs `Diarize::compute` to get raw sherpa turns
 //!    `{ start_s, end_s, speaker: i32 }`,
-//! 3. converts the seconds to milliseconds and overlays a `speaker_id` onto each
-//!    ASR `Segment` by **max-overlap interval-join** over `[start_ms, end_ms]`
-//!    (no overlap → `None`),
-//! 4. applies a **post-cluster prune** (and optional cap) — drops clusters that
+//! 3. maps each to a sherpa-free [`SpeakerTurn`] in milliseconds — so the
+//!    `sherpa-rs` type never escapes the crate.
+//!
+//! [`overlay_speakers`] then, over those `SpeakerTurn`s:
+//! 4. overlays a `speaker_id` onto each ASR `Segment` by **max-overlap
+//!    interval-join** over `[start_ms, end_ms)` (no overlap → `None`),
+//! 5. applies a **post-cluster prune** (and optional cap) — drops clusters that
 //!    win a negligible share of the attributed speech and reassigns their
 //!    segments to the nearest surviving cluster (issue #63) — then
-//! 5. relabels the surviving `i32` cluster ids to first-seen-order `"A"`, `"B"`,
-//!    … and returns the distinct-label count.
+//! 6. relabels the surviving `i32` cluster ids to first-seen-order `"A"`, `"B"`,
+//!    …, returning the segments, the distinct-label count, and the cluster→letter
+//!    map (so a caller re-lettering a re-ASR'd sub-clip reuses the same scheme).
+//!
+//! [`SherpaDiarizer::assign_speakers`] (the `common::Diarizer` trait method) is
+//! the thin compose of the two, dropping the map for its `(Vec<Segment>, u32)`
+//! contract.
 //!
 //! The over-split fix (issue #63, 2026-06-10): on long, acoustically-varied
 //! recordings (room coloration + system-audio loopback + a podcast over a
@@ -62,10 +71,32 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use minutist_common::{AppResult, Diarizer, Segment};
-use sherpa_rs::diarize::{Diarize, DiarizeConfig, Segment as SherpaSegment};
+use sherpa_rs::diarize::{Diarize, DiarizeConfig};
 
 mod error;
 pub use error::Error;
+
+/// One diarized speaker turn in **milliseconds** — a sherpa-free plain-data
+/// projection of `sherpa_rs::diarize::Segment` (`{ start_s, end_s, speaker }`).
+///
+/// [`SherpaDiarizer::compute_turns`] maps each raw sherpa turn to this POD so the
+/// `sherpa-rs` type never crosses the crate boundary. `cluster` is the arbitrary
+/// `i32` cluster id sherpa assigns (not yet a first-seen `A`/`B` label — that
+/// happens in [`overlay_speakers`]). `[start_ms, end_ms)` is half-open, on the
+/// same clock as the PCM the turns were computed over.
+///
+/// Diarizer-public, deliberately NOT in `common`: the orchestrator already
+/// depends on `diarizer`, so exposing the raw turns here adds no dependency edge,
+/// whereas a `common::SpeakerTurn` would let any crate pick it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeakerTurn {
+    /// Turn start, milliseconds (inclusive).
+    pub start_ms: u64,
+    /// Turn end, milliseconds (exclusive).
+    pub end_ms: u64,
+    /// Arbitrary sherpa cluster id (first-seen-relabelled downstream).
+    pub cluster: i32,
+}
 
 mod online;
 pub use online::clusterer::{ClusterAssignment, OnlineClusterer, OnlineClustererConfig};
@@ -266,6 +297,51 @@ impl SherpaDiarizer {
     pub fn config(&self) -> &DiarizerConfig {
         &self.config
     }
+
+    /// Run the sherpa segmentation + embedding + clustering pipeline and return
+    /// the raw speaker turns as sherpa-free [`SpeakerTurn`]s in **milliseconds**.
+    ///
+    /// Asserts the input is 16 kHz (sherpa's pyannote segmentation is fixed at
+    /// 16 kHz; anything else is `AppError::InvalidInput`), short-circuits empty
+    /// audio to an empty turn list (sherpa's `compute` bail!s on zero-length
+    /// input), then runs `Diarize::compute` under the engine `Mutex` and maps each
+    /// `sherpa_rs::diarize::Segment` `{ start_s, end_s, speaker }` to a
+    /// `SpeakerTurn` via [`seconds_to_ms`] — so the sherpa type never escapes.
+    ///
+    /// The turns run over the audio buffer as supplied (production passes the
+    /// pause-INCLUDING PCM), so the returned ms share that clock. This is the
+    /// public seam the orchestrator's split funnel consumes directly;
+    /// [`SherpaDiarizer::assign_speakers`] composes it with [`overlay_speakers`].
+    pub fn compute_turns(&self, audio: &[f32], sample_rate: u32) -> AppResult<Vec<SpeakerTurn>> {
+        require_supported_sample_rate(sample_rate)?;
+
+        // Nothing to diarize — empty audio. Don't invoke sherpa (its `compute`
+        // bail!s on zero-length input).
+        if audio.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let raw = {
+            let mut engine = self
+                .engine
+                .lock()
+                .map_err(|_| Error::Inference("diarizer engine mutex poisoned".to_string()))?;
+            // sherpa takes ownership of the sample buffer (it mutates the ptr in
+            // place); clone the borrowed slice into an owned Vec for the FFI call.
+            engine
+                .compute(audio.to_vec(), None)
+                .map_err(|e| Error::Inference(format!("sherpa Diarize::compute failed: {e:?}")))?
+        };
+
+        Ok(raw
+            .into_iter()
+            .map(|s| SpeakerTurn {
+                start_ms: seconds_to_ms(s.start),
+                end_ms: seconds_to_ms(s.end),
+                cluster: s.speaker,
+            })
+            .collect())
+    }
 }
 
 /// Map [`DiarizerConfig`] onto sherpa's `DiarizeConfig`.
@@ -301,41 +377,31 @@ impl Diarizer for SherpaDiarizer {
         sample_rate: u32,
         segments: Vec<Segment>,
     ) -> AppResult<(Vec<Segment>, u32)> {
-        require_supported_sample_rate(sample_rate)?;
-
-        // Nothing to assign — empty transcript or empty audio. Don't invoke
-        // sherpa (its `compute` bail!s on zero-length input).
-        if segments.is_empty() || audio.is_empty() {
-            return Ok((segments, 0));
-        }
-
-        let turns = {
-            let mut engine = self.engine.lock().map_err(|_| {
-                Error::Inference("diarizer engine mutex poisoned".to_string())
-            })?;
-            // sherpa takes ownership of the sample buffer (it mutates the ptr in
-            // place); clone the borrowed slice into an owned Vec for the FFI call.
-            engine
-                .compute(audio.to_vec(), None)
-                .map_err(|e| Error::Inference(format!("sherpa Diarize::compute failed: {e:?}")))?
-        };
-
-        Ok(overlay_speakers(&turns, segments, &self.config))
+        // Compose the two public seams: compute the raw turns, then overlay them
+        // onto the ASR segments. The cluster→letter map is discarded here (the
+        // trait contract is `(Vec<Segment>, u32)`); the orchestrator's split
+        // funnel calls `compute_turns` + `overlay_speakers` directly when it needs
+        // the map.
+        self.compute_turns(audio, sample_rate).map(|turns| {
+            let (segs, n, _map) = overlay_speakers(&turns, segments, &self.config);
+            (segs, n)
+        })
     }
 }
 
 /// Overlay first-seen-relabelled speaker ids onto `segments` by max-overlap
 /// interval-join, applying the `config`'s post-cluster prune + cap, splitting a
 /// mixed word-timestamped segment at its turn boundaries, and return the owned
-/// (possibly longer) segment list plus the distinct-label count.
+/// (possibly longer) segment list, the distinct-label count, and the
+/// cluster→letter map.
 ///
-/// For each ASR `segment`, the sherpa cluster (turns are in **seconds**) with
-/// the greatest total temporal overlap over `[start_ms, end_ms)` wins; its `i32`
-/// cluster id is recorded. Segments with no overlapping turn get
-/// `speaker_id = None`. Ties (equal overlap) resolve to the **lower** cluster id
-/// (deterministic; sherpa numbers clusters by first appearance, so the lower id
-/// is the earlier-seen speaker — the same orientation as the previous earlier-
-/// turn tie-break, but now over per-cluster totals).
+/// For each ASR `segment`, the [`SpeakerTurn`] cluster (turns are in
+/// **milliseconds**) with the greatest total temporal overlap over
+/// `[start_ms, end_ms)` wins; its `i32` cluster id is recorded. Segments with no
+/// overlapping turn get `speaker_id = None`. Ties (equal overlap) resolve to the
+/// **lower** cluster id (deterministic; sherpa numbers clusters by first
+/// appearance, so the lower id is the earlier-seen speaker — the same orientation
+/// as the previous earlier-turn tie-break, but now over per-cluster totals).
 ///
 /// Then, when the `config` enables it (issue #63):
 /// 1. **Prune** — tally each cluster's share of total attributed speech DURATION
@@ -358,16 +424,21 @@ impl Diarizer for SherpaDiarizer {
 ///
 /// The surviving cluster ids (per kept segment and per split sub-segment) are
 /// relabelled to first-seen order `"A"`, `"B"`, … across the OUTPUT segments in
-/// order — so a split's sub-segments letter in transcript order. The return
-/// value is the number of distinct labels actually assigned (segments left
-/// `None` do not count).
+/// order — so a split's sub-segments letter in transcript order. The returned
+/// tuple is `(segments, distinct-label count, cluster→letter map)`: the count is
+/// the number of distinct labels actually assigned (segments left `None` do not
+/// count), and the map pairs each surviving cluster id with the letter baked into
+/// the output `speaker_id`s, in the SAME first-seen order. The map lets a caller
+/// re-ASR'ing a sub-clip letter the new segments into the EXISTING scheme rather
+/// than minting a fresh first-seen pass (which would rename speakers and break
+/// `MeetingMeta.speaker_names` keying).
 ///
 /// Pure (no FFI, no I/O) so the default test suite covers it without a model.
 pub fn overlay_speakers(
-    turns: &[SherpaSegment],
+    turns: &[SpeakerTurn],
     segments: Vec<Segment>,
     config: &DiarizerConfig,
-) -> (Vec<Segment>, u32) {
+) -> (Vec<Segment>, u32, Vec<(i32, String)>) {
     // Per-segment ranked overlaps: (cluster_id, overlap_ms) sorted descending by
     // overlap, lower cluster id breaking ties. Lets the prune/cap reassign a
     // segment to its next-best SURVIVING cluster without re-touching the turns.
@@ -498,7 +569,15 @@ pub fn overlay_speakers(
         }
     }
 
-    (out, seen.len() as u32)
+    // Cluster→letter map in the SAME first-seen order `label_for` uses, so each
+    // entry is consistent with the letter baked into the output `speaker_id`s.
+    let cluster_labels: Vec<(i32, String)> = seen
+        .iter()
+        .enumerate()
+        .map(|(idx, &cluster)| (cluster, alpha_label(idx)))
+        .collect();
+
+    (out, seen.len() as u32, cluster_labels)
 }
 
 /// Decide the surviving cluster set after the `config`'s prune + cap, or `None`
@@ -598,22 +677,20 @@ fn surviving_clusters(
 /// `[start_ms, end_ms)`, ranked descending by overlap (lower cluster id breaks a
 /// tie). Empty when nothing overlaps.
 ///
-/// sherpa turns carry start/end in **seconds**; they are converted to
-/// milliseconds for the overlap computation. Overlap is summed PER CLUSTER (a
-/// cluster may own several turns touching one segment), which is what the prune
-/// reassignment needs to pick a segment's next-best surviving speaker.
-fn ranked_overlaps(turns: &[SherpaSegment], start_ms: u64, end_ms: u64) -> Vec<(i32, u64)> {
+/// [`SpeakerTurn`]s already carry start/end in **milliseconds**, on the same
+/// clock as the segment bounds. Overlap is summed PER CLUSTER (a cluster may own
+/// several turns touching one segment), which is what the prune reassignment
+/// needs to pick a segment's next-best surviving speaker.
+fn ranked_overlaps(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> Vec<(i32, u64)> {
     let mut totals: Vec<(i32, u64)> = Vec::new();
     for turn in turns {
-        let turn_start_ms = seconds_to_ms(turn.start);
-        let turn_end_ms = seconds_to_ms(turn.end);
-        let overlap = interval_overlap_ms(start_ms, end_ms, turn_start_ms, turn_end_ms);
+        let overlap = interval_overlap_ms(start_ms, end_ms, turn.start_ms, turn.end_ms);
         if overlap == 0 {
             continue;
         }
-        match totals.iter_mut().find(|(id, _)| *id == turn.speaker) {
+        match totals.iter_mut().find(|(id, _)| *id == turn.cluster) {
             Some((_, acc)) => *acc += overlap,
-            None => totals.push((turn.speaker, overlap)),
+            None => totals.push((turn.cluster, overlap)),
         }
     }
     // Descending overlap; lower cluster id wins a tie (deterministic, and the
@@ -646,22 +723,68 @@ fn is_mixed_segment(ranked: &[(i32, u64)], survivors: &[i32], dur_ms: u64, min_s
     qualifying >= 2
 }
 
+/// Interior speaker-change boundaries of `turns` inside one segment, as
+/// millisecond cut points strictly within `(seg.start_ms, seg.end_ms)`.
+///
+/// Considers only the `turns` that overlap `[seg.start_ms, seg.end_ms)`, ordered
+/// by start; a cut point is the start of a turn whose `cluster` differs from the
+/// immediately preceding overlapping turn's — i.e. the instant the speaker
+/// changes. Boundaries at or outside the segment edges are excluded (a change
+/// flush with `start_ms`/`end_ms` is not an INTERIOR cut), and the result is
+/// deduped + sorted ascending.
+///
+/// An **empty** `Vec` is the keep-whole signal: a continuous single-speaker
+/// segment (or one the turns don't subdivide). This is the time-domain analogue
+/// of [`split_segment_by_words`] for the Qwen (no-words) path — the orchestrator's
+/// re-ASR split slices the segment's PCM at these points. Pure (no FFI/IO).
+///
+/// The cuts are speaker-change **onsets**, not a full interior partition: a short
+/// turn nested inside a longer one yields a leading cut at the interjection's
+/// start but NO trailing cut where the primary speaker resumes (no later
+/// overlapping turn re-asserts the primary cluster), so the resumed primary speech
+/// stays in the trailing sub-clip. The split is coarser there, not mislabelled —
+/// the orchestrator re-letters each sub-clip by max-overlap.
+pub fn turn_boundaries_within(seg: &Segment, turns: &[SpeakerTurn]) -> Vec<u64> {
+    // Overlapping turns only, ordered by start (then end) so adjacency is the
+    // temporal order. Ties on start keep a stable order via the end bound.
+    let mut overlapping: Vec<&SpeakerTurn> = turns
+        .iter()
+        .filter(|t| interval_overlap_ms(seg.start_ms, seg.end_ms, t.start_ms, t.end_ms) > 0)
+        .collect();
+    overlapping.sort_by(|a, b| a.start_ms.cmp(&b.start_ms).then(a.end_ms.cmp(&b.end_ms)));
+
+    let mut cuts: Vec<u64> = Vec::new();
+    for pair in overlapping.windows(2) {
+        let (prev, next) = (pair[0], pair[1]);
+        if prev.cluster == next.cluster {
+            continue;
+        }
+        let boundary = next.start_ms;
+        // Strictly interior: a change flush with either edge is not a cut.
+        if boundary > seg.start_ms && boundary < seg.end_ms && !cuts.contains(&boundary) {
+            cuts.push(boundary);
+        }
+    }
+    cuts.sort_unstable();
+    cuts
+}
+
 /// Winning sherpa cluster for a word: the SURVIVING cluster with the greatest
 /// total overlap of the word's `[word_start_ms, word_end_ms)` against the `turns`,
 /// lower cluster id breaking a tie. `None` when no surviving cluster overlaps the
 /// word.
 ///
-/// Reuses [`ranked_overlaps`]' per-cluster summing (via [`interval_overlap_ms`] +
-/// [`seconds_to_ms`]), then skips any cluster the issue-63 prune dropped from
-/// `survivors` — so the split path respects the prune exactly as the kept-segment
-/// reassignment does: a word whose top overlap is a pruned drift-cluster
-/// attributes to its next-best surviving cluster, not the dropped one. Parakeet
-/// word ENDS are approximate (taken as the next word's start), so a word that
-/// straddles a turn boundary attributes by max overlap — the right call.
+/// Reuses [`ranked_overlaps`]' per-cluster summing (via [`interval_overlap_ms`]),
+/// then skips any cluster the issue-63 prune dropped from `survivors` — so the
+/// split path respects the prune exactly as the kept-segment reassignment does: a
+/// word whose top overlap is a pruned drift-cluster attributes to its next-best
+/// surviving cluster, not the dropped one. Parakeet word ENDS are approximate
+/// (taken as the next word's start), so a word that straddles a turn boundary
+/// attributes by max overlap — the right call.
 fn word_turn(
     word_start_ms: u64,
     word_end_ms: u64,
-    turns: &[SherpaSegment],
+    turns: &[SpeakerTurn],
     survivors: &[i32],
 ) -> Option<i32> {
     ranked_overlaps(turns, word_start_ms, word_end_ms)
@@ -688,7 +811,7 @@ fn word_turn(
 /// returned, so the caller can split unconditionally on a mixed Parakeet segment.
 fn split_segment_by_words(
     seg: &Segment,
-    turns: &[SherpaSegment],
+    turns: &[SpeakerTurn],
     survivors: &[i32],
 ) -> Vec<(Segment, i32)> {
     // Build a sub-segment from a run of words on one cluster: bounds from the
@@ -864,6 +987,11 @@ pub fn merge_adjacent_speakers(segments: &mut Vec<Segment>, gap_threshold_ms: u6
 /// Re-overlay a prior diarization onto a freshly ASR-transcribed segment slice
 /// by maximum-overlap interval-join.
 ///
+/// Carry a prior diarization onto freshly ASR-transcribed segments by max-overlap
+/// interval-join. The orchestrator's `finalise_retranscribe` calls this on the
+/// re-transcribe path so a re-transcribe alone preserves the existing speaker
+/// labels (and `MeetingMeta.speaker_names`) without a fresh diarize pass.
+///
 /// For each new segment, the prior segment whose interval covers the most of the
 /// new segment's time wins; its `speaker_id` is copied onto the new segment. New
 /// segments with zero overlap against any prior segment keep `speaker_id = None`.
@@ -930,11 +1058,13 @@ mod tests {
     use super::*;
     use minutist_common::Segment;
 
-    fn turn(start_s: f32, end_s: f32, speaker: i32) -> SherpaSegment {
-        SherpaSegment {
-            start: start_s,
-            end: end_s,
-            speaker,
+    /// Build a [`SpeakerTurn`] from seconds (the fixtures read naturally in
+    /// seconds; `overlay_speakers` now consumes ms turns directly).
+    fn turn(start_s: f32, end_s: f32, cluster: i32) -> SpeakerTurn {
+        SpeakerTurn {
+            start_ms: seconds_to_ms(start_s),
+            end_ms: seconds_to_ms(end_s),
+            cluster,
         }
     }
 
@@ -1023,7 +1153,7 @@ mod tests {
             seg(2_100, 3_900), // overlaps the 3-turn → B
             seg(4_100, 5_900), // overlaps the 7-turn → A
         ];
-        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -1035,7 +1165,7 @@ mod tests {
         let turns = vec![turn(0.0, 1.0, 0)];
         // Segment sits entirely after the only turn → no overlap → None.
         let segs = vec![seg(5_000, 6_000)];
-        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 0);
         assert_eq!(segs[0].speaker_id, None);
     }
@@ -1048,7 +1178,7 @@ mod tests {
             turn(1.2, 3.0, 1), // 1200..3000 ms : overlaps [1000,2000) by 800 ms
         ];
         let segs = vec![seg(1_000, 2_000)];
-        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 1);
         // Cluster id 1 is the only chosen id → first-seen → "A".
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -1063,7 +1193,7 @@ mod tests {
             turn(1.5, 3.0, 4), // overlaps [1000,2000) by 500 ms (1500..2000)
         ];
         let segs = vec![seg(1_000, 2_000)];
-        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 1);
         // Cluster 4 (the lower id) wins the tie; as the only chosen id it
         // first-seen-relabels to "A".
@@ -1088,7 +1218,7 @@ mod tests {
     fn overlay_single_speaker_one_label() {
         let turns = vec![turn(0.0, 10.0, 2)];
         let segs = vec![seg(0, 2_000), seg(3_000, 5_000), seg(6_000, 9_000)];
-        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 1);
         for s in &segs {
             assert_eq!(s.speaker_id.as_deref(), Some("A"));
@@ -1111,7 +1241,7 @@ mod tests {
             seg(2_500, 3_500), // gap → None
             seg(4_100, 4_900), // C
         ];
-        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 3);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -1123,7 +1253,7 @@ mod tests {
     fn overlay_empty_segments_is_zero() {
         let turns = vec![turn(0.0, 1.0, 0)];
         let segs: Vec<Segment> = Vec::new();
-        let (segs, count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(count, 0);
         assert!(segs.is_empty());
     }
@@ -1137,7 +1267,7 @@ mod tests {
             speaker_id: Some("Z".to_string()),
             ..seg(5_000, 6_000)
         }];
-        let (segs, _count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert_eq!(segs[0].speaker_id, None);
     }
 
@@ -1163,7 +1293,7 @@ mod tests {
         // Empty `words` (the Qwen path): a mixed segment is NOT split — it keeps
         // its dominant label + the `shared_speakers` flag.
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count) = overlay_speakers(&turns, segs, &flag_share());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share());
 
         // Primary labels by first-seen order.
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -1183,7 +1313,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count) = overlay_speakers(&turns, segs, &flag_share());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share());
 
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert!(
@@ -1201,7 +1331,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune());
         assert!(segs[0].shared_speakers.is_empty());
     }
 
@@ -1243,7 +1373,7 @@ mod tests {
         // blip cluster only ever wins via a turn no segment maxes on — exercise
         // the share prune with a segment that DOES max on the blip.
         segs[1] = seg(5_000, 5_150); // overlaps cluster 1 by 100 ms, cluster 0 by 50 ms
-        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None));
         assert_eq!(count, 1, "tiny-share cluster must be pruned away");
         // The straddling segment reassigned to the surviving cluster 0 → "A".
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1265,7 +1395,7 @@ mod tests {
             seg(5_100, 7_400),
             seg(7_500, 9_900),
         ];
-        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.02, 2, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 2, None));
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1293,7 +1423,7 @@ mod tests {
             seg(2_900, 3_550),
             seg(4_100, 5_000),
         ];
-        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.0, 2, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 2, None));
         assert_eq!(count, 1, "single-segment cluster pruned by the count floor");
         assert_eq!(segs[2].speaker_id.as_deref(), Some("A"));
     }
@@ -1313,7 +1443,7 @@ mod tests {
             seg(6_100, 9_900),
             seg(10_100, 11_900), // overlaps only cluster 2; after cap, reassigns
         ];
-        let (segs, count) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)));
         assert_eq!(count, 2, "cap must keep exactly the two largest speakers");
         // The capped-out segment had no overlap with a survivor → None (no
         // surviving turn covers [10100,11900)).
@@ -1328,7 +1458,7 @@ mod tests {
         // confirm the largest cluster is retained.
         let turns = vec![turn(0.0, 5.0, 0)];
         let segs = vec![seg(0, 4_900)];
-        let (segs, count) = overlay_speakers(&turns, segs, &pruned(2.0, 0, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(2.0, 0, None));
         assert_eq!(count, 1, "the largest cluster is retained when all prune");
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
     }
@@ -1348,7 +1478,7 @@ mod tests {
             let start = (t * 1000.0) as u64;
             segs.push(seg(start, start + 200));
         }
-        let (_segs, count) = overlay_speakers(&turns, segs, &DiarizerConfig::default());
+        let (_segs, count, _map) = overlay_speakers(&turns, segs, &DiarizerConfig::default());
         assert_eq!(count, 1, "default prune collapses the tiny-cluster scatter");
     }
 
@@ -1844,7 +1974,7 @@ mod tests {
             ]),
             seg(2_000, 3_000), // cluster 1 alone (no words)
         ];
-        let (out, count) = overlay_speakers(&turns, segs, &flag_share());
+        let (out, count, _map) = overlay_speakers(&turns, segs, &flag_share());
         assert_eq!(count, 2, "the split yields two distinct speakers");
         assert_eq!(out.len(), 3, "the mixed segment split into two, plus segment 1");
         assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
@@ -1867,9 +1997,119 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (out, _count) = overlay_speakers(&turns, segs, &flag_share());
+        let (out, _count, _map) = overlay_speakers(&turns, segs, &flag_share());
         assert_eq!(out.len(), 2, "no split on the no-words path");
         assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(out[0].shared_speakers, vec!["B".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // overlay_speakers cluster→letter map (#0015 phase 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overlay_map_is_consistent_with_baked_in_letters() {
+        // Two clusters seen in first-seen order 7 → A, 3 → B (the same fixture as
+        // `overlay_two_speakers_first_seen_relabel`). The returned map must pair
+        // each cluster id with the letter actually baked into the segments.
+        let turns = vec![turn(0.0, 2.0, 7), turn(2.0, 4.0, 3), turn(4.0, 6.0, 7)];
+        let segs = vec![seg(0, 1_900), seg(2_100, 3_900), seg(4_100, 5_900)];
+        let (segs, count, map) = overlay_speakers(&turns, segs, &no_prune());
+
+        assert_eq!(count, 2);
+        assert_eq!(map, vec![(7, "A".to_string()), (3, "B".to_string())]);
+
+        // Every segment's baked-in label matches its cluster's map entry.
+        let lookup = |cluster: i32| -> &str {
+            map.iter()
+                .find(|(c, _)| *c == cluster)
+                .map(|(_, l)| l.as_str())
+                .expect("map covers every assigned cluster")
+        };
+        assert_eq!(segs[0].speaker_id.as_deref(), Some(lookup(7)));
+        assert_eq!(segs[1].speaker_id.as_deref(), Some(lookup(3)));
+        assert_eq!(segs[2].speaker_id.as_deref(), Some(lookup(7)));
+    }
+
+    #[test]
+    fn overlay_map_omits_pruned_clusters() {
+        // The tiny-share cluster 1 is pruned away (same fixture as
+        // `prune_drops_tiny_share_cluster_and_reassigns`), so the map carries only
+        // the surviving cluster 0 → A — never a letter for a dropped cluster.
+        let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 5.1, 1), turn(5.1, 10.0, 0)];
+        let segs = vec![seg(0, 4_900), seg(5_000, 5_150), seg(5_400, 9_900)];
+        let (_segs, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None));
+        assert_eq!(count, 1);
+        assert_eq!(map, vec![(0, "A".to_string())]);
+    }
+
+    // -----------------------------------------------------------------------
+    // turn_boundaries_within (#0015 phase 4)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn boundaries_empty_for_continuous_single_speaker() {
+        // One cluster spanning the whole segment → no interior change → keep-whole.
+        let turns = vec![turn(0.0, 3.0, 0)];
+        assert!(turn_boundaries_within(&seg(0, 3_000), &turns).is_empty());
+    }
+
+    #[test]
+    fn boundaries_empty_for_two_same_cluster_turns() {
+        // Two adjacent turns of the SAME cluster never produce a cut.
+        let turns = vec![turn(0.0, 1.5, 0), turn(1.5, 3.0, 0)];
+        assert!(turn_boundaries_within(&seg(0, 3_000), &turns).is_empty());
+    }
+
+    #[test]
+    fn boundaries_single_interior_change() {
+        // Cluster 0 then cluster 1 abut at 1500 ms, strictly inside [0,3000).
+        let turns = vec![turn(0.0, 1.5, 0), turn(1.5, 3.0, 1)];
+        assert_eq!(turn_boundaries_within(&seg(0, 3_000), &turns), vec![1_500]);
+    }
+
+    #[test]
+    fn boundaries_multiple_changes_sorted() {
+        // 0 → 1 at 1000, 1 → 2 at 2000: two interior cuts, ascending.
+        let turns = vec![turn(0.0, 1.0, 0), turn(1.0, 2.0, 1), turn(2.0, 3.0, 2)];
+        assert_eq!(
+            turn_boundaries_within(&seg(0, 3_000), &turns),
+            vec![1_000, 2_000]
+        );
+    }
+
+    #[test]
+    fn boundaries_ignore_non_overlapping_distant_turn() {
+        // The cluster-1 turn at [5000,6000) is wholly outside the segment, so the
+        // speaker change it would imply is not an interior cut.
+        let turns = vec![turn(0.0, 3.0, 0), turn(5.0, 6.0, 1)];
+        assert!(turn_boundaries_within(&seg(0, 3_000), &turns).is_empty());
+    }
+
+    #[test]
+    fn boundaries_change_flush_with_edge_is_not_interior() {
+        // The change happens exactly at the segment's start (the first overlapping
+        // turn IS cluster 1 starting at 0) — a boundary at start_ms is excluded.
+        // Cluster 0's turn [−? ,0) does not overlap, so only one transition lands
+        // strictly inside.
+        let turns = vec![turn(0.0, 1.0, 0), turn(1.0, 2.0, 1)];
+        // Segment [0,2000): change at 1000 is interior → one cut. A segment
+        // [1000,2000) would see only cluster 1 overlapping → no interior cut.
+        assert_eq!(turn_boundaries_within(&seg(0, 2_000), &turns), vec![1_000]);
+        assert!(turn_boundaries_within(&seg(1_000, 2_000), &turns).is_empty());
+    }
+
+    #[test]
+    fn boundaries_dedup_repeated_boundary() {
+        // Two turns both start at 1000 ms (an overlap artefact) with clusters that
+        // differ from each other AND from the preceding cluster-0 turn — so two
+        // adjacent differing pairs both yield boundary 1000. The dedup must collapse
+        // them to a single 1000 entry.
+        let turns = vec![
+            turn(0.0, 1.0, 0),
+            turn(1.0, 1.5, 1), // 0 → 1 boundary at 1000
+            turn(1.0, 2.0, 2), // 1 → 2 boundary also at 1000 (deduped)
+        ];
+        assert_eq!(turn_boundaries_within(&seg(0, 3_000), &turns), vec![1_000]);
     }
 }

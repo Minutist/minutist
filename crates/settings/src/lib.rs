@@ -95,12 +95,6 @@ const fn default_capture_system_audio() -> bool {
     true
 }
 
-/// Serde default for `prefer_large_asr_model` (retained for compatibility; field
-/// is no longer consulted at runtime).
-const fn default_prefer_large_asr_model() -> bool {
-    false
-}
-
 /// Default MCP server port (Phase 10 — D1). A FIXED loopback port: only one app
 /// instance/window runs, so a fixed default avoids the ephemeral-port friction
 /// of a per-run URL change in an external MCP client's config. User-editable in
@@ -414,14 +408,6 @@ pub struct Settings {
     #[serde(default = "default_transcription_language")]
     pub transcription_language: String,
 
-    /// Retained for serde/wire compatibility; the value is no longer consulted.
-    /// The large ASR tier is requested automatically and the VRAM clamp in
-    /// `common::resolve_gpu_plan` decides whether it fits. An older store written
-    /// before this field existed deserialises to `false`.
-    /// See `architecture/cross-cutting.md` — "ASR engine routing".
-    #[serde(default = "default_prefer_large_asr_model")]
-    pub prefer_large_asr_model: bool,
-
     /// Whether the notes editor renders faint horizontal "writing paper" rules
     /// behind the text. Presentation-only: the webview reads this and toggles a
     /// class on the editor surface. The oxblood *vertical* margin rule that
@@ -578,7 +564,6 @@ impl Default for Settings {
             gpu_acceleration: default_gpu_acceleration(),
             capture_system_audio: true,
             transcription_language: default_transcription_language(),
-            prefer_large_asr_model: default_prefer_large_asr_model(),
             notes_paper_rules: default_notes_paper_rules(),
             chat_system_prompt: default_chat_system_prompt(),
             summary_preset: SummaryPreset::default(),
@@ -631,7 +616,6 @@ mod tests {
             gpu_acceleration: GpuAcceleration::On,
             capture_system_audio: true,
             transcription_language: "Japanese".to_string(),
-            prefer_large_asr_model: true,
             notes_paper_rules: false,
             chat_system_prompt: "Be a terse assistant.".to_string(),
             summary_preset: SummaryPreset::ActionItems,

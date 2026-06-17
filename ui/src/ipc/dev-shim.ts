@@ -125,8 +125,6 @@ const DEV_SETTINGS: Settings = {
   // ASR language hint. Seeded "English" (the schema default) so the language
   // picker renders selected under `vite dev`.
   transcription_language: "English",
-  // Phase 8 hybrid-ASR GPU tier opt-in (off by default).
-  prefer_large_asr_model: false,
   // Notes-editor writing-paper rules (on by default) — seeded on so the ruled
   // sheet renders under `vite dev` for visual QA.
   notes_paper_rules: true,

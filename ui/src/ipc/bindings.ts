@@ -1450,14 +1450,6 @@ capture_system_audio?: boolean;
  */
 transcription_language?: string; 
 /**
- * Retained for serde/wire compatibility; the value is no longer consulted.
- * The large ASR tier is requested automatically and the VRAM clamp in
- * `common::resolve_gpu_plan` decides whether it fits. An older store written
- * before this field existed deserialises to `false`.
- * See `architecture/cross-cutting.md` — "ASR engine routing".
- */
-prefer_large_asr_model?: boolean; 
-/**
  * Whether the notes editor renders faint horizontal "writing paper" rules
  * behind the text. Presentation-only: the webview reads this and toggles a
  * class on the editor surface. The oxblood *vertical* margin rule that

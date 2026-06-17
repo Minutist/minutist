@@ -303,9 +303,9 @@ the call sites pass `true` as the `prefer_large_asr` argument to
 `resolve_gpu_plan`, and the VRAM clamp inside that function decides whether the
 1.7B fits alongside whatever else is placed on GPU; if not, `effective_prefer_large`
 comes back `false` and the 0.6B is used instead. `GpuAcceleration::On` applies the
-same clamp (it previously trusted a now-removed user flag blindly). The
-`Settings::prefer_large_asr_model` field is retained in the struct for serde/wire
-compatibility only; its value is no longer read by any call site. The orchestrator
+same clamp. There is no user-facing "prefer large model" toggle: the large tier is
+always requested and the VRAM clamp is the sole decider, so no setting can force a
+1.7B that would not fit on the available GPU. The orchestrator
 resolves the engine once at recording start (and at re-transcribe) in
 `runner::build_asr_backend`, mirroring how it already resolves the language hint
 and GPU layers. `model-registry` only fetches the model(s) for the selected

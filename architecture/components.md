@@ -518,7 +518,18 @@ crate exposes `SherpaDiarizer::open(seg_onnx, emb_onnx, DiarizerConfig)` and
 `impl Diarizer` (`assign_speakers(audio, sample_rate=16000, Vec<Segment>) ->
 (Vec<Segment>, u32)`), which runs sherpa `Diarize::compute`, relabels first-seen
 `A`/`B`/…, and overlays `speaker_id` onto the ASR segments by max-overlap
-interval-join (no `common::SpeakerTurn` type — overlay only). The segments are
+interval-join. The raw turns are exposed as a diarizer-public POD
+`SpeakerTurn { start_ms, end_ms, cluster: i32 }` (deliberately NOT a
+`common::SpeakerTurn` — the orchestrator already depends on `diarizer`, so no new
+dependency edge, and the `sherpa-rs` type never crosses the boundary). The sherpa
+`compute` body is a public inherent `SherpaDiarizer::compute_turns(audio,
+sample_rate) -> AppResult<Vec<SpeakerTurn>>` (16 kHz guard + empty short-circuit +
+`engine.lock().compute()`, mapping each `sherpa_rs::diarize::Segment` to a
+`SpeakerTurn` in ms); `assign_speakers` is the thin compose
+`compute_turns(..).map(|turns| overlay_speakers(&turns, segments, cfg))` (#0015
+phase 4 — the orchestrator's re-ASR split funnel consumes `compute_turns` +
+`overlay_speakers` directly, supplying turns as an explicit param so the stub
+diarizer the default suite injects can still drive it). The segments are
 taken and returned by value because a mixed Parakeet segment is split at the turn
 boundary, which grows the list (#0015 phase 3). It takes RESOLVED model paths and
 depends only on `common` (NOT `model-registry`, NOT `persistence`). All
@@ -554,12 +565,13 @@ constructs the diarizer with `DiarizerConfig::default()` (`num_clusters = None`,
 `min_cluster_share = 0.02`) for BOTH the on-stop pass and the user-triggered
 re-diarize pass: at record time the speaker count is unknown, so production uses
 threshold/auto-count mode to discover it rather than fixing a cluster count.
-There is no `Some(1)` production path. `assign_speakers` rejects any
-`sample_rate != 16000` with `AppError::InvalidInput`, short-circuits empty
-audio/segments to `(segments, 0)`, runs `Diarize::compute`, and overlays via a
-pure `overlay_speakers(&[sherpa::Segment], Vec<Segment>, &DiarizerConfig) ->
-(Vec<Segment>, u32)`:
-per ASR segment it picks the max-total-overlap sherpa CLUSTER (seconds→ms,
+There is no `Some(1)` production path. `compute_turns` rejects any
+`sample_rate != 16000` with `AppError::InvalidInput`, short-circuits empty audio
+to an empty turn list, runs `Diarize::compute`, and returns the turns as
+`Vec<SpeakerTurn>` (ms). `assign_speakers` composes that with a
+pure `overlay_speakers(&[SpeakerTurn], Vec<Segment>, &DiarizerConfig) ->
+(Vec<Segment>, u32, Vec<(i32, String)>)`:
+per ASR segment it picks the max-total-overlap CLUSTER (turns already in ms,
 half-open `[start_ms, end_ms)`; ties resolve to the lower cluster id; no overlap
 → `speaker_id = None`), then applies the **post-cluster prune + cap** (issue #63:
 drop clusters below `min_cluster_share` of the attributed speech duration — or
@@ -572,7 +584,11 @@ word run — each word assigned to its max-overlap turn, no re-ASR, no audio cut
 (#0015 phase 3); the split GROWS the list, which is why segments are owned
 in/out. The (post-split) surviving `i32` cluster ids relabel to first-seen-order
 `A`/`B`/… across the OUTPUT segments in order, and the function returns the
-owned list + distinct-label count. It also fills `Segment::shared_speakers`
+owned list, the distinct-label count, AND a cluster→letter map
+`Vec<(i32, String)>` in that SAME first-seen order (#0015 phase 4) — so a caller
+re-ASR'ing a sub-clip letters the new segments into the EXISTING scheme rather
+than minting a fresh first-seen pass (which would rename speakers and break
+`MeetingMeta.speaker_names` keying). It also fills `Segment::shared_speakers`
 (#0002) — but only for a KEPT mixed segment (the no-words/Qwen path that is not
 split): a SURVIVING cluster other than the segment's chosen primary whose overlap
 reaches `DiarizerConfig::multi_speaker_min_share` (default 0.30) of the segment
@@ -580,8 +596,7 @@ duration — and only when the primary is itself that substantial — contribute
 first-seen label, so a mixed Qwen segment is flagged (not split, pending Phase 4
 re-ASR); a split Parakeet sub-segment is resolved per-speaker and carries no
 flag. Restricted to clusters that win some segment (so every shared label matches
-a `speaker_id` shown elsewhere); `0.0` disables. `overlay_speakers_from_prior` (the re-transcribe path) leaves
-`shared_speakers` empty — only the full re-diarize pass flags. The prune is the
+a `speaker_id` shown elsewhere); `0.0` disables. The prune is the
 robust lever against the long-recording over-split (a single distance threshold
 cannot separate a drifted same-speaker embedding from a distinct speaker); see
 `cross-cutting.md` — "Offline over-split prune". The sherpa `eyre::Result` is
@@ -590,15 +605,21 @@ mapped to `Error::ModelLoad`/`Error::Inference` →
 arrives transitively via `sherpa-rs`; no separate `eyre` dep). `sherpa-rs =
 { workspace = true }` is added to `crates/diarizer/Cargo.toml`; `hound` and
 `persistence` (test-only, the over-split eval's audio/transcript decode) are
-dev-dependencies. A second pure public function
-`overlay_speakers_from_prior(&mut [Segment], &[(u64, u64, Option<String>)])` carries
-the prior diarization onto a freshly ASR-transcribed segment slice by
-max-overlap interval-join: for each new segment the prior segment with the
-greatest time overlap wins and its `speaker_id` string is copied verbatim
-(no re-lettering), so `MeetingMeta.speaker_names` stays keyed correctly after
-a re-transcribe. New segments with no prior overlap keep `None`. The
-orchestrator's `finalise_retranscribe` calls this before writing the new
-`transcript.json`. A third pure public function
+dev-dependencies. A pure public function
+`turn_boundaries_within(&Segment, &[SpeakerTurn]) -> Vec<u64>` (#0015 phase 4)
+returns the interior speaker-change cut points strictly inside
+`(seg.start_ms, seg.end_ms)` — the start of each overlapping turn whose `cluster`
+differs from the immediately preceding overlapping turn's, deduped + sorted
+ascending; an empty `Vec` is the keep-whole signal. It is the time-domain analogue
+of the word-run split for the Qwen (no-words) path: the orchestrator's re-ASR
+split slices a mixed Qwen segment's PCM at these points.
+`overlay_speakers_from_prior(&mut [Segment], &[(u64, u64, Option<String>)])` is a
+pure max-overlap interval-join the orchestrator's `finalise_retranscribe` calls on
+the re-transcribe path, so a re-transcribe alone preserves the existing speaker
+labels (and `MeetingMeta.speaker_names`) without a fresh diarize pass: for each new
+segment the prior segment with the greatest time overlap wins and its
+`speaker_id` string is copied verbatim (no re-lettering). New segments with no
+prior overlap keep `None`. A third pure public function
 `merge_adjacent_speakers(&mut Vec<Segment>, gap_threshold_ms)` collapses a run of
 adjacent segments sharing one `speaker_id` (gap `<=` threshold; a `None` label is
 a hard boundary) into a single segment — `text` space-joined, `words` concatenated
@@ -613,13 +634,17 @@ same-cluster runs — a no-turn word joins the preceding run; a leading no-turn
 word seeds with the segment's dominant cluster). Tests: the default suite covers
 `overlay_speakers`
 (interval-join, no-overlap=None, tie-break, first-seen relabel, stale-label
-clearing) AND the prune/cap (tiny-share drop + reassign, genuine-speaker keep,
-segment-count floor, cap-to-largest, never-zero fallback) AND the #0015 phase-3
+clearing, and the #0015-phase-4 cluster→letter map matching the baked-in letters /
+omitting pruned clusters) AND the prune/cap (tiny-share drop + reassign,
+genuine-speaker keep, segment-count floor, cap-to-largest, never-zero fallback)
+AND the #0015 phase-3
 split (`word_turn` max-overlap + tie-break, `split_segment_by_words` runs /
 empty / single-cluster / leading-None / mid-run-None, the overlay split path on
 a mixed Parakeet segment, and the no-split-on-mixed-Qwen case) AND
-`overlay_speakers_from_prior` (full-overlap, max-overlap-wins, gap→None,
-label-survival, empty-prior, prior-was-None) with no model; the
+`turn_boundaries_within` (#0015 phase 4 — continuous keep-whole, single + multiple
+interior changes, non-overlapping distant turn ignored, edge-flush excluded,
+dedup) AND `overlay_speakers_from_prior` (full-overlap, max-overlap-wins,
+gap→None, label-survival, empty-prior, prior-was-None) with no model; the
 env-var-gated `tests/accuracy.rs` (`MINUTIST_DIARIZE_SEG_PATH` +
 `MINUTIST_DIARIZE_EMB_PATH`, skip-on-unset) runs `assign_speakers` over
 committed fixtures (`tests/fixtures/two_speakers_synth.wav` = two distinct

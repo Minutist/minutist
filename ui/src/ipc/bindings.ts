@@ -361,18 +361,31 @@ async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
 }
 },
 /**
- * Re-run transcription for a meeting offline (FR-33 action).
+ * Reprocess a meeting offline (FR-33 + FR-11 action): re-transcribe THEN
+ * re-diarize under a single offline claim.
  * 
- * Routes to `Orchestrator::re_transcribe`, which decodes the meeting audio and
- * drives the same batched-VAD + ASR pipeline the live recorder uses, rewrites
- * `transcript.json`, refreshes the index row, and emits
- * `AppEvent::TranscriptSegment` events. Refused while a recording is in
- * progress (the orchestrator returns `AppError::InvalidInput`). The index
- * handle is shared from `IpcState` so the orchestrator need not own one.
+ * Routes to `Orchestrator::reprocess`, which takes ONE `claim_offline`, re-runs
+ * the live ASR pipeline over the complete `audio.opus` (rewriting the
+ * transcript), then diarizes/splits/merges over that FRESH transcript and
+ * finalises ONCE — rewriting `transcript.json` with overlaid `speaker_id`s,
+ * updating `metadata.json`'s `{ speaker_count, diarizer }`, refreshing the
+ * index row, and emitting the same `AppEvent::TranscriptSegment` +
+ * `AppEvent::DiarizationComplete` events the two former passes emitted (the
+ * `DiarizationComplete` is emitted by the **orchestrator**, on the shared bus
+ * the forwarder subscribes to). The re-diarize step clears
+ * `metadata.json`'s `speaker_names` (re-lettering can change who each label
+ * is), so any user-assigned speaker names are reset.
+ * 
+ * Refused while a recording is in progress (the orchestrator returns
+ * `AppError::InvalidInput`). The `model-registry` edge stays inside the
+ * orchestrator (both the ASR backend and the diarizer are built there) — there
+ * is **no** `ipc-bridge → diarizer` Cargo edge; `ipc-bridge` routes via the
+ * orchestrator. The shared `IpcState::index` handle is passed into the call so
+ * the orchestrator refreshes the index row without owning one.
  */
-async reTranscribe(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+async reprocess(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("re_transcribe", { meetingId }) };
+    return { status: "ok", data: await TAURI_INVOKE("reprocess", { meetingId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -433,34 +446,6 @@ async getSummary(meetingId: MeetingId) : Promise<Result<string | null, IpcError>
 async saveSummary(meetingId: MeetingId, summaryMarkdown: string) : Promise<Result<null, IpcError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_summary", { meetingId, summaryMarkdown }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Re-run speaker diarization for a meeting offline (Phase 6, FR-11 action).
- * 
- * Routes to `Orchestrator::rediarize`, which decodes the meeting's
- * pause-INCLUDING PCM, runs the bundled `SherpaDiarizer` over the stored
- * transcript segments (resolving both diarize model directories via
- * `model-registry`), rewrites `transcript.json` with the overlaid
- * `speaker_id`s, updates `metadata.json`'s `{ speaker_count, diarizer }`,
- * refreshes the index row's `speaker_count`, and emits
- * `AppEvent::DiarizationComplete { meeting_id, speaker_count }` — the event is
- * emitted by the **orchestrator** (not here), on the shared bus the forwarder
- * subscribes to. Refused while a recording is in progress (the orchestrator
- * returns `AppError::InvalidInput`).
- * 
- * The `model-registry` edge stays inside the orchestrator (the diarizer is
- * built there) — there is **no** `ipc-bridge → diarizer` Cargo edge;
- * `ipc-bridge` routes via the orchestrator. The shared `IpcState::index` handle
- * is passed into the call so the orchestrator refreshes the index row without
- * owning an index of its own.
- */
-async rediarizeMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("rediarize_meeting", { meetingId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1303,12 +1288,16 @@ export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id:
 export type Segment = { start_ms: number; end_ms: number; text: string; speaker_id?: string | null; confidence?: number | null; words: WordTimestamp[]; 
 /**
  * Additional speaker labels (beyond `speaker_id`) that also speak
- * substantially within this segment's time span — set only by the offline
+ * substantially within this segment's time span — set by the offline
  * diarization pass (#0002) when a segment overlaps more than one surviving
- * speaker turn above the share threshold. Each label is one that appears as
- * a `speaker_id` elsewhere in the transcript. Empty for the common
- * single-speaker case and for live / un-diarized / re-transcribed segments.
- * Presentation only — a "multiple speakers" hint; the segment is NOT split.
+ * speaker turn above the share threshold AND the segment cannot be split
+ * (the no-word-timestamp / Qwen path). A mixed segment that carries per-word
+ * timestamps is instead split at the turn boundary (#0015) into
+ * single-speaker segments, each with empty `shared_speakers`. Each label is
+ * one that appears as a `speaker_id` elsewhere in the transcript. Empty for
+ * the common single-speaker case and for live / un-diarized / re-transcribed
+ * segments. Presentation only — a "multiple speakers" hint on an unsplit
+ * segment.
  */
 shared_speakers: string[] }
 /**
@@ -1506,8 +1495,8 @@ mcp_port?: number;
  * default = read-only over MCP.** Consulted at registry-projection time by
  * the MCP server: with it OFF, `tools/list` is read/compute tools + the
  * inter-agent tool only; with it ON, the reversible writes
- * (`set_speaker_name`, `rename_meeting`) join. `retranscribe_meeting` /
- * `rediarize_meeting` / any destructive tool stay internal-only regardless
+ * (`set_speaker_name`, `rename_meeting`) join. `reprocess_meeting` /
+ * any destructive tool stay internal-only regardless
  * (they are never `expose_over_mcp`). `#[serde(default)]` defaults to
  * `false`; an older store deserialises to `false`. See
  * `architecture/cross-cutting.md` — "MCP transport".

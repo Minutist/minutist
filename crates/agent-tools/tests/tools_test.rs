@@ -1,10 +1,9 @@
 //! Behavioural tests for the v1 tool layer.
 //!
 //! Uses tempdir meeting fixtures + a `StubSummariser`. The orchestrator-backed
-//! tools (relisten / retranscribe / rediarize) are driven through the
-//! orchestrator's `test-source` seam where a real model would otherwise be
-//! required; the read/compute + metadata-write tools run directly against
-//! tempdir fixtures.
+//! tools (relisten / reprocess) are driven through the orchestrator's
+//! `test-source` seam where a real model would otherwise be required; the
+//! read/compute + metadata-write tools run directly against tempdir fixtures.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -168,8 +167,7 @@ async fn registry_v1_has_the_documented_tool_set() {
         "speaker_talk_time",
         "set_speaker_name",
         "rename_meeting",
-        "retranscribe_meeting",
-        "rediarize_meeting",
+        "reprocess_meeting",
         "start_recording",
         "stop_recording",
         "pause_recording",
@@ -218,10 +216,9 @@ async fn mcp_write_gate_projection() {
     assert!(off.contains(&"send_to_internal_agent"));
     assert!(!off.contains(&"set_speaker_name"));
     assert!(!off.contains(&"rename_meeting"));
-    assert!(!off.contains(&"retranscribe_meeting"));
-    assert!(!off.contains(&"rediarize_meeting"));
+    assert!(!off.contains(&"reprocess_meeting"));
 
-    // Gate ON: the reversible writes join; the heavy ops STILL never appear.
+    // Gate ON: the reversible writes join; the heavy op STILL never appears.
     let on: Vec<&str> = reg
         .mcp_tool_descriptors_gated(true)
         .iter()
@@ -229,13 +226,12 @@ async fn mcp_write_gate_projection() {
         .collect();
     assert!(on.contains(&"set_speaker_name"));
     assert!(on.contains(&"rename_meeting"));
-    assert!(!on.contains(&"retranscribe_meeting"));
-    assert!(!on.contains(&"rediarize_meeting"));
+    assert!(!on.contains(&"reprocess_meeting"));
 
     // mcp_call_allowed mirrors the listing under each gate.
     assert!(!reg.mcp_call_allowed("set_speaker_name", false));
     assert!(reg.mcp_call_allowed("set_speaker_name", true));
-    assert!(!reg.mcp_call_allowed("retranscribe_meeting", true));
+    assert!(!reg.mcp_call_allowed("reprocess_meeting", true));
     assert!(!reg.mcp_call_allowed("unknown_tool", true));
 }
 
@@ -289,14 +285,14 @@ async fn record_control_tools_are_write_gated_over_mcp() {
     }
 
     // They ARE in the expose-only projection (expose_over_mcp == true), unlike
-    // the internal-only writes (retranscribe/rediarize).
+    // the internal-only write (reprocess).
     let exposed: Vec<&str> = reg.mcp_tool_descriptors().iter().map(|d| d.name).collect();
     for name in record_control {
         assert!(exposed.contains(&name), "{name} must be MCP-exposable");
     }
     assert!(
-        !exposed.contains(&"retranscribe_meeting") && !exposed.contains(&"rediarize_meeting"),
-        "heavy ops stay internal-only (expose_over_mcp == false)"
+        !exposed.contains(&"reprocess_meeting"),
+        "the heavy op stays internal-only (expose_over_mcp == false)"
     );
 }
 
@@ -306,8 +302,7 @@ async fn write_flags_are_set_correctly() {
     let writes = [
         "set_speaker_name",
         "rename_meeting",
-        "retranscribe_meeting",
-        "rediarize_meeting",
+        "reprocess_meeting",
         "start_recording",
         "stop_recording",
         "pause_recording",
@@ -343,9 +338,8 @@ async fn mcp_exposure_default_safe_with_allowlist() {
     // Allowlisted writes are exposed.
     assert!(mcp.contains(&"set_speaker_name"));
     assert!(mcp.contains(&"rename_meeting"));
-    // Heavy writes are internal-only.
-    assert!(!mcp.contains(&"retranscribe_meeting"));
-    assert!(!mcp.contains(&"rediarize_meeting"));
+    // The heavy write is internal-only.
+    assert!(!mcp.contains(&"reprocess_meeting"));
 }
 
 #[tokio::test]

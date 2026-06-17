@@ -92,7 +92,9 @@ export const commands: Commands = {
   setSpeakerName: (meetingId, label, name) =>
     callCommand("setSpeakerName", [meetingId, label, name]),
   deleteMeeting: (meetingId) => callCommand("deleteMeeting", [meetingId]),
-  reTranscribe: (meetingId) => callCommand("reTranscribe", [meetingId]),
+  // #0015 — the offline reprocess (re-transcribe + re-diarize under one claim)
+  // merges the former `reTranscribe` + `rediarizeMeeting` commands into one.
+  reprocess: (meetingId) => callCommand("reprocess", [meetingId]),
   // Phase 5 summary surface (FR-30). Now present on the generated `commands`
   // object (the Phase-5 backend JOIN regenerated `bindings.ts` and removed the
   // Phase-4 `re_summarise` stub), so these route through `callCommand` like
@@ -104,13 +106,6 @@ export const commands: Commands = {
   getSummary: (meetingId) => callCommand("getSummary", [meetingId]),
   saveSummary: (meetingId, summaryMarkdown) =>
     callCommand("saveSummary", [meetingId, summaryMarkdown]),
-  // Phase 6 re-diarize (FR-11). Now present on the generated `commands` object
-  // (the Phase-6 backend JOIN regenerated `bindings.ts`), so it routes through
-  // `callCommand` like every other command — the earlier shim-aware
-  // `callPendingCommand` raw-`invoke` path was collapsed (A9). The DEV shim and
-  // the Vitest mocks still intercept here.
-  rediarizeMeeting: (meetingId) =>
-    callCommand("rediarizeMeeting", [meetingId]),
   // Phase 9 chat surface. The backend (this step, 4a) is wired; the chat UI is
   // a later step (4b). These delegations exist so the typed `commands` surface
   // matches the regenerated `bindings.ts` and consumers have a single seam.

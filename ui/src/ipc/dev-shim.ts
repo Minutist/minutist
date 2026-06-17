@@ -475,7 +475,19 @@ export const devCommands = {
   async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
     return ok(null);
   },
-  async reTranscribe(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+  // `reprocess(meeting_id) -> ()` (#0015): re-transcribe THEN re-diarize under
+  // one backend claim. The DEV shim has no real ASR/diarizer, so it just
+  // notifies the live event stream with `diarization_complete` (the terminal
+  // event the merged op emits) so the meetings store re-reads that meeting's
+  // transcript and the operation-progress indicator clears.
+  async reprocess(meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    devDiarizationListeners.forEach((cb) =>
+      cb({
+        kind: "diarization_complete",
+        meeting_id: meetingId,
+        speaker_count: 2,
+      }),
+    );
     return ok(null);
   },
   // --- Phase 5 summary surface (FR-30) ------------------------------------
@@ -501,24 +513,6 @@ export const devCommands = {
     summaryMarkdown: string,
   ): Promise<Result<null, IpcError>> {
     devSummaries.set(meetingId, summaryMarkdown);
-    return ok(null);
-  },
-  // --- Phase 6 re-diarize (FR-11) -----------------------------------------
-  // `rediarize_meeting(meeting_id) -> ()`: assign speakers to the meeting's
-  // segments, then notify the live event stream so the meetings store re-reads
-  // that meeting's transcript (the real backend emits
-  // `AppEvent::DiarizationComplete`). Now a first-class `devCommands` entry —
-  // the Phase-6 JOIN regenerated `bindings.ts`, so this folded out of the
-  // temporary `devPendingCommands` map alongside the `callPendingCommand`
-  // collapse (A9).
-  async rediarizeMeeting(meetingId: MeetingId): Promise<Result<null, IpcError>> {
-    devDiarizationListeners.forEach((cb) =>
-      cb({
-        kind: "diarization_complete",
-        meeting_id: meetingId,
-        speaker_count: 2,
-      }),
-    );
     return ok(null);
   },
   // Phase 9 chat surface. The DEV shim drives a representative streamed turn so
@@ -687,9 +681,9 @@ function startDevChatTurn(sessionId: ChatSessionId, _message: string): void {
 }
 
 /**
- * DEV-only `diarization_complete` fan-out so the dev shim's `rediarize_meeting`
- * can notify the live event stream started by {@link startDevEventStream}. The
- * real backend emits `AppEvent::DiarizationComplete`; this mirrors it.
+ * DEV-only `diarization_complete` fan-out so the dev shim's `reprocess` can
+ * notify the live event stream started by {@link startDevEventStream}. The real
+ * backend emits `AppEvent::DiarizationComplete`; this mirrors it.
  */
 const devDiarizationListeners = new Set<(event: AppEvent) => void>();
 
@@ -722,7 +716,7 @@ export function startDevEventStream(
   // `summariseMeeting`) into this event stream so the summary store re-reads.
   devSummaryReadyListeners.add(emit);
   // Likewise forward dev `diarization_complete` notifications (fired by the
-  // shim's `rediarize_meeting`) so the meetings store re-reads the transcript.
+  // shim's `reprocess`) so the meetings store re-reads the transcript.
   devDiarizationListeners.add(emit);
   // Likewise forward dev chat events (fired by the shim's `sendChatMessage`) so
   // the chat store streams the sample turn under `vite dev`.

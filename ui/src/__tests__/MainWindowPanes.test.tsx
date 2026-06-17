@@ -60,8 +60,7 @@ vi.mock("../ipc/meetings", () => ({
   openMeeting: vi.fn(),
   renameMeeting: vi.fn(),
   deleteMeeting: vi.fn(),
-  reTranscribe: vi.fn(),
-  rediarize: vi.fn(),
+  reprocess: vi.fn(),
 }));
 // The summary column mounts the SummaryView, which reads through the summary
 // seam; mock it so the column renders without a backend.

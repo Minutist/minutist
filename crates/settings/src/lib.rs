@@ -470,8 +470,8 @@ pub struct Settings {
     /// default = read-only over MCP.** Consulted at registry-projection time by
     /// the MCP server: with it OFF, `tools/list` is read/compute tools + the
     /// inter-agent tool only; with it ON, the reversible writes
-    /// (`set_speaker_name`, `rename_meeting`) join. `retranscribe_meeting` /
-    /// `rediarize_meeting` / any destructive tool stay internal-only regardless
+    /// (`set_speaker_name`, `rename_meeting`) join. `reprocess_meeting` /
+    /// any destructive tool stay internal-only regardless
     /// (they are never `expose_over_mcp`). `#[serde(default)]` defaults to
     /// `false`; an older store deserialises to `false`. See
     /// `architecture/cross-cutting.md` — "MCP transport".

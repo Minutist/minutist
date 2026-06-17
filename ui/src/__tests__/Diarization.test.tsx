@@ -11,7 +11,9 @@
  *      meeting's transcript via `open_meeting` (not the live store).
  *   3. The `diarization_enabled` settings toggle round-trips through
  *      `commands.updateSettings`.
- *   4. The Re-diarize action invokes the `rediarize` seam.
+ *   4. The Reprocess action invokes the `reprocess` seam (#0015 merged the
+ *      former re-transcribe + re-diarize actions; re-diarize runs as the second
+ *      phase of that one op).
  *
  * This is a default-suite test: it needs no model, GPU, or microphone — the
  * synthetic speaker-tagged segments and the mocked seams are the fixtures.
@@ -39,8 +41,7 @@ vi.mock("../ipc/meetings", () => ({
   renameMeeting: vi.fn().mockResolvedValue(undefined),
   setSpeakerName: vi.fn().mockResolvedValue({}),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
-  reTranscribe: vi.fn().mockResolvedValue(undefined),
-  rediarize: vi.fn().mockResolvedValue(undefined),
+  reprocess: vi.fn().mockResolvedValue(undefined),
 }));
 
 // The recording store rounds the toggle through `commands.updateSettings`; mock
@@ -530,26 +531,28 @@ describe("diarization_enabled toggle round-trip (Phase 6)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Re-diarize action invokes the seam (via the store)
+// 4. Reprocess action invokes the seam (via the store). #0015 merged the
+//    re-transcribe + re-diarize actions; re-diarization runs as the second
+//    phase of the one reprocess op, emitting `diarization_complete` as before.
 // ---------------------------------------------------------------------------
 
-describe("Re-diarize action (Phase 6)", () => {
+describe("Reprocess action (#0015)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStores();
   });
 
-  it("the meetings-store rediarize action invokes the rediarize seam", async () => {
-    await useMeetingsStore.getState().rediarize("m-7");
-    expect(meetingsIpc.rediarize).toHaveBeenCalledWith("m-7");
+  it("the meetings-store reprocess action invokes the reprocess seam", async () => {
+    await useMeetingsStore.getState().reprocess("m-7");
+    expect(meetingsIpc.reprocess).toHaveBeenCalledWith("m-7");
     expect(useMeetingsStore.getState().lastError).toBeNull();
   });
 
-  it("surfaces an error when the rediarize seam rejects", async () => {
-    vi.mocked(meetingsIpc.rediarize).mockRejectedValueOnce(
+  it("surfaces an error when the reprocess seam rejects", async () => {
+    vi.mocked(meetingsIpc.reprocess).mockRejectedValueOnce(
       new Error("no diarizer model"),
     );
-    await useMeetingsStore.getState().rediarize("m-7");
+    await useMeetingsStore.getState().reprocess("m-7");
     expect(useMeetingsStore.getState().lastError).toBe("no diarizer model");
   });
 });

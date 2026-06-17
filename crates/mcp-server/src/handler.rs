@@ -213,9 +213,8 @@ mod tests {
         // Reversible writes ABSENT when the gate is off.
         assert!(!names.contains(&"set_speaker_name".to_string()));
         assert!(!names.contains(&"rename_meeting".to_string()));
-        // Heavy/destructive writes never exposed.
-        assert!(!names.contains(&"retranscribe_meeting".to_string()));
-        assert!(!names.contains(&"rediarize_meeting".to_string()));
+        // The heavy/destructive write is never exposed.
+        assert!(!names.contains(&"reprocess_meeting".to_string()));
     }
 
     #[test]
@@ -224,9 +223,8 @@ mod tests {
         // Reversible writes now present.
         assert!(names.contains(&"set_speaker_name".to_string()));
         assert!(names.contains(&"rename_meeting".to_string()));
-        // Heavy ops STILL never exposed, regardless of the gate.
-        assert!(!names.contains(&"retranscribe_meeting".to_string()));
-        assert!(!names.contains(&"rediarize_meeting".to_string()));
+        // The heavy op STILL never exposed, regardless of the gate.
+        assert!(!names.contains(&"reprocess_meeting".to_string()));
     }
 
     #[test]
@@ -384,14 +382,13 @@ mod tests {
         // With writes off: a read is callable, a write is not, an unknown is not.
         assert!(registry.mcp_call_allowed("get_transcript", false));
         assert!(!registry.mcp_call_allowed("set_speaker_name", false));
-        assert!(!registry.mcp_call_allowed("retranscribe_meeting", false));
+        assert!(!registry.mcp_call_allowed("reprocess_meeting", false));
         assert!(!registry.mcp_call_allowed("no_such_tool", false));
         assert!(registry.mcp_call_allowed("send_to_internal_agent", false));
         // With writes on: the reversible write becomes callable; the heavy one
         // never does.
         assert!(registry.mcp_call_allowed("set_speaker_name", true));
         assert!(registry.mcp_call_allowed("rename_meeting", true));
-        assert!(!registry.mcp_call_allowed("retranscribe_meeting", true));
-        assert!(!registry.mcp_call_allowed("rediarize_meeting", true));
+        assert!(!registry.mcp_call_allowed("reprocess_meeting", true));
     }
 }

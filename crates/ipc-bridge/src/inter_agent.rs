@@ -24,12 +24,12 @@
 //! An external MCP client reaching the internal agent through this bridge must
 //! get NO broader a write surface than a DIRECT MCP call under the active
 //! `settings.mcp_write_tools`. `ToolRegistry::v1(false)` includes the destructive
-//! `retranscribe_meeting` / `rediarize_meeting` ops the direct MCP path keeps
+//! `reprocess_meeting` op the direct MCP path keeps
 //! unreachable (`expose_over_mcp() == false`), so the bridge applies the SAME
 //! gate the direct path uses (the single policy in `agent-tools`):
 //! - the engine is offered only the MCP-allowed descriptors
 //!   (`mcp_tool_descriptors_gated(allow_writes)`), so the model never sees
-//!   `retranscribe`/`rediarize`; and
+//!   `reprocess`; and
 //! - the per-call dispatch REJECTS a non-allowed tool (`mcp_call_allowed`) as
 //!   defence in depth, even if the model requests it by name.
 //!

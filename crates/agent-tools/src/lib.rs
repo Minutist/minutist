@@ -24,7 +24,7 @@
 //! # Threading
 //!
 //! [`Tool::execute`] is `async` because the backing operations are async
-//! (`Orchestrator::re_transcribe`/`rediarize`/`transcribe_pcm_window` are
+//! (`Orchestrator::reprocess`/`transcribe_pcm_window` are
 //! `async fn`; `MeetingIndex::list_meetings`/`search` are async libsql). Tool
 //! *bodies* still push CPU/fs/inference work onto `tokio::task::spawn_blocking`
 //! — the trait being async does not relax the cross-cutting rule.
@@ -130,9 +130,9 @@ pub trait Tool: Send + Sync {
 /// `broadcast::Sender`).
 #[derive(Clone)]
 pub struct ToolContext {
-    /// The recording orchestrator. Backs `relisten_section`, `retranscribe_meeting`,
-    /// `rediarize_meeting`, and `get_recording_state`. Owns the `model-registry`
-    /// edge so `agent-tools` need not.
+    /// The recording orchestrator. Backs `relisten_section`, `reprocess_meeting`,
+    /// and `get_recording_state`. Owns the `model-registry` edge so `agent-tools`
+    /// need not.
     pub orchestrator: Arc<Orchestrator>,
     /// The libsql meeting index. Backs `list_meetings` + `search_meetings`, and
     /// is passed to the orchestrator's offline ops which refresh its rows.
@@ -145,7 +145,7 @@ pub struct ToolContext {
     /// `Arc<dyn Summariser>` directly (SP0: the bundled impl is `Send + Sync`).
     pub summariser: Arc<dyn Summariser>,
     /// The shared `AppEvent` broadcast bus. Currently UNREAD by any tool — the
-    /// offline write ops (`retranscribe`/`rediarize`) emit
+    /// offline write op (`reprocess`) emits
     /// `TranscriptReady`/`DiarizationComplete` via the orchestrator's own bus,
     /// and the chat driver (Phase 9 ipc-bridge) emits the chat events itself.
     /// Held on the context so a future tool that needs to emit progress can,
@@ -301,8 +301,7 @@ impl ToolRegistry {
             // Writes (MCP exposure per the allowlist on each impl).
             Arc::new(tools::SetSpeakerName),
             Arc::new(tools::RenameMeeting),
-            Arc::new(tools::RetranscribeMeeting),
-            Arc::new(tools::RediarizeMeeting),
+            Arc::new(tools::ReprocessMeeting),
             // Record-control writes (#62). All `is_write` with the default
             // `expose_over_mcp` (`!is_write` → `false`), so they are write-gated
             // OFF over MCP regardless of `mcp_write_tools` — the recording
@@ -354,7 +353,7 @@ impl ToolRegistry {
     /// `allow_writes` is `settings.mcp_write_tools`. The two layers compose:
     /// - a tool is a candidate only if `expose_over_mcp()` is `true` (reads +
     ///   compute + the two reversible writes + the inter-agent tool; never
-    ///   `retranscribe`/`rediarize`/any destructive tool — those return `false`
+    ///   `reprocess`/any destructive tool — those return `false`
     ///   on the trait and so are unreachable regardless of `allow_writes`);
     /// - when `allow_writes` is `false`, write tools are additionally dropped,
     ///   so the surface is read/compute + the inter-agent tool only.

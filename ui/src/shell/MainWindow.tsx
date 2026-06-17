@@ -233,11 +233,10 @@ export function MainWindow() {
               </button>
             )}
           {/*
-            #67 — the Re-transcribe / Re-identify-speakers offline actions moved
-            out of this heading into an action toolbar at the TOP of the
-            transcript pane (see `TranscriptPane`). The meetings-store
-            `reTranscribe` / `rediarize` seams are unchanged; only the affordance
-            location moved.
+            #67 — the offline Reprocess action lives in an action toolbar at the
+            TOP of the transcript pane (see `TranscriptPane`), not in this
+            heading. It drives the meetings-store `reprocess` seam (#0015 merged
+            the former re-transcribe + re-diarize actions into one).
           */}
           <MeetingControls />
           <div className="main-window__meter" aria-label="Audio level">

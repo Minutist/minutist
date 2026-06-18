@@ -103,7 +103,8 @@ used, not added here.
 `WordTimestamp`, `MeetingMeta`, `ModelDescriptor`, `RecordingState`,
 `AppEvent`, `AudioDevice`, `AudioMeterFrame`, `AudioFormat`,
 `ModelKind`, `ModelManifestEntry`, `ModelFileEntry`, `ModelStatusState`,
-`ModelStatus`, `MeetingListEntry`, `NotesDocument`, `NoteBlock`, `MeetingState`,
+`ModelStatus`, `MeetingListEntry`, `Collection`, `CollectionId`, `NotesDocument`,
+`NoteBlock`, `MeetingState`,
 `InterAgentRequest`, `InterAgentReply`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias, and the
@@ -258,6 +259,18 @@ payload). Re-transcribe reuses `AppEvent::TranscriptSegment` — no new event.
 The local index uses **libsql** (`default-features=false, features=["core"]`;
 Gate-A-confirmed building on Linux + Windows MSVC); `index.db` is a derived
 cache rebuildable from the per-meeting folders.
+
+**Collections ("folders").** `Collection { id: CollectionId, name, position }`
+and the `CollectionId` UUID newtype (mirroring `MeetingId`) model a user-facing
+"folder" that groups meetings — **distinct** from `persistence::MeetingFolder`,
+which is a single meeting's on-disk directory (the UI label is "Folders"; the
+internal type is `Collection` to avoid that collision). A meeting belongs to at
+most one collection: `MeetingMeta.collection_id: Option<CollectionId>`
+(`#[serde(default, skip_serializing_if = …)]`, the established additive pattern)
+is the authoritative membership, and `MeetingListEntry.collection_id` is its
+derived mirror for filtered listing. Collection *definitions* live in
+`{app-data}/collections.json`, owned by `persistence` (see below) — never in
+`index.db`, which is a wiped-and-rebuilt cache.
 
 **Stable surface — locked.** The trait signatures and event variants in
 this crate are the architectural contract that sub-agents implement
@@ -859,7 +872,8 @@ drifts when the upstream repo is re-uploaded and silently breaks hash verificati
 ### `persistence`
 **Crate:** `crates/persistence`
 **Owns:** the per-meeting folder layout, the libsql index schema and
-migrations, Opus audio encoding, Tiptap JSON I/O.
+migrations, the collection ("folder") definitions store (`collections.json`),
+Opus audio encoding, Tiptap JSON I/O.
 
 **Opus encoder pin.** `audiopus = "0.3.0-rc.0"` (the explicit pre-release
 tag is required at workspace level; Cargo's semver does not resolve
@@ -1112,7 +1126,26 @@ on `common`.
   `label`), never the `new_title` or speaker `name` — both are user content that
   must not reach a log line (and thus the crash file / report excerpt, which
   capture info+ log lines).
-- **Summary hook (`summary` module + `MeetingFolder::summary_path()`).**
+- **Collections store (`collections` module + `collections.json`).** A user-facing
+"folder" grouping meetings — distinct from [`MeetingFolder`] (a single meeting's
+directory). `CollectionStore` is the authoritative reader/writer for the flat
+`Vec<Collection>` in `{app-data}/collections.json` (atomic tmp+fsync+rename,
+beside `index.db` — NOT under it, since the index is a wiped-and-rebuilt cache
+while the folder list must survive a rebuild): `load` (absent file → empty list),
+`create` (assigns the next `position`; trims + rejects empty), `rename`.
+Membership is authoritative on each meeting's `metadata.json`
+(`MeetingMeta::collection_id`, written by `meeting_ops::set_meeting_collection`,
+which also refreshes the index row); the forward-only migration runner adds a
+derived `collection_id` column to the `meetings` index table at **schema version
+2** (a nullable `ALTER TABLE ADD COLUMN` + a `collection_id` index) for filtered
+listing. The async free fn `collections::delete_collection(app_data_root,
+meetings_root, index, id)` first clears the membership of every meeting filed
+under the collection (found via `MeetingIndex::ids_in_collection`, cleared through
+`set_meeting_collection(None)`) so no `metadata.json` keeps a dangling reference,
+then removes the definition. No new cross-component dependency edge —
+`persistence` still depends only on `common`.
+
+**Summary hook (`summary` module + `MeetingFolder::summary_path()`).**
   `write_summary(meeting_dir, &str)` (atomic tmp+rename) and
   `read_summary(meeting_dir) -> AppResult<Option<String>>` for `summary.md`.
   Phase 5's `summariser` produces the file; Phase 4 lands only the path helper
@@ -2115,7 +2148,7 @@ regenerated.
 
 **Phase 4 additions (18 commands at Phase 4; `re_summarise` removed in Phase 5)
 — meeting list / open / actions.** Six commands back the meeting-list view
-(FR-33):
+(FR-33), plus five **collection** ("folder") commands:
 
 - `list_meetings() -> Vec<MeetingListEntry>` — self-heals via
   `MeetingIndex::reconcile_orphans(meetings_dir)` (best-effort), then queries the
@@ -2133,6 +2166,20 @@ regenerated.
   updated map so the webview re-renders the transcript overlay without a
   reload. The same write is also reachable as the `set_speaker_name` agent
   tool; this is its direct UI path. Label + name capped at 512 chars.
+- **Collections ("folders"), five commands.** `list_collections() ->
+  Vec<Collection>`, `create_collection(name) -> Collection`,
+  `rename_collection(collection_id, name) -> ()`,
+  `delete_collection(collection_id) -> ()`, and
+  `set_meeting_collection(meeting_id, collection_id: Option<CollectionId>) ->
+  ()`. A *collection* is a user-facing folder grouping meetings — distinct from
+  `persistence::MeetingFolder` (a single meeting's on-disk directory). The first
+  four route to `persistence::collections` (the authoritative `collections.json`
+  store at the app-data root; `delete_collection` clears the membership of every
+  affected meeting first so no `metadata.json` keeps a dangling `collection_id`);
+  the last routes to `persistence::meeting_ops::set_meeting_collection`. The
+  app-data root is derived from `IpcState::index_db_path`'s parent (where
+  `collections.json` sits, beside `index.db`). Names are trimmed + capped at 128
+  chars; file I/O runs on `spawn_blocking`.
 - `reprocess(meeting_id) -> ()` — the **only** read/action command that routes
   through the orchestrator (`Orchestrator::reprocess`): an offline re-run of the
   live ASR pipeline FOLLOWED BY re-diarization, under one offline claim (#0015

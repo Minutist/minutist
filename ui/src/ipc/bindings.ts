@@ -361,6 +361,64 @@ async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
 }
 },
 /**
+ * List all collections (folders), ordered by position. Reads the authoritative
+ * `collections.json` (blocking file I/O on `spawn_blocking`).
+ */
+async listCollections() : Promise<Result<Collection[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_collections") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Create a collection named `name`; returns the created [`Collection`].
+ */
+async createCollection(name: string) : Promise<Result<Collection, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_collection", { name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Rename the collection `collection_id` to `name`.
+ */
+async renameCollection(collectionId: CollectionId, name: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rename_collection", { collectionId, name }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Delete a collection: clears the membership of every meeting filed under it
+ * (those meetings become unfiled), then removes the definition.
+ */
+async deleteCollection(collectionId: CollectionId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_collection", { collectionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * File a meeting into a collection (`Some(id)`) or unfile it (`None`). Updates
+ * `metadata.json` (authoritative) then the index row's derived mirror.
+ */
+async setMeetingCollection(meetingId: MeetingId, collectionId: CollectionId | null) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_meeting_collection", { meetingId, collectionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Reprocess a meeting offline (FR-33 + FR-11 action): re-transcribe THEN
  * re-diarize under a single offline claim.
  * 
@@ -997,6 +1055,31 @@ export type ChatSession = { id: ChatSessionId; meeting_id?: MeetingId | null; ti
  */
 export type ChatSessionId = string
 /**
+ * A user-facing "folder" that groups meetings (UI label: "Folders").
+ * 
+ * A meeting belongs to at most one collection ([`MeetingMeta::collection_id`]);
+ * collections are a flat list ordered by `position`. The authoritative
+ * definitions live in `{app-data}/collections.json` (owned by `persistence`);
+ * `index.db` carries only a derived `collection_id` column on each meeting row
+ * for fast filtered listing. Distinct from `persistence::MeetingFolder`, which
+ * is a single meeting's on-disk directory.
+ */
+export type Collection = { id: CollectionId; name: string; 
+/**
+ * Sort position in the flat folder list (ascending). Assigned at creation.
+ */
+position: number }
+/**
+ * Stable identifier for a collection — a user-facing "folder" that groups
+ * meetings. UUIDv4. Mirrors [`MeetingId`].
+ * 
+ * Distinct from `persistence::MeetingFolder`, which is a single meeting's
+ * on-disk directory. A meeting belongs to at most one collection
+ * ([`MeetingMeta::collection_id`]); the collection's definition (name, order)
+ * lives in `{app-data}/collections.json` (owned by `persistence`).
+ */
+export type CollectionId = string
+/**
  * A redacted diagnostic snapshot for the user-driven "Report a problem" flow.
  * 
  * Assembled and **redacted** by `ipc-bridge` (`get_diagnostic_report`), it
@@ -1101,7 +1184,13 @@ started_at: string; duration_ms: number; speaker_count: number;
 /**
  * Short transcript excerpt for the list preview, when available.
  */
-excerpt?: string | null }
+excerpt?: string | null; 
+/**
+ * The collection (user-facing "folder") this meeting belongs to, if any —
+ * a derived mirror of [`MeetingMeta::collection_id`] for filtered listing.
+ * `None` = unfiled.
+ */
+collection_id?: CollectionId | null }
 /**
  * Per-meeting metadata persisted as `metadata.json`.
  * 
@@ -1134,7 +1223,19 @@ speaker_names: Partial<{ [key in string]: string }>;
  * existed) reads as `0` — the same defaulted-field pattern `speaker_names`
  * used.
  */
-notes_format?: number; app_version: string }
+notes_format?: number; 
+/**
+ * The collection (user-facing "folder") this meeting belongs to, if any.
+ * `None` = unfiled. Authoritative here in `metadata.json`; the `index.db`
+ * `collection_id` column is a derived mirror for filtered listing, so a
+ * `rebuild_from_disk` reconstructs membership from this field.
+ * 
+ * `#[serde(default, skip_serializing_if = …)]` so existing `metadata.json`
+ * (written before the field existed) reads as `None` and the wire shape only
+ * grows when set — the same defaulted-field pattern `speaker_names` /
+ * `notes_format` use.
+ */
+collection_id?: CollectionId | null; app_version: string }
 /**
  * The full restorable state of a meeting, assembled by `persistence` for
  * `open_meeting`: metadata, transcript segments, and the notes document

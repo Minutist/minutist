@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use libsql::{Builder, Connection, Database};
-use minutist_common::{AppResult, MeetingId, MeetingListEntry};
+use minutist_common::{AppResult, CollectionId, MeetingId, MeetingListEntry};
 
 use crate::error::Error;
 use crate::{migrations, reader};
@@ -60,7 +60,7 @@ impl MeetingIndex {
         let rows = self
             .conn
             .query(
-                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt
+                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id
                  FROM meetings
                  ORDER BY started_at DESC",
                 (),
@@ -80,7 +80,7 @@ impl MeetingIndex {
         let rows = self
             .conn
             .query(
-                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt
+                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id
                  FROM meetings
                  WHERE title LIKE ?1 ESCAPE '\\' OR excerpt LIKE ?1 ESCAPE '\\'
                  ORDER BY started_at DESC",
@@ -102,14 +102,15 @@ impl MeetingIndex {
     async fn upsert_inner(&self, entry: &MeetingListEntry) -> Result<(), Error> {
         self.conn
             .execute(
-                "INSERT INTO meetings (id, title, started_at, duration_ms, speaker_count, excerpt)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO meetings (id, title, started_at, duration_ms, speaker_count, excerpt, collection_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      started_at = excluded.started_at,
                      duration_ms = excluded.duration_ms,
                      speaker_count = excluded.speaker_count,
-                     excerpt = excluded.excerpt",
+                     excerpt = excluded.excerpt,
+                     collection_id = excluded.collection_id",
                 libsql::params![
                     entry.id.0.to_string(),
                     entry.title.clone(),
@@ -117,6 +118,7 @@ impl MeetingIndex {
                     entry.duration_ms as i64,
                     entry.speaker_count as i64,
                     entry.excerpt.clone(),
+                    entry.collection_id.map(|c| c.0.to_string()),
                 ],
             )
             .await?;
@@ -136,6 +138,37 @@ impl MeetingIndex {
             )
             .await?;
         Ok(())
+    }
+
+    /// The ids of all meetings currently filed under `collection_id`.
+    ///
+    /// Used when a collection is deleted to clear each affected meeting's
+    /// membership (the per-meeting `metadata.json` is authoritative, so the
+    /// clear must rewrite each one — see `collections::delete_collection`).
+    pub async fn ids_in_collection(
+        &self,
+        collection_id: &CollectionId,
+    ) -> AppResult<Vec<MeetingId>> {
+        Ok(self.ids_in_collection_inner(collection_id).await?)
+    }
+
+    async fn ids_in_collection_inner(
+        &self,
+        collection_id: &CollectionId,
+    ) -> Result<Vec<MeetingId>, Error> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM meetings WHERE collection_id = ?1",
+                libsql::params![collection_id.0.to_string()],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            ids.push(parse_meeting_id(&id)?);
+        }
+        Ok(ids)
     }
 
     /// Rebuild the index from the per-meeting folders under `meetings_root`.
@@ -356,6 +389,7 @@ fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> 
         duration_ms: meta.duration_ms,
         speaker_count: meta.speaker_count,
         excerpt,
+        collection_id: meta.collection_id,
     })
 }
 
@@ -408,6 +442,9 @@ fn row_to_entry(row: &libsql::Row) -> Result<MeetingListEntry, Error> {
     let speaker_count: i64 = row.get(4)?;
     // `excerpt` is nullable; libsql maps SQL NULL to an Option.
     let excerpt: Option<String> = row.get(5)?;
+    // `collection_id` is nullable (NULL = unfiled); parse the stored UUID string.
+    let collection_id: Option<String> = row.get(6)?;
+    let collection_id = collection_id.as_deref().map(parse_collection_id).transpose()?;
 
     Ok(MeetingListEntry {
         id,
@@ -416,6 +453,7 @@ fn row_to_entry(row: &libsql::Row) -> Result<MeetingListEntry, Error> {
         duration_ms: duration_ms as u64,
         speaker_count: speaker_count as u32,
         excerpt,
+        collection_id,
     })
 }
 
@@ -428,6 +466,14 @@ fn row_to_entry(row: &libsql::Row) -> Result<MeetingListEntry, Error> {
 fn parse_meeting_id(s: &str) -> Result<MeetingId, Error> {
     serde_json::from_str::<MeetingId>(&format!("\"{s}\""))
         .map_err(|e| Error::Migration(format!("invalid meeting id in index: {s} ({e})")))
+}
+
+/// Parse a stored UUID string back into a [`CollectionId`] (mirrors
+/// [`parse_meeting_id`]; both newtypes are `#[serde(transparent)]` over a UUID
+/// string, so round-trip through `serde_json` rather than depending on `uuid`).
+fn parse_collection_id(s: &str) -> Result<CollectionId, Error> {
+    serde_json::from_str::<CollectionId>(&format!("\"{s}\""))
+        .map_err(|e| Error::Migration(format!("invalid collection id in index: {s} ({e})")))
 }
 
 /// Escape `LIKE` wildcards in a user-supplied search term so they match

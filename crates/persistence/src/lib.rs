@@ -53,6 +53,7 @@
 
 pub mod assets;
 pub mod chat;
+pub mod collections;
 pub mod error;
 pub mod folder;
 pub mod index;
@@ -71,6 +72,7 @@ pub mod ydoc;
 // Public re-exports for the crate's primary surface.
 pub use assets::{read_note_asset, save_note_asset};
 pub use chat::ChatStore;
+pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;
 pub use folder::MeetingFolder;
 pub use index::MeetingIndex;

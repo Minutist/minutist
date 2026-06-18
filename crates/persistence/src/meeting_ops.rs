@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use minutist_common::{AppResult, MeetingId};
+use minutist_common::{AppResult, CollectionId, MeetingId};
 
 use crate::error::Error;
 use crate::index::MeetingIndex;
@@ -53,6 +53,42 @@ pub async fn rename_meeting(
         target: "persistence",
         meeting_id = %id.0,
         "meeting renamed"
+    );
+
+    Ok(())
+}
+
+/// Set (or clear) the collection a meeting belongs to: update `metadata.json`'s
+/// `collection_id` (authoritative) then refresh the index row (whose
+/// `collection_id` column is the derived mirror used for filtered listing).
+/// `None` clears membership (unfiled).
+///
+/// Only the meeting id is logged — the collection id is an opaque UUID and the
+/// collection's name (user content) lives in `collections.json`, never here.
+/// `AppError::InvalidInput` if the folder has no `metadata.json`.
+pub async fn set_meeting_collection(
+    meetings_root: &Path,
+    index: &MeetingIndex,
+    id: MeetingId,
+    collection_id: Option<CollectionId>,
+) -> AppResult<()> {
+    let folder = meetings_root.join(id.0.to_string());
+    if !folder.join("metadata.json").exists() {
+        return Err(Error::MeetingNotFound(id).into());
+    }
+
+    let mut meta = reader::read_metadata_inner(&folder)?;
+    meta.collection_id = collection_id;
+    crate::metadata::write_metadata(&folder, &meta)?;
+
+    // Refresh the index row so the derived `collection_id` mirror matches.
+    let entry = list_entry_from(&folder)?;
+    index.upsert(&entry).await?;
+
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        "meeting collection set"
     );
 
     Ok(())
@@ -141,6 +177,7 @@ fn list_entry_from(folder: &Path) -> Result<minutist_common::MeetingListEntry, E
         duration_ms: meta.duration_ms,
         speaker_count: meta.speaker_count,
         excerpt,
+        collection_id: meta.collection_id,
     })
 }
 
@@ -178,6 +215,7 @@ mod tests {
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
+            collection_id: None,
             app_version: "0.0.0".into(),
         };
         write_metadata(folder.path(), &meta).expect("write metadata");

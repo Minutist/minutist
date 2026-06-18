@@ -97,6 +97,7 @@ async fn seed_meeting(
         diarizer: None,
         speaker_names,
         notes_format: 0,
+        collection_id: None,
         app_version: "0.0.0".to_string(),
     };
     persistence::write_metadata(&dir, &meta).expect("write metadata");
@@ -112,6 +113,7 @@ async fn seed_meeting(
         duration_ms: meta.duration_ms,
         speaker_count: meta.speaker_count,
         excerpt: segments_excerpt(meetings_dir, id),
+        collection_id: meta.collection_id,
     };
     index.upsert(&entry).await.expect("index upsert");
     id

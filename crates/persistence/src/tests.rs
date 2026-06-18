@@ -116,6 +116,7 @@ fn dummy_meta(id: MeetingId, duration_ms: u64) -> MeetingMeta {
         diarizer: None,
         speaker_names: std::collections::BTreeMap::new(),
         notes_format: 0,
+        collection_id: None,
         app_version: "0.0.0-test".to_string(),
     }
 }
@@ -1330,6 +1331,7 @@ fn list_entry(title: &str, started_at: &str) -> minutist_common::MeetingListEntr
         duration_ms: 1_000,
         speaker_count: 1,
         excerpt: Some(format!("{title} excerpt")),
+        collection_id: None,
     }
 }
 

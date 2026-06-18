@@ -78,6 +78,33 @@ impl Default for ChatSessionId {
     }
 }
 
+/// Stable identifier for a collection — a user-facing "folder" that groups
+/// meetings. UUIDv4. Mirrors [`MeetingId`].
+///
+/// Distinct from `persistence::MeetingFolder`, which is a single meeting's
+/// on-disk directory. A meeting belongs to at most one collection
+/// ([`MeetingMeta::collection_id`]); the collection's definition (name, order)
+/// lives in `{app-data}/collections.json` (owned by `persistence`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
+pub struct CollectionId(
+    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
+);
+
+impl CollectionId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for CollectionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Stable identifier for a model in the registry.
 ///
 /// Examples: `"qwen3-asr-1.7b-q8_0"`, `"qwen2.5-3b-instruct-q4_k_m"`,
@@ -365,6 +392,17 @@ pub struct MeetingMeta {
     /// used.
     #[serde(default)]
     pub notes_format: u8,
+    /// The collection (user-facing "folder") this meeting belongs to, if any.
+    /// `None` = unfiled. Authoritative here in `metadata.json`; the `index.db`
+    /// `collection_id` column is a derived mirror for filtered listing, so a
+    /// `rebuild_from_disk` reconstructs membership from this field.
+    ///
+    /// `#[serde(default, skip_serializing_if = …)]` so existing `metadata.json`
+    /// (written before the field existed) reads as `None` and the wire shape only
+    /// grows when set — the same defaulted-field pattern `speaker_names` /
+    /// `notes_format` use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_id: Option<CollectionId>,
     pub app_version: String,
 }
 
@@ -394,6 +432,28 @@ pub struct MeetingListEntry {
     /// Short transcript excerpt for the list preview, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excerpt: Option<String>,
+    /// The collection (user-facing "folder") this meeting belongs to, if any —
+    /// a derived mirror of [`MeetingMeta::collection_id`] for filtered listing.
+    /// `None` = unfiled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_id: Option<CollectionId>,
+}
+
+/// A user-facing "folder" that groups meetings (UI label: "Folders").
+///
+/// A meeting belongs to at most one collection ([`MeetingMeta::collection_id`]);
+/// collections are a flat list ordered by `position`. The authoritative
+/// definitions live in `{app-data}/collections.json` (owned by `persistence`);
+/// `index.db` carries only a derived `collection_id` column on each meeting row
+/// for fast filtered listing. Distinct from `persistence::MeetingFolder`, which
+/// is a single meeting's on-disk directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct Collection {
+    pub id: CollectionId,
+    pub name: String,
+    /// Sort position in the flat folder list (ascending). Assigned at creation.
+    pub position: u32,
 }
 
 /// The notes document as it crosses the IPC boundary.
@@ -1708,6 +1768,7 @@ mod tests {
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
+            collection_id: None,
             app_version: "0.0.0".to_string(),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -1727,6 +1788,7 @@ mod tests {
             duration_ms: 1_800_000,
             speaker_count: 2,
             excerpt: None,
+            collection_id: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains("excerpt"), "absent excerpt must be omitted");
@@ -1754,6 +1816,7 @@ mod tests {
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
+            collection_id: None,
             app_version: "0.0.0".to_string(),
         };
         let segment = Segment {

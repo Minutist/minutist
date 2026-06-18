@@ -607,6 +607,7 @@ impl Orchestrator {
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
+            collection_id: None,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 
@@ -1150,6 +1151,7 @@ impl Orchestrator {
                 duration_ms: meta.duration_ms,
                 speaker_count: meta.speaker_count,
                 excerpt: transcript.first().map(|s| s.text.clone()),
+                collection_id: meta.collection_id,
             })
         })
         .await
@@ -1545,6 +1547,7 @@ impl Orchestrator {
                     duration_ms: meta.duration_ms,
                     speaker_count: meta.speaker_count,
                     excerpt: transcript.first().map(|s| s.text.clone()),
+                    collection_id: meta.collection_id,
                 })
             })
             .await

@@ -465,6 +465,7 @@ mod diarization {
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
+            collection_id: None,
             app_version: "0.0.0".into(),
         };
         let folder = writer.finalise(meta).expect("finalise");

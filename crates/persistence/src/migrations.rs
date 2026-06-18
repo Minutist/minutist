@@ -21,7 +21,7 @@ use crate::error::Error;
 
 /// The schema version this build of `persistence` targets. Bump this and add a
 /// matching arm in [`apply_migration`] when the schema changes.
-pub const CURRENT_VERSION: i64 = 1;
+pub const CURRENT_VERSION: i64 = 2;
 
 /// Bring `conn`'s schema up to [`CURRENT_VERSION`].
 ///
@@ -101,6 +101,23 @@ async fn apply_migration(conn: &Connection, version: i64) -> Result<(), Error> {
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_meetings_started_at
                  ON meetings (started_at DESC)",
+                (),
+            )
+            .await?;
+            Ok(())
+        }
+        2 => {
+            // Add the derived `collection_id` mirror (a meeting's user-facing
+            // "folder", authoritative in its `metadata.json`) so the list view
+            // can filter by folder straight from the index. Nullable = unfiled.
+            conn.execute(
+                "ALTER TABLE meetings ADD COLUMN collection_id TEXT",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_meetings_collection_id
+                 ON meetings (collection_id)",
                 (),
             )
             .await?;

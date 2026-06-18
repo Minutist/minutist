@@ -27,6 +27,9 @@ pub enum Error {
     #[error("meeting not found: {}", .0 .0)]
     MeetingNotFound(minutist_common::MeetingId),
 
+    #[error("collection not found: {}", .0 .0)]
+    CollectionNotFound(minutist_common::CollectionId),
+
     #[error("schema migration error: {0}")]
     Migration(String),
 }
@@ -61,6 +64,9 @@ impl From<Error> for AppError {
             },
             Error::MeetingNotFound(id) => AppError::InvalidInput {
                 context: format!("meeting not found: {}", id.0),
+            },
+            Error::CollectionNotFound(id) => AppError::InvalidInput {
+                context: format!("collection not found: {}", id.0),
             },
             Error::Migration(msg) => AppError::Internal {
                 context: format!("schema migration: {msg}"),

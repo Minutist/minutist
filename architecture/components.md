@@ -36,8 +36,9 @@ appears in:
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
+| `sync` | WS4-B | `common`, `persistence` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡ |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
 Cargo feature (default ON). The free artifact is built with
@@ -51,6 +52,20 @@ tunnel is wired into `app-main`; the S3b crate-add lands the crate in the
 workspace unconditionally (compiled by `cargo test`/workspace build) without the
 `app-main` edge, exactly as `mcp-server` did before Phase 10 wired it. The free
 artifact omits it. See `cross-cutting.md` — "Build variants".
+
+§ `sync` is an **optional** edge of `app-main`, gated by the same `connected`
+Cargo feature as `mcp-server` / `tunnel-client` (it is part of the connected-tier
+surface — the free build does not sync). `sync` is a near-leaf transport crate:
+device-to-device sync over iroh + iroh-blobs, exchanging Yjs notes-update frames
+(a small custom ALPN protocol) and meeting-media blobs (audio + note assets). It
+takes **no** workspace edge beyond `common` (shared types / errors) and
+`persistence` (read the authoritative `notes.ydoc` via `NotesStore` + the
+meeting-media paths; apply received updates). The `app-main -> sync` edge + the
+`ipc-bridge` trait injection land in a LATER slice (WS4-B S5); the S1 crate-add
+lands the crate in the workspace unconditionally (compiled by the workspace
+build) WITHOUT the `app-main` edge, exactly as `mcp-server` and `tunnel-client`
+did before they were wired. The free artifact omits it. See `cross-cutting.md` —
+"Build variants".
 
 The `tunnel-client` row's "May depend on" is empty by design: the crate takes
 **no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)

@@ -16,6 +16,7 @@ members = [
     "crates/chat-agent",
     "crates/mcp-server",
     "crates/tunnel-client",
+    "crates/sync",
     "crates/ipc-bridge",
     "src-tauri",
     "spikes/asr",

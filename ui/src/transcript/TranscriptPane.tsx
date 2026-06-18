@@ -8,7 +8,7 @@ import { useTranslationsStore } from "../state/translations";
 import { OUTPUT_LANGUAGES } from "../shell/OutputLanguagePicker";
 import { writeSegmentDrag } from "../editor/transcript-dnd";
 import { speakerColorIndex } from "./speaker-color";
-import type { Segment } from "../ipc/bindings";
+import type { MeetingId, Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
 
 /**
@@ -35,9 +35,92 @@ import "./TranscriptPane.css";
  *   - Once a translated view is active, a "Show original" button flips back to
  *     the verbatim transcript.
  */
+/** Format a millisecond duration as `M:SS` for the elapsed / ETA readout. */
+function formatClock(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const mm = Math.floor(totalSeconds / 60);
+  const ss = totalSeconds % 60;
+  return `${mm}:${String(ss).padStart(2, "0")}`;
+}
+
+/**
+ * Progress readout for an in-flight reprocess: a full-width bar plus a text line
+ * (phase label, percent, elapsed, and — during the determinate re-transcribe
+ * phase — a rough ETA). Before the backend's first `operation_progress` event
+ * lands, the op is absent, so it shows an indeterminate "Starting…" state driven
+ * by the store's local flag — giving the click immediate visible feedback.
+ *
+ * Phases: re-transcribe reports a determinate fraction (a bar + ETA); the
+ * subsequent diarize phase is indeterminate (an animated bar, no ETA).
+ */
+function ReprocessProgress({
+  meetingId,
+  startedMs,
+}: {
+  meetingId: MeetingId;
+  startedMs: number | null;
+}) {
+  const op = useOperationProgressStore((s) => s.operations[meetingId]);
+  // Tick once a second so the elapsed / ETA readout advances live.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const fraction = op?.fraction ?? null;
+  const determinate = fraction !== null;
+  const pct = determinate
+    ? Math.round(Math.min(1, Math.max(0, fraction)) * 100)
+    : null;
+  const label = op?.label ?? "Starting…";
+
+  const elapsedMs = startedMs !== null ? Math.max(0, nowMs - startedMs) : 0;
+  // A rough ETA from the determinate fraction; suppressed below 3 % so the first
+  // ticks don't show a wildly swinging estimate.
+  const etaMs =
+    determinate && (fraction as number) > 0.03
+      ? (elapsedMs * (1 - (fraction as number))) / (fraction as number)
+      : null;
+
+  return (
+    <div
+      className="transcript-pane__progress"
+      role="status"
+      aria-live="polite"
+      data-op={op?.op}
+    >
+      <div
+        className="transcript-pane__progress-track"
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct ?? undefined}
+      >
+        <div
+          className={
+            determinate
+              ? "transcript-pane__progress-fill"
+              : "transcript-pane__progress-fill transcript-pane__progress-fill--indeterminate"
+          }
+          style={determinate ? { width: `${pct}%` } : undefined}
+        />
+      </div>
+      <span className="transcript-pane__progress-text tnum">
+        {label}
+        {pct !== null ? ` · ${pct}%` : ""}
+        {` · ${formatClock(elapsedMs)} elapsed`}
+        {etaMs !== null ? ` · ~${formatClock(etaMs)} left` : ""}
+      </span>
+    </div>
+  );
+}
+
 function TranscriptToolbar() {
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const reprocess = useMeetingsStore((s) => s.reprocess);
+  const reprocessingId = useMeetingsStore((s) => s.reprocessingId);
+  const reprocessStartedMs = useMeetingsStore((s) => s.reprocessStartedMs);
   const recordingState = useRecordingStore((s) => s.state);
   const operation = useOperationProgressStore((s) =>
     openMeetingId !== null ? s.operations[openMeetingId] : undefined,
@@ -48,84 +131,96 @@ function TranscriptToolbar() {
   const translate = useTranslationsStore((s) => s.translate);
   const showVerbatim = useTranslationsStore((s) => s.showVerbatim);
 
-  // Language picker local state: pre-seeded to the first supported language.
-  const [pickedLanguage, setPickedLanguage] = useState<string>(
-    OUTPUT_LANGUAGES[0],
-  );
+  // Translation target language. Starts UNSELECTED (a "Translate to…"
+  // placeholder) rather than pre-seeded to the alphabetically-first language, so
+  // the control never silently defaults to e.g. Arabic.
+  const [pickedLanguage, setPickedLanguage] = useState<string>("");
 
   // Offline reprocessing only applies to a saved meeting that is open while the
   // recorder is idle (recording / paused / stopping / finalising would contend
   // with the live pipeline). Render nothing otherwise.
   if (openMeetingId === null || recordingState.kind !== "idle") return null;
 
-  // The merged reprocess op surfaces progress under both phases the backend runs
-  // (`re_transcribe` then `rediarize`); treat either as the reprocess in flight.
+  // In flight the INSTANT the user clicks (the store's local `reprocessingId`
+  // flag, set before the IPC await), then corroborated by the backend's progress
+  // events (`re_transcribe` then `rediarize`). The local flag spans the whole
+  // pass; the events also feed the progress bar.
+  const localReprocessing = reprocessingId === openMeetingId;
   const reprocessInFlight =
-    operation?.op === "re_transcribe" || operation?.op === "rediarize";
+    localReprocessing ||
+    operation?.op === "re_transcribe" ||
+    operation?.op === "rediarize";
   const translateOpInFlight = operation?.op === "translate";
   // Every offline op contends for the same backend claim — reprocess and
   // translate each refuse while the other runs. Disable BOTH buttons whenever
-  // any offline op is in flight (the translate store may also consider its call
-  // in-flight before the first progress event lands). The Reprocess button shows
-  // its "Reprocessing…" label only while the reprocess op itself runs.
+  // any offline op is in flight.
   const anyOfflineOpInFlight =
     reprocessInFlight || translateOpInFlight || translateInFlight;
   const reprocessDisabled = anyOfflineOpInFlight;
   const translateDisabled = anyOfflineOpInFlight;
 
   return (
-    <div
-      className="transcript-pane__toolbar"
-      role="toolbar"
-      aria-label="Transcript actions"
-    >
-      <button
-        type="button"
-        className="transcript-pane__action"
-        disabled={reprocessDisabled}
-        onClick={() => void reprocess(openMeetingId)}
-        title="Re-run speech recognition and speaker identification on this recording (rare; e.g. after changing the language or model). Resets any speaker names you have set."
+    <>
+      <div
+        className="transcript-pane__toolbar"
+        role="toolbar"
+        aria-label="Transcript actions"
       >
-        {reprocessInFlight ? "Reprocessing…" : "Reprocess"}
-      </button>
-      <span className="transcript-pane__toolbar-sep" aria-hidden="true" />
-      {selectedLanguage !== null ? (
         <button
           type="button"
           className="transcript-pane__action"
-          onClick={showVerbatim}
-          title="Return to the verbatim transcript."
+          disabled={reprocessDisabled}
+          onClick={() => void reprocess(openMeetingId)}
+          title="Re-run speech recognition and speaker identification on this recording, using the transcription language and model set in Settings. Resets any speaker names you have set."
         >
-          Show original
+          {reprocessInFlight ? "Reprocessing…" : "Reprocess"}
         </button>
-      ) : (
-        <>
-          <select
-            className="transcript-pane__lang-select"
-            aria-label="Translation target language"
-            value={pickedLanguage}
-            onChange={(e) => setPickedLanguage(e.target.value)}
-          >
-            {OUTPUT_LANGUAGES.map((l) => (
-              <option key={l} value={l}>
-                {l}
-              </option>
-            ))}
-          </select>
+        <span className="transcript-pane__toolbar-sep" aria-hidden="true" />
+        {selectedLanguage !== null ? (
           <button
             type="button"
             className="transcript-pane__action"
-            disabled={translateDisabled}
-            onClick={() => void translate(openMeetingId, pickedLanguage)}
-            title="Translate this transcript into the selected language using the local LLM."
+            onClick={showVerbatim}
+            title="Return to the verbatim transcript."
           >
-            {translateOpInFlight || translateInFlight
-              ? "Translating…"
-              : "Translate"}
+            Show original
           </button>
-        </>
+        ) : (
+          <>
+            <select
+              className="transcript-pane__lang-select"
+              aria-label="Translation target language"
+              value={pickedLanguage}
+              onChange={(e) => setPickedLanguage(e.target.value)}
+            >
+              <option value="">Translate to…</option>
+              {OUTPUT_LANGUAGES.map((l) => (
+                <option key={l} value={l}>
+                  {l}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="transcript-pane__action"
+              disabled={translateDisabled || pickedLanguage === ""}
+              onClick={() => void translate(openMeetingId, pickedLanguage)}
+              title="Translate this transcript into the selected language using the local LLM."
+            >
+              {translateOpInFlight || translateInFlight
+                ? "Translating…"
+                : "Translate"}
+            </button>
+          </>
+        )}
+      </div>
+      {reprocessInFlight && (
+        <ReprocessProgress
+          meetingId={openMeetingId}
+          startedMs={reprocessStartedMs}
+        />
       )}
-    </div>
+    </>
   );
 }
 

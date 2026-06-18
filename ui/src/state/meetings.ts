@@ -38,6 +38,16 @@ export type MeetingsStore = {
   openMeetingState: MeetingState | null;
   /** Last error surfaced by a meetings IPC call. */
   lastError: string | null;
+  /**
+   * The meeting currently being reprocessed, set the instant `reprocess` is
+   * called — BEFORE the backend's first `operation_progress` event lands (which
+   * lags the click by seconds: claim + audio decode + first ASR flush). Drives
+   * immediate button feedback and guards against a double-press re-claiming the
+   * offline slot. `null` when no reprocess is in flight.
+   */
+  reprocessingId: MeetingId | null;
+  /** Wall-clock ms when the in-flight reprocess started (for elapsed / ETA). */
+  reprocessStartedMs: number | null;
 
   /** Refresh the meeting list (FR-33). */
   refresh: () => Promise<void>;
@@ -83,6 +93,8 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   openMeetingId: null,
   openMeetingState: null,
   lastError: null,
+  reprocessingId: null,
+  reprocessStartedMs: null,
 
   refresh: async () => {
     set({ loading: true });
@@ -169,11 +181,27 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   },
 
   reprocess: async (meetingId) => {
+    // Ignore a re-entrant press: the backend allows only one offline op, and
+    // the button is disabled the instant `reprocessingId` is set below, but
+    // guard here too so a fast double-click can't fire two calls before React
+    // re-renders.
+    if (get().reprocessingId !== null) return;
+    // Set the local in-flight flag NOW (before awaiting) so the button greys to
+    // "Reprocessing…" immediately rather than waiting seconds for the backend's
+    // first progress event.
+    set({
+      reprocessingId: meetingId,
+      reprocessStartedMs: Date.now(),
+      lastError: null,
+    });
     try {
       await reprocess(meetingId);
-      set({ lastError: null });
     } catch (err) {
       set({ lastError: errorMessage(err) });
+    } finally {
+      // The IPC promise resolves only when the whole pass (re-transcribe →
+      // diarize) finishes, so the flag spans the entire operation.
+      set({ reprocessingId: null, reprocessStartedMs: null });
     }
   },
 

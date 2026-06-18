@@ -84,6 +84,63 @@
   cursor: pointer;
 }
 
+/* Reprocess progress: a full-width bar + a quiet text readout (phase, percent,
+   elapsed, ETA) shown below the toolbar while an offline reprocess runs. */
+.transcript-pane__progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  flex: none;
+  padding: 0.55rem 1.5rem;
+  border-bottom: 1px solid var(--rule);
+  background: var(--sheet-quiet);
+}
+
+.transcript-pane__progress-track {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--rule-strong);
+  overflow: hidden;
+}
+
+.transcript-pane__progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width 250ms ease;
+}
+
+/* Indeterminate (the diarize phase, or before the first progress event): a
+   sliding segment so the user sees the pass is alive without a known fraction. */
+.transcript-pane__progress-fill--indeterminate {
+  width: 40%;
+  transition: none;
+  animation: transcript-progress-slide 1.1s ease-in-out infinite;
+}
+
+@keyframes transcript-progress-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.transcript-pane__progress-text {
+  font-family: var(--font-text);
+  font-size: 0.76rem;
+  color: var(--stone);
+  letter-spacing: 0.01em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transcript-pane__progress-fill--indeterminate {
+    animation: none;
+  }
+}
+
 /* Small label appended to translated segments to make the substitution
    visible. Quiet — does not dominate the line. */
 .transcript-pane__translated-label {

@@ -2879,7 +2879,20 @@ left, transcript right).
   the overlaid `speaker_id`s, clears `speaker_names`, refreshes the index row's
   `speaker_count`, emits
   `AppEvent::TranscriptSegment` + `AppEvent::DiarizationComplete { meeting_id, speaker_count }`,
-  and refuses unless the recorder is `Idle`.
+  and refuses unless the recorder is `Idle`. **Reprocess UX:** the meetings
+  store sets a local `reprocessingId` (+ `reprocessStartedMs`) the instant
+  `reprocess` is called — before the first `OperationProgress` event lands
+  (which lags the click by seconds: claim + audio decode + first ASR flush) — so
+  the button greys to "Reprocessing…" immediately, and a re-entrant press is
+  ignored. While in flight the toolbar shows a progress bar (`ReprocessProgress`):
+  a determinate bar + percent + a rough ETA during the re-transcribe phase (from
+  the `OperationProgress.fraction`), an indeterminate animated bar during the
+  diarize phase (`fraction = null`) and before the first event ("Starting…"),
+  plus a live elapsed clock. The translation target-language `<select>` starts
+  UNSELECTED (a "Translate to…" placeholder), not pre-seeded to the
+  alphabetically-first `OUTPUT_LANGUAGES` entry; it controls translation only,
+  NOT the reprocess transcription language (which is the `transcription_language`
+  setting).
 
 **Phase 7 additions (first-run onboarding gate).** `App.tsx` is the gate point:
 it fetches `settings` (via the recording store's `refreshSettings`) + the model

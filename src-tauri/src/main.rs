@@ -1253,7 +1253,15 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
 
     let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
 
-    let icon = app.default_window_icon().cloned().unwrap_or_else(tray_icon);
+    // `default_window_icon()` borrows from `app`, and `.cloned()` keeps that
+    // borrow (the `Image`'s `Cow` still points at app data), so it cannot live
+    // in the app-managed (`'static`) tray. Copy the pixels into an OWNED image.
+    let icon = app
+        .default_window_icon()
+        .map(|img| {
+            tauri::image::Image::new_owned(img.rgba().to_vec(), img.width(), img.height())
+        })
+        .unwrap_or_else(tray_icon);
 
     TrayIconBuilder::new()
         .icon(icon)

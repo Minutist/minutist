@@ -95,6 +95,17 @@ export const commands: Commands = {
   // #0015 — the offline reprocess (re-transcribe + re-diarize under one claim)
   // merges the former `reTranscribe` + `rediarizeMeeting` commands into one.
   reprocess: (meetingId) => callCommand("reprocess", [meetingId]),
+  // Collections ("folders"): list/create/rename/delete the folder definitions
+  // and file a meeting into one (or unfile it with `null`). The DEV shim keeps
+  // an in-memory list so the sidebar renders + mutates under `vite dev`.
+  listCollections: () => callCommand("listCollections", []),
+  createCollection: (name) => callCommand("createCollection", [name]),
+  renameCollection: (collectionId, name) =>
+    callCommand("renameCollection", [collectionId, name]),
+  deleteCollection: (collectionId) =>
+    callCommand("deleteCollection", [collectionId]),
+  setMeetingCollection: (meetingId, collectionId) =>
+    callCommand("setMeetingCollection", [meetingId, collectionId]),
   // Phase 5 summary surface (FR-30). Now present on the generated `commands`
   // object (the Phase-5 backend JOIN regenerated `bindings.ts` and removed the
   // Phase-4 `re_summarise` stub), so these route through `callCommand` like

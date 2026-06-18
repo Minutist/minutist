@@ -32,6 +32,8 @@ import type {
   McpServerInfo,
   NotesDocument,
   DiagnosticReport,
+  Collection,
+  CollectionId,
 } from "./bindings";
 import type { MeetingListEntry, MeetingState } from "./meetings";
 
@@ -325,6 +327,21 @@ const DEV_MEETINGS: MeetingListEntry[] = [
   },
 ];
 
+/**
+ * Sample collections ("folders") + a seeded membership map, so the home-screen
+ * folder sidebar renders populated and reacts to create/rename/delete/move under
+ * `vite dev`. Mutable module state — the shim is a single-session QA stub.
+ */
+let devCollections: Collection[] = [
+  { id: "dev-collection-0001", name: "Projects", position: 0 },
+  { id: "dev-collection-0002", name: "Personal", position: 1 },
+];
+const devMeetingCollection = new Map<string, CollectionId | null>([
+  [DEV_MEETING_ID, "dev-collection-0001"],
+  ["dev-meeting-0002", "dev-collection-0001"],
+  ["dev-meeting-0003", "dev-collection-0002"],
+]);
+
 function ok<T>(data: T): Result<T, IpcError> {
   return { status: "ok", data };
 }
@@ -450,7 +467,14 @@ export const devCommands = {
   },
   // --- Phase 4 meeting-list + open surface (FR-33) ------------------------
   async listMeetings(): Promise<Result<MeetingListEntry[], IpcError>> {
-    return ok(DEV_MEETINGS);
+    // Overlay the (mutable) folder membership so moving a meeting between
+    // folders is reflected on the next list refresh under `vite dev`.
+    return ok(
+      DEV_MEETINGS.map((m) => ({
+        ...m,
+        collection_id: devMeetingCollection.get(m.id) ?? null,
+      })),
+    );
   },
   async openMeeting(
     meetingId: MeetingId,
@@ -471,6 +495,48 @@ export const devCommands = {
     return ok(name.trim() ? { [label]: name.trim() } : {});
   },
   async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  // --- Collections ("folders") --------------------------------------------
+  async listCollections(): Promise<Result<Collection[], IpcError>> {
+    return ok([...devCollections].sort((a, b) => a.position - b.position));
+  },
+  async createCollection(name: string): Promise<Result<Collection, IpcError>> {
+    const position = devCollections.reduce(
+      (max, c) => Math.max(max, c.position + 1),
+      0,
+    );
+    const created: Collection = {
+      id: `dev-collection-new-${devCollections.length + 1}`,
+      name: name.trim(),
+      position,
+    };
+    devCollections = [...devCollections, created];
+    return ok(created);
+  },
+  async renameCollection(
+    collectionId: CollectionId,
+    name: string,
+  ): Promise<Result<null, IpcError>> {
+    devCollections = devCollections.map((c) =>
+      c.id === collectionId ? { ...c, name: name.trim() } : c,
+    );
+    return ok(null);
+  },
+  async deleteCollection(
+    collectionId: CollectionId,
+  ): Promise<Result<null, IpcError>> {
+    devCollections = devCollections.filter((c) => c.id !== collectionId);
+    for (const [mid, cid] of devMeetingCollection) {
+      if (cid === collectionId) devMeetingCollection.set(mid, null);
+    }
+    return ok(null);
+  },
+  async setMeetingCollection(
+    meetingId: MeetingId,
+    collectionId: CollectionId | null,
+  ): Promise<Result<null, IpcError>> {
+    devMeetingCollection.set(meetingId, collectionId);
     return ok(null);
   },
   // `reprocess(meeting_id) -> ()` (#0015): re-transcribe THEN re-diarize under

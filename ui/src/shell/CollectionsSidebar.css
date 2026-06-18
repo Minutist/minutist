@@ -1,0 +1,161 @@
+/*
+ * Editorial Ink — home-screen folder sidebar.
+ *
+ * A quiet left rail of folder entries (All / each folder / Unfiled). The active
+ * entry carries the sanctioned oxblood tint, matching the pane-toggle's
+ * pressed state. All colour / type values come from `styles/theme.css`.
+ */
+
+.collections-sidebar {
+  flex: 0 0 14rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding-right: 1.4rem;
+  border-right: 1px solid var(--rule);
+  min-width: 0;
+}
+
+.collections-sidebar__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0 0.3rem 0.2rem;
+}
+
+.collections-sidebar__title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 480;
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--stone);
+}
+
+.collections-sidebar__new {
+  appearance: none;
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  color: var(--stone);
+  border-radius: var(--radius);
+  width: 1.4rem;
+  height: 1.4rem;
+  line-height: 1;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.collections-sidebar__new:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.collections-sidebar__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.collections-sidebar__folder-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.collections-sidebar__item {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.6rem;
+  appearance: none;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-family: var(--font-text);
+  font-size: 0.92rem;
+  color: var(--ink-soft);
+  padding: 0.32rem 0.5rem;
+  border-radius: var(--radius);
+  cursor: pointer;
+  min-width: 0;
+  transition: background 120ms ease, color 120ms ease;
+}
+.collections-sidebar__item:hover {
+  background: color-mix(in srgb, var(--ink) 5%, transparent);
+  color: var(--ink);
+}
+.collections-sidebar__item--active {
+  background: var(--accent-tint);
+  color: var(--ink);
+}
+
+.collections-sidebar__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.collections-sidebar__label--muted {
+  color: var(--stone);
+  font-style: italic;
+}
+
+.collections-sidebar__count {
+  flex: 0 0 auto;
+  font-size: 0.8rem;
+  color: var(--stone);
+}
+
+/* Rename / delete reveal on row hover so the rail stays calm at rest. */
+.collections-sidebar__folder-actions {
+  position: absolute;
+  right: 0.4rem;
+  display: inline-flex;
+  gap: 0.3rem;
+  background: var(--bg);
+  padding-left: 0.3rem;
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+.collections-sidebar__folder-row:hover .collections-sidebar__folder-actions,
+.collections-sidebar__folder-row:focus-within .collections-sidebar__folder-actions {
+  opacity: 1;
+}
+
+.collections-sidebar__action {
+  appearance: none;
+  border: 0;
+  background: none;
+  font-family: var(--font-text);
+  font-size: 0.74rem;
+  color: var(--stone);
+  cursor: pointer;
+  padding: 0.1rem 0.2rem;
+}
+.collections-sidebar__action:hover {
+  color: var(--ink);
+}
+.collections-sidebar__action--danger:hover {
+  color: var(--accent);
+}
+
+.collections-sidebar__rename-input {
+  flex: 1 1 auto;
+  font-family: var(--font-text);
+  font-size: 0.92rem;
+  color: var(--ink);
+  background: var(--sheet);
+  border: 1px solid var(--rule-margin);
+  border-radius: var(--radius);
+  padding: 0.28rem 0.45rem;
+  min-width: 0;
+}
+.collections-sidebar__rename-input::placeholder {
+  color: var(--stone);
+  font-style: italic;
+}

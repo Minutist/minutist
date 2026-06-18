@@ -20,8 +20,9 @@ import {
   deleteMeeting,
   reprocess,
 } from "../ipc/meetings";
+import { setMeetingCollection } from "../ipc/collections";
 import type { MeetingListEntry, MeetingState } from "../ipc/meetings";
-import type { MeetingId } from "../ipc/bindings";
+import type { CollectionId, MeetingId } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
 
 export type { MeetingListEntry, MeetingState };
@@ -54,6 +55,15 @@ export type MeetingsStore = {
   setSpeakerName: (label: string, name: string) => Promise<void>;
   /** Delete a meeting, then refresh the list. */
   remove: (meetingId: MeetingId) => Promise<void>;
+  /**
+   * File a meeting into a folder (or unfile it with `null`), then refresh the
+   * list so the row's `collection_id` (and the sidebar counts derived from it)
+   * update.
+   */
+  setCollection: (
+    meetingId: MeetingId,
+    collectionId: CollectionId | null,
+  ) => Promise<void>;
   /**
    * Reprocess a meeting (#0015): re-transcribe THEN re-diarize under one offline
    * claim. Resets any user-assigned speaker names (the diarize step re-letters).
@@ -141,6 +151,16 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   remove: async (meetingId) => {
     try {
       await deleteMeeting(meetingId);
+      set({ lastError: null });
+      await get().refresh();
+    } catch (err) {
+      set({ lastError: errorMessage(err) });
+    }
+  },
+
+  setCollection: async (meetingId, collectionId) => {
+    try {
+      await setMeetingCollection(meetingId, collectionId);
       set({ lastError: null });
       await get().refresh();
     } catch (err) {

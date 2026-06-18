@@ -1,20 +1,26 @@
 /**
  * Meeting-list view (FR-33) — the entry surface before a meeting is open.
  *
- * A quiet index of ruled paper rows in the Editorial Ink language: each row is
- * a meeting showing its title (Fraunces), a stone meta line (date · duration ·
- * speaker count), and a transcript excerpt set in reading italic. Opening is the
- * row's primary action — the title is a single click, the text area a
- * double-click, plus an explicit Open button; quiet Rename / Delete management
- * actions reveal on hover. Re-processing (re-transcribe / re-diarize / re-
- * summarise) is rare and lives in the opened-meeting view, not here.
+ * A folder sidebar (left) filters a quiet index of ruled-paper rows (right):
+ * each row is a meeting showing its title (Fraunces), a stone meta line (date ·
+ * duration · speaker count), and a transcript excerpt set in reading italic.
+ * Opening is the row's primary action — the title is a single click, the text
+ * area a double-click, plus an explicit Open button; quiet Move-to / Rename /
+ * Delete management actions reveal on hover. Re-processing lives in the opened-
+ * meeting view, not here.
  *
  * The view consumes `theme.css` tokens only (no hard-coded colour/type) and
- * renders in the DEV shim with sample meetings for visual QA.
+ * renders in the DEV shim with sample meetings + folders for visual QA.
  */
 import { useEffect, useState } from "react";
 import { useMeetingsStore } from "../state/meetings";
 import type { MeetingListEntry } from "../state/meetings";
+import {
+  useCollectionsStore,
+  meetingMatchesFilter,
+} from "../state/collections";
+import type { Collection, CollectionId } from "../state/collections";
+import { CollectionsSidebar } from "./CollectionsSidebar";
 import { OperationIndicator } from "./OperationIndicator";
 import "./MeetingList.css";
 
@@ -44,11 +50,83 @@ export function formatSpeakers(count: number): string {
   return count === 1 ? "1 speaker" : `${count} speakers`;
 }
 
+/**
+ * "Move to…" popover: files the meeting into a folder (or Unfiled). A backdrop
+ * button closes the menu on an outside click; the current folder is marked.
+ */
+function MoveMenu(props: {
+  current: CollectionId | null | undefined;
+  collections: Collection[];
+  onMove: (collectionId: CollectionId | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const { current, collections, onMove } = props;
+
+  return (
+    <span className="meeting-list__move">
+      <button
+        type="button"
+        className="meeting-list__action"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        Move to…
+      </button>
+      {open && (
+        <>
+          <button
+            type="button"
+            className="meeting-list__move-backdrop"
+            aria-label="Close menu"
+            tabIndex={-1}
+            onClick={() => setOpen(false)}
+          />
+          <div className="meeting-list__move-menu" role="menu">
+            <button
+              type="button"
+              role="menuitem"
+              className="meeting-list__move-item"
+              aria-current={!current}
+              onClick={() => {
+                onMove(null);
+                setOpen(false);
+              }}
+            >
+              Unfiled
+            </button>
+            {collections.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                role="menuitem"
+                className="meeting-list__move-item"
+                aria-current={current === c.id}
+                onClick={() => {
+                  onMove(c.id);
+                  setOpen(false);
+                }}
+              >
+                {c.name}
+              </button>
+            ))}
+            {collections.length === 0 && (
+              <span className="meeting-list__move-empty">No folders yet</span>
+            )}
+          </div>
+        </>
+      )}
+    </span>
+  );
+}
+
 type MeetingRowProps = {
   meeting: MeetingListEntry;
+  collections: Collection[];
   onOpen: () => void;
   onRename: (title: string) => void;
   onDelete: () => void;
+  onMove: (collectionId: CollectionId | null) => void;
 };
 
 function MeetingRow(props: MeetingRowProps) {
@@ -133,6 +211,11 @@ function MeetingRow(props: MeetingRowProps) {
         >
           Open
         </button>
+        <MoveMenu
+          current={meeting.collection_id}
+          collections={props.collections}
+          onMove={props.onMove}
+        />
         <button
           type="button"
           className="meeting-list__action"
@@ -162,10 +245,29 @@ export function MeetingList() {
   const open = useMeetingsStore((s) => s.open);
   const rename = useMeetingsStore((s) => s.rename);
   const remove = useMeetingsStore((s) => s.remove);
+  const setCollection = useMeetingsStore((s) => s.setCollection);
+
+  const collections = useCollectionsStore((s) => s.collections);
+  const filter = useCollectionsStore((s) => s.filter);
+  const refreshCollections = useCollectionsStore((s) => s.refresh);
 
   useEffect(() => {
     void refresh();
-  }, [refresh]);
+    void refreshCollections();
+  }, [refresh, refreshCollections]);
+
+  const visible = meetings.filter((m) =>
+    meetingMatchesFilter(filter, m.collection_id),
+  );
+
+  // Distinguish "nothing recorded yet" (whole index empty) from "this folder is
+  // empty" (the active filter excludes every meeting) so the empty copy is honest.
+  const emptyMessage =
+    meetings.length === 0
+      ? loading
+        ? "Loading meetings…"
+        : "No meetings yet. Start a recording to begin."
+      : "No meetings in this folder.";
 
   return (
     <section className="meeting-list ink-reveal" aria-label="Meetings">
@@ -176,25 +278,31 @@ export function MeetingList() {
         </p>
       </header>
 
-      {meetings.length === 0 ? (
-        <p className="meeting-list__empty">
-          {loading
-            ? "Loading meetings…"
-            : "No meetings yet. Start a recording to begin."}
-        </p>
-      ) : (
-        <ol className="meeting-list__rows">
-          {meetings.map((meeting) => (
-            <MeetingRow
-              key={meeting.id}
-              meeting={meeting}
-              onOpen={() => void open(meeting.id)}
-              onRename={(title) => void rename(meeting.id, title)}
-              onDelete={() => void remove(meeting.id)}
-            />
-          ))}
-        </ol>
-      )}
+      <div className="meeting-list__body">
+        <CollectionsSidebar />
+
+        <div className="meeting-list__rows-col">
+          {visible.length === 0 ? (
+            <p className="meeting-list__empty">{emptyMessage}</p>
+          ) : (
+            <ol className="meeting-list__rows">
+              {visible.map((meeting) => (
+                <MeetingRow
+                  key={meeting.id}
+                  meeting={meeting}
+                  collections={collections}
+                  onOpen={() => void open(meeting.id)}
+                  onRename={(title) => void rename(meeting.id, title)}
+                  onDelete={() => void remove(meeting.id)}
+                  onMove={(collectionId) =>
+                    void setCollection(meeting.id, collectionId)
+                  }
+                />
+              ))}
+            </ol>
+          )}
+        </div>
+      </div>
     </section>
   );
 }

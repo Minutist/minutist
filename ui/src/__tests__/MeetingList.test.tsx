@@ -37,6 +37,16 @@ vi.mock("../ipc/summary", () => ({
   saveSummary: vi.fn().mockResolvedValue(undefined),
 }));
 
+// The list now renders the folder sidebar (it reads the collections store on
+// mount); mock the seam so the test doesn't reach the real client.
+vi.mock("../ipc/collections", () => ({
+  listCollections: vi.fn().mockResolvedValue([]),
+  createCollection: vi.fn(),
+  renameCollection: vi.fn().mockResolvedValue(undefined),
+  deleteCollection: vi.fn().mockResolvedValue(undefined),
+  setMeetingCollection: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { MeetingList, formatDuration } from "../shell/MeetingList";
 import { useMeetingsStore } from "../state/meetings";
 import * as meetingsIpc from "../ipc/meetings";

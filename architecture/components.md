@@ -2694,7 +2694,16 @@ left, transcript right).
   workspace on `useMeetingsStore.openMeetingId` (and the recording state): the
   list shows when no meeting is open and nothing is recording; opening a meeting
   or starting a recording reveals the workspace, and a left-aligned back
-  affordance ("‹ Meetings") in the top bar returns to the list when idle.
+  affordance ("‹ Meetings") in the top bar returns to the list when idle. A
+  **folder sidebar** (`CollectionsSidebar.tsx` + `.css`) on the left lists "All
+  meetings", each user folder (with a count), and "Unfiled", and creates /
+  renames / deletes folders; selecting one filters the rows. The folder
+  definitions + the active filter live in `state/collections.ts`
+  (`useCollectionsStore`, wrapping the `ipc/collections.ts` seam); membership is
+  read from each row's `collection_id` (filtering is client-side via the pure
+  `meetingMatchesFilter`), and a per-row "Move to…" popover files a meeting
+  through `useMeetingsStore.setCollection`. The DEV shim seeds sample folders +
+  membership so the sidebar renders + mutates under `vite dev`.
 - **Cross-reference, paragraph-RANGE granularity (FR-22/23).** On the
   pause-EXCLUDING timeline (`data-anchor-ms` ↔ `Segment.start_ms`, NEVER
   `Date.now()`). `ui/src/editor/hover-bridge.ts` (`NotesHoverBridge`) is a

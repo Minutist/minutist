@@ -22,8 +22,38 @@
 
 .meeting-list__header {
   width: 100%;
-  max-width: 58rem;
+  max-width: 72rem;
   margin-bottom: 1.75rem;
+}
+
+/* Two-column body: folder sidebar (left) + the filtered rows (right). */
+.meeting-list__body {
+  width: 100%;
+  max-width: 72rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 2rem;
+}
+
+.meeting-list__rows-col {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* On a narrow window the sidebar stacks above the list. */
+@media (max-width: 48rem) {
+  .meeting-list__body {
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+  .collections-sidebar {
+    flex-basis: auto;
+    width: 100%;
+    padding-right: 0;
+    border-right: none;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 0.75rem;
+  }
 }
 
 .meeting-list__heading {
@@ -46,11 +76,10 @@
 
 .meeting-list__empty {
   width: 100%;
-  max-width: 58rem;
   color: var(--stone);
   font-style: italic;
   font-size: 0.95rem;
-  margin-top: 1.5rem;
+  margin-top: 0.5rem;
 }
 
 .meeting-list__rows {
@@ -58,7 +87,6 @@
   margin: 0;
   padding: 0;
   width: 100%;
-  max-width: 58rem;
   /* Paper sheet holding the index. */
   background: var(--sheet);
   border: 1px solid var(--rule);
@@ -215,6 +243,70 @@
     /* Reveal-on-hover still applies, but without a fade transition. */
     transition: none;
   }
+}
+
+/* "Move to…" popover — files the meeting into a folder (or Unfiled). */
+.meeting-list__move {
+  position: relative;
+  display: inline-flex;
+}
+
+.meeting-list__move-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: default;
+}
+
+.meeting-list__move-menu {
+  position: absolute;
+  top: calc(100% + 0.3rem);
+  right: 0;
+  z-index: 11;
+  min-width: 10rem;
+  max-height: 16rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+  padding: 0.25rem;
+}
+
+.meeting-list__move-item {
+  appearance: none;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-family: var(--font-text);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.meeting-list__move-item:hover {
+  background: var(--accent-tint);
+  color: var(--ink);
+}
+
+.meeting-list__move-item[aria-current="true"] {
+  color: var(--accent);
+}
+
+.meeting-list__move-empty {
+  font-family: var(--font-text);
+  font-size: 0.8rem;
+  font-style: italic;
+  color: var(--stone);
+  padding: 0.35rem 0.5rem;
 }
 
 /* ---------------------------------------------------------------------------

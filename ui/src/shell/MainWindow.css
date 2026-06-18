@@ -491,6 +491,32 @@
   font-size: 0.8rem;
 }
 
+/* --- Sync-ready toast --------------------------------------------------- */
+
+/*
+ * Non-blocking "Synced changes from another device" notification. A quiet
+ * inline strip using the sheet/rule vocabulary rather than the error-accent
+ * colour — sync completion is informational, not an error. The × dismiss
+ * button reuses .main-window__error-dismiss for consistent sizing.
+ */
+.main-window__sync-toast {
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-left: 3px solid var(--stone-faint);
+  border-radius: var(--radius);
+  color: var(--ink-soft);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.main-window__sync-toast-text {
+  flex: 1;
+  min-width: 0;
+}
+
 /* --- Two-pane body ------------------------------------------------------ */
 
 .main-window__panes {

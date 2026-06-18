@@ -70,6 +70,12 @@ that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
 the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
 — "Build variants".
 
+**WS4-B S5 phase 3 (UI):** `ui/src/state/sync-status.ts` and
+`ui/src/shell/SyncSettingsPane.tsx` are purely internal to the webview layer; they
+add no new Cargo edge and no new public IPC command (the four sync commands were
+added in phase 1). Both are VITE_CONNECTED-gated exactly like the MCP /
+ConnectionSettings panes — tree-shaken from the free bundle at build time.
+
 Third-party deps: `iroh` / `iroh-blobs` (the QUIC transport, pinned EXACT),
 `iroh-tickets` (the `EndpointTicket` round-trip for manual device pairing, pinned
 EXACT alongside the iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same

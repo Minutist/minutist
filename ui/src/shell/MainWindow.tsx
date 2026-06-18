@@ -5,6 +5,7 @@ import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
 import { useReportProblemStore } from "../state/report-problem";
+import { useSyncStatusStore } from "../state/sync-status";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
@@ -77,6 +78,12 @@ export function MainWindow() {
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const prewarmAsr = useRecordingStore((s) => s.prewarmAsr);
   const lastError = useRecordingStore((s) => s.lastError);
+  const syncReadyNotifications = useSyncStatusStore(
+    (s) => s.pendingReadyNotifications,
+  );
+  const dismissSyncReady = useSyncStatusStore(
+    (s) => s.dismissReadyNotification,
+  );
   const report = useReportProblemStore((s) => s.report);
   const reporting = useReportProblemStore((s) => s.reporting);
   const reportStatus = useReportProblemStore((s) => s.status);
@@ -378,6 +385,26 @@ export function MainWindow() {
             {reportStatus}
           </div>
         )}
+        {syncReadyNotifications.map((meetingId) => (
+          <div
+            key={meetingId}
+            className="main-window__sync-toast"
+            role="status"
+            aria-live="polite"
+          >
+            <span className="main-window__sync-toast-text">
+              Synced changes from another device.
+            </span>
+            <button
+              type="button"
+              className="main-window__error-dismiss"
+              aria-label="Dismiss sync notification"
+              onClick={() => dismissSyncReady(meetingId)}
+            >
+              ×
+            </button>
+          </div>
+        ))}
       </div>
 
       {inWorkspace ? (

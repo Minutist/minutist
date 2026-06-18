@@ -34,6 +34,7 @@ import type {
   DiagnosticReport,
   Collection,
   CollectionId,
+  SyncStatus,
 } from "./bindings";
 import type { MeetingListEntry, MeetingState } from "./meetings";
 
@@ -658,6 +659,22 @@ export const devCommands = {
       log_excerpt: "INFO app-main: started\nINFO ipc-bridge: meeting index opened",
       backtrace: null,
     });
+  },
+  // WS4-B S5: sync surface stubs. The dev shim has no iroh endpoint, so
+  // `syncGetMyTicket` returns a plausible-shaped placeholder; the other commands
+  // are no-ops. `syncStatus` returns `idle` (not `disabled`) so the Sync pane
+  // shows a live state under `vite dev`.
+  async syncStatus(): Promise<Result<SyncStatus, IpcError>> {
+    return ok({ kind: "idle" });
+  },
+  async syncGetMyTicket(): Promise<Result<string, IpcError>> {
+    return ok("dev-ticket:AAAA-1111-BBBB-2222-CCCC-3333-DDDD-4444");
+  },
+  async syncAddPeer(_ticket: string): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async syncNow(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    return ok(null);
   },
 };
 

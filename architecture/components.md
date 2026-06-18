@@ -2727,8 +2727,11 @@ left, transcript right).
   definitions + the active filter live in `state/collections.ts`
   (`useCollectionsStore`, wrapping the `ipc/collections.ts` seam); membership is
   read from each row's `collection_id` (filtering is client-side via the pure
-  `meetingMatchesFilter`), and a per-row "Move to…" popover files a meeting
-  through `useMeetingsStore.setCollection`. The DEV shim seeds sample folders +
+  `meetingMatchesFilter`). A meeting is filed two ways, both through
+  `useMeetingsStore.setCollection`: a per-row "Move to…" popover, OR dragging the
+  row onto a sidebar folder (or "Unfiled") — HTML5 drag-and-drop via
+  `shell/meeting-dnd.ts` (a `MEETING_DND_MIME` distinct from the transcript-segment
+  drag, so a folder only accepts a meeting). The DEV shim seeds sample folders +
   membership so the sidebar renders + mutates under `vite dev`.
 - **Cross-reference, paragraph-RANGE granularity (FR-22/23).** On the
   pause-EXCLUDING timeline (`data-anchor-ms` ↔ `Segment.start_ms`, NEVER

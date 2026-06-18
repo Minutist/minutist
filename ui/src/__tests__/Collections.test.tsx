@@ -242,4 +242,40 @@ describe("MeetingList folder filtering + move", () => {
       ),
     );
   });
+
+  it("dragging a meeting row onto a folder files it", async () => {
+    render(<MeetingList />);
+    await screen.findByText("Standup");
+
+    // Minimal DataTransfer stub (jsdom doesn't implement it): tracks set data
+    // and exposes `types` so `hasMeetingDrag` sees the meeting MIME on dragover.
+    const store: Record<string, string> = {};
+    const dataTransfer = {
+      setData: (t: string, v: string) => {
+        store[t] = v;
+      },
+      getData: (t: string) => store[t] ?? "",
+      get types() {
+        return Object.keys(store);
+      },
+      dropEffect: "none",
+      effectAllowed: "none",
+    } as unknown as DataTransfer;
+
+    // Drag the unfiled "Standup" (m2) onto the "Personal" folder.
+    const row = screen.getByText("Standup").closest("li");
+    const personal = screen.getByText("Personal").closest("button");
+    fireEvent.dragStart(row as Element, { dataTransfer });
+    fireEvent.dragOver(personal as Element, { dataTransfer });
+    await act(async () => {
+      fireEvent.drop(personal as Element, { dataTransfer });
+    });
+
+    await waitFor(() =>
+      expect(collectionsIpc.setMeetingCollection).toHaveBeenCalledWith(
+        "m2",
+        "col-personal",
+      ),
+    );
+  });
 });

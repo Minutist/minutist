@@ -95,6 +95,14 @@
   color: var(--ink);
 }
 
+/* A meeting is being dragged over this folder — accept-drop affordance. */
+.collections-sidebar__item--drop-target {
+  background: var(--accent-tint);
+  outline: 1px dashed var(--accent);
+  outline-offset: -1px;
+  color: var(--ink);
+}
+
 .collections-sidebar__label {
   overflow: hidden;
   text-overflow: ellipsis;

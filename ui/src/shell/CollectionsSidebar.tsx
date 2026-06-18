@@ -8,14 +8,16 @@
  * list (each `MeetingListEntry.collection_id`), so they update when a meeting is
  * filed or a list refresh lands.
  */
-import { useState } from "react";
+import { useState, type DragEvent } from "react";
 import { useMeetingsStore } from "../state/meetings";
 import {
   useCollectionsStore,
   ALL_FILTER,
   UNFILED_FILTER,
   type CollectionFilter,
+  type CollectionId,
 } from "../state/collections";
+import { hasMeetingDrag, readMeetingDrag } from "./meeting-dnd";
 import "./CollectionsSidebar.css";
 
 /** Whether two filters select the same entry (for the active highlight). */
@@ -32,11 +34,15 @@ export function CollectionsSidebar() {
   const create = useCollectionsStore((s) => s.create);
   const rename = useCollectionsStore((s) => s.rename);
   const remove = useCollectionsStore((s) => s.remove);
+  // Filing a dragged meeting reuses the same seam as the row's "Move to…" menu.
+  const setCollection = useMeetingsStore((s) => s.setCollection);
 
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState("");
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  // The folder entry currently under a meeting drag (for the drop highlight).
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null);
 
   const total = meetings.length;
   const unfiledCount = meetings.filter((m) => !m.collection_id).length;
@@ -54,6 +60,27 @@ export function CollectionsSidebar() {
     const name = renameDraft.trim();
     setRenamingId(null);
     if (name) void rename(id, name);
+  }
+
+  // Drop handlers for filing a dragged meeting onto a folder (`target` = the
+  // collection id, or `null` for "Unfiled"). `key` identifies the entry for the
+  // drop highlight. Only accepts a meeting drag (`hasMeetingDrag`).
+  function dropProps(key: string, target: CollectionId | null) {
+    return {
+      onDragOver: (e: DragEvent) => {
+        if (!hasMeetingDrag(e.dataTransfer)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "move";
+        if (dragOverKey !== key) setDragOverKey(key);
+      },
+      onDragLeave: () => setDragOverKey((k) => (k === key ? null : k)),
+      onDrop: (e: DragEvent) => {
+        e.preventDefault();
+        setDragOverKey(null);
+        const id = readMeetingDrag(e.dataTransfer);
+        if (id) void setCollection(id, target);
+      },
+    };
   }
 
   return (
@@ -114,9 +141,13 @@ export function CollectionsSidebar() {
                     "collections-sidebar__item" +
                     (sameFilter(filter, { kind: "collection", id: c.id })
                       ? " collections-sidebar__item--active"
+                      : "") +
+                    (dragOverKey === c.id
+                      ? " collections-sidebar__item--drop-target"
                       : "")
                   }
                   onClick={() => select({ kind: "collection", id: c.id })}
+                  {...dropProps(c.id, c.id)}
                 >
                   <span className="collections-sidebar__label">{c.name}</span>
                   <span className="collections-sidebar__count tnum">
@@ -156,9 +187,13 @@ export function CollectionsSidebar() {
               "collections-sidebar__item" +
               (sameFilter(filter, UNFILED_FILTER)
                 ? " collections-sidebar__item--active"
+                : "") +
+              (dragOverKey === "unfiled"
+                ? " collections-sidebar__item--drop-target"
                 : "")
             }
             onClick={() => select(UNFILED_FILTER)}
+            {...dropProps("unfiled", null)}
           >
             <span className="collections-sidebar__label collections-sidebar__label--muted">
               Unfiled

@@ -114,6 +114,16 @@
   background: var(--sheet-quiet);
 }
 
+/* Draggable affordance (drag a row onto a sidebar folder to file it). Only when
+   draggable — i.e. not while the row's title is being renamed. The row's buttons
+   keep their own pointer cursor. */
+.meeting-list__row[draggable="true"] {
+  cursor: grab;
+}
+.meeting-list__row[draggable="true"]:active {
+  cursor: grabbing;
+}
+
 .meeting-list__main {
   min-width: 0;
   flex: 1;

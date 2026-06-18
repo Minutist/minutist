@@ -22,6 +22,7 @@ import {
 import type { Collection, CollectionId } from "../state/collections";
 import { CollectionsSidebar } from "./CollectionsSidebar";
 import { OperationIndicator } from "./OperationIndicator";
+import { writeMeetingDrag } from "./meeting-dnd";
 import "./MeetingList.css";
 
 /** Format an RFC3339 start timestamp as a quiet, readable date. */
@@ -145,7 +146,16 @@ function MeetingRow(props: MeetingRowProps) {
   }
 
   return (
-    <li className="meeting-list__row">
+    <li
+      className="meeting-list__row"
+      // Drag the row onto a sidebar folder to file it (a parallel path to the
+      // "Move to…" menu). Disabled while renaming so the inline input stays
+      // usable. The drop target + the actual move live in CollectionsSidebar.
+      draggable={!renaming}
+      onDragStart={(e) => {
+        if (e.dataTransfer) writeMeetingDrag(e.dataTransfer, meeting.id);
+      }}
+    >
       {/* Double-click anywhere in the meeting's text opens it (the row's
           primary action); the title is also a single-click open. Bound to the
           main area (not the whole row) so double-clicking the quiet management

@@ -717,6 +717,31 @@ pub enum TunnelStatus {
     NeedsRepair,
 }
 
+/// The peer-to-peer notes-sync engine's live state, surfaced to the UI (WS4-B
+/// S5). A pure status enum carrying no peer ticket or device-key material —
+/// those cross only the sync commands' return values / secure storage, never the
+/// event bus. The sync channel is end-to-end between the user's own paired
+/// devices (D4); it is distinct from the connector channel ([`TunnelStatus`]),
+/// which transits content to the AI vendor by design.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum SyncStatus {
+    /// Sync is unavailable in this build (the free build) or disabled. Nothing
+    /// is dialled and no inbound connections are accepted.
+    Disabled,
+    /// The sync engine is up with at least one paired peer, but no transfer is
+    /// in flight — waiting for a change to push or a peer to dial.
+    Idle,
+    /// Dialling / handshaking a peer before a transfer.
+    Connecting,
+    /// A notes-sync transfer is in progress with a peer.
+    Syncing,
+    /// The sync engine hit a terminal error. `message` is a stable
+    /// human-readable string the UI surfaces; the engine is not retrying.
+    Error { message: String },
+}
+
 /// Events emitted from the Rust core to the webview via tauri-specta.
 ///
 /// Adding a variant requires updating `ipc-bridge` (encoder), the webview
@@ -920,6 +945,33 @@ pub enum AppEvent {
     /// account label and pairing codes cross only the pairing command's return
     /// value, never the bus.
     TunnelStatusChanged { status: TunnelStatus },
+
+    // --- Peer-to-peer notes sync (WS4-B S5) ------------------------------
+    // These ride the existing `AppEventPayload` newtype + the single
+    // `collect_events![AppEventPayload]` registration in `ipc-bridge` — no new
+    // event registration. They carry no peer ticket / device-key material; the
+    // shareable ticket crosses only the `sync_get_my_ticket` command's return.
+    /// A notes-sync transfer for a meeting made progress. The UI renders a
+    /// per-meeting indicator: a determinate bar when `fraction` is `Some`
+    /// (0.0..=1.0), an indeterminate spinner when `None`. A terminal
+    /// `SyncReady` / `SyncError` clears it.
+    SyncProgress {
+        meeting_id: MeetingId,
+        /// A short human-readable label for the in-flight transfer (e.g.
+        /// "Syncing notes…").
+        label: String,
+        /// `Some(f)` with `0.0 <= f <= 1.0` for a determinate bar; `None` for an
+        /// indeterminate spinner.
+        fraction: Option<f32>,
+    },
+    /// A notes-sync transfer for a meeting finished and the local copy is now
+    /// merged. The UI re-reads the meeting's notes so the synced content
+    /// surfaces without a manual refresh.
+    SyncReady { meeting_id: MeetingId },
+    /// A notes-sync operation failed. `context` is a stable human-readable
+    /// string the UI surfaces in a notification; the sync continues for other
+    /// meetings.
+    SyncError { context: String },
 }
 
 // ---------------------------------------------------------------------------

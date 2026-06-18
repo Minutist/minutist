@@ -895,6 +895,11 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             #[cfg(not(feature = "connected"))]
             let tunnel_control: Arc<dyn ipc_bridge::TunnelControl> = ipc_bridge::disabled_tunnel();
 
+            // The peer-to-peer notes-sync control (WS4-B S5). The connected
+            // SyncControl implementation lands in phase 2; until then both builds
+            // use the no-op DisabledSync (free build keeps it permanently).
+            let sync_control: Arc<dyn ipc_bridge::SyncControl> = ipc_bridge::disabled_sync();
+
             // Register the IPC state so command handlers can access it.
             app.manage(IpcState {
                 orchestrator: orchestrator.clone(),
@@ -912,6 +917,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 )),
                 mcp_info: mcp_info.clone(),
                 tunnel: tunnel_control,
+                sync: sync_control,
                 logs_dir: logs_dir.clone(),
                 app_version: app_handle.package_info().version.to_string(),
                 platform: platform_string(),

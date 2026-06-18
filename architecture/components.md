@@ -60,8 +60,13 @@ device-to-device sync over iroh + iroh-blobs, exchanging Yjs notes-update frames
 (a small custom ALPN protocol) and meeting-media blobs (audio + note assets). It
 takes **no** workspace edge beyond `common` (shared types / errors) and
 `persistence` (read the authoritative `notes.ydoc` via `NotesStore` + the
-meeting-media paths; apply received updates). The `app-main -> sync` edge + the
-`ipc-bridge` trait injection land in a LATER slice (WS4-B S5); the S1 crate-add
+meeting-media paths; apply received updates). The `ipc-bridge` trait injection
+(the `SyncControl` seam + `DisabledSync`, mirroring the `TunnelControl` seam)
+lands in WS4-B S5 and takes NO `sync` edge — `ipc-bridge` carries the trait +
+`DisabledSync` unconditionally and `app-main` injects the connected
+implementation. The `app-main -> sync` edge (the connected `SyncControl` that
+holds the `sync` engine) lands in the next WS4-B S5 slice, gated by `connected`;
+until then `app-main` wires `disabled_sync()` and takes no edge. The S1 crate-add
 lands the crate in the workspace unconditionally (compiled by the workspace
 build) WITHOUT the `app-main` edge, exactly as `mcp-server` and `tunnel-client`
 did before they were wired. The free artifact omits it. See `cross-cutting.md` —

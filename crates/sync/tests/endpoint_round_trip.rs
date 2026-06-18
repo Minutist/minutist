@@ -2,15 +2,18 @@
 //! deployed relay.
 //!
 //! Two `SyncEngine`s bind on localhost with relays disabled, inject each other's
-//! direct `EndpointAddr` (id + loopback socket), then the dial side opens a bi
-//! stream on the sync ALPN and the accept side (the S2 hook) echoes the bytes
-//! back. A successful round-trip proves the persisted ed25519 identity, the bound
-//! endpoint, and ALPN negotiation work together — without the homelab relay or its
-//! access token.
+//! direct `EndpointAddr` (id + loopback socket), then the dial side reconciles a
+//! meeting's notes with the accept side over the sync ALPN. A successful exchange
+//! proves the persisted ed25519 identity, the bound endpoint, and ALPN
+//! negotiation work together — without the homelab relay or its access token.
+//! The notes-convergence assertions live in `notes_sync.rs`; this test only
+//! exercises the transport handshake against an empty meeting (an empty exchange
+//! still completes the four-message protocol).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use iroh::EndpointAddr;
+use minutist_common::MeetingId;
 use sync::identity::DeviceIdentity;
 use sync::SyncEngine;
 
@@ -28,23 +31,28 @@ fn direct_addr(engine: &SyncEngine) -> EndpointAddr {
 }
 
 #[tokio::test]
-async fn two_engines_round_trip_bytes_over_sync_alpn() {
+async fn two_engines_reconcile_over_sync_alpn() {
     let dir_a = tempfile::TempDir::new().expect("tempdir a");
     let dir_b = tempfile::TempDir::new().expect("tempdir b");
 
     let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
 
-    let engine_a = SyncEngine::start_direct(id_a).await.expect("engine a");
-    let engine_b = SyncEngine::start_direct(id_b).await.expect("engine b");
+    // Each engine's meetings root is its own temp dir; the empty meeting has no
+    // notes on either side, so the exchange completes with empty diffs.
+    let engine_a = SyncEngine::start_direct(id_a, dir_a.path().to_path_buf())
+        .await
+        .expect("engine a");
+    let engine_b = SyncEngine::start_direct(id_b, dir_b.path().to_path_buf())
+        .await
+        .expect("engine b");
 
     // Inject each other's direct address (the out-of-band step the account
     // service performs in production).
     engine_a.add_peer(direct_addr(&engine_b));
     engine_b.add_peer(direct_addr(&engine_a));
 
-    // A dials B on the sync ALPN and round-trips a probe payload through the
-    // accept-side echo hook.
+    // Identity check: a bare dial resolves to B's endpoint id over the ALPN.
     let conn = engine_a
         .connect(direct_addr(&engine_b))
         .await
@@ -54,16 +62,15 @@ async fn two_engines_round_trip_bytes_over_sync_alpn() {
         engine_b.endpoint_id(),
         "the dialled peer identity must match B's endpoint id"
     );
+    conn.close(0u32.into(), b"id-check");
 
-    let probe = b"minutist-sync-probe";
-    let (mut send, mut recv) = conn.open_bi().await.expect("open bi");
-    send.write_all(probe).await.expect("write probe");
-    send.finish().expect("finish send");
+    // A reconciles an (empty) meeting with B end-to-end over the protocol.
+    let meeting = MeetingId::new();
+    engine_a
+        .sync_notes(direct_addr(&engine_b), meeting)
+        .await
+        .expect("notes reconciliation over sync alpn");
 
-    let echoed = recv.read_to_end(probe.len()).await.expect("read echo");
-    assert_eq!(echoed, probe, "the accept hook must echo the probe bytes");
-
-    conn.close(0u32.into(), b"done");
     engine_a.shutdown().await.expect("shutdown a");
     engine_b.shutdown().await.expect("shutdown b");
 }

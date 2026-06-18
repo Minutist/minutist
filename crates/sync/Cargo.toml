@@ -33,6 +33,14 @@ iroh = "=1.0.0"
 # Content-addressed blob transfer (audio + note assets). iroh-blobs 0.103 tracks
 # iroh 1.0 but is still pre-1.0, so it is pinned EXACT and re-checked on bumps.
 iroh-blobs = "=0.103.0"
+# yrs — the Yjs CRDT port. `persistence` owns the authoritative `notes.ydoc` and
+# its projections; `sync` uses yrs only for the wire-level reconciliation math on
+# lib0-v1 update bytes (`encode_state_vector_from_update_v1` / `diff_updates_v1`),
+# never to materialise a doc or re-derive projections. Same workspace pin as
+# `persistence` so the two agree on the on-the-wire encoding.
+yrs = { workspace = true }
+# UUID — decode the fixed 16-byte meeting id off the wire back into a `MeetingId`.
+uuid = { workspace = true }
 
 [features]
 # Exposes the relay-less direct-connection path (`SyncEngine::start_direct` +

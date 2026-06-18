@@ -13,10 +13,13 @@
 //!   [`Router`]. The blobs ALPN multiplexes onto the same router in S4.
 //!
 //! The inbound accept side is owned by the [`Router`], which runs its own accept
-//! loop and dispatches each `SYNC_ALPN` connection to the registered handler. The
-//! per-connection sync exchange is the S3 hook: [`AcceptHook`] logs the peer and
-//! returns, so the connection is accepted (proving identity + ALPN end-to-end)
-//! without the notes-update logic. [`SyncEngine::connect`] dials a peer.
+//! loop and dispatches each `SYNC_ALPN` connection to [`AcceptHook`]. The hook
+//! runs the responder side of the notes-sync protocol
+//! ([`crate::notes_proto::respond_notes_sync`]) against the device's meetings
+//! root. [`SyncEngine::connect`] dials a peer; [`SyncEngine::sync_notes`] dials
+//! and runs the initiator side for one meeting.
+
+use std::path::PathBuf;
 
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -24,10 +27,11 @@ use iroh::{
     endpoint::Connection, Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode,
     RelayUrl,
 };
+use minutist_common::MeetingId;
 
 use crate::address_lookup::PeerDirectory;
 use crate::identity::DeviceIdentity;
-use crate::notes_proto::SYNC_ALPN;
+use crate::notes_proto::{self, SYNC_ALPN};
 use crate::{Error, Result, SyncConfig};
 
 /// Owns the iroh endpoint, the out-of-band peer directory, and the router that
@@ -37,6 +41,9 @@ pub struct SyncEngine {
     router: Router,
     peers: PeerDirectory,
     config: SyncConfig,
+    /// Meetings root the notes protocol reads/writes through `persistence`
+    /// (`{root}/{meeting_id}/notes.ydoc`). The inbound [`AcceptHook`] shares it.
+    meetings_root: PathBuf,
 }
 
 impl SyncEngine {
@@ -50,6 +57,7 @@ impl SyncEngine {
     pub async fn start(config: SyncConfig, identity: DeviceIdentity) -> Result<Self> {
         let relay_mode = Self::relay_mode(&config)?;
         let peers = PeerDirectory::new();
+        let meetings_root = config.app_data_dir.clone();
 
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key())
@@ -68,7 +76,7 @@ impl SyncEngine {
         );
 
         let router = Router::builder(endpoint.clone())
-            .accept(SYNC_ALPN, AcceptHook)
+            .accept(SYNC_ALPN, AcceptHook::new(meetings_root.clone()))
             .spawn();
 
         Ok(Self {
@@ -76,6 +84,7 @@ impl SyncEngine {
             router,
             peers,
             config,
+            meetings_root,
         })
     }
 
@@ -85,7 +94,7 @@ impl SyncEngine {
     /// involved. Gated behind `test-support` — it is a test/local-only path, not
     /// part of the production sync surface (which always pins the relay).
     #[cfg(feature = "test-support")]
-    pub async fn start_direct(identity: DeviceIdentity) -> Result<Self> {
+    pub async fn start_direct(identity: DeviceIdentity, meetings_root: PathBuf) -> Result<Self> {
         let peers = PeerDirectory::new();
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key())
@@ -96,13 +105,14 @@ impl SyncEngine {
             .await
             .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;
         let router = Router::builder(endpoint.clone())
-            .accept(SYNC_ALPN, AcceptHook)
+            .accept(SYNC_ALPN, AcceptHook::new(meetings_root.clone()))
             .spawn();
         Ok(Self {
             endpoint,
             router,
             peers,
-            config: SyncConfig::new(std::env::temp_dir()),
+            config: SyncConfig::new(meetings_root.clone()),
+            meetings_root,
         })
     }
 
@@ -161,6 +171,28 @@ impl SyncEngine {
             .map_err(|e| Error::Endpoint(format!("dialling peer on sync alpn: {e}")))
     }
 
+    /// Reconcile one meeting's notes with `peer`: dial it on the [`SYNC_ALPN`]
+    /// and run the initiator side of the notes-sync protocol
+    /// ([`notes_proto::initiate_notes_sync`]) against this device's
+    /// [`Self::meetings_root`]. On return both sides have merged each other's
+    /// missing updates into their `notes.ydoc` (via `persistence`).
+    ///
+    /// On-demand per-meeting reconciliation: one call, one meeting. The current
+    /// cut dials a fresh connection per call.
+    /// TODO(OQ-A): a debounce window that coalesces rapid edit bursts into one
+    /// reconciliation per meeting, and reuse of a live connection across
+    /// meetings, land with the orchestrator wiring (S5).
+    pub async fn sync_notes(
+        &self,
+        peer: impl Into<EndpointAddr>,
+        meeting_id: MeetingId,
+    ) -> Result<()> {
+        let conn = self.connect(peer).await?;
+        let result = notes_proto::initiate_notes_sync(&conn, &self.meetings_root, meeting_id).await;
+        conn.close(0u32.into(), b"notes-sync-done");
+        result
+    }
+
     /// The relay URL this engine is configured to pin.
     pub fn relay_url(&self) -> &str {
         &self.config.relay_url
@@ -179,40 +211,32 @@ impl SyncEngine {
 /// The inbound-connection handler registered on the [`Router`] for the
 /// [`SYNC_ALPN`].
 ///
-/// S3 hook: a real notes-sync exchange (accept a bi stream, read/merge Yjs update
-/// frames) lands here. For S2 it accepts the connection, logs the peer, and waits
-/// for close — enough to prove identity + ALPN negotiation end-to-end. The
-/// integration test drives the bytes round-trip by opening its own bi stream from
-/// the dial side and reading it back here.
+/// Runs the responder side of the notes-sync protocol
+/// ([`notes_proto::respond_notes_sync`]) against the device's
+/// [`SyncEngine::meetings_root`], which it carries by clone (the router spawns a
+/// fresh task per connection). A failed exchange is logged and converted to an
+/// [`AcceptError`]; it does not bring the router down.
 #[derive(Debug, Clone)]
-struct AcceptHook;
+struct AcceptHook {
+    meetings_root: PathBuf,
+}
+
+impl AcceptHook {
+    fn new(meetings_root: PathBuf) -> Self {
+        Self { meetings_root }
+    }
+}
 
 impl ProtocolHandler for AcceptHook {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         let peer = connection.remote_id();
         tracing::info!(target: "sync", peer = %peer, "accepted sync connection");
 
-        // S3 hook: read the first bi stream and echo it back so the S2 test can
-        // assert an end-to-end byte round-trip over the negotiated ALPN. The
-        // notes-update merge replaces this body.
-        let (mut send, mut recv) = connection.accept_bi().await?;
-        let frame = recv
-            .read_to_end(MAX_FRAME)
+        notes_proto::respond_notes_sync(&connection, &self.meetings_root)
             .await
-            .map_err(AcceptError::from_err)?;
-        send.write_all(&frame)
-            .await
-            .map_err(AcceptError::from_err)?;
-        send.finish().map_err(AcceptError::from_err)?;
-
-        connection.closed().await;
-        Ok(())
+            .map_err(AcceptError::from_err)
     }
 }
-
-/// Upper bound on a single inbound frame the S2 accept hook will buffer. Sized for
-/// the test's probe payload; S3 sets the real notes-update bound.
-const MAX_FRAME: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {

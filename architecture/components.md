@@ -67,6 +67,17 @@ build) WITHOUT the `app-main` edge, exactly as `mcp-server` and `tunnel-client`
 did before they were wired. The free artifact omits it. See `cross-cutting.md` —
 "Build variants".
 
+Third-party deps: `iroh` / `iroh-blobs` (the QUIC transport, pinned EXACT), and
+— from WS4-B S3 — `yrs` (the same workspace pin as `persistence`) and `uuid`.
+The notes-sync protocol exchanges yrs state vectors and computes the minimal
+lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
+operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —
+`sync` never materialises a yrs `Doc` and never re-derives the `notes.json` /
+`notes.md` projections; that stays in `persistence::NotesStore::apply_update`
+(`persistence` owns the one place that relaxes the document-opacity guarantee —
+see its "CRDT notes storage" section). `uuid` only decodes the fixed 16-byte
+meeting id off the wire back into a `common::MeetingId`.
+
 The `tunnel-client` row's "May depend on" is empty by design: the crate takes
 **no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)
 and re-implements the relay's postcard wire frames locally rather than sharing a

@@ -30,6 +30,11 @@ thiserror = { workspace = true }
 # service. Pinned EXACT; the 1.0 API is a hard floor and bumping is a coordinated
 # change.
 iroh = "=1.0.0"
+# Shareable endpoint tickets (manual device pairing). `iroh-tickets` carries the
+# `EndpointTicket` Display/FromStr round-trip that serialises this device's
+# `EndpointAddr` to a string the user copies to another device. Pinned EXACT to
+# track the iroh 1.0 line alongside `iroh` / `iroh-blobs`.
+iroh-tickets = "=1.0.0"
 # Content-addressed blob transfer (audio + note assets). iroh-blobs 0.103 tracks
 # iroh 1.0 but is still pre-1.0, so it is pinned EXACT and re-checked on bumps.
 iroh-blobs = "=0.103.0"

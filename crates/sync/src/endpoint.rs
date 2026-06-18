@@ -27,6 +27,7 @@ use iroh::{
     endpoint::Connection, Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode,
     RelayUrl,
 };
+use iroh_tickets::endpoint::EndpointTicket;
 use minutist_common::MeetingId;
 
 use crate::address_lookup::PeerDirectory;
@@ -161,6 +162,37 @@ impl SyncEngine {
         self.peers.add(addr);
     }
 
+    /// This device's shareable ticket: its [`EndpointAddr`] (id + current
+    /// relay/direct addresses) encoded as an [`EndpointTicket`] string. The user
+    /// copies it to another of their devices, which feeds it to
+    /// [`Self::add_peer_from_ticket`] to dial back. The ticket carries only this
+    /// device's public addressing — never its secret key.
+    pub fn my_ticket(&self) -> String {
+        EndpointTicket::new(self.endpoint_addr()).to_string()
+    }
+
+    /// Parse a peer's [`EndpointTicket`] string (produced by [`Self::my_ticket`]
+    /// on the other device) back into its [`EndpointAddr`] and register it via
+    /// [`Self::add_peer`], so the two devices can dial each other.
+    ///
+    /// Returns the peer's [`EndpointId`] on success. A malformed ticket is an
+    /// [`Error::Protocol`].
+    pub fn add_peer_from_ticket(&self, ticket: &str) -> Result<EndpointId> {
+        let ticket: EndpointTicket = ticket
+            .parse()
+            .map_err(|e| Error::Protocol(format!("parsing endpoint ticket: {e}")))?;
+        let addr: EndpointAddr = ticket.into();
+        let id = addr.id;
+        self.add_peer(addr);
+        Ok(id)
+    }
+
+    /// The [`EndpointId`]s of every peer currently registered in the directory.
+    /// The connected `SyncControl` syncs a meeting against each of them.
+    pub fn peer_ids(&self) -> Vec<EndpointId> {
+        self.peers.ids()
+    }
+
     /// Dial a peer on the [`SYNC_ALPN`]. The peer must already be resolvable —
     /// either injected via [`Self::add_peer`] or passed as a full
     /// [`EndpointAddr`] carrying its relay/direct addresses.
@@ -261,5 +293,49 @@ mod tests {
         let mut config = SyncConfig::new(std::env::temp_dir());
         config.relay_url = String::new();
         assert!(SyncEngine::relay_mode(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn ticket_round_trips_an_endpoint_addr() {
+        let dir_a = tempfile::TempDir::new().expect("tempdir a");
+        let dir_b = tempfile::TempDir::new().expect("tempdir b");
+        let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
+        let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
+        let engine_a = SyncEngine::start_direct(id_a, dir_a.path().to_path_buf())
+            .await
+            .expect("engine a");
+        let engine_b = SyncEngine::start_direct(id_b, dir_b.path().to_path_buf())
+            .await
+            .expect("engine b");
+
+        // A exports its ticket; B parses it back and registers A as a peer. The
+        // parsed id must equal A's endpoint id, and the peer must appear in B's
+        // directory.
+        let ticket = engine_a.my_ticket();
+        let parsed = engine_b.add_peer_from_ticket(&ticket).expect("import ticket");
+        assert_eq!(parsed, engine_a.endpoint_id());
+        assert_eq!(engine_b.peer_ids(), vec![engine_a.endpoint_id()]);
+
+        engine_a.shutdown().await.expect("shutdown a");
+        engine_b.shutdown().await.expect("shutdown b");
+    }
+
+    #[test]
+    fn malformed_ticket_is_rejected() {
+        // Build a real engine via the relay-less path so the directory exists, then
+        // feed it garbage.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
+            let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+                .await
+                .expect("engine");
+            assert!(matches!(
+                engine.add_peer_from_ticket("not-a-ticket"),
+                Err(Error::Protocol(_))
+            ));
+            engine.shutdown().await.expect("shutdown");
+        });
     }
 }

@@ -4068,6 +4068,7 @@ dependencies = [
  "serde_json",
  "settings",
  "specta-typescript",
+ "sync",
  "tauri",
  "tauri-build",
  "tauri-plugin-fs",
@@ -7173,6 +7174,7 @@ version = "0.0.0"
 dependencies = [
  "iroh",
  "iroh-blobs",
+ "iroh-tickets",
  "minutist-common",
  "persistence",
  "serde",

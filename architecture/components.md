@@ -62,18 +62,18 @@ takes **no** workspace edge beyond `common` (shared types / errors) and
 `persistence` (read the authoritative `notes.ydoc` via `NotesStore` + the
 meeting-media paths; apply received updates). The `ipc-bridge` trait injection
 (the `SyncControl` seam + `DisabledSync`, mirroring the `TunnelControl` seam)
-lands in WS4-B S5 and takes NO `sync` edge — `ipc-bridge` carries the trait +
-`DisabledSync` unconditionally and `app-main` injects the connected
-implementation. The `app-main -> sync` edge (the connected `SyncControl` that
-holds the `sync` engine) lands in the next WS4-B S5 slice, gated by `connected`;
-until then `app-main` wires `disabled_sync()` and takes no edge. The S1 crate-add
-lands the crate in the workspace unconditionally (compiled by the workspace
-build) WITHOUT the `app-main` edge, exactly as `mcp-server` and `tunnel-client`
-did before they were wired. The free artifact omits it. See `cross-cutting.md` —
-"Build variants".
+takes NO `sync` edge — `ipc-bridge` carries the trait + `DisabledSync`
+unconditionally and `app-main` injects the connected implementation. The
+`app-main -> sync` edge (the connected `SyncControl` in `src-tauri/src/sync.rs`
+that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
+`connected` Cargo feature exactly like the `mcp-server` / `tunnel-client` edges;
+the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
+— "Build variants".
 
-Third-party deps: `iroh` / `iroh-blobs` (the QUIC transport, pinned EXACT), and
-— from WS4-B S3 — `yrs` (the same workspace pin as `persistence`) and `uuid`.
+Third-party deps: `iroh` / `iroh-blobs` (the QUIC transport, pinned EXACT),
+`iroh-tickets` (the `EndpointTicket` round-trip for manual device pairing, pinned
+EXACT alongside the iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same
+workspace pin as `persistence`) and `uuid`.
 The notes-sync protocol exchanges yrs state vectors and computes the minimal
 lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
 operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —

@@ -172,14 +172,22 @@ fn is_noop_update(diff: &[u8]) -> Result<bool> {
 /// on next save.
 ///
 /// A no-op diff (the peer had nothing we lacked) is skipped: there is no merge to
-/// perform, and skipping avoids a `notes.ydoc` rewrite — and a write into a
-/// meeting folder that may not exist yet (folder creation is the orchestrator's
-/// job at the S5 wiring boundary). Only a diff that actually carries changes
-/// reaches `apply_update`.
+/// perform, and skipping avoids a `notes.ydoc` rewrite. Only a diff that actually
+/// carries changes reaches `apply_update`.
+///
+/// Before that merge, the meeting folder is ensured on disk via
+/// [`persistence::MeetingFolder::ensure`]: a brand-new meeting syncing to a device
+/// that lacks its folder must not fail for want of the directory. `persistence`
+/// owns the folder/metadata creation (it seeds a placeholder `metadata.json` the
+/// authoritative one later overwrites); `sync` only triggers it. Ensuring runs
+/// only for a change-carrying diff, so an already-converged or empty meeting still
+/// touches no disk.
 fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> {
     if is_noop_update(diff)? {
         return Ok(());
     }
+    persistence::MeetingFolder::ensure(root, meeting_id)
+        .map_err(|e| Error::Protocol(format!("ensuring inbound meeting folder: {e}")))?;
     let notes_md = match NotesStore::load(root, meeting_id) {
         Ok(Some(data)) => data.markdown,
         Ok(None) => String::new(),

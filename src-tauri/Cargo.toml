@@ -34,7 +34,7 @@ directml = ["ipc-bridge/directml"]
 # The free artifact is built with --no-default-features (plus an explicit GPU
 # feature when needed, e.g. --no-default-features --features vulkan).
 # See architecture/cross-cutting.md "Build variants".
-connected = ["dep:mcp-server", "dep:tunnel-client", "dep:async-trait", "dep:rand", "dep:hex"]
+connected = ["dep:mcp-server", "dep:tunnel-client", "dep:sync", "dep:async-trait", "dep:rand", "dep:hex"]
 default = ["connected"]
 
 [build-dependencies]
@@ -50,6 +50,10 @@ mcp-server = { path = "../crates/mcp-server", optional = true }
 # WS4-A S5b: the app-side relay tunnel (pairing + reconnect + lifecycle). Part
 # of the connected feature surface — the free build omits it (no relay).
 tunnel-client = { path = "../crates/tunnel-client", optional = true }
+# WS4-B S5: device-to-device notes sync (iroh endpoint + the notes-update
+# protocol). The ConnectedSync impl of ipc_bridge::SyncControl is backed by this
+# crate. Part of the connected feature surface — the free build omits it.
+sync = { path = "../crates/sync", optional = true }
 settings = { path = "../crates/settings" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-fs = { workspace = true }

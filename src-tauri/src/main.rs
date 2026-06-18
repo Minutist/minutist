@@ -1216,10 +1216,12 @@ fn serve_note_asset(
     }
 }
 
-/// Placeholder 32×32 RGBA tray icon — solid blue (#1E64B4).
+/// Fallback 32×32 RGBA tray icon — solid blue (#1E64B4).
 ///
-/// Generated at build time.  Replaced by final art in Phase 7.
-/// Each pixel is [R=30, G=100, B=180, A=255] repeated 1024 times.
+/// The tray uses the real app logo (`default_window_icon()`, see [`build_tray`]);
+/// this solid square is used ONLY if that embedded icon is somehow unavailable
+/// at runtime, so `build_tray` stays infallible. Each pixel is
+/// [R=30, G=100, B=180, A=255] repeated 1024 times.
 const TRAY_ICON_RGBA: [u8; 32 * 32 * 4] = {
     let mut buf = [0u8; 32 * 32 * 4];
     let mut i = 0;
@@ -1237,15 +1239,24 @@ fn tray_icon() -> tauri::image::Image<'static> {
     tauri::image::Image::new(&TRAY_ICON_RGBA, 32, 32)
 }
 
-/// Construct the tray icon and attach menu event + icon-click handlers.
+/// Construct the SINGLE tray icon and attach menu event + icon-click handlers.
+///
+/// This is the only tray: the declarative `app.trayIcon` was removed from
+/// `tauri.conf.json` because it auto-created a SECOND, handler-less tray (a
+/// duplicate icon that did nothing). The icon is the real app logo — the
+/// window icon embedded by `tauri-build` from the bundle `icon` list — so the
+/// tray matches the brand; the solid-blue [`tray_icon`] is only an infallible
+/// fallback if that embedded icon is unavailable.
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let open_item = MenuItem::with_id(app, "open", "Open minutist", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
     let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
 
+    let icon = app.default_window_icon().cloned().unwrap_or_else(tray_icon);
+
     TrayIconBuilder::new()
-        .icon(tray_icon())
+        .icon(icon)
         .tooltip("minutist")
         .menu(&menu)
         // Left-click shows the menu on platforms where that's conventional.

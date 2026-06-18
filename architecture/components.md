@@ -2462,8 +2462,13 @@ row to the workspace dependency table. Not an app network operation — the OS
 browser makes any request, at the user's click; the D4 no-telemetry claim is
 untouched.
 
-**Tray menu:** "Open minutist" (show/focus main window) + "Quit"
-(`app.exit(0)`). Left-click on the tray icon shows the main window.
+**Tray menu:** a SINGLE tray icon built programmatically in `build_tray`
+("Open minutist" → show/focus main window, "Quit" → `app.exit(0)`; left-click
+shows the main window). Its icon is the real app logo via
+`app.default_window_icon()` (embedded by `tauri-build` from the bundle `icon`
+list). There is deliberately **no** declarative `app.trayIcon` in
+`tauri.conf.json`: that auto-created a second, handler-less tray (a duplicate
+icon that did nothing), so the tray is owned entirely by `build_tray`.
 Window close intercepts `CloseRequested` and hides rather than exits.
 
 **Bindings harness:** `cargo run -p minutist --bin generate-bindings`

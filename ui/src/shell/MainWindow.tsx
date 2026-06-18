@@ -90,27 +90,33 @@ export function MainWindow() {
   // lives in the transcript pane's action toolbar (#67) — see TranscriptPane —
   // not on this heading or the meeting list.
 
-  // The recorder is actively capturing (or in the brief stopping handoff). Live-
-  // test UX T3: `finalising` is deliberately EXCLUDED — once the meeting is
-  // finalised the heavy background passes (re-transcribe / re-identify-speakers)
-  // run in the background and must NOT keep the recording window open. They
-  // surface as a non-blocking per-row indicator on the meeting list instead.
+  // The recorder is actively capturing (or in the brief stopping handoff).
+  // `finalising` is intentionally NOT part of "live recording" (capture has
+  // stopped), but `inWorkspace` below keeps the workspace up through it so a
+  // stop does not flash the meeting list while the post-stop drain runs.
   const isLiveRecording =
     recordingState.kind === "recording" ||
     recordingState.kind === "paused" ||
     recordingState.kind === "stopping";
 
-  // The meeting-list is the entry surface (FR-33): shown when no meeting is
-  // open and the recorder is not actively capturing. Opening a meeting, or
-  // starting a recording, switches to the editor/transcript workspace; on stop
-  // we return to the list as soon as the meeting finalises (T3).
-  const inWorkspace = openMeetingId !== null || isLiveRecording;
+  // The meeting-list is the entry surface (FR-33): shown when no meeting is open
+  // and the recorder is idle. Opening a meeting, or starting a recording,
+  // switches to the editor/transcript workspace. The workspace ALSO stays up
+  // through `finalising` (the post-stop drain) so stopping does not flash the
+  // list — once finalise completes the meetings store opens the just-recorded
+  // meeting (see its `meeting_finalised` handler), so the user lands on that
+  // meeting rather than bouncing home.
+  const inWorkspace =
+    openMeetingId !== null ||
+    isLiveRecording ||
+    recordingState.kind === "finalising";
 
   // The meeting the workspace is operating on: the opened saved meeting, else
-  // the live recording's meeting (recording / paused / stopping carry the id).
-  // This is the meeting the summary view summarises.
+  // the in-progress meeting (recording / paused / stopping / finalising all
+  // carry the id). This is the meeting the summary view summarises.
   const activeMeetingId =
-    openMeetingId ?? (isLiveRecording ? recordingState.meeting_id : null);
+    openMeetingId ??
+    (recordingState.kind === "idle" ? null : recordingState.meeting_id);
 
   // A finished, opened meeting: idle and viewing a saved meeting. Only then is a
   // summary meaningful (you cannot summarise a recording mid-flight), so the

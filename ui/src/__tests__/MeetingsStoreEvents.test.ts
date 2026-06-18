@@ -4,8 +4,9 @@
  * When a summary is written the backend refreshes the index row so the
  * meeting-list excerpt becomes the summary blurb. The store must re-run
  * `list_meetings` on the `summary_ready` event so the row shows the blurb
- * without a manual reload. Also re-asserts the existing `meeting_finalised`
- * refresh path so the T3 return-to-list flow is covered.
+ * without a manual reload. Also covers the `meeting_finalised` path, which now
+ * OPENS the just-stopped meeting (the stay-on-meeting flow) rather than bouncing
+ * to the list.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -25,7 +26,7 @@ vi.mock("../ipc/meetings", () => ({
   reprocess: vi.fn(),
 }));
 
-import { listMeetings } from "../ipc/meetings";
+import { listMeetings, openMeeting } from "../ipc/meetings";
 import { useMeetingsStore } from "../state/meetings";
 import type { AppEvent } from "../ipc/bindings";
 
@@ -49,10 +50,14 @@ describe("meetings store — terminal-event refreshes (T6 / T3)", () => {
     expect(listMeetings).toHaveBeenCalledOnce();
   });
 
-  it("meeting_finalised refreshes the list (T3 return-to-list)", async () => {
+  it("meeting_finalised opens the just-stopped meeting (stays on it) and refreshes the list", async () => {
     const event: AppEvent = { kind: "meeting_finalised", meeting_id: "m1" };
     useMeetingsStore.getState().handleEvent(event);
+    // `openMeetingId` is set SYNCHRONOUSLY (before the async open load) so the
+    // workspace never flashes the list as the recorder goes idle.
+    expect(useMeetingsStore.getState().openMeetingId).toBe("m1");
     await Promise.resolve();
+    expect(openMeeting).toHaveBeenCalledWith("m1");
     expect(listMeetings).toHaveBeenCalledOnce();
   });
 });

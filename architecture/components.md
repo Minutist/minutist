@@ -2155,9 +2155,15 @@ to `Idle` only once the runner replies — so the webview stays responsive durin
 the drain; the record controls treat `finalising` as busy, gating only a NEW
 recording, which the state machine enforces (`Recording|Paused → Stopping →
 Finalising → Idle`, via `transition_finalising`). On completion `stop()` emits
-`Idle` plus `AppEvent::MeetingFinalised { meeting_id }`; the webview's meetings
-store refreshes on that event so the just-finalised meeting appears (through
-`reconcile_orphans`/`upsert`) with no manual refresh. `RecordingState` gains a
+`AppEvent::MeetingFinalised { meeting_id }` **before** the `Idle` transition (the
+order matters — see below); the webview's meetings store, on that event, OPENS
+the just-recorded meeting (sets `openMeetingId` synchronously, then loads it) and
+refreshes the list, so the user STAYS on the meeting they just recorded rather
+than bouncing to the list. Emitting `MeetingFinalised` first means the meeting is
+already opening by the time `Idle` arrives, and `MainWindow` keeps the workspace
+up through `finalising`, so a stop never flashes the meeting list. Background
+re-transcribe / diarize passes then update the now-open meeting in place
+(`transcript_ready` / `diarization_complete`). `RecordingState` gains a
 `Finalising` variant and `AppEvent` a `MeetingFinalised` variant — bindings
 regenerated.
 

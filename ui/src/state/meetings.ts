@@ -207,11 +207,19 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
 
   handleEvent: (event) => {
     if (event.kind === "meeting_finalised") {
-      // A just-stopped meeting finished finalising on disk (the background
-      // drain/finalise completed). Refresh the list so the new row appears —
-      // `list_meetings` reconciles it from disk if the stop-time upsert has not
-      // landed yet. This is what makes the meeting show without a manual
-      // refresh now that finalise is decoupled from the stop response.
+      // A just-stopped meeting finished finalising on disk. Stay on it: OPEN the
+      // meeting so the workspace shows the recording the user just made rather
+      // than bouncing to the list. `MeetingFinalised` fires exactly once per stop
+      // (background re-transcribe / diarize passes emit `transcript_ready` /
+      // `diarization_complete`, never this), so it always targets the
+      // just-recorded meeting. Set `openMeetingId` SYNCHRONOUSLY before the async
+      // `open()` load so the workspace never flashes the list as the recorder
+      // goes `Idle` (the orchestrator emits this BEFORE the `Idle` transition).
+      // Background passes then update the open meeting in place (see the
+      // transcript_ready / diarization_complete branch below).
+      set({ openMeetingId: event.meeting_id });
+      void get().open(event.meeting_id);
+      // Refresh the list too, so the row (and its masthead entry) is present.
       void get().refresh();
       return;
     }

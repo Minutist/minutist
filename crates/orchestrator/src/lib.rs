@@ -700,14 +700,18 @@ impl Orchestrator {
             }
         }
 
+        // Announce the finalised meeting BEFORE the `Idle` transition. The webview
+        // opens the just-recorded meeting on `MeetingFinalised` (so the user stays
+        // on it instead of bouncing to the list); emitting it first means the
+        // meeting is already opening by the time `Idle` arrives, so the workspace
+        // never flashes the list as the recorder goes idle. The meeting is fully
+        // on disk at this point (the runner reply was awaited above), so the row
+        // also appears via `reconcile_orphans`/`upsert` on the list refresh.
+        self.emit(AppEvent::MeetingFinalised { meeting_id });
+
         self.emit(AppEvent::StateChanged {
             state: RecordingState::Idle,
         });
-
-        // The meeting is now fully on disk. Announce it so the webview refreshes
-        // the meeting list (the row appears via `reconcile_orphans`/`upsert`);
-        // distinct from the `Idle` transition, which also fires in other paths.
-        self.emit(AppEvent::MeetingFinalised { meeting_id });
 
         tracing::info!(
             target: "orchestrator",

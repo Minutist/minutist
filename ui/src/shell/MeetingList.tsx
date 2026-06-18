@@ -19,7 +19,7 @@ import { OperationIndicator } from "./OperationIndicator";
 import "./MeetingList.css";
 
 /** Format an RFC3339 start timestamp as a quiet, readable date. */
-function formatDate(iso: string): string {
+export function formatDate(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
   return date.toLocaleDateString(undefined, {
@@ -39,7 +39,7 @@ export function formatDuration(durationMs: number): string {
 }
 
 /** Pluralise the speaker count for the meta line. */
-function formatSpeakers(count: number): string {
+export function formatSpeakers(count: number): string {
   if (count <= 0) return "no speakers";
   return count === 1 ? "1 speaker" : `${count} speakers`;
 }

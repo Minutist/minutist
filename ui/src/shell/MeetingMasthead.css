@@ -1,0 +1,101 @@
+/*
+ * Editorial Ink — meeting-screen masthead (the open meeting's headline).
+ *
+ * A dedicated band below the slim top bar: a large Fraunces title with a pencil
+ * edit affordance, above a quiet stone dateline. All colour / radius / type
+ * values come from `styles/theme.css`.
+ */
+
+.meeting-masthead {
+  flex: 0 0 auto;
+  padding: 0.85rem 1.4rem 0.75rem;
+  background: var(--bg);
+  border-bottom: 1px solid var(--rule);
+}
+
+/* The title affordance — text + pencil on one baseline, the whole thing clickable
+   to rename. `cursor: text` signals in-place editing (matches the home list). */
+.meeting-masthead__title-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  max-width: 100%;
+  border: 0;
+  background: none;
+  padding: 0.05rem 0.35rem 0.05rem 0;
+  border-radius: var(--radius);
+  cursor: text;
+}
+
+.meeting-masthead__title {
+  font-family: var(--font-display);
+  font-weight: 480;
+  font-size: 1.7rem;
+  line-height: 1.15;
+  letter-spacing: 0.005em;
+  color: var(--ink);
+  /* A touch of Fraunces optical-size + soft character, matching the home heading. */
+  font-variation-settings: "opsz" 60, "SOFT" 24, "WONK" 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* An un-named (auto-titled) meeting reads as a muted placeholder, nudging a name. */
+.meeting-masthead__title--placeholder {
+  color: var(--stone);
+  font-style: italic;
+}
+
+/* The pencil is quiet at rest and warms to oxblood on hover, so the title's
+   editability is visible without shouting. */
+.meeting-masthead__edit-icon {
+  flex: 0 0 auto;
+  align-self: center;
+  color: var(--stone-faint);
+  transition: color 120ms ease;
+}
+
+.meeting-masthead__title-btn:hover .meeting-masthead__edit-icon {
+  color: var(--accent);
+}
+
+.meeting-masthead__title-btn:hover .meeting-masthead__title {
+  color: var(--ink);
+}
+
+.meeting-masthead__title-input {
+  font-family: var(--font-display);
+  font-weight: 480;
+  font-size: 1.7rem;
+  line-height: 1.15;
+  letter-spacing: 0.005em;
+  color: var(--ink);
+  background: var(--sheet);
+  border: 1px solid var(--rule-margin);
+  border-radius: var(--radius);
+  padding: 0.05rem 0.45rem;
+  min-width: 16rem;
+  max-width: 100%;
+  width: 30rem;
+}
+
+.meeting-masthead__title-input::placeholder {
+  color: var(--stone);
+  font-style: italic;
+}
+
+.meeting-masthead__dateline {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0.4rem 0 0;
+  font-family: var(--font-text);
+  font-size: 0.85rem;
+  color: var(--stone);
+}
+
+.meeting-masthead__dot {
+  color: var(--stone-faint);
+}

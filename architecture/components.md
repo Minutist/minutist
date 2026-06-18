@@ -2646,8 +2646,8 @@ left, transcript right).
   actions. `MainWindow` switches between this view and the editor/transcript
   workspace on `useMeetingsStore.openMeetingId` (and the recording state): the
   list shows when no meeting is open and nothing is recording; opening a meeting
-  or starting a recording reveals the workspace, and a header "Meetings"
-  affordance returns to the list when idle.
+  or starting a recording reveals the workspace, and a left-aligned back
+  affordance ("‹ Meetings") in the top bar returns to the list when idle.
 - **Cross-reference, paragraph-RANGE granularity (FR-22/23).** On the
   pause-EXCLUDING timeline (`data-anchor-ms` ↔ `Segment.start_ms`, NEVER
   `Date.now()`). `ui/src/editor/hover-bridge.ts` (`NotesHoverBridge`) is a
@@ -2924,10 +2924,17 @@ A warm-paper, document-centric **light** theme applied across the webview.
   the quiet, recessed `--sheet-quiet` columns. The resizable show/hide
   `react-resizable-panels` structure and panel `id`s (`notes` / `transcript` /
   `summary`) are described under "Phase 4/5 additions". The top bar
-  (`ui/src/shell/`) is calm and hairline-ruled: wordmark left, recording status
-  focal (oxblood dot, gentle pulse only while recording, plus a tabular elapsed
-  clock in `RecordingStatus.tsx`), grouped transport + slim meter + the
-  segmented pane-visibility toggle right.
+  (`ui/src/shell/`) is calm and hairline-ruled: on the home screen or a live
+  recording the lead is the wordmark + recording status (oxblood dot, gentle
+  pulse only while recording, plus a tabular elapsed clock in
+  `RecordingStatus.tsx`); on a finished open meeting the lead is instead a
+  left-aligned back affordance ("‹ Meetings") and the meeting's NAME moves to a
+  dedicated masthead band below the bar (`MeetingMasthead.tsx` + `.css`: a large
+  Fraunces title with a pencil edit affordance over a stone dateline — date ·
+  duration · speakers; an auto-titled `Recording <timestamp>` meeting shows a
+  muted "Untitled meeting" placeholder to nudge a name, renaming through the same
+  `useMeetingsStore.rename` seam as the home list). The right cluster is the
+  grouped transport + slim meter + the segmented pane-visibility toggle.
 - **Margin-anchor marginalia.** `ui/src/editor/anchor-marginalia.ts` is a
   **presentation-only** ProseMirror decoration extension: it renders each
   anchored paragraph's `data-anchor-ms` value as a quiet timestamp in the sheet's

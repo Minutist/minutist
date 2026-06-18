@@ -9,7 +9,7 @@ import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
-import { MeetingTitle } from "./MeetingTitle";
+import { MeetingMasthead } from "./MeetingMasthead";
 import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
 import { ChatView } from "./ChatView";
@@ -188,50 +188,43 @@ export function MainWindow() {
   return (
     <div className="main-window">
       {/*
-        Top bar — calm, hairline-ruled. Left: wordmark. Centre/focal:
-        recording status (oxblood dot + elapsed clock). Right: grouped
-        transport, audio meter, and device affordance. The most-used action
-        (Record/Stop) is the strongest control in MeetingControls; Pause is
-        quieter.
+        Top bar — calm, hairline-ruled. Left lead group: on a finished open
+        meeting, a left-aligned back affordance ("‹ Meetings") to the list; on
+        the home screen or a live recording, the wordmark + recording status
+        (oxblood dot + elapsed clock). Right: grouped transport, audio meter, and
+        the pane-visibility toggle. The open meeting's NAME is not here — it is
+        the headline of the masthead band below the bar (`MeetingMasthead`).
       */}
       <header className="main-window__topbar ink-reveal">
         {/*
-          Lead group — wordmark + recording status, left-aligned together so the
-          masthead reads as a single coherent row (brand/status left, actions
-          right) instead of a centre-anchored grid whose right cluster wraps.
+          Lead group. A finished open meeting leads with the back-to-list
+          affordance (the meeting's name lives in the masthead below, not here);
+          otherwise the wordmark + recording status sit left-aligned together so
+          the bar reads as a single coherent row instead of a centre-anchored
+          grid whose right cluster wraps. The back affordance is shown ONLY when
+          idle — leaving an open meeting mid-recording would be ambiguous.
         */}
         <div className="main-window__lead">
-          <span className="main-window__wordmark">Minutist</span>
-          {/*
-            When a finalised meeting is open (idle, not recording), show its
-            editable name here so it can be seen + renamed from the meeting
-            screen, not only the home list. Otherwise (home screen / a live
-            recording) show the recording status.
-          */}
-          {openMeetingId !== null && recordingState.kind === "idle" ? (
-            <MeetingTitle meetingId={openMeetingId} />
+          {isFinishedMeeting ? (
+            <button
+              type="button"
+              className="main-window__back"
+              onClick={closeMeeting}
+            >
+              <span className="main-window__back-chevron" aria-hidden="true">
+                ‹
+              </span>
+              Meetings
+            </button>
           ) : (
-            <RecordingStatus />
+            <>
+              <span className="main-window__wordmark">Minutist</span>
+              <RecordingStatus />
+            </>
           )}
         </div>
 
         <div className="main-window__controls">
-          {/*
-            Return to the meeting-list (FR-33 entry surface). Shown only when a
-            meeting is open AND nothing is recording — leaving an open meeting
-            mid-recording would be ambiguous.
-          */}
-          {inWorkspace &&
-            openMeetingId !== null &&
-            recordingState.kind === "idle" && (
-              <button
-                type="button"
-                className="main-window__header-btn"
-                onClick={closeMeeting}
-              >
-                Meetings
-              </button>
-            )}
           {/*
             #67 — the offline Reprocess action lives in an action toolbar at the
             TOP of the transcript pane (see `TranscriptPane`), not in this
@@ -310,6 +303,15 @@ export function MainWindow() {
           </button>
         </div>
       </header>
+
+      {/*
+        Masthead — the open meeting's headline (large editable title + dateline),
+        shown only for a finished, opened meeting (idle). During a live recording
+        the recording status carries the lead instead, so no masthead is shown.
+      */}
+      {openMeetingId !== null && recordingState.kind === "idle" && (
+        <MeetingMasthead meetingId={openMeetingId} />
+      )}
 
       {/*
         Restrained chrome strip below the bar: first-run model download status

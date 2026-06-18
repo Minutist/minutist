@@ -43,51 +43,32 @@
 }
 
 /*
-  The open meeting's name in the masthead — editorial, quietly editable. A
-  hairline separates it from the wordmark so the row reads "app · meeting name".
+  Back-to-list affordance — leads the bar on a finished open meeting, in place
+  of the wordmark. A quiet stone control with a leading chevron that warms to
+  oxblood on hover; the open meeting's name is the masthead headline below.
 */
-.main-window__meeting-title {
-  position: relative;
+.main-window__back {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
   appearance: none;
   border: 0;
   background: none;
-  font-family: var(--font-display);
-  font-weight: 460;
-  font-size: 1.02rem;
-  letter-spacing: 0.005em;
-  color: var(--ink);
-  max-width: 22rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding: 0.1rem 0.3rem;
-  border-radius: 0.3rem;
-  cursor: text;
+  font-family: var(--font-text);
+  font-size: 0.9rem;
+  letter-spacing: 0.01em;
+  color: var(--stone);
+  padding: 0.2rem 0.45rem 0.2rem 0;
+  cursor: pointer;
+  transition: color 120ms ease;
 }
-.main-window__meeting-title::before {
-  content: "";
-  position: absolute;
-  left: -0.55rem;
-  top: 0.15rem;
-  bottom: 0.15rem;
-  width: 1px;
-  background: var(--rule-margin);
-  opacity: 0.3;
+.main-window__back:hover {
+  color: var(--accent);
 }
-.main-window__meeting-title:hover {
-  background: color-mix(in srgb, var(--ink) 8%, transparent);
-}
-.main-window__meeting-title-input {
-  font-family: var(--font-display);
-  font-weight: 460;
-  font-size: 1.02rem;
-  color: var(--ink);
-  background: transparent;
-  border: 1px solid var(--rule-margin);
-  border-radius: 0.3rem;
-  padding: 0.1rem 0.35rem;
-  min-width: 8rem;
-  max-width: 22rem;
+.main-window__back-chevron {
+  font-size: 1.3em;
+  line-height: 1;
+  font-weight: 500;
 }
 
 .main-window__wordmark {
@@ -314,7 +295,7 @@
   border-color: var(--stone-faint);
 }
 
-/* --- Header buttons (Meetings / re-process / Settings) ------------------ */
+/* --- Header buttons (re-process / Settings) ----------------------------- */
 
 .main-window__header-btn {
   font-family: var(--font-text);

@@ -109,6 +109,11 @@ struct OrchestratorInner {
     runner: Option<runner::RunnerHandle>,
     /// Wall-clock instant the current recording started.
     started_at: Option<DateTime<Utc>>,
+    /// User-typed meeting title captured DURING the live recording (via
+    /// `set_pending_title`), consumed by `stop()` in place of the synthesized
+    /// `Recording <timestamp>` default. `None` = unnamed → the default is used.
+    /// Reset at `start()` so a title never bleeds across meetings.
+    pending_title: Option<String>,
 }
 
 impl Orchestrator {
@@ -156,6 +161,7 @@ impl Orchestrator {
                 capture: None,
                 runner: None,
                 started_at: None,
+                pending_title: None,
             }),
             event_tx,
             last_transcript_incomplete: Arc::new(AtomicBool::new(false)),
@@ -346,6 +352,9 @@ impl Orchestrator {
         let started_at =
             DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64).unwrap_or_else(Utc::now);
         guard.started_at = Some(started_at);
+        // Fresh recording: drop any title left over from a prior meeting so it
+        // cannot bleed across. A live title arrives later via `set_pending_title`.
+        guard.pending_title = None;
 
         // Resolve device: caller wins; fall back to settings; then OS default.
         let resolved_device = device_id.or_else(|| self.settings.current().input_device_id);
@@ -563,7 +572,7 @@ impl Orchestrator {
     pub async fn stop(&self) -> AppResult<MeetingMeta> {
         // Extract runner + capture + timestamps while holding the lock, then
         // release it so the runner can complete without deadlocking.
-        let (meeting_id, runner_handle, started_at, capture_opt) = {
+        let (meeting_id, runner_handle, started_at, capture_opt, pending_title) = {
             let mut guard = self.inner.lock().await;
             let meeting_id = transition_stop(&mut guard.state)?;
 
@@ -573,7 +582,9 @@ impl Orchestrator {
             let runner = guard.runner.take();
             let started_at = guard.started_at.take().unwrap_or_else(Utc::now);
             let capture = guard.capture.take();
-            (meeting_id, runner, started_at, capture)
+            // The title the user typed during the recording (if any), consumed here.
+            let pending_title = guard.pending_title.take();
+            (meeting_id, runner, started_at, capture, pending_title)
         };
 
         // Stop audio capture (drops the cpal stream → signals forwarder to exit).
@@ -589,9 +600,16 @@ impl Orchestrator {
         let ended_at = Utc::now();
         let duration_ms = (ended_at - started_at).num_milliseconds().max(0) as u64;
 
+        // Use the title the user typed during recording when present + non-blank;
+        // otherwise fall back to the synthesized `Recording <timestamp>` default.
+        let title = pending_title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| format!("Recording {}", started_at.format("%Y-%m-%dT%H:%M:%SZ")));
+
         let meta = MeetingMeta {
             uuid: meeting_id,
-            title: format!("Recording {}", started_at.format("%Y-%m-%dT%H:%M:%SZ")),
+            title,
             started_at: started_at.to_rfc3339(),
             ended_at: Some(ended_at.to_rfc3339()),
             duration_ms,
@@ -719,6 +737,36 @@ impl Orchestrator {
     /// settings read, but the *execution* is decoupled from `stop()`.
     pub fn diarization_enabled(&self) -> bool {
         self.settings.current().diarization_enabled
+    }
+
+    /// Set the title the user typed for the LIVE recording, captured in-progress
+    /// and consumed by [`Self::stop`] in place of the `Recording <timestamp>`
+    /// default. A no-op unless `meeting_id` is the currently recording/paused
+    /// meeting (guards against a late set racing a stop, or a stale id). An empty
+    /// / whitespace title clears it (revert to the default). `metadata.json` is
+    /// untouched here — it does not exist until finalise — so this never violates
+    /// the "metadata present ⇒ finalised" invariant.
+    ///
+    /// Privacy (issue #0014): the title is user content; like `rename_meeting`
+    /// this MUST NOT log the title — only the meeting id.
+    pub async fn set_pending_title(&self, meeting_id: MeetingId, title: String) -> AppResult<()> {
+        let mut guard = self.inner.lock().await;
+        if guard.state.live_meeting_id() != Some(meeting_id) {
+            // Not the live meeting (already stopping/finalised, or a stale id).
+            return Ok(());
+        }
+        let trimmed = title.trim();
+        guard.pending_title = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        tracing::info!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            "pending meeting title set"
+        );
+        Ok(())
     }
 
     /// Take (read + reset) whether the most recent `stop()`'s live transcript

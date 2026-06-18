@@ -61,6 +61,10 @@ export const commands: Commands = {
   prewarmAsr: () => callCommand("prewarmAsr", []),
   pauseRecording: () => callCommand("pauseRecording", []),
   resumeRecording: () => callCommand("resumeRecording", []),
+  // Set the live recording's meeting title (held by the orchestrator, applied at
+  // stop). The DEV shim no-ops it (no backend), so the masthead input still works.
+  setRecordingTitle: (meetingId, title) =>
+    callCommand("setRecordingTitle", [meetingId, title]),
   stopRecording: () => callCommand("stopRecording", []),
   getRecordingState: () => callCommand("getRecordingState", []),
   getSettings: () => callCommand("getSettings", []),

@@ -50,6 +50,13 @@ export type RecordingStore = {
   meter: { peak: number; rms: number };
   lastError: string | null;
   /**
+   * The meeting title the user has typed for the IN-PROGRESS recording. The live
+   * meeting has no `metadata.json` yet, so it cannot be renamed the usual way;
+   * this is echoed locally for the recording masthead input and pushed to the
+   * orchestrator via `setTitle` (consumed at `stop()`). Reset to "" on `start`.
+   */
+  pendingTitle: string;
+  /**
    * Client-only optimistic transient (live-test UX T1): `true` from the moment
    * `start()` is invoked until the backend confirms the recording has begun (the
    * `state_changed` → `recording` event) or `start()` fails. It exists because
@@ -93,6 +100,12 @@ export type RecordingStore = {
   pause: () => Promise<void>;
   resume: () => Promise<void>;
   stop: () => Promise<void>;
+  /**
+   * Set the live recording's meeting title (see `pendingTitle`). Echoes locally
+   * then pushes to the orchestrator keyed on the live meeting_id; a no-op when
+   * not recording/paused.
+   */
+  setTitle: (title: string) => Promise<void>;
   setSelectedDevice: (id: string | null) => Promise<void>;
   /**
    * Toggle the Phase-6 diarization-enabled setting (off by default), persisting
@@ -209,6 +222,7 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   preparing: false,
   transcript: [],
   recordingClockMs: null,
+  pendingTitle: "",
 
   refreshDevices: async () => {
     try {
@@ -243,6 +257,25 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
+  setTitle: async (title) => {
+    // Echo locally for the masthead input, then push to the orchestrator, which
+    // holds the title for the live meeting and consumes it at stop(). The live
+    // meeting_id is read off the current state (recording/paused); a no-op
+    // otherwise (and the command itself no-ops on a stale id).
+    set({ pendingTitle: title });
+    const live = get().state;
+    const meetingId =
+      live.kind === "recording" || live.kind === "paused"
+        ? live.meeting_id
+        : null;
+    if (meetingId === null) return;
+    try {
+      unwrap(await commands.setRecordingTitle(meetingId, title));
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
   start: async () => {
     // Guard against a double-press / start-while-busy (live-test UX T1a): only a
     // genuinely idle recorder may start. A second press while Recording would
@@ -261,7 +294,8 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     // "Preparing transcription model…" while the backend opens capture and (on
     // the first record) lazy-loads the ASR model. Cleared on the `recording`
     // state event (see `handleEvent`) or on error below.
-    set({ preparing: true, lastError: null });
+    // Clear any title from a prior recording so it cannot bleed into this one.
+    set({ preparing: true, lastError: null, pendingTitle: "" });
     try {
       const result = await commands.startRecording(get().selectedDeviceId);
       unwrap(result);

@@ -1202,6 +1202,17 @@ Parallel agents working on capture / VAD / ASR cannot independently
 change the orchestrator's wiring — that's an orchestration-owner
 decision and needs an architecture-doc update.
 
+**Live meeting title (`set_pending_title`).** The state machine holds a
+`pending_title: Option<String>` set by
+`set_pending_title(meeting_id, title)` — a no-op unless `meeting_id` is the live
+`Recording`/`Paused` meeting (via `InternalState::live_meeting_id`), reset at
+`start()`. `stop()` consumes it as the finished `MeetingMeta.title` in place of
+the synthesized `Recording <timestamp>` default. This is how the UI names a
+meeting DURING recording — the live meeting has no `metadata.json` yet, so
+`rename_meeting` cannot be used and writing metadata early would break the
+"metadata present ⇒ finalised" index invariant. The title is user content and is
+never logged (#0014, mirroring `rename_meeting`).
+
 **Phase 1 surface (broadcast policy).** `AppEvent` fan-out uses
 `broadcast::channel(256)` (~8 s of meter at 30 Hz). Slow subscribers
 receive `RecvError::Lagged` from tokio and must warn at their call site;
@@ -1607,7 +1618,11 @@ so they are **write-gated** like `set_speaker_name`/`rename_meeting`: absent +
 rejected when `mcp_write_tools` is OFF (the default), exposed + callable when it
 is ON — the deliberate opt-in that lets an external MCP client drive the
 record→transcribe→read loop for E2E (off by default, behind the bearer token +
-loopback). The internal UI chat (no MCP gate) can always drive them. MCP-only
+loopback). The internal UI chat (no MCP gate) can always drive them.
+`set_recording_title(meeting_id, title)` is a fifth record-control write
+delegating to `Orchestrator::set_pending_title` (UI-only — no agent-tool / MCP
+exposure); it names the live meeting before it finalises, capped at 512 chars.
+MCP-only
 (Phase 10, `v1(true)`): `send_to_internal_agent` — forwards one
 message to the internal chat agent over the bridge channel and returns its reply
 (body in `agent-tools`; chat-engine driver in `ipc-bridge::inter_agent`).
@@ -3007,8 +3022,12 @@ A warm-paper, document-centric **light** theme applied across the webview.
   Fraunces title with a pencil edit affordance over a stone dateline — date ·
   duration · speakers; an auto-titled `Recording <timestamp>` meeting shows a
   muted "Untitled meeting" placeholder to nudge a name, renaming through the same
-  `useMeetingsStore.rename` seam as the home list). The right cluster is the
-  grouped transport + slim meter + the segmented pane-visibility toggle.
+  `useMeetingsStore.rename` seam as the home list). While recording or paused the
+  band is instead an always-editable "Name this meeting" field
+  (`RecordingMasthead.tsx`) bound to the live meeting via
+  `useRecordingStore.setTitle` → `set_recording_title` (the live meeting has no
+  saved title yet; it is applied at stop). The right cluster is the grouped
+  transport + slim meter + the segmented pane-visibility toggle.
 - **Margin-anchor marginalia.** `ui/src/editor/anchor-marginalia.ts` is a
   **presentation-only** ProseMirror decoration extension: it renders each
   anchored paragraph's `data-anchor-ms` value as a quiet timestamp in the sheet's

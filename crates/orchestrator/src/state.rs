@@ -72,6 +72,18 @@ pub(crate) enum InternalState {
 }
 
 impl InternalState {
+    /// The meeting id of the live recording IF the recorder is in a state where a
+    /// user-typed title can still be captured — `Recording` or `Paused`. Returns
+    /// `None` once `Stopping`/`Finalising`/`Idle`/`Offline` (the title is consumed
+    /// at `stop()`), so a late title set against a no-longer-live id is a no-op.
+    pub(crate) fn live_meeting_id(&self) -> Option<MeetingId> {
+        match self {
+            InternalState::Recording { meeting_id, .. }
+            | InternalState::Paused { meeting_id, .. } => Some(*meeting_id),
+            _ => None,
+        }
+    }
+
     /// Convert to the public `RecordingState` for broadcast.
     pub(crate) fn as_public(&self) -> RecordingState {
         match self {

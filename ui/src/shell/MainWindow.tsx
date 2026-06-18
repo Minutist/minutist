@@ -10,6 +10,7 @@ import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
 import { MeetingMasthead } from "./MeetingMasthead";
+import { RecordingMasthead } from "./RecordingMasthead";
 import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
 import { ChatView } from "./ChatView";
@@ -312,6 +313,15 @@ export function MainWindow() {
       {openMeetingId !== null && recordingState.kind === "idle" && (
         <MeetingMasthead meetingId={openMeetingId} />
       )}
+
+      {/*
+        While recording or paused, the live meeting has no title yet — show an
+        editable field so the user can name it during the meeting (applied at
+        stop). Mutually exclusive with the finished-meeting masthead above
+        (idle vs recording/paused). Suppressed during stopping/finalising.
+      */}
+      {(recordingState.kind === "recording" ||
+        recordingState.kind === "paused") && <RecordingMasthead />}
 
       {/*
         Restrained chrome strip below the bar: first-run model download status

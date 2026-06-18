@@ -80,6 +80,22 @@ async resumeRecording() : Promise<Result<null, IpcError>> {
 }
 },
 /**
+ * Set the meeting title for the LIVE recording (the active meeting has no
+ * `metadata.json` yet, so this cannot route through `rename_meeting`). Held in
+ * the orchestrator's in-progress state and consumed by `stop()` in place of the
+ * `Recording <timestamp>` default; a no-op if `meeting_id` is not the meeting
+ * currently recording/paused. Trimmed + capped so the UI cannot persist an
+ * unbounded value (mirrors the speaker-name / collection-name caps).
+ */
+async setRecordingTitle(meetingId: MeetingId, title: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_recording_title", { meetingId, title }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Stop the current recording and finalise the meeting.
  * 
  * Returns the completed `MeetingMeta` on success.

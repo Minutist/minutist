@@ -928,6 +928,57 @@ mod diarization {
         );
     }
 
+    /// A title typed during the live recording (via `set_pending_title`) is
+    /// captured and consumed by `stop()` in place of the `Recording <timestamp>`
+    /// default — trimmed — and a set against a non-live id is a no-op.
+    #[tokio::test]
+    async fn stop_uses_the_live_pending_title_when_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        let source = DummyAudioSource::new(3200, 1600);
+        let streams = source.generate_streams(5, 32, 64);
+        let meeting_id = orch.start_with_streams(streams).await.expect("start");
+
+        // A stale id must NOT clobber the live title.
+        orch.set_pending_title(MeetingId::new(), "Wrong".into())
+            .await
+            .expect("stale id is a no-op");
+        // The live meeting's title is captured (and trimmed).
+        orch.set_pending_title(meeting_id, "  Quarterly planning  ".into())
+            .await
+            .expect("set live title");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let meta = orch.stop().await.expect("stop");
+        assert_eq!(
+            meta.title, "Quarterly planning",
+            "stop() must use the trimmed live title"
+        );
+    }
+
+    /// An unnamed recording falls back to the synthesized `Recording <timestamp>`
+    /// default title.
+    #[tokio::test]
+    async fn stop_falls_back_to_default_title_when_unnamed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        let source = DummyAudioSource::new(3200, 1600);
+        let streams = source.generate_streams(5, 32, 64);
+        orch.start_with_streams(streams).await.expect("start");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let meta = orch.stop().await.expect("stop");
+        assert!(
+            meta.title.starts_with("Recording "),
+            "unnamed recording keeps the default title, got {:?}",
+            meta.title
+        );
+    }
+
     /// With `diarization_enabled = false` (the default), `stop()` runs no
     /// diarization pass: the returned `MeetingMeta` and the on-disk transcript
     /// keep every `speaker_id == None`, `speaker_count == 0`, and NO

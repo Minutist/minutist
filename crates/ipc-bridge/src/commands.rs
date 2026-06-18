@@ -171,6 +171,33 @@ pub async fn resume_recording(state: State<'_, IpcState>) -> Result<(), IpcError
     state.orchestrator.resume().await.map_err(IpcError::from)
 }
 
+/// Set the meeting title for the LIVE recording (the active meeting has no
+/// `metadata.json` yet, so this cannot route through `rename_meeting`). Held in
+/// the orchestrator's in-progress state and consumed by `stop()` in place of the
+/// `Recording <timestamp>` default; a no-op if `meeting_id` is not the meeting
+/// currently recording/paused. Trimmed + capped so the UI cannot persist an
+/// unbounded value (mirrors the speaker-name / collection-name caps).
+#[tauri::command]
+#[specta::specta]
+pub async fn set_recording_title(
+    meeting_id: MeetingId,
+    title: String,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    const MAX_TITLE_LEN: usize = 512;
+    let title = title.trim().to_string();
+    if title.chars().count() > MAX_TITLE_LEN {
+        return Err(IpcError::from(AppError::InvalidInput {
+            context: format!("meeting title too long (max {MAX_TITLE_LEN} characters)"),
+        }));
+    }
+    state
+        .orchestrator
+        .set_pending_title(meeting_id, title)
+        .await
+        .map_err(IpcError::from)
+}
+
 /// Stop the current recording and finalise the meeting.
 ///
 /// Returns the completed `MeetingMeta` on success.

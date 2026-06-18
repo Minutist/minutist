@@ -497,6 +497,13 @@ export const devCommands = {
   async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
     return ok(null);
   },
+  async setRecordingTitle(
+    _meetingId: MeetingId,
+    _title: string,
+  ): Promise<Result<null, IpcError>> {
+    // No backend in the shim; the masthead input echoes locally via the store.
+    return ok(null);
+  },
   // --- Collections ("folders") --------------------------------------------
   async listCollections(): Promise<Result<Collection[], IpcError>> {
     return ok([...devCollections].sort((a, b) => a.position - b.position));

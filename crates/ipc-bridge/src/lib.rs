@@ -533,6 +533,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::prewarm_asr,
             commands::pause_recording,
             commands::resume_recording,
+            commands::set_recording_title,
             commands::stop_recording,
             commands::get_recording_state,
             commands::get_settings,

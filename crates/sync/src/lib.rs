@@ -22,6 +22,7 @@
 //! [iroh]: https://docs.rs/iroh/1.0.0/iroh/
 //! [iroh-blobs]: https://docs.rs/iroh-blobs/
 
+pub mod address_lookup;
 pub mod blobs;
 pub mod endpoint;
 pub mod identity;
@@ -72,6 +73,12 @@ pub struct SyncConfig {
     /// `https://sync.minutist.ai`).
     pub relay_url: String,
 
+    /// The shared access token the self-hosted relay requires. When set it is
+    /// threaded into the relay config via `RelayConfig::with_auth_token`; the
+    /// relay's `AccessControl` admits the connection only when it matches. `None`
+    /// for relays that do not gate on a token (e.g. a local/direct test).
+    pub relay_auth_token: Option<String>,
+
     /// The application data directory. The device key is persisted under it
     /// (see [`identity`]); blob media is read from the per-meeting folders below
     /// it via `persistence`.
@@ -82,11 +89,20 @@ impl SyncConfig {
     /// The default relay endpoint for the connected tier.
     pub const DEFAULT_RELAY_URL: &'static str = "https://sync.minutist.ai";
 
-    /// Build a config for `app_data_dir`, pinning [`Self::DEFAULT_RELAY_URL`].
+    /// Build a config for `app_data_dir`, pinning [`Self::DEFAULT_RELAY_URL`] with
+    /// no relay auth token. The token is set later via
+    /// [`Self::with_relay_auth_token`] once the account service issues one.
     pub fn new(app_data_dir: PathBuf) -> Self {
         Self {
             relay_url: Self::DEFAULT_RELAY_URL.to_string(),
+            relay_auth_token: None,
             app_data_dir,
         }
+    }
+
+    /// Set the relay access token presented to the self-hosted relay.
+    pub fn with_relay_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.relay_auth_token = Some(token.into());
+        self
     }
 }

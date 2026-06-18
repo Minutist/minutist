@@ -33,3 +33,17 @@ iroh = "=1.0.0"
 # Content-addressed blob transfer (audio + note assets). iroh-blobs 0.103 tracks
 # iroh 1.0 but is still pre-1.0, so it is pinned EXACT and re-checked on bumps.
 iroh-blobs = "=0.103.0"
+
+[features]
+# Exposes the relay-less direct-connection path (`SyncEngine::start_direct` +
+# `bound_sockets`) for integration tests and local bring-up. NOT enabled in the
+# production build, whose sync surface always pins the relay.
+test-support = []
+
+[dev-dependencies]
+# Self-dependency with `test-support` on so `cargo test -p sync` builds the
+# integration test against the relay-less path without a feature flag on the
+# command line.
+sync = { path = ".", features = ["test-support"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

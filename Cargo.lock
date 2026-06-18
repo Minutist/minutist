@@ -7177,6 +7177,8 @@ dependencies = [
  "persistence",
  "serde",
  "serde_json",
+ "sync",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

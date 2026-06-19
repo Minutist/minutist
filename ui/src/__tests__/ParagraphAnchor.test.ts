@@ -21,15 +21,24 @@ import {
   placeCursorAtEnd,
   pressEnter,
   paragraphAnchors,
+  paragraphWallAnchors,
 } from "./editor-test-utils";
 
 /** A mutable simulated clock the test controls; mirrors the store field. */
-type SimClock = { recording: boolean; clockMs: number | null };
+type SimClock = {
+  recording: boolean;
+  clockMs: number | null;
+  wallMs?: number | null;
+};
 
 function makeEditor(clock: SimClock): Editor {
   return new Editor({
     extensions: buildEditorExtensions({
-      clockSource: () => ({ recording: clock.recording, clockMs: clock.clockMs }),
+      clockSource: () => ({
+        recording: clock.recording,
+        clockMs: clock.clockMs,
+        wallMs: clock.wallMs ?? null,
+      }),
     }),
     content: "<p></p>",
   });
@@ -72,6 +81,24 @@ describe("paragraph-anchor extension", () => {
     // implementation would have stamped ~1.9e12 instead of 7350.
     expect(anchor).not.toBe(WALL_CLOCK);
     expect(anchor).toBeLessThan(WALL_CLOCK);
+    editor.destroy();
+  });
+
+  it("pairs the wall-clock (data-anchor-wall) with the offset on stamp", () => {
+    // wallMs is the epoch ms at stamp time — the gutter's time-of-day source —
+    // distinct from the pause-excluding offset (clockMs).
+    const clock: SimClock = {
+      recording: true,
+      clockMs: 4200,
+      wallMs: 1_750_000_000_000,
+    };
+    const editor = makeEditor(clock);
+    placeCursorAtEnd(editor);
+
+    typeText(editor, "h");
+
+    expect(paragraphAnchors(editor)).toEqual([4200]);
+    expect(paragraphWallAnchors(editor)).toEqual([1_750_000_000_000]);
     editor.destroy();
   });
 

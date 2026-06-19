@@ -86,3 +86,15 @@ export function paragraphAnchors(editor: Editor): Array<number | null> {
   });
   return anchors;
 }
+
+/** Per-paragraph `data-anchor-wall` (epoch ms), `null` when unstamped. */
+export function paragraphWallAnchors(editor: Editor): Array<number | null> {
+  const walls: Array<number | null> = [];
+  editor.state.doc.descendants((node) => {
+    if (node.type.name === "paragraph") {
+      const value = node.attrs["data-anchor-wall"];
+      walls.push(typeof value === "number" ? value : null);
+    }
+  });
+  return walls;
+}

@@ -326,6 +326,19 @@ Phase 4 cross-reference (FR-22/23, anchor → nearest transcript segment) would
 resolve to the wrong region. `started_at_ms` remains valid for elapsed-time
 *display* only.
 
+**Gutter display is a separate, display-only wall-clock.** `data-anchor-ms` (the
+cross-reference / summariser timeline) is never shown raw. The notes gutter shows
+the **local time-of-day** the note was written: a paired `data-anchor-wall`
+attribute (epoch ms) is stamped ALONGSIDE `data-anchor-ms` at anchor time — so it
+is correct across pauses, unlike a naive `started_at_ms + offset` conversion —
+and `AnchorMarginalia` renders it via `formatWallClock`. Notes predating the
+stored wall-clock fall back to deriving a time-of-day from the meeting start +
+the offset (pause-naive), then to the bare elapsed offset if no start time is
+known. `data-anchor-wall` is presentation-only — it never feeds cross-reference
+(FR-22/23) or the summariser, which stay on `data-anchor-ms` — and round-trips
+like any paragraph attribute (notes.json opacity + the generic ydoc attr walk),
+so no persistence change is needed.
+
 Consequence: `audio.opus` is recorded pause-*including* (the encoder pads each
 pause with synthesised silence), while anchors and segment timestamps are
 pause-*excluding*. Phase 4 cross-reference (FR-22/23) operates **entirely on the

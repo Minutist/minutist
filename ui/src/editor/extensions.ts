@@ -60,6 +60,12 @@ export type BuildExtensionsOptions = {
    */
   onHoverAnchor?: HoverAnchorReporter;
   /**
+   * Supplies the open/recording meeting's start wall-clock (epoch ms) to
+   * {@link AnchorMarginalia} for the derived-time fallback on notes that predate
+   * the stored per-note wall-clock. Defaults to `null` (elapsed shown for those).
+   */
+  startedAtMs?: () => number | null;
+  /**
    * Supplies the current meeting id to {@link NoteImage} so a stored portable
    * image ref resolves to its `meetingasset:` URL at render time. Defaults to a
    * no-op (`null`) when omitted; bare refs then render as-is (unresolved).
@@ -119,10 +125,12 @@ export function buildEditorExtensions(
       transformPastedText: true,
     }),
     ParagraphAnchor.configure({ clockSource: options.clockSource }),
-    // Presentation-only: renders anchor timestamps as left-margin marginalia.
-    // Adds no node attrs and dispatches no transactions, so it cannot affect
-    // ParagraphAnchor's stamping logic.
-    AnchorMarginalia,
+    // Presentation-only: renders anchor timestamps (local time-of-day) as
+    // left-margin marginalia. Adds no node attrs and dispatches no transactions,
+    // so it cannot affect ParagraphAnchor's stamping logic.
+    AnchorMarginalia.configure({
+      startedAtMs: options.startedAtMs ?? (() => null),
+    }),
     // First-class dragged-in transcript segment (FR-24/25).
     TranscriptChip,
     // Pasted/dropped note images, stored as files + referenced portably.

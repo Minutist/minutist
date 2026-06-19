@@ -8,7 +8,7 @@
  * clamp guards against a bad/early anchor value.
  */
 import { describe, it, expect } from "vitest";
-import { formatAnchorMark } from "../editor/anchor-marginalia";
+import { formatAnchorMark, formatWallClock } from "../editor/anchor-marginalia";
 
 describe("formatAnchorMark", () => {
   it("formats sub-minute offsets as M:SS", () => {
@@ -31,5 +31,20 @@ describe("formatAnchorMark", () => {
 
   it("clamps a negative offset to zero", () => {
     expect(formatAnchorMark(-5_000)).toBe("0:00");
+  });
+});
+
+describe("formatWallClock", () => {
+  it("renders an epoch as a local hour:minute time-of-day (not elapsed)", () => {
+    const epoch = Date.UTC(2026, 5, 19, 13, 18, 32);
+    // Format contract: locale-aware hour:minute, no seconds. Compared against
+    // the same Intl call so the test is robust across the runner's TZ/locale.
+    const expected = new Date(epoch).toLocaleTimeString(undefined, {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+    expect(formatWallClock(epoch)).toBe(expected);
+    // It is a time-of-day (h:mm, optionally with AM/PM), never an elapsed M:SS.
+    expect(formatWallClock(epoch)).toMatch(/\d{1,2}:\d{2}/);
   });
 });

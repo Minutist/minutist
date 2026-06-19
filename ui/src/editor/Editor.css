@@ -358,4 +358,6 @@
   user-select: none;
   pointer-events: none;
   letter-spacing: 0.01em;
+  /* Keep a time-of-day stamp ("12:05 PM") on one line within the gutter band. */
+  white-space: nowrap;
 }

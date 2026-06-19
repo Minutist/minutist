@@ -28,16 +28,30 @@ import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 export const ANCHOR_ATTR = "data-anchor-ms";
 
 /**
+ * Wall-clock time (epoch ms) at the moment a paragraph was anchored. Stamped
+ * ALONGSIDE [`ANCHOR_ATTR`] for the gutter's time-of-day display (issue: users
+ * read the gutter as a clock, not elapsed time). It is display-only: the
+ * recording-offset `ANCHOR_ATTR` remains the cross-reference / summariser
+ * timeline. Captured at stamp time so it is correct even across pauses (a naive
+ * `start + offset` conversion would under-count by the pause duration).
+ */
+export const WALL_ATTR = "data-anchor-wall";
+
+/**
  * Live recording-clock snapshot consulted on each keystroke.
  *
  * `recording` gates whether anchoring happens at all; `clockMs` is the value
- * stamped (the pause-excluding capture clock). Injected so the extension stays
- * decoupled from the Zustand store and can be driven by a simulated clock in
- * tests.
+ * stamped (the pause-excluding capture clock); `wallMs` is the wall-clock epoch
+ * ms stamped into [`WALL_ATTR`] for the gutter display. Injected so the extension
+ * stays decoupled from the Zustand store and can be driven by a simulated clock
+ * in tests.
  */
 export type AnchorClockSource = () => {
   recording: boolean;
   clockMs: number | null;
+  /** Wall-clock epoch ms; omit/null to stamp only the offset (the gutter then
+   *  derives the time-of-day from the meeting start). */
+  wallMs?: number | null;
 };
 
 export type ParagraphAnchorOptions = {
@@ -105,7 +119,7 @@ export const ParagraphAnchor = Extension.create<ParagraphAnchorOptions>({
       // Default source reports "idle" so the extension is a no-op unless an
       // explicit clock source is supplied (the production Editor wires the
       // recording store; tests wire a simulated clock).
-      clockSource: () => ({ recording: false, clockMs: null }),
+      clockSource: () => ({ recording: false, clockMs: null, wallMs: null }),
     };
   },
 
@@ -126,6 +140,18 @@ export const ParagraphAnchor = Extension.create<ParagraphAnchorOptions>({
               const value = attributes[ANCHOR_ATTR];
               if (value === null || value === undefined) return {};
               return { [ANCHOR_ATTR]: String(value) };
+            },
+          },
+          [WALL_ATTR]: {
+            default: null,
+            parseHTML: (element: HTMLElement) => {
+              const raw = element.getAttribute(WALL_ATTR);
+              return raw === null ? null : Number.parseInt(raw, 10);
+            },
+            renderHTML: (attributes: Record<string, unknown>) => {
+              const value = attributes[WALL_ATTR];
+              if (value === null || value === undefined) return {};
+              return { [WALL_ATTR]: String(value) };
             },
           },
         },
@@ -185,12 +211,15 @@ export const ParagraphAnchor = Extension.create<ParagraphAnchorOptions>({
             !isUnanchored(cursorPara)
           ) {
             tr.setNodeAttribute(cursorParaPos, ANCHOR_ATTR, null);
+            // Clear the paired wall-clock too so a split never resurrects a
+            // stale time-of-day on the new paragraph.
+            tr.setNodeAttribute(cursorParaPos, WALL_ATTR, null);
             changed = true;
           }
 
           // Stamp on the first text-bearing keystroke while recording.
           if (insertedText && !splitParagraph) {
-            const { recording, clockMs } = clockSource();
+            const { recording, clockMs, wallMs } = clockSource();
             if (
               recording &&
               clockMs !== null &&
@@ -199,6 +228,12 @@ export const ParagraphAnchor = Extension.create<ParagraphAnchorOptions>({
               isUnanchored(cursorPara)
             ) {
               tr.setNodeAttribute(cursorParaPos, ANCHOR_ATTR, clockMs);
+              // Pair the recording offset with the wall-clock at stamp time for
+              // the gutter's time-of-day display (the offset stays authoritative
+              // for cross-reference).
+              if (wallMs !== null && wallMs !== undefined) {
+                tr.setNodeAttribute(cursorParaPos, WALL_ATTR, wallMs);
+              }
               changed = true;
             }
           }

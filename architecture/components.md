@@ -3048,11 +3048,14 @@ A warm-paper, document-centric **light** theme applied across the webview.
   transport + slim meter + the segmented pane-visibility toggle.
 - **Margin-anchor marginalia.** `ui/src/editor/anchor-marginalia.ts` is a
   **presentation-only** ProseMirror decoration extension: it renders each
-  anchored paragraph's `data-anchor-ms` value as a quiet timestamp in the sheet's
-  left gutter, right-aligned flush against the oxblood margin rule (editorial
-  side-note). It adds no node attributes and dispatches no transactions, so it
-  cannot interfere with `ParagraphAnchor`'s stamping logic and never shifts the
-  text column.
+  anchored paragraph's timestamp as a quiet side-note in the sheet's left gutter,
+  centred in the gutter band. It shows the **local time-of-day** the note was
+  written (`formatWallClock` of the paired `data-anchor-wall`; falling back to the
+  meeting start + `data-anchor-ms` offset, then to the bare elapsed
+  `formatAnchorMark`), NOT the raw recording offset — see `cross-cutting.md`
+  "Notes paragraph-anchor clock". It adds no node attributes and dispatches no
+  transactions, so it cannot interfere with `ParagraphAnchor`'s stamping logic
+  and never shifts the text column.
 - **Appearance settings.** The Settings drawer's Appearance group exposes the
   colour-theme control (System / Light / Dark — `settings.theme`, applied to the
   document root in `App.tsx`; "System" follows `prefers-color-scheme`) and the

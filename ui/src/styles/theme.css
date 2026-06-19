@@ -82,7 +82,9 @@
      `--notes-text-pad` to the right of the rule. `--notes-leading` is the
      baseline pitch the body line-height and the horizontal rules share so the
      two align. */
-  --notes-gutter: 3.5rem; /* timestamp column width */
+  --notes-gutter: 4rem; /* timestamp column width — fits a local time-of-day
+                           anchor like "12:05 PM" (wider than the old elapsed
+                           "10:05") without crowding the margin rule. */
   --notes-anchor-gap: 0.45rem; /* breathing room between the timestamp and the rule */
   --notes-text-pad: 1.4rem; /* gap between the margin rule and the text */
   --notes-leading: 1.85rem; /* body line-height == ruled-line pitch */

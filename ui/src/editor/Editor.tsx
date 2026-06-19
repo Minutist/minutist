@@ -125,7 +125,24 @@ export function Editor() {
         return {
           recording: s.state.kind === "recording",
           clockMs: s.recordingClockMs,
+          // Wall-clock at the stamp moment, paired with the offset for the
+          // gutter's time-of-day display. Correct across pauses (captured live).
+          wallMs: s.state.kind === "recording" ? Date.now() : null,
         };
+      },
+      // The open/recording meeting's start wall-clock, for the gutter to derive a
+      // time-of-day on older notes that predate the stored per-note wall-clock.
+      startedAtMs: () => {
+        const rs = useRecordingStore.getState().state;
+        // Only the `recording` variant carries the start wall-clock; new notes
+        // during a recording stamp their own wall-clock anyway, so the fallback
+        // is really for a saved meeting's older notes (read from its metadata).
+        if (rs.kind === "recording") return rs.started_at_ms;
+        const startedAt =
+          useMeetingsStore.getState().openMeetingState?.meta?.started_at;
+        if (!startedAt) return null;
+        const t = Date.parse(startedAt);
+        return Number.isNaN(t) ? null : t;
       },
       // FR-22: a hovered paragraph's anchor span maps to the RANGE of transcript
       // segments in [anchorMs, nextAnchorMs) (on Segment.start_ms, the

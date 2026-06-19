@@ -2167,6 +2167,15 @@ re-transcribe / diarize passes then update the now-open meeting in place
 `Finalising` variant and `AppEvent` a `MeetingFinalised` variant — bindings
 regenerated.
 
+**Responsive start.** `start()` emits `StateChanged(Recording)` as soon as audio
+capture is running and the `MeetingWriter` is open — BEFORE the GPU probe, the
+optional live-diarizer model load, and the runner spawn — so the webview switches
+to the meeting screen (and the rec indicator starts) immediately rather than
+waiting on that setup. The recording is genuinely live at that point; the runner
+(drain → transcribe) and the lazy/first-flush ASR model load follow in the
+background, and the capture ring buffers in the meantime, so the early emit loses
+no audio. The webview's optimistic `preparing` flag clears on this event.
+
 **Phase 4 additions (18 commands at Phase 4; `re_summarise` removed in Phase 5)
 — meeting list / open / actions.** Six commands back the meeting-list view
 (FR-33), plus five **collection** ("folder") commands:

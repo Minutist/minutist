@@ -398,6 +398,19 @@ impl Orchestrator {
             }
         };
 
+        // Surface the live state NOW — capture is already running and the writer
+        // is open, so the recording is genuinely live. Emitting here, BEFORE the
+        // GPU probe + (optional) live-diarizer model load + runner spawn below,
+        // makes the meeting screen and the rec indicator appear immediately
+        // instead of waiting on that setup. The runner (drain → transcribe) and
+        // the lazy ASR model load follow in the background; no audio is lost (the
+        // capture ring buffers until the runner drains it, exactly as before —
+        // only the event moved earlier). No state rollback follows this point:
+        // the remaining steps degrade rather than fail.
+        self.emit(AppEvent::StateChanged {
+            state: guard.state.as_public(),
+        });
+
         // GPU offload is a VRAM-aware runtime decision: a single plan probes the
         // GPU once and decides per model (see `architecture/cross-cutting.md` —
         // "GPU portability"). `resolve_gpu_layers` maps `plan.asr_gpu` to the
@@ -461,9 +474,9 @@ impl Orchestrator {
         guard.capture = Some(capture);
         guard.runner = Some(runner_handle);
 
-        let new_state = guard.state.as_public();
-        self.emit(AppEvent::StateChanged { state: new_state });
-
+        // StateChanged(Recording) was already emitted above (right after capture +
+        // writer came up) so the UI switched to the meeting screen immediately;
+        // do not re-emit here.
         tracing::info!(
             target: "orchestrator",
             meeting_id = %meeting_id.0,

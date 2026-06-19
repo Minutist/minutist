@@ -38,9 +38,6 @@ export function RecordingMasthead() {
           }
         }}
       />
-      <p className="meeting-masthead__dateline">
-        <span>Name it now, or rename it after you stop.</span>
-      </p>
     </div>
   );
 }

@@ -12,6 +12,7 @@
  *   - `transcript_ready`     → clear (the re-transcribe pass finished).
  *   - `diarization_complete` → clear (the re-identify-speakers pass finished).
  *   - `summary_ready`        → clear (the summarise pass finished).
+ *   - `summary_unavailable`  → clear (an auto-summarise was deferred/failed).
  *   - `meeting_finalised`    → clear (the finalise drain finished).
  *   - `translation_ready`    → clear (the translate pass finished).
  *
@@ -67,6 +68,7 @@ export const useOperationProgressStore = create<OperationProgressStore>(
         case "transcript_ready":
         case "diarization_complete":
         case "summary_ready":
+        case "summary_unavailable":
         case "meeting_finalised":
         case "translation_ready": {
           const meetingId = event.meeting_id;

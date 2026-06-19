@@ -74,6 +74,7 @@ describe("operation-progress store", () => {
     "transcript_ready",
     "diarization_complete",
     "summary_ready",
+    "summary_unavailable",
     "meeting_finalised",
   ] as const)("terminal event %s clears the meeting's indicator", (kind) => {
     useOperationProgressStore.setState({

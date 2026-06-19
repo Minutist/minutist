@@ -46,6 +46,7 @@ function resetStore() {
     useSummaryStore.setState({
       summaryMarkdown: null,
       summarising: false,
+      autoPending: {},
       meetingId: null,
       lastError: null,
       editing: false,
@@ -304,5 +305,79 @@ describe("SummaryView (FR-30)", () => {
     render(<SummaryView meetingId={MEETING} />);
     await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
+
+  // -------------------------------------------------------------------------
+  // #NN — a post-stop AUTO-summary is queued (`autoPending`) the instant the
+  // meeting finalises, BEFORE the determinate `summarise` op streams (which can
+  // be minutes later, after re-transcribe / re-diarize). The pane must show busy
+  // for that whole window — NOT the manual "Summarise" empty state — so the user
+  // does not press a redundant, racing Summarise.
+  // -------------------------------------------------------------------------
+
+  it("shows busy (not the empty state) when a post-stop auto-summary is queued", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    act(() => {
+      // Queued, but NO operation_progress yet (the determinate op has not begun;
+      // the chain may still be finishing the transcript).
+      useSummaryStore.setState({ autoPending: { [MEETING]: true } });
+    });
+
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+
+    // No empty-state prompt and no manual "Summarise" affordance: the primary
+    // action reads as busy and is disabled.
+    expect(screen.queryByText(/No summary yet/i)).not.toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "Summarising…" });
+    expect(button).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent(/Generating summary/i);
+  });
+
+  it("names the transcript-finishing phase while a reprocess precedes the queued summary", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    act(() => {
+      // Auto-summary queued AND a re-transcribe op is in flight for this meeting:
+      // the summary is waiting on the transcript, so say so.
+      useSummaryStore.setState({ autoPending: { [MEETING]: true } });
+      useOperationProgressStore.setState({
+        operations: {
+          [MEETING]: {
+            op: "re_transcribe",
+            fraction: 0.3,
+            label: "Re-transcribing…",
+          },
+        },
+      });
+    });
+
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+
+    expect(screen.getByRole("status")).toHaveTextContent(
+      /Finishing the transcript, then summarising/i,
+    );
+  });
+
+  it("falls back to the manual action once the queued auto-summary clears", async () => {
+    vi.mocked(getSummary).mockResolvedValue(null);
+    act(() => {
+      useSummaryStore.setState({ meetingId: MEETING, autoPending: { [MEETING]: true } });
+    });
+    render(<SummaryView meetingId={MEETING} />);
+    await waitFor(() => expect(getSummary).toHaveBeenCalledWith(MEETING));
+    expect(screen.getByRole("button", { name: "Summarising…" })).toBeDisabled();
+
+    // A `summary_unavailable` (deferred/failed) terminal clears the busy marker.
+    act(() => {
+      useSummaryStore
+        .getState()
+        .handleEvent({ kind: "summary_unavailable", meeting_id: MEETING });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Summarise" })).toBeEnabled(),
+    );
+    expect(screen.getByText(/No summary yet/i)).toBeInTheDocument();
   });
 });

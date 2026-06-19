@@ -29,6 +29,7 @@ function resetStore() {
   useSummaryStore.setState({
     summaryMarkdown: null,
     summarising: false,
+    autoPending: {},
     meetingId: null,
     lastError: null,
   });
@@ -85,6 +86,37 @@ describe("useSummaryStore", () => {
       .handleEvent({ kind: "summary_ready", meeting_id: "other-meeting" });
     expect(getSummary).not.toHaveBeenCalled();
     expect(useSummaryStore.getState().summarising).toBe(true);
+  });
+
+  it("summary_queued marks the meeting auto-pending (busy)", () => {
+    useSummaryStore
+      .getState()
+      .handleEvent({ kind: "summary_queued", meeting_id: MEETING });
+    expect(useSummaryStore.getState().autoPending[MEETING]).toBe(true);
+  });
+
+  it("summary_unavailable clears the auto-pending marker (deferred/failed)", () => {
+    useSummaryStore.setState({ autoPending: { [MEETING]: true } });
+    useSummaryStore
+      .getState()
+      .handleEvent({ kind: "summary_unavailable", meeting_id: MEETING });
+    expect(useSummaryStore.getState().autoPending[MEETING]).toBeUndefined();
+  });
+
+  it("summary_ready clears the auto-pending marker even for a non-loaded meeting", () => {
+    // A backgrounded auto-summary for a meeting OTHER than the open one must
+    // still clear its busy marker (it would otherwise spin forever on its pane).
+    useSummaryStore.setState({
+      meetingId: MEETING,
+      autoPending: { "other-meeting": true },
+    });
+    useSummaryStore
+      .getState()
+      .handleEvent({ kind: "summary_ready", meeting_id: "other-meeting" });
+    // The other meeting's marker is gone…
+    expect(useSummaryStore.getState().autoPending["other-meeting"]).toBeUndefined();
+    // …and the unrelated event did not re-read the open meeting's summary.
+    expect(getSummary).not.toHaveBeenCalled();
   });
 
   it("save persists via save_summary and reflects the edit", async () => {

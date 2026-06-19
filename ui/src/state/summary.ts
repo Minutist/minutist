@@ -29,6 +29,18 @@ export type SummaryStore = {
    * error). Drives the in-progress affordance in the summary view.
    */
   summarising: boolean;
+  /**
+   * Meetings with a post-stop AUTOMATIC summary queued or running (keyed by id).
+   * Set by the `summary_queued` event the backend emits at stop — BEFORE any
+   * transcript-repair pass the summary waits for — and cleared by the terminal
+   * `summary_ready` (a summary was written) or `summary_unavailable` (deferred /
+   * failed). It makes the summary pane show a busy state for the whole queued →
+   * summarising window, not just once the determinate `summarise` op streams
+   * (which can be minutes later, after re-transcribe / re-diarize). Per-meeting,
+   * since a backgrounded auto-summary may be running for a meeting other than the
+   * one currently open. This is transient UI state, never a source of truth.
+   */
+  autoPending: Record<MeetingId, boolean>;
   /** The meeting whose summary is currently loaded, or `null`. */
   meetingId: MeetingId | null;
   /** Last error surfaced by a summary IPC call. */
@@ -68,9 +80,21 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Drop a meeting's entry from the auto-pending map (immutably, no-op if absent). */
+function withoutPending(
+  pending: Record<MeetingId, boolean>,
+  meetingId: MeetingId,
+): Record<MeetingId, boolean> {
+  if (!(meetingId in pending)) return pending;
+  const next = { ...pending };
+  delete next[meetingId];
+  return next;
+}
+
 export const useSummaryStore = create<SummaryStore>((set, get) => ({
   summaryMarkdown: null,
   summarising: false,
+  autoPending: {},
   meetingId: null,
   lastError: null,
   editing: false,
@@ -137,21 +161,50 @@ export const useSummaryStore = create<SummaryStore>((set, get) => ({
   },
 
   handleEvent: (event) => {
-    if (event.kind !== "summary_ready") return;
-    // A summary was produced for this meeting. Re-read `summary.md` so the
-    // view shows the fresh content, and leave the in-progress state. Only act
-    // when the event is for the meeting currently loaded (or none is loaded
-    // yet) so an unrelated meeting's summary does not clobber the view.
-    const current = get().meetingId;
-    if (current !== null && current !== event.meeting_id) return;
-    set({ meetingId: event.meeting_id });
-    void (async () => {
-      try {
-        const markdown = await getSummary(event.meeting_id);
-        set({ summaryMarkdown: markdown, summarising: false, lastError: null });
-      } catch (err) {
-        set({ summarising: false, lastError: errorMessage(err) });
+    switch (event.kind) {
+      case "summary_queued": {
+        // A post-stop auto-summary was scheduled — mark this meeting busy so the
+        // pane shows progress, not the manual Summarise button, for the whole
+        // (possibly minutes-long) queued → summarising window.
+        const meetingId = event.meeting_id;
+        set((s) => ({ autoPending: { ...s.autoPending, [meetingId]: true } }));
+        return;
       }
-    })();
+      case "summary_unavailable": {
+        // The auto-summary was deferred (a new recording started) or failed:
+        // clear the busy marker so the pane falls back to the manual action.
+        // Per-meeting + ungated on the loaded meeting (a backgrounded one must
+        // clear even when another is open).
+        set((s) => ({ autoPending: withoutPending(s.autoPending, event.meeting_id) }));
+        return;
+      }
+      case "summary_ready": {
+        // A summary was written. Clear the busy marker for THIS meeting first,
+        // regardless of which meeting is open, so a backgrounded auto-summary
+        // never leaves a stale spinner on its pane.
+        set((s) => ({ autoPending: withoutPending(s.autoPending, event.meeting_id) }));
+        // Re-read `summary.md` into the view only when the event is for the
+        // loaded meeting (or none is loaded yet), so an unrelated meeting's
+        // summary does not clobber the view, and leave the in-progress state.
+        const current = get().meetingId;
+        if (current !== null && current !== event.meeting_id) return;
+        set({ meetingId: event.meeting_id });
+        void (async () => {
+          try {
+            const markdown = await getSummary(event.meeting_id);
+            set({
+              summaryMarkdown: markdown,
+              summarising: false,
+              lastError: null,
+            });
+          } catch (err) {
+            set({ summarising: false, lastError: errorMessage(err) });
+          }
+        })();
+        return;
+      }
+      default:
+        return;
+    }
   },
 }));

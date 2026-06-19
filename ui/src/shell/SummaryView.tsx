@@ -67,6 +67,23 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
   // same events drive the same bar.)
   const operation = useOperationProgressStore((s) => s.operations[meetingId]);
   const summariseInFlight = operation?.op === "summarise";
+  // During the queued window a post-stop auto-summary may still be finishing the
+  // transcript (re-transcribe / re-diarize) BEFORE it summarises — surface THAT
+  // honestly rather than implying the summary itself is already generating.
+  const reprocessInFlight =
+    operation?.op === "re_transcribe" || operation?.op === "rediarize";
+
+  // #NN — a post-stop AUTO-summary is queued/running for this meeting (set by
+  // the `summary_queued` event, cleared by `summary_ready`/`summary_unavailable`).
+  // This is set the instant the meeting finalises, BEFORE the determinate
+  // `summarise` op streams (which can be minutes later, after any reprocess), so
+  // the pane shows busy immediately instead of the manual "Summarise" button.
+  const autoPending = useSummaryStore((s) => s.autoPending[meetingId] ?? false);
+  // Busy = a summary is being produced for this meeting by ANY path: the pane
+  // dispatched one (`summarising`), the determinate op is streaming
+  // (`summariseInFlight`), or a post-stop auto-summary is queued (`autoPending`).
+  // Any of these replaces the manual Summarise affordance with a progress state.
+  const busy = summarising || summariseInFlight || autoPending;
 
   // Summarisation needs the LLM; on first use the orchestrator downloads it
   // (multi-GB) before any text is generated. Surface THAT phase distinctly so a
@@ -165,9 +182,9 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
                 type="button"
                 className="summary-view__action summary-view__action--primary"
                 onClick={() => void summarise(meetingId)}
-                disabled={summarising || summariseInFlight}
+                disabled={busy}
               >
-                {summarising || summariseInFlight
+                {busy
                   ? downloadingModel
                     ? "Downloading model…"
                     : "Summarising…"
@@ -180,7 +197,7 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
                   type="button"
                   className="summary-view__action"
                   onClick={beginEdit}
-                  disabled={summarising || summariseInFlight}
+                  disabled={busy}
                 >
                   Edit
                 </button>
@@ -272,20 +289,24 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
         (`summariseInFlight`), the determinate OperationIndicator above is the
         authoritative phase display ("Loading the summarisation model…",
         "Reading the meeting…", "Writing the summary…"), so this line is
-        suppressed to avoid showing two competing messages. It remains for two
-        cases the indicator does not cover: the model DOWNLOAD (which carries a
-        byte %, from the models store, not the operation bus) and the brief gap
-        after dispatch before the first progress event arrives.
+        suppressed to avoid showing two competing messages. It covers the phases
+        the indicator does not: the model DOWNLOAD (byte %, from the models
+        store, not the operation bus), the brief gap after a dispatch before the
+        first progress event, and the post-stop auto-summary's QUEUED window —
+        including while it is still finishing the transcript (`reprocessInFlight`)
+        before the summary itself begins.
       */}
       {!editing &&
-        (downloadingModel || (summarising && !summariseInFlight)) && (
+        (downloadingModel || ((summarising || autoPending) && !summariseInFlight)) && (
           <p className="summary-view__status" role="status">
             <span className="summary-view__spinner" aria-hidden="true" />
             {downloadingModel
               ? `Downloading the summarisation model (one-time, ~5 GB)${
                   downloadPct !== null ? ` — ${downloadPct}%` : "…"
                 }`
-              : "Generating summary from the transcript and your notes…"}
+              : reprocessInFlight
+                ? "Finishing the transcript, then summarising automatically…"
+                : "Generating summary from the transcript and your notes…"}
           </p>
         )}
 
@@ -304,7 +325,7 @@ export function SummaryView({ meetingId }: SummaryViewProps) {
           dangerouslySetInnerHTML={{ __html: renderedHtml }}
         />
       ) : (
-        !summarising && (
+        !busy && (
           <p className="summary-view__empty">
             No summary yet. Run Summarise to generate one from the transcript
             and your notes.

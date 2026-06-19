@@ -823,6 +823,23 @@ export type AppEvent =
  */
 { kind: "summary_ready"; meeting_id: MeetingId } | 
 /**
+ * A post-stop AUTOMATIC summary has been scheduled for this meeting. Emitted
+ * by `ipc-bridge`'s `stop_recording` only when `auto_summarise_on_stop` is on,
+ * the instant the meeting is finalised — BEFORE any transcript-repair /
+ * diarize pass it must wait for. The webview shows the summary pane as busy
+ * for the whole queued → summarising window instead of the manual
+ * "Summarise" affordance. A terminal `SummaryReady` (a summary was written)
+ * or `SummaryUnavailable` (deferred / failed) clears the busy state.
+ */
+{ kind: "summary_queued"; meeting_id: MeetingId } | 
+/**
+ * A post-stop automatic summary will NOT produce a summary: it was deferred
+ * (a new recording started and claimed the model) or it failed. The webview
+ * clears the queued/busy state and falls back to the manual `Summarise`
+ * action. Distinct from `SummaryReady`, which means `summary.md` now exists.
+ */
+{ kind: "summary_unavailable"; meeting_id: MeetingId } | 
+/**
  * A stopped meeting finished finalising on disk (`transcript.json` +
  * `metadata.json` written, `audio.opus` closed). The webview refreshes the
  * meeting list so the just-recorded meeting appears. Distinct from

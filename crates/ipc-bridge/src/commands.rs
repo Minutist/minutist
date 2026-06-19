@@ -292,6 +292,17 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
         let index = std::sync::Arc::clone(&state.index);
         let handles = state.chat_handles();
         let meeting_id = meta.uuid;
+        // If an auto-summary is planned, tell the webview NOW — before the
+        // background task even starts — so the just-opened summary pane shows a
+        // busy state for the whole queued → (reprocess) → summarising window
+        // instead of the manual "Summarise" button (which invites a redundant,
+        // racing second run). The terminal `SummaryReady` (success) or
+        // `SummaryUnavailable` (deferred/failed, emitted in the Summarise arm
+        // below) clears it; without the latter a deferred/failed auto-summary
+        // would leave the pane spinning forever.
+        if passes.contains(&PostStopPass::Summarise) {
+            emit_summary_queued(&handles.event_tx, meeting_id);
+        }
         tokio::spawn(async move {
             run_post_stop_passes(&passes, meeting_id, |pass| {
                 let orchestrator = std::sync::Arc::clone(&orchestrator);
@@ -316,15 +327,32 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
                         // recording's GPU/LLM use.
                         PostStopPass::Summarise => {
                             if orchestrator.recorder_is_live().await {
+                                // A new recording claimed the model; defer this
+                                // meeting's auto-summary (the manual Summarise
+                                // action is the recovery). Clear the queued busy
+                                // state so the pane offers that action.
+                                emit_summary_unavailable(&handles.event_tx, meeting_id);
                                 Err(AppError::InvalidInput {
                                     context: "auto-summarise deferred: a new recording started"
                                         .into(),
                                 })
                             } else {
-                                run_held_summarise(&handles, meeting_id)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(AppError::from)
+                                match run_held_summarise(&handles, meeting_id).await {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => {
+                                        // Best-effort: a failed auto-summary wrote
+                                        // no `summary.md`. Clear the queued busy
+                                        // state (run_held_summarise emits no
+                                        // terminal on the error path) so the pane
+                                        // falls back to the manual action instead
+                                        // of spinning forever.
+                                        emit_summary_unavailable(
+                                            &handles.event_tx,
+                                            meeting_id,
+                                        );
+                                        Err(AppError::from(e))
+                                    }
+                                }
                             }
                         }
                     }
@@ -1494,6 +1522,22 @@ fn emit_summary_ready(event_tx: &broadcast::Sender<AppEvent>, meeting_id: Meetin
             "SummaryReady dropped (no subscribers)"
         ),
     }
+}
+
+/// Emit `AppEvent::SummaryQueued { meeting_id }` — a post-stop auto-summary is
+/// scheduled (the webview shows the summary pane busy until a terminal
+/// `SummaryReady` / `SummaryUnavailable`). A send with no live subscribers is not
+/// an error (broadcast semantics).
+fn emit_summary_queued(event_tx: &broadcast::Sender<AppEvent>, meeting_id: MeetingId) {
+    let _ = event_tx.send(AppEvent::SummaryQueued { meeting_id });
+}
+
+/// Emit `AppEvent::SummaryUnavailable { meeting_id }` — a post-stop auto-summary
+/// was deferred (a new recording started) or failed, so no `summary.md` was
+/// written. The webview clears the busy state and offers the manual `Summarise`
+/// action. A send with no live subscribers is not an error.
+fn emit_summary_unavailable(event_tx: &broadcast::Sender<AppEvent>, meeting_id: MeetingId) {
+    let _ = event_tx.send(AppEvent::SummaryUnavailable { meeting_id });
 }
 
 // ---------------------------------------------------------------------------
@@ -2944,6 +2988,28 @@ mod tests {
         match event {
             AppEvent::SummaryReady { meeting_id: got } => assert_eq!(got, meeting_id),
             other => panic!("expected SummaryReady, got {other:?}"),
+        }
+    }
+
+    /// #NN — the post-stop auto-summary lifecycle markers carry the right
+    /// `meeting_id`. `SummaryQueued` is broadcast when a stop plans an
+    /// auto-summary (so the pane shows busy immediately); `SummaryUnavailable`
+    /// is the terminal the deferred/failed path emits so the busy state clears.
+    #[tokio::test]
+    async fn summary_queued_and_unavailable_carry_the_meeting_id() {
+        let meeting_id = MeetingId::new();
+        let (event_tx, mut event_rx) = broadcast::channel::<AppEvent>(8);
+
+        emit_summary_queued(&event_tx, meeting_id);
+        match event_rx.recv().await.expect("queued event") {
+            AppEvent::SummaryQueued { meeting_id: got } => assert_eq!(got, meeting_id),
+            other => panic!("expected SummaryQueued, got {other:?}"),
+        }
+
+        emit_summary_unavailable(&event_tx, meeting_id);
+        match event_rx.recv().await.expect("unavailable event") {
+            AppEvent::SummaryUnavailable { meeting_id: got } => assert_eq!(got, meeting_id),
+            other => panic!("expected SummaryUnavailable, got {other:?}"),
         }
     }
 

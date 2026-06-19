@@ -648,12 +648,33 @@ meeting-list as soon as the recorder leaves the live states
 offline claim releasing (`Idle`). The background passes surface only as the
 non-blocking per-row "Operation progress" indicator above, which the meeting-list
 store refreshes on the terminal `MeetingFinalised` / `TranscriptReady` /
-`DiarizationComplete` / `SummaryReady` events. The auto-summarise progress is ALSO
-surfaced inside the summary pane: when the user opens `SummaryView` while a
-`summarise` op is in flight for that meeting (read from the operation-progress
-store, keyed on `meeting_id` + `op == Summarise`), the determinate
-`OperationIndicator` bar shows — even when the pane itself did not dispatch the
-summarise — and `SummaryReady` then reveals the summary.
+`DiarizationComplete` / `SummaryReady` events.
+
+**Auto-summary busy lifecycle (summary pane).** The just-stopped meeting opens
+on its finished screen immediately (`MeetingFinalised`), so the user is looking
+at the summary pane *before* the determinate `OperationProgress { op: Summarise }`
+stream begins — which can be minutes later, since auto-summarise runs LAST, after
+any re-transcribe / re-diarize. To stop the pane offering a manual "Summarise"
+button (a redundant, racing second run) during that gap, the auto-summary has its
+own lifecycle event pair, distinct from the single-slot operation-progress bus
+(whose slot the reprocess pass owns while it runs):
+
+- `stop_recording` emits **`AppEvent::SummaryQueued { meeting_id }`** the instant
+  it plans an auto-summary (only when `auto_summarise_on_stop` is on), *before*
+  spawning the background passes. The webview marks the meeting busy
+  (`summary` store `autoPending`) and shows a progress state for the whole queued
+  → summarising window. While a reprocess op is in flight the pane names that
+  phase ("Finishing the transcript, then summarising…"); once the `summarise` op
+  streams, the determinate `OperationIndicator` takes over (read from the
+  operation-progress store, keyed on `meeting_id` + `op == Summarise`, so the bar
+  shows even though the pane never dispatched the summarise).
+- The terminal is **`SummaryReady`** (a summary was written — reveals it) OR
+  **`AppEvent::SummaryUnavailable { meeting_id }`**, emitted by the Summarise pass
+  when it is deferred (a new recording claimed the model) or fails. Without the
+  latter a deferred/failed auto-summary would leave the pane spinning forever;
+  it clears `autoPending` so the pane falls back to the manual Summarise action.
+  `SummaryUnavailable` also clears the per-row operation-progress indicator (a
+  failed `run_held_summarise` may leave a stale `summarise` op).
 
 ## Agent chat loop (Phase 9)
 

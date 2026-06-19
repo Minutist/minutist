@@ -222,8 +222,11 @@ threaded through `LlamaSummariser::summarise_with_progress`; `ipc-bridge`'s
 segments); the re-diarize and finalise-drain paths emit INDETERMINATE (`fraction =
 None`, one opaque sherpa/drain compute with no progress callback). The webview
 clears the per-row indicator on the terminal `TranscriptReady` / `SummaryReady` /
-`DiarizationComplete` / `TranslationReady`. See `architecture/cross-cutting.md` —
-"Operation progress".
+`SummaryUnavailable` / `DiarizationComplete` / `TranslationReady`. The post-stop
+auto-summary additionally has a busy lifecycle (`SummaryQueued` →
+`SummaryReady`/`SummaryUnavailable`) that drives the summary pane independently of
+this single-slot bus — see `architecture/cross-cutting.md`, "Auto-summary busy
+lifecycle". See also `architecture/cross-cutting.md` — "Operation progress".
 
 **Phase 7 — shared LlamaBackend (feature-gated).** Behind the optional
 `llama-backend` feature (`dep:llama-cpp-2`, OFF by default so the default

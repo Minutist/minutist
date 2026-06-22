@@ -34,7 +34,9 @@
 //! progress and completion ride [`AppEvent::SyncProgress`] /
 //! [`AppEvent::SyncReady`] / [`AppEvent::SyncError`] on the shared event bus, so
 //! the Sync pane reflects a transfer live without polling. [`Self::sync_now`]
-//! reconciles a meeting against every registered peer and emits these as it runs.
+//! reconciles a meeting against every registered peer — both its notes (the CRDT
+//! update exchange) and its media (`audio.opus` + assets, as content-addressed
+//! blobs) — and emits these as it runs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,10 +55,11 @@ use tokio::sync::Mutex;
 /// `AccessControl`; it is never logged.
 const RELAY_TOKEN_ENV: &str = "MINUTIST_SYNC_TOKEN";
 
-/// The mutable runtime state, guarded by one async mutex (held only briefly, and
-/// across the network awaits in [`SyncEngine::sync_notes`] — the engine's own
-/// per-call connection means concurrent `sync_now`s serialise here, acceptable
-/// for a manual-trigger surface).
+/// The mutable runtime state, guarded by one async mutex held only briefly. A
+/// `sync_now` clones the engine `Arc` out under the lock and runs the per-peer
+/// notes + media reconciliation without holding it, re-locking only to flip the
+/// `Syncing`/`Idle` status; the engine's own per-call connection bounds
+/// concurrent transfers.
 struct Runtime {
     /// The bound engine, present once startup succeeds. `None` while the
     /// connector is disabled or before the background bind completes.
@@ -212,13 +215,17 @@ impl SyncControl for ConnectedSync {
             // No paired devices: nothing to reconcile against. Surface a
             // completed-with-nothing-to-do rather than an error — the meeting is
             // already as synced as it can be on a lone device.
-            let _ = self
-                .event_tx
-                .send(AppEvent::SyncReady { meeting_id });
+            let _ = self.event_tx.send(AppEvent::SyncReady { meeting_id });
             return Ok(());
         }
 
-        let total = peers.len();
+        // Each peer is reconciled in two phases — notes (the CRDT update
+        // exchange) then media (`audio.opus` + assets, content-addressed blobs) —
+        // so the progress fraction is over `peers * 2` units. The media phase runs
+        // even when the notes phase failed for that peer: the two are independent
+        // reconciliations and a notes failure should not strand the recording.
+        let steps_per_peer = 2;
+        let total = peers.len() * steps_per_peer;
         // Reflect the in-flight transfer in the engine status so a `sync_status`
         // read (e.g. the pane's refresh) observes `Syncing`, alongside the live
         // `SyncProgress` events the UI drives its indicator from. Restored to
@@ -232,19 +239,37 @@ impl SyncControl for ConnectedSync {
         });
 
         let mut last_err: Option<String> = None;
-        for (i, peer) in peers.into_iter().enumerate() {
-            match engine.sync_notes(peer, meeting_id).await {
-                Ok(()) => {}
-                Err(e) => {
-                    let message = format!("syncing notes with a peer: {e}");
-                    tracing::warn!(target: "app-main", "sync: {message}");
-                    last_err = Some(message);
-                }
+        let mut done = 0usize;
+        for peer in peers {
+            // Phase 1: notes. The engine dials the peer on the sync ALPN and runs
+            // the bidirectional CRDT-update exchange for this meeting.
+            if let Err(e) = engine.sync_notes(peer, meeting_id).await {
+                let message = format!("syncing notes with a peer: {e}");
+                tracing::warn!(target: "app-main", "sync: {message}");
+                last_err = Some(message);
             }
+            done += 1;
             let _ = self.event_tx.send(AppEvent::SyncProgress {
                 meeting_id,
-                label: "Syncing notes…".to_string(),
-                fraction: Some((i + 1) as f32 / total as f32),
+                label: "Syncing media…".to_string(),
+                fraction: Some(done as f32 / total as f32),
+            });
+
+            // Phase 2: media. The engine imports this meeting's media into its
+            // content-addressed blob store, exchanges manifests with the peer over
+            // the same sync ALPN, and pulls the blobs it is missing over the blobs
+            // ALPN — exporting each to the per-meeting `audio.opus` / `assets/*`
+            // path and pinning it with a persistent tag for retention.
+            if let Err(e) = engine.sync_media(peer, meeting_id).await {
+                let message = format!("syncing media with a peer: {e}");
+                tracing::warn!(target: "app-main", "sync: {message}");
+                last_err = Some(message);
+            }
+            done += 1;
+            let _ = self.event_tx.send(AppEvent::SyncProgress {
+                meeting_id,
+                label: "Syncing media…".to_string(),
+                fraction: Some(done as f32 / total as f32),
             });
         }
 

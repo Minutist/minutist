@@ -49,24 +49,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Linux WebKit / Tauri system dependencies. Only needed on the Ubuntu
-      # leg; Windows and macOS ship the required webview with the OS.
-      # libopus-dev: audiopus_sys v0.2.2's bundled CMakeLists.txt requires
-      # cmake_minimum_required >= 3.5; modern CMake rejects older declarations.
-      # Installing the system libopus lets pkg-config satisfy the dep directly,
-      # bypassing the vendored CMake build entirely.
-      - name: Install Linux system dependencies
+      # All Linux build deps from the single source (see install-linux-deps.sh):
+      # WebKit/Tauri, the build toolchain, audio (libopus bypasses
+      # audiopus_sys's vendored CMake), and the rest. Only the Linux leg uses
+      # it; Windows and macOS ship the webview with the OS and handle their
+      # deps in the per-OS steps below.
+      - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libasound2-dev \
-            libopus-dev
+        run: ./ci/scripts/install-linux-deps.sh
 
       # audiopus_sys v0.2.2 bundles an opus CMake tree whose
       # cmake_minimum_required is < 3.5, which CMake 3.27+ rejects. Installing
@@ -315,31 +305,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies
+      # Single source for all Linux build/bundle deps, including the Vulkan SDK
+      # (libvulkan-dev/glslang-tools/glslc) used by the `vulkan` cargo check.
+      # See ci/scripts/install-linux-deps.sh.
+      - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libasound2-dev \
-            libopus-dev
-
-      # Vulkan loader/headers + glslc for the `vulkan` cargo check on Linux.
-      # glslang-tools alone does not provide glslc; llama.cpp's CMake uses
-      # FindVulkan which requires glslc specifically. On Ubuntu 24.04 the
-      # binary package is "glslc" (from source package shaderc), which lives
-      # in the universe repo — enabled explicitly so the install works
-      # regardless of whether the runner image pre-enables universe.
-      - name: Install Vulkan SDK (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo add-apt-repository universe -y
-          sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools glslc
+        run: ./ci/scripts/install-linux-deps.sh
 
       # audiopus_sys v0.2.2's bundled opus CMake tree requires
       # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.

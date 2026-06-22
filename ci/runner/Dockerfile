@@ -1,9 +1,12 @@
 # Self-hosted GitHub Actions runner for the Linux CI legs.
 #
 # Base matches GitHub's ubuntu-latest (24.04/noble) so workflow steps behave
-# identically. The workflow's apt packages are prebaked so per-job installs
-# are fast no-op upgrades; the workflows still run their install steps, which
-# keeps GitHub-hosted runners working unchanged.
+# identically. The build/bundle deps are prebaked by running the SAME
+# ci/scripts/install-linux-deps.sh the workflows run, so per-job installs are
+# fast no-op upgrades and the image cannot drift from CI. Add deps in that
+# script, never here. The build context is the repo root (see
+# docker-compose.yml) so the script and entrypoint copy in at repo-relative
+# paths.
 #
 # The runner distribution is staged at /opt/actions-runner-dist; the
 # entrypoint copies it into the (volume-backed) state directory on first run
@@ -22,24 +25,18 @@ ARG GID=1001
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Baseline tooling + everything the repo's Linux CI legs apt-get install.
+# Runner-infra baseline (not build deps): the actions runner's own
+# prerequisites plus add-apt-repository (software-properties-common) and the
+# NodeSource/Docker download tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl jq git sudo unzip zstd \
         software-properties-common gnupg \
-    && add-apt-repository universe -y \
-    && apt-get update && apt-get install -y --no-install-recommends \
-        build-essential pkg-config cmake ninja-build \
-        libwebkit2gtk-4.1-dev \
-        libssl-dev \
-        libayatana-appindicator3-dev \
-        librsvg2-dev \
-        libasound2-dev \
-        libopus-dev \
-        libfuse2 \
-        libvulkan-dev glslang-tools glslc \
-        file desktop-file-utils \
-        clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Build/bundle deps: prebake by running the SAME script the CI workflows run,
+# so the image and CI cannot drift. Add deps in the script, not here.
+COPY ci/scripts/install-linux-deps.sh /tmp/install-linux-deps.sh
+RUN /tmp/install-linux-deps.sh && rm -rf /var/lib/apt/lists/*
 
 # Node.js 20 LTS via NodeSource. Ubuntu 24.04 noble ships Node 18 in its
 # default packages, which is below the ≥20 requirement in the workflow.
@@ -73,7 +70,7 @@ RUN mkdir -p /opt/actions-runner-dist \
     && /opt/actions-runner-dist/bin/installdependencies.sh \
     && chown -R ${UID}:${GID} /opt/actions-runner-dist
 
-COPY entrypoint.sh /entrypoint.sh
+COPY ci/runner/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 USER runner

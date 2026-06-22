@@ -1,0 +1,46 @@
+# The CI runner image (ci/runner/Dockerfile) builds with the repo root as its
+# context so it can COPY ci/scripts/install-linux-deps.sh and
+# ci/runner/entrypoint.sh. The image only needs those two paths; everything
+# heavy or irrelevant is excluded here to keep the build context small.
+#
+# Anything NOT listed is sent to the daemon, so when adding large dirs to the
+# repo, exclude them here too (or the runner-image build slows down).
+
+# Build outputs.
+target/
+target-ci-local/
+src-tauri/target/
+**/node_modules/
+ui/dist/
+dist-windows/
+
+# VCS / agent / planning trees (not needed to build the image).
+.git/
+.claude/
+.playwright-mcp/
+planning/
+context/
+
+# Source crates and app trees — the image is built before any of these and
+# does not depend on them.
+crates/
+spikes/
+src-tauri/
+
+# Docs, branding, screenshots, and assets.
+architecture/
+brand/
+resources/
+*.png
+
+# Model weights / archives / bundles that may land in the tree.
+*.AppImage
+**/*.gguf
+**/*.onnx
+**/*.bin
+**/*.tar.gz
+**/*.zip
+
+# Runner registration secrets — never copy these into the build context.
+ci/runner/.env
+ci/runner/.env2

@@ -907,6 +907,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 settings_handle.clone(),
                 ipc_event_tx.clone(),
                 app_data_dir.clone(),
+                notes_meetings_dir.clone(),
             );
             #[cfg(not(feature = "connected"))]
             let sync_control: Arc<dyn ipc_bridge::SyncControl> = ipc_bridge::disabled_sync();

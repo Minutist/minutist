@@ -15,9 +15,13 @@
 //! the relay tunnel); a disabled connector leaves the engine unbuilt and the
 //! status [`SyncStatus::Disabled`]. Startup:
 //!
-//! 1. loads (or generates) the device [`DeviceIdentity`] under `{app-data}`,
-//! 2. builds a [`SyncConfig`] pinning [`sync::SyncConfig::DEFAULT_RELAY_URL`],
-//!    with the relay auth token from `MINUTIST_SYNC_TOKEN` / settings when set,
+//! 1. loads (or generates) the device [`DeviceIdentity`] under the app-data BASE
+//!    (the device key lives at `{app-data}/sync_node_key`, not under
+//!    `meetings/`),
+//! 2. builds a [`SyncConfig`] over the MEETINGS root (`{app-data}/meetings`, the
+//!    same directory the rest of the app uses for per-meeting `{uuid}` folders),
+//!    pinning [`sync::SyncConfig::DEFAULT_RELAY_URL`], with the relay auth token
+//!    from `MINUTIST_SYNC_TOKEN` / settings when set,
 //! 3. calls [`SyncEngine::start`], which binds the endpoint and spawns the
 //!    router's inbound accept loop (the responder side of the notes protocol).
 //!
@@ -72,11 +76,15 @@ impl ConnectedSync {
     /// the spawned bind completes (the status moves `Connecting → Idle`).
     ///
     /// `relay_token` is the resolved access token (env-or-settings) the caller
-    /// passes in; `app_data_dir` holds the device key and the meetings root.
+    /// passes in. The two directories are DISTINCT: `app_data_base` holds the
+    /// device key (`{app-data}/sync_node_key`); `meetings_dir`
+    /// (`{app-data}/meetings`) holds the per-meeting `{uuid}` folders the notes
+    /// protocol reads/writes — the same root the rest of the app uses.
     pub fn new(
         settings: SettingsHandle,
         event_tx: broadcast::Sender<AppEvent>,
-        app_data_dir: PathBuf,
+        app_data_base: PathBuf,
+        meetings_dir: PathBuf,
     ) -> Arc<Self> {
         let enabled = settings.current().connector_enabled;
         let initial_status = if enabled {
@@ -96,7 +104,9 @@ impl ConnectedSync {
             let relay_token = resolve_relay_token(&settings);
             let starter = Arc::clone(&this);
             tauri::async_runtime::spawn(async move {
-                starter.start_engine(app_data_dir, relay_token).await;
+                starter
+                    .start_engine(app_data_base, meetings_dir, relay_token)
+                    .await;
             });
         }
 
@@ -106,8 +116,18 @@ impl ConnectedSync {
     /// Bind the engine in the background, recording the result on the runtime.
     /// A failure sets [`SyncStatus::Error`] and emits [`AppEvent::SyncError`];
     /// it never panics the spawned task.
-    async fn start_engine(&self, app_data_dir: PathBuf, relay_token: Option<String>) {
-        let identity = match DeviceIdentity::load_or_generate(&app_data_dir) {
+    ///
+    /// The device identity loads from `app_data_base` (the key lives at the
+    /// app-data base, never under `meetings/`); the engine config is built over
+    /// `meetings_dir` so the notes protocol resolves
+    /// `{meetings_dir}/{uuid}/notes.ydoc`.
+    async fn start_engine(
+        &self,
+        app_data_base: PathBuf,
+        meetings_dir: PathBuf,
+        relay_token: Option<String>,
+    ) {
+        let identity = match DeviceIdentity::load_or_generate(&app_data_base) {
             Ok(id) => id,
             Err(e) => {
                 self.fail(format!("loading the sync device identity: {e}"))
@@ -116,7 +136,7 @@ impl ConnectedSync {
             }
         };
 
-        let mut config = SyncConfig::new(app_data_dir);
+        let mut config = SyncConfig::new(meetings_dir);
         if let Some(token) = relay_token {
             config = config.with_relay_auth_token(token);
         }

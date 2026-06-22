@@ -75,6 +75,20 @@ pub const SYNC_ALPN: &[u8] = b"minutist/sync/notes/1";
 /// far smaller than this; the cap bounds a hostile/buggy peer's allocation.
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 
+/// Validate a frame's big-endian `u32` length prefix against [`MAX_FRAME`],
+/// returning the length as a `usize` to allocate. A length over the cap is an
+/// [`Error::Protocol`] — the guard that bounds a hostile/buggy peer's allocation,
+/// checked BEFORE any buffer is allocated.
+fn checked_frame_len(len_buf: [u8; 4]) -> Result<usize> {
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME {
+        return Err(Error::Protocol(format!(
+            "frame length {len} exceeds cap {MAX_FRAME}"
+        )));
+    }
+    Ok(len)
+}
+
 /// Read one length-prefixed frame from `recv`: a `u32` big-endian length then
 /// that many bytes. Rejects a length over [`MAX_FRAME`] before allocating.
 async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
@@ -82,12 +96,7 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     recv.read_exact(&mut len_buf)
         .await
         .map_err(|e| Error::Protocol(format!("reading frame length: {e}")))?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        return Err(Error::Protocol(format!(
-            "frame length {len} exceeds cap {MAX_FRAME}"
-        )));
-    }
+    let len = checked_frame_len(len_buf)?;
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf)
         .await
@@ -344,5 +353,35 @@ mod tests {
             before,
             "diff against own sv must be a no-op"
         );
+    }
+
+    #[test]
+    fn oversized_frame_length_is_rejected_before_allocating() {
+        // A `u32` length prefix beyond MAX_FRAME must be rejected as a protocol
+        // error, not used to allocate a multi-gigabyte buffer. `u32::MAX` is the
+        // worst case a hostile peer can put on the wire.
+        assert!(matches!(
+            checked_frame_len(u32::MAX.to_be_bytes()),
+            Err(Error::Protocol(_))
+        ));
+        // The exact cap is fine; one over it is not.
+        assert!(checked_frame_len((MAX_FRAME as u32).to_be_bytes()).is_ok());
+        assert!(matches!(
+            checked_frame_len((MAX_FRAME as u32 + 1).to_be_bytes()),
+            Err(Error::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn garbage_update_bytes_are_a_protocol_error_not_a_panic() {
+        // Garbage in a frame body (a peer sending non-lib0 bytes) must surface as
+        // an Error::Protocol from the decode helpers, never a panic.
+        let garbage = [0xFFu8, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x42];
+        assert!(matches!(state_vector_of(&garbage), Err(Error::Protocol(_))));
+        assert!(matches!(is_noop_update(&garbage), Err(Error::Protocol(_))));
+        assert!(matches!(
+            diff_against(&garbage, &garbage),
+            Err(Error::Protocol(_))
+        ));
     }
 }

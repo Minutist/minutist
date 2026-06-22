@@ -67,7 +67,11 @@ impl From<Error> for minutist_common::AppError {
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Static configuration for the [`SyncEngine`].
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-implemented to redact [`Self::relay_auth_token`]: the token
+/// gates admission to the relay's `AccessControl`, so it must never reach a log
+/// line through a derived `Debug`.
+#[derive(Clone)]
 pub struct SyncConfig {
     /// The relay the endpoint pins via `RelayMode::Custom` (e.g.
     /// `https://sync.minutist.ai`).
@@ -79,24 +83,39 @@ pub struct SyncConfig {
     /// for relays that do not gate on a token (e.g. a local/direct test).
     pub relay_auth_token: Option<String>,
 
-    /// The application data directory. The device key is persisted under it
-    /// (see [`identity`]); blob media is read from the per-meeting folders below
-    /// it via `persistence`.
-    pub app_data_dir: PathBuf,
+    /// The directory holding the per-meeting `{uuid}` folders — the meetings
+    /// root the app uses (`{app-data}/meetings`), NOT the app-data base. The
+    /// notes protocol resolves `{meetings_root}/{uuid}/notes.ydoc` through
+    /// `persistence`. The device key is persisted at the app-data BASE
+    /// (see [`identity`]), which the caller loads separately.
+    pub meetings_root: PathBuf,
+}
+
+impl std::fmt::Debug for SyncConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the relay token; print only whether one is set.
+        let redacted = self.relay_auth_token.as_ref().map(|_| "<redacted>");
+        f.debug_struct("SyncConfig")
+            .field("relay_url", &self.relay_url)
+            .field("relay_auth_token", &redacted)
+            .field("meetings_root", &self.meetings_root)
+            .finish()
+    }
 }
 
 impl SyncConfig {
     /// The default relay endpoint for the connected tier.
     pub const DEFAULT_RELAY_URL: &'static str = "https://sync.minutist.ai";
 
-    /// Build a config for `app_data_dir`, pinning [`Self::DEFAULT_RELAY_URL`] with
-    /// no relay auth token. The token is set later via
-    /// [`Self::with_relay_auth_token`] once the account service issues one.
-    pub fn new(app_data_dir: PathBuf) -> Self {
+    /// Build a config for `meetings_root` (the directory holding the per-meeting
+    /// `{uuid}` folders), pinning [`Self::DEFAULT_RELAY_URL`] with no relay auth
+    /// token. The token is set later via [`Self::with_relay_auth_token`] once the
+    /// account service issues one.
+    pub fn new(meetings_root: PathBuf) -> Self {
         Self {
             relay_url: Self::DEFAULT_RELAY_URL.to_string(),
             relay_auth_token: None,
-            app_data_dir,
+            meetings_root,
         }
     }
 

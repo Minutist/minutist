@@ -20,7 +20,7 @@ use minutist_common::MeetingId;
 use persistence::{MeetingFolder, NotesData, NotesStore};
 use serde_json::{json, Value};
 use sync::identity::DeviceIdentity;
-use sync::SyncEngine;
+use sync::{SyncConfig, SyncEngine};
 
 /// Loopback `EndpointAddr` for `engine` (its id + each bound port against
 /// `127.0.0.1`), mirroring the endpoint round-trip test's helper.
@@ -247,4 +247,128 @@ fn all_paragraph_text(doc: &Value) -> String {
     let mut out = String::new();
     walk(doc, &mut out);
     out
+}
+
+#[tokio::test]
+async fn sync_resolves_notes_under_the_meetings_root_not_the_app_data_base() {
+    // The device key base and the meetings root are DISTINCT in production
+    // (`{app-data}/sync_node_key` vs `{app-data}/meetings/{uuid}/notes.ydoc`).
+    // Every other test conflates the two onto one dir, which is exactly what hid
+    // the bug where sync read/wrote `{app-data}/{uuid}` — a parallel, invisible
+    // tree. Here the base and the meetings root are deliberately different
+    // directories, and the assertions prove the synced note lands under the
+    // meetings root, with nothing written directly under the base.
+    let base_a = tempfile::TempDir::new().expect("base a");
+    let base_b = tempfile::TempDir::new().expect("base b");
+    let meetings_a = base_a.path().join("meetings");
+    let meetings_b = base_b.path().join("meetings");
+    std::fs::create_dir_all(&meetings_a).expect("mk meetings a");
+    std::fs::create_dir_all(&meetings_b).expect("mk meetings b");
+
+    // Identity loads from the BASE (the key file sits there, not under meetings/).
+    let id_a = DeviceIdentity::load_or_generate(base_a.path()).expect("identity a");
+    let id_b = DeviceIdentity::load_or_generate(base_b.path()).expect("identity b");
+    assert!(
+        base_a.path().join("sync_node_key").is_file(),
+        "the device key must live at the app-data base"
+    );
+
+    // Engines bind their MEETINGS root (mirrors SyncConfig::new(meetings_root)).
+    let a = SyncEngine::start_direct(id_a, meetings_a.clone())
+        .await
+        .expect("engine a");
+    let b = SyncEngine::start_direct(id_b, meetings_b.clone())
+        .await
+        .expect("engine b");
+    a.add_peer(direct_addr(&b));
+    b.add_peer(direct_addr(&a));
+
+    // Seed a note on A under its MEETINGS root; B has only an empty folder there.
+    let meeting = MeetingId::new();
+    let doc = seed_doc("note under the meetings root");
+    seed_notes(&meetings_a, meeting, &doc, "# A");
+    MeetingFolder::create(&meetings_b, meeting).expect("folder b under meetings root");
+
+    a.sync_notes(direct_addr(&b), meeting)
+        .await
+        .expect("reconcile a -> b");
+
+    // B converged under its MEETINGS root.
+    assert_eq!(
+        projected_json(&meetings_b, meeting),
+        doc,
+        "the synced note must resolve under B's meetings root"
+    );
+    // And nothing was written to the parallel `{base}/{uuid}` path the bug used.
+    assert!(
+        !base_b.path().join(meeting.0.to_string()).exists(),
+        "sync must not write a meeting folder directly under the app-data base"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+#[tokio::test]
+async fn an_unpaired_peer_is_rejected_and_leaves_the_meeting_untouched() {
+    // B does NOT pair A (only A pairs B). A dials B; B's accept side must reject
+    // the inbound connection before reading any frame, so B's meeting is never
+    // touched. This proves sync requires MUTUAL pairing (H1).
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+
+    let meeting = MeetingId::new();
+    let doc = seed_doc("notes from device A");
+    seed_notes(root_a, meeting, &doc, "# A");
+    MeetingFolder::create(root_b, meeting).expect("create folder b");
+
+    let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
+    let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
+    let a = SyncEngine::start_direct(id_a, root_a.to_path_buf())
+        .await
+        .expect("engine a");
+    let b = SyncEngine::start_direct(id_b, root_b.to_path_buf())
+        .await
+        .expect("engine b");
+
+    // ONE-directional pairing: A can dial B, but B has not added A.
+    a.add_peer(direct_addr(&b));
+
+    // The dial must fail: B rejects the unpaired peer, so the reconciliation errors.
+    let result = a.sync_notes(direct_addr(&b), meeting).await;
+    assert!(
+        result.is_err(),
+        "syncing to a peer that has not paired this device must fail"
+    );
+
+    // B's meeting is untouched — still no notes.ydoc.
+    assert!(
+        NotesStore::read_ydoc_state(root_b, meeting)
+            .expect("read b state")
+            .is_none(),
+        "an unpaired peer must not be able to write into B's meeting"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+/// Bind config built from a `SyncConfig` directly (smoke for the renamed field).
+#[tokio::test]
+async fn config_new_targets_the_meetings_root() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let meetings_root = dir.path().join("meetings");
+    let cfg = SyncConfig::new(meetings_root.clone());
+    assert_eq!(cfg.meetings_root, meetings_root);
+    // The redacting Debug must not print a token when none is set.
+    assert!(format!("{cfg:?}").contains("relay_auth_token: None"));
+    let cfg = cfg.with_relay_auth_token("super-secret");
+    let dbg = format!("{cfg:?}");
+    assert!(
+        !dbg.contains("super-secret"),
+        "Debug must redact the relay token"
+    );
+    assert!(dbg.contains("<redacted>"));
 }

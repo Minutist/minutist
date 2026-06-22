@@ -60,7 +60,10 @@ async fn notes_converge_through_the_deployed_relay() {
     let cfg = |dir: &std::path::Path| SyncConfig {
         relay_url: relay_url.clone(),
         relay_auth_token: Some(token.clone()),
-        app_data_dir: dir.to_path_buf(),
+        // Live test conflates the device-key base and the meetings root onto one
+        // temp dir: the key and the per-meeting folders both sit directly under
+        // it. Production keeps them distinct (base vs `base/meetings`).
+        meetings_root: dir.to_path_buf(),
     };
 
     let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a)
@@ -74,6 +77,16 @@ async fn notes_converge_through_the_deployed_relay() {
         engine_a.endpoint_id(),
         engine_b.endpoint_id()
     );
+
+    // Mutual pairing: each device adds the other's ticket. Sync requires it —
+    // B's accept side rejects an inbound connection from a peer it has not paired,
+    // so A must be in B's directory for the dial below to be served.
+    engine_a
+        .add_peer_from_ticket(&engine_b.my_ticket())
+        .expect("A pairs B");
+    engine_b
+        .add_peer_from_ticket(&engine_a.my_ticket())
+        .expect("B pairs A");
 
     // Let both endpoints home to the relay (the token-gated relay handshake).
     tokio::time::sleep(Duration::from_secs(3)).await;

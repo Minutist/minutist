@@ -14,7 +14,10 @@
 //!
 //! The inbound accept side is owned by the [`Router`], which runs its own accept
 //! loop and dispatches each `SYNC_ALPN` connection to [`AcceptHook`]. The hook
-//! runs the responder side of the notes-sync protocol
+//! first authorises the remote against the paired-peer [`PeerDirectory`] (sync
+//! requires MUTUAL pairing — each device adds the other's ticket), rejecting an
+//! unpaired peer before any frame is read; only then does it run the responder
+//! side of the notes-sync protocol
 //! ([`crate::notes_proto::respond_notes_sync`]) against the device's meetings
 //! root. [`SyncEngine::connect`] dials a peer; [`SyncEngine::sync_notes`] dials
 //! and runs the initiator side for one meeting.
@@ -41,7 +44,6 @@ pub struct SyncEngine {
     endpoint: Endpoint,
     router: Router,
     peers: PeerDirectory,
-    config: SyncConfig,
     /// Meetings root the notes protocol reads/writes through `persistence`
     /// (`{root}/{meeting_id}/notes.ydoc`). The inbound [`AcceptHook`] shares it.
     meetings_root: PathBuf,
@@ -58,7 +60,7 @@ impl SyncEngine {
     pub async fn start(config: SyncConfig, identity: DeviceIdentity) -> Result<Self> {
         let relay_mode = Self::relay_mode(&config)?;
         let peers = PeerDirectory::new();
-        let meetings_root = config.app_data_dir.clone();
+        let meetings_root = config.meetings_root.clone();
 
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key())
@@ -77,14 +79,16 @@ impl SyncEngine {
         );
 
         let router = Router::builder(endpoint.clone())
-            .accept(SYNC_ALPN, AcceptHook::new(meetings_root.clone()))
+            .accept(
+                SYNC_ALPN,
+                AcceptHook::new(meetings_root.clone(), peers.clone()),
+            )
             .spawn();
 
         Ok(Self {
             endpoint,
             router,
             peers,
-            config,
             meetings_root,
         })
     }
@@ -106,13 +110,15 @@ impl SyncEngine {
             .await
             .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;
         let router = Router::builder(endpoint.clone())
-            .accept(SYNC_ALPN, AcceptHook::new(meetings_root.clone()))
+            .accept(
+                SYNC_ALPN,
+                AcceptHook::new(meetings_root.clone(), peers.clone()),
+            )
             .spawn();
         Ok(Self {
             endpoint,
             router,
             peers,
-            config: SyncConfig::new(meetings_root.clone()),
             meetings_root,
         })
     }
@@ -225,11 +231,6 @@ impl SyncEngine {
         result
     }
 
-    /// The relay URL this engine is configured to pin.
-    pub fn relay_url(&self) -> &str {
-        &self.config.relay_url
-    }
-
     /// Shut the router (and its endpoint) down gracefully, draining in-flight
     /// connections. Idempotent at the iroh layer.
     pub async fn shutdown(self) -> Result<()> {
@@ -243,7 +244,14 @@ impl SyncEngine {
 /// The inbound-connection handler registered on the [`Router`] for the
 /// [`SYNC_ALPN`].
 ///
-/// Runs the responder side of the notes-sync protocol
+/// Authorises the remote against the paired-peer [`PeerDirectory`] before doing
+/// anything else: an inbound connection from an `EndpointId` that this device has
+/// NOT paired (its ticket is not in the directory) is rejected before a single
+/// frame is read, so a holder of the shared relay token who merely learns an
+/// `EndpointId` cannot push CRDT updates into this device's meetings. Sync
+/// therefore requires mutual pairing — each device must add the other's ticket.
+///
+/// Once authorised it runs the responder side of the notes-sync protocol
 /// ([`notes_proto::respond_notes_sync`]) against the device's
 /// [`SyncEngine::meetings_root`], which it carries by clone (the router spawns a
 /// fresh task per connection). A failed exchange is logged and converted to an
@@ -251,17 +259,38 @@ impl SyncEngine {
 #[derive(Debug, Clone)]
 struct AcceptHook {
     meetings_root: PathBuf,
+    /// The authorised-peer set, shared with [`SyncEngine`] (cheap-to-clone, same
+    /// backing store), so a peer paired after the router spawned is honoured on
+    /// the next inbound connection.
+    peers: PeerDirectory,
 }
 
 impl AcceptHook {
-    fn new(meetings_root: PathBuf) -> Self {
-        Self { meetings_root }
+    fn new(meetings_root: PathBuf, peers: PeerDirectory) -> Self {
+        Self {
+            meetings_root,
+            peers,
+        }
     }
 }
 
 impl ProtocolHandler for AcceptHook {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
         let peer = connection.remote_id();
+
+        // Authorise before reading any frame: only a peer this device has paired
+        // (its ticket is in the directory) may sync. An unpaired peer is rejected.
+        if !self.peers.ids().contains(&peer) {
+            tracing::debug!(
+                target: "sync",
+                peer = %peer,
+                "rejecting inbound sync connection from an unpaired peer"
+            );
+            return Err(AcceptError::from_err(Error::Protocol(format!(
+                "unpaired peer {peer}"
+            ))));
+        }
+
         tracing::info!(target: "sync", peer = %peer, "accepted sync connection");
 
         notes_proto::respond_notes_sync(&connection, &self.meetings_root)

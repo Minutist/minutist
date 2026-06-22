@@ -37,6 +37,7 @@ function statusLabel(status: SyncStatus): string {
 
 export function SyncSettingsPane() {
   const status = useSyncStatusStore((s) => s.status);
+  const inProgress = useSyncStatusStore((s) => s.inProgress);
   const myTicket = useSyncStatusStore((s) => s.myTicket);
   const lastError = useSyncStatusStore((s) => s.lastError);
   const refresh = useSyncStatusStore((s) => s.refresh);
@@ -94,6 +95,14 @@ export function SyncSettingsPane() {
         <div className="settings-drawer__mcp-endpoint">
           <code>{status !== null ? statusLabel(status) : "—"}</code>
         </div>
+        {inProgress && (
+          <p className="settings-drawer__hint" aria-label="Sync progress">
+            {inProgress.label}
+            {inProgress.fraction !== null
+              ? ` ${Math.round(inProgress.fraction * 100)}%`
+              : ""}
+          </p>
+        )}
       </div>
 
       {myTicket && (

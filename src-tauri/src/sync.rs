@@ -154,6 +154,12 @@ impl ConnectedSync {
         }
     }
 
+    /// Set the runtime status. Used to mark the engine `Syncing` for the span of
+    /// a `sync_now` and restore it to `Idle` afterwards.
+    async fn set_status(&self, status: SyncStatus) {
+        self.runtime.lock().await.status = status;
+    }
+
     /// Record an error status and emit [`AppEvent::SyncError`].
     async fn fail(&self, message: String) {
         tracing::error!(target: "app-main", "sync: {message}");
@@ -213,6 +219,12 @@ impl SyncControl for ConnectedSync {
         }
 
         let total = peers.len();
+        // Reflect the in-flight transfer in the engine status so a `sync_status`
+        // read (e.g. the pane's refresh) observes `Syncing`, alongside the live
+        // `SyncProgress` events the UI drives its indicator from. Restored to
+        // `Idle` once the loop finishes (a transfer leaves the engine idle, with
+        // any failure surfaced via `SyncError`, not a sticky status).
+        self.set_status(SyncStatus::Syncing).await;
         let _ = self.event_tx.send(AppEvent::SyncProgress {
             meeting_id,
             label: "Syncing notes…".to_string(),
@@ -236,6 +248,7 @@ impl SyncControl for ConnectedSync {
             });
         }
 
+        self.set_status(SyncStatus::Idle).await;
         match last_err {
             None => {
                 let _ = self.event_tx.send(AppEvent::SyncReady { meeting_id });

@@ -42,6 +42,19 @@ vi.mock("../ipc/client", () => ({
   },
 }));
 
+// On `sync_ready` the sync store reloads the meeting list (and re-reads the open
+// meeting). Mock the meetings IPC seam so those calls are inert in this test.
+const listMeetings = vi.fn(async () => []);
+const openMeeting = vi.fn(async () => null);
+vi.mock("../ipc/meetings", () => ({
+  listMeetings: () => listMeetings(),
+  openMeeting: () => openMeeting(),
+  renameMeeting: vi.fn(),
+  setSpeakerName: vi.fn(),
+  deleteMeeting: vi.fn(),
+  reprocess: vi.fn(),
+}));
+
 import { SyncSettingsPane } from "../shell/SyncSettingsPane";
 import { useSyncStatusStore } from "../state/sync-status";
 import { useMeetingsStore } from "../state/meetings";
@@ -50,6 +63,7 @@ function resetStores() {
   act(() => {
     useSyncStatusStore.setState({
       status: null,
+      inProgress: null,
       myTicket: null,
       lastError: null,
       pendingReadyNotifications: [],
@@ -158,7 +172,10 @@ describe("SyncSettingsPane", () => {
 });
 
 describe("useSyncStatusStore event handling", () => {
-  beforeEach(resetStores);
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStores();
+  });
 
   it("sync_ready queues a pending notification for the meeting", () => {
     act(() => {
@@ -205,20 +222,80 @@ describe("useSyncStatusStore event handling", () => {
     expect(useSyncStatusStore.getState().lastError).toBe("peer unreachable");
   });
 
-  it("sync_progress is a no-op on the sync store", () => {
+  it("sync_progress sets the in-flight transfer state", () => {
+    act(() => {
+      useSyncStatusStore.getState().handleEvent({
+        kind: "sync_progress",
+        meeting_id: "mtg-1",
+        label: "Syncing notes…",
+        fraction: 0.5,
+      });
+    });
+    const inProgress = useSyncStatusStore.getState().inProgress;
+    expect(inProgress).toEqual({
+      meetingId: "mtg-1",
+      label: "Syncing notes…",
+      fraction: 0.5,
+    });
+    // No terminal side effects yet.
+    expect(
+      useSyncStatusStore.getState().pendingReadyNotifications,
+    ).toHaveLength(0);
+    expect(useSyncStatusStore.getState().lastError).toBeNull();
+  });
+
+  it("sync_progress with a null fraction is indeterminate", () => {
     act(() => {
       useSyncStatusStore.getState().handleEvent({
         kind: "sync_progress",
         meeting_id: "mtg-1",
         label: "Syncing…",
-        fraction: 0.5,
+        fraction: null,
       });
     });
-    // No state change expected.
-    expect(
-      useSyncStatusStore.getState().pendingReadyNotifications,
-    ).toHaveLength(0);
-    expect(useSyncStatusStore.getState().lastError).toBeNull();
+    expect(useSyncStatusStore.getState().inProgress?.fraction).toBeNull();
+  });
+
+  it("sync_ready clears the in-flight state and refreshes the meeting list", () => {
+    act(() => {
+      useSyncStatusStore.setState({
+        inProgress: { meetingId: "mtg-1", label: "Syncing…", fraction: 0.5 },
+      });
+    });
+    act(() => {
+      useSyncStatusStore
+        .getState()
+        .handleEvent({ kind: "sync_ready", meeting_id: "mtg-1" });
+    });
+    expect(useSyncStatusStore.getState().inProgress).toBeNull();
+    expect(listMeetings).toHaveBeenCalled();
+  });
+
+  it("sync_ready re-reads the open meeting when it matches", () => {
+    act(() => {
+      useMeetingsStore.setState({ openMeetingId: "mtg-1" });
+    });
+    act(() => {
+      useSyncStatusStore
+        .getState()
+        .handleEvent({ kind: "sync_ready", meeting_id: "mtg-1" });
+    });
+    expect(openMeeting).toHaveBeenCalled();
+  });
+
+  it("sync_error clears the in-flight state and sets lastError", () => {
+    act(() => {
+      useSyncStatusStore.setState({
+        inProgress: { meetingId: "mtg-1", label: "Syncing…", fraction: null },
+      });
+    });
+    act(() => {
+      useSyncStatusStore
+        .getState()
+        .handleEvent({ kind: "sync_error", context: "boom" });
+    });
+    expect(useSyncStatusStore.getState().inProgress).toBeNull();
+    expect(useSyncStatusStore.getState().lastError).toBe("boom");
   });
 
   it("an unrelated event does not affect the sync store", () => {

@@ -81,13 +81,19 @@
       "kind": "llm",
       "display_name": "Gemma 4 E4B Instruct (Q4_K_M)",
       "license": "apache-2.0",
-      "total_size_bytes": 5335289824,
+      "total_size_bytes": 5895164352,
       "files": [
         {
           "filename": "gemma-4-E4B-it-Q4_K_M.gguf",
           "url": "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/2714b5519c6c3516b1000e7c5e1eba998dfe1fe8/gemma-4-E4B-it-Q4_K_M.gguf",
           "size": 5335289824,
           "sha256": "90ce98129eb3e8cc57e62433d500c97c624b1e3af1fcc85dd3b55ad7e0313e9f"
+        },
+        {
+          "filename": "mmproj-gemma-4-E4B-it-Q8_0.gguf",
+          "url": "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/2714b5519c6c3516b1000e7c5e1eba998dfe1fe8/mmproj-gemma-4-E4B-it-Q8_0.gguf",
+          "size": 559874528,
+          "sha256": "51d4b7fd825e4569f746b200fccc5332bf914e8ef7cbe447272ce4fec6df3db6"
         }
       ]
     },

@@ -38,8 +38,10 @@
 //!    capped at `config.max_tokens`. Detokenisation is incremental via an
 //!    `encoding_rs` UTF-8 decoder (mirrors `asr-runtime`).
 
+use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -47,6 +49,9 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::mtmd::{
+    mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
+};
 use llama_cpp_2::sampling::LlamaSampler;
 
 use minutist_common::{AppResult, NoteBlock, Segment, Summariser};
@@ -169,6 +174,23 @@ pub struct LlamaSummariser {
     model: LlamaModel,
     model_path: PathBuf,
     config: SummariserConfig,
+    /// Lazily-built vision projector bound to `model`, for the document-OCR
+    /// fallback (`image_to_markdown`). Empty until the first OCR job calls
+    /// [`ensure_vision`](Self::ensure_vision); the same Gemma-4 weights serve
+    /// both summarisation and OCR, so no second GGUF is loaded.
+    ///
+    /// # Send/Sync — why `Mutex`
+    ///
+    /// `LlamaSummariser` is held behind an `Arc<dyn Summariser>` shared across
+    /// threads, so every field must be `Send + Sync`. `MtmdContext` carries an
+    /// `unsafe impl Send + Sync` in `llama-cpp-2`, but its encode path mutates
+    /// internal C state through a shared pointer, and OCR runs on the same GPU
+    /// the summariser and ASR use — concurrent `eval_chunks` on one context
+    /// would race that state and contend on the device. The `Mutex` serialises
+    /// OCR calls, which is acceptable because OCR is a background, single-worker
+    /// job (the conversion worker is bounded to one in flight). `OnceLock` gives
+    /// the lazy-once-then-immutable build; the inner `Mutex` guards per-call use.
+    vision: OnceLock<Mutex<MtmdContext>>,
 }
 
 impl LlamaSummariser {
@@ -219,6 +241,7 @@ impl LlamaSummariser {
             model,
             model_path,
             config,
+            vision: OnceLock::new(),
         })
     }
 
@@ -307,6 +330,256 @@ impl LlamaSummariser {
     /// exposure) and `chat-agent`.
     pub fn model(&self) -> &LlamaModel {
         &self.model
+    }
+
+    /// Bring up the vision projector for document OCR, reusing the held model.
+    ///
+    /// Lazy and idempotent: the first call binds `mmproj_path` to the
+    /// already-loaded [`LlamaModel`] via [`MtmdContext::init_from_file`] (mirrors
+    /// `asr-runtime`'s audio binding) and caches it; later calls return the
+    /// cached context regardless of the `mmproj_path` argument. The projector is
+    /// asserted to advertise **vision** support — a mismatched (e.g. audio-only)
+    /// mmproj is rejected up front rather than producing garbage at OCR time.
+    ///
+    /// The mtmd encoder follows the same GPU decision as the model: it offloads
+    /// iff the summariser is offloading layers (`config.n_gpu_layers > 0`), so a
+    /// CPU-forced build keeps the encoder on CPU too.
+    ///
+    /// # Errors
+    ///
+    /// `AppError::ModelLoad` if the mmproj path is missing/invalid or the
+    /// projector cannot be loaded or does not support vision.
+    pub fn ensure_vision(&self, mmproj_path: &Path) -> AppResult<&Mutex<MtmdContext>> {
+        // Fast path: already built.
+        if let Some(ctx) = self.vision.get() {
+            return Ok(ctx);
+        }
+
+        // Existence check before crossing into llama.cpp — the C library asserts
+        // on a missing path rather than returning an error (same as `open`).
+        if !mmproj_path.exists() {
+            return Err(Error::MtmdInit {
+                path: mmproj_path.display().to_string(),
+                context: "file not found".to_string(),
+            }
+            .into());
+        }
+
+        let mmproj_str = mmproj_path.to_str().ok_or_else(|| Error::MtmdInit {
+            path: mmproj_path.display().to_string(),
+            context: "path is not valid UTF-8".to_string(),
+        })?;
+
+        let mtmd_params = MtmdContextParams {
+            // GPU affinity tracks the model's runtime offload decision.
+            use_gpu: self.config.n_gpu_layers > 0,
+            print_timings: false,
+            n_threads: self.config.threads,
+            media_marker: CString::new(mtmd_default_marker()).map_err(|e| Error::MtmdInit {
+                path: mmproj_path.display().to_string(),
+                context: format!("invalid media marker: {e}"),
+            })?,
+        };
+
+        let mtmd_ctx =
+            MtmdContext::init_from_file(mmproj_str, &self.model, &mtmd_params).map_err(|e| {
+                Error::MtmdInit {
+                    path: mmproj_path.display().to_string(),
+                    context: e.to_string(),
+                }
+            })?;
+
+        if !mtmd_ctx.support_vision() {
+            return Err(Error::MtmdInit {
+                path: mmproj_path.display().to_string(),
+                context: "mmproj does not advertise vision support".to_string(),
+            }
+            .into());
+        }
+
+        tracing::info!(
+            target: "summariser",
+            mmproj = %mmproj_path.display(),
+            "vision mtmd context initialised"
+        );
+
+        // Another thread may have raced us to build the context; `set` returns
+        // `Err` in that case and we just use whichever instance won. `get`
+        // cannot return `None` after either branch, so the `expect` is
+        // unreachable.
+        let _ = self.vision.set(Mutex::new(mtmd_ctx));
+        Ok(self
+            .vision
+            .get()
+            .expect("vision context is populated after set/race"))
+    }
+
+    /// OCR one page image (PNG bytes) into markdown using the held Gemma-4 model.
+    ///
+    /// This is the production lift of the validated spike loop
+    /// (`spikes/doc-vlm-spike/src/main.rs` — `infer_page`): decode the PNG into
+    /// an [`MtmdBitmap`], build the Gemma "convert this page to markdown"
+    /// instruction with the media marker appended (Gemma places the marker
+    /// AFTER the instruction, via its chat template), allocate a fresh
+    /// [`LlamaContext`] (clean KV cache, mirroring `summarise`), tokenise the
+    /// text+image into mtmd chunks, prefill via `eval_chunks`, then greedily
+    /// decode to EOG. The returned markdown is trimmed.
+    ///
+    /// [`ensure_vision`](Self::ensure_vision) MUST have been called first to
+    /// provision the projector; this method locks the cached context for the
+    /// duration of the call, so concurrent OCR jobs serialise (acceptable — OCR
+    /// is a bounded single-worker background job sharing the GPU).
+    ///
+    /// # Errors
+    ///
+    /// `AppError::ModelLoad` if the vision projector was never built;
+    /// `AppError::Inference` on any decode/tokenise/eval failure.
+    pub fn image_to_markdown(&self, png: &[u8]) -> AppResult<String> {
+        let vision = self.vision.get().ok_or_else(|| Error::Inference(
+            "image_to_markdown called before ensure_vision built the projector".to_string(),
+        ))?;
+        // Serialise OCR on the shared mtmd context (see the `vision` field doc).
+        let mtmd_ctx = vision
+            .lock()
+            .map_err(|e| Error::Inference(format!("vision mtmd context lock poisoned: {e}")))?;
+
+        let markdown = self.run_image_to_markdown(&mtmd_ctx, png)?;
+        Ok(markdown)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vision / document-OCR (private machinery)
+// ---------------------------------------------------------------------------
+
+/// Gemma-4 instruction for the document-OCR fallback. Lifted verbatim from the
+/// validated `doc-vlm-spike` (`GEMMA_INSTRUCTION`). The media marker is appended
+/// AFTER this text (Gemma's marker-last placement); `MtmdContext::tokenize`
+/// splits the prompt on the marker and inserts the encoded page image there.
+const GEMMA_OCR_INSTRUCTION: &str = "Convert this document page to clean, well-structured markdown. \
+     Preserve headings, lists, and tables. For tables use GitHub \
+     pipe-table syntax. Output only the markdown content, no preamble.";
+
+impl LlamaSummariser {
+    /// Build the OCR prompt: the Gemma instruction followed by the media marker,
+    /// wrapped by the GGUF chat template — or the hand-built Gemma turn format
+    /// when the bundled llama.cpp cannot render the (newer) Gemma template.
+    ///
+    /// Reuses the SAME fallback chain as [`Self::build_prompt`]: the shipped
+    /// Gemma-4 GGUF postdates the vendored llama.cpp, so `apply_chat_template`
+    /// returns `ffi error -1` and we emit the `gemma_turn_prompt` scaffold
+    /// (which carries an explicit `<bos>`). Either way the marker survives
+    /// verbatim because tokenisation parses it as a special token; mtmd then
+    /// splits the prompt on it.
+    fn build_ocr_prompt(&self) -> Result<String, Error> {
+        let marker = mtmd_default_marker();
+        let user_content = format!("{GEMMA_OCR_INSTRUCTION}\n{marker}");
+
+        let template = self
+            .model
+            .chat_template(None::<&str>)
+            .map_err(|e| Error::Template(e.to_string()))?;
+
+        let user_msg = LlamaChatMessage::new("user".to_string(), user_content.clone())
+            .map_err(|e| Error::Template(format!("user message: {e}")))?;
+
+        match self.model.apply_chat_template(&template, &[user_msg], true) {
+            Ok(prompt) => Ok(prompt),
+            Err(e) => {
+                tracing::warn!(
+                    target: "summariser",
+                    "apply_chat_template failed ({e}); using the Gemma turn-format fallback for OCR"
+                );
+                Ok(gemma_turn_prompt(&user_content))
+            }
+        }
+    }
+
+    /// The OCR decode loop (lifted from `doc-vlm-spike`'s `infer_page`).
+    ///
+    /// `mtmd_ctx` is the locked, vision-capable projector. A fresh
+    /// [`LlamaContext`] is allocated per page so the KV cache is clean (mirrors
+    /// `generate_with_config`). The page image is decoded from PNG bytes, the
+    /// text+image is tokenised into mtmd chunks, prefilled via `eval_chunks`,
+    /// then greedily decoded with an EOG stop and incremental UTF-8
+    /// detokenisation.
+    fn run_image_to_markdown(
+        &self,
+        mtmd_ctx: &MtmdContext,
+        png: &[u8],
+    ) -> Result<String, Error> {
+        let backend = get_or_init_backend()?;
+
+        // Decode the page image (stb_image inside mtmd). Image analogue of the
+        // audio-bitmap path in `asr-runtime`.
+        let bitmap = MtmdBitmap::from_buffer(mtmd_ctx, png)
+            .map_err(|e| Error::Inference(format!("MtmdBitmap::from_buffer: {e:?}")))?;
+
+        // The Gemma OCR prompt carries an explicit `<bos>` (via the chat
+        // template, or the `gemma_turn_prompt` fallback), so `add_special` is
+        // false to avoid a second BOS — mirroring `generate`'s `AddBos::Never`.
+        // `parse_special` is true so the media marker tokenises as a special
+        // token and mtmd can split on it.
+        let prompt_text = self.build_ocr_prompt()?;
+        let input_text = MtmdInputText {
+            text: prompt_text,
+            add_special: false,
+            parse_special: true,
+        };
+
+        let n_ctx = NonZeroU32::new(self.config.n_ctx)
+            .ok_or_else(|| Error::ContextOverflow("n_ctx must be non-zero".to_string()))?;
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(Some(n_ctx))
+            .with_n_batch(self.config.n_batch)
+            .with_n_threads(self.config.threads)
+            .with_n_threads_batch(self.config.threads);
+
+        let mut llama_ctx = self
+            .model
+            .new_context(backend, ctx_params)
+            .map_err(|e| Error::Inference(format!("LlamaContext init: {e}")))?;
+
+        let chunks = mtmd_ctx
+            .tokenize(input_text, &[&bitmap])
+            .map_err(|e| Error::Inference(format!("mtmd tokenize: {e}")))?;
+
+        // Prefill: the image chunk is encoded via mtmd_encode inside
+        // `eval_chunks`, the text chunks via llama_decode. `n_batch` is the
+        // chunked-prefill chunk size (cross-cutting "llama.cpp prefill batching").
+        let mut n_past = chunks
+            .eval_chunks(mtmd_ctx, &llama_ctx, 0, 0, self.config.n_batch as i32, true)
+            .map_err(|e| Error::Inference(format!("eval_chunks: {e}")))?;
+
+        // Greedy decode with EOG stop.
+        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        let mut batch = LlamaBatch::new(self.config.n_batch as usize, 1);
+        let mut decoder = UTF_8.new_decoder();
+        let mut markdown = String::new();
+
+        for _ in 0..self.config.max_tokens {
+            let token = sampler.sample(&llama_ctx, -1);
+            sampler.accept(token);
+            if self.model.is_eog_token(token) {
+                break;
+            }
+            let piece = self
+                .model
+                .token_to_piece(token, &mut decoder, true, None)
+                .map_err(|e| Error::Inference(format!("token_to_piece: {e}")))?;
+            markdown.push_str(&piece);
+
+            batch.clear();
+            batch
+                .add(token, n_past, &[0], true)
+                .map_err(|e| Error::Inference(format!("batch.add (gen): {e}")))?;
+            n_past += 1;
+            llama_ctx
+                .decode(&mut batch)
+                .map_err(|e| Error::Inference(format!("decode (gen): {e}")))?;
+        }
+
+        Ok(markdown.trim().to_string())
     }
 }
 

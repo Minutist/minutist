@@ -26,9 +26,13 @@
 //! (best-effort).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use minutist_common::{AppError, AppEvent, AttachmentId, ConversionState, MeetingId};
+use minutist_common::{AppError, AppEvent, AttachmentId, ConversionState, DocVlm, MeetingId};
 use tokio::sync::{broadcast, mpsc};
+
+use crate::chat_runtime::ChatHandles;
+use crate::commands;
 
 // ---------------------------------------------------------------------------
 // meetingdoc: URI scheme
@@ -140,7 +144,121 @@ pub(crate) fn doc_content_type_for(filename: &str) -> &'static str {
         "ods" => "application/vnd.oasis.opendocument.spreadsheet",
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        // Image attachments — converted to markdown via the VLM OCR fallback,
+        // but the original is served back to the webview under its real type.
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "tiff" => "image/tiff",
         _ => "application/octet-stream",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GemmaVlm — the held-summariser-backed DocVlm fallback
+// ---------------------------------------------------------------------------
+
+/// The [`DocVlm`] implementation injected into `doc-convert`'s OCR fallback,
+/// backed by the **already-held** Gemma-4 summariser.
+///
+/// `doc-convert` is a `common`-only leaf and reaches the VLM solely through the
+/// [`DocVlm`] trait; this type is the concrete `ipc-bridge` side. It carries the
+/// shared [`ChatHandles`] so that resolving the model and the vision projector
+/// reuses the SAME lazily-loaded `LlamaSummariser` the chat / summarise paths
+/// hold — no second model and no second GGUF.
+///
+/// **Lazy.** Nothing loads at construction. The summariser GGUF and the vision
+/// `MtmdContext` come up only on the first OCR call (the first image attachment
+/// actually reaching the converter), via [`ChatHandles::ensure_summariser`] and
+/// [`summariser::LlamaSummariser::ensure_vision`].
+///
+/// **Async-in-sync.** [`DocVlm::image_to_markdown`] is synchronous (it is called
+/// from `doc_convert::convert_to_markdown` inside the worker's `spawn_blocking`),
+/// but resolving the model directory and loading the summariser are async. The
+/// implementation bridges with `Handle::block_on` on the ambient Tokio runtime —
+/// valid because the call always originates on a `spawn_blocking` thread, never
+/// on a runtime worker thread.
+#[derive(Clone)]
+pub struct GemmaVlm {
+    handles: ChatHandles,
+}
+
+impl GemmaVlm {
+    /// Construct a `GemmaVlm` over the shared chat-runtime handles. Loads
+    /// nothing — see the type doc.
+    pub fn new(handles: ChatHandles) -> Self {
+        Self { handles }
+    }
+}
+
+/// Locate the multimodal vision projector (`mmproj-*.gguf`) inside a resolved
+/// model directory.
+///
+/// The vision projector ships as a sibling file of the Gemma-4 weights (the
+/// model-registry provisions it at onboarding). `find_gguf_weights` in
+/// `commands` deliberately SKIPS the `mmproj-*` file when loading the text
+/// weights; this is its mirror image — the single `mmproj-*.gguf`.
+fn find_mmproj_in_dir(model_dir: &Path) -> Result<PathBuf, AppError> {
+    let read_dir = std::fs::read_dir(model_dir).map_err(|e| AppError::ModelLoad {
+        model_id: model_dir.display().to_string(),
+        context: format!("cannot read model directory: {e}"),
+    })?;
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_gguf = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+        if is_gguf && name.to_ascii_lowercase().starts_with("mmproj") {
+            candidates.push(path);
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates.pop().expect("len == 1")),
+        0 => Err(AppError::ModelLoad {
+            model_id: model_dir.display().to_string(),
+            context: "no mmproj-*.gguf vision projector found in model directory; \
+                      document OCR requires the Gemma-4 vision projector sibling file"
+                .into(),
+        }),
+        n => Err(AppError::ModelLoad {
+            model_id: model_dir.display().to_string(),
+            context: format!("expected one mmproj-*.gguf vision projector, found {n}"),
+        }),
+    }
+}
+
+impl DocVlm for GemmaVlm {
+    fn image_to_markdown(&self, png: &[u8]) -> Result<String, AppError> {
+        // Resolve the held summariser + the mmproj sibling path on the ambient
+        // runtime. This runs on a `spawn_blocking` thread (the conversion
+        // worker's), so a blocking `block_on` is safe (never on a runtime worker
+        // thread). A missing runtime is a programming error (the VLM is only
+        // ever reached from the worker), surfaced as `Internal`.
+        let handle = tokio::runtime::Handle::try_current().map_err(|e| AppError::Internal {
+            context: format!("GemmaVlm::image_to_markdown called outside a Tokio runtime: {e}"),
+        })?;
+        let handles = self.handles.clone();
+        let (summariser, mmproj_path) = handle.block_on(async move {
+            let model_id = commands::resolve_llm_model_id(&handles.settings.current());
+            let model_dir = handles.orchestrator.ensure_model_path(&model_id).await?;
+            let mmproj_path = find_mmproj_in_dir(&model_dir)?;
+            // Loads the GGUF once (shared with summarise + chat); subsequent OCR
+            // jobs reuse the cached handle.
+            let summariser = handles.ensure_summariser().await.map_err(AppError::from)?;
+            Ok::<_, AppError>((summariser, mmproj_path))
+        })?;
+
+        // Build (once) and lock the vision projector, then OCR the page. Both
+        // are synchronous; `ensure_vision` is idempotent so repeated pages reuse
+        // the cached context.
+        summariser.ensure_vision(&mmproj_path)?;
+        summariser.image_to_markdown(png)
     }
 }
 
@@ -177,6 +295,11 @@ pub struct ConvertJob {
 /// worker never crashes on a job error (best-effort) and exits cleanly when the
 /// sender is dropped.
 ///
+/// `vlm` is the optional image-OCR backend (a [`GemmaVlm`] in production,
+/// `None` when no held model is wired). It is cloned into each job and passed to
+/// `doc_convert::convert_to_markdown`, which consults it only for direct image
+/// attachments — every digital-text path ignores it.
+///
 /// Uses `tauri::async_runtime::spawn` (like [`crate::spawn_event_forwarder`])
 /// because `app-main` calls this from Tauri's `setup()` hook, which has no
 /// entered Tokio runtime for a bare `tokio::spawn`.
@@ -184,10 +307,11 @@ pub fn spawn_attachment_convert_worker(
     mut rx: mpsc::Receiver<ConvertJob>,
     meetings_dir: PathBuf,
     event_tx: broadcast::Sender<AppEvent>,
+    vlm: Option<Arc<dyn DocVlm>>,
 ) {
     tauri::async_runtime::spawn(async move {
         while let Some(job) = rx.recv().await {
-            run_convert_job(&meetings_dir, &event_tx, job).await;
+            run_convert_job(&meetings_dir, &event_tx, vlm.clone(), job).await;
         }
         tracing::info!(
             target: "ipc-bridge",
@@ -288,6 +412,7 @@ pub fn requeue_pending(meetings_dir: &Path, tx: &mpsc::Sender<ConvertJob>) {
 async fn run_convert_job(
     meetings_dir: &Path,
     event_tx: &broadcast::Sender<AppEvent>,
+    vlm: Option<Arc<dyn DocVlm>>,
     job: ConvertJob,
 ) {
     let ConvertJob {
@@ -308,7 +433,11 @@ async fn run_convert_job(
             meeting_id,
             &original_filename,
         )?;
-        let md = doc_convert::convert_to_markdown(&bytes, &ext)?;
+        // The VLM is reached only for image attachments; `convert_to_markdown`
+        // ignores it on every digital-text path. `as_deref()` turns the
+        // `Option<Arc<dyn DocVlm>>` into the `Option<&dyn DocVlm>` the converter
+        // takes.
+        let md = doc_convert::convert_to_markdown(&bytes, &ext, vlm.as_deref())?;
         let md_filename = persistence::save_attachment_markdown(
             &meetings_dir_owned,
             meeting_id,
@@ -475,8 +604,40 @@ mod tests {
             doc_content_type_for("a.docx"),
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
+        // Image attachments serve under their real type (the OCR fallback only
+        // touches the converted markdown, never the served original).
+        assert_eq!(doc_content_type_for("a.png"), "image/png");
+        assert_eq!(doc_content_type_for("a.jpg"), "image/jpeg");
+        assert_eq!(doc_content_type_for("a.jpeg"), "image/jpeg");
+        assert_eq!(doc_content_type_for("a.tiff"), "image/tiff");
         assert_eq!(doc_content_type_for("a.bin"), "application/octet-stream");
         assert_eq!(doc_content_type_for("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn find_mmproj_in_dir_picks_the_single_projector() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let dir = tempdir.path();
+        std::fs::write(dir.join("gemma-4-E4B-it-Q8_0.gguf"), b"weights").expect("write weights");
+        std::fs::write(dir.join("mmproj-gemma-4-E4B-it-Q8_0.gguf"), b"proj").expect("write proj");
+
+        let found = find_mmproj_in_dir(dir).expect("mmproj found");
+        assert_eq!(
+            found.file_name().and_then(|n| n.to_str()),
+            Some("mmproj-gemma-4-E4B-it-Q8_0.gguf")
+        );
+    }
+
+    #[test]
+    fn find_mmproj_in_dir_errors_when_absent() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let dir = tempdir.path();
+        std::fs::write(dir.join("gemma-4-E4B-it-Q8_0.gguf"), b"weights").expect("write weights");
+
+        assert!(
+            matches!(find_mmproj_in_dir(dir), Err(AppError::ModelLoad { .. })),
+            "a directory with no mmproj projector must be a ModelLoad error"
+        );
     }
 
     /// The conversion worker marks a row Failed + emits the failure event when
@@ -513,6 +674,7 @@ mod tests {
         run_convert_job(
             root,
             &event_tx,
+            None,
             ConvertJob {
                 meeting_id: id,
                 attachment_id,
@@ -584,6 +746,7 @@ mod tests {
         run_convert_job(
             root,
             &event_tx,
+            None,
             ConvertJob {
                 meeting_id: id,
                 attachment_id,

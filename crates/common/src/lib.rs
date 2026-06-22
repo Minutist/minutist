@@ -1553,6 +1553,35 @@ pub trait Summariser: Send + Sync {
     ) -> AppResult<String>;
 }
 
+/// Injected vision-OCR seam used by `doc-convert` to handle direct image
+/// attachments (`png`/`jpg`/`jpeg`/`tiff`). The seam is deliberately generic
+/// over PNG input, so a future PDF-page rasterisation path (planning issue
+/// 0019) can reuse it without a trait change.
+///
+/// `doc-convert` is a `common`-only leaf — it carries no workspace edge to
+/// `summariser` or `ipc-bridge`. Callers (currently `ipc-bridge`) construct a
+/// concrete implementation backed by the held Gemma-4 `LlamaModel` + a lazily
+/// initialised `MtmdContext`, then pass it into `convert_to_markdown`. The trait
+/// is `Option<&dyn DocVlm>` at every call site so the pure-Rust path works
+/// without any model present.
+///
+/// `Send + Sync`: implementations hold either an `Arc`-wrapped model (safe with
+/// `unsafe impl`) or a `Mutex`-guarded stub (safe by construction). No
+/// `LlamaContext` or `MtmdContext` is stored across calls — each call builds one
+/// fresh, runs inference, and drops it before returning.
+pub trait DocVlm: Send + Sync {
+    /// Convert a single PNG image (one document page, or a direct image
+    /// attachment) to clean markdown text via vision inference.
+    ///
+    /// `png` is a complete, valid PNG byte slice. The implementation is
+    /// responsible for encoding the image into the format expected by the
+    /// underlying model (e.g. llama.cpp `MtmdImage`).
+    ///
+    /// Returns `AppError::Unsupported` when no model is available or the
+    /// underlying model does not support vision.
+    fn image_to_markdown(&self, png: &[u8]) -> AppResult<String>;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -57,6 +57,13 @@ safety argument at the impl site):
   (`Arc<Mutex<StreamInner>>` + `Weak` upgrade on the listener thread), so
   moving the owned handle across tokio worker threads is safe.
   ALSA/WASAPI streams are `Send` natively; `Sync` is never asserted.
+- `ipc-bridge` (`GemmaVlm`): **no `unsafe` impl**. `GemmaVlm: Send + Sync`
+  is derived from `Arc<Mutex<MtmdContext>>` + `Arc<LlamaSummariser>` (which
+  is already `unsafe impl Send + Sync`). `MtmdContext` itself is `!Send`
+  (internal FFI pointer); it is entirely encapsulated behind the `Mutex` and
+  never exposed as a reference across a thread boundary, so no `unsafe impl`
+  is required or permitted on `GemmaVlm`. See `cross-cutting.md` — "Held
+  model serves vision".
 
 **Live vs. offline diarization (Phase B).** There are two independent
 diarization paths. The offline `SherpaDiarizer` / `common::Diarizer`
@@ -1186,6 +1193,78 @@ derived from `SummariserConfig.n_ctx` minus reserves for transcript + notes +
 generation). The assembled string is passed as `attachments_markdown` to `summarise`.
 An empty string (no manifest, or no Ready entries) produces byte-identical output to
 a run with no attachments — the prepend in `render_user_content` is conditional.
+
+## Held model serves vision
+
+The OCR VLM is the **already-held Gemma-4**, not a second model. `LlamaSummariser`
+owns a `LlamaModel` (already `unsafe impl Send + Sync`). A vision `MtmdContext` —
+the multimodal projector that maps image tokens into the LM's embedding space —
+can be bound to that same loaded model via
+`MtmdContext::init_from_file(mmproj_path, &model, …)`, exactly as
+`asr-runtime` binds its audio `MtmdContext` to the Qwen3-ASR model. So there is
+**no second GGUF**: the OCR VLM reuses the `~5 GiB` Gemma-4 LM weights already
+held by the summariser, and the mmproj/encoder (~560 MB) is co-resident only
+while an OCR job is active.
+
+**Lazy vision context.** `LlamaSummariser` gains a `vision: OnceCell<MtmdContext>`
+(or `Arc<Mutex<MtmdContext>>` — see Send/Sync below) and an `ensure_vision(mmproj)
+-> AppResult<()>` that builds the `MtmdContext` from the already-loaded model on
+first image job, mirroring the `maybe_preload_summariser` lazy posture. No vision
+load happens until an image attachment actually reaches the worker.
+
+**Same ~8 GiB GPU budget.** The VRAM thresholds in `resolve_gpu_plan`
+(`SUMMARISER_VRAM_BYTES`, `cross-cutting.md` — "GPU portability") already account
+for the full Gemma-4 activation footprint. The mmproj encoder adds ~200–300 MB
+of temporary activation while an image is being encoded; the VRAM budget is NOT
+widened to accommodate it — the estimate already includes headroom, and the
+encoder is short-lived. If a future measurement shows the budget needs revision,
+that is a `common` architecture-owner change.
+
+**MtmdContext Send/Sync.** `MtmdContext` in llama-cpp-2 is `!Send` (it holds an
+internal FFI pointer that must not migrate threads). The vision context is wrapped
+in `Mutex<MtmdContext>` inside `GemmaVlm` so `GemmaVlm: Send + Sync` holds via the
+mutex wrapper, and the `spawn_blocking` closure takes a clone of the wrapping `Arc`.
+The one bounded conversion worker processes OCR jobs sequentially, so the mutex is
+never contended; its cost is a single lock/unlock per image page. This follows the
+same pattern as the offline `SherpaDiarizer`'s `Mutex<Diarize>` — the `&self`
+trait method hides a `Mutex`-guarded `&mut` resource. The `unsafe impl` is NOT
+asserted for `MtmdContext`; only the enclosing `GemmaVlm` struct is `Send + Sync`
+(via `Arc<Mutex<…>>`).
+
+## OCR policy for image attachments
+
+**The VLM handles only inputs with no pure-Rust text path.** Every digital
+document (`txt`/`md`/`xlsx`/`ods`/`html`/`eml`/`pdf`/`pptx`/`docx`) extracts via
+its pure-Rust converter; the VLM is consulted only for direct image attachments
+(`png`/`jpg`/`jpeg`/`tiff`). Rationale: digital text extracts instantly and
+losslessly, whereas a ~4–14 s/page GPU pass buys nothing for text-bearing
+documents and can *introduce* OCR errors; it would also contend with
+summarise/ASR on the shared GPU. The single bounded conversion worker serialises
+OCR jobs, so OCR and summarise never compete for the `LlamaContext`.
+
+**Image attachments.** The bytes are decoded and re-encoded to PNG (via the
+`image` crate) and passed to `vlm.image_to_markdown()`. When `vlm` is `None` (no
+held model / mmproj absent), they return `AppError::Unsupported`; the attachment
+row shows "Conversion failed" and the user can still open the original via "Open
+anyway".
+
+**Scanned / image-only PDFs are NOT supported.** `pdf-extract` returns
+near-empty text for them, and `doc-convert` then returns `AppError::Unsupported`
+rather than attempting OCR — the VLM is never invoked for a PDF in this build.
+PDF-page OCR needs page rasterisation (a PDFium runtime library bundled per
+platform), which is deferred — planning issue 0019.
+
+**Near-empty threshold.** A PDF extraction result is treated as near-empty when
+the whitespace-stripped text is shorter than a small constant (100 characters,
+in `doc-convert`). Conservative by design: a PDF with a few hundred words of
+digital text extracts reliably.
+
+**Deferred.**
+- The PDF-image cases — scanned pages, embedded figures, and digital-PDF
+  table-structure recovery (`pdf-extract` flattens table grids to cell text) —
+  are tracked in `planning/issues/0019`; all need PDF-page rasterisation.
+- Which VLM model does the OCR (Gemma-4 chosen; PaddleOCR-VL revisit) is
+  `planning/issues/0018`.
 
 ## Telemetry
 

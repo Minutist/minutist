@@ -37,7 +37,7 @@ fn supported_exts_covers_all_converters() {
 #[test]
 fn txt_passthrough_preserves_content() {
     let bytes = fixture("sample.txt");
-    let out = convert_to_markdown(&bytes, "txt").expect("txt conversion");
+    let out = convert_to_markdown(&bytes, "txt", None).expect("txt conversion");
     assert!(out.contains("Plain text"), "got: {out:?}");
     assert!(out.contains("Line two"), "got: {out:?}");
 }
@@ -45,7 +45,7 @@ fn txt_passthrough_preserves_content() {
 #[test]
 fn md_passthrough_preserves_heading() {
     let bytes = fixture("sample.md");
-    let out = convert_to_markdown(&bytes, "md").expect("md conversion");
+    let out = convert_to_markdown(&bytes, "md", None).expect("md conversion");
     assert!(out.contains("Meeting Notes"), "got: {out:?}");
     assert!(out.contains("Revenue"), "got: {out:?}");
 }
@@ -57,7 +57,7 @@ fn md_passthrough_preserves_heading() {
 #[test]
 fn html_converter_extracts_body_text() {
     let bytes = fixture("sample.html");
-    let out = convert_to_markdown(&bytes, "html").expect("html conversion");
+    let out = convert_to_markdown(&bytes, "html", None).expect("html conversion");
     assert!(
         out.contains("Quarterly Report") || out.contains("Revenue"),
         "expected article content, got: {out:?}"
@@ -68,7 +68,7 @@ fn html_converter_extracts_body_text() {
 fn htm_extension_also_works() {
     // .htm must be treated identically to .html.
     let bytes = fixture("sample.html");
-    let out = convert_to_markdown(&bytes, "htm").expect("htm conversion");
+    let out = convert_to_markdown(&bytes, "htm", None).expect("htm conversion");
     assert!(!out.is_empty(), "htm output must not be empty");
 }
 
@@ -79,7 +79,7 @@ fn htm_extension_also_works() {
 #[test]
 fn xlsx_converter_produces_table() {
     let bytes = fixture("sample.xlsx");
-    let out = convert_to_markdown(&bytes, "xlsx").expect("xlsx conversion");
+    let out = convert_to_markdown(&bytes, "xlsx", None).expect("xlsx conversion");
     // The output should contain a markdown table with pipe characters.
     assert!(out.contains('|'), "expected table separators, got: {out:?}");
     assert!(
@@ -95,7 +95,7 @@ fn xlsx_converter_produces_table() {
 #[test]
 fn eml_converter_extracts_body() {
     let bytes = fixture("sample.eml");
-    let out = convert_to_markdown(&bytes, "eml").expect("eml conversion");
+    let out = convert_to_markdown(&bytes, "eml", None).expect("eml conversion");
     // Should contain some body text from either the HTML or plain-text part.
     assert!(
         out.contains("Milestone") || out.contains("Project"),
@@ -109,7 +109,7 @@ fn eml_no_body_renders_headers_without_debug_formatting() {
     // fallback. The From line must read as "Name <addr>", not the parser's
     // internal `Address` Debug shape (no "List(", "Addr {", "Some(" leakage).
     let bytes = fixture("headers-only.eml");
-    let out = convert_to_markdown(&bytes, "eml").expect("eml conversion");
+    let out = convert_to_markdown(&bytes, "eml", None).expect("eml conversion");
     assert!(out.contains("**From:**"), "expected From header, got: {out:?}");
     assert!(out.contains("Jane Doe"), "expected sender name, got: {out:?}");
     assert!(
@@ -209,7 +209,7 @@ fn pdf_multi_column_captures_all_text() {
         "paparazzi",
     ];
     let bytes = build_two_column_pdf(&left, &right);
-    let out = convert_to_markdown(&bytes, "pdf").expect("two-column pdf conversion");
+    let out = convert_to_markdown(&bytes, "pdf", None).expect("two-column pdf conversion");
     for word in left.iter().chain(right.iter()) {
         assert!(
             out.contains(word),
@@ -225,7 +225,7 @@ fn pdf_digital_text_is_extracted() {
     let body = "Quarterly revenue increased by twelve percent across all regions, \
                 and the board approved the proposed expansion plan for next year.";
     let bytes = build_text_pdf(body);
-    let out = convert_to_markdown(&bytes, "pdf").expect("digital-text pdf conversion");
+    let out = convert_to_markdown(&bytes, "pdf", None).expect("digital-text pdf conversion");
     assert!(
         out.contains("Quarterly revenue") || out.contains("expansion plan"),
         "expected extracted PDF text, got: {out:?}"
@@ -233,15 +233,15 @@ fn pdf_digital_text_is_extracted() {
 }
 
 #[test]
-fn pdf_near_empty_reaches_vlm_fallback() {
+fn pdf_near_empty_without_vlm_is_unsupported() {
     // A PDF whose extractable text is under the 100 non-whitespace-char
-    // threshold (here: a near-empty page) reaches the VLM fallback seam, which
-    // in the production build returns AppError::Unsupported.
+    // threshold (here: a near-empty page) reaches the VLM fallback. With no VLM
+    // injected, the fallback returns AppError::Unsupported rather than guessing.
     let bytes = build_text_pdf("ok");
-    let err = convert_to_markdown(&bytes, "pdf").unwrap_err();
+    let err = convert_to_markdown(&bytes, "pdf", None).unwrap_err();
     assert!(
         matches!(err, AppError::Unsupported { .. }),
-        "expected Unsupported from the VLM fallback seam, got {err:?}"
+        "expected Unsupported from the VLM fallback with no model, got {err:?}"
     );
 }
 
@@ -322,7 +322,7 @@ fn ods_converter_produces_table() {
         &["North", "1200"],
         &["South", "950"],
     ]);
-    let out = convert_to_markdown(&bytes, "ods").expect("ods conversion");
+    let out = convert_to_markdown(&bytes, "ods", None).expect("ods conversion");
     assert!(out.contains('|'), "expected table separators, got: {out:?}");
     assert!(out.contains("Name"), "expected header cell, got: {out:?}");
     assert!(out.contains("Revenue"), "expected header cell, got: {out:?}");
@@ -336,7 +336,7 @@ fn ods_converter_produces_table() {
 #[test]
 fn pptx_converter_extracts_slide_text() {
     let bytes = fixture("sample.pptx");
-    let out = convert_to_markdown(&bytes, "pptx").expect("pptx conversion");
+    let out = convert_to_markdown(&bytes, "pptx", None).expect("pptx conversion");
     // The converter emits "## Slide N" headings.
     assert!(
         out.contains("## Slide") || out.contains("Results") || out.contains("Action"),
@@ -395,7 +395,7 @@ fn build_pptx_with_notes(slide_text: &str, notes_text: &str) -> Vec<u8> {
 #[test]
 fn pptx_appends_speaker_notes_per_slide() {
     let bytes = build_pptx_with_notes("Roadmap overview", "Remember to mention the Q3 budget");
-    let out = convert_to_markdown(&bytes, "pptx").expect("pptx conversion");
+    let out = convert_to_markdown(&bytes, "pptx", None).expect("pptx conversion");
 
     assert!(out.contains("Roadmap overview"), "expected slide body, got: {out:?}");
     assert!(out.contains("Notes"), "expected a Notes block, got: {out:?}");
@@ -440,7 +440,7 @@ fn build_docx() -> Vec<u8> {
 #[test]
 fn docx_extracts_paragraph_list_and_table_cells() {
     let bytes = build_docx();
-    let out = convert_to_markdown(&bytes, "docx").expect("docx conversion");
+    let out = convert_to_markdown(&bytes, "docx", None).expect("docx conversion");
 
     // Heading + body + list-item text all surface as plain paragraph text
     // (the bullet glyph itself is not reconstructed — the bar is content).
@@ -467,7 +467,7 @@ fn docx_extracts_paragraph_list_and_table_cells() {
 fn oversize_input_is_rejected() {
     // 50 MiB + 1 byte — rejected before the parser runs.
     let big = vec![0u8; 50 * 1024 * 1024 + 1];
-    let err = convert_to_markdown(&big, "txt").unwrap_err();
+    let err = convert_to_markdown(&big, "txt", None).unwrap_err();
     assert!(
         matches!(err, AppError::InvalidInput { .. }),
         "expected InvalidInput, got {err:?}"
@@ -495,7 +495,7 @@ fn zip_bomb_entry_count_rejected() {
     zip.finish().unwrap();
     let bytes = buf.into_inner();
 
-    let err = convert_to_markdown(&bytes, "pptx").unwrap_err();
+    let err = convert_to_markdown(&bytes, "pptx", None).unwrap_err();
     assert!(
         matches!(err, AppError::InvalidInput { .. }),
         "expected InvalidInput for entry-count bomb, got {err:?}"
@@ -506,7 +506,7 @@ fn zip_bomb_entry_count_rejected() {
 fn malformed_pptx_zip_is_rejected() {
     // Garbage bytes that are not a valid zip archive.
     let garbage = b"this is not a zip file at all!!!";
-    let err = convert_to_markdown(garbage, "pptx").unwrap_err();
+    let err = convert_to_markdown(garbage, "pptx", None).unwrap_err();
     assert!(
         matches!(err, AppError::InvalidInput { .. }),
         "expected InvalidInput for malformed zip, got {err:?}"
@@ -515,7 +515,7 @@ fn malformed_pptx_zip_is_rejected() {
 
 #[test]
 fn unknown_extension_is_rejected() {
-    let err = convert_to_markdown(b"hello", "rtf").unwrap_err();
+    let err = convert_to_markdown(b"hello", "rtf", None).unwrap_err();
     assert!(
         matches!(err, AppError::InvalidInput { .. }),
         "expected InvalidInput for unsupported ext, got {err:?}"
@@ -524,6 +524,96 @@ fn unknown_extension_is_rejected() {
 
 #[test]
 fn empty_input_is_ok() {
-    let out = convert_to_markdown(b"", "txt").expect("empty txt");
+    let out = convert_to_markdown(b"", "txt", None).expect("empty txt");
     assert_eq!(out, "");
+}
+
+// ---------------------------------------------------------------------------
+// VLM OCR fallback (stub DocVlm — no real model)
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A `DocVlm` test double: counts how many times it is invoked and returns a
+/// fixed markdown string echoing the call index, so concatenation order and
+/// per-page invocation can be asserted without loading any model.
+#[derive(Default)]
+struct StubVlm {
+    calls: AtomicUsize,
+}
+
+impl minutist_common::DocVlm for StubVlm {
+    fn image_to_markdown(&self, png: &[u8]) -> Result<String, AppError> {
+        // Sanity: the fallback must hand us a valid PNG (magic bytes).
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "DocVlm must receive a PNG");
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(format!("STUB-OCR call {n}"))
+    }
+}
+
+/// Build a tiny in-memory PNG (no opaque binary committed). The pixels are
+/// irrelevant — the stub asserts the PNG header, not the content.
+fn build_png() -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(4, 4, image::Rgb([200, 200, 200]));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("encode png");
+    buf.into_inner()
+}
+
+#[test]
+fn image_attachment_routes_to_vlm_stub() {
+    let png = build_png();
+    let stub = StubVlm::default();
+    let out = convert_to_markdown(&png, "png", Some(&stub)).expect("png via stub");
+    assert!(out.contains("STUB-OCR call 1"), "stub output missing: {out:?}");
+    assert_eq!(stub.calls.load(Ordering::SeqCst), 1, "stub called once");
+}
+
+#[test]
+fn image_attachment_without_vlm_is_unsupported() {
+    let png = build_png();
+    let err = convert_to_markdown(&png, "png", None).unwrap_err();
+    assert!(
+        matches!(err, AppError::Unsupported { .. }),
+        "image with no VLM must be Unsupported, got {err:?}"
+    );
+}
+
+#[test]
+fn image_attachment_jpeg_reencoded_to_png_for_vlm() {
+    // A JPEG must be decoded and re-encoded to PNG before the VLM sees it —
+    // the stub asserts the PNG header, so a JPEG passed through unchanged would
+    // trip that assertion.
+    let rgb = image::RgbImage::from_pixel(4, 4, image::Rgb([10, 20, 30]));
+    let mut buf = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(rgb)
+        .write_to(&mut buf, image::ImageFormat::Jpeg)
+        .expect("encode jpeg");
+    let jpeg = buf.into_inner();
+
+    let stub = StubVlm::default();
+    let out = convert_to_markdown(&jpeg, "jpeg", Some(&stub)).expect("jpeg via stub");
+    assert!(out.contains("STUB-OCR call 1"), "stub output missing: {out:?}");
+}
+
+#[test]
+fn near_empty_pdf_is_unsupported_even_with_vlm() {
+    // A near-empty PDF (under the 100 non-ws-char threshold) is a scanned /
+    // image-only document. PDF-page OCR is deferred (planning issue 0019): the
+    // VLM is never consulted for PDFs, so this returns Unsupported and the stub
+    // stays untouched even when one is injected.
+    let bytes = build_text_pdf("ok");
+    let stub = StubVlm::default();
+    let err = convert_to_markdown(&bytes, "pdf", Some(&stub)).unwrap_err();
+    assert!(
+        matches!(err, AppError::Unsupported { .. }),
+        "near-empty PDF must be Unsupported, got {err:?}"
+    );
+    assert_eq!(
+        stub.calls.load(Ordering::SeqCst),
+        0,
+        "the VLM must not be invoked for PDFs (no rasterisation path)"
+    );
 }

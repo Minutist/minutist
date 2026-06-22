@@ -2091,6 +2091,7 @@ dependencies = [
  "docx-rs",
  "dom_smoothie",
  "htmd",
+ "image",
  "mail-parser",
  "minutist-common",
  "pdf-extract",

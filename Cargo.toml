@@ -215,12 +215,13 @@ pulldown-cmark = "0.13"
 # pulldown-cmark-to-cmark: re-serialises the AST back to canonical markdown.
 pulldown-cmark-to-cmark = "22"
 
-# doc-vlm-spike additions (spikes/doc-vlm-spike only — not used by production crates).
-# pdfium-render: high-level Rust wrapper around Google PDFium for PDF rasterisation.
-# `image_025` wires pdfium-render's `as_image()` to the image 0.25.x API (the
-# version this workspace pins). Without it `as_image()` is unavailable; raw RGBA
-# bytes via `as_rgba_bytes()` remain accessible regardless.
+# pdfium-render: high-level Rust wrapper around Google PDFium for PDF
+# rasterisation. Used ONLY by spikes/doc-vlm-spike (PDF-page OCR is deferred —
+# planning issue 0019); not a production dependency. `image_025` wires
+# pdfium-render's `as_image()` to the image 0.25.x API (the version this
+# workspace pins).
 pdfium-render = { version = "0.9", features = ["image_025"] }
-# image: image decoding / encoding used to PNG-encode rasterised PDF pages and
-# to load plain image fixtures (JPEG/PNG/TIFF) for direct bitmap construction.
+# image: image decoding / encoding. Used by doc-convert to re-encode image
+# attachments (png/jpg/jpeg/tiff) to PNG for the VLM, and by the doc-vlm spike
+# for bitmap fixtures.
 image = "0.25"

@@ -174,7 +174,7 @@ used, not added here.
 `InterAgentRequest`, `InterAgentReply`,
 `AttachmentId`, `ConversionState`, `AttachmentEntry`),
 trait definitions (`AsrBackend`, `Diarizer`,
-`Summariser`), the shared `AppError` enum + `AppResult<T>` alias, and the
+`Summariser`, `DocVlm`), the shared `AppError` enum + `AppResult<T>` alias, and the
 `apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` helper — the
 single canonical speaker-name overlay (raw diarizer label → display name),
 shared by the agent read tools and the summariser input path so a summary
@@ -219,6 +219,22 @@ rename_all="snake_case")]`):
 - `AttachmentRemoved { meeting_id: MeetingId, attachment_id: AttachmentId }` —
   emitted by `ipc-bridge`'s `remove_attachment` command after the manifest row is
   dropped and any now-unreferenced hash files are unlinked.
+
+**VLM OCR — `DocVlm` trait (feat/vlm-ocr).** The `DocVlm` trait is the
+injection seam that keeps `doc-convert` a `common`-only leaf while giving it
+access to vision inference:
+
+    pub trait DocVlm: Send + Sync {
+        fn image_to_markdown(&self, png: &[u8]) -> AppResult<String>;
+    }
+
+It lives in `common` (not in `doc-convert`) so `ipc-bridge` can implement it
+against its held `LlamaSummariser` without introducing a new workspace edge from
+`doc-convert` toward `ipc-bridge` or `summariser`. `doc-convert` receives an
+`Option<&dyn DocVlm>` at call time — `None` in the default test path (stub or
+absent VLM), `Some(GemmaVlm)` in production. Adding this trait is an
+architecture-owner change; all downstream consumers are updated in the same
+commit.
 
 **Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
 newtype mirroring `MeetingId`); six chat `AppEvent` variants (`ChatToken`,
@@ -2121,16 +2137,27 @@ on the `settings` crate. See the `ipc-bridge` "Output-language resolution" note.
 **Crate:** `crates/doc-convert`
 **Owner role:** `data-engineer`
 **Depends on:** `common` only (no workspace-component edge beyond `common`).
+Third-party deps include `image` (decode an image attachment and re-encode it
+to PNG for the VLM OCR path) — a third-party crate, not a workspace edge, so the
+`common`-only rule is preserved.
 
-Converts attached document bytes to canonical markdown. The single public entry
-point is:
+Converts attached document bytes to canonical markdown. The public entry points
+are:
 
-    pub fn convert_to_markdown(bytes: &[u8], ext: &str) -> AppResult<String>
+    pub fn convert_to_markdown(
+        bytes: &[u8],
+        ext: &str,
+        vlm: Option<&dyn common::DocVlm>,
+    ) -> AppResult<String>
     pub fn supported_exts() -> &'static [&'static str]
-      // ["txt","md","xlsx","ods","html","htm","eml","pdf","pptx","docx"]
+      // ["txt","md","xlsx","ods","html","htm","eml","pdf","pptx","docx","png","jpg","jpeg","tiff"]
 
-Each format is handled by a pure-Rust, in-process converter; no subprocess, no
-native lib, no OCR engine:
+The `vlm` parameter carries the optional VLM injected by `ipc-bridge`; it is
+`None` in tests (which supply a stub impl) or when no vision context is loaded.
+`DocVlm` is defined in `common` (see below); `ipc-bridge` provides a `GemmaVlm`
+impl backed by the held summariser's lazy vision context.
+
+Each format is handled by a converter:
 
 | Extension | Converter |
 |---|---|
@@ -2141,6 +2168,7 @@ native lib, no OCR engine:
 | `pdf` | `pdf-extract` (digital text extraction only) |
 | `pptx` | `zip` open + `quick-xml` walk of `ppt/slides/slideN.xml` `<a:t>` runs (incl. table-cell text), one `## Slide N` per slide; per-slide `ppt/notesSlides/notesSlideN.xml` speaker notes appended as a `### Notes` block |
 | `docx` | `zip` open + `quick-xml` walk of `word/document.xml`: `<w:p>` → paragraph, `<w:t>` → text, `<w:tbl>`/`<w:tr>`/`<w:tc>` → markdown pipe-table |
+| `png`, `jpg`, `jpeg`, `tiff` | VLM OCR path only (no pure-Rust text content); returns `AppError::Unsupported` when `vlm` is `None` |
 
 Bar for the Office formats (`pptx`, `docx`) is textual content for the
 summariser, not faithful structure: paragraph/list/cell text is captured;
@@ -2150,6 +2178,19 @@ zip + `quick-xml` approach as `pptx` (no `docx-rs` production dependency;
 
 All converter output is normalised through `pulldown-cmark` (parse → re-emit) so
 the markdown is canonical before it is stored.
+
+**VLM OCR flow (image attachments).** The VLM handles only inputs that have no
+pure-Rust text path:
+
+- **Digital PDFs** run `pdf-extract`; the extracted text is returned as-is. The
+  VLM is never invoked for PDFs.
+- **Scanned / image-only PDFs** return near-empty text from `pdf-extract` and
+  are rejected with `AppError::Unsupported`. PDF-page rasterisation/OCR is
+  deferred (planning issue 0019) — there is no `pdfium` dependency in this build.
+- **Direct image attachments** (`png` / `jpg` / `jpeg` / `tiff`) have no
+  pure-Rust text path and route to `vlm.image_to_markdown()` — the bytes are
+  decoded and re-encoded to PNG first (via `image`). When `vlm` is `None`, they
+  return `AppError::Unsupported`.
 
 **Robustness wrapper (binding).** Every conversion runs inside
 `std::panic::catch_unwind` — parser panics on malformed input must not crash the
@@ -2165,12 +2206,28 @@ returned as `AppError::InvalidInput`:
 Crate-local `thiserror` `Error` converts to `common::AppError` via `From`.
 No `anyhow` in any public signature.
 
-**VLM-fallback seam (documented stub — no production code).** A private
-`fn vlm_fallback(_bytes, _ext) -> AppResult<String>` returns
-`AppError::Unsupported { context: "VLM fallback not built; see spikes/doc-vlm" }`.
-It is reached on the scanned-PDF path (when `pdf-extract` returns near-empty text)
-and is the documented slot for the `spikes/doc-vlm` result to graduate into —
-without a public-surface change.
+**`common::DocVlm` trait.** Defined in `crates/common/src/lib.rs`:
+
+    pub trait DocVlm: Send + Sync {
+        fn image_to_markdown(&self, png: &[u8]) -> AppResult<String>;
+    }
+
+The trait takes PNG bytes (the image-attachment bytes after normalisation to
+PNG; a future PDF-page rasteriser — issue 0019 — would supply page images the
+same way without a trait change). `doc-convert`
+takes `Option<&dyn DocVlm>` — it defines the trait's call site but holds no
+direct knowledge of the implementing crate. `ipc-bridge` provides the concrete
+`GemmaVlm` implementation backed by the held Gemma-4 summariser with a lazy
+vision `MtmdContext` (see `cross-cutting.md` — "Held model serves vision").
+
+**Gemma-4 mmproj sibling file.** The vision multimodal projector
+(`mmproj-gemma-4-E4B-it-Q8_0.gguf`, ~560 MB) is registered as a sibling file
+of the Gemma-4 summariser entry in `resources/models.json`, using the existing
+`ModelManifestEntry.files: Vec<ModelFileEntry>` sibling mechanism (the same
+pattern the Qwen3-ASR GGUF + mmproj pair already uses). It downloads alongside
+the LM during onboarding, so OCR is fully offline after setup. `model-registry`
+owns the download; `ipc-bridge` resolves the mmproj path from the registry at
+`ensure_vision` time.
 
 ### `tunnel-client`
 **Crate:** `crates/tunnel-client`
@@ -2755,14 +2812,16 @@ directly (same architecture as the `meetingasset:` handler).
 
 **Bounded conversion worker (binding).** `IpcState` gains
 `attachment_convert_tx: tokio::sync::mpsc::Sender<ConvertJob>` (bounded — no
-unbounded channels). `app-main` constructs the `(tx, rx)` pair and spawns ONE
+unbounded channels). `app-main` constructs the `(tx, rx)` pair, builds a
+`GemmaVlm` backed by the held summariser's `ensure_vision`, and spawns ONE
 long-lived worker task via `tauri::async_runtime::spawn` (mirroring
 `spawn_event_forwarder`). The worker loop receives `ConvertJob { meeting_id,
 attachment_id, hash, ext }`, runs on `spawn_blocking`:
 
 1. `persistence::read_attachment_original` → bytes
-2. `doc_convert::convert_to_markdown(&bytes, &ext)` — `catch_unwind` already
-   inside `doc-convert`
+2. `doc_convert::convert_to_markdown(&bytes, &ext, Some(&gemma_vlm))` —
+   `catch_unwind` already inside `doc-convert`; the `GemmaVlm` is `Arc`-shared
+   so the `spawn_blocking` closure can own a clone
 3. On `Ok`: `persistence::save_attachment_markdown` + `set_entry_conversion(Ready,
    Some(filename))` → emit `AppEvent::AttachmentConverted`
 4. On `Err`: `set_entry_conversion(Failed(reason))` → emit
@@ -2772,6 +2831,16 @@ Every error is logged (`target: "ipc-bridge"`); the worker never panics. If the
 bounded queue is full, `add_attachment` uses `try_send`, logs the back-pressure,
 and marks the entry `Failed("conversion queue full")` immediately so the UI does not
 show a permanent `Pending`.
+
+**`GemmaVlm: DocVlm` (ipc-bridge).** `ipc-bridge` owns a `GemmaVlm` struct that
+wraps an `Arc<LlamaSummariser>` and calls `ensure_vision(mmproj_path)` on first
+use (lazy — the `MtmdContext` is only built when an image job actually arrives).
+`GemmaVlm::image_to_markdown` builds a fresh `LlamaContext`, tokenises
+`<media-marker> + prompt`, evaluates via `mtmd_helper_eval_chunks`, and
+greedy-decodes with EOG stop — the validated loop from the `doc-vlm` spike. The
+single bounded conversion worker serialises all OCR calls (no parallel GPU
+contention). `GemmaVlm: Send + Sync` — see `cross-cutting.md` — "Held model
+serves vision".
 
 **Summarise path — attachments feed (Attachments WS).** `summarise_meeting_with_progress`
 (the `run_held_summarise` path) reads the meeting's manifest, concatenates every

@@ -2874,8 +2874,12 @@ mod tests {
                 "ext {ext:?} should normalise from a dotted upper-case form"
             );
         }
-        // Rejected — image-only / executable / unsupported document extensions.
-        for evil in ["png", "exe", "", "pdf.exe", "../pdf", "rtf", "doc"] {
+        // Rejected — executable / unsupported document extensions. Image
+        // extensions (png/jpg/jpeg/tiff) and Office docx ARE supported now (the
+        // VLM OCR fallback and the OOXML walk respectively), so they are
+        // exercised by the supported-exts loop above; "doc" (legacy binary
+        // Word) and "rtf" remain unsupported.
+        for evil in ["exe", "", "pdf.exe", "../pdf", "rtf", "doc"] {
             assert!(
                 matches!(
                     normalise_attachment_ext(evil),

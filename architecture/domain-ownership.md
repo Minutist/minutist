@@ -49,6 +49,20 @@ restated. Adding any other edge requires updating
   specta-derived) and ride the existing `AppEventPayload` + `collect_events!`
   registration — no second event bus.
 
+- **`DocVlm` trait (image-attachment OCR).** `common::DocVlm` is the injection
+  seam that lets `doc-convert` call vision inference without taking a workspace
+  edge beyond `common`. The trait is owned by `common` (architecture-owner). The
+  concrete `GemmaVlm` implementation lives in `ipc-bridge` (systems-engineer):
+  it wraps the held `LlamaSummariser` and its lazy `MtmdContext`, and is wired
+  through the conversion worker in `ipc-bridge` and `app-main`. `doc-convert`
+  (data-engineer) gains `image` as a third-party dep (decode/re-encode image
+  attachments to PNG) — NOT a workspace-component edge, so `doc-convert` remains
+  a `common`-only leaf. No new row is needed in the dependency table for either
+  `GemmaVlm` (it lives inside `ipc-bridge`, which already depends on
+  `summariser`) or `image` (third-party). Scanned/image-only PDF OCR — which
+  would add `pdfium-render` for page rasterisation — is deferred (planning issue
+  0019).
+
 - **`Summariser::summarise` widening (Attachments WS).** The trait gains
   `attachments_markdown: &str` before `system_prompt` — an architecture-owner
   change (the "Change shape" table: trait changes are architecture-owner). All

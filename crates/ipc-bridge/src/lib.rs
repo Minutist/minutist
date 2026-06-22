@@ -153,7 +153,7 @@ use tauri_specta::{collect_commands, collect_events, Builder};
 use tokio::sync::{broadcast, mpsc, OnceCell};
 
 pub use attachments::{
-    requeue_pending, resolve_meeting_doc, spawn_attachment_convert_worker, ConvertJob,
+    requeue_pending, resolve_meeting_doc, spawn_attachment_convert_worker, ConvertJob, GemmaVlm,
     ResolvedMeetingDoc, ATTACHMENT_CONVERT_QUEUE_BOUND, MEETING_DOC_SCHEME,
 };
 pub use chat_runtime::ChatHandles;

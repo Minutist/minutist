@@ -7,7 +7,7 @@
 //! # Public surface
 //!
 //! ```text
-//! pub fn convert_to_markdown(bytes: &[u8], ext: &str) -> AppResult<String>
+//! pub fn convert_to_markdown(bytes: &[u8], ext: &str, vlm: Option<&dyn DocVlm>) -> AppResult<String>
 //! pub fn supported_exts() -> &'static [&'static str]
 //! ```
 //!
@@ -19,16 +19,18 @@
 //! surface as recoverable AppError"). Hard size limits are checked BEFORE the
 //! parser sees the bytes.
 //!
-//! # VLM fallback seam
+//! # VLM OCR for image attachments
 //!
-//! A private stub [`vlm_fallback`] is the documented insertion point for a
-//! future vision-model path (validated separately in `spikes/doc-vlm`). The
-//! production build returns `AppError::Unsupported` from that stub; the spike's
-//! result can graduate here without changing the public surface.
+//! Direct image attachments (`png`/`jpg`/`jpeg`/`tiff`) have no pure-Rust text
+//! path, so they convert through the injected [`minutist_common::DocVlm`]
+//! (vision OCR). When `vlm` is `None` they return [`AppError::Unsupported`];
+//! every digital-text path ignores it. Scanned / image-only PDFs are not
+//! handled here — they need PDF-page rasterisation, tracked in planning issue
+//! 0019; a near-empty PDF extraction returns [`AppError::Unsupported`].
 
 use std::panic::AssertUnwindSafe;
 
-use minutist_common::{AppError, AppResult};
+use minutist_common::{AppError, AppResult, DocVlm};
 
 mod error;
 mod normalise;
@@ -52,8 +54,15 @@ const MAX_ZIP_UNCOMPRESSED_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
 const MAX_ZIP_ENTRIES: usize = 10_000;
 
 /// The file extensions this crate can convert. Lower-cased, dot-less.
+///
+/// The image extensions (`png`/`jpg`/`jpeg`/`tiff`) have no pure-Rust text
+/// path: they convert ONLY when a [`DocVlm`] is injected into
+/// [`convert_to_markdown`]; without one they return `AppError::Unsupported`.
 pub fn supported_exts() -> &'static [&'static str] {
-    &["txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx", "docx"]
+    &[
+        "txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx", "docx", "png", "jpg",
+        "jpeg", "tiff",
+    ]
 }
 
 /// Convert `bytes` (the raw content of a file with extension `ext`) to a
@@ -62,13 +71,22 @@ pub fn supported_exts() -> &'static [&'static str] {
 /// `ext` must be lower-cased and dot-less (e.g. `"pdf"`, `"xlsx"`); the caller
 /// (`ipc-bridge`) normalises it before handing to this function.
 ///
+/// `vlm` is the optional vision-OCR backend. It is consulted only for direct
+/// image attachments (`png`/`jpg`/`jpeg`/`tiff`), which have no pure-Rust text
+/// path. When `None`, those paths return `AppError::Unsupported`; all
+/// digital-text paths ignore it.
+///
 /// Returns `AppError::InvalidInput` for oversize input, pathological zip
 /// archives, or an unsupported extension. Returns `AppError::Internal` when a
 /// parser returns a genuine error on otherwise valid-looking input. Parser
 /// panics are caught and mapped to `AppError::InvalidInput`.
 ///
 /// Empty input is allowed and returns an empty string.
-pub fn convert_to_markdown(bytes: &[u8], ext: &str) -> AppResult<String> {
+pub fn convert_to_markdown(
+    bytes: &[u8],
+    ext: &str,
+    vlm: Option<&dyn DocVlm>,
+) -> AppResult<String> {
     // Hard size guard — checked before any parser is invoked.
     if bytes.len() > MAX_INPUT_BYTES {
         return Err(AppError::InvalidInput {
@@ -84,7 +102,7 @@ pub fn convert_to_markdown(bytes: &[u8], ext: &str) -> AppResult<String> {
     // worker. `bytes` and `ext` are both `UnwindSafe`; the closure only reads
     // them.
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        dispatch(bytes, ext)
+        dispatch(bytes, ext, vlm)
     }));
 
     match result {
@@ -104,7 +122,7 @@ pub fn convert_to_markdown(bytes: &[u8], ext: &str) -> AppResult<String> {
 }
 
 /// Route to the per-extension converter.
-fn dispatch(bytes: &[u8], ext: &str) -> AppResult<String> {
+fn dispatch(bytes: &[u8], ext: &str, vlm: Option<&dyn DocVlm>) -> AppResult<String> {
     match ext {
         "txt" | "md" => converters::passthrough(bytes),
         "xlsx" | "ods" => converters::spreadsheet(bytes, ext),
@@ -113,6 +131,7 @@ fn dispatch(bytes: &[u8], ext: &str) -> AppResult<String> {
         "pdf" => converters::pdf(bytes),
         "pptx" => converters::pptx(bytes),
         "docx" => converters::docx(bytes),
+        "png" | "jpg" | "jpeg" | "tiff" => converters::image(bytes, ext, vlm),
         // Test-only hook: drive the `catch_unwind` arm in `convert_to_markdown`
         // with a real parser panic (no third-party input panics deterministically).
         #[cfg(test)]
@@ -123,29 +142,6 @@ fn dispatch(bytes: &[u8], ext: &str) -> AppResult<String> {
     }
 }
 
-/// Future VLM fallback insertion point (NOT built in production).
-///
-/// The `spikes/doc-vlm` spike validates Gemma 4 multimodal vision as a
-/// fallback for scanned PDFs (where `pdf-extract` returns near-empty text).
-/// When that spike graduates, its implementation replaces this stub without
-/// changing the public surface of `convert_to_markdown`.
-///
-/// Called internally by the `pdf` converter when the extracted text is
-/// near-empty (heuristic: fewer than 100 non-whitespace chars).
-fn vlm_fallback(_bytes: &[u8], ext: &str) -> AppResult<String> {
-    // User-facing reason (surfaced on the attachment row as the Failed message),
-    // so a scanned PDF reads clearly rather than as a generic "unsupported".
-    let context = match ext {
-        "pdf" => "scanned or image-only PDF — no extractable text \
-                  (image-document conversion is not yet available)"
-            .to_string(),
-        _ => {
-            format!("no text-extraction path for .{ext} (VLM fallback not built; see spikes/doc-vlm)")
-        }
-    };
-    Err(AppError::Unsupported { context })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,7 +150,7 @@ mod tests {
     fn rejects_oversize_input() {
         // One byte over the limit — must be rejected before any parser runs.
         let big = vec![0u8; MAX_INPUT_BYTES + 1];
-        let err = convert_to_markdown(&big, "txt").unwrap_err();
+        let err = convert_to_markdown(&big, "txt", None).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidInput { .. }),
             "expected InvalidInput, got {err:?}"
@@ -163,7 +159,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_extension() {
-        let err = convert_to_markdown(b"hello", "rtf").unwrap_err();
+        let err = convert_to_markdown(b"hello", "rtf", None).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidInput { .. }),
             "expected InvalidInput for unknown ext, got {err:?}"
@@ -172,7 +168,7 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty_string() {
-        let out = convert_to_markdown(b"", "txt").expect("empty txt should succeed");
+        let out = convert_to_markdown(b"", "txt", None).expect("empty txt should succeed");
         assert_eq!(out, "");
     }
 
@@ -190,7 +186,7 @@ mod tests {
         // `catch_unwind` wrapper must convert that to InvalidInput rather than
         // unwind into the caller — the conversion worker must survive a malformed
         // input that panics a parser.
-        let err = convert_to_markdown(b"anything", "__panic__").unwrap_err();
+        let err = convert_to_markdown(b"anything", "__panic__", None).unwrap_err();
         assert!(
             matches!(err, AppError::InvalidInput { .. }),
             "a panicking converter must map to InvalidInput, got {err:?}"

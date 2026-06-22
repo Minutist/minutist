@@ -33,6 +33,11 @@ pub enum ConvertError {
     #[error("PDF extraction error: {0}")]
     Pdf(String),
 
+    /// A direct image attachment could not be decoded or re-encoded — treated
+    /// as invalid input.
+    #[error("image decode error: {0}")]
+    Image(String),
+
     #[error("XML parse error: {0}")]
     Xml(String),
 
@@ -66,6 +71,9 @@ impl From<ConvertError> for AppError {
             },
             ConvertError::Pdf(msg) => AppError::Internal {
                 context: format!("pdf: {msg}"),
+            },
+            ConvertError::Image(msg) => AppError::InvalidInput {
+                context: format!("image: {msg}"),
             },
             ConvertError::Xml(msg) => AppError::Internal {
                 context: format!("xml: {msg}"),

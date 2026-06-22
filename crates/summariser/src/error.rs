@@ -17,6 +17,9 @@ pub enum Error {
 
     #[error("prompt exceeds the model context window: {0}")]
     ContextOverflow(String),
+
+    #[error("failed to initialise the vision mtmd context from {path}: {context}")]
+    MtmdInit { path: String, context: String },
 }
 
 impl From<Error> for AppError {
@@ -34,6 +37,14 @@ impl From<Error> for AppError {
             // caller-input problems, surfaced as InvalidInput (never a panic).
             Error::Template(context) => AppError::InvalidInput { context },
             Error::ContextOverflow(context) => AppError::InvalidInput { context },
+            // A missing/unusable vision projector is a load-time failure of the
+            // same class as `ModelLoad` — surface it as such so the caller can
+            // distinguish "could not bring the OCR path up" from a runtime
+            // inference fault.
+            Error::MtmdInit { path, context } => AppError::ModelLoad {
+                model_id: path,
+                context,
+            },
         }
     }
 }

@@ -851,10 +851,34 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // forwarder relays. Bounded per the "bounded channels only" rule.
             let (attachment_convert_tx, attachment_convert_rx) =
                 tokio::sync::mpsc::channel(ipc_bridge::ATTACHMENT_CONVERT_QUEUE_BOUND);
+
+            // The held-summariser cell, shared by the chat command, the
+            // inter-agent driver, AND the attachment-conversion VLM (all load the
+            // SAME Gemma-4 model once). Constructed here — before the worker — so
+            // the conversion worker can carry a `GemmaVlm` backed by it.
+            let summariser_cell = Arc::new(tokio::sync::OnceCell::new());
+
+            // The image-OCR backend for the conversion worker: a `GemmaVlm`
+            // wrapping the held summariser via a `ChatHandles`. Lazy — it loads
+            // the model + vision projector only when a direct image attachment
+            // actually reaches the VLM. The bounded single worker serialises
+            // OCR, so it never contends with itself on the GPU (it does share
+            // the device with summarise/ASR — compute serialises, acceptable
+            // for a background job).
+            let attachment_vlm: Arc<dyn minutist_common::DocVlm> =
+                Arc::new(ipc_bridge::GemmaVlm::new(ipc_bridge::ChatHandles {
+                    orchestrator: orchestrator.clone(),
+                    index: index.clone(),
+                    meetings_dir: notes_meetings_dir.clone(),
+                    event_tx: ipc_event_tx.clone(),
+                    settings: settings_handle.clone(),
+                    summariser: summariser_cell.clone(),
+                }));
             ipc_bridge::spawn_attachment_convert_worker(
                 attachment_convert_rx,
                 notes_meetings_dir.clone(),
                 ipc_event_tx.clone(),
+                Some(attachment_vlm),
             );
 
             // Converge-on-startup for attachment conversions: re-enqueue any row
@@ -909,9 +933,9 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // the flag for a running UI turn.
             let chat_cancel = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-            // The held-summariser cell, shared by the chat command + the
-            // inter-agent driver (both load the SAME model once).
-            let summariser_cell = Arc::new(tokio::sync::OnceCell::new());
+            // (The held-summariser cell — shared by chat, inter-agent, and the
+            // attachment-conversion VLM — is constructed earlier, before the
+            // conversion worker that carries the `GemmaVlm` backed by it.)
 
             // The MCP server info slot (URL + token). In the connected build this
             // is filled once the MCP server binds; in the free build it is

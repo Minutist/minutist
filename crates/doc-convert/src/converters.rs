@@ -228,9 +228,10 @@ fn format_address(address: &mail_parser::Address) -> String {
 
 /// Digital-text PDF extractor. Returns extracted text as plain paragraphs.
 ///
-/// If the extracted text is near-empty (< 100 non-whitespace chars), the
-/// VLM fallback seam is reached. The production stub returns
-/// `AppError::Unsupported`; the spike's validated path can graduate here.
+/// If the extracted text is near-empty (< 100 non-whitespace chars), the PDF is
+/// treated as scanned / image-only and rejected with `AppError::Unsupported`:
+/// this build has no PDF-page rasterisation path, so only PDFs with a usable
+/// digital text layer convert. (PDF page OCR is tracked in planning issue 0019.)
 pub fn pdf(bytes: &[u8]) -> minutist_common::AppResult<String> {
     let text = pdf_extract::extract_text_from_mem(bytes)
         .map_err(|e| ConvertError::Pdf(e.to_string()))?;
@@ -240,10 +241,13 @@ pub fn pdf(bytes: &[u8]) -> minutist_common::AppResult<String> {
         tracing::debug!(
             target: "doc-convert",
             non_ws,
-            "pdf-extract returned near-empty text; reaching VLM fallback seam"
+            "pdf-extract returned near-empty text; scanned/image-only PDF is unsupported"
         );
-        // Production stub — the spike's result slots in here.
-        return crate::vlm_fallback(bytes, "pdf");
+        return Err(minutist_common::AppError::Unsupported {
+            context: "scanned or image-only PDF — no extractable text \
+                      (PDF page OCR is not available in this build)"
+                .to_string(),
+        });
     }
 
     normalise(&text).map_err(minutist_common::AppError::from)
@@ -263,6 +267,47 @@ fn non_whitespace_count(text: &str) -> usize {
 /// exclusive — exactly the threshold count is treated as usable text.
 fn is_near_empty_text(text: &str) -> bool {
     non_whitespace_count(text) < PDF_MIN_NON_WHITESPACE_CHARS
+}
+
+// ---------------------------------------------------------------------------
+// Direct image attachments via the VLM (png / jpg / jpeg / tiff)
+// ---------------------------------------------------------------------------
+
+/// Direct image attachment converter.
+///
+/// Images have no pure-Rust text path, so the injected
+/// [`minutist_common::DocVlm`] is the only route: the bytes are decoded and
+/// re-encoded to PNG (the format the trait expects) and handed to
+/// [`minutist_common::DocVlm::image_to_markdown`]. Returns
+/// `AppError::Unsupported` when no VLM is injected, and `AppError::InvalidInput`
+/// when the bytes do not decode as `ext`.
+pub fn image(
+    bytes: &[u8],
+    ext: &str,
+    vlm: Option<&dyn minutist_common::DocVlm>,
+) -> minutist_common::AppResult<String> {
+    let Some(vlm) = vlm else {
+        return Err(minutist_common::AppError::Unsupported {
+            context: format!(
+                "image attachment .{ext} — document OCR is unavailable (no vision model)"
+            ),
+        });
+    };
+
+    let png = reencode_to_png(bytes).map_err(minutist_common::AppError::from)?;
+    let md = vlm.image_to_markdown(&png)?;
+    normalise(&md).map_err(minutist_common::AppError::from)
+}
+
+/// Decode an image (any format `image` recognises by content) and re-encode it
+/// as PNG, so the [`minutist_common::DocVlm`] always receives a valid PNG.
+fn reencode_to_png(bytes: &[u8]) -> Result<Vec<u8>> {
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| ConvertError::Image(format!("decoding image: {e}")))?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png)
+        .map_err(|e| ConvertError::Image(format!("PNG-encoding image: {e}")))?;
+    Ok(buf.into_inner())
 }
 
 // ---------------------------------------------------------------------------

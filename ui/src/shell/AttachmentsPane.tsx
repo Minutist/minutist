@@ -25,6 +25,9 @@ import "./AttachmentsPane.css";
  * The extensions the backend converter accepts (mirrors
  * `doc_convert::supported_exts()`). Used to build the file-picker `accept` list
  * and to reject an unsupported drop before the round-trip.
+ *
+ * Image extensions (`png`, `jpg`, `jpeg`, `tiff`) route to the VLM OCR path
+ * (Gemma-4 vision) rather than a pure-Rust converter.
  */
 const SUPPORTED_EXTS = [
   "txt",
@@ -37,6 +40,10 @@ const SUPPORTED_EXTS = [
   "pdf",
   "pptx",
   "docx",
+  "png",
+  "jpg",
+  "jpeg",
+  "tiff",
 ] as const;
 
 const ACCEPT = SUPPORTED_EXTS.map((e) => `.${e}`).join(",");
@@ -186,8 +193,8 @@ export function AttachmentsPane({ meetingId }: AttachmentsPaneProps) {
       </header>
 
       <p className="attachments-pane__hint">
-        Reference material — spreadsheets, slides, PDFs, web pages, emails — fed
-        to the summary as context.
+        Reference material — spreadsheets, slides, PDFs, web pages, emails,
+        images — fed to the summary as context.
       </p>
 
       {lastError && (

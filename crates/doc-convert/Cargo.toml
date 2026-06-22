@@ -24,6 +24,11 @@ pdf-extract   = { workspace = true }          # Digital-text PDF extraction
 quick-xml     = { workspace = true }          # PPTX OOXML walk (ppt/slides/*.xml)
 zip           = { workspace = true }          # PPTX / XLSX / ODS zip container + bomb guard
 
+# Image-attachment VLM OCR (third-party only — keeps doc-convert a common-only
+# leaf; no workspace-component edge). `image` decodes a png/jpg/jpeg/tiff
+# attachment and re-encodes it to PNG, the format the injected `DocVlm` expects.
+image = { workspace = true }
+
 # Markdown normalisation
 pulldown-cmark          = { workspace = true }
 pulldown-cmark-to-cmark = { workspace = true }

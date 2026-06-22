@@ -5,16 +5,15 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-# WS4-B: device-to-device sync over iroh + iroh-blobs. The crate exchanges Yjs
-# notes-updates (a small custom QUIC protocol) and meeting-media blobs (audio +
-# note assets) directly between a user's own paired devices, dialled through the
-# self-hosted relay (sync.minutist.ai) with out-of-band addressing. It depends on
-# `common` (shared types / errors) and `persistence` (read the authoritative
-# `notes.ydoc` + meeting-media paths; apply received updates). Part of the
-# CONNECTED feature surface: the crate lives in the workspace unconditionally
-# (like `mcp-server` / `tunnel-client`) but the app-main -> sync edge + the
-# ipc-bridge trait injection are only wired behind the `connected` feature in a
-# later slice (S5).
+# WS4-B: device-to-device sync over iroh. The crate exchanges Yjs notes-updates
+# (a small custom QUIC protocol) directly between a user's own paired devices,
+# dialled through the self-hosted relay (sync.minutist.ai) with out-of-band
+# addressing. Content-addressed meeting-media (audio + note assets) sync is the
+# deferred S4 slice and is NOT present yet. It depends on `common` (shared types /
+# errors) and `persistence` (read the authoritative `notes.ydoc`; apply received
+# updates). Part of the CONNECTED feature surface: the crate lives in the
+# workspace unconditionally (like `mcp-server` / `tunnel-client`) but the
+# app-main -> sync edge is wired behind the `connected` feature.
 
 [dependencies]
 minutist-common = { path = "../common" }
@@ -33,11 +32,8 @@ iroh = "=1.0.0"
 # Shareable endpoint tickets (manual device pairing). `iroh-tickets` carries the
 # `EndpointTicket` Display/FromStr round-trip that serialises this device's
 # `EndpointAddr` to a string the user copies to another device. Pinned EXACT to
-# track the iroh 1.0 line alongside `iroh` / `iroh-blobs`.
+# track the iroh 1.0 line alongside `iroh`.
 iroh-tickets = "=1.0.0"
-# Content-addressed blob transfer (audio + note assets). iroh-blobs 0.103 tracks
-# iroh 1.0 but is still pre-1.0, so it is pinned EXACT and re-checked on bumps.
-iroh-blobs = "=0.103.0"
 # yrs — the Yjs CRDT port. `persistence` owns the authoritative `notes.ydoc` and
 # its projections; `sync` uses yrs only for the wire-level reconciliation math on
 # lib0-v1 update bytes (`encode_state_vector_from_update_v1` / `diff_updates_v1`),

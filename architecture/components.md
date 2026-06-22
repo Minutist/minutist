@@ -56,11 +56,11 @@ artifact omits it. See `cross-cutting.md` — "Build variants".
 § `sync` is an **optional** edge of `app-main`, gated by the same `connected`
 Cargo feature as `mcp-server` / `tunnel-client` (it is part of the connected-tier
 surface — the free build does not sync). `sync` is a near-leaf transport crate:
-device-to-device sync over iroh + iroh-blobs, exchanging Yjs notes-update frames
-(a small custom ALPN protocol) and meeting-media blobs (audio + note assets). It
-takes **no** workspace edge beyond `common` (shared types / errors) and
-`persistence` (read the authoritative `notes.ydoc` via `NotesStore` + the
-meeting-media paths; apply received updates). The `ipc-bridge` trait injection
+device-to-device sync over iroh, exchanging Yjs notes-update frames (a small
+custom ALPN protocol). Content-addressed meeting-media (audio + note assets) sync
+is the deferred S4 slice and is not present yet. It takes **no** workspace edge
+beyond `common` (shared types / errors) and `persistence` (read the authoritative
+`notes.ydoc` via `NotesStore`; apply received updates). The `ipc-bridge` trait injection
 (the `SyncControl` seam + `DisabledSync`, mirroring the `TunnelControl` seam)
 takes NO `sync` edge — `ipc-bridge` carries the trait + `DisabledSync`
 unconditionally and `app-main` injects the connected implementation. The
@@ -76,10 +76,11 @@ add no new Cargo edge and no new public IPC command (the four sync commands were
 added in phase 1). Both are VITE_CONNECTED-gated exactly like the MCP /
 ConnectionSettings panes — tree-shaken from the free bundle at build time.
 
-Third-party deps: `iroh` / `iroh-blobs` (the QUIC transport, pinned EXACT),
-`iroh-tickets` (the `EndpointTicket` round-trip for manual device pairing, pinned
-EXACT alongside the iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same
-workspace pin as `persistence`) and `uuid`.
+Third-party deps: `iroh` (the QUIC transport, pinned EXACT), `iroh-tickets` (the
+`EndpointTicket` round-trip for manual device pairing, pinned EXACT alongside the
+iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same workspace pin as
+`persistence`) and `uuid`. (Media-blob sync, the deferred S4 slice, will add
+`iroh-blobs` when it lands; it is not a dependency today.)
 The notes-sync protocol exchanges yrs state vectors and computes the minimal
 lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
 operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —

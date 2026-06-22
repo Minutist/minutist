@@ -1,29 +1,26 @@
 //! Device-to-device sync (WS4-B).
 //!
 //! Synchronises a user's own paired devices directly over [iroh] QUIC, dialled
-//! through the self-hosted relay at `sync.minutist.ai`. Two payloads ride the
-//! one [`SyncEngine`] endpoint:
+//! through the self-hosted relay at `sync.minutist.ai`.
 //!
 //! - **Notes** — Yjs CRDT update frames over a small custom ALPN protocol
-//!   ([`notes_proto`]). The authoritative document is `persistence`'s
-//!   `notes.ydoc`; received updates are merged with
+//!   ([`notes_proto`]) on the one [`SyncEngine`] endpoint. The authoritative
+//!   document is `persistence`'s `notes.ydoc`; received updates are merged with
 //!   [`persistence::NotesStore::apply_update`].
-//! - **Meeting media** — audio (`audio.opus`) and note assets, content-addressed
-//!   via [iroh-blobs] ([`blobs`]).
+//! - **Meeting media** — audio (`audio.opus`) and note assets. NOT present yet:
+//!   content-addressed media-blob sync is the deferred S4 slice; this crate
+//!   currently syncs only notes.
 //!
 //! Peers are learned out-of-band from the account service (the same connected-tier
 //! surface as `tunnel-client`), so addressing uses iroh's `MemoryLookup` rather
 //! than DNS/pkarr discovery.
 //!
 //! This crate is part of the CONNECTED feature surface. It lives in the workspace
-//! unconditionally, but the `app-main -> sync` wiring + the `ipc-bridge` trait
-//! injection land in a later slice (S5); the free build omits it.
+//! unconditionally; the free build omits the `app-main -> sync` wiring.
 //!
 //! [iroh]: https://docs.rs/iroh/1.0.0/iroh/
-//! [iroh-blobs]: https://docs.rs/iroh-blobs/
 
 pub mod address_lookup;
-pub mod blobs;
 pub mod endpoint;
 pub mod identity;
 pub mod notes_proto;

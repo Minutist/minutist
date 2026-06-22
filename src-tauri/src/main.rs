@@ -687,6 +687,15 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
         // an empty 404 (no detail leaks). See architecture/cross-cutting.md —
         // "Note image assets".
         .register_uri_scheme_protocol(ipc_bridge::MEETING_ASSET_SCHEME, serve_note_asset)
+        // Attachment-original protocol (`meetingdoc:`). A sibling of the
+        // `meetingasset:` scheme above that serves an attachment ORIGINAL's bytes
+        // from `{meetings_dir}/<uuid>/attachments/<file>` (#0016). The webview
+        // builds `convertFileSrc(<uuid>/<hash>.<ext>, "meetingdoc")` and opens it
+        // to view/download the original. All parsing + the path-traversal guard
+        // live in `ipc_bridge::resolve_meeting_doc` (the same shape as
+        // `resolve_note_asset`, joining `attachments/`); this handler only shapes
+        // the HTTP response, 404-ing on ANY failure so no detail leaks.
+        .register_uri_scheme_protocol(ipc_bridge::MEETING_DOC_SCHEME, serve_meeting_doc)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // Mount events first so the event channel is ready before any
@@ -833,6 +842,39 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // Spawn the event forwarder so orchestrator events reach the webview.
             spawn_event_forwarder(orchestrator.clone(), app_handle.clone());
 
+            // Attachment conversion (#0016): construct the BOUNDED job queue and
+            // spawn the SINGLE long-lived worker. `add_attachment` `try_send`s a
+            // `ConvertJob` onto `attachment_convert_tx` (stored on IpcState); the
+            // worker drains it, converts each original to markdown via
+            // `doc_convert`, persists `<hash>.md`, and emits AttachmentConverted /
+            // AttachmentConversionFailed on the same `ipc_event_tx` bus the
+            // forwarder relays. Bounded per the "bounded channels only" rule.
+            let (attachment_convert_tx, attachment_convert_rx) =
+                tokio::sync::mpsc::channel(ipc_bridge::ATTACHMENT_CONVERT_QUEUE_BOUND);
+            ipc_bridge::spawn_attachment_convert_worker(
+                attachment_convert_rx,
+                notes_meetings_dir.clone(),
+                ipc_event_tx.clone(),
+            );
+
+            // Converge-on-startup for attachment conversions: re-enqueue any row
+            // left `Pending` by a crash (or a clean exit with jobs still queued)
+            // so it resumes instead of stranding. Best-effort + non-blocking on a
+            // background task, mirroring the index rebuild above. Uses
+            // `tauri::async_runtime::spawn` (NOT a bare `tokio::spawn`) — `setup`
+            // runs with no entered Tokio runtime — and `spawn_blocking` for the
+            // synchronous manifest scan so it never stalls the runtime.
+            {
+                let requeue_tx = attachment_convert_tx.clone();
+                let requeue_dir = notes_meetings_dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        ipc_bridge::requeue_pending(&requeue_dir, &requeue_tx);
+                    })
+                    .await;
+                });
+            }
+
             // Live-test UX T2: pre-warm the routed ASR model in the background so
             // the FIRST record does not pay the cold ~29 s model load at record
             // time. Best-effort + non-blocking-at-start (no download; a
@@ -920,6 +962,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 index_db_path,
                 index: index.clone(),
                 event_tx: ipc_event_tx.clone(),
+                attachment_convert_tx,
                 summariser: summariser_cell.clone(),
                 tool_registry,
                 chat_in_flight: chat_in_flight.clone(),
@@ -1225,6 +1268,58 @@ fn serve_note_asset(
                 target: "app-main",
                 path = %request.uri().path(),
                 "meetingasset request rejected: {e}"
+            );
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Vec::new())
+                .unwrap_or_else(|_| Response::new(Vec::new()))
+        }
+    }
+}
+
+/// Handle a `meetingdoc:` URI-scheme request: serve an attachment ORIGINAL's
+/// bytes from the meeting's `attachments/` directory (#0016).
+///
+/// The request URI path is `/<meeting_id>/<filename>` (as produced by
+/// `convertFileSrc(<meeting_id>/<filename>, "meetingdoc")` on the frontend). A
+/// sibling of [`serve_note_asset`]: all parsing + validation + the
+/// path-traversal guard live in `ipc_bridge::resolve_meeting_doc` (which owns the
+/// `persistence` edge); this handler only shapes the HTTP response (a `200` with
+/// the inferred `Content-Type`, or an empty `404` on ANY failure so no detail
+/// leaks).
+fn serve_meeting_doc(
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::{header, Response, StatusCode};
+
+    let meetings_dir = {
+        let state = ctx.app_handle().state::<IpcState>();
+        state.meetings_dir.clone()
+    };
+
+    match ipc_bridge::resolve_meeting_doc(&meetings_dir, request.uri().path()) {
+        Ok(doc) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, doc.content_type)
+            // Attachment originals are untrusted reference material — serve them
+            // as a download, never an inline render, so the webview cannot be
+            // coerced into executing one (e.g. a hostile `.html` original). Pairs
+            // with `doc_content_type_for` remapping html/htm → text/plain.
+            .header(header::CONTENT_DISPOSITION, "attachment")
+            // The original is immutable (content-addressed filename), so it is
+            // safe for the webview to cache aggressively.
+            .header(
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            )
+            .body(doc.bytes)
+            .unwrap_or_else(|_| Response::new(Vec::new())),
+        Err(e) => {
+            tracing::debug!(
+                target: "app-main",
+                path = %request.uri().path(),
+                "meetingdoc request rejected: {e}"
             );
             Response::builder()
                 .status(StatusCode::NOT_FOUND)

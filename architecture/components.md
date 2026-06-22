@@ -37,7 +37,8 @@ appears in:
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
 | `sync` | WS4-B | `common`, `persistence` |
-| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
+| `doc-convert` | Attachments WS | `common` |
+| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
@@ -129,7 +130,10 @@ loopback HTTP client, response streamed not buffered), `tokio`, `futures-util`,
 the `tunnel-client` component section below and `planning/WS4A_BUILD_PLAN.md` §2.
 
 Any PR adding an edge not in this table requires an architecture-doc
-update in the same commit. The table tracks **runtime** edges only;
+update in the same commit. The `doc-convert` crate adds one new edge:
+`ipc-bridge → doc-convert` (the conversion worker inside `ipc-bridge` calls
+`doc_convert::convert_to_markdown`; all other components reach `doc-convert`
+only transitively through `ipc-bridge`). The table tracks **runtime** edges only;
 test-only dev-dependencies (e.g. `diarizer → persistence` and
 `diarizer → hound` for the over-split eval's audio decode, mirroring
 `orchestrator`'s test-only deps) are documented in prose where they are
@@ -167,7 +171,8 @@ used, not added here.
 `ModelKind`, `ModelManifestEntry`, `ModelFileEntry`, `ModelStatusState`,
 `ModelStatus`, `MeetingListEntry`, `Collection`, `CollectionId`, `NotesDocument`,
 `NoteBlock`, `MeetingState`,
-`InterAgentRequest`, `InterAgentReply`),
+`InterAgentRequest`, `InterAgentReply`,
+`AttachmentId`, `ConversionState`, `AttachmentEntry`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`), the shared `AppError` enum + `AppResult<T>` alias, and the
 `apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` helper — the
@@ -178,6 +183,42 @@ refers to "Alice", not "A".
 summariser — anchored ones carry the `data-anchor-ms` recording-clock
 timestamp; `Summariser::summarise` takes `&[NoteBlock]` (not flat markdown) so
 notes weave into the transcript at their time.
+
+**Attachments — shared types (Attachments WS).** Three new vocabulary types and
+four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the
+single `collect_events![AppEventPayload]` registration — no second registration.
+
+- `AttachmentId` — a `Uuid` newtype (transparent serde, `specta::Type`), mirroring
+  `MeetingId` / `ChatSessionId` exactly.
+- `ConversionState { Pending, Ready, Failed(String) }` — serde-tagged
+  (`tag = "state", content = "reason", rename_all = "snake_case"`); `Failed`
+  carries a concise human reason string the UI shows on the attachment row.
+- `AttachmentEntry { id: AttachmentId, hash: String, original_filename: String,
+  ext: String, byte_len: u64, added_at: String, conversion: ConversionState,
+  converted_md_filename: Option<String> }` — the manifest row that crosses IPC.
+  `hash` is the hex SHA-256 of the original bytes (the dedup key shared with the
+  on-disk `<hash>.<ext>` original and `<hash>.md` sibling). `added_at` is RFC 3339
+  (same convention as `ChatSession::created_at`). `converted_md_filename` is
+  `Some("<hash>.md")` once `ConversionState` reaches `Ready`; absent otherwise
+  (`serde(default, skip_serializing_if = "Option::is_none")`).
+
+Four `AppEvent` variants (placed in a `--- Attachments ---` comment block after
+`TranslationReady`, serialised via the existing `#[serde(tag="kind",
+rename_all="snake_case")]`):
+
+- `AttachmentAdded { meeting_id: MeetingId, attachment: AttachmentEntry }` —
+  emitted by `ipc-bridge`'s `add_attachment` command after the original is stored
+  and the manifest row written (`Pending`). The webview inserts the row without a
+  re-list.
+- `AttachmentConverted { meeting_id: MeetingId, attachment_id: AttachmentId }` —
+  emitted by the bounded conversion worker when `<hash>.md` is written and the
+  manifest row flipped to `Ready`. The webview re-reads (or patches) the row.
+- `AttachmentConversionFailed { meeting_id: MeetingId, attachment_id: AttachmentId,
+  reason: String }` — emitted by the bounded conversion worker on a best-effort
+  conversion failure (never crashes the worker). The UI shows `reason` on the row.
+- `AttachmentRemoved { meeting_id: MeetingId, attachment_id: AttachmentId }` —
+  emitted by `ipc-bridge`'s `remove_attachment` command after the manifest row is
+  dropped and any now-unreferenced hash files are unlinked.
 
 **Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
 newtype mirroring `MeetingId`); six chat `AppEvent` variants (`ChatToken`,
@@ -886,6 +927,43 @@ extra context tokens). `summarise_with_progress` now reports a two-phase
 model-load / context-prepare phase — onto labelled `OperationProgress` (see
 `cross-cutting.md` — "Operation progress"). Still depends only on `common`.
 
+**Attachments feed — `Summariser::summarise` signature widening (Attachments WS).**
+The `common::Summariser` trait gains a new leading parameter:
+
+    fn summarise(&self, transcript: &[Segment], notes: &[NoteBlock],
+                 attachments_markdown: &str, system_prompt: &str) -> AppResult<String>;
+
+`attachments_markdown` is placed before `system_prompt` so `system_prompt` stays
+last, matching the build-prompt fold order. An empty string produces byte-identical
+output to the no-attachment path (the prepend is guarded by
+`!attachments_markdown.is_empty()`). This is an **architecture-owner change** — the
+trait is the stable surface that every `Summariser` impl contracts against; all call
+sites are updated in the same commit: `LlamaSummariser`, `OllamaSummariser`, the
+`agent-tools` `resummarise` tool (passes `""`), `ipc-bridge`'s
+`summarise_meeting_inner` test stub, and the `mcp-server` + `agent-tools` test
+stubs. The prompt assembly change lives in `summariser::render_user_content`, which
+prepends a leading `# Reference material (attachments)` section when the string is
+non-empty — see the `summariser` section below.
+
+**Reference material (attachments) — Attachments WS.** When the meeting has
+Ready attachments, `ipc-bridge` assembles an `attachments_markdown: String` by
+concatenating each attachment's `<hash>.md` content in manifest order, each
+under a `## Attachment: <original_filename>` header. This string is passed into
+`summarise` as the new `attachments_markdown` parameter. `render_user_content`
+prepends a leading `# Reference material (attachments)` section — placed BEFORE
+`# Transcript` — when the string is non-empty. Attachments are reference material,
+NOT time-woven (they are not transcript lines or notes and never enter the `(ms,
+kind)` merge in `render_user_content`). An empty string produces byte-identical
+output to a run with no attachments (the prepend is conditional).
+
+Budget guard: before calling `summarise`, `ipc-bridge` deterministically truncates
+the assembled string if it would overflow `n_ctx` minus reserves (transcript +
+notes + generation headroom). Truncation is per-attachment, equal-share, and appends
+a visible `[truncated]` marker on any trimmed part. The truncation logic lives in
+`ipc-bridge` (which holds the `SummariserConfig.n_ctx` value) and is a pure helper
+function tested without a model. The `OllamaSummariser` has no `n_ctx` field; its
+callers apply the same truncation before calling `summarise`.
+
 **`external-ollama` test coverage + verification.** `OllamaSummariser`'s
 deterministic seams are factored into pure functions — `chat_url` (base-URL
 normalisation, trailing slash tolerant), `build_chat_request` (the
@@ -1095,6 +1173,61 @@ is a standalone, stateless reader/writer for a meeting's chat sessions under
   store; `persistence` stays the **sole writer** under `meetings/`. `delete_meeting`
   already removes the whole meeting folder, so a meeting's chat sessions go with
   it — no separate chat cleanup is required.
+
+**Attachments storage (Attachments WS).** New `crates/persistence/src/attachments.rs`
+module (`pub mod attachments` + re-exports in `lib.rs`). Still depends only on
+`common` — `sha2` and `chrono` were already direct dependencies.
+
+Per-meeting on-disk layout (subdir `attachments/`, distinct from `assets/` to
+avoid collision with the notes-image assets path):
+
+```
+{app-data}/meetings/{uuid}/attachments/
+    attachments.json          # manifest (Vec<AttachmentEntry>, atomic tmp+rename)
+    <sha256>.<ext>            # content-addressed original
+    <sha256>.md               # converted markdown sibling (written when Ready)
+```
+
+Public surface:
+
+- `save_attachment_original(root, meeting_id, bytes, ext) -> AppResult<String>` —
+  SHA-256-names the file (`<hash>.<ext>`), creates `attachments/` on demand, writes
+  atomically (tmp + fsync + rename, mirroring `assets.rs`), dedupes (no-op if the
+  target already exists). Returns the hash hex.
+- `read_attachment_original(root, meeting_id, filename) -> AppResult<Vec<u8>>` —
+  `is_safe_asset_filename` traversal guard FIRST (rejects any `filename` containing
+  a path separator or `..`), then reads.
+- `save_attachment_markdown(root, meeting_id, hash, md) -> AppResult<String>` —
+  writes `<hash>.md` atomically, returns the filename.
+- `read_attachment_markdown(root, meeting_id, filename) -> AppResult<String>` —
+  guarded read.
+- `unlink_attachment_files(root, meeting_id, hash, ext)` — best-effort remove
+  `<hash>.<ext>` + `<hash>.md`; ignores `NotFound`.
+
+Manifest read-modify-write uses a process-wide per-meeting `std::sync::Mutex`
+registry (`OnceLock<Mutex<HashMap<MeetingId, Arc<Mutex<()>>>>>`) — the same
+claim-style pattern as the orchestrator's offline mutex, but local to the
+attachments module. Every manifest operation (read, add, set-conversion, remove)
+holds the per-meeting lock for the whole read-modify-write so concurrent
+`add_attachment` calls cannot lose-update.
+
+Public manifest ops:
+
+- `read_manifest(root, meeting_id) -> AppResult<Vec<AttachmentEntry>>` — absent
+  file returns `Ok(vec![])` (mirrors `chat.rs`'s `NotFound` short-circuit).
+- `add_manifest_entry(root, meeting_id, entry) -> AppResult<()>` — lock, read,
+  push, write atomically.
+- `set_entry_conversion(root, meeting_id, id, state, md_filename) ->
+  AppResult<Vec<AttachmentEntry>>` — lock, read, find by id, mutate, write, return
+  new list (so the conversion worker can emit events).
+- `remove_manifest_entry(root, meeting_id, id) -> AppResult<Option<AttachmentEntry>>`
+  — lock, read, remove by id, write; then dedup-safe unlink: `unlink_attachment_files`
+  is called only if no surviving row shares the removed entry's hash. Returns the
+  removed entry (`None` → idempotent).
+
+Auto-cleanup: `meeting_ops::delete_meeting`'s `remove_dir_all` already removes the
+whole meeting folder including `attachments/` — no new cleanup path required (same
+as `assets/`, documented in `cross-cutting.md`).
 
 **Phase 4 surface growth — readers, libsql index, summary, meeting ops.**
 The minimal write-only crate grows to its full read/write surface. The
@@ -1984,6 +2117,54 @@ resolved language name is appended to the summariser and chat system prompts by
 `ipc-bridge` — the transcript itself is never touched. No new dependency edge
 on the `settings` crate. See the `ipc-bridge` "Output-language resolution" note.
 
+### `doc-convert`
+**Crate:** `crates/doc-convert`
+**Owner role:** `data-engineer`
+**Depends on:** `common` only (no workspace-component edge beyond `common`).
+
+Converts attached document bytes to canonical markdown. The single public entry
+point is:
+
+    pub fn convert_to_markdown(bytes: &[u8], ext: &str) -> AppResult<String>
+    pub fn supported_exts() -> &'static [&'static str]
+      // ["txt","md","xlsx","ods","html","htm","eml","pdf","pptx"]
+
+Each format is handled by a pure-Rust, in-process converter; no subprocess, no
+native lib, no OCR engine:
+
+| Extension | Converter |
+|---|---|
+| `txt`, `md` | passthrough |
+| `xlsx`, `ods` | `calamine` (sheet → pipe-table or TSV-style markdown) |
+| `html`, `htm` | `dom_smoothie` readability extract → `htmd` markdown |
+| `eml` | `mail-parser` → HTML body → `dom_smoothie` + `htmd`; plain-text body passthrough |
+| `pdf` | `pdf-extract` (digital text extraction only) |
+| `pptx` | `zip` open + `quick-xml` walk of `ppt/slides/slideN.xml` `<a:t>` runs, one `## Slide N` per slide |
+
+All converter output is normalised through `pulldown-cmark` (parse → re-emit) so
+the markdown is canonical before it is stored.
+
+**Robustness wrapper (binding).** Every conversion runs inside
+`std::panic::catch_unwind` — parser panics on malformed input must not crash the
+bounded conversion worker (see `cross-cutting.md` — "Attachments — parser
+sandboxing"). Before parsing, two limits are enforced and any violation is
+returned as `AppError::InvalidInput`:
+
+1. `MAX_INPUT_BYTES` (50 MiB) — checked on `bytes.len()` before parsing begins.
+2. Zip-decompression bound — for `pptx` / `xlsx` / `ods`, cumulative
+   uncompressed size and entry count are tracked via `zip`'s `by_index` sizing
+   metadata; abort if a zip-bomb ratio is exceeded.
+
+Crate-local `thiserror` `Error` converts to `common::AppError` via `From`.
+No `anyhow` in any public signature.
+
+**VLM-fallback seam (documented stub — no production code).** A private
+`fn vlm_fallback(_bytes, _ext) -> AppResult<String>` returns
+`AppError::Unsupported { context: "VLM fallback not built; see spikes/doc-vlm" }`.
+It is reached on the scanned-PDF path (when `pdf-extract` returns near-empty text)
+and is the documented slot for the `spikes/doc-vlm` result to graduate into —
+without a public-surface change.
+
 ### `tunnel-client`
 **Crate:** `crates/tunnel-client`
 **Owns:** the app-side half of the connected-tier relay tunnel (WS4-A S3b): the
@@ -2423,14 +2604,16 @@ omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
 `chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
 per-session cancel flags `cancel_chat_turn` raises, P1).
 
-The command ledger is now **39** (P6 21 + the four P9 chat commands = 25; P10's
+The command ledger is now **42** (P6 21 + the four P9 chat commands = 25; P10's
 `get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27;
 `prewarm_asr` = 28; `save_note_image` = 29; `set_speaker_name` = 30;
 `translate_meeting` + `get_translations` = 32; `get_diagnostic_report` = 33; the
 B6 WU7 CRDT editor binding's `apply_notes_update` + `load_notes_ydoc` = 35; the
 WS4-A S5b tunnel surface's `tunnel_begin_pairing` + `tunnel_poll_pairing` +
-`set_connector_enabled` + `tunnel_status` = 39), asserted by the
-`bindings_builder_registers_expected_command_ledger` test.
+`set_connector_enabled` + `tunnel_status` = 39; #0015 merges `re_transcribe` +
+`rediarize_meeting` into `reprocess` (39 − 2 + 1 = 38); the Attachments WS's
+`add_attachment` + `list_attachments` + `open_attachment` + `remove_attachment`
+= 42), asserted by the `bindings_builder_registers_expected_command_ledger` test.
 
 **Connected-tier tunnel surface (`tunnel_begin_pairing` / `tunnel_poll_pairing` /
 `set_connector_enabled` / `tunnel_status`, WS4-A S5b).** The webview drives device
@@ -2526,6 +2709,71 @@ Two commands land, using the existing `ipc-bridge → summariser` +
 derivation and are surfaced in the generated TypeScript bindings. The webview's
 `operation-progress` store terminal-event handler must clear on `TranslationReady`
 (mirrors the existing clears for `SummaryReady` / `DiarizationComplete`).
+
+**Attachments commands (Attachments WS, +4, total 43).** Four commands route
+directly to `persistence::attachments` on `spawn_blocking` (no orchestrator
+involvement — same pattern as `save_note_image`). Adds the `doc-convert` Cargo dep
+(`doc-convert = { path = "../doc-convert" }`), the one new dependency edge in the
+table.
+
+- `add_attachment(meeting_id, bytes: Vec<u8>, ext: String, original_filename:
+  String) -> AttachmentEntry` — normalises and validates `ext` against
+  `doc_convert::supported_exts()` (rejects others as `InvalidInput`, mirroring
+  `normalise_image_ext`); builds the `AttachmentEntry` (`Pending`, new
+  `AttachmentId`, SHA-256 hash, RFC-3339 `added_at`); calls
+  `persistence::save_attachment_original` + `persistence::add_manifest_entry`;
+  emits `AppEvent::AttachmentAdded`; enqueues a conversion job on the bounded
+  worker (see below). Returns the entry.
+- `list_attachments(meeting_id) -> Vec<AttachmentEntry>` — reads the manifest in
+  order via `persistence::read_manifest`.
+- `open_attachment(meeting_id, attachment_id) -> ()` — serves the original via the
+  `meetingdoc:` custom-URI scheme (see below); the frontend builds
+  `convertFileSrc("<meeting_id>/<hash>.<ext>", "meetingdoc")` and opens it via
+  `tauri-plugin-opener` (already a workspace dep).
+- `remove_attachment(meeting_id, attachment_id) -> ()` — calls
+  `persistence::remove_manifest_entry` (dedup-safe unlink inside persistence);
+  emits `AppEvent::AttachmentRemoved`.
+
+**`meetingdoc:` URI scheme.** A sibling of the existing `meetingasset:` scheme
+(registered in `app-main` alongside it). `ipc-bridge` exposes
+`resolve_meeting_doc(meetings_dir, request_path) -> ResolvedMeetingDoc` +
+`MEETING_DOC_SCHEME`, mirroring `resolve_note_asset` / `MEETING_ASSET_SCHEME`
+but joining `attachments/` instead of `assets/`. The same `is_safe_asset_filename`
+path-traversal guard applies; any validation or read failure returns an empty 404.
+`content_type_for` is extended to cover the attachment MIME types (`pdf`,
+`xlsx`/`ods`, `eml`, `pptx`, etc.) alongside the existing image types. The `app-main`
+handler reads `meetings_dir` from `IpcState` and delegates parse + read to
+`ipc_bridge::resolve_meeting_doc` — `app-main` does not depend on `persistence`
+directly (same architecture as the `meetingasset:` handler).
+
+**Bounded conversion worker (binding).** `IpcState` gains
+`attachment_convert_tx: tokio::sync::mpsc::Sender<ConvertJob>` (bounded — no
+unbounded channels). `app-main` constructs the `(tx, rx)` pair and spawns ONE
+long-lived worker task via `tauri::async_runtime::spawn` (mirroring
+`spawn_event_forwarder`). The worker loop receives `ConvertJob { meeting_id,
+attachment_id, hash, ext }`, runs on `spawn_blocking`:
+
+1. `persistence::read_attachment_original` → bytes
+2. `doc_convert::convert_to_markdown(&bytes, &ext)` — `catch_unwind` already
+   inside `doc-convert`
+3. On `Ok`: `persistence::save_attachment_markdown` + `set_entry_conversion(Ready,
+   Some(filename))` → emit `AppEvent::AttachmentConverted`
+4. On `Err`: `set_entry_conversion(Failed(reason))` → emit
+   `AppEvent::AttachmentConversionFailed`
+
+Every error is logged (`target: "ipc-bridge"`); the worker never panics. If the
+bounded queue is full, `add_attachment` uses `try_send`, logs the back-pressure,
+and marks the entry `Failed("conversion queue full")` immediately so the UI does not
+show a permanent `Pending`.
+
+**Summarise path — attachments feed (Attachments WS).** `summarise_meeting_with_progress`
+(the `run_held_summarise` path) reads the meeting's manifest, concatenates every
+`Ready` entry's `<hash>.md` under a `## Attachment: <original_filename>` header in
+manifest order, applies the deterministic per-attachment budget-truncation helper,
+and passes the resulting `attachments_markdown: &str` into `summarise`. An empty
+manifest (or no Ready entries) passes `""`, producing byte-identical output to the
+no-attachment path. `summarise_meeting_inner` (the `#[cfg(test)]` stub path) passes
+`""` to preserve existing test behaviour.
 
 ### `app-main` (bin)
 **Crate:** `src-tauri/` (Tauri convention)

@@ -52,6 +52,7 @@
 //! app-main).
 
 pub mod assets;
+pub mod attachments;
 pub mod chat;
 pub mod collections;
 pub mod error;
@@ -71,6 +72,12 @@ pub mod ydoc;
 
 // Public re-exports for the crate's primary surface.
 pub use assets::{read_note_asset, save_note_asset};
+pub use attachments::{
+    add_manifest_entry, read_attachment_markdown, read_attachment_original,
+    read_attachments_markdown_parts, read_manifest, remove_manifest_entry,
+    save_attachment_markdown, save_attachment_original, set_entry_conversion,
+    unlink_attachment_files, unlink_orphan_attachment_markdown,
+};
 pub use chat::ChatStore;
 pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;

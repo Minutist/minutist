@@ -105,6 +105,32 @@ impl Default for CollectionId {
     }
 }
 
+/// Stable identifier for a meeting attachment on disk. UUIDv4. Mirrors
+/// [`MeetingId`].
+///
+/// Carried on [`AttachmentEntry`] and the four attachment [`AppEvent`]
+/// variants so the webview store can route adds / conversions / removes to
+/// the right row without a re-list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
+pub struct AttachmentId(
+    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
+);
+
+impl AttachmentId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for AttachmentId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Stable identifier for a model in the registry.
 ///
 /// Examples: `"qwen3-asr-1.7b-q8_0"`, `"qwen2.5-3b-instruct-q4_k_m"`,
@@ -587,6 +613,68 @@ pub struct ChatSession {
 }
 
 // ---------------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------------
+
+/// The conversion state of a meeting attachment. Stored on [`AttachmentEntry`]
+/// and updated by the bounded background conversion worker in `ipc-bridge`.
+///
+/// `Failed` carries a concise human string the attachments pane shows on the
+/// row. The `state`/`reason` serde tagging mirrors `AppError`'s `code`/`context`
+/// shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum ConversionState {
+    /// The original has been stored; the background converter has not yet
+    /// processed it.
+    Pending,
+    /// `<hash>.md` exists alongside the original; the attachment is ready for
+    /// the summariser feed.
+    Ready,
+    /// Conversion finished with an error (best-effort; never crashes the worker).
+    /// The string is a concise human-readable reason shown in the pane.
+    Failed(String),
+}
+
+/// One persisted attachment row for a meeting.
+///
+/// `persistence::attachments` stores a `Vec<AttachmentEntry>` as
+/// `attachments/attachments.json` (atomic tmp+rename); the IPC attachment
+/// commands load/save it. Content-addressed originals live at
+/// `attachments/<hash>.<ext>`; converted markdown siblings at
+/// `attachments/<hash>.md`.
+///
+/// `hash` is hex-encoded SHA-256 of the original bytes — the dedup key shared
+/// with the on-disk filenames. `byte_len` is the original's size in bytes
+/// (matches existing `u64` wire fields). `added_at` is RFC 3339 (UTC), mirroring
+/// `ChatSession::created_at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct AttachmentEntry {
+    pub id: AttachmentId,
+    /// Hex-encoded SHA-256 of the original bytes. Shared with the on-disk
+    /// `<hash>.<ext>` original and `<hash>.md` sibling; used for dedup-safe
+    /// remove.
+    pub hash: String,
+    /// The user-visible original filename (e.g. `"Q2_report.xlsx"`).
+    pub original_filename: String,
+    /// Lower-cased, dot-less extension (e.g. `"xlsx"`, `"pdf"`).
+    pub ext: String,
+    /// Size of the original file in bytes.
+    pub byte_len: u64,
+    /// RFC 3339 timestamp (UTC) when the attachment was added, mirroring
+    /// `ChatSession::created_at`.
+    pub added_at: String,
+    /// Whether `doc-convert` has processed this attachment.
+    pub conversion: ConversionState,
+    /// The filename of the converted markdown sibling (`"<hash>.md"`), present
+    /// once `conversion` is [`ConversionState::Ready`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converted_md_filename: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Inter-agent bridge (Phase 9 precursor; consumed by Phase 10 MCP)
 // ---------------------------------------------------------------------------
 
@@ -837,6 +925,37 @@ pub enum AppEvent {
         /// relevant language cache.
         language: String,
     },
+    // --- Attachments ---------------------------------------------------------
+    // These ride the existing `AppEventPayload` newtype + the single
+    // `collect_events![AppEventPayload]` registration in `ipc-bridge` — no new
+    // event registration needed.
+    /// A new attachment was added to a meeting (original stored + manifest row
+    /// written with `conversion: Pending`). The webview inserts the row without
+    /// a re-list.
+    AttachmentAdded {
+        meeting_id: MeetingId,
+        attachment: AttachmentEntry,
+    },
+    /// An attachment's background conversion finished; `<hash>.md` now exists
+    /// and the manifest row is `Ready`. The webview flips the row to Ready.
+    AttachmentConverted {
+        meeting_id: MeetingId,
+        attachment_id: AttachmentId,
+    },
+    /// An attachment's background conversion failed (best-effort; never crashes
+    /// the worker). `reason` is a concise human string the pane shows on the row.
+    AttachmentConversionFailed {
+        meeting_id: MeetingId,
+        attachment_id: AttachmentId,
+        reason: String,
+    },
+    /// An attachment was removed (manifest row dropped; hash files unlinked iff
+    /// no other row shares the hash). The webview drops the row.
+    AttachmentRemoved {
+        meeting_id: MeetingId,
+        attachment_id: AttachmentId,
+    },
+
     /// Model download progress, used by the first-run flow.
     ModelDownloadProgress {
         model_id: ModelId,
@@ -1408,17 +1527,28 @@ pub trait Diarizer: Send {
 /// (never stored — SP0); `OllamaSummariser` holds a `reqwest::blocking::Client`
 /// (Sync); the test stub holds `Mutex`-guarded fields (Sync).
 pub trait Summariser: Send + Sync {
-    /// Produce a markdown summary from a transcript + the user's notes.
+    /// Produce a markdown summary from a transcript, the user's notes, and any
+    /// attachment reference material.
     ///
     /// `notes` are the note paragraphs in document order (#70). Anchored
     /// paragraphs (`NoteBlock::at_ms == Some`) are woven into the transcript at
     /// their recording-clock timestamp; un-anchored paragraphs render as a
-    /// trailing block. An empty slice means no notes were taken. `system_prompt`
-    /// is the user-configured prompt from settings.
+    /// trailing block. An empty slice means no notes were taken.
+    ///
+    /// `attachments_markdown` is a pre-assembled block containing every `Ready`
+    /// attachment's converted markdown, each under a `## Attachment: <name>`
+    /// heading, rendered as a leading `# Reference material (attachments)`
+    /// section — NOT time-woven. Pass `""` when there are no ready attachments;
+    /// an empty string produces byte-identical output to the no-attachment path.
+    /// The caller (ipc-bridge) is responsible for assembling and deterministically
+    /// truncating this string to fit within the context-window budget.
+    ///
+    /// `system_prompt` is the user-configured prompt from settings.
     fn summarise(
         &self,
         transcript: &[Segment],
         notes: &[NoteBlock],
+        attachments_markdown: &str,
         system_prompt: &str,
     ) -> AppResult<String>;
 }

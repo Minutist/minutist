@@ -14,6 +14,7 @@ import { MeetingMasthead } from "./MeetingMasthead";
 import { RecordingMasthead } from "./RecordingMasthead";
 import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
+import { AttachmentsPane } from "./AttachmentsPane";
 import { ChatView } from "./ChatView";
 import { SettingsDrawer } from "./SettingsDrawer";
 import { About } from "./About";
@@ -138,6 +139,12 @@ export function MainWindow() {
   // `activeMeetingId` to scope the conversation.
   const showChatPane = inWorkspace && activeMeetingId !== null;
 
+  // Attachments are reference material, not part of the live pipeline, so the
+  // pane is offered the moment the workspace is operating on a concrete meeting
+  // — before, during, and after recording — NOT gated on a finished meeting
+  // (unlike summary). Hidden by default; one click on the toggle reveals it.
+  const showAttachmentsPane = inWorkspace && activeMeetingId !== null;
+
   // Pane visibility (FR-21/FR-30). Panes are included/excluded from the Group
   // rather than collapsed to zero width. Reset to the per-mode default whenever
   // the workspace is (re-)entered or the mode flips (see the effect below).
@@ -147,6 +154,8 @@ export function MainWindow() {
   // Chat is OFF by default (notes are the primary surface); one click on the
   // toggle reveals it.
   const [chatShown, setChatShown] = useState(false);
+  // Attachments are OFF by default; one click on the toggle reveals the column.
+  const [attachmentsShown, setAttachmentsShown] = useState(false);
 
   // The About dialog (Phase 7, S6) is hidden by default; a header affordance
   // opens it. Presentational overlay; closing returns to the prior surface.
@@ -184,6 +193,7 @@ export function MainWindow() {
     setTranscriptShown(false);
     setSummaryShown(true); // only rendered when showSummaryPane (finished meeting)
     setChatShown(false); // chat is one click away on the toggle
+    setAttachmentsShown(false); // attachments are one click away on the toggle
   }, [inWorkspace, showSummaryPane]);
 
   // How many panes are currently visible — used to forbid hiding the last one.
@@ -191,7 +201,8 @@ export function MainWindow() {
     (notesShown ? 1 : 0) +
     (transcriptShown ? 1 : 0) +
     (showSummaryPane && summaryShown ? 1 : 0) +
-    (showChatPane && chatShown ? 1 : 0);
+    (showChatPane && chatShown ? 1 : 0) +
+    (showAttachmentsPane && attachmentsShown ? 1 : 0);
 
   function togglePane(shown: boolean, setShown: (next: boolean) => void) {
     // Never hide the last visible pane — the workspace must show something.
@@ -295,6 +306,18 @@ export function MainWindow() {
                   onClick={() => togglePane(chatShown, setChatShown)}
                 >
                   Chat
+                </button>
+              )}
+              {showAttachmentsPane && (
+                <button
+                  type="button"
+                  className="main-window__view-seg"
+                  aria-pressed={attachmentsShown}
+                  onClick={() =>
+                    togglePane(attachmentsShown, setAttachmentsShown)
+                  }
+                >
+                  Attachments
                 </button>
               )}
             </div>
@@ -457,6 +480,19 @@ export function MainWindow() {
                 <ChatView meetingId={activeMeetingId} />
               </Panel>
             ),
+            showAttachmentsPane &&
+              attachmentsShown &&
+              activeMeetingId !== null && (
+                <Panel
+                  key="attachments"
+                  id="attachments"
+                  className="main-window__pane main-window__pane--attachments"
+                  minSize="18%"
+                  defaultSize="30%"
+                >
+                  <AttachmentsPane meetingId={activeMeetingId} />
+                </Panel>
+              ),
           ])}
         </Group>
       ) : (

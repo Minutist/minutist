@@ -23,6 +23,7 @@ role when work is parallel.
 | `summariser` | ml-runtime-engineer | `crates/summariser/**` | Same | `common` |
 | `model-registry` | ml-runtime-engineer | `crates/model-registry/**` | Same | `common`, `settings` |
 | `persistence` | data-engineer | `crates/persistence/**` | Same | `common` |
+| `doc-convert` | data-engineer | `crates/doc-convert/**` | Same | `common` only — NO other workspace-component edge |
 | `settings` | data-engineer | `crates/settings/**` | Same | `common` |
 | `orchestrator` | systems-engineer | `crates/orchestrator/**` | Same | `common` + all live-pipeline crates per table in `components.md` |
 | `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator` |
@@ -30,7 +31,7 @@ role when work is parallel.
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
 | `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |
 | `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `persistence` |
-| `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
+| `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |
 
@@ -39,6 +40,21 @@ restated. Adding any other edge requires updating
 [`components.md`](components.md) in the same commit.
 
 ## Cross-cutting ownership notes
+
+- **Attachments common types (Attachments WS).** `AttachmentId`, `ConversionState`,
+  `AttachmentEntry`, and the four `AppEvent` variants (`AttachmentAdded`,
+  `AttachmentConverted`, `AttachmentConversionFailed`, `AttachmentRemoved`) are owned
+  by `common` (architecture-owner). Adding them was an architecture-owner change
+  (parallel-work rule 2). They follow the additive-field discipline (serde-defaulted,
+  specta-derived) and ride the existing `AppEventPayload` + `collect_events!`
+  registration — no second event bus.
+
+- **`Summariser::summarise` widening (Attachments WS).** The trait gains
+  `attachments_markdown: &str` before `system_prompt` — an architecture-owner
+  change (the "Change shape" table: trait changes are architecture-owner). All
+  impls and call sites are updated in the same commit so the workspace compiles
+  throughout; the empty-string path is byte-identical to the prior no-attachment
+  behaviour (asserted by a `summariser` unit test).
 
 - **VRAM-aware GPU placement.** `common` (architecture-owner) owns the VRAM
   probe `probe_primary_gpu()` (behind the `llama-backend` feature) + the **pure**
@@ -148,6 +164,8 @@ These rules let multiple agents work concurrently without coordination:
 | "Add a new keyboard shortcut" | frontend-engineer |
 | "Refactor the live pipeline to use a different chunking strategy" | systems-engineer (orchestrator) — but specify the new contract in this doc first |
 | "Add Ollama dispatcher as a `Summariser` impl" | ml-runtime-engineer (lives in `summariser`, no new edge) |
+| "Add a new document format converter" | data-engineer (`doc-convert` — one match arm in `convert_to_markdown` + a fixture test) |
+| "Adjust attachment storage layout or manifest schema" | data-engineer (`persistence::attachments`) + architecture-owner if the `AttachmentEntry` shape changes |
 | "Add a chat tool" | systems-engineer (`agent-tools` — one `impl Tool` + register in `ToolRegistry::v1`) |
 | "Change the agent loop / sampling / tool-call parsing" | ml-runtime-engineer (`chat-agent`) |
 | "Expose a tool over MCP" | systems-engineer (the `expose_over_mcp` allowlist + the `mcp_write_tools` gate in `mcp-server`); the tool itself is `agent-tools` |

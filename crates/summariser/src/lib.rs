@@ -247,10 +247,11 @@ impl LlamaSummariser {
         &self,
         transcript: &[Segment],
         notes: &[NoteBlock],
+        attachments_markdown: &str,
         system_prompt: &str,
         mut on_progress: impl FnMut(SummariseProgress),
     ) -> AppResult<String> {
-        let prompt = self.build_prompt(transcript, notes, system_prompt)?;
+        let prompt = self.build_prompt(transcript, notes, attachments_markdown, system_prompt)?;
         let raw = self.generate_with_progress(&prompt, &mut on_progress)?;
         Ok(strip_think_block(&raw))
     }
@@ -314,9 +315,10 @@ impl Summariser for LlamaSummariser {
         &self,
         transcript: &[Segment],
         notes: &[NoteBlock],
+        attachments_markdown: &str,
         system_prompt: &str,
     ) -> AppResult<String> {
-        let prompt = self.build_prompt(transcript, notes, system_prompt)?;
+        let prompt = self.build_prompt(transcript, notes, attachments_markdown, system_prompt)?;
         let raw = self.generate(&prompt)?;
         Ok(strip_think_block(&raw))
     }
@@ -341,6 +343,7 @@ impl LlamaSummariser {
         &self,
         transcript: &[Segment],
         notes: &[NoteBlock],
+        attachments_markdown: &str,
         system_prompt: &str,
     ) -> Result<String, Error> {
         let template = self
@@ -348,7 +351,7 @@ impl LlamaSummariser {
             .chat_template(None::<&str>)
             .map_err(|e| Error::Template(e.to_string()))?;
 
-        let user_content = render_user_content(transcript, notes);
+        let user_content = render_user_content(transcript, notes, attachments_markdown);
         let combined = format!("{system_prompt}\n\n{user_content}");
 
         let user_msg = LlamaChatMessage::new("user".to_string(), combined.clone())
@@ -583,9 +586,22 @@ fn gemma_turn_prompt(content: &str) -> String {
 /// or notes were typed while idle / imported — the transcript renders WITHOUT
 /// per-line timestamps (the prior format), so the common case spends no extra
 /// context tokens and the no-notes prompt is byte-for-byte unchanged.
-fn render_user_content(transcript: &[Segment], notes: &[NoteBlock]) -> String {
+fn render_user_content(
+    transcript: &[Segment],
+    notes: &[NoteBlock],
+    attachments_markdown: &str,
+) -> String {
     let any_anchored = notes.iter().any(|n| n.at_ms.is_some());
     let mut out = String::new();
+
+    // Reference material (attachments) is a LEADING section — not time-woven, so
+    // it never enters the (ms, kind) merge below. When empty the prepend is
+    // skipped so the rendered output is byte-identical to the no-attachment path.
+    if !attachments_markdown.is_empty() {
+        out.push_str("# Reference material (attachments)\n\n");
+        out.push_str(attachments_markdown);
+        out.push_str("\n\n");
+    }
 
     if any_anchored {
         out.push_str("# Transcript (notes woven in at the time they were written)\n\n");
@@ -1025,7 +1041,7 @@ mod tests {
             seg("hello there", Some("Speaker 1")),
             seg("general kenobi", Some("Speaker 2")),
         ];
-        let body = render_user_content(&transcript, &[note(None, "- action item one")]);
+        let body = render_user_content(&transcript, &[note(None, "- action item one")], "");
 
         assert!(body.contains("# Transcript"));
         assert!(body.contains("Speaker 1: hello there"));
@@ -1039,7 +1055,7 @@ mod tests {
     #[test]
     fn render_user_content_without_speakers_or_notes() {
         let transcript = vec![seg("just one line", None)];
-        let body = render_user_content(&transcript, &[]);
+        let body = render_user_content(&transcript, &[], "");
         assert!(body.contains("just one line"));
         assert!(!body.contains(": just one line"), "no speaker prefix expected");
         assert!(body.contains("(no notes taken)"));
@@ -1054,7 +1070,7 @@ mod tests {
             seg_at(65_000, "later point", Some("Bob")),
         ];
         let notes = vec![note(Some(60_000), "follow up on budget")];
-        let body = render_user_content(&transcript, &notes);
+        let body = render_user_content(&transcript, &notes, "");
 
         assert!(body.contains("woven in"), "weaving heading expected: {body}");
         let note_pos = body.find("NOTE — follow up on budget").expect("note line");
@@ -1072,7 +1088,7 @@ mod tests {
     fn render_user_content_segment_outranks_note_at_equal_timestamp() {
         let transcript = vec![seg_at(30_000, "said this", Some("Cara"))];
         let notes = vec![note(Some(30_000), "wrote this")];
-        let body = render_user_content(&transcript, &notes);
+        let body = render_user_content(&transcript, &notes, "");
         let seg_pos = body.find("Cara: said this").expect("seg");
         let note_pos = body.find("NOTE — wrote this").expect("note");
         assert!(seg_pos < note_pos, "transcript ranks before a note at the same ms");
@@ -1085,11 +1101,51 @@ mod tests {
             note(Some(5_000), "anchored thought"),
             note(None, "pre-meeting agenda"),
         ];
-        let body = render_user_content(&transcript, &notes);
+        let body = render_user_content(&transcript, &notes, "");
         let woven = body.find("anchored thought").expect("anchored");
         let trailing_header = body.find("# Notes (no timestamp)").expect("trailing header");
         let trailing = body.find("pre-meeting agenda").expect("unanchored");
         assert!(woven < trailing_header && trailing_header < trailing);
+    }
+
+    #[test]
+    fn render_user_content_empty_attachments_is_byte_identical() {
+        // The no-attachment regression guard (LOCKED): passing `""` for
+        // `attachments_markdown` must produce output byte-identical to the prior
+        // two-arg behaviour (the leading section is skipped entirely).
+        let transcript = vec![
+            seg("hello there", Some("Speaker 1")),
+            seg("general kenobi", Some("Speaker 2")),
+        ];
+        let notes = vec![note(None, "- action item one")];
+        let empty = render_user_content(&transcript, &notes, "");
+        // Re-render WITHOUT prepending anything (the leading `if !is_empty()`
+        // block is skipped) — the body starts at the `# Transcript` heading.
+        assert!(
+            empty.starts_with("# Transcript"),
+            "empty attachments must not prepend any reference-material header: {empty:?}"
+        );
+        assert!(!empty.contains("# Reference material (attachments)"));
+    }
+
+    #[test]
+    fn render_user_content_prepends_reference_material_when_non_empty() {
+        let transcript = vec![seg("a line", None)];
+        let body = render_user_content(
+            &transcript,
+            &[],
+            "## Attachment: agenda.txt\n\nDiscuss Q3 roadmap\n",
+        );
+        let header = body
+            .find("# Reference material (attachments)")
+            .expect("leading attachments header");
+        let attachment = body.find("## Attachment: agenda.txt").expect("attachment header");
+        let transcript_pos = body.find("# Transcript").expect("transcript header");
+        assert!(header < attachment, "reference-material header leads the section");
+        assert!(
+            attachment < transcript_pos,
+            "attachments render BEFORE the transcript (leading, not woven)"
+        );
     }
 
     #[test]
@@ -1245,7 +1301,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let summary = summariser
-            .summarise(&transcript, &notes, system_prompt)
+            .summarise(&transcript, &notes, "", system_prompt)
             .expect("summarise must succeed");
         let elapsed = start.elapsed();
 
@@ -1304,6 +1360,7 @@ mod tests {
             .summarise(
                 &transcript,
                 &[],
+                "",
                 "You are a meeting-notes assistant. Produce a concise markdown \
                  summary with headings.",
             )

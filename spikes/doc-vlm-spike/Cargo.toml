@@ -1,0 +1,63 @@
+[package]
+name = "spike-doc-vlm"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "spike-doc-vlm"
+path = "src/main.rs"
+
+# GPU passthrough. The spike is isolated from the app fan-out, so it wires the
+# llama-cpp-2 backend feature directly:
+#   cargo run -p spike-doc-vlm --release --features vulkan
+# CPU-only is the default (no Vulkan/Metal/CUDA SDK required to build or run).
+[features]
+default = []
+vulkan = ["llama-cpp-2/vulkan"]
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+rocm = ["llama-cpp-2/rocm"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+encoding_rs = "0.8"
+sha2 = { workspace = true }
+
+# Multimodal LLM inference — same exact pin as the rest of the workspace.
+# `mtmd` feature enables MtmdBitmap::from_buffer, which this spike drives with
+# rasterised / synthesised page bitmaps rather than audio.
+llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["mtmd"] }
+
+# PDF rasteriser for the optional --input real-document path. pdfium-render
+# wraps Google PDFium (BSD-3). It does NOT bundle the PDFium shared library;
+# the spike auto-downloads a prebuilt from bblanchon/pdfium-binaries and binds
+# to the extracted path at runtime (Pdfium::bind_to_library). `image_025` wires
+# as_image() to the image 0.25 API.
+pdfium-render = { workspace = true }
+
+# Image buffer + PNG encode (synthetic fixtures and PDF page raster).
+image = { workspace = true }
+
+# --- Spike-only deps (spike crates are exempt from the workspace dep table) ---
+
+# Synchronous HTTP for model + PDFium downloads. ureq follows 3xx redirects by
+# default (HF resolve URLs and GitHub release assets both redirect to a CDN).
+ureq = { version = "2", features = ["tls"] }
+
+# OS cache/data dir resolution for the spike model + binary cache.
+dirs = "5"
+
+# Extract the bblanchon PDFium .tgz (gzip tarball).
+flate2 = "1"
+tar = "0.4"
+
+# Pure-Rust glyph rasterisation for the self-contained synthetic fixtures.
+ab_glyph = "0.2"
+
+# Levenshtein / normalised edit distance for the CER gate (OmniDocBench-style).
+strsim = "0.11"

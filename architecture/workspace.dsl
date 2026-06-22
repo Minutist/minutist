@@ -107,6 +107,8 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 settings = component "settings" "Settings schema, validation, change notifications. Persists via tauri-plugin-store." "Rust crate: crates/settings"
 
+                docConvert = component "doc-convert" "Converts attached document bytes (PDF, XLSX, PPTX, HTML, EML, ODS, txt/md) to canonical markdown. Pure-Rust in-process; catch_unwind sandboxed; no OCR. Public surface: convert_to_markdown + supported_exts." "Rust crate: crates/doc-convert"
+
                 ipcBridge = component "ipc-bridge" "Tauri command + event surface. tauri-specta generates the TypeScript bindings consumed by the webview's IPC client. The only crate that knows about Tauri APIs." "Rust crate: crates/ipc-bridge"
 
                 appMain = component "app-main" "Tauri main binary. Wires components, owns process lifetime, handles tray icon and window management." "Rust crate: src-tauri (bin)"
@@ -235,6 +237,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.ipcBridge -> minutist.core.settings    "Get / set settings"
         minutist.core.ipcBridge -> minutist.core.agentTools  "Builds the registry + context; dispatches tools"
         minutist.core.ipcBridge -> minutist.core.chatAgent   "Holds the engine; drives the turn loop"
+        minutist.core.ipcBridge -> minutist.core.docConvert  "Enqueues attachment conversion jobs; calls convert_to_markdown in the bounded worker"
         minutist.core.appMain   -> minutist.core.ipcBridge   "Mounts command handlers"
         minutist.core.appMain   -> minutist.core.orchestrator "Owns lifetime"
         minutist.core.appMain   -> minutist.core.agentTools  "Wires the tool registry"

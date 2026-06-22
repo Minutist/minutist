@@ -309,7 +309,13 @@ mod tests {
 
             struct StubSummariser;
             impl Summariser for StubSummariser {
-                fn summarise(&self, _: &[Segment], _: &[NoteBlock], _: &str) -> AppResult<String> {
+                fn summarise(
+                    &self,
+                    _: &[Segment],
+                    _: &[NoteBlock],
+                    _: &str,
+                    _: &str,
+                ) -> AppResult<String> {
                     Ok(String::new())
                 }
             }

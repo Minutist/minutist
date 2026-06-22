@@ -69,10 +69,19 @@ vi.mock("../ipc/summary", () => ({
   getSummary: vi.fn().mockResolvedValue(null),
   saveSummary: vi.fn().mockResolvedValue(undefined),
 }));
+// The attachments column mounts the AttachmentsPane, which reads through the
+// attachments seam; mock it so toggling the column renders without a backend.
+vi.mock("../ipc/attachments", () => ({
+  addAttachment: vi.fn(),
+  listAttachments: vi.fn().mockResolvedValue([]),
+  openAttachment: vi.fn().mockResolvedValue(undefined),
+  removeAttachment: vi.fn().mockResolvedValue(undefined),
+}));
 
 import { MainWindow } from "../shell/MainWindow";
 import { useMeetingsStore } from "../state/meetings";
 import { useRecordingStore } from "../state/recording";
+import { listAttachments } from "../ipc/attachments";
 
 /** The segmented pane-visibility toggle and its segment buttons. */
 function viewToggle() {
@@ -205,6 +214,44 @@ describe("MainWindow workspace columns", () => {
       expect(screen.getByTestId("summary")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("transcript")).not.toBeInTheDocument();
+  });
+
+  it("the Attachments pane is hidden by default but revealable via the toggle", async () => {
+    await renderFinishedMeeting();
+    // Hidden by default — the column is not in the Group.
+    expect(screen.queryByTestId("attachments")).not.toBeInTheDocument();
+    // The segment is present (always-available for a concrete meeting) + unpressed.
+    expect(segment("Attachments")).toHaveAttribute("aria-pressed", "false");
+
+    act(() => fireEvent.click(segment("Attachments")));
+    expect(screen.getByTestId("attachments")).toBeInTheDocument();
+    expect(segment("Attachments")).toHaveAttribute("aria-pressed", "true");
+
+    act(() => fireEvent.click(segment("Attachments")));
+    await waitFor(() =>
+      expect(screen.queryByTestId("attachments")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("offers the Attachments pane during a live recording (not mode-gated)", async () => {
+    act(() => {
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+      useRecordingStore.setState({
+        state: { kind: "recording", meeting_id: "rec-1", started_at_ms: 0 },
+      });
+    });
+    render(<MainWindow />);
+    await waitFor(() => expect(screen.getByTestId("notes")).toBeInTheDocument());
+
+    // Unlike Summary, Attachments is offered mid-recording.
+    expect(segment("Attachments")).toHaveAttribute("aria-pressed", "false");
+    act(() => fireEvent.click(segment("Attachments")));
+    expect(screen.getByTestId("attachments")).toBeInTheDocument();
+    // Settle the pane's mount-time manifest load so its async state update
+    // does not leak past the test (avoids an act() warning).
+    await waitFor(() =>
+      expect(listAttachments).toHaveBeenCalledWith("rec-1"),
+    );
   });
 
   it("a live recording defaults to notes only — transcript hidden, no summary column", async () => {

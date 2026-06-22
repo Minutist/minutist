@@ -1,0 +1,35 @@
+[package]
+name = "doc-convert"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Owner role: data-engineer.
+# Converts raw document bytes to markdown for the summariser reference-material
+# feed. Depends ONLY on `common` (AppError/AppResult at the boundary) and
+# third-party parser crates — no other workspace-component edges.
+
+[dependencies]
+minutist-common = { path = "../common" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Document parsers (pinned to current crates.io at Gate-A, 2026-06-22)
+calamine      = { workspace = true }          # XLSX / ODS spreadsheet reader
+dom_smoothie  = { workspace = true }          # HTML readability extraction
+htmd          = { workspace = true }          # HTML → Markdown
+mail-parser   = { workspace = true }          # .eml parsing
+pdf-extract   = { workspace = true }          # Digital-text PDF extraction
+quick-xml     = { workspace = true }          # PPTX OOXML walk (ppt/slides/*.xml)
+zip           = { workspace = true }          # PPTX / XLSX / ODS zip container + bomb guard
+
+# Markdown normalisation
+pulldown-cmark          = { workspace = true }
+pulldown-cmark-to-cmark = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+# Used only by the PDF integration tests to synthesise small text/blank PDFs at
+# test time rather than committing opaque binary fixtures.
+printpdf = "0.7"

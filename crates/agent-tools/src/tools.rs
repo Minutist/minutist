@@ -580,7 +580,10 @@ impl Tool for Resummarise {
         // (tokio cannot cancel it).
         let summariser = ctx.summariser.clone();
         let join = tokio::task::spawn_blocking(move || {
-            summariser.summarise(&transcript, &notes, &instruction)
+            // The resummarise tool carries no attachment context — pass an empty
+            // reference-material block so this is byte-identical to the
+            // pre-attachments summarise path.
+            summariser.summarise(&transcript, &notes, "", &instruction)
         });
         let text = match tokio::time::timeout(RESUMMARISE_TIMEOUT, join).await {
             Ok(joined) => joined.map_err(|e| AppError::Internal {

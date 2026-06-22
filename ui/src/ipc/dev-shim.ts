@@ -18,6 +18,8 @@
  */
 import type {
   AppEvent,
+  AttachmentEntry,
+  AttachmentId,
   AudioDevice,
   ChatSession,
   ChatSessionId,
@@ -587,6 +589,74 @@ export const devCommands = {
     devSummaries.set(meetingId, summaryMarkdown);
     return ok(null);
   },
+  // Reference-material attachments. The DEV shim keeps an in-memory list per
+  // meeting (seeded with a couple of rows in mixed conversion states) so the
+  // attachments pane renders + mutates under `vite dev`. No real bytes are
+  // stored and `open_attachment` is inert (no OS file to open).
+  async addAttachment(
+    meetingId: MeetingId,
+    bytes: number[],
+    ext: string,
+    originalFilename: string,
+  ): Promise<Result<AttachmentEntry, IpcError>> {
+    const entry: AttachmentEntry = {
+      id: `dev-att-${Math.random().toString(36).slice(2, 10)}` as AttachmentId,
+      hash: Math.random().toString(36).slice(2),
+      original_filename: originalFilename,
+      ext,
+      byte_len: bytes.length,
+      added_at: new Date().toISOString(),
+      conversion: { state: "pending" },
+      converted_md_filename: null,
+    };
+    const list = devAttachments.get(meetingId) ?? [];
+    list.push(entry);
+    devAttachments.set(meetingId, list);
+    // Flip to Ready shortly after, mirroring the real background converter.
+    setTimeout(() => {
+      entry.conversion = { state: "ready" };
+      entry.converted_md_filename = `${entry.hash}.md`;
+      devAttachmentEventListeners.forEach((cb) =>
+        cb({
+          kind: "attachment_converted",
+          meeting_id: meetingId,
+          attachment_id: entry.id,
+        }),
+      );
+    }, 1200);
+    devAttachmentEventListeners.forEach((cb) =>
+      cb({ kind: "attachment_added", meeting_id: meetingId, attachment: entry }),
+    );
+    return ok(entry);
+  },
+  async listAttachments(
+    meetingId: MeetingId,
+  ): Promise<Result<AttachmentEntry[], IpcError>> {
+    return ok(devAttachments.get(meetingId) ?? []);
+  },
+  async openAttachment(
+    _meetingId: MeetingId,
+    _attachmentId: AttachmentId,
+  ): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async removeAttachment(
+    meetingId: MeetingId,
+    attachmentId: AttachmentId,
+  ): Promise<Result<null, IpcError>> {
+    const list = (devAttachments.get(meetingId) ?? []).filter(
+      (a) => a.id !== attachmentId,
+    );
+    devAttachments.set(meetingId, list);
+    devAttachmentEventListeners.forEach((cb) =>
+      cb({
+        kind: "attachment_removed",
+        meeting_id: meetingId,
+        attachment_id: attachmentId,
+      }),
+    );
+    return ok(null);
+  },
   // Phase 9 chat surface. The DEV shim drives a representative streamed turn so
   // the chat pane renders and animates under `vite dev` for visual QA: it adopts
   // (or mints) a session id, then fans out `chat_token` deltas, a tool
@@ -783,6 +853,57 @@ const devDiarizationListeners = new Set<(event: AppEvent) => void>();
 const devSummaryReadyListeners = new Set<(event: AppEvent) => void>();
 
 /**
+ * DEV-only attachment-event fan-out so the shim's attachment commands notify the
+ * live event stream. Mirrors the four real `AppEvent::Attachment*` variants.
+ */
+const devAttachmentEventListeners = new Set<(event: AppEvent) => void>();
+
+/**
+ * In-memory attachment rows per dev meeting, seeded with a mix of conversion
+ * states so the pane shows ready / converting / failed under `vite dev`.
+ */
+const devAttachments = new Map<MeetingId, AttachmentEntry[]>([
+  [
+    DEV_MEETING_ID,
+    [
+      {
+        id: "dev-att-0001" as AttachmentId,
+        hash: "a1b2c3d4e5f6",
+        original_filename: "Q2 financial summary.xlsx",
+        ext: "xlsx",
+        byte_len: 48_213,
+        added_at: new Date(Date.now() - 9 * 60_000).toISOString(),
+        conversion: { state: "ready" },
+        converted_md_filename: "a1b2c3d4e5f6.md",
+      },
+      {
+        id: "dev-att-0002" as AttachmentId,
+        hash: "f6e5d4c3b2a1",
+        original_filename: "Roadmap deck.pptx",
+        ext: "pptx",
+        byte_len: 2_104_998,
+        added_at: new Date(Date.now() - 3 * 60_000).toISOString(),
+        conversion: { state: "pending" },
+        converted_md_filename: null,
+      },
+      {
+        id: "dev-att-0003" as AttachmentId,
+        hash: "0011223344ff",
+        original_filename: "scanned-contract.pdf",
+        ext: "pdf",
+        byte_len: 887_120,
+        added_at: new Date(Date.now() - 60_000).toISOString(),
+        conversion: {
+          state: "failed",
+          reason: "no extractable text (looks scanned)",
+        },
+        converted_md_filename: null,
+      },
+    ],
+  ],
+]);
+
+/**
  * Drive a representative live event stream into the supplied callback.
  *
  * Emits an initial `state_changed` → recording, a `recording_clock`, each
@@ -809,6 +930,9 @@ export function startDevEventStream(
   // Likewise forward dev chat events (fired by the shim's `sendChatMessage`) so
   // the chat store streams the sample turn under `vite dev`.
   devChatListeners.add(emit);
+  // Likewise forward dev attachment events (fired by the shim's add/remove) so
+  // the attachments store updates the sample rows under `vite dev`.
+  devAttachmentEventListeners.add(emit);
 
   // Establish the recording state on the next tick (after stores subscribe).
   timers.push(
@@ -845,6 +969,7 @@ export function startDevEventStream(
     devSummaryReadyListeners.delete(emit);
     devDiarizationListeners.delete(emit);
     devChatListeners.delete(emit);
+    devAttachmentEventListeners.delete(emit);
     timers.forEach(clearTimeout);
     clearInterval(tick);
   };

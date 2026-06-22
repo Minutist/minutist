@@ -121,6 +121,19 @@ export const commands: Commands = {
   getSummary: (meetingId) => callCommand("getSummary", [meetingId]),
   saveSummary: (meetingId, summaryMarkdown) =>
     callCommand("saveSummary", [meetingId, summaryMarkdown]),
+  // Reference-material attachments. Originals are stored content-addressed under
+  // the meeting's `attachments/` dir; `add_attachment` enqueues a background
+  // doc→markdown conversion (the four attachment events stream the row state).
+  // `open_attachment` validates the original is reachable, then the webview
+  // opens it via the `meetingdoc:` scheme; remove is dedup-safe. The DEV shim
+  // and the Vitest mocks intercept at the `../ipc/attachments` seam, not here.
+  addAttachment: (meetingId, bytes, ext, originalFilename) =>
+    callCommand("addAttachment", [meetingId, bytes, ext, originalFilename]),
+  listAttachments: (meetingId) => callCommand("listAttachments", [meetingId]),
+  openAttachment: (meetingId, attachmentId) =>
+    callCommand("openAttachment", [meetingId, attachmentId]),
+  removeAttachment: (meetingId, attachmentId) =>
+    callCommand("removeAttachment", [meetingId, attachmentId]),
   // Phase 9 chat surface. The backend (this step, 4a) is wired; the chat UI is
   // a later step (4b). These delegations exist so the typed `commands` surface
   // matches the regenerated `bindings.ts` and consumers have a single seam.

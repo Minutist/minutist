@@ -23,6 +23,7 @@ async-trait = { workspace = true }
 minutist-common = { path = "../common", features = ["specta"] }
 orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }
+doc-convert = { path = "../doc-convert" }
 summariser = { path = "../summariser" }
 agent-tools = { path = "../agent-tools" }
 chat-agent = { path = "../chat-agent" }

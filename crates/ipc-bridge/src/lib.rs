@@ -24,6 +24,10 @@
 //! | `apply_notes_update` | `()` | CRDT editor binding (B6 WU7) |
 //! | `load_notes_ydoc` | `Option<Vec<u8>>` (v1 state) | CRDT editor binding (B6 WU7) |
 //! | `save_note_image` | `String` (portable asset ref) | notes images |
+//! | `add_attachment` | `AttachmentEntry` | attachments (#0016) |
+//! | `list_attachments` | `Vec<AttachmentEntry>` | attachments (#0016) |
+//! | `open_attachment` | `()` | attachments (#0016) |
+//! | `remove_attachment` | `()` | attachments (#0016) |
 //! | `list_meetings` | `Vec<MeetingListEntry>` | 4 |
 //! | `open_meeting` | `MeetingState` | 4 |
 //! | `rename_meeting` | `()` | 4 |
@@ -126,6 +130,7 @@
 //!
 //! All log calls use `target: "ipc-bridge"`.
 
+pub mod attachments;
 pub mod chat;
 pub mod chat_runtime;
 pub mod commands;
@@ -145,8 +150,12 @@ use minutist_common::AppEvent;
 use orchestrator::Orchestrator;
 use settings::SettingsHandle;
 use tauri_specta::{collect_commands, collect_events, Builder};
-use tokio::sync::{broadcast, OnceCell};
+use tokio::sync::{broadcast, mpsc, OnceCell};
 
+pub use attachments::{
+    requeue_pending, resolve_meeting_doc, spawn_attachment_convert_worker, ConvertJob,
+    ResolvedMeetingDoc, ATTACHMENT_CONVERT_QUEUE_BOUND, MEETING_DOC_SCHEME,
+};
 pub use chat_runtime::ChatHandles;
 pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
@@ -198,6 +207,15 @@ pub struct IpcState {
     /// re-deriving it from the orchestrator) keeps the single-bus invariant from
     /// `architecture/cross-cutting.md` "Model lifecycle".
     pub event_tx: broadcast::Sender<AppEvent>,
+    /// The send half of the BOUNDED attachment-conversion job queue. `app-main`
+    /// constructs the `(tx, rx)` pair (bound
+    /// [`attachments::ATTACHMENT_CONVERT_QUEUE_BOUND`]), stores `tx` here, and
+    /// spawns the single long-lived worker on `rx` via
+    /// [`spawn_attachment_convert_worker`]. `add_attachment` `try_send`s a
+    /// [`ConvertJob`] onto this queue; a full queue surfaces back-pressure by
+    /// marking the row `Failed` rather than blocking the command. Bounded per the
+    /// "bounded channels only" rule (`architecture/cross-cutting.md`).
+    pub attachment_convert_tx: mpsc::Sender<ConvertJob>,
     /// The lazily-loaded, **held** LLM summariser substrate (Phase 9, C2).
     ///
     /// The GGUF is loaded **once** on first chat/summarise use (via
@@ -560,6 +578,10 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::apply_notes_update,
             commands::load_notes_ydoc,
             commands::save_note_image,
+            commands::add_attachment,
+            commands::list_attachments,
+            commands::open_attachment,
+            commands::remove_attachment,
             commands::list_meetings,
             commands::open_meeting,
             commands::rename_meeting,
@@ -699,7 +721,9 @@ mod tests {
     /// `tunnel_poll_pairing` / `set_connector_enabled` / `tunnel_status`:
     /// 35 + 4 = 39; #0015 merges `re_transcribe` + `rediarize_meeting` into one
     /// `reprocess`: 39 − 2 + 1 = 38; the WS4-B S5 sync surface adds `sync_status`
-    /// / `sync_get_my_ticket` / `sync_add_peer` / `sync_now`: 38 + 4 = 42).
+    /// / `sync_get_my_ticket` / `sync_add_peer` / `sync_now`: 38 + 4 = 42; #0016
+    /// adds the attachments surface `add_attachment` / `list_attachments` /
+    /// `open_attachment` / `remove_attachment`: 42 + 4 = 46).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -731,6 +755,10 @@ mod tests {
             "apply_notes_update",
             "load_notes_ydoc",
             "save_note_image",
+            "add_attachment",
+            "list_attachments",
+            "open_attachment",
+            "remove_attachment",
             "list_meetings",
             "open_meeting",
             "rename_meeting",
@@ -761,10 +789,12 @@ mod tests {
 
         assert_eq!(
             expected.len(),
-            42,
-            "command ledger must be 42 (38 + the 4 WS4-B S5 sync commands; the 38 \
-             is 39 − the #0015 merge of re_transcribe + rediarize_meeting into one \
-             reprocess command)"
+            46,
+            "command ledger must be 46 (38 base; +4 WS4-B S5 sync commands \
+             (sync_status / sync_get_my_ticket / sync_add_peer / sync_now); +4 \
+             #0016 attachments commands (add_attachment / list_attachments / \
+             open_attachment / remove_attachment). The 38 is 39 − the #0015 merge \
+             of re_transcribe + rediarize_meeting into one reprocess command)"
         );
 
         // #0015 — the two former offline commands merged into `reprocess`; assert

@@ -33,6 +33,7 @@ impl Summariser for StubSummariser {
         &self,
         transcript: &[Segment],
         _notes: &[NoteBlock],
+        _attachments_markdown: &str,
         system_prompt: &str,
     ) -> AppResult<String> {
         Ok(format!(

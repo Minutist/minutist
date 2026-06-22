@@ -38,6 +38,7 @@ that.
 | Diarization (offline) | One-shot `spawn_blocking` task — the authoritative pass — spawned as a background job by `ipc-bridge` *after* stop (decoupled from the stop response), or by user action (re-diarize). |
 | Diarization (live, Phase B) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from the runner's drain-loop thread (`spawn_blocking`) at SegmentEnd — gated on the `diarization_enabled` setting AND the embedding model being locally `Available` (no download, no block at start; the heavy `EmbeddingExtractor` load is built on `spawn_blocking` before the runner spawns). Best-effort/additive: any failure degrades to "no label" without affecting recording/transcription. See the live-vs-offline note below. |
 | Summarisation | One-shot `spawn_blocking` task triggered by user action. |
+| Attachment conversion | A SINGLE long-lived worker task (`tauri::async_runtime::spawn`, same pattern as `spawn_event_forwarder`). Jobs arrive on a **bounded** `tokio::sync::mpsc` channel; the worker processes them one at a time, each on `spawn_blocking`. Best-effort: every error is logged (`target: "ipc-bridge"`); the worker never panics. Back-pressure: `add_attachment` uses `try_send`; a full queue marks the entry `Failed("conversion queue full")` immediately. |
 | Persistence writes | `spawn_blocking` per write op for now; revisit if it shows up in profiling. |
 | Tauri command handlers | Tokio worker threads. Short-lived, dispatch to the above. |
 
@@ -606,9 +607,13 @@ indicator. Producers + determinism:
   total }` as the transcript+notes prompt decodes chunk by chunk; (4) determinate
   **"Writing the summary…"** `Generate { done, max }` per token. The callback is
   throttled to ~5 Hz but always emits on a phase change and at completion. (The
-  `common::Summariser::summarise` signature changed for #70 — `notes_markdown:
-  &str` → `notes: &[NoteBlock]` — but the *progress* method stays concrete on
-  `LlamaSummariser`, which `ipc-bridge` holds.) Cleared by `SummaryReady`.
+  `common::Summariser::summarise` signature has been widened twice: #70 changed
+  `notes_markdown: &str` → `notes: &[NoteBlock]`; the Attachments WS added
+  `attachments_markdown: &str` before `system_prompt`. The current four-argument
+  signature is `fn summarise(&self, transcript: &[Segment], notes: &[NoteBlock],
+  attachments_markdown: &str, system_prompt: &str) -> AppResult<String>`. The
+  *progress* method stays concrete on `LlamaSummariser`, which `ipc-bridge` holds.)
+  Cleared by `SummaryReady`.
 - **`Rediarize` (indeterminate)** — the sherpa diarization `compute` is one opaque
   FFI call with no progress callback, so `fraction = None`. Cleared by
   `DiarizationComplete`.
@@ -1084,6 +1089,94 @@ The content-hash filename means identical pastes dedupe to one file.
 - **Auto-cleanup.** `meeting_ops::delete_meeting`'s `remove_dir_all` removes the
   whole meeting folder, so `assets/` (and its images) are deleted with the
   meeting — no separate asset cleanup path is required.
+
+## Attachments (Attachments WS)
+
+Meeting attachments extend the `persistence` component and the `ipc-bridge`
+command surface. The design mirrors the note-image `assets/` pattern (content hash,
+atomic write, traversal guard) and adds a JSON manifest with a per-meeting write
+lock.
+
+### Attachments storage layout
+
+```
+{app-data}/meetings/{uuid}/
+    attachments/                       # sub-dir distinct from assets/
+        attachments.json               # manifest: Vec<AttachmentEntry>
+        <sha256>.<ext>                 # content-addressed original
+        <sha256>.md                    # converted markdown sibling
+```
+
+`attachments/` is intentionally separate from `assets/` (note-image originals) to
+avoid a namespace collision. `meeting_ops::delete_meeting`'s `remove_dir_all`
+removes the whole meeting folder including `attachments/` — no separate cleanup
+required (same as `assets/`).
+
+### Content addressing and deduplication
+
+The original filename is stored in the manifest (`AttachmentEntry.original_filename`)
+but the on-disk file uses `<sha256>.<ext>` (content-hash, mirroring
+`assets::save_note_asset`). Identical file bytes dedupe to one `<hash>.<ext>` file
+and one `<hash>.md` sibling. `remove_manifest_entry` applies dedup-safe unlink:
+`unlink_attachment_files` is called only when no other surviving manifest row shares
+the removed entry's hash, so two manifest rows pointing at the same bytes are both
+present before either is unlinked.
+
+### Per-meeting manifest write lock
+
+The manifest is a single JSON file; concurrent `add_attachment` /
+`remove_attachment` calls for the same meeting must not lost-update. A process-wide
+per-meeting `std::sync::Mutex` registry serialises every read-modify-write:
+
+    static MANIFEST_LOCKS: OnceLock<Mutex<HashMap<MeetingId, Arc<Mutex<()>>>>>
+
+Each public manifest function takes the per-meeting lock for the whole RMW (read
+the file, mutate, write atomically via tmp + fsync + rename). The RMW is
+synchronous `std::fs` on `spawn_blocking`, matching `chat.rs` and `assets.rs`.
+
+### `meetingdoc:` URI scheme
+
+Attachment originals are served to the frontend via a `meetingdoc:` custom-URI
+scheme, mirroring `meetingasset:` for note images. `app-main` registers
+`register_uri_scheme_protocol("meetingdoc", handler)` alongside the existing
+`meetingasset` handler. The handler delegates to `ipc_bridge::resolve_meeting_doc`
+(which joins `attachments/` + applies the `is_safe_asset_filename` traversal guard)
+and returns an empty 404 on any validation or read failure. The frontend builds
+`convertFileSrc("<meeting_id>/<hash>.<ext>", "meetingdoc")` and opens the file via
+`tauri-plugin-opener` (the OS opens the file in the user's default application).
+
+The `content_type_for` map in `ipc-bridge` is extended to cover attachment MIME
+types (`application/pdf`, `application/vnd.ms-excel`, etc.) alongside the existing
+image types.
+
+### Attachments — parser sandboxing (binding)
+
+`doc-convert`'s `convert_to_markdown` wraps every converter in
+`std::panic::catch_unwind` (parser panics on malformed input must surface as a
+recoverable `AppError`, not crash the conversion worker — see "Error handling").
+Two hard limits are enforced before parsing and returned as `AppError::InvalidInput`
+on violation:
+
+1. `MAX_INPUT_BYTES` (50 MiB) checked on `bytes.len()`.
+2. Zip-decompression bound for `pptx` / `xlsx` / `ods`: cumulative uncompressed
+   size and entry count tracked via `zip`'s `by_index` sizing; abort if a zip-bomb
+   ratio is exceeded.
+
+`catch_unwind` requires `UnwindSafe`; inputs are wrapped in `AssertUnwindSafe`
+(the closure only reads `&[u8]` + `&str`). A caught panic is mapped to
+`AppError::InvalidInput { context: "conversion panicked for .<ext>" }` and logged
+at `tracing::warn(target: "doc-convert")`.
+
+### Summariser attachments feed
+
+When `ipc-bridge` calls `run_held_summarise`, it reads the meeting's manifest,
+concatenates every `Ready` entry's `<hash>.md` under a `## Attachment: <original_filename>`
+header in manifest order, and applies the deterministic budget-truncation helper
+(per-attachment equal-share, `[truncated]` marker on any trimmed part, budget
+derived from `SummariserConfig.n_ctx` minus reserves for transcript + notes +
+generation). The assembled string is passed as `attachments_markdown` to `summarise`.
+An empty string (no manifest, or no Ready entries) produces byte-identical output to
+a run with no attachments — the prepend in `render_user_content` is conditional.
 
 ## Telemetry
 

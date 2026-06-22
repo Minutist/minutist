@@ -35,6 +35,7 @@ impl Summariser for StubSummariser {
         &self,
         _transcript: &[Segment],
         _notes: &[NoteBlock],
+        _attachments_markdown: &str,
         _system_prompt: &str,
     ) -> AppResult<String> {
         Ok(String::new())

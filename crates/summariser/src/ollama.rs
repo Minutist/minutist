@@ -113,9 +113,10 @@ impl Summariser for OllamaSummariser {
         &self,
         transcript: &[Segment],
         notes: &[NoteBlock],
+        attachments_markdown: &str,
         system_prompt: &str,
     ) -> AppResult<String> {
-        let user_content = render_user_content(transcript, notes);
+        let user_content = render_user_content(transcript, notes, attachments_markdown);
         let body = build_chat_request(&self.model, system_prompt, &user_content);
 
         let url = chat_url(&self.base_url);

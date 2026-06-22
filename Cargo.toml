@@ -17,12 +17,14 @@ members = [
     "crates/mcp-server",
     "crates/tunnel-client",
     "crates/sync",
+    "crates/doc-convert",
     "crates/ipc-bridge",
     "src-tauri",
     "spikes/asr",
     "spikes/llm",
     "spikes/vad-loop",
     "spikes/diarize",
+    "spikes/doc-vlm-spike",
 ]
 
 [workspace.package]
@@ -188,3 +190,37 @@ tokio-tungstenite = { version = "0.29", default-features = false }
 # tunnel-client re-implements the relay's `Frame` enum — variant order is the
 # contract). Same workspace pin as the relay repo.
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+# doc-convert additions (Gate-A, 2026-06-22).
+# Pinned to current crates.io stable at Gate-A; bumping is coordinated (the
+# parsed document format is load-bearing for the summariser reference feed).
+#
+# calamine: XLSX / ODS spreadsheet reader (pure Rust).
+calamine = "0.35"
+# dom_smoothie: HTML readability extraction (Mozilla Readability port).
+dom_smoothie = "0.18"
+# htmd: HTML → Markdown conversion.
+htmd = "0.5"
+# mail-parser: .eml / MIME message parsing (headers + body parts).
+mail-parser = "0.11"
+# pdf-extract: digital-text PDF extraction (no OCR / no VLM).
+pdf-extract = "0.10"
+# quick-xml: SAX-style XML reader used for the PPTX OOXML slide walk.
+quick-xml = "0.40"
+# zip: ZIP container reader used for PPTX / XLSX / ODS archives.
+# The 8.x line is the latest stable (9.x is pre-release at Gate-A).
+zip = "8.6"
+# pulldown-cmark: CommonMark parser; normalises all converter output.
+pulldown-cmark = "0.13"
+# pulldown-cmark-to-cmark: re-serialises the AST back to canonical markdown.
+pulldown-cmark-to-cmark = "22"
+
+# doc-vlm-spike additions (spikes/doc-vlm-spike only — not used by production crates).
+# pdfium-render: high-level Rust wrapper around Google PDFium for PDF rasterisation.
+# `image_025` wires pdfium-render's `as_image()` to the image 0.25.x API (the
+# version this workspace pins). Without it `as_image()` is unavailable; raw RGBA
+# bytes via `as_rgba_bytes()` remain accessible regardless.
+pdfium-render = { version = "0.9", features = ["image_025"] }
+# image: image decoding / encoding used to PNG-encode rasterised PDF pages and
+# to load plain image fixtures (JPEG/PNG/TIFF) for direct bitmap construction.
+image = "0.25"

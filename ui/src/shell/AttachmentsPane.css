@@ -1,0 +1,367 @@
+/*
+ * Editorial Ink — attachments pane.
+ *
+ * Reference-material rows on a sheet of warm paper: Fraunces heading, Newsreader
+ * chrome, one oxblood accent on the "Add files" action and the drop affordance.
+ * All values come from `styles/theme.css` — no hard-coded colour / radius /
+ * shadow / type.
+ */
+
+.attachments-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 1.5rem 1.75rem 2.5rem;
+  background: var(--sheet-quiet);
+  position: relative;
+  transition: box-shadow 120ms ease;
+}
+
+/* Drag-over: an inset oxblood frame signalling the whole pane is a drop target. */
+.attachments-pane--drag {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.attachments-pane__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.4rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.attachments-pane__heading {
+  font-family: var(--font-display);
+  font-size: 1.35rem;
+  font-weight: 540;
+  color: var(--ink);
+  margin: 0;
+  font-variation-settings: "opsz" 36, "SOFT" 22, "WONK" 0;
+  letter-spacing: -0.005em;
+}
+
+.attachments-pane__actions {
+  display: flex;
+  gap: 0.4rem;
+  flex: 0 0 auto;
+}
+
+.attachments-pane__action {
+  font-family: var(--font-text);
+  font-size: 0.82rem;
+  letter-spacing: 0.01em;
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+}
+
+.attachments-pane__action:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--stone-faint);
+}
+
+.attachments-pane__action:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* Primary action — the single strong oxblood control. */
+.attachments-pane__action--primary {
+  color: var(--sheet);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.attachments-pane__action--primary:hover:not(:disabled) {
+  color: var(--sheet);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+}
+
+/* The native picker is driven programmatically; keep it out of layout + a11y. */
+.attachments-pane__file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+.attachments-pane__hint {
+  margin: 0 0 1rem;
+  font-family: var(--font-text);
+  font-size: 0.82rem;
+  font-style: italic;
+  line-height: 1.5;
+  color: var(--stone);
+}
+
+.attachments-pane__error {
+  font-family: var(--font-text);
+  font-size: 0.9rem;
+  color: var(--accent);
+  margin: 0 0 1rem;
+}
+
+.attachments-pane__status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-text);
+  font-style: italic;
+  font-size: 0.95rem;
+  color: var(--stone);
+  margin: 0;
+}
+
+.attachments-pane__spinner {
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid var(--rule-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: attachments-spin 720ms linear infinite;
+}
+
+@keyframes attachments-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* --- Empty state — the drop affordance ------------------------------------ */
+.attachments-pane__empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+
+.attachments-pane__dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  max-width: var(--reading-measure);
+  padding: 2.25rem 1.5rem;
+  border: 1px dashed var(--rule-strong);
+  border-radius: var(--radius);
+  background: var(--sheet);
+  color: var(--ink-soft);
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.attachments-pane__dropzone:hover,
+.attachments-pane__dropzone:focus-visible {
+  border-color: var(--accent);
+  background: var(--sheet);
+  outline: none;
+}
+
+.attachments-pane__drop-mark {
+  font-family: var(--font-display);
+  font-size: 1.6rem;
+  line-height: 1;
+  color: var(--accent);
+}
+
+.attachments-pane__drop-lead {
+  margin: 0;
+  font-family: var(--font-text);
+  font-size: 0.95rem;
+  color: var(--ink-soft);
+}
+
+.attachments-pane__drop-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.attachments-pane__drop-meta {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--stone);
+}
+
+/* --- Rows ----------------------------------------------------------------- */
+.attachments-pane__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.attachments-pane__row {
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.attachments-pane__row:last-child {
+  border-bottom: none;
+}
+
+.attachments-pane__row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+}
+
+/* Extension badge — a small recessed chip in the mono family. */
+.attachments-pane__ext {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.6rem;
+  height: 1.6rem;
+  padding: 0 0.4rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  background: var(--sheet-quiet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+}
+
+.attachments-pane__row-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.attachments-pane__name {
+  font-family: var(--font-text);
+  font-size: 0.95rem;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.attachments-pane__meta {
+  font-family: var(--font-text);
+  font-size: 0.76rem;
+  color: var(--stone);
+}
+
+.attachments-pane__state--pending {
+  color: var(--stone);
+  font-style: italic;
+}
+
+.attachments-pane__state--ready {
+  color: var(--ink-soft);
+}
+
+.attachments-pane__state--failed {
+  color: var(--accent);
+}
+
+.attachments-pane__row-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0.3rem;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+/* Reveal actions on hover/focus-within; keep them reachable for keyboard. */
+.attachments-pane__row:hover .attachments-pane__row-actions,
+.attachments-pane__row:focus-within .attachments-pane__row-actions {
+  opacity: 1;
+}
+
+.attachments-pane__row-btn {
+  font-family: var(--font-text);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.22rem 0.55rem;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+
+.attachments-pane__row-btn:hover {
+  color: var(--ink);
+  border-color: var(--stone-faint);
+}
+
+.attachments-pane__row-btn--remove:hover {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+}
+
+/* Per-row converting indicator — a subtle indeterminate sweep. */
+.attachments-pane__progress {
+  margin-top: 0.5rem;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--rule);
+  overflow: hidden;
+}
+
+.attachments-pane__progress-fill {
+  display: block;
+  width: 40%;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 1px;
+  animation: attachments-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes attachments-sweep {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(310%);
+  }
+}
+
+.attachments-pane__row-error {
+  margin: 0.4rem 0 0;
+  font-family: var(--font-text);
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .attachments-pane__spinner,
+  .attachments-pane__progress-fill {
+    animation: none;
+  }
+  /* Reduced motion: make the indeterminate bar a static partial fill. */
+  .attachments-pane__progress-fill {
+    width: 100%;
+    opacity: 0.5;
+  }
+}

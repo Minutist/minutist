@@ -34,9 +34,10 @@ use std::sync::Arc;
 use agent_tools::{ToolContext, ToolOutput};
 use chat_agent::{LlamaTurnBackend, LlamaTurnConfig, TurnEngine};
 use minutist_common::{
-    AppError, AppEvent, AppResult, AudioDevice, ChatMessage, ChatRole, ChatSession, ChatSessionId,
-    Collection, CollectionId, MeetingId, MeetingListEntry, MeetingMeta, MeetingState, ModelId,
-    ModelStatus, NotesDocument, OperationKind, RecordingState, Summariser,
+    AppError, AppEvent, AppResult, AttachmentEntry, AttachmentId, AudioDevice, ChatMessage,
+    ChatRole, ChatSession, ChatSessionId, Collection, CollectionId, ConversionState, MeetingId,
+    MeetingListEntry, MeetingMeta, MeetingState, ModelId, ModelStatus, NotesDocument, OperationKind,
+    RecordingState, Summariser,
 };
 use persistence::{collections, meeting_ops, ChatStore, NotesStore};
 use settings::Settings;
@@ -47,6 +48,7 @@ use tokio::sync::broadcast;
 use crate::chat::{
     engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX,
 };
+use crate::attachments::ConvertJob;
 use crate::chat_runtime::ChatHandles;
 use crate::output_language::resolve_output_language;
 use crate::{error::IpcError, IpcState};
@@ -767,6 +769,229 @@ fn normalise_image_ext(ext: &str) -> Result<String, AppError> {
 }
 
 // ---------------------------------------------------------------------------
+// Attachments (#0016 — reference material fed to the post-hoc summariser)
+// ---------------------------------------------------------------------------
+
+/// Upper bound on a stored `original_filename` (characters).
+///
+/// Mirrors `MAX_SPEAKER_NAME_LEN`. The filename is attacker-influenced (it comes
+/// from the OS file picker and is echoed back in the `## Attachment: <name>`
+/// reference-material header), so an unbounded one could inflate the manifest
+/// and the summariser prompt. 512 is far above any real filename.
+const MAX_ATTACHMENT_FILENAME_LEN: usize = 512;
+
+/// Validate + normalise an attachment extension against
+/// `doc_convert::supported_exts()`.
+///
+/// Strips a single leading dot, lower-cases, and rejects anything not in the
+/// supported set as `AppError::InvalidInput` (mirrors [`normalise_image_ext`]).
+/// Pure so the allowlist gate is verified without a Tauri runtime.
+fn normalise_attachment_ext(ext: &str) -> Result<String, AppError> {
+    let cleaned = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    if doc_convert::supported_exts().contains(&cleaned.as_str()) {
+        Ok(cleaned)
+    } else {
+        Err(AppError::InvalidInput {
+            context: format!(
+                "unsupported attachment extension {ext:?}; allowed: {:?}",
+                doc_convert::supported_exts()
+            ),
+        })
+    }
+}
+
+/// Add a reference-material attachment to a meeting.
+///
+/// Routes DIRECTLY to `persistence` (no orchestrator — attachments are
+/// pipeline-independent, like note assets): stores the original bytes under
+/// `attachments/<hash>.<ext>`, writes a `Pending` manifest row, emits
+/// [`AppEvent::AttachmentAdded`], and enqueues a background conversion job. The
+/// blocking filesystem work runs on `spawn_blocking`. Returns the new entry so
+/// the webview can insert the row without a re-list.
+///
+/// `ext` is validated against `doc_convert::supported_exts()` (a non-supported
+/// extension is rejected as `AppError::InvalidInput`). The conversion runs on the
+/// shared bounded worker; if its queue is full the row is marked `Failed`
+/// (back-pressure surfaced) rather than blocking this command.
+#[tauri::command]
+#[specta::specta]
+pub async fn add_attachment(
+    meeting_id: MeetingId,
+    bytes: Vec<u8>,
+    ext: String,
+    original_filename: String,
+    state: State<'_, IpcState>,
+) -> Result<AttachmentEntry, IpcError> {
+    let ext = normalise_attachment_ext(&ext)?;
+    if original_filename.chars().count() > MAX_ATTACHMENT_FILENAME_LEN {
+        return Err(AppError::InvalidInput {
+            context: format!(
+                "attachment filename too long (max {MAX_ATTACHMENT_FILENAME_LEN} characters)"
+            ),
+        }
+        .into());
+    }
+    if bytes.len() > doc_convert::MAX_INPUT_BYTES {
+        return Err(AppError::InvalidInput {
+            context: format!(
+                "attachment exceeds the {} MiB size limit",
+                doc_convert::MAX_INPUT_BYTES / 1024 / 1024
+            ),
+        }
+        .into());
+    }
+    let byte_len = bytes.len() as u64;
+    let meetings_dir = state.meetings_dir.clone();
+
+    // Store the original + write the Pending manifest row on a blocking thread.
+    let entry_ext = ext.clone();
+    let entry = tokio::task::spawn_blocking(move || -> Result<AttachmentEntry, AppError> {
+        let hash = persistence::save_attachment_original(&meetings_dir, meeting_id, &bytes, &ext)?;
+        let entry = AttachmentEntry {
+            id: AttachmentId::new(),
+            hash,
+            original_filename,
+            ext,
+            byte_len,
+            added_at: chrono::Utc::now().to_rfc3339(),
+            conversion: ConversionState::Pending,
+            converted_md_filename: None,
+        };
+        persistence::add_manifest_entry(&meetings_dir, meeting_id, entry.clone())?;
+        Ok(entry)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("add_attachment task join failed: {e}"),
+    })??;
+
+    // The row is durable — tell the webview before kicking off conversion.
+    let _ = state.event_tx.send(AppEvent::AttachmentAdded {
+        meeting_id,
+        attachment: entry.clone(),
+    });
+
+    // Enqueue conversion on the bounded worker. `try_send` (never blocks the
+    // command): a full queue is back-pressure → mark the row Failed + emit so the
+    // user sees a clear state rather than a silent stall.
+    let job = ConvertJob {
+        meeting_id,
+        attachment_id: entry.id,
+        hash: entry.hash.clone(),
+        ext: entry_ext,
+    };
+    if let Err(e) = state.attachment_convert_tx.try_send(job) {
+        let reason = match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                "conversion queue is full; try again shortly".to_string()
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                "conversion worker is not running".to_string()
+            }
+        };
+        crate::attachments::mark_failed(
+            &state.meetings_dir,
+            &state.event_tx,
+            meeting_id,
+            entry.id,
+            reason,
+        );
+    }
+
+    Ok(entry)
+}
+
+/// List a meeting's attachments in manifest order.
+///
+/// Routes directly to `persistence::read_manifest` on `spawn_blocking`. An
+/// absent manifest is an empty list.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_attachments(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> Result<Vec<AttachmentEntry>, IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || persistence::read_manifest(&meetings_dir, meeting_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("list_attachments task join failed: {e}"),
+        })?
+        .map_err(IpcError::from)
+}
+
+/// Validate that an attachment original is openable through the `meetingdoc:`
+/// scheme.
+///
+/// The original is served (REUSING the note-image custom-URI machinery) via the
+/// sibling `meetingdoc:` scheme: the frontend builds
+/// `convertFileSrc(<meeting_id>/<hash>.<ext>, MEETING_DOC_SCHEME)` and opens that
+/// URL with `tauri-plugin-opener`; the `app-main` protocol handler resolves it
+/// through [`crate::resolve_meeting_doc`] (same traversal guard + 404-on-failure
+/// shape as `resolve_note_asset`, but joining `attachments/`). This command holds
+/// the `persistence` edge `app-main` lacks, so it does the manifest lookup and
+/// confirms the attachment exists; it returns no bytes and writes no temp file.
+/// The frontend has the `<hash>.<ext>` filename on its [`AttachmentEntry`] from
+/// `add_attachment` / `list_attachments`, so the URL is built webview-side.
+/// An absent attachment id is `AppError::InvalidInput`.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_attachment(
+    meeting_id: MeetingId,
+    attachment_id: AttachmentId,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        let manifest = persistence::read_manifest(&meetings_dir, meeting_id)?;
+        let exists = manifest.iter().any(|e| e.id == attachment_id);
+        if exists {
+            Ok(())
+        } else {
+            Err(AppError::InvalidInput {
+                context: format!("attachment {attachment_id:?} not found in meeting {meeting_id:?}"),
+            })
+        }
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("open_attachment task join failed: {e}"),
+    })?
+    .map_err(IpcError::from)
+}
+
+/// Remove an attachment from a meeting.
+///
+/// Routes directly to `persistence::remove_manifest_entry` (which performs the
+/// dedup-safe unlink internally — the `<hash>.<ext>` / `<hash>.md` files are only
+/// deleted when no surviving row shares the hash) on `spawn_blocking`, then emits
+/// [`AppEvent::AttachmentRemoved`]. Idempotent: removing an absent id is a no-op
+/// that still emits (the webview drops the row either way).
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_attachment(
+    meeting_id: MeetingId,
+    attachment_id: AttachmentId,
+    state: State<'_, IpcState>,
+) -> Result<(), IpcError> {
+    let meetings_dir = state.meetings_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        persistence::remove_manifest_entry(&meetings_dir, meeting_id, attachment_id)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("remove_attachment task join failed: {e}"),
+    })?
+    .map_err(IpcError::from)?;
+
+    let _ = state.event_tx.send(AppEvent::AttachmentRemoved {
+        meeting_id,
+        attachment_id,
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Meeting list + open + actions (Phase 4)
 // ---------------------------------------------------------------------------
 
@@ -1106,6 +1331,37 @@ async fn run_held_summarise(
     let summariser = handles.ensure_summariser().await?;
 
     let meetings_dir_owned = handles.meetings_dir.clone();
+
+    // Reference material (attachments): assemble every Ready attachment's
+    // converted markdown (manifest order, each under `## Attachment: <name>`) via
+    // `persistence`, then deterministically truncate it to a character budget
+    // derived from the held model's `n_ctx` minus a reserve for the transcript +
+    // notes + generation. The summariser renders it as a LEADING
+    // `# Reference material (attachments)` section (NOT time-woven). An empty
+    // result is byte-identical to the no-attachment path. The read is blocking
+    // `std::fs`, so it runs on `spawn_blocking`.
+    let attachments_budget = attachments_markdown_budget_chars(summariser.config().n_ctx);
+    let meetings_dir_for_attach = handles.meetings_dir.clone();
+    let attachment_parts = tokio::task::spawn_blocking(move || {
+        persistence::read_attachments_markdown_parts(&meetings_dir_for_attach, meeting_id)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("attachments assembly task join failed: {e}"),
+    })?
+    // A failure to read the manifest must not block summarising — the summary is
+    // still useful without attachments. Log and fall back to no reference
+    // material (best-effort, matching the conversion worker's posture).
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "assembling attachment reference material failed: {e}; summarising without it"
+        );
+        Vec::new()
+    });
+    let attachments_markdown =
+        assemble_attachments_markdown(attachment_parts, attachments_budget);
     // Resolve the preset-aware effective prompt (Phase 9 — D4): the user's
     // custom `summary_system_prompt` override when non-empty, else the built-in
     // prompt for the selected `summary_preset`. The output-language instruction
@@ -1124,6 +1380,7 @@ async fn run_held_summarise(
             &meetings_dir_owned,
             meeting_id,
             summariser.as_ref(),
+            &attachments_markdown,
             &system_prompt,
             &event_tx_for_blocking,
         )
@@ -1239,6 +1496,7 @@ fn summarise_meeting_with_progress(
     meetings_dir: &Path,
     meeting_id: MeetingId,
     summariser: &LlamaSummariser,
+    attachments_markdown: &str,
     system_prompt: &str,
     event_tx: &broadcast::Sender<AppEvent>,
 ) -> Result<String, AppError> {
@@ -1269,6 +1527,7 @@ fn summarise_meeting_with_progress(
     let summary_md = summariser.summarise_with_progress(
         &transcript,
         &notes,
+        attachments_markdown,
         system_prompt,
         |progress| {
             let (phase, fraction, label): (u8, f32, &str) = match progress {
@@ -1403,7 +1662,11 @@ fn summarise_meeting_inner(
     // has none.
     let notes = persistence::read_note_blocks(&meeting_dir)?;
 
-    let summary_md = summariser.summarise(&transcript, &notes, system_prompt)?;
+    // The trait-based test seam carries no attachment context; `""` keeps the
+    // stub path byte-identical to the pre-attachments summarise behaviour. The
+    // production path ([`run_held_summarise`]) assembles the real
+    // attachments_markdown and drives `summarise_with_progress`.
+    let summary_md = summariser.summarise(&transcript, &notes, "", system_prompt)?;
 
     persistence::write_summary(&meeting_dir, &summary_md)?;
 
@@ -1427,6 +1690,110 @@ fn save_summary_inner(
 ) -> Result<(), AppError> {
     let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
     persistence::write_summary(&meeting_dir, summary_markdown)
+}
+
+/// Character budget for the assembled attachment reference material, derived
+/// from the held model's context window (`n_ctx`).
+///
+/// The summariser prompt must hold the transcript, the notes, the system prompt,
+/// the reference material, AND leave room for the generated summary. We reserve
+/// a fixed fraction of the window for the reference material and convert tokens →
+/// characters with a coarse heuristic (~4 chars/token). Semantic retrieval over
+/// the reference material is deferred (#0016); this character budget is the
+/// deterministic guard that keeps attachments from pushing the transcript out of
+/// the window. The per-attachment split lives in
+/// [`assemble_attachments_markdown`]. Pure + unit-tested.
+pub(crate) fn attachments_markdown_budget_chars(n_ctx: u32) -> usize {
+    // Reserve ~40% of the window for reference material; the remaining ~60%
+    // covers the transcript + notes + system prompt + the generated summary.
+    const REFERENCE_FRACTION: u64 = 40; // percent
+    const CHARS_PER_TOKEN: u64 = 4;
+    ((n_ctx as u64) * REFERENCE_FRACTION / 100 * CHARS_PER_TOKEN) as usize
+}
+
+/// Assemble the reference-material markdown from each `Ready` attachment's
+/// `(original_filename, markdown)`, rendered under a `## Attachment: <name>`
+/// header in manifest order.
+///
+/// When the untruncated assembly fits `budget_chars` it is returned unchanged
+/// (an empty `parts` yields `""`, byte-identical to the no-attachment path).
+/// When it would overflow, each attachment gets an EQUAL share of the budget so
+/// a single large attachment cannot starve the others; that per-attachment share
+/// is charged for the rendered `## Attachment: <name>` header (and surrounding
+/// separators) too, so a pathologically long filename eats into its own share
+/// rather than silently overrunning the budget. Whatever share remains caps the
+/// BODY; a body trimmed to fit carries a visible `[truncated]` marker
+/// (UTF-8-boundary safe, never mid-codepoint). Semantic retrieval is deferred
+/// (#0016). Pure + unit-tested.
+pub(crate) fn assemble_attachments_markdown(
+    parts: Vec<(String, String)>,
+    budget_chars: usize,
+) -> String {
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    const MARKER: &str = "\n\n[truncated]\n";
+    let marker_len = MARKER.chars().count();
+
+    // Char count of the fixed framing rendered around each attachment's body:
+    // the `## Attachment: ` prefix, the `\n\n` after the filename, and the
+    // trailing `\n` (the inter-attachment `\n` separator is counted on the
+    // header side via `i > 0`). The filename itself is added per-attachment.
+    let header_overhead = |filename: &str, with_separator: bool| -> usize {
+        let mut n = "## Attachment: ".chars().count()
+            + filename.chars().count()
+            + "\n\n".chars().count()
+            + "\n".chars().count();
+        if with_separator {
+            n += 1; // the leading '\n' between attachments
+        }
+        n
+    };
+
+    // Render the block, optionally capping each attachment's BODY at `body_cap`
+    // chars (`None` = full body, no truncation).
+    let assemble = |body_cap: Option<usize>| -> String {
+        let mut out = String::new();
+        for (i, (filename, md)) in parts.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str("## Attachment: ");
+            out.push_str(filename);
+            out.push_str("\n\n");
+            match body_cap {
+                Some(cap) if md.chars().count() > cap => {
+                    let keep = cap.saturating_sub(marker_len);
+                    let trimmed: String = md.chars().take(keep).collect();
+                    out.push_str(&trimmed);
+                    out.push_str(MARKER);
+                }
+                _ => out.push_str(md),
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    let full = assemble(None);
+    if full.chars().count() <= budget_chars {
+        return full;
+    }
+    // Overflow: give every attachment an EQUAL share of the budget, then charge
+    // each attachment's rendered header (and separator) against its own share so
+    // a long filename cannot push the total past the budget. The remainder caps
+    // the body (at least one char so the body marker still renders).
+    let share = (budget_chars / parts.len()).max(1);
+    let body_cap = parts
+        .iter()
+        .enumerate()
+        .map(|(i, (filename, _))| {
+            share.saturating_sub(header_overhead(filename, i > 0)).max(1)
+        })
+        .min()
+        .unwrap_or(1);
+    assemble(Some(body_cap))
 }
 
 /// Resolve the summariser `n_gpu_layers` from the runtime `gpu_acceleration`
@@ -2495,6 +2862,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn normalise_attachment_ext_accepts_supported_rejects_others() {
+        // Every `doc_convert::supported_exts` value normalises (lower-cased,
+        // dot-less) and round-trips.
+        for ext in doc_convert::supported_exts() {
+            let upper = ext.to_ascii_uppercase();
+            assert_eq!(
+                normalise_attachment_ext(&format!(".{upper}")).expect("supported ext"),
+                *ext,
+                "ext {ext:?} should normalise from a dotted upper-case form"
+            );
+        }
+        // Rejected — image-only / executable / unsupported document extensions.
+        for evil in ["png", "exe", "", "pdf.exe", "../pdf", "docx", "rtf"] {
+            assert!(
+                matches!(
+                    normalise_attachment_ext(evil),
+                    Err(AppError::InvalidInput { .. })
+                ),
+                "ext {evil:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn attachments_budget_scales_with_context() {
+        // Budget grows with n_ctx (40% of the window × ~4 chars/token).
+        let small = attachments_markdown_budget_chars(8_192);
+        let large = attachments_markdown_budget_chars(32_768);
+        assert!(large > small, "a larger context window must allow more chars");
+        assert!(small > 0);
+    }
+
+    #[test]
+    fn assemble_attachments_empty_and_within_budget() {
+        // No attachments → empty (byte-identical to the no-attachment path).
+        assert_eq!(assemble_attachments_markdown(Vec::new(), 100), "");
+
+        // Within budget → full assembly under per-attachment headers, no marker.
+        let parts = vec![
+            ("a.txt".to_string(), "hi".to_string()),
+            ("b.txt".to_string(), "yo".to_string()),
+        ];
+        let out = assemble_attachments_markdown(parts, 1_000);
+        assert!(out.contains("## Attachment: a.txt"));
+        assert!(out.contains("## Attachment: b.txt"));
+        assert!(!out.contains("[truncated]"), "within budget must not truncate");
+    }
+
+    #[test]
+    fn assemble_attachments_equal_share_does_not_starve_later_parts() {
+        // A huge first attachment must NOT consume the whole budget: every
+        // attachment gets an equal share, the trimmed one is marked, and the
+        // small later attachment survives in full (the whole-string truncation
+        // this replaced would have dropped it entirely).
+        let parts = vec![
+            ("big.txt".to_string(), "x".repeat(5_000)),
+            ("small.txt".to_string(), "kept".to_string()),
+        ];
+        let out = assemble_attachments_markdown(parts, 400);
+        assert!(out.contains("## Attachment: big.txt"), "first header survives");
+        assert!(
+            out.contains("## Attachment: small.txt"),
+            "second header survives (not starved)"
+        );
+        assert!(out.contains("kept"), "the small attachment's body is retained");
+        assert!(out.contains("[truncated]"), "the trimmed large attachment is marked");
+    }
+
     /// `save_note_asset` (the persistence body the command calls) round-trips an
     /// image and returns a portable bare-filename reference.
     #[test]
@@ -2840,6 +3276,7 @@ mod tests {
             &self,
             transcript: &[Segment],
             notes: &[NoteBlock],
+            _attachments_markdown: &str,
             system_prompt: &str,
         ) -> Result<String, AppError> {
             *self.seen_transcript_len.lock().unwrap() = Some(transcript.len());

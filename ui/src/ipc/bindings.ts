@@ -296,6 +296,84 @@ async saveNoteImage(meetingId: MeetingId, bytes: number[], ext: string) : Promis
 }
 },
 /**
+ * Add a reference-material attachment to a meeting.
+ * 
+ * Routes DIRECTLY to `persistence` (no orchestrator — attachments are
+ * pipeline-independent, like note assets): stores the original bytes under
+ * `attachments/<hash>.<ext>`, writes a `Pending` manifest row, emits
+ * [`AppEvent::AttachmentAdded`], and enqueues a background conversion job. The
+ * blocking filesystem work runs on `spawn_blocking`. Returns the new entry so
+ * the webview can insert the row without a re-list.
+ * 
+ * `ext` is validated against `doc_convert::supported_exts()` (a non-supported
+ * extension is rejected as `AppError::InvalidInput`). The conversion runs on the
+ * shared bounded worker; if its queue is full the row is marked `Failed`
+ * (back-pressure surfaced) rather than blocking this command.
+ */
+async addAttachment(meetingId: MeetingId, bytes: number[], ext: string, originalFilename: string) : Promise<Result<AttachmentEntry, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("add_attachment", { meetingId, bytes, ext, originalFilename }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List a meeting's attachments in manifest order.
+ * 
+ * Routes directly to `persistence::read_manifest` on `spawn_blocking`. An
+ * absent manifest is an empty list.
+ */
+async listAttachments(meetingId: MeetingId) : Promise<Result<AttachmentEntry[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_attachments", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Validate that an attachment original is openable through the `meetingdoc:`
+ * scheme.
+ * 
+ * The original is served (REUSING the note-image custom-URI machinery) via the
+ * sibling `meetingdoc:` scheme: the frontend builds
+ * `convertFileSrc(<meeting_id>/<hash>.<ext>, MEETING_DOC_SCHEME)` and opens that
+ * URL with `tauri-plugin-opener`; the `app-main` protocol handler resolves it
+ * through [`crate::resolve_meeting_doc`] (same traversal guard + 404-on-failure
+ * shape as `resolve_note_asset`, but joining `attachments/`). This command holds
+ * the `persistence` edge `app-main` lacks, so it does the manifest lookup and
+ * confirms the attachment exists; it returns no bytes and writes no temp file.
+ * The frontend has the `<hash>.<ext>` filename on its [`AttachmentEntry`] from
+ * `add_attachment` / `list_attachments`, so the URL is built webview-side.
+ * An absent attachment id is `AppError::InvalidInput`.
+ */
+async openAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_attachment", { meetingId, attachmentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove an attachment from a meeting.
+ * 
+ * Routes directly to `persistence::remove_manifest_entry` (which performs the
+ * dedup-safe unlink internally — the `<hash>.<ext>` / `<hash>.md` files are only
+ * deleted when no surviving row shares the hash) on `spawn_blocking`, then emits
+ * [`AppEvent::AttachmentRemoved`]. Idempotent: removing an absent id is a no-op
+ * that still emits (the webview drops the row either way).
+ */
+async removeAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_attachment", { meetingId, attachmentId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * List all meetings for the meeting-list view (FR-33), most-recent first.
  * 
  * Reads straight from the libsql `index.db` ([`MeetingIndex::list_meetings`])
@@ -925,6 +1003,27 @@ export type AppEvent =
  */
 { kind: "translation_ready"; meeting_id: MeetingId; language: string } | 
 /**
+ * A new attachment was added to a meeting (original stored + manifest row
+ * written with `conversion: Pending`). The webview inserts the row without
+ * a re-list.
+ */
+{ kind: "attachment_added"; meeting_id: MeetingId; attachment: AttachmentEntry } | 
+/**
+ * An attachment's background conversion finished; `<hash>.md` now exists
+ * and the manifest row is `Ready`. The webview flips the row to Ready.
+ */
+{ kind: "attachment_converted"; meeting_id: MeetingId; attachment_id: AttachmentId } | 
+/**
+ * An attachment's background conversion failed (best-effort; never crashes
+ * the worker). `reason` is a concise human string the pane shows on the row.
+ */
+{ kind: "attachment_conversion_failed"; meeting_id: MeetingId; attachment_id: AttachmentId; reason: string } | 
+/**
+ * An attachment was removed (manifest row dropped; hash files unlinked iff
+ * no other row shares the hash). The webview drops the row.
+ */
+{ kind: "attachment_removed"; meeting_id: MeetingId; attachment_id: AttachmentId } | 
+/**
  * Model download progress, used by the first-run flow.
  */
 { kind: "model_download_progress"; model_id: ModelId; bytes_done: number; bytes_total: number | null } | 
@@ -1046,6 +1145,62 @@ export type AppEvent =
  * representation.
  */
 export type AppEventPayload = AppEvent
+/**
+ * One persisted attachment row for a meeting.
+ * 
+ * `persistence::attachments` stores a `Vec<AttachmentEntry>` as
+ * `attachments/attachments.json` (atomic tmp+rename); the IPC attachment
+ * commands load/save it. Content-addressed originals live at
+ * `attachments/<hash>.<ext>`; converted markdown siblings at
+ * `attachments/<hash>.md`.
+ * 
+ * `hash` is hex-encoded SHA-256 of the original bytes — the dedup key shared
+ * with the on-disk filenames. `byte_len` is the original's size in bytes
+ * (matches existing `u64` wire fields). `added_at` is RFC 3339 (UTC), mirroring
+ * `ChatSession::created_at`.
+ */
+export type AttachmentEntry = { id: AttachmentId; 
+/**
+ * Hex-encoded SHA-256 of the original bytes. Shared with the on-disk
+ * `<hash>.<ext>` original and `<hash>.md` sibling; used for dedup-safe
+ * remove.
+ */
+hash: string; 
+/**
+ * The user-visible original filename (e.g. `"Q2_report.xlsx"`).
+ */
+original_filename: string; 
+/**
+ * Lower-cased, dot-less extension (e.g. `"xlsx"`, `"pdf"`).
+ */
+ext: string; 
+/**
+ * Size of the original file in bytes.
+ */
+byte_len: number; 
+/**
+ * RFC 3339 timestamp (UTC) when the attachment was added, mirroring
+ * `ChatSession::created_at`.
+ */
+added_at: string; 
+/**
+ * Whether `doc-convert` has processed this attachment.
+ */
+conversion: ConversionState; 
+/**
+ * The filename of the converted markdown sibling (`"<hash>.md"`), present
+ * once `conversion` is [`ConversionState::Ready`].
+ */
+converted_md_filename?: string | null }
+/**
+ * Stable identifier for a meeting attachment on disk. UUIDv4. Mirrors
+ * [`MeetingId`].
+ * 
+ * Carried on [`AttachmentEntry`] and the four attachment [`AppEvent`]
+ * variants so the webview store can route adds / conversions / removes to
+ * the right row without a re-list.
+ */
+export type AttachmentId = string
 /**
  * One audio-input device exposed to the device-picker UI.
  * 
@@ -1182,6 +1337,30 @@ position: number }
  * lives in `{app-data}/collections.json` (owned by `persistence`).
  */
 export type CollectionId = string
+/**
+ * The conversion state of a meeting attachment. Stored on [`AttachmentEntry`]
+ * and updated by the bounded background conversion worker in `ipc-bridge`.
+ * 
+ * `Failed` carries a concise human string the attachments pane shows on the
+ * row. The `state`/`reason` serde tagging mirrors `AppError`'s `code`/`context`
+ * shape.
+ */
+export type ConversionState = 
+/**
+ * The original has been stored; the background converter has not yet
+ * processed it.
+ */
+{ state: "pending" } | 
+/**
+ * `<hash>.md` exists alongside the original; the attachment is ready for
+ * the summariser feed.
+ */
+{ state: "ready" } | 
+/**
+ * Conversion finished with an error (best-effort; never crashes the worker).
+ * The string is a concise human-readable reason shown in the pane.
+ */
+{ state: "failed"; reason: string }
 /**
  * A redacted diagnostic snapshot for the user-driven "Report a problem" flow.
  * 

@@ -180,6 +180,28 @@ impl MeetingFolder {
     pub fn assets_dir(&self) -> PathBuf {
         self.path.join("assets")
     }
+
+    /// Path to the `attachments/` subdirectory within the folder.
+    ///
+    /// `attachments/` holds uploaded document originals
+    /// (`<sha256>.<ext>`) and their converted markdown siblings
+    /// (`<sha256>.md`), plus the `attachments.json` manifest. The
+    /// directory is created lazily by [`crate::save_attachment_original`]
+    /// and removed wholesale by `meeting_ops::delete_meeting`'s
+    /// `remove_dir_all` (no extra cleanup). "attachments/" is used rather
+    /// than "resources/" to avoid collision with the repo-root `resources/`
+    /// directory.
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.path.join("attachments")
+    }
+
+    /// Path to `attachments/attachments.json` — the manifest of all attachment
+    /// rows for this meeting. Written atomically (tmp+rename) by
+    /// [`crate::add_manifest_entry`] / [`crate::remove_manifest_entry`] /
+    /// [`crate::set_entry_conversion`].
+    pub fn attachments_manifest_path(&self) -> PathBuf {
+        self.attachments_dir().join("attachments.json")
+    }
 }
 
 /// The current UTC time as an ISO 8601 / RFC 3339 string, matching the

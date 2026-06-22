@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use minutist_common::{AppResult, MeetingId};
+use minutist_common::{AppResult, AudioFormat, MeetingId, MeetingMeta};
 
 use crate::error::Error;
 
@@ -105,6 +105,69 @@ impl MeetingFolder {
         self.path.join("translations.json")
     }
 
+    /// Ensure a meeting folder exists at `{root}/{uuid}/`, seeding a minimal
+    /// `metadata.json` when it is absent, and return its path. Idempotent: an
+    /// existing folder (and an existing `metadata.json`) is left untouched.
+    ///
+    /// This is the seam a sync receiver calls before merging an inbound document
+    /// for a meeting this device has never seen: a brand-new meeting arriving from
+    /// a paired device must not fail for want of its folder. `persistence` stays
+    /// the sole owner of folder + projection writes, so the receiver routes the
+    /// folder/metadata creation through here rather than touching the layout
+    /// itself. The seeded metadata is a placeholder — `uuid`, the current time as
+    /// `started_at`, an empty title, and the standard 16 kHz mono Opus
+    /// `audio_format` — that the authoritative `metadata.json` overwrites when it
+    /// later syncs across (a metadata/media payload, a separate slice). It exists
+    /// only so the folder is a valid meeting on disk the moment notes land in it.
+    ///
+    /// Unlike [`Self::create`], this does NOT fail when the folder already exists;
+    /// the converged steady state of a paired device is that the folder is already
+    /// there, and re-running a sync must be a no-op.
+    pub fn ensure(root: &Path, meeting_id: MeetingId) -> AppResult<PathBuf> {
+        let path = root.join(meeting_id.0.to_string());
+
+        let freshly_created = !path.exists();
+        std::fs::create_dir_all(&path)
+            .map_err(Error::Io)
+            .map_err(minutist_common::AppError::from)?;
+
+        let metadata_path = path.join("metadata.json");
+        if !metadata_path.exists() {
+            let placeholder = MeetingMeta {
+                uuid: meeting_id,
+                title: String::new(),
+                started_at: now_iso8601(),
+                ended_at: None,
+                duration_ms: 0,
+                speaker_count: 0,
+                audio_format: AudioFormat {
+                    codec: "opus".to_string(),
+                    sample_rate: 16_000,
+                    channels: 1,
+                    bitrate_kbps: Some(32),
+                },
+                asr_model: None,
+                llm_model: None,
+                diarizer: None,
+                speaker_names: std::collections::BTreeMap::new(),
+                notes_format: 0,
+                collection_id: None,
+                app_version: String::new(),
+            };
+            crate::write_metadata(&path, &placeholder)?;
+        }
+
+        if freshly_created {
+            tracing::info!(
+                target: "persistence",
+                folder = %path.display(),
+                "ensured inbound meeting folder (seeded placeholder metadata)"
+            );
+        }
+
+        Ok(path)
+    }
+
     /// Path to the `assets/` subdirectory within the folder.
     ///
     /// `assets/` holds pasted/dropped note image files (see
@@ -116,5 +179,74 @@ impl MeetingFolder {
     /// `meeting_ops::delete_meeting`'s `remove_dir_all` (no extra cleanup).
     pub fn assets_dir(&self) -> PathBuf {
         self.path.join("assets")
+    }
+}
+
+/// The current UTC time as an ISO 8601 / RFC 3339 string, matching the
+/// `started_at` format the orchestrator writes (`chrono::Utc::now().to_rfc3339()`).
+fn now_iso8601() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reader::read_metadata;
+
+    #[test]
+    fn ensure_creates_folder_and_seeds_metadata() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = MeetingId::new();
+
+        let path = MeetingFolder::ensure(dir.path(), id).expect("ensure");
+        assert!(path.is_dir(), "the meeting folder must exist");
+        assert!(
+            path.join("metadata.json").is_file(),
+            "a placeholder metadata.json must be seeded"
+        );
+
+        let meta = read_metadata(&path).expect("read seeded metadata");
+        assert_eq!(meta.uuid, id);
+        assert!(
+            meta.title.is_empty(),
+            "the placeholder carries no title until the authoritative metadata syncs"
+        );
+    }
+
+    #[test]
+    fn ensure_is_idempotent_and_preserves_existing_metadata() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = MeetingId::new();
+
+        // First call seeds the placeholder; overwrite it with a real title to
+        // stand in for the authoritative metadata having synced across.
+        let path = MeetingFolder::ensure(dir.path(), id).expect("first ensure");
+        let mut meta = read_metadata(&path).expect("read");
+        meta.title = "Real meeting".to_string();
+        crate::write_metadata(&path, &meta).expect("overwrite metadata");
+
+        // A second ensure (a re-sync of the same meeting) must not clobber it.
+        let path2 = MeetingFolder::ensure(dir.path(), id).expect("second ensure");
+        assert_eq!(path, path2);
+        let reloaded = read_metadata(&path2).expect("re-read");
+        assert_eq!(
+            reloaded.title, "Real meeting",
+            "ensure must leave an existing metadata.json untouched"
+        );
+    }
+
+    #[test]
+    fn ensure_succeeds_where_create_would_reject() {
+        // `create` rejects a pre-existing folder; `ensure` is the converged-steady
+        // -state path and must succeed on it (a re-sync of an already-present
+        // meeting).
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = MeetingId::new();
+        MeetingFolder::create(dir.path(), id).expect("create");
+        assert!(
+            MeetingFolder::create(dir.path(), id).is_err(),
+            "create must reject an existing folder"
+        );
+        MeetingFolder::ensure(dir.path(), id).expect("ensure on an existing folder");
     }
 }

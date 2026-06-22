@@ -49,6 +49,15 @@ vi.mock("../ipc/client", () => ({
       status: "ok",
       data: { enabled: false, status: "disconnected", account_id: null },
     })),
+    // The lazy SyncSettingsPane calls sync_status + sync_get_my_ticket on mount.
+    syncStatus: vi.fn(async () => ({
+      status: "ok",
+      data: { kind: "idle" },
+    })),
+    syncGetMyTicket: vi.fn(async () => ({
+      status: "ok",
+      data: "test-ticket-abc123",
+    })),
   },
   unwrap: <T,>(r: { status: string; data: T }) => {
     if (r.status !== "ok") throw new Error("err");
@@ -160,5 +169,12 @@ describe("MCP pane lazy wiring", () => {
   it("renders the Connection pane via the lazy path in the connected build", async () => {
     render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
     await screen.findByText("Enable the connector");
+  });
+
+  // The Sync pane is gated the same way; verify it resolves via the lazy path in
+  // the connected build. The free-build absence is verified by the CI grep.
+  it("renders the Sync pane via the lazy path in the connected build", async () => {
+    render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
+    await screen.findByText("Sync");
   });
 });

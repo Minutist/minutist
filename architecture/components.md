@@ -36,8 +36,9 @@ appears in:
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
+| `sync` | WS4-B | `common`, `persistence` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡ |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
 Cargo feature (default ON). The free artifact is built with
@@ -51,6 +52,43 @@ tunnel is wired into `app-main`; the S3b crate-add lands the crate in the
 workspace unconditionally (compiled by `cargo test`/workspace build) without the
 `app-main` edge, exactly as `mcp-server` did before Phase 10 wired it. The free
 artifact omits it. See `cross-cutting.md` — "Build variants".
+
+§ `sync` is an **optional** edge of `app-main`, gated by the same `connected`
+Cargo feature as `mcp-server` / `tunnel-client` (it is part of the connected-tier
+surface — the free build does not sync). `sync` is a near-leaf transport crate:
+device-to-device sync over iroh, exchanging Yjs notes-update frames (a small
+custom ALPN protocol). Content-addressed meeting-media (audio + note assets) sync
+is the deferred S4 slice and is not present yet. It takes **no** workspace edge
+beyond `common` (shared types / errors) and `persistence` (read the authoritative
+`notes.ydoc` via `NotesStore`; apply received updates). The `ipc-bridge` trait injection
+(the `SyncControl` seam + `DisabledSync`, mirroring the `TunnelControl` seam)
+takes NO `sync` edge — `ipc-bridge` carries the trait + `DisabledSync`
+unconditionally and `app-main` injects the connected implementation. The
+`app-main -> sync` edge (the connected `SyncControl` in `src-tauri/src/sync.rs`
+that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
+`connected` Cargo feature exactly like the `mcp-server` / `tunnel-client` edges;
+the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
+— "Build variants".
+
+**WS4-B S5 phase 3 (UI):** `ui/src/state/sync-status.ts` and
+`ui/src/shell/SyncSettingsPane.tsx` are purely internal to the webview layer; they
+add no new Cargo edge and no new public IPC command (the four sync commands were
+added in phase 1). Both are VITE_CONNECTED-gated exactly like the MCP /
+ConnectionSettings panes — tree-shaken from the free bundle at build time.
+
+Third-party deps: `iroh` (the QUIC transport, pinned EXACT), `iroh-tickets` (the
+`EndpointTicket` round-trip for manual device pairing, pinned EXACT alongside the
+iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same workspace pin as
+`persistence`) and `uuid`. (Media-blob sync, the deferred S4 slice, will add
+`iroh-blobs` when it lands; it is not a dependency today.)
+The notes-sync protocol exchanges yrs state vectors and computes the minimal
+lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
+operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —
+`sync` never materialises a yrs `Doc` and never re-derives the `notes.json` /
+`notes.md` projections; that stays in `persistence::NotesStore::apply_update`
+(`persistence` owns the one place that relaxes the document-opacity guarantee —
+see its "CRDT notes storage" section). `uuid` only decodes the fixed 16-byte
+meeting id off the wire back into a `common::MeetingId`.
 
 The `tunnel-client` row's "May depend on" is empty by design: the crate takes
 **no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)

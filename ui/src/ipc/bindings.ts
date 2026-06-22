@@ -750,6 +750,57 @@ async tunnelStatus() : Promise<Result<TunnelSnapshot, IpcError>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * The sync engine's current live status for the Settings → Sync pane.
+ */
+async syncStatus() : Promise<Result<SyncStatus, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * This device's shareable ticket string. The UI shows it (and/or a QR) so the
+ * user can pair another of their devices, which calls [`sync_add_peer`] with it.
+ * 
+ * In the free build (or before any sync wiring) this returns an `Unsupported`
+ * error — the Sync pane is absent from that bundle, so the command is never
+ * invoked there.
+ */
+async syncGetMyTicket() : Promise<Result<string, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_get_my_ticket") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Register a peer device from its shareable ticket (produced by
+ * [`sync_get_my_ticket`] on the other device).
+ */
+async syncAddPeer(ticket: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_add_peer", { ticket }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Trigger a notes sync for one meeting with the paired peers. Progress and
+ * completion arrive on the event bus (`AppEvent::SyncProgress` / `SyncReady`).
+ */
+async syncNow(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sync_now", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -966,7 +1017,26 @@ export type AppEvent =
  * account label and pairing codes cross only the pairing command's return
  * value, never the bus.
  */
-{ kind: "tunnel_status_changed"; status: TunnelStatus }
+{ kind: "tunnel_status_changed"; status: TunnelStatus } | 
+/**
+ * A notes-sync transfer for a meeting made progress. The UI renders a
+ * per-meeting indicator: a determinate bar when `fraction` is `Some`
+ * (0.0..=1.0), an indeterminate spinner when `None`. A terminal
+ * `SyncReady` / `SyncError` clears it.
+ */
+{ kind: "sync_progress"; meeting_id: MeetingId; label: string; fraction: number | null } | 
+/**
+ * A notes-sync transfer for a meeting finished and the local copy is now
+ * merged. The UI re-reads the meeting's notes so the synced content
+ * surfaces without a manual refresh.
+ */
+{ kind: "sync_ready"; meeting_id: MeetingId } | 
+/**
+ * A notes-sync operation failed. `context` is a stable human-readable
+ * string the UI surfaces in a notification; the sync continues for other
+ * meetings.
+ */
+{ kind: "sync_error"; context: string }
 /**
  * Typed wrapper that gives `AppEvent` a stable tauri-specta event name.
  * 
@@ -1723,6 +1793,38 @@ export type SummaryPreset =
  * A thorough, sectioned summary covering topics, discussion and outcomes.
  */
 "detailed"
+/**
+ * The peer-to-peer notes-sync engine's live state, surfaced to the UI (WS4-B
+ * S5). A pure status enum carrying no peer ticket or device-key material —
+ * those cross only the sync commands' return values / secure storage, never the
+ * event bus. The sync channel is end-to-end between the user's own paired
+ * devices (D4); it is distinct from the connector channel ([`TunnelStatus`]),
+ * which transits content to the AI vendor by design.
+ */
+export type SyncStatus = 
+/**
+ * Sync is unavailable in this build (the free build) or disabled. Nothing
+ * is dialled and no inbound connections are accepted.
+ */
+{ kind: "disabled" } | 
+/**
+ * The sync engine is up with at least one paired peer, but no transfer is
+ * in flight — waiting for a change to push or a peer to dial.
+ */
+{ kind: "idle" } | 
+/**
+ * Dialling / handshaking a peer before a transfer.
+ */
+{ kind: "connecting" } | 
+/**
+ * A notes-sync transfer is in progress with a peer.
+ */
+{ kind: "syncing" } | 
+/**
+ * The sync engine hit a terminal error. `message` is a stable
+ * human-readable string the UI surfaces; the engine is not retrying.
+ */
+{ kind: "error"; message: string }
 /**
  * UI colour-scheme preference.
  */

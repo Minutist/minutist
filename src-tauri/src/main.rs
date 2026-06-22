@@ -13,6 +13,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod crash;
 #[cfg(feature = "connected")]
+mod sync;
+#[cfg(feature = "connected")]
 mod tunnel;
 mod updater;
 
@@ -895,6 +897,21 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             #[cfg(not(feature = "connected"))]
             let tunnel_control: Arc<dyn ipc_bridge::TunnelControl> = ipc_bridge::disabled_tunnel();
 
+            // The peer-to-peer notes-sync control (WS4-B S5). In the connected
+            // build this is the ConnectedSync (iroh endpoint + the notes-update
+            // protocol, backed by the `sync` crate); it spawns engine startup in
+            // the background when the connector is enabled. In the free build it
+            // is the no-op DisabledSync. Mirrors the tunnel wiring above.
+            #[cfg(feature = "connected")]
+            let sync_control: Arc<dyn ipc_bridge::SyncControl> = sync::ConnectedSync::new(
+                settings_handle.clone(),
+                ipc_event_tx.clone(),
+                app_data_dir.clone(),
+                notes_meetings_dir.clone(),
+            );
+            #[cfg(not(feature = "connected"))]
+            let sync_control: Arc<dyn ipc_bridge::SyncControl> = ipc_bridge::disabled_sync();
+
             // Register the IPC state so command handlers can access it.
             app.manage(IpcState {
                 orchestrator: orchestrator.clone(),
@@ -912,6 +929,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 )),
                 mcp_info: mcp_info.clone(),
                 tunnel: tunnel_control,
+                sync: sync_control,
                 logs_dir: logs_dir.clone(),
                 app_version: app_handle.package_info().version.to_string(),
                 platform: platform_string(),

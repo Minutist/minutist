@@ -80,6 +80,22 @@ const LazyConnectionSettingsPane =
       )
     : null;
 
+// SyncSettingsPane (the peer-to-peer notes sync) is likewise present only in the
+// connected build, gated by the same VITE_CONNECTED literal. The false branch and
+// its `import()` are dead-code-eliminated, dropping the pane and its state module
+// (sync-status.ts) from the free bundle.
+//
+// Verification: VITE_CONNECTED= npm run build && grep -r "Sync this meeting now" dist/
+// → no matches expected in the free bundle.
+const LazySyncSettingsPane =
+  import.meta.env.VITE_CONNECTED === "1"
+    ? lazy(() =>
+        import("./SyncSettingsPane").then((m) => ({
+          default: m.SyncSettingsPane,
+        })),
+      )
+    : null;
+
 export type SettingsDrawerProps = {
   /** Whether the drawer is shown. */
   open: boolean;
@@ -257,6 +273,14 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
           <McpPaneErrorBoundary>
             <Suspense fallback={null}>
               <LazyConnectionSettingsPane />
+            </Suspense>
+          </McpPaneErrorBoundary>
+        )}
+
+        {LazySyncSettingsPane && (
+          <McpPaneErrorBoundary>
+            <Suspense fallback={null}>
+              <LazySyncSettingsPane />
             </Suspense>
           </McpPaneErrorBoundary>
         )}

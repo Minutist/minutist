@@ -29,6 +29,7 @@ role when work is parallel.
 | `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
 | `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |
+| `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `persistence` |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |
@@ -94,6 +95,14 @@ and `app-main` (systems-engineer) is the assembler that injects its config and
 wires it behind the feature in S5. It owns no domain logic of another crate — it
 re-implements the relay's wire frames and forwards HTTP — so it stays a near-leaf
 under one role.
+
+`sync` (WS4-B) is systems-engineer for the same reason: it is transport
+connective tissue (the device-to-device iroh sync engine), it shares the
+`connected`-feature gating with `mcp-server` / `tunnel-client`, and `app-main`
+(systems-engineer) is the assembler that injects its config and wires it behind
+the feature in S5. It depends only on `common` (shared types) and `persistence`
+(the notes-CRDT store + meeting-media paths it transports) — it owns no domain
+logic of another crate, so it stays a near-leaf under one role.
 
 ### `frontend-engineer`
 Owns everything under `ui/src/`. Knowledge expected: React 19, Tiptap +

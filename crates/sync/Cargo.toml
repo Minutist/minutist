@@ -1,0 +1,58 @@
+[package]
+name = "sync"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# WS4-B: device-to-device sync over iroh. The crate exchanges Yjs notes-updates
+# (a small custom QUIC protocol) directly between a user's own paired devices,
+# dialled through the self-hosted relay (sync.minutist.ai) with out-of-band
+# addressing. Content-addressed meeting-media (audio + note assets) sync is the
+# deferred S4 slice and is NOT present yet. It depends on `common` (shared types /
+# errors) and `persistence` (read the authoritative `notes.ydoc`; apply received
+# updates). Part of the CONNECTED feature surface: the crate lives in the
+# workspace unconditionally (like `mcp-server` / `tunnel-client`) but the
+# app-main -> sync edge is wired behind the `connected` feature.
+
+[dependencies]
+minutist-common = { path = "../common" }
+persistence = { path = "../persistence" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Device-to-device transport. iroh 1.0 supplies the QUIC endpoint, the ed25519
+# device identity, the custom relay (RelayMode::Custom -> sync.minutist.ai), and
+# out-of-band addressing (MemoryLookup) for peers learned over the account
+# service. Pinned EXACT; the 1.0 API is a hard floor and bumping is a coordinated
+# change.
+iroh = "=1.0.0"
+# Shareable endpoint tickets (manual device pairing). `iroh-tickets` carries the
+# `EndpointTicket` Display/FromStr round-trip that serialises this device's
+# `EndpointAddr` to a string the user copies to another device. Pinned EXACT to
+# track the iroh 1.0 line alongside `iroh`.
+iroh-tickets = "=1.0.0"
+# yrs — the Yjs CRDT port. `persistence` owns the authoritative `notes.ydoc` and
+# its projections; `sync` uses yrs only for the wire-level reconciliation math on
+# lib0-v1 update bytes (`encode_state_vector_from_update_v1` / `diff_updates_v1`),
+# never to materialise a doc or re-derive projections. Same workspace pin as
+# `persistence` so the two agree on the on-the-wire encoding.
+yrs = { workspace = true }
+# UUID — decode the fixed 16-byte meeting id off the wire back into a `MeetingId`.
+uuid = { workspace = true }
+
+[features]
+# Exposes the relay-less direct-connection path (`SyncEngine::start_direct` +
+# `bound_sockets`) for integration tests and local bring-up. NOT enabled in the
+# production build, whose sync surface always pins the relay.
+test-support = []
+
+[dev-dependencies]
+# Self-dependency with `test-support` on so `cargo test -p sync` builds the
+# integration test against the relay-less path without a feature flag on the
+# command line.
+sync = { path = ".", features = ["test-support"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

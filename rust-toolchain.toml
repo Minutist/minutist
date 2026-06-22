@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned to 1.91.0 (was floating `stable`): the connected-tier `sync` crate's
+# `iroh` 1.0 declares an MSRV of 1.91 (`rust-version = "1.91"`). The pin is exact
+# so every clone + CI leg builds the same compiler the connected stack requires.
+channel = "1.91.0"
 components = ["rustfmt", "clippy"]

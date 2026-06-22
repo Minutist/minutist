@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (35 total)
+//! ## Commands (42 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -46,6 +46,10 @@
 //! | `tunnel_poll_pairing` | `TunnelStatus` | WS4-A S5b |
 //! | `set_connector_enabled` | `TunnelSnapshot` | WS4-A S5b |
 //! | `tunnel_status` | `TunnelSnapshot` | WS4-A S5b |
+//! | `sync_status` | `SyncStatus` | WS4-B S5 |
+//! | `sync_get_my_ticket` | `String` | WS4-B S5 |
+//! | `sync_add_peer` | `()` | WS4-B S5 |
+//! | `sync_now` | `()` | WS4-B S5 |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
@@ -130,6 +134,7 @@ pub mod error;
 pub mod events;
 pub mod inter_agent;
 pub mod output_language;
+pub mod sync;
 pub mod tunnel;
 
 use std::path::PathBuf;
@@ -152,6 +157,7 @@ pub use inter_agent::spawn_inter_agent_driver;
 /// holds `Arc<OnceCell<Arc<LlamaSummariser>>>`).
 pub use persistence::MeetingIndex;
 pub use summariser::LlamaSummariser;
+pub use sync::{disabled_sync, DisabledSync, SyncControl};
 pub use tunnel::{disabled_tunnel, DisabledTunnel, PairingPrompt, TunnelControl, TunnelSnapshot};
 
 // ---------------------------------------------------------------------------
@@ -252,6 +258,15 @@ pub struct IpcState {
     /// `tunnel_status`) call through this trait so `ipc-bridge` takes no
     /// `tunnel-client` dependency edge.
     pub tunnel: Arc<dyn TunnelControl>,
+    /// The peer-to-peer notes-sync control surface (WS4-B S5). `app-main` injects
+    /// a `connected`-gated implementation (holding the `sync` engine: iroh
+    /// endpoint + pairing + notes-sync protocol); the free build (and a connected
+    /// build with no sync wiring) gets [`DisabledSync`], which reports `Disabled`
+    /// and rejects ticket / peer / sync operations as unsupported. The sync IPC
+    /// commands (`sync_status`, `sync_get_my_ticket`, `sync_add_peer`,
+    /// `sync_now`) call through this trait so `ipc-bridge` takes no `sync`
+    /// dependency edge — the same seam as [`Self::tunnel`].
+    pub sync: Arc<dyn SyncControl>,
     /// The logs directory (`{app-data}/logs/`), owned by `app-main` but its path
     /// is shared here so `get_diagnostic_report` (#0014) can read the rolling
     /// `minutist.log` tail and the `last-crash.txt` written by the panic hook.
@@ -572,6 +587,10 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             tunnel::tunnel_poll_pairing,
             tunnel::set_connector_enabled,
             tunnel::tunnel_status,
+            sync::sync_status,
+            sync::sync_get_my_ticket,
+            sync::sync_add_peer,
+            sync::sync_now,
         ])
         .events(collect_events![AppEventPayload])
 }
@@ -679,7 +698,8 @@ mod tests {
     /// 33 + 2 = 35; the WS4-A S5b tunnel surface adds `tunnel_begin_pairing` /
     /// `tunnel_poll_pairing` / `set_connector_enabled` / `tunnel_status`:
     /// 35 + 4 = 39; #0015 merges `re_transcribe` + `rediarize_meeting` into one
-    /// `reprocess`: 39 − 2 + 1 = 38).
+    /// `reprocess`: 39 − 2 + 1 = 38; the WS4-B S5 sync surface adds `sync_status`
+    /// / `sync_get_my_ticket` / `sync_add_peer` / `sync_now`: 38 + 4 = 42).
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
@@ -733,13 +753,18 @@ mod tests {
             "tunnel_poll_pairing",
             "set_connector_enabled",
             "tunnel_status",
+            "sync_status",
+            "sync_get_my_ticket",
+            "sync_add_peer",
+            "sync_now",
         ];
 
         assert_eq!(
             expected.len(),
-            38,
-            "command ledger must be 38 (39 − the #0015 merge of re_transcribe + \
-             rediarize_meeting into one reprocess command)"
+            42,
+            "command ledger must be 42 (38 + the 4 WS4-B S5 sync commands; the 38 \
+             is 39 − the #0015 merge of re_transcribe + rediarize_meeting into one \
+             reprocess command)"
         );
 
         // #0015 — the two former offline commands merged into `reprocess`; assert

@@ -268,6 +268,38 @@ pub fn normalise(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Canonicalise a table — whether GitHub pipe-markdown OR PaddleOCR-VL's OTSL
+/// markup (`<fcel>` / `<ecel>` / `<nl>` ...) — to a cell-content stream, so the
+/// table-page CER scores recognition accuracy rather than which serialization a
+/// model emits. Applied IDENTICALLY to ground truth and prediction: every
+/// angle-bracket tag and every `|` is folded to one cell boundary; cells are
+/// trimmed, empty cells and markdown separator cells (only `-`/`:`) are dropped,
+/// and survivors are joined by " | " in reading order. Structure-agnostic (row
+/// boundaries are not scored) — the fair common denominator across the two
+/// serializations for these flat tables.
+pub fn canonicalize_table(s: &str) -> String {
+    let mut flat = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                flat.push('|');
+            }
+            '>' => in_tag = false,
+            _ if in_tag => {}
+            '|' => flat.push('|'),
+            c => flat.push(c),
+        }
+    }
+    let cells: Vec<&str> = flat
+        .split('|')
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && !c.chars().all(|ch| ch == '-' || ch == ':'))
+        .collect();
+    cells.join(" | ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +327,17 @@ mod tests {
         let table = pages.iter().find(|p| p.name == "table").unwrap();
         assert!(table.ground_truth.contains("| Item | Owner | Status |"));
         assert!(table.ground_truth.contains("--- |"));
+    }
+
+    #[test]
+    fn canonicalize_table_unifies_markdown_and_otsl() {
+        // A markdown pipe-table and PaddleOCR's OTSL markup with identical cell
+        // content must reduce to the same canonical stream (separator row + empty
+        // cells dropped), so CER scores content, not serialization.
+        let markdown = "| Item | Owner | | --- | --- | | Transcript | Alice |";
+        let otsl = "<fcel>Item<fcel>Owner<nl><fcel>Transcript<fcel>Alice<nl>";
+        let want = "Item | Owner | Transcript | Alice";
+        assert_eq!(canonicalize_table(markdown), want);
+        assert_eq!(canonicalize_table(otsl), want);
     }
 }

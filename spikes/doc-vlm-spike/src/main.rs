@@ -241,7 +241,18 @@ fn run() -> Result<()> {
             })?;
 
             let pred = synth::normalise(&out.markdown);
-            let cer = char_error_rate(&page.ground_truth, &pred);
+            // The table page is scored on canonical cell content, not raw syntax:
+            // a markdown pipe-table and PaddleOCR's OTSL (<fcel>/<nl>) markup
+            // reduce to the same cell stream, so CER measures recognition accuracy
+            // rather than which serialization a model emits.
+            let cer = if page.name == "table" {
+                char_error_rate(
+                    &synth::canonicalize_table(&page.ground_truth),
+                    &synth::canonicalize_table(&pred),
+                )
+            } else {
+                char_error_rate(&page.ground_truth, &pred)
+            };
             eprintln!(
                 "  [{}] '{}': CER={:.3} latency={:.2}s tokens={}",
                 spec.display_name, page.name, cer, out.inference_secs, out.tokens

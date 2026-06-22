@@ -65,62 +65,40 @@ use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::Update;
 
+use crate::frame::{read_frame, write_frame};
 use crate::{Error, Result};
 
-/// ALPN for the notes-update protocol. Bumping the suffix is a wire break.
+/// ALPN for the sync-update protocol. Bumping the suffix is a wire break.
+///
+/// Both the notes reconciliation and the media-manifest exchange
+/// ([`crate::media_proto`]) multiplex onto this one ALPN: the initiator writes a
+/// one-byte [`StreamKind`] tag as the first byte of each bidirectional stream, and
+/// the accept hook dispatches on it. Keeping a single ALPN means one paired-peer
+/// authorisation point (the notes-ALPN accept hook) covers both protocols.
 pub const SYNC_ALPN: &[u8] = b"minutist/sync/notes/1";
 
-/// Upper bound on a single length-prefixed frame the protocol will buffer, in
-/// bytes. A whole-document Yjs update or state vector for a meeting's notes is
-/// far smaller than this; the cap bounds a hostile/buggy peer's allocation.
-const MAX_FRAME: usize = 8 * 1024 * 1024;
-
-/// Validate a frame's big-endian `u32` length prefix against [`MAX_FRAME`],
-/// returning the length as a `usize` to allocate. A length over the cap is an
-/// [`Error::Protocol`] — the guard that bounds a hostile/buggy peer's allocation,
-/// checked BEFORE any buffer is allocated.
-fn checked_frame_len(len_buf: [u8; 4]) -> Result<usize> {
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
-        return Err(Error::Protocol(format!(
-            "frame length {len} exceeds cap {MAX_FRAME}"
-        )));
-    }
-    Ok(len)
+/// The first byte of a sync bidirectional stream, selecting the protocol that
+/// runs over it. Lets notes and media reconciliation share one ALPN and one
+/// authorised accept loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamKind {
+    /// Yjs notes reconciliation ([`initiate_notes_sync`] / [`respond_notes_sync`]).
+    Notes = 1,
+    /// Media-manifest exchange ([`crate::media_proto`]).
+    Media = 2,
 }
 
-/// Read one length-prefixed frame from `recv`: a `u32` big-endian length then
-/// that many bytes. Rejects a length over [`MAX_FRAME`] before allocating.
-async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| Error::Protocol(format!("reading frame length: {e}")))?;
-    let len = checked_frame_len(len_buf)?;
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf)
-        .await
-        .map_err(|e| Error::Protocol(format!("reading {len}-byte frame body: {e}")))?;
-    Ok(buf)
-}
-
-/// Write one length-prefixed frame to `send`: a `u32` big-endian length then the
-/// bytes. Rejects a body over [`MAX_FRAME`] so both directions share the cap.
-async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
-    if bytes.len() > MAX_FRAME {
-        return Err(Error::Protocol(format!(
-            "frame body {} exceeds cap {MAX_FRAME}",
-            bytes.len()
-        )));
+impl StreamKind {
+    /// Decode a stream-kind tag byte, rejecting an unknown value as a protocol
+    /// error rather than silently mis-dispatching.
+    pub fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            1 => Ok(Self::Notes),
+            2 => Ok(Self::Media),
+            other => Err(Error::Protocol(format!("unknown sync stream kind {other}"))),
+        }
     }
-    let len = bytes.len() as u32;
-    send.write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| Error::Protocol(format!("writing frame length: {e}")))?;
-    send.write_all(bytes)
-        .await
-        .map_err(|e| Error::Protocol(format!("writing frame body: {e}")))?;
-    Ok(())
 }
 
 /// The local v1 whole-state update for `meeting_id`, or the empty-document state
@@ -209,11 +187,12 @@ fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> 
 /// Run the *initiator* (dialling) side of one notes reconciliation for
 /// `meeting_id` over `conn`, against the meetings `root`.
 ///
-/// Opens a bi stream, sends the REQUEST (meeting id + local state vector), reads
-/// the peer's state vector, sends the DIFF the peer is missing (so the responder
-/// converges), then reads the DIFF we are missing and applies it (so we
-/// converge). The caller closes `conn` after this returns — the initiator is the
-/// last reader, so closing then is safe. See the module wire-protocol diagram.
+/// Opens a bi stream, writes the [`StreamKind::Notes`] tag, sends the REQUEST
+/// (meeting id + local state vector), reads the peer's state vector, sends the
+/// DIFF the peer is missing (so the responder converges), then reads the DIFF we
+/// are missing and applies it (so we converge). The caller closes `conn` after
+/// this returns — the initiator is the last reader, so closing then is safe. See
+/// the module wire-protocol diagram.
 pub async fn initiate_notes_sync(
     conn: &Connection,
     root: &Path,
@@ -226,6 +205,11 @@ pub async fn initiate_notes_sync(
         .open_bi()
         .await
         .map_err(|e| Error::Protocol(format!("opening notes-sync bi stream: {e}")))?;
+
+    // Tag this stream as a notes exchange so the responder dispatches correctly.
+    send.write_all(&[StreamKind::Notes as u8])
+        .await
+        .map_err(|e| Error::Protocol(format!("writing notes stream tag: {e}")))?;
 
     // REQUEST: meeting id (fixed 16 bytes) then our state vector.
     send.write_all(meeting_id.0.as_bytes())
@@ -246,43 +230,44 @@ pub async fn initiate_notes_sync(
     Ok(())
 }
 
-/// Run the *responder* (accepting) side of one notes reconciliation over `conn`,
-/// against the meetings `root`.
+/// Run the *responder* (accepting) side of one notes reconciliation against the
+/// meetings `root`, over a bi stream the accept hook has already accepted and
+/// whose leading [`StreamKind`] tag it has already consumed.
 ///
-/// Accepts the bi stream the initiator opened, reads the REQUEST (meeting id +
-/// initiator state vector), replies with its own state vector, reads the
-/// initiator's DIFF and applies it (so we converge), then sends the DIFF the
-/// initiator is missing. Finally parks on [`Connection::closed`] so the
-/// router does not drop the connection (aborting our last write) before the
-/// initiator has read it. See the module wire-protocol diagram.
+/// Reads the REQUEST (meeting id + initiator state vector), replies with its own
+/// state vector, reads the initiator's DIFF and applies it (so we converge), then
+/// sends the DIFF the initiator is missing. Finally parks on
+/// [`Connection::closed`] so the router does not drop the connection (aborting our
+/// last write) before the initiator has read it. See the module wire-protocol
+/// diagram.
 ///
 /// [`Connection::closed`]: iroh::endpoint::Connection::closed
-pub async fn respond_notes_sync(conn: &Connection, root: &Path) -> Result<()> {
-    let (mut send, mut recv) = conn
-        .accept_bi()
-        .await
-        .map_err(|e| Error::Protocol(format!("accepting notes-sync bi stream: {e}")))?;
-
+pub async fn respond_notes_sync(
+    conn: &Connection,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    root: &Path,
+) -> Result<()> {
     // REQUEST: meeting id then the initiator's state vector.
     let mut id_buf = [0u8; 16];
     recv.read_exact(&mut id_buf)
         .await
         .map_err(|e| Error::Protocol(format!("reading meeting id: {e}")))?;
     let meeting_id = MeetingId(Uuid::from_bytes(id_buf));
-    let init_sv = read_frame(&mut recv).await?;
+    let init_sv = read_frame(recv).await?;
 
     let local_state = local_v1_state(root, meeting_id)?;
     let local_sv = state_vector_of(&local_state)?;
 
     // Reply with our state vector so the initiator can diff against it.
-    write_frame(&mut send, &local_sv).await?;
+    write_frame(send, &local_sv).await?;
 
     // Apply the initiator's diff (we converge), then send the diff it is missing.
-    let diff_for_us = read_frame(&mut recv).await?;
+    let diff_for_us = read_frame(recv).await?;
     apply_inbound(root, meeting_id, &diff_for_us)?;
 
     let diff_for_init = diff_against(&local_state, &init_sv)?;
-    write_frame(&mut send, &diff_for_init).await?;
+    write_frame(send, &diff_for_init).await?;
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing notes-sync send: {e}")))?;
 
@@ -353,23 +338,6 @@ mod tests {
             before,
             "diff against own sv must be a no-op"
         );
-    }
-
-    #[test]
-    fn oversized_frame_length_is_rejected_before_allocating() {
-        // A `u32` length prefix beyond MAX_FRAME must be rejected as a protocol
-        // error, not used to allocate a multi-gigabyte buffer. `u32::MAX` is the
-        // worst case a hostile peer can put on the wire.
-        assert!(matches!(
-            checked_frame_len(u32::MAX.to_be_bytes()),
-            Err(Error::Protocol(_))
-        ));
-        // The exact cap is fine; one over it is not.
-        assert!(checked_frame_len((MAX_FRAME as u32).to_be_bytes()).is_ok());
-        assert!(matches!(
-            checked_frame_len((MAX_FRAME as u32 + 1).to_be_bytes()),
-            Err(Error::Protocol(_))
-        ));
     }
 
     #[test]

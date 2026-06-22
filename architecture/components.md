@@ -79,8 +79,17 @@ ConnectionSettings panes — tree-shaken from the free bundle at build time.
 Third-party deps: `iroh` (the QUIC transport, pinned EXACT), `iroh-tickets` (the
 `EndpointTicket` round-trip for manual device pairing, pinned EXACT alongside the
 iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same workspace pin as
-`persistence`) and `uuid`. (Media-blob sync, the deferred S4 slice, will add
-`iroh-blobs` when it lands; it is not a dependency today.)
+`persistence`) and `uuid`. WS4-B S4 adds `iroh-blobs` (pinned EXACT `=0.103.0`,
+`fs-store` feature) for content-addressed media-blob sync: it supplies the BLAKE3
+blob store and the `BlobsProtocol` handler, multiplexed onto the SAME `Endpoint` /
+`Router` under a SECOND ALPN (`iroh_blobs::ALPN`) beside `SYNC_ALPN`. `iroh-blobs`
+depends on `iroh ^1.0.0`; the `=1.0.0` pin is in range and there is ONE `iroh` in
+the tree so the endpoint/connection types unify across the accept/connect/download
+boundary. The blobs ALPN's accept side is wrapped in an authorising
+`ProtocolHandler` that rejects an inbound connection from a peer not in the paired
+`PeerDirectory` BEFORE delegating to `BlobsProtocol::accept` — the same
+mutual-pairing guard the notes ALPN's `AcceptHook` applies, so the new ALPN does
+not serve arbitrary peers.
 The notes-sync protocol exchanges yrs state vectors and computes the minimal
 lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
 operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —
@@ -89,6 +98,21 @@ operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns �
 (`persistence` owns the one place that relaxes the document-opacity guarantee —
 see its "CRDT notes storage" section). `uuid` only decodes the fixed 16-byte
 meeting id off the wire back into a `common::MeetingId`.
+
+The media-sync protocol (WS4-B S4) multiplexes onto the same `SYNC_ALPN`: each
+bidirectional stream opens with a one-byte stream-kind tag so the accept hook
+dispatches between notes reconciliation and the media-manifest exchange. The two
+sides exchange a manifest of `(relative-path, BLAKE3 hash)` pairs for `audio.opus`
++ each `assets/*` file (imported into the `iroh-blobs` store at
+`{meetings_root}/.blobs` — a dot-prefixed sibling that cannot collide with a
+`{uuid}` folder), then each pulls the blobs it lacks over the blobs ALPN and
+exports them to the per-meeting paths `persistence` owns
+(`MeetingFolder::ensure` creates the folder; `sync` writes only the media file).
+Imported and downloaded blobs are pinned with persistent named tags
+(`meeting/{id}/audio`, `meeting/{id}/asset/{name}`) so retention does not depend
+on GC state. `sync` reads/writes only `audio.opus` and `assets/*` under the
+meetings root — it does not touch metadata/transcript/notes projections in the
+media path.
 
 The `tunnel-client` row's "May depend on" is empty by design: the crate takes
 **no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)

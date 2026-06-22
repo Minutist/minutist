@@ -258,6 +258,15 @@ pub(crate) fn is_safe_rel(rel: &str) -> bool {
     )
 }
 
+/// Upper bound on the number of entries in a manifest received from a peer. A
+/// real meeting carries one `audio.opus` plus its note assets — tens of files in
+/// practice — so this ceiling is far above any legitimate manifest while bounding
+/// the work a hostile paired peer can force: without it an 8 MiB manifest frame
+/// (the [`crate::frame::MAX_FRAME`] cap) could pack on the order of 10^5 minimal
+/// entries, each driving a download attempt. The frame cap already bounds
+/// allocation; this bounds the per-entry fan-out.
+const MAX_MANIFEST_ENTRIES: usize = 4096;
+
 /// A media manifest: the `(relative-path, hash)` pairs for a meeting's
 /// `audio.opus` and each note asset. Exchanged over the notes channel
 /// ([`crate::media_proto`]); the receiver pulls the entries whose hashes it lacks.
@@ -279,13 +288,36 @@ pub struct ManifestEntry {
 }
 
 impl Manifest {
-    /// Reject any entry whose relative path could escape the meeting folder.
-    /// Called on a manifest received from a peer before any export.
+    /// Validate a manifest received from a peer before any export. Rejects, in
+    /// order, a manifest that:
+    ///
+    /// - carries more than [`MAX_MANIFEST_ENTRIES`] entries (bounds the download
+    ///   fan-out a hostile paired peer can force);
+    /// - contains an entry whose relative path could escape the meeting folder
+    ///   ([`is_safe_rel`]);
+    /// - lists the same `rel_path` twice. A local import produces at most one
+    ///   entry per path (audio once, each asset filename once), so a duplicate is
+    ///   definitionally malformed; left unchecked, two entries for one path would
+    ///   each be pulled and the later export would overwrite the earlier at the
+    ///   same target — a nondeterministic, peer-controlled outcome.
     pub fn validate(&self) -> Result<()> {
+        if self.entries.len() > MAX_MANIFEST_ENTRIES {
+            return Err(Error::Protocol(format!(
+                "manifest has {} entries, over the cap {MAX_MANIFEST_ENTRIES}",
+                self.entries.len()
+            )));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(self.entries.len());
         for entry in &self.entries {
             if !is_safe_rel(&entry.rel_path) {
                 return Err(Error::Protocol(format!(
                     "manifest entry has unsafe path: {:?}",
+                    entry.rel_path
+                )));
+            }
+            if !seen.insert(entry.rel_path.as_str()) {
+                return Err(Error::Protocol(format!(
+                    "manifest lists relative path more than once: {:?}",
                     entry.rel_path
                 )));
             }
@@ -346,6 +378,53 @@ mod tests {
                 rel_path: "../escape".to_string(),
                 hash: Hash::from([0u8; 32]),
             }],
+        };
+        assert!(matches!(m.validate(), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn manifest_validate_rejects_too_many_entries() {
+        // One past the cap is rejected; a manifest at the cap of distinct safe
+        // paths is accepted (the per-entry path safety is already covered
+        // elsewhere, so use audio + distinct asset filenames here).
+        let over = MAX_MANIFEST_ENTRIES + 1;
+        let m = Manifest {
+            entries: (0..over)
+                .map(|i| ManifestEntry {
+                    rel_path: format!("assets/a{i}.png"),
+                    hash: Hash::from([0u8; 32]),
+                })
+                .collect(),
+        };
+        assert!(matches!(m.validate(), Err(Error::Protocol(_))));
+
+        let at_cap = Manifest {
+            entries: (0..MAX_MANIFEST_ENTRIES)
+                .map(|i| ManifestEntry {
+                    rel_path: format!("assets/a{i}.png"),
+                    hash: Hash::from([0u8; 32]),
+                })
+                .collect(),
+        };
+        assert!(at_cap.validate().is_ok());
+    }
+
+    #[test]
+    fn manifest_validate_rejects_duplicate_rel_path() {
+        // Two entries for the same path (here two `audio.opus` rows with different
+        // hashes) is malformed — a local import never produces it — and would
+        // otherwise let the peer pick the final on-disk bytes by entry order.
+        let m = Manifest {
+            entries: vec![
+                ManifestEntry {
+                    rel_path: "audio.opus".to_string(),
+                    hash: Hash::from([1u8; 32]),
+                },
+                ManifestEntry {
+                    rel_path: "audio.opus".to_string(),
+                    hash: Hash::from([2u8; 32]),
+                },
+            ],
         };
         assert!(matches!(m.validate(), Err(Error::Protocol(_))));
     }

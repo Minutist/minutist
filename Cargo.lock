@@ -8117,7 +8117,6 @@ dependencies = [
  "image",
  "llama-cpp-2",
  "pdfium-render",
- "sha2 0.10.9",
  "strsim",
  "tar",
  "tracing",

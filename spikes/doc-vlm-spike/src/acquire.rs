@@ -35,44 +35,44 @@ pub fn cache_root() -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Gemma-4 E4B vision GGUFs (ggml-org HF GGUF repo)
+// Multi-model vision GGUFs
 // ---------------------------------------------------------------------------
+//
+// Per-model URLs / filenames / size-floors live on each `ModelSpec` in
+// `models.rs`; this module just drives the download/cache machinery from them.
+// The one model-specific hook that stays here is the app-LM reuse for Gemma-4
+// (the app bundles the text-only Gemma LM but never the vision mmproj).
 
-/// ggml-org Gemma-4 E4B-it GGUF repo. E4B is the "small enough for a desktop
-/// GPU" Gemma-4 that ships a vision mmproj under the ggml-org org.
-const HF_REPO: &str = "ggml-org/gemma-4-E4B-it-GGUF";
-
-/// Main LM GGUF (Q4_K_M ~5.34 GB) — recommended desktop-GPU quant.
-const LM_FILENAME: &str = "gemma-4-E4B-it-Q4_K_M.gguf";
-/// Vision projector GGUF (Q8_0 ~560 MB) — the extra vision piece the app's
-/// text-only bundle never carries.
-const MMPROJ_FILENAME: &str = "mmproj-gemma-4-E4B-it-Q8_0.gguf";
-
-/// Loose lower bounds used as a "did the download actually complete / is this a
-/// truncated or HTML-error file" sanity check. NOT exact sizes — HF may requant.
+/// Loose lower bound for the app-LM reuse check: a present Gemma-4 LM under the
+/// app models dir is only reused if it is at least this big (truncated/partial
+/// files are ignored). NOT an exact size — HF may requant.
 const LM_MIN_BYTES: u64 = 4_500_000_000; // ~5.34 GB expected
-const MMPROJ_MIN_BYTES: u64 = 400_000_000; // ~560 MB expected
 
 pub struct ModelPaths {
     pub lm: PathBuf,
     pub mmproj: PathBuf,
 }
 
-/// Ensure the Gemma-4 vision LM + mmproj GGUFs exist in the cache, downloading
-/// the missing pieces from the ggml-org HF resolve URL.
+/// Ensure a registered model's LM + mmproj GGUFs exist in the cache, fetching
+/// the missing pieces from the model's resolve URLs (size-floor sanity, `.part`
+/// + rename, skip when cached). Each model is cached under its own subdir so
+/// filenames cannot collide between models.
 ///
-/// If an app-downloaded Gemma-4 LM of the right size is already present (under
-/// the app models dir), that file is reused for the LM and only the mmproj is
-/// fetched into the spike cache.
-pub fn ensure_models() -> Result<ModelPaths> {
+/// As a special case, for the Gemma-4 spec an app-downloaded Gemma-4 LM of the
+/// right size is reused if present (the app bundles the text-only LM but never
+/// the vision mmproj), so only the mmproj is fetched into the spike cache.
+pub fn ensure_model_spec(spec: &crate::models::ModelSpec) -> Result<ModelPaths> {
     let root = cache_root()?;
-    let vlm_dir = root.join("vlm");
-    fs::create_dir_all(&vlm_dir)
-        .with_context(|| format!("creating {}", vlm_dir.display()))?;
+    // Per-model subdir keyed on the LM cache filename stem; keeps the two
+    // models' artifacts from colliding and makes selective deletion easy.
+    let model_dir = root.join("vlm").join(model_subdir(spec));
+    fs::create_dir_all(&model_dir)
+        .with_context(|| format!("creating {}", model_dir.display()))?;
 
-    // LM: reuse an app-downloaded Gemma-4 LM if one is present and big enough.
-    let lm = match find_app_gemma4_lm() {
-        Some(existing) => {
+    // LM: reuse an app-downloaded Gemma-4 LM if this is the Gemma spec and one
+    // is present and big enough; otherwise fetch from the spec's resolve URL.
+    let lm = match (spec.lm_cache_filename.contains("gemma-4"), find_app_gemma4_lm()) {
+        (true, Some(existing)) => {
             eprintln!(
                 "reusing app-downloaded Gemma-4 LM: {} ({} bytes)",
                 existing.display(),
@@ -80,27 +80,26 @@ pub fn ensure_models() -> Result<ModelPaths> {
             );
             existing
         }
-        None => {
-            let target = vlm_dir.join(LM_FILENAME);
-            ensure_file(&target, &hf_resolve_url(LM_FILENAME), LM_MIN_BYTES, "LM GGUF")?;
+        _ => {
+            let target = model_dir.join(spec.lm_cache_filename);
+            ensure_file(&target, spec.lm_url, spec.lm_min_bytes, "LM GGUF")?;
             target
         }
     };
 
     // mmproj: ALWAYS fetched into the spike cache (the app never bundles it).
-    let mmproj = vlm_dir.join(MMPROJ_FILENAME);
-    ensure_file(
-        &mmproj,
-        &hf_resolve_url(MMPROJ_FILENAME),
-        MMPROJ_MIN_BYTES,
-        "vision mmproj GGUF",
-    )?;
+    let mmproj = model_dir.join(spec.mmproj_cache_filename);
+    ensure_file(&mmproj, spec.mmproj_url, spec.mmproj_min_bytes, "vision mmproj GGUF")?;
 
     Ok(ModelPaths { lm, mmproj })
 }
 
-fn hf_resolve_url(filename: &str) -> String {
-    format!("https://huggingface.co/{HF_REPO}/resolve/main/{filename}")
+/// Stable per-model cache subdir derived from the LM cache filename (extension
+/// stripped). e.g. `gemma-4-E4B-it-Q4_K_M` / `PaddleOCR-VL-1.6-q4_k_m`.
+fn model_subdir(spec: &crate::models::ModelSpec) -> &'static str {
+    spec.lm_cache_filename
+        .strip_suffix(".gguf")
+        .unwrap_or(spec.lm_cache_filename)
 }
 
 /// Look for an already-present Gemma-4 LM under the production app models dir

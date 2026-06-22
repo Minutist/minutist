@@ -1,6 +1,8 @@
-//! doc-vlm-spike — fully-automated Gemma-4 vision doc-to-markdown go/no-go.
+//! doc-vlm-spike — fully-automated head-to-head doc-to-markdown go/no-go.
 //!
-//! Validates the VLM fallback seam that `crates/doc-convert` deliberately
+//! Benchmarks Gemma-4-E4B (a generic chat VLM) against PaddleOCR-VL-1.6 (a
+//! doc-OCR specialist) on the SAME synthetic pages, to decide which model
+//! should fill the VLM fallback seam that `crates/doc-convert` deliberately
 //! omits from its production path. Throwaway code (see
 //! `architecture/cross-cutting.md` §6-10): `anyhow`, `eprintln!`, blocking
 //! `ureq`, a single sync `main`. NOT wired into the app, and it deliberately
@@ -14,10 +16,20 @@
 //! ```
 //!
 //! No model paths, no PDFium path, no fixture, no required flags. The spike
-//! self-acquires the Gemma-4 E4B vision LM + mmproj GGUFs and a PDFium prebuilt
+//! self-acquires each registered model's LM + mmproj GGUFs and a PDFium prebuilt
 //! into the OS cache dir, renders known synthetic pages with exact ground
-//! truth, runs each through mtmd IMAGE inference, scores CER + latency, prints a
-//! table, and exits 0 (PASS) / non-zero (FAIL).
+//! truth, runs EVERY page through EVERY model via mtmd IMAGE inference, scores
+//! CER + latency, prints a side-by-side comparison + per-model PASS/FAIL +
+//! the winning model, and exits 0 (every model passes) / non-zero otherwise.
+//!
+//! # Per-model prompting (load-bearing)
+//!
+//! The two models need OPPOSITE image-marker placement. Gemma takes a verbose
+//! "convert to markdown" instruction with the `<__media__>` marker AFTER it,
+//! rendered through its chat template. PaddleOCR-VL is trained on bare task
+//! prefixes (`OCR:`, `Table Recognition:`) with the marker BEFORE the prefix
+//! inside an ERNIE-4.5 turn. Each `ModelSpec` in `models.rs` carries its own
+//! instruction + prompt-assembly so the two coexist.
 //!
 //! # mtmd IMAGE path
 //!
@@ -25,13 +37,18 @@
 //! marker -> `eval_chunks` prefill -> greedy decode with EOG stop. Same C
 //! bindings as the audio path in `crates/asr-runtime`, fed a page image.
 //!
-//! # Caveat (record on first Vulkan run)
+//! # Caveats (record on first Vulkan run)
 //!
-//! Gemma-4 PLE forward-graph issue (llama.cpp #22243) may affect the vision
-//! graph. If vision inference crashes on Vulkan, a Gemma-3 multimodal GGUF
-//! (`ggml-org/gemma-3-4b-it-GGUF`, no PLE) is the control.
+//! * Gemma-4 PLE forward-graph issue (llama.cpp #22243) may affect the vision
+//!   graph. If vision inference crashes on Vulkan, a Gemma-3 multimodal GGUF
+//!   (`ggml-org/gemma-3-4b-it-GGUF`, no PLE) is the control.
+//! * PaddleOCR-VL support landed via llama.cpp PR #18825 (mrope + the
+//!   `<__media__>OCR:` template). If `MtmdContext::init_from_file` rejects the
+//!   projector or `support_vision()` is false, the vendored llama.cpp predates
+//!   the PR and `llama-cpp-2` must be bumped.
 
 mod acquire;
+mod models;
 mod synth;
 
 use std::ffi::CString;
@@ -52,6 +69,8 @@ use llama_cpp_2::mtmd::{
     mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
 };
 use llama_cpp_2::sampling::LlamaSampler;
+
+use crate::models::{ModelSpec, REGISTRY};
 
 // ---------------------------------------------------------------------------
 // Acceptance thresholds
@@ -85,11 +104,13 @@ struct Cli {
     #[arg(short = 'i', long, value_name = "PATH")]
     input: Option<PathBuf>,
 
-    /// Override the auto-acquired LM GGUF (default: self-downloaded).
+    /// Override the auto-acquired LM GGUF for the FIRST registered model
+    /// (Gemma-4); other models still self-acquire. Mostly for local debugging.
     #[arg(long, value_name = "PATH")]
     model: Option<PathBuf>,
 
-    /// Override the auto-acquired vision mmproj GGUF (default: self-downloaded).
+    /// Override the auto-acquired vision mmproj GGUF for the FIRST registered
+    /// model (Gemma-4); other models still self-acquire.
     #[arg(long, value_name = "PATH")]
     mmproj: Option<PathBuf>,
 
@@ -106,15 +127,6 @@ struct Cli {
     /// 'all'). Ignored for image input.
     #[arg(long, default_value = "1")]
     pages: String,
-
-    /// Instruction prompt injected before the image marker.
-    #[arg(
-        long,
-        default_value = "Convert this document page to clean, well-structured markdown. \
-                          Preserve headings, lists, and tables. For tables use GitHub \
-                          pipe-table syntax. Output only the markdown content, no preamble."
-    )]
-    prompt: String,
 
     /// CPU threads for inference.
     #[arg(short = 't', long, default_value_t = 8)]
@@ -163,77 +175,28 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let n_gpu_layers = cli.n_gpu_layers.unwrap_or(if GPU_BUILD { 99 } else { 0 });
 
-    eprintln!("spike-doc-vlm: GPU build={GPU_BUILD} n_gpu_layers={n_gpu_layers}");
-
-    // --- Acquire artifacts (cache + skip when present) ---
-    let model_path = match &cli.model {
-        Some(p) => {
-            if !p.exists() {
-                bail!("--model {} does not exist", p.display());
-            }
-            p.clone()
-        }
-        None => acquire::ensure_models()
-            .context("acquiring Gemma-4 vision LM GGUF")?
-            .lm,
-    };
-    let mmproj_path = match &cli.mmproj {
-        Some(p) => {
-            if !p.exists() {
-                bail!("--mmproj {} does not exist", p.display());
-            }
-            p.clone()
-        }
-        // ensure_models() also fetches the LM; when --model is given but
-        // --mmproj is not, we still need the mmproj from the cache.
-        None => acquire::ensure_models()
-            .context("acquiring Gemma-4 vision mmproj GGUF")?
-            .mmproj,
-    };
-
-    eprintln!("LM     = {}", model_path.display());
-    eprintln!("mmproj = {}", mmproj_path.display());
-
-    // --- llama backend + model + mtmd context ---
-    let load_t0 = Instant::now();
-    let backend = LlamaBackend::init().map_err(|e| anyhow!("LlamaBackend::init: {e}"))?;
-    eprintln!("backend init: {:?}", load_t0.elapsed());
-
-    let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
-    let model_t0 = Instant::now();
-    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-        .map_err(|e| anyhow!("LlamaModel::load_from_file ({}): {e}", model_path.display()))?;
-    eprintln!("model load: {:?}", model_t0.elapsed());
-
-    let mtmd_params = MtmdContextParams {
-        use_gpu: n_gpu_layers > 0,
-        print_timings: true,
-        n_threads: cli.threads,
-        media_marker: CString::new(mtmd_default_marker())
-            .map_err(|e| anyhow!("media marker CString: {e}"))?,
-    };
-    let mmproj_str = mmproj_path
-        .to_str()
-        .ok_or_else(|| anyhow!("non-UTF8 mmproj path"))?;
-
-    let mtmd_t0 = Instant::now();
-    let mtmd_ctx = MtmdContext::init_from_file(mmproj_str, &model, &mtmd_params)
-        .map_err(|e| anyhow!("MtmdContext::init_from_file ({mmproj_str}): {e}"))?;
-    eprintln!("mtmd init: {:?}", mtmd_t0.elapsed());
     eprintln!(
-        "mtmd: supports_vision={} supports_audio={}",
-        mtmd_ctx.support_vision(),
-        mtmd_ctx.support_audio(),
+        "spike-doc-vlm: GPU build={GPU_BUILD} n_gpu_layers={n_gpu_layers} models={}",
+        REGISTRY.len()
     );
 
-    // Hard bail: image inference is meaningless without a vision encoder.
-    if !mtmd_ctx.support_vision() {
-        bail!(
-            "passed mmproj does not advertise vision support — did you point at the \
-             audio projector? Expected the Gemma-4 vision mmproj \
-             (mmproj-gemma-4-E4B-it-Q8_0.gguf)."
+    // --- Acquire every model up front (cache + skip when present) ---
+    // Resolve all artifacts before loading anything so a download failure on
+    // model 2 does not strand us mid-run after model 1's inference.
+    let mut resolved: Vec<(&'static ModelSpec, acquire::ModelPaths)> = Vec::new();
+    for (i, spec) in REGISTRY.iter().enumerate() {
+        let paths = resolve_model_paths(spec, &cli, i == 0)
+            .with_context(|| format!("acquiring artifacts for {}", spec.display_name))?;
+        eprintln!(
+            "[{}] LM={} mmproj={}",
+            spec.display_name,
+            paths.lm.display(),
+            paths.mmproj.display()
         );
+        resolved.push((spec, paths));
     }
+
+    let backend = LlamaBackend::init().map_err(|e| anyhow!("LlamaBackend::init: {e}"))?;
 
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(Some(cli.n_ctx))
@@ -241,41 +204,162 @@ fn run() -> Result<()> {
         .with_n_threads(cli.threads)
         .with_n_threads_batch(cli.threads);
 
-    // --- Real-document mode: print output only, no gate ---
+    // --- Real-document mode: run through EVERY model, print output only ---
     if let Some(input) = &cli.input {
-        return run_real_input(
-            input, &backend, &model, &mtmd_ctx, &ctx_params, &cli, n_gpu_layers,
-        );
+        return run_real_input(input, &backend, &ctx_params, &resolved, &cli, n_gpu_layers);
     }
 
-    // --- Synthetic gate mode ---
+    // --- Synthetic gate mode: every page through every model ---
     let pages = synth::build_pages().context("building synthetic fixtures")?;
     eprintln!("synthetic pages: {}", pages.len());
 
     let mut results: Vec<GateRow> = Vec::new();
-    for page in &pages {
-        eprintln!("--- page '{}' ({} bytes PNG) ---", page.name, page.png.len());
-        let out = infer_page(
-            &backend, &model, &mtmd_ctx, &ctx_params, &page.png, &cli,
-        )
-        .with_context(|| format!("inference on synthetic page '{}'", page.name))?;
+    for (spec, paths) in &resolved {
+        eprintln!("\n==== model: {} ====", spec.display_name);
+        let loaded = load_model(&backend, spec, paths, &cli, n_gpu_layers)
+            .with_context(|| format!("loading {}", spec.display_name))?;
 
-        let pred = synth::normalise(&out.markdown);
-        let cer = char_error_rate(&page.ground_truth, &pred);
-        eprintln!(
-            "  page '{}': CER={:.3} latency={:.2}s tokens={}",
-            page.name, cer, out.inference_secs, out.tokens
-        );
-        results.push(GateRow {
-            name: page.name,
-            cer,
-            latency: out.inference_secs,
-            ground_truth: page.ground_truth.clone(),
-            prediction: pred,
-        });
+        for page in &pages {
+            eprintln!(
+                "--- [{}] page '{}' ({} bytes PNG) ---",
+                spec.display_name,
+                page.name,
+                page.png.len()
+            );
+            let out = infer_page(
+                &backend,
+                &loaded.model,
+                &loaded.mtmd_ctx,
+                &ctx_params,
+                spec,
+                page.name,
+                &page.png,
+                &cli,
+            )
+            .with_context(|| {
+                format!("inference on '{}' with {}", page.name, spec.display_name)
+            })?;
+
+            let pred = synth::normalise(&out.markdown);
+            let cer = char_error_rate(&page.ground_truth, &pred);
+            eprintln!(
+                "  [{}] '{}': CER={:.3} latency={:.2}s tokens={}",
+                spec.display_name, page.name, cer, out.inference_secs, out.tokens
+            );
+            results.push(GateRow {
+                model: spec.display_name,
+                page: page.name,
+                instruction: spec.instruction_for(page.name),
+                cer,
+                latency: out.inference_secs,
+                ground_truth: page.ground_truth.clone(),
+                prediction: pred,
+            });
+        }
+        // `loaded` (model + mtmd context) drops here, freeing VRAM/RAM before
+        // the next model loads — the two LMs are not co-resident.
     }
 
-    report_and_gate(&results)
+    report_and_gate(&pages, &results)
+}
+
+/// Resolve a model's LM + mmproj paths, honouring the `--model`/`--mmproj`
+/// debugging overrides for the first registered model only.
+fn resolve_model_paths(
+    spec: &ModelSpec,
+    cli: &Cli,
+    is_first: bool,
+) -> Result<acquire::ModelPaths> {
+    if is_first && (cli.model.is_some() || cli.mmproj.is_some()) {
+        // Overrides apply to the first model; fall back to self-acquired paths
+        // for whichever of LM/mmproj is not overridden.
+        let acquired = spec.acquire()?;
+        let lm = match &cli.model {
+            Some(p) => {
+                if !p.exists() {
+                    bail!("--model {} does not exist", p.display());
+                }
+                p.clone()
+            }
+            None => acquired.lm,
+        };
+        let mmproj = match &cli.mmproj {
+            Some(p) => {
+                if !p.exists() {
+                    bail!("--mmproj {} does not exist", p.display());
+                }
+                p.clone()
+            }
+            None => acquired.mmproj,
+        };
+        Ok(acquire::ModelPaths { lm, mmproj })
+    } else {
+        spec.acquire()
+    }
+}
+
+/// A loaded model: the LM plus its mtmd vision context. The two are kept
+/// together so one model's resources drop as a unit before the next loads.
+struct LoadedModel {
+    model: LlamaModel,
+    mtmd_ctx: MtmdContext,
+}
+
+/// Load one model's LM + mtmd context and assert it advertises vision support.
+fn load_model(
+    backend: &LlamaBackend,
+    spec: &ModelSpec,
+    paths: &acquire::ModelPaths,
+    cli: &Cli,
+    n_gpu_layers: u32,
+) -> Result<LoadedModel> {
+    let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
+    let model_t0 = Instant::now();
+    let model = LlamaModel::load_from_file(backend, &paths.lm, &model_params)
+        .map_err(|e| anyhow!("LlamaModel::load_from_file ({}): {e}", paths.lm.display()))?;
+    eprintln!("[{}] model load: {:?}", spec.display_name, model_t0.elapsed());
+
+    let mtmd_params = MtmdContextParams {
+        // Per-model GPU affinity, gated on actually having a GPU build/offload.
+        use_gpu: spec.use_gpu && n_gpu_layers > 0,
+        print_timings: true,
+        n_threads: cli.threads,
+        // The default marker `<__media__>` is correct for BOTH models (Gemma
+        // appends it, PaddleOCR prepends it); only its placement differs, and
+        // that is handled in `ModelSpec::build_prompt`, not here.
+        media_marker: CString::new(mtmd_default_marker())
+            .map_err(|e| anyhow!("media marker CString: {e}"))?,
+    };
+    let mmproj_str = paths
+        .mmproj
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF8 mmproj path"))?;
+
+    let mtmd_t0 = Instant::now();
+    let mtmd_ctx = MtmdContext::init_from_file(mmproj_str, &model, &mtmd_params)
+        .map_err(|e| anyhow!("MtmdContext::init_from_file ({mmproj_str}): {e}"))?;
+    eprintln!("[{}] mtmd init: {:?}", spec.display_name, mtmd_t0.elapsed());
+    eprintln!(
+        "[{}] mtmd: supports_vision={} supports_audio={}",
+        spec.display_name,
+        mtmd_ctx.support_vision(),
+        mtmd_ctx.support_audio(),
+    );
+
+    // Hard bail: image inference is meaningless without a vision encoder.
+    // (PaddleOCR support needs a post-PR-#18825 llama.cpp; a false here on that
+    //  model means the vendored llama.cpp predates the PR.)
+    if !mtmd_ctx.support_vision() {
+        bail!(
+            "{}: projector {} does not advertise vision support — either it is an \
+             audio projector, or (for PaddleOCR-VL) the vendored llama.cpp predates \
+             PR #18825 and llama-cpp-2 must be bumped.",
+            spec.display_name,
+            paths.mmproj.display()
+        );
+    }
+
+    Ok(LoadedModel { model, mtmd_ctx })
 }
 
 // ---------------------------------------------------------------------------
@@ -285,11 +369,10 @@ fn run() -> Result<()> {
 fn run_real_input(
     input: &std::path::Path,
     backend: &LlamaBackend,
-    model: &LlamaModel,
-    mtmd_ctx: &MtmdContext,
     ctx_params: &LlamaContextParams,
+    resolved: &[(&'static ModelSpec, acquire::ModelPaths)],
     cli: &Cli,
-    _n_gpu_layers: u32,
+    n_gpu_layers: u32,
 ) -> Result<()> {
     if !input.exists() {
         bail!("--input {} does not exist", input.display());
@@ -300,6 +383,7 @@ fn run_real_input(
         .unwrap_or("")
         .to_ascii_lowercase();
 
+    // Rasterise once (model-independent), then run every model over the pages.
     let page_pngs: Vec<(u32, Vec<u8>)> = if ext == "pdf" {
         let pdfium_lib = match &cli.pdfium_lib {
             Some(p) => p.clone(),
@@ -316,21 +400,42 @@ fn run_real_input(
         bail!("no pages to process from {}", input.display());
     }
 
-    let mut all = String::new();
-    for (page, png) in &page_pngs {
-        eprintln!("--- input page {page} ({} bytes) ---", png.len());
-        let out = infer_page(backend, model, mtmd_ctx, ctx_params, png, cli)
-            .with_context(|| format!("inference on input page {page}"))?;
-        eprintln!("  page {page}: latency={:.2}s tokens={}", out.inference_secs, out.tokens);
-        if page_pngs.len() > 1 {
-            all.push_str(&format!("## Page {page}\n\n"));
+    let mut out_doc = String::new();
+    for (spec, paths) in resolved {
+        eprintln!("\n==== model: {} ====", spec.display_name);
+        let loaded = load_model(backend, spec, paths, cli, n_gpu_layers)
+            .with_context(|| format!("loading {}", spec.display_name))?;
+
+        out_doc.push_str(&format!("# {} — {}\n\n", spec.display_name, input.display()));
+        for (page, png) in &page_pngs {
+            eprintln!("--- [{}] input page {page} ({} bytes) ---", spec.display_name, png.len());
+            // No ground truth -> the page name is not "table", so each model
+            // uses its general instruction (`OCR:` for PaddleOCR).
+            let out = infer_page(
+                backend,
+                &loaded.model,
+                &loaded.mtmd_ctx,
+                ctx_params,
+                spec,
+                "input",
+                png,
+                cli,
+            )
+            .with_context(|| format!("inference on input page {page} with {}", spec.display_name))?;
+            eprintln!(
+                "  [{}] page {page}: latency={:.2}s tokens={}",
+                spec.display_name, out.inference_secs, out.tokens
+            );
+            if page_pngs.len() > 1 {
+                out_doc.push_str(&format!("## Page {page}\n\n"));
+            }
+            out_doc.push_str(out.markdown.trim());
+            out_doc.push_str("\n\n");
         }
-        all.push_str(out.markdown.trim());
-        all.push_str("\n\n");
     }
 
     // markdown -> stdout; diagnostics -> stderr.
-    print!("{}", all.trim_end());
+    print!("{}", out_doc.trim_end());
     println!();
     eprintln!("--- real-document mode: no CER gate applied ---");
     Ok(())
@@ -346,11 +451,14 @@ struct PageOutput {
     tokens: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_page(
     backend: &LlamaBackend,
     model: &LlamaModel,
     mtmd_ctx: &MtmdContext,
     ctx_params: &LlamaContextParams,
+    spec: &ModelSpec,
+    page_name: &str,
     png_bytes: &[u8],
     cli: &Cli,
 ) -> Result<PageOutput> {
@@ -365,15 +473,18 @@ fn infer_page(
         bitmap.ny()
     );
 
-    // Prompt: instruction + media marker in one user turn.
+    // Per-model prompt assembly. Gemma puts the marker AFTER its verbose
+    // instruction (via chat template); PaddleOCR puts it BEFORE the bare task
+    // prefix inside an ERNIE turn. `tokenize` splits the text on the marker and
+    // inserts the image chunk at that position, so placement is what differs.
     let media_marker = mtmd_default_marker();
-    let user_content = format!("{}\n{}", cli.prompt, media_marker);
-    let prompt_text = build_prompt(model, &user_content)?;
+    let prompt_text = spec.build_prompt(model, page_name, media_marker)?;
+    eprintln!("  prompt[{}]: {}", spec.display_name, truncate(&prompt_text, 160));
 
     let input_text = MtmdInputText {
         text: prompt_text,
-        add_special: true,
-        parse_special: true,
+        add_special: spec.add_special(),
+        parse_special: spec.parse_special(),
     };
 
     // Fresh context per page (clean KV cache); MtmdContext reused.
@@ -433,24 +544,6 @@ fn infer_page(
         inference_secs: infer_t0.elapsed().as_secs_f64(),
         tokens,
     })
-}
-
-fn build_prompt(model: &LlamaModel, user_content: &str) -> Result<String> {
-    use llama_cpp_2::model::LlamaChatMessage;
-
-    let msg = LlamaChatMessage::new("user".to_string(), user_content.to_string())
-        .map_err(|e| anyhow!("LlamaChatMessage::new: {e}"))?;
-
-    match model.chat_template(None::<&str>) {
-        Ok(template) => match model.apply_chat_template(&template, &[msg], true) {
-            Ok(rendered) => return Ok(rendered),
-            Err(e) => eprintln!("apply_chat_template failed, ChatML fallback: {e}"),
-        },
-        Err(e) => eprintln!("no chat template ({e:?}); ChatML fallback"),
-    }
-    Ok(format!(
-        "<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -528,12 +621,25 @@ fn parse_page_selection(spec: &str, total: u32) -> Result<Vec<u32>> {
 // CER + gate
 // ---------------------------------------------------------------------------
 
+/// One (model x page) measurement.
 struct GateRow {
-    name: &'static str,
+    model: &'static str,
+    page: &'static str,
+    /// The instruction prefix this model used on this page (documents the
+    /// like-for-like vs on-spec prompt choice in the comparison).
+    instruction: &'static str,
     cer: f64,
     latency: f64,
     ground_truth: String,
     prediction: String,
+}
+
+impl GateRow {
+    /// A page passes the gate iff CER is under the gate AND it ran in under the
+    /// per-page latency budget.
+    fn pass(&self) -> bool {
+        self.cer < CER_GATE && self.latency < LATENCY_GATE_SECS
+    }
 }
 
 /// OmniDocBench-style character error rate: Levenshtein at the character level
@@ -543,46 +649,125 @@ fn char_error_rate(gt: &str, pred: &str) -> f64 {
     strsim::levenshtein(gt, pred) as f64 / denom as f64
 }
 
-fn report_and_gate(rows: &[GateRow]) -> Result<()> {
+/// Per-model rollup over the synthetic pages.
+struct ModelSummary {
+    model: &'static str,
+    mean_cer: f64,
+    mean_latency: f64,
+    /// PASS iff EVERY synthetic page passed the gate for this model.
+    pass: bool,
+}
+
+/// Side-by-side report: a model x page CER/latency grid, per-model PASS/FAIL,
+/// and the winning model on the synthetic pages (lower mean CER, then lower
+/// mean latency). Returns Ok iff every model passes; otherwise bails so the
+/// process exits non-zero.
+fn report_and_gate(pages: &[synth::SyntheticPage], rows: &[GateRow]) -> Result<()> {
+    let model_names: Vec<&'static str> = REGISTRY.iter().map(|m| m.display_name).collect();
+
+    let lookup = |model: &str, page: &str| -> Option<&GateRow> {
+        rows.iter().find(|r| r.model == model && r.page == page)
+    };
+
     println!();
-    println!("==== doc-vlm-spike synthetic gate ====");
-    println!(
-        "{:<14} {:>8} {:>10}  {}",
-        "page", "CER", "latency_s", "verdict"
-    );
-    let mut all_pass = true;
-    for r in rows {
-        let pass = r.cer < CER_GATE && r.latency < LATENCY_GATE_SECS;
-        all_pass &= pass;
-        println!(
-            "{:<14} {:>8.3} {:>10.2}  {}",
-            r.name,
-            r.cer,
-            r.latency,
-            if pass { "PASS" } else { "FAIL" }
-        );
+    println!("==== doc-vlm-spike head-to-head (model x page) ====");
+
+    // One column per model; rows are pages.
+    let col_w = 30usize;
+    print!("{:<14}", "page");
+    for m in &model_names {
+        print!(" | {:<width$}", m, width = col_w);
+    }
+    println!();
+    for page in pages {
+        print!("{:<14}", page.name);
+        for m in &model_names {
+            let cell = match lookup(m, page.name) {
+                Some(r) => format!(
+                    "CER={:.3} {:.1}s {} [{}]",
+                    r.cer,
+                    r.latency,
+                    if r.pass() { "PASS" } else { "FAIL" },
+                    r.instruction.trim_end_matches(':')
+                ),
+                None => "—".to_string(),
+            };
+            print!(" | {cell:<col_w$}");
+        }
+        println!();
     }
     println!(
-        "thresholds: CER < {:.2}  latency < {:.0}s",
+        "thresholds: CER < {:.2}  latency < {:.0}s/page  (synthetic pages only)",
         CER_GATE, LATENCY_GATE_SECS
     );
 
-    // Diagnostics for any failing page (truncated) to aid debugging.
+    // Per-model summary over the synthetic pages.
+    let mut summaries: Vec<ModelSummary> = Vec::new();
+    for m in &model_names {
+        let model_rows: Vec<&GateRow> = rows.iter().filter(|r| r.model == *m).collect();
+        if model_rows.is_empty() {
+            continue;
+        }
+        let n = model_rows.len() as f64;
+        let mean_cer = model_rows.iter().map(|r| r.cer).sum::<f64>() / n;
+        let mean_latency = model_rows.iter().map(|r| r.latency).sum::<f64>() / n;
+        let pass = model_rows.iter().all(|r| r.pass());
+        summaries.push(ModelSummary {
+            model: m,
+            mean_cer,
+            mean_latency,
+            pass,
+        });
+    }
+
+    println!();
+    println!("---- per-model summary (synthetic pages) ----");
+    println!("{:<18} {:>9} {:>11}  {}", "model", "mean_CER", "mean_lat_s", "verdict");
+    for s in &summaries {
+        println!(
+            "{:<18} {:>9.3} {:>11.2}  {}",
+            s.model,
+            s.mean_cer,
+            s.mean_latency,
+            if s.pass { "PASS" } else { "FAIL" }
+        );
+    }
+
+    // Diagnostics for any failing (model x page) cell to aid debugging.
     for r in rows {
         if !(r.cer < CER_GATE) {
-            eprintln!("--- page '{}' diff ---", r.name);
+            eprintln!("--- [{}] page '{}' diff (prompt: {:?}) ---", r.model, r.page, r.instruction);
             eprintln!("  ground truth: {}", truncate(&r.ground_truth, 200));
             eprintln!("  prediction  : {}", truncate(&r.prediction, 200));
         }
     }
 
+    // Winner: lowest mean CER, tie-broken by lowest mean latency.
+    if let Some(winner) = summaries.iter().min_by(|a, b| {
+        a.mean_cer
+            .partial_cmp(&b.mean_cer)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.mean_latency
+                    .partial_cmp(&b.mean_latency)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    }) {
+        println!();
+        println!(
+            "WINNER (synthetic pages): {} (mean CER={:.3}, mean latency={:.2}s)",
+            winner.model, winner.mean_cer, winner.mean_latency
+        );
+    }
+
+    let all_pass = !summaries.is_empty() && summaries.iter().all(|s| s.pass);
     if all_pass {
-        println!("RESULT: PASS (go)");
+        println!("RESULT: PASS (every model meets the gate)");
         Ok(())
     } else {
-        println!("RESULT: FAIL (no-go)");
+        println!("RESULT: FAIL (at least one model misses the gate)");
         // Non-zero exit via the run() -> main() error path.
-        bail!("acceptance gate failed (see table above)")
+        bail!("acceptance gate failed for at least one model (see tables above)")
     }
 }
 

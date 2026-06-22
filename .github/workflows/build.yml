@@ -243,6 +243,16 @@ jobs:
         with:
           features: ${{ matrix.features }}
 
+      # Clear any stale bundle output from a prior build on this (persistent,
+      # self-hosted) runner so the upload captures only THIS run's artifacts —
+      # e.g. a pre-#0013 deb/rpm whose .sig the broad upload glob would sweep in.
+      # Removes only the bundler OUTPUT dir; the cargo compile cache under
+      # target/release/ is untouched. macOS/Windows runners are ephemeral, so
+      # this is Linux-only.
+      - name: Clear stale bundle output
+        if: runner.os == 'Linux'
+        run: rm -rf target/release/bundle
+
       # tauri-action runs the configured beforeBuildCommand (npm run build) and
       # bundles the app. `--features <gpu>` selects the single per-platform GPU
       # backend. Signing vars are set in the "Prepare signing env" step above
@@ -263,7 +273,7 @@ jobs:
         with:
           name: bundle-${{ matrix.platform }}
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
           path: |
             target/release/bundle/**/*.AppImage
             target/release/bundle/**/*.msi
@@ -363,6 +373,11 @@ jobs:
             fi
           done
 
+      # Clear stale bundle output (see the connected build job above). This job
+      # is Linux-only and runs on the persistent self-hosted runner.
+      - name: Clear stale bundle output
+        run: rm -rf target/release/bundle
+
       - name: Build free release bundle
         uses: tauri-apps/tauri-action@v0
         with:
@@ -385,6 +400,6 @@ jobs:
         with:
           name: bundle-linux-free
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 7
           path: |
             target/release/bundle/**/*.AppImage

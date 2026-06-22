@@ -312,7 +312,9 @@ mod tests {
         // parsed id must equal A's endpoint id, and the peer must appear in B's
         // directory.
         let ticket = engine_a.my_ticket();
-        let parsed = engine_b.add_peer_from_ticket(&ticket).expect("import ticket");
+        let parsed = engine_b
+            .add_peer_from_ticket(&ticket)
+            .expect("import ticket");
         assert_eq!(parsed, engine_a.endpoint_id());
         assert_eq!(engine_b.peer_ids(), vec![engine_a.endpoint_id()]);
 

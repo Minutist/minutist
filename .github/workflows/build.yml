@@ -44,40 +44,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # libopus-dev: audiopus_sys v0.2.2 bundles an opus CMake tree whose
-      # cmake_minimum_required is < 3.5, which CMake 3.27+ rejects.  Installing
-      # the system libopus lets pkg-config satisfy the dep and bypass the
-      # vendored CMake build.
-      - name: Install Linux system dependencies
+      # All Linux build/bundle deps come from one script so the workflows, the
+      # self-hosted runner image, and make ci-local cannot drift. This covers
+      # the toolchain (clang/cmake/ninja), Tauri/WebKit, audio (libopus —
+      # bypasses audiopus_sys's vendored CMake), AppImage bundling
+      # (libfuse2/xdg-utils), and the Vulkan SDK incl. glslc. See the script
+      # header for the full list. macOS/Windows handle their deps in the
+      # per-OS steps below.
+      - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libasound2-dev \
-            libopus-dev \
-            libfuse2 \
-            xdg-utils
-
-      # Vulkan loader/headers + glslc for the `vulkan` feature on Linux.
-      # glslang-tools alone does not provide glslc; llama.cpp's CMake uses
-      # FindVulkan which requires glslc specifically. On Ubuntu 24.04 the
-      # binary package is "glslc" (from source package shaderc), which lives
-      # in the universe repo — enabled explicitly so the install works
-      # regardless of whether the runner image pre-enables universe.
-      # macOS uses Metal (built into the OS). Windows runners ship the Vulkan
-      # loader; the full SDK (with glslc) is installed below via the LunarG
-      # installer so llama.cpp CMake can find it.
-      - name: Install Vulkan SDK (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo add-apt-repository universe -y
-          sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools glslc
+        run: ./ci/scripts/install-linux-deps.sh
 
       # Install the LunarG Vulkan SDK on Windows so llama.cpp CMake can find
       # glslc (required by FindVulkan.cmake). humbletim/setup-vulkan-sdk builds
@@ -319,25 +295,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libasound2-dev \
-            libopus-dev \
-            libfuse2 \
-            xdg-utils
-
-      - name: Install Vulkan SDK (Linux)
-        run: |
-          sudo add-apt-repository universe -y
-          sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools glslc
+      # Single source for all Linux build/bundle deps (see install-linux-deps.sh).
+      # This job is linux-only, so no runner.os guard is needed.
+      - name: Install Linux build dependencies
+        run: ./ci/scripts/install-linux-deps.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

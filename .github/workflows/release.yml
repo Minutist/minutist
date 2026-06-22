@@ -52,24 +52,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies
+      # All Linux build/bundle deps from the single source — including
+      # libfuse2/xdg-utils (AppImage runtime) and the Vulkan SDK with glslc.
+      # See ci/scripts/install-linux-deps.sh.
+      - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libasound2-dev
-
-      - name: Install Vulkan SDK (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo add-apt-repository universe -y
-          sudo apt-get update -qq
-          sudo apt-get install -y libvulkan-dev glslang-tools glslc
+        run: ./ci/scripts/install-linux-deps.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

@@ -136,6 +136,57 @@ async fn identical_bytes_dedupe_to_one_hash_on_both_sides() {
 }
 
 #[tokio::test]
+async fn media_sync_is_a_noop_when_both_sides_already_hold_the_blobs() {
+    // Both devices already have byte-identical audio + asset for the same
+    // meeting. A full `sync_media` must converge cleanly (a no-op): every
+    // manifest entry is already held by content hash, so nothing is pulled and
+    // both files stay byte-identical. Proves the content-addressed skip path and
+    // that a re-run after convergence does not corrupt or re-fetch.
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+
+    let meeting = MeetingId::new();
+    let audio = b"already-converged-audio-bytes".repeat(48);
+    write_audio(root_a, meeting, &audio);
+    write_audio(root_b, meeting, &audio);
+    // Same asset bytes on both sides → same content-addressed filename.
+    let asset_bytes = b"already-converged-asset-bytes".repeat(8);
+    let name_a = save_note_asset(root_a, meeting, &asset_bytes, "png").expect("seed asset a");
+    let name_b = save_note_asset(root_b, meeting, &asset_bytes, "png").expect("seed asset b");
+    assert_eq!(
+        name_a, name_b,
+        "identical asset bytes must dedupe to one name"
+    );
+
+    let (a, b) = paired_engines(root_a, root_b).await;
+
+    a.sync_media(direct_addr(&b), meeting)
+        .await
+        .expect("no-op media reconcile a -> b");
+
+    // Both files are unchanged and still byte-identical on both sides.
+    let a_audio = std::fs::read(root_a.join(meeting.0.to_string()).join("audio.opus"))
+        .expect("A keeps its audio");
+    let b_audio = std::fs::read(root_b.join(meeting.0.to_string()).join("audio.opus"))
+        .expect("B keeps its audio");
+    assert_eq!(a_audio, audio, "A's audio is unchanged by the no-op sync");
+    assert_eq!(b_audio, audio, "B's audio is unchanged by the no-op sync");
+    assert_eq!(
+        persistence::read_note_asset(root_a, meeting, &name_a).expect("A keeps its asset"),
+        asset_bytes
+    );
+    assert_eq!(
+        persistence::read_note_asset(root_b, meeting, &name_b).expect("B keeps its asset"),
+        asset_bytes
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+#[tokio::test]
 async fn an_unpaired_peer_is_rejected_on_the_blobs_alpn() {
     // B does NOT pair A (only A pairs B). B holds a blob; A learns its hash and
     // tries to download it directly over the blobs ALPN. B's blobs accept side

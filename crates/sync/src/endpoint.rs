@@ -9,20 +9,29 @@
 //! - a [`MemoryLookup`] for out-of-band peer addressing (peers learned from the
 //!   account service rather than DNS/pkarr discovery — the iroh 1.0 successor to
 //!   0.x's `StaticProvider`),
-//! - the notes ([`crate::notes_proto::SYNC_ALPN`]) protocol accepted on an iroh
-//!   [`Router`]. The blobs ALPN multiplexes onto the same router in S4.
+//! - TWO ALPNs accepted on one iroh [`Router`]: the sync-update protocol
+//!   ([`crate::notes_proto::SYNC_ALPN`], carrying both notes and media-manifest
+//!   exchanges, dispatched by a leading [`crate::notes_proto::StreamKind`] tag),
+//!   and the blobs protocol ([`iroh_blobs::ALPN`], moving media bytes).
 //!
-//! The inbound accept side is owned by the [`Router`], which runs its own accept
-//! loop and dispatches each `SYNC_ALPN` connection to [`AcceptHook`]. The hook
-//! first authorises the remote against the paired-peer [`PeerDirectory`] (sync
-//! requires MUTUAL pairing — each device adds the other's ticket), rejecting an
-//! unpaired peer before any frame is read; only then does it run the responder
-//! side of the notes-sync protocol
-//! ([`crate::notes_proto::respond_notes_sync`]) against the device's meetings
-//! root. [`SyncEngine::connect`] dials a peer; [`SyncEngine::sync_notes`] dials
-//! and runs the initiator side for one meeting.
+//! The inbound accept side is owned by the [`Router`]. The sync ALPN dispatches
+//! to [`AcceptHook`]; the blobs ALPN to [`AuthorizedBlobs`]. BOTH first authorise
+//! the remote against the paired-peer [`PeerDirectory`] (sync requires MUTUAL
+//! pairing — each device adds the other's ticket), rejecting an unpaired peer
+//! before any frame or blob request is served:
+//!
+//! - [`AcceptHook`] reads the leading stream-kind tag and runs the responder side
+//!   of either the notes-sync ([`crate::notes_proto::respond_notes_sync`]) or the
+//!   media-manifest ([`crate::media_proto::respond_media_sync`]) protocol.
+//! - [`AuthorizedBlobs`] wraps [`iroh_blobs::BlobsProtocol`] and delegates to it
+//!   only for a paired remote — closing the same hole [`AcceptHook`] closes, on
+//!   the new ALPN: the blobs protocol on its own serves any peer that connects,
+//!   so it must NEVER be registered unguarded.
+//!
+//! [`SyncEngine::connect`] dials a peer; [`SyncEngine::sync_notes`] /
+//! [`SyncEngine::sync_media`] dial and run the initiator side for one meeting.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -34,18 +43,25 @@ use iroh_tickets::endpoint::EndpointTicket;
 use minutist_common::MeetingId;
 
 use crate::address_lookup::PeerDirectory;
+use crate::blobs::BlobStore;
 use crate::identity::DeviceIdentity;
-use crate::notes_proto::{self, SYNC_ALPN};
-use crate::{Error, Result, SyncConfig};
+use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
+use crate::{media_proto, Error, Result, SyncConfig};
 
-/// Owns the iroh endpoint, the out-of-band peer directory, and the router that
-/// accepts inbound sync connections for one device.
+/// Owns the iroh endpoint, the out-of-band peer directory, the content-addressed
+/// blob store, and the router that accepts inbound sync connections for one
+/// device.
 pub struct SyncEngine {
     endpoint: Endpoint,
     router: Router,
     peers: PeerDirectory,
-    /// Meetings root the notes protocol reads/writes through `persistence`
-    /// (`{root}/{meeting_id}/notes.ydoc`). The inbound [`AcceptHook`] shares it.
+    /// The content-addressed media-blob store for this device. Held here so the
+    /// initiator side ([`Self::sync_media`]) can import/export/download, and kept
+    /// alive for the lifetime of the router (the [`iroh_blobs::BlobsProtocol`]
+    /// registered on it borrows from a clone of the inner store).
+    blobs: BlobStore,
+    /// Meetings root the protocols read/write through `persistence`
+    /// (`{root}/{meeting_id}/...`). The inbound [`AcceptHook`] shares it.
     meetings_root: PathBuf,
 }
 
@@ -61,11 +77,12 @@ impl SyncEngine {
         let relay_mode = Self::relay_mode(&config)?;
         let peers = PeerDirectory::new();
         let meetings_root = config.meetings_root.clone();
+        let blobs = BlobStore::open(&meetings_root).await?;
 
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key())
             .relay_mode(relay_mode)
-            .alpns(vec![SYNC_ALPN.to_vec()])
+            .alpns(vec![SYNC_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
             .address_lookup(peers.lookup())
             .bind()
             .await
@@ -78,19 +95,44 @@ impl SyncEngine {
             "sync endpoint bound"
         );
 
-        let router = Router::builder(endpoint.clone())
-            .accept(
-                SYNC_ALPN,
-                AcceptHook::new(meetings_root.clone(), peers.clone()),
-            )
-            .spawn();
+        let router = Self::build_router(&endpoint, &blobs, &peers, &meetings_root);
 
         Ok(Self {
             endpoint,
             router,
             peers,
+            blobs,
             meetings_root,
         })
+    }
+
+    /// Build the [`Router`] accepting both the sync ALPN ([`AcceptHook`]) and the
+    /// blobs ALPN ([`AuthorizedBlobs`]). Both accept hooks share the peer
+    /// directory so a peer paired after the router spawned is honoured on its next
+    /// inbound connection; the blobs hook also carries a clone of the endpoint so a
+    /// media responder can dial the peer back for blobs.
+    fn build_router(
+        endpoint: &Endpoint,
+        blobs: &BlobStore,
+        peers: &PeerDirectory,
+        meetings_root: &Path,
+    ) -> Router {
+        let blobs_protocol = iroh_blobs::BlobsProtocol::new(blobs.inner(), None);
+        Router::builder(endpoint.clone())
+            .accept(
+                SYNC_ALPN,
+                AcceptHook::new(
+                    meetings_root.to_path_buf(),
+                    peers.clone(),
+                    blobs.clone(),
+                    endpoint.clone(),
+                ),
+            )
+            .accept(
+                iroh_blobs::ALPN,
+                AuthorizedBlobs::new(blobs_protocol, peers.clone()),
+            )
+            .spawn()
     }
 
     /// Build a relay-less engine: `RelayMode::Disabled`, otherwise the same bind +
@@ -101,24 +143,21 @@ impl SyncEngine {
     #[cfg(feature = "test-support")]
     pub async fn start_direct(identity: DeviceIdentity, meetings_root: PathBuf) -> Result<Self> {
         let peers = PeerDirectory::new();
+        let blobs = BlobStore::open(&meetings_root).await?;
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key())
             .relay_mode(RelayMode::Disabled)
-            .alpns(vec![SYNC_ALPN.to_vec()])
+            .alpns(vec![SYNC_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
             .address_lookup(peers.lookup())
             .bind()
             .await
             .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;
-        let router = Router::builder(endpoint.clone())
-            .accept(
-                SYNC_ALPN,
-                AcceptHook::new(meetings_root.clone(), peers.clone()),
-            )
-            .spawn();
+        let router = Self::build_router(&endpoint, &blobs, &peers, &meetings_root);
         Ok(Self {
             endpoint,
             router,
             peers,
+            blobs,
             meetings_root,
         })
     }
@@ -231,6 +270,75 @@ impl SyncEngine {
         result
     }
 
+    /// Reconcile one meeting's media (`audio.opus` + note assets) with `peer`:
+    /// dial it on the [`SYNC_ALPN`] and run the initiator side of the
+    /// media-manifest protocol ([`media_proto::initiate_media_sync`]) against this
+    /// device's [`Self::meetings_root`]. Each side imports its own media into the
+    /// blob store, exchanges a manifest of `(relative-path, hash)` pairs, and
+    /// pulls the blobs it is missing over the blobs ALPN — exporting each to the
+    /// correct per-meeting path and pinning it with a persistent tag. On return
+    /// both sides hold byte-identical media for the meeting.
+    ///
+    /// The remote [`EndpointId`] is taken from the dialled connection so the
+    /// downloader dials the same peer back for blobs. Like [`Self::sync_notes`],
+    /// this is on-demand per-meeting reconciliation: one call, one meeting, a
+    /// fresh connection per call (S5 wires it into the orchestrator).
+    pub async fn sync_media(
+        &self,
+        peer: impl Into<EndpointAddr>,
+        meeting_id: MeetingId,
+    ) -> Result<()> {
+        let conn = self.connect(peer).await?;
+        let peer_id = conn.remote_id();
+        let result = media_proto::initiate_media_sync(
+            &conn,
+            &self.blobs,
+            &self.endpoint,
+            peer_id,
+            &self.meetings_root,
+            meeting_id,
+        )
+        .await;
+        conn.close(0u32.into(), b"media-sync-done");
+        result
+    }
+
+    /// Import a meeting's media into this device's blob store and return its
+    /// [`crate::blobs::Manifest`]. Test-only seam used to stage blobs and to read
+    /// a known hash for the blobs-ALPN authorisation test, without going through a
+    /// full media reconciliation.
+    #[cfg(feature = "test-support")]
+    pub async fn import_media(&self, meeting_id: MeetingId) -> Result<crate::blobs::Manifest> {
+        self.blobs
+            .import_meeting(&self.meetings_root, meeting_id)
+            .await
+    }
+
+    /// Attempt to download a single blob `hash` from `peer` over the blobs ALPN and
+    /// export it to `{meetings_root}/{meeting_id}/{rel}`. Test-only seam that
+    /// drives the blobs channel directly so a test can prove the blobs-ALPN
+    /// authorisation guard rejects an unpaired peer.
+    #[cfg(feature = "test-support")]
+    pub async fn download_blob(
+        &self,
+        peer: EndpointId,
+        meeting_id: MeetingId,
+        rel: &str,
+        hash: crate::blobs::Hash,
+    ) -> Result<()> {
+        self.blobs
+            .download(
+                &self.endpoint,
+                peer,
+                &self.meetings_root,
+                meeting_id,
+                rel,
+                hash,
+            )
+            .await
+            .map(|_| ())
+    }
+
     /// Shut the router (and its endpoint) down gracefully, draining in-flight
     /// connections. Idempotent at the iroh layer.
     pub async fn shutdown(self) -> Result<()> {
@@ -248,14 +356,18 @@ impl SyncEngine {
 /// anything else: an inbound connection from an `EndpointId` that this device has
 /// NOT paired (its ticket is not in the directory) is rejected before a single
 /// frame is read, so a holder of the shared relay token who merely learns an
-/// `EndpointId` cannot push CRDT updates into this device's meetings. Sync
-/// therefore requires mutual pairing — each device must add the other's ticket.
+/// `EndpointId` cannot push CRDT updates or media into this device's meetings.
+/// Sync therefore requires mutual pairing — each device must add the other's
+/// ticket.
 ///
-/// Once authorised it runs the responder side of the notes-sync protocol
-/// ([`notes_proto::respond_notes_sync`]) against the device's
-/// [`SyncEngine::meetings_root`], which it carries by clone (the router spawns a
-/// fresh task per connection). A failed exchange is logged and converted to an
-/// [`AcceptError`]; it does not bring the router down.
+/// Once authorised it accepts the bidirectional stream the initiator opened, reads
+/// the leading one-byte [`StreamKind`] tag, and runs the matching responder:
+/// notes-sync ([`notes_proto::respond_notes_sync`]) or media-manifest
+/// ([`media_proto::respond_media_sync`]) against the device's
+/// [`SyncEngine::meetings_root`]. The media responder also needs the blob store
+/// and the endpoint (to pull blobs back from the initiator), so the hook carries
+/// clones of both (the router spawns a fresh task per connection). A failed
+/// exchange is converted to an [`AcceptError`]; it does not bring the router down.
 #[derive(Debug, Clone)]
 struct AcceptHook {
     meetings_root: PathBuf,
@@ -263,13 +375,24 @@ struct AcceptHook {
     /// backing store), so a peer paired after the router spawned is honoured on
     /// the next inbound connection.
     peers: PeerDirectory,
+    /// The blob store, for the media responder.
+    blobs: BlobStore,
+    /// The endpoint, for the media responder's blob pulls.
+    endpoint: Endpoint,
 }
 
 impl AcceptHook {
-    fn new(meetings_root: PathBuf, peers: PeerDirectory) -> Self {
+    fn new(
+        meetings_root: PathBuf,
+        peers: PeerDirectory,
+        blobs: BlobStore,
+        endpoint: Endpoint,
+    ) -> Self {
         Self {
             meetings_root,
             peers,
+            blobs,
+            endpoint,
         }
     }
 }
@@ -293,9 +416,94 @@ impl ProtocolHandler for AcceptHook {
 
         tracing::info!(target: "sync", peer = %peer, "accepted sync connection");
 
-        notes_proto::respond_notes_sync(&connection, &self.meetings_root)
+        self.dispatch(&connection, peer)
             .await
             .map_err(AcceptError::from_err)
+    }
+}
+
+impl AcceptHook {
+    /// Accept the initiator's bidirectional stream, read its leading
+    /// [`StreamKind`] tag, and run the matching responder.
+    async fn dispatch(&self, connection: &Connection, peer: EndpointId) -> Result<()> {
+        let (mut send, mut recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|e| Error::Protocol(format!("accepting sync bi stream: {e}")))?;
+
+        let mut tag = [0u8; 1];
+        recv.read_exact(&mut tag)
+            .await
+            .map_err(|e| Error::Protocol(format!("reading sync stream tag: {e}")))?;
+
+        match StreamKind::from_tag(tag[0])? {
+            StreamKind::Notes => {
+                notes_proto::respond_notes_sync(
+                    connection,
+                    &mut send,
+                    &mut recv,
+                    &self.meetings_root,
+                )
+                .await
+            }
+            StreamKind::Media => {
+                media_proto::respond_media_sync(
+                    connection,
+                    &mut send,
+                    &mut recv,
+                    &self.blobs,
+                    &self.endpoint,
+                    peer,
+                    &self.meetings_root,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// The inbound-connection handler registered on the [`Router`] for the blobs ALPN
+/// ([`iroh_blobs::ALPN`]).
+///
+/// Wraps [`iroh_blobs::BlobsProtocol`] with the SAME paired-peer authorisation
+/// [`AcceptHook`] applies to the sync ALPN. This is a hard security requirement:
+/// `BlobsProtocol` on its own serves a blob to ANY peer that connects (its
+/// `accept` spawns the provider handler unconditionally), so registering it
+/// unguarded would let any holder of the shared relay token who learns an
+/// `EndpointId` read this device's meeting media. By rejecting an unpaired remote
+/// BEFORE delegating to `BlobsProtocol::accept`, only a mutually-paired peer can
+/// fetch a blob.
+#[derive(Debug, Clone)]
+struct AuthorizedBlobs {
+    inner: iroh_blobs::BlobsProtocol,
+    peers: PeerDirectory,
+}
+
+impl AuthorizedBlobs {
+    fn new(inner: iroh_blobs::BlobsProtocol, peers: PeerDirectory) -> Self {
+        Self { inner, peers }
+    }
+}
+
+impl ProtocolHandler for AuthorizedBlobs {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let peer = connection.remote_id();
+        if !self.peers.ids().contains(&peer) {
+            tracing::debug!(
+                target: "sync",
+                peer = %peer,
+                "rejecting inbound blobs connection from an unpaired peer"
+            );
+            return Err(AcceptError::from_err(Error::Protocol(format!(
+                "unpaired peer {peer}"
+            ))));
+        }
+        tracing::debug!(target: "sync", peer = %peer, "accepted blobs connection");
+        self.inner.accept(connection).await
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await
     }
 }
 

@@ -3,13 +3,19 @@
 //! Synchronises a user's own paired devices directly over [iroh] QUIC, dialled
 //! through the self-hosted relay at `sync.minutist.ai`.
 //!
-//! - **Notes** — Yjs CRDT update frames over a small custom ALPN protocol
+//! - **Notes** — Yjs CRDT update frames over the sync ALPN protocol
 //!   ([`notes_proto`]) on the one [`SyncEngine`] endpoint. The authoritative
 //!   document is `persistence`'s `notes.ydoc`; received updates are merged with
 //!   [`persistence::NotesStore::apply_update`].
-//! - **Meeting media** — audio (`audio.opus`) and note assets. NOT present yet:
-//!   content-addressed media-blob sync is the deferred S4 slice; this crate
-//!   currently syncs only notes.
+//! - **Meeting media** — audio (`audio.opus`) and note assets, content-addressed
+//!   over `iroh-blobs` ([`blobs`]). The two sides exchange a media manifest of
+//!   `(relative-path, BLAKE3 hash)` pairs ([`media_proto`]) over the same sync
+//!   ALPN, then pull the blobs each is missing over the blobs ALPN, exporting to
+//!   the per-meeting paths `persistence` owns.
+//!
+//! Both exchanges share one ALPN, dispatched by a leading
+//! [`notes_proto::StreamKind`] tag, so one paired-peer authorisation point covers
+//! both. Framing is shared ([`frame`]).
 //!
 //! Peers are learned out-of-band from the account service (the same connected-tier
 //! surface as `tunnel-client`), so addressing uses iroh's `MemoryLookup` rather
@@ -21,8 +27,11 @@
 //! [iroh]: https://docs.rs/iroh/1.0.0/iroh/
 
 pub mod address_lookup;
+pub mod blobs;
 pub mod endpoint;
+pub mod frame;
 pub mod identity;
+pub mod media_proto;
 pub mod notes_proto;
 
 use std::path::PathBuf;

@@ -99,6 +99,21 @@ operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns �
 see its "CRDT notes storage" section). `uuid` only decodes the fixed 16-byte
 meeting id off the wire back into a `common::MeetingId`.
 
+The media-sync protocol (WS4-B S4) multiplexes onto the same `SYNC_ALPN`: each
+bidirectional stream opens with a one-byte stream-kind tag so the accept hook
+dispatches between notes reconciliation and the media-manifest exchange. The two
+sides exchange a manifest of `(relative-path, BLAKE3 hash)` pairs for `audio.opus`
++ each `assets/*` file (imported into the `iroh-blobs` store at
+`{meetings_root}/.blobs` — a dot-prefixed sibling that cannot collide with a
+`{uuid}` folder), then each pulls the blobs it lacks over the blobs ALPN and
+exports them to the per-meeting paths `persistence` owns
+(`MeetingFolder::ensure` creates the folder; `sync` writes only the media file).
+Imported and downloaded blobs are pinned with persistent named tags
+(`meeting/{id}/audio`, `meeting/{id}/asset/{name}`) so retention does not depend
+on GC state. `sync` reads/writes only `audio.opus` and `assets/*` under the
+meetings root — it does not touch metadata/transcript/notes projections in the
+media path.
+
 The `tunnel-client` row's "May depend on" is empty by design: the crate takes
 **no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)
 and re-implements the relay's postcard wire frames locally rather than sharing a

@@ -6,13 +6,13 @@ license.workspace = true
 authors.workspace = true
 
 # WS4-B: device-to-device sync over iroh. The crate exchanges Yjs notes-updates
-# (a small custom QUIC protocol) directly between a user's own paired devices,
+# (a small custom QUIC protocol) and content-addressed meeting media (audio +
+# note assets, over `iroh-blobs`) directly between a user's own paired devices,
 # dialled through the self-hosted relay (sync.minutist.ai) with out-of-band
-# addressing. Content-addressed meeting-media (audio + note assets) sync is the
-# deferred S4 slice and is NOT present yet. It depends on `common` (shared types /
-# errors) and `persistence` (read the authoritative `notes.ydoc`; apply received
-# updates). Part of the CONNECTED feature surface: the crate lives in the
-# workspace unconditionally (like `mcp-server` / `tunnel-client`) but the
+# addressing. It depends on `common` (shared types / errors) and `persistence`
+# (read the authoritative `notes.ydoc` and the per-meeting media paths; apply
+# received updates). Part of the CONNECTED feature surface: the crate lives in
+# the workspace unconditionally (like `mcp-server` / `tunnel-client`) but the
 # app-main -> sync edge is wired behind the `connected` feature.
 
 [dependencies]
@@ -34,6 +34,14 @@ iroh = "=1.0.0"
 # `EndpointAddr` to a string the user copies to another device. Pinned EXACT to
 # track the iroh 1.0 line alongside `iroh`.
 iroh-tickets = "=1.0.0"
+# Content-addressed media-blob sync. `iroh-blobs` supplies the BLAKE3 blob store
+# (the `fs-store` feature pulls redb for a persistent on-disk store), the
+# `BlobsProtocol` handler multiplexed onto the same `Router` under a second ALPN,
+# and the downloader that reuses our existing `Endpoint` (sharing the relay
+# path). It depends on `iroh ^1.0.0`; the `=1.0.0` pin is in range and keeps ONE
+# `iroh` in the tree so `Endpoint`/`Connection`/`EndpointId` unify across the
+# `.accept()`/`connect()`/`downloader()` boundary. Pinned EXACT alongside `iroh`.
+iroh-blobs = { version = "=0.103.0", features = ["fs-store"] }
 # yrs — the Yjs CRDT port. `persistence` owns the authoritative `notes.ydoc` and
 # its projections; `sync` uses yrs only for the wire-level reconciliation math on
 # lib0-v1 update bytes (`encode_state_vector_from_update_v1` / `diff_updates_v1`),

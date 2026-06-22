@@ -79,8 +79,17 @@ ConnectionSettings panes — tree-shaken from the free bundle at build time.
 Third-party deps: `iroh` (the QUIC transport, pinned EXACT), `iroh-tickets` (the
 `EndpointTicket` round-trip for manual device pairing, pinned EXACT alongside the
 iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same workspace pin as
-`persistence`) and `uuid`. (Media-blob sync, the deferred S4 slice, will add
-`iroh-blobs` when it lands; it is not a dependency today.)
+`persistence`) and `uuid`. WS4-B S4 adds `iroh-blobs` (pinned EXACT `=0.103.0`,
+`fs-store` feature) for content-addressed media-blob sync: it supplies the BLAKE3
+blob store and the `BlobsProtocol` handler, multiplexed onto the SAME `Endpoint` /
+`Router` under a SECOND ALPN (`iroh_blobs::ALPN`) beside `SYNC_ALPN`. `iroh-blobs`
+depends on `iroh ^1.0.0`; the `=1.0.0` pin is in range and there is ONE `iroh` in
+the tree so the endpoint/connection types unify across the accept/connect/download
+boundary. The blobs ALPN's accept side is wrapped in an authorising
+`ProtocolHandler` that rejects an inbound connection from a peer not in the paired
+`PeerDirectory` BEFORE delegating to `BlobsProtocol::accept` — the same
+mutual-pairing guard the notes ALPN's `AcceptHook` applies, so the new ALPN does
+not serve arbitrary peers.
 The notes-sync protocol exchanges yrs state vectors and computes the minimal
 lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
 operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —

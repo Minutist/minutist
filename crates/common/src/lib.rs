@@ -89,9 +89,7 @@ impl Default for ChatSessionId {
 #[serde(transparent)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[cfg_attr(feature = "specta", specta(transparent))]
-pub struct CollectionId(
-    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
-);
+pub struct CollectionId(#[cfg_attr(feature = "specta", specta(type = String))] pub Uuid);
 
 impl CollectionId {
     pub fn new() -> Self {
@@ -115,9 +113,7 @@ impl Default for CollectionId {
 #[serde(transparent)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[cfg_attr(feature = "specta", specta(transparent))]
-pub struct AttachmentId(
-    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
-);
+pub struct AttachmentId(#[cfg_attr(feature = "specta", specta(type = String))] pub Uuid);
 
 impl AttachmentId {
     pub fn new() -> Self {

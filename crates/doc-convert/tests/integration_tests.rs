@@ -22,7 +22,7 @@ fn fixture(name: &str) -> Vec<u8> {
 #[test]
 fn supported_exts_covers_all_converters() {
     let exts = supported_exts();
-    for required in &["txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx"] {
+    for required in &["txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx", "docx"] {
         assert!(
             exts.contains(required),
             "missing ext {required:?} in supported_exts()"
@@ -148,6 +148,74 @@ fn build_text_pdf(text: &str) -> Vec<u8> {
     let layer = doc.get_page(page1).get_layer(layer1);
     layer.use_text(text, 14.0, Mm(20.0), Mm(270.0), &font);
     doc.save_to_bytes().expect("serialise pdf")
+}
+
+/// Build a single-page PDF laid out as two side-by-side text columns, each a
+/// vertical stack of the given words. Generated at test time via printpdf.
+fn build_two_column_pdf(left: &[&str], right: &[&str]) -> Vec<u8> {
+    use printpdf::{BuiltinFont, Mm, PdfDocument};
+    let (doc, page1, layer1) =
+        PdfDocument::new("doc-convert test", Mm(210.0), Mm(297.0), "Layer 1");
+    let font = doc
+        .add_builtin_font(BuiltinFont::Helvetica)
+        .expect("add builtin font");
+    let layer = doc.get_page(page1).get_layer(layer1);
+
+    // Left column at x=20mm, right column at x=120mm; both stack downward from
+    // the top so the two columns share the same vertical band.
+    let mut y = 270.0;
+    for word in left {
+        layer.use_text(*word, 14.0, Mm(20.0), Mm(y), &font);
+        y -= 10.0;
+    }
+    let mut y = 270.0;
+    for word in right {
+        layer.use_text(*word, 14.0, Mm(120.0), Mm(y), &font);
+        y -= 10.0;
+    }
+    doc.save_to_bytes().expect("serialise pdf")
+}
+
+#[test]
+fn pdf_multi_column_captures_all_text() {
+    // Content-completeness bar: a two-column digital PDF must yield every word
+    // from BOTH columns. Reading order across columns is NOT asserted —
+    // pdf-extract emits text in the PDF's content-stream order, which for a
+    // genuine multi-column layout may interleave the two columns rather than
+    // reading each column top-to-bottom. This is a documented known limitation
+    // (see architecture/cross-cutting.md); the summariser tolerates imperfect
+    // ordering, so capturing all the text is the requirement here.
+    // Use distinctive multi-syllable words; their combined non-whitespace length
+    // must clear the 100-char near-empty threshold so the real extractor runs
+    // rather than the VLM fallback seam.
+    let left = [
+        "alphabetical",
+        "bravissimo",
+        "charcuterie",
+        "delicatessen",
+        "echolocation",
+        "foxgloves",
+        "golfcourse",
+        "hotelier",
+    ];
+    let right = [
+        "indianapolis",
+        "julienne",
+        "kilometres",
+        "limousine",
+        "microphone",
+        "novemberfest",
+        "oscillator",
+        "paparazzi",
+    ];
+    let bytes = build_two_column_pdf(&left, &right);
+    let out = convert_to_markdown(&bytes, "pdf").expect("two-column pdf conversion");
+    for word in left.iter().chain(right.iter()) {
+        assert!(
+            out.contains(word),
+            "expected column word {word:?} in extracted text, got: {out:?}"
+        );
+    }
 }
 
 #[test]
@@ -276,6 +344,121 @@ fn pptx_converter_extracts_slide_text() {
     );
 }
 
+/// Build a minimal PPTX in memory: a `[Content_Types].xml`, one slide carrying
+/// shape `<a:t>` text, and a matching `notesSlide1.xml` carrying speaker-note
+/// `<a:t>` text. Constructed with the `zip` crate (no committed binary),
+/// mirroring how `build_ods` synthesises an ODS package. Only the parts the
+/// `pptx` converter reads (`ppt/slides/*` and `ppt/notesSlides/*`) are
+/// populated; relationship and presentation parts are omitted because the
+/// converter pairs slide↔notes by numeric ordinal, not via `.rels`.
+fn build_pptx_with_notes(slide_text: &str, notes_text: &str) -> Vec<u8> {
+    use std::io::{Cursor, Write};
+    use zip::write::FileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut zip = ZipWriter::new(&mut buf);
+    let opts: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="xml" ContentType="application/xml"/>
+</Types>"#;
+    zip.start_file("[Content_Types].xml", opts).unwrap();
+    zip.write_all(content_types.as_bytes()).unwrap();
+
+    // A slide part: one shape with a single paragraph/run.
+    let slide = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+ <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{slide_text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+</p:sld>"#
+    );
+    zip.start_file("ppt/slides/slide1.xml", opts).unwrap();
+    zip.write_all(slide.as_bytes()).unwrap();
+
+    // A notes-slide part carrying the speaker-note text.
+    let notes = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<p:notes xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+ <p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>{notes_text}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>
+</p:notes>"#
+    );
+    zip.start_file("ppt/notesSlides/notesSlide1.xml", opts).unwrap();
+    zip.write_all(notes.as_bytes()).unwrap();
+
+    zip.finish().unwrap();
+    buf.into_inner()
+}
+
+#[test]
+fn pptx_appends_speaker_notes_per_slide() {
+    let bytes = build_pptx_with_notes("Roadmap overview", "Remember to mention the Q3 budget");
+    let out = convert_to_markdown(&bytes, "pptx").expect("pptx conversion");
+
+    assert!(out.contains("Roadmap overview"), "expected slide body, got: {out:?}");
+    assert!(out.contains("Notes"), "expected a Notes block, got: {out:?}");
+    assert!(
+        out.contains("Remember to mention the Q3 budget"),
+        "expected speaker-note text, got: {out:?}"
+    );
+}
+
+/// Build a minimal valid DOCX in memory using the `docx-rs` writer (a DEV-only
+/// dependency): a heading paragraph, a body paragraph, two bullet-list item
+/// paragraphs, and a 2x2 table with known cell text. Generated at test time so
+/// no opaque binary fixture is committed; the production `docx` converter never
+/// depends on `docx-rs` (it reads the OOXML with `zip` + `quick-xml`).
+fn build_docx() -> Vec<u8> {
+    use docx_rs::{Docx, Paragraph, Run, Table, TableCell, TableRow};
+    use std::io::Cursor;
+
+    fn cell(text: &str) -> TableCell {
+        TableCell::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text(text)))
+    }
+
+    let docx = Docx::new()
+        .add_paragraph(
+            Paragraph::new()
+                .style("Heading1")
+                .add_run(Run::new().add_text("Project Kickoff")),
+        )
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Intro body paragraph text.")))
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("First bullet item")))
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Second bullet item")))
+        .add_table(Table::new(vec![
+            TableRow::new(vec![cell("Region"), cell("Owner")]),
+            TableRow::new(vec![cell("North"), cell("Alice")]),
+        ]));
+
+    let mut buf = Cursor::new(Vec::new());
+    docx.build().pack(&mut buf).expect("pack docx");
+    buf.into_inner()
+}
+
+#[test]
+fn docx_extracts_paragraph_list_and_table_cells() {
+    let bytes = build_docx();
+    let out = convert_to_markdown(&bytes, "docx").expect("docx conversion");
+
+    // Heading + body + list-item text all surface as plain paragraph text
+    // (the bullet glyph itself is not reconstructed — the bar is content).
+    assert!(out.contains("Project Kickoff"), "expected heading text, got: {out:?}");
+    assert!(
+        out.contains("Intro body paragraph text"),
+        "expected body paragraph, got: {out:?}"
+    );
+    assert!(out.contains("First bullet item"), "expected list item, got: {out:?}");
+    assert!(out.contains("Second bullet item"), "expected list item, got: {out:?}");
+
+    // Table cells render as a markdown pipe-table carrying every cell's text.
+    assert!(out.contains('|'), "expected table separators, got: {out:?}");
+    for cell in &["Region", "Owner", "North", "Alice"] {
+        assert!(out.contains(cell), "expected table cell {cell:?}, got: {out:?}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Size and zip limits
 // ---------------------------------------------------------------------------
@@ -332,7 +515,7 @@ fn malformed_pptx_zip_is_rejected() {
 
 #[test]
 fn unknown_extension_is_rejected() {
-    let err = convert_to_markdown(b"hello", "docx").unwrap_err();
+    let err = convert_to_markdown(b"hello", "rtf").unwrap_err();
     assert!(
         matches!(err, AppError::InvalidInput { .. }),
         "expected InvalidInput for unsupported ext, got {err:?}"

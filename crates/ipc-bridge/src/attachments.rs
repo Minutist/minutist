@@ -139,6 +139,7 @@ pub(crate) fn doc_content_type_for(filename: &str) -> &'static str {
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "ods" => "application/vnd.oasis.opendocument.spreadsheet",
         "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         _ => "application/octet-stream",
     }
 }
@@ -469,6 +470,10 @@ mod tests {
         assert_eq!(
             doc_content_type_for("a.xlsx"),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert_eq!(
+            doc_content_type_for("a.docx"),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
         assert_eq!(doc_content_type_for("a.bin"), "application/octet-stream");
         assert_eq!(doc_content_type_for("noext"), "application/octet-stream");

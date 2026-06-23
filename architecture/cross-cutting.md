@@ -1158,9 +1158,18 @@ Two hard limits are enforced before parsing and returned as `AppError::InvalidIn
 on violation:
 
 1. `MAX_INPUT_BYTES` (50 MiB) checked on `bytes.len()`.
-2. Zip-decompression bound for `pptx` / `xlsx` / `ods`: cumulative uncompressed
-   size and entry count tracked via `zip`'s `by_index` sizing; abort if a zip-bomb
-   ratio is exceeded.
+2. Zip-decompression bound for the zip-container formats (`pptx` / `docx` /
+   `xlsx` / `ods`): cumulative uncompressed size and entry count tracked via
+   `zip`'s `by_index` sizing; abort if a zip-bomb ratio is exceeded.
+
+Textual-content bar for Office formats: `pptx` and `docx` extract text content
+(paragraphs, list-item text, table-cell text, plus per-slide pptx speaker
+notes) for the summariser feed, not faithful structure. `docx` uses the same
+`zip` + `quick-xml` walk as `pptx` (over `word/document.xml`), so no `docx-rs`
+production dependency is introduced. Known limitation: for a multi-column
+digital PDF, `pdf-extract` emits text in content-stream order, which may
+interleave columns rather than reading each top-to-bottom; all text is captured
+but cross-column reading order is not guaranteed (the summariser tolerates this).
 
 `catch_unwind` requires `UnwindSafe`; inputs are wrapped in `AssertUnwindSafe`
 (the closure only reads `&[u8]` + `&str`). A caught panic is mapped to

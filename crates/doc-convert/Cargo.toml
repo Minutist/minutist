@@ -33,3 +33,7 @@ tempfile = "3"
 # Used only by the PDF integration tests to synthesise small text/blank PDFs at
 # test time rather than committing opaque binary fixtures.
 printpdf = "0.7"
+# DEV-ONLY writer used to synthesise a small DOCX fixture (heading, paragraph,
+# list, table) at test time. Never a production dependency — the `docx`
+# converter reads OOXML with `zip` + `quick-xml`, the same as `pptx`.
+docx-rs = "0.4"

@@ -53,7 +53,7 @@ const MAX_ZIP_ENTRIES: usize = 10_000;
 
 /// The file extensions this crate can convert. Lower-cased, dot-less.
 pub fn supported_exts() -> &'static [&'static str] {
-    &["txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx"]
+    &["txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx", "docx"]
 }
 
 /// Convert `bytes` (the raw content of a file with extension `ext`) to a
@@ -112,6 +112,7 @@ fn dispatch(bytes: &[u8], ext: &str) -> AppResult<String> {
         "eml" => converters::eml(bytes),
         "pdf" => converters::pdf(bytes),
         "pptx" => converters::pptx(bytes),
+        "docx" => converters::docx(bytes),
         // Test-only hook: drive the `catch_unwind` arm in `convert_to_markdown`
         // with a real parser panic (no third-party input panics deterministically).
         #[cfg(test)]
@@ -162,7 +163,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_extension() {
-        let err = convert_to_markdown(b"hello", "docx").unwrap_err();
+        let err = convert_to_markdown(b"hello", "rtf").unwrap_err();
         assert!(
             matches!(err, AppError::InvalidInput { .. }),
             "expected InvalidInput for unknown ext, got {err:?}"

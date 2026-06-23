@@ -2875,7 +2875,7 @@ mod tests {
             );
         }
         // Rejected — image-only / executable / unsupported document extensions.
-        for evil in ["png", "exe", "", "pdf.exe", "../pdf", "docx", "rtf"] {
+        for evil in ["png", "exe", "", "pdf.exe", "../pdf", "rtf", "doc"] {
             assert!(
                 matches!(
                     normalise_attachment_ext(evil),

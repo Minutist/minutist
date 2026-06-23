@@ -2127,7 +2127,7 @@ point is:
 
     pub fn convert_to_markdown(bytes: &[u8], ext: &str) -> AppResult<String>
     pub fn supported_exts() -> &'static [&'static str]
-      // ["txt","md","xlsx","ods","html","htm","eml","pdf","pptx"]
+      // ["txt","md","xlsx","ods","html","htm","eml","pdf","pptx","docx"]
 
 Each format is handled by a pure-Rust, in-process converter; no subprocess, no
 native lib, no OCR engine:
@@ -2139,7 +2139,14 @@ native lib, no OCR engine:
 | `html`, `htm` | `dom_smoothie` readability extract → `htmd` markdown |
 | `eml` | `mail-parser` → HTML body → `dom_smoothie` + `htmd`; plain-text body passthrough |
 | `pdf` | `pdf-extract` (digital text extraction only) |
-| `pptx` | `zip` open + `quick-xml` walk of `ppt/slides/slideN.xml` `<a:t>` runs, one `## Slide N` per slide |
+| `pptx` | `zip` open + `quick-xml` walk of `ppt/slides/slideN.xml` `<a:t>` runs (incl. table-cell text), one `## Slide N` per slide; per-slide `ppt/notesSlides/notesSlideN.xml` speaker notes appended as a `### Notes` block |
+| `docx` | `zip` open + `quick-xml` walk of `word/document.xml`: `<w:p>` → paragraph, `<w:t>` → text, `<w:tbl>`/`<w:tr>`/`<w:tc>` → markdown pipe-table |
+
+Bar for the Office formats (`pptx`, `docx`) is textual content for the
+summariser, not faithful structure: paragraph/list/cell text is captured;
+numbering glyphs and exact layout are not reconstructed. `docx` reuses the same
+zip + `quick-xml` approach as `pptx` (no `docx-rs` production dependency;
+`docx-rs` is a dev-dependency only, used to synthesise the DOCX test fixture).
 
 All converter output is normalised through `pulldown-cmark` (parse → re-emit) so
 the markdown is canonical before it is stored.

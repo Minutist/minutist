@@ -36,6 +36,7 @@ const SUPPORTED_EXTS = [
   "eml",
   "pdf",
   "pptx",
+  "docx",
 ] as const;
 
 const ACCEPT = SUPPORTED_EXTS.map((e) => `.${e}`).join(",");

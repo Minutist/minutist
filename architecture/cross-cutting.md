@@ -57,13 +57,13 @@ safety argument at the impl site):
   (`Arc<Mutex<StreamInner>>` + `Weak` upgrade on the listener thread), so
   moving the owned handle across tokio worker threads is safe.
   ALSA/WASAPI streams are `Send` natively; `Sync` is never asserted.
-- `ipc-bridge` (`GemmaVlm`): **no `unsafe` impl**. `GemmaVlm: Send + Sync`
-  is derived from `Arc<Mutex<MtmdContext>>` + `Arc<LlamaSummariser>` (which
-  is already `unsafe impl Send + Sync`). `MtmdContext` itself is `!Send`
-  (internal FFI pointer); it is entirely encapsulated behind the `Mutex` and
-  never exposed as a reference across a thread boundary, so no `unsafe impl`
-  is required or permitted on `GemmaVlm`. See `cross-cutting.md` — "Held
-  model serves vision".
+- `ipc-bridge` (`GemmaVlm`): **no `unsafe` impl**. `GemmaVlm` holds only a
+  `ChatHandles` (all `Arc` / `PathBuf` / handle fields), so `Send + Sync` is
+  auto-derived — it carries no `MtmdContext`. The vision context lives in
+  `LlamaSummariser` (summariser crate) as `OnceLock<Mutex<MtmdContext>>`, where
+  the `Mutex` serialises the mutating encode path (not a Send/Sync barrier —
+  `MtmdContext` is already `unsafe impl Send + Sync` in `llama-cpp-2`). See
+  `cross-cutting.md` — "Held model serves vision".
 
 **Live vs. offline diarization (Phase B).** There are two independent
 diarization paths. The offline `SherpaDiarizer` / `common::Diarizer`
@@ -1206,11 +1206,14 @@ can be bound to that same loaded model via
 held by the summariser, and the mmproj/encoder (~560 MB) is co-resident only
 while an OCR job is active.
 
-**Lazy vision context.** `LlamaSummariser` gains a `vision: OnceCell<MtmdContext>`
-(or `Arc<Mutex<MtmdContext>>` — see Send/Sync below) and an `ensure_vision(mmproj)
--> AppResult<()>` that builds the `MtmdContext` from the already-loaded model on
-first image job, mirroring the `maybe_preload_summariser` lazy posture. No vision
-load happens until an image attachment actually reaches the worker.
+**Lazy vision context.** `LlamaSummariser` gains a `vision:
+OnceLock<Mutex<MtmdContext>>` and an `ensure_vision(mmproj) ->
+AppResult<&Mutex<MtmdContext>>` that builds the `MtmdContext` from the
+already-loaded model on first image job, mirroring the `maybe_preload_summariser`
+lazy posture. `GemmaVlm` (ipc-bridge) is a thin adapter holding only a
+`ChatHandles`; it resolves the held summariser, calls `ensure_vision` +
+`image_to_markdown`, and owns no vision state itself. No vision load happens
+until an image attachment actually reaches the worker.
 
 **Same ~8 GiB GPU budget.** The VRAM thresholds in `resolve_gpu_plan`
 (`SUMMARISER_VRAM_BYTES`, `cross-cutting.md` — "GPU portability") already account
@@ -1220,16 +1223,18 @@ widened to accommodate it — the estimate already includes headroom, and the
 encoder is short-lived. If a future measurement shows the budget needs revision,
 that is a `common` architecture-owner change.
 
-**MtmdContext Send/Sync.** `MtmdContext` in llama-cpp-2 is `!Send` (it holds an
-internal FFI pointer that must not migrate threads). The vision context is wrapped
-in `Mutex<MtmdContext>` inside `GemmaVlm` so `GemmaVlm: Send + Sync` holds via the
-mutex wrapper, and the `spawn_blocking` closure takes a clone of the wrapping `Arc`.
-The one bounded conversion worker processes OCR jobs sequentially, so the mutex is
-never contended; its cost is a single lock/unlock per image page. This follows the
-same pattern as the offline `SherpaDiarizer`'s `Mutex<Diarize>` — the `&self`
-trait method hides a `Mutex`-guarded `&mut` resource. The `unsafe impl` is NOT
-asserted for `MtmdContext`; only the enclosing `GemmaVlm` struct is `Send + Sync`
-(via `Arc<Mutex<…>>`).
+**MtmdContext serialisation (not a Send/Sync barrier).** `MtmdContext` carries
+an `unsafe impl Send + Sync` in `llama-cpp-2`, so it is not the threading
+constraint: both `LlamaSummariser` (holding `OnceLock<Mutex<MtmdContext>>`
+alongside the already-`unsafe impl Send + Sync` `LlamaModel`) and `GemmaVlm`
+(holding only `ChatHandles`) derive `Send + Sync` without any new `unsafe impl`.
+The `Mutex<MtmdContext>` exists to SERIALISE access: the encode path mutates
+internal C state through a shared pointer and runs on the same GPU as
+summarise/ASR, so concurrent `eval_chunks` would race that state and contend on
+the device. The one bounded conversion worker processes OCR jobs sequentially, so
+the mutex is uncontended in practice — a single lock/unlock per image. This
+mirrors the offline `SherpaDiarizer`'s `Mutex<Diarize>`: a `&self` trait method
+hiding a `Mutex`-guarded `&mut` resource.
 
 ## OCR policy for image attachments
 

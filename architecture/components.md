@@ -927,6 +927,16 @@ reverse. `pub fn gpu_layers()` (the compile-time GPU-offload ceiling) is also
 re-used by `chat-agent`'s `LlamaTurnConfig` default. No new dependency edge —
 `summariser` still depends only on `common`.
 
+**Image OCR surface (attachments WS).** `LlamaSummariser` also gains
+`pub fn ensure_vision(&self, mmproj_path) -> AppResult<&Mutex<MtmdContext>>` and
+`pub fn image_to_markdown(&self, png) -> AppResult<String>`: a lazily-built
+vision `MtmdContext` bound to the already-loaded Gemma-4 `LlamaModel` (no second
+model, same GPU budget), and the per-image OCR call. The held vision context
+lives here, not in `ipc-bridge`; `ipc-bridge`'s `GemmaVlm` is a thin adapter that
+resolves the held summariser and delegates to these methods (see `cross-cutting.md`
+— "Held model serves vision"). Still no new dependency edge — `summariser`
+depends only on `common`.
+
 **Notes weaving + two-phase progress (#69/#70).** The `common::Summariser`
 trait's `summarise` now takes `notes: &[NoteBlock]` (was `notes_markdown:
 &str`). `NoteBlock { at_ms: Option<u64>, text }` is a `common` vocabulary type;
@@ -2842,13 +2852,16 @@ and marks the entry `Failed("conversion queue full")` immediately so the UI does
 show a permanent `Pending`.
 
 **`GemmaVlm: DocVlm` (ipc-bridge).** `ipc-bridge` owns a `GemmaVlm` struct that
-wraps an `Arc<LlamaSummariser>` and calls `ensure_vision(mmproj_path)` on first
-use (lazy — the `MtmdContext` is only built when an image job actually arrives).
-`GemmaVlm::image_to_markdown` builds a fresh `LlamaContext`, tokenises
-`<media-marker> + prompt`, evaluates via `mtmd_helper_eval_chunks`, and
-greedy-decodes with EOG stop — the validated loop from the `doc-vlm` spike. The
-single bounded conversion worker serialises all OCR calls (no parallel GPU
-contention). `GemmaVlm: Send + Sync` — see `cross-cutting.md` — "Held model
+holds only a `ChatHandles` (the shared chat-runtime handles, including the held
+`Arc<OnceCell<Arc<LlamaSummariser>>>`). Its `image_to_markdown` resolves the held
+summariser, then delegates to `LlamaSummariser::ensure_vision(mmproj_path)` (lazy
+— the `MtmdContext` is built only when an image job actually arrives) and
+`LlamaSummariser::image_to_markdown`. The OCR inference itself lives in
+`summariser`: it builds a fresh `LlamaContext`, tokenises `<media-marker> +
+prompt`, evaluates via `mtmd_helper_eval_chunks`, and greedy-decodes with EOG
+stop — the validated loop from the `doc-vlm` spike. The single bounded conversion
+worker serialises all OCR calls (no parallel GPU contention). `GemmaVlm: Send +
+Sync` is auto-derived from `ChatHandles` — see `cross-cutting.md` — "Held model
 serves vision".
 
 **Summarise path — attachments feed (Attachments WS).** `summarise_meeting_with_progress`

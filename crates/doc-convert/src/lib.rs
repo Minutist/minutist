@@ -71,6 +71,15 @@ pub fn supported_exts() -> &'static [&'static str] {
 /// `ext` must be lower-cased and dot-less (e.g. `"pdf"`, `"xlsx"`); the caller
 /// (`ipc-bridge`) normalises it before handing to this function.
 ///
+/// `ext` is a ROUTING HINT only — it selects the converter but is NOT a
+/// validated assertion about `bytes`. The bytes may not match the extension
+/// (the caller passes them separately and does not sniff content), so every
+/// converter must self-defend on its own input rather than trusting `ext` to
+/// imply a safe shape. In particular the zip-container converters
+/// (`xlsx`/`ods`/`pptx`/`docx`) run their own bomb guard; a payload mislabelled
+/// to a non-zip extension simply reaches a converter that treats it as that
+/// format (bounded by `MAX_INPUT_BYTES`), never the zip guard.
+///
 /// `vlm` is the optional vision-OCR backend. It is consulted only for direct
 /// image attachments (`png`/`jpg`/`jpeg`/`tiff`), which have no pure-Rust text
 /// path. When `None`, those paths return `AppError::Unsupported`; all

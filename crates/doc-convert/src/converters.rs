@@ -136,7 +136,13 @@ fn cell_to_str(cell: &calamine::Data) -> String {
         Data::Int(i) => format!("{i}"),
         Data::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         Data::Error(e) => format!("#ERR:{e}"),
-        Data::DateTime(dt) => format!("{dt}"),
+        // `ExcelDateTime`'s Display writes the raw serial number, not a date, so
+        // render via `as_datetime()` (the `dates` feature). Durations and any
+        // value that does not resolve to a datetime fall back to the serial.
+        Data::DateTime(dt) => dt
+            .as_datetime()
+            .map(|ndt| ndt.to_string())
+            .unwrap_or_else(|| format!("{dt}")),
         Data::DateTimeIso(s) | Data::DurationIso(s) => s.clone(),
     }
 }
@@ -150,6 +156,14 @@ fn escape_pipe(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// HTML converter: readability extraction then HTML → Markdown.
+///
+/// Unlike the zip-container formats, the readability/DOM pass has no structural
+/// bound (entry count, expansion ratio) — its only backstop against pathological
+/// markup is the `MAX_INPUT_BYTES` (50 MiB) input cap enforced in
+/// [`crate::convert_to_markdown`] before this runs. That ceiling is the
+/// deliberate limit for the non-zip parsers (`html`/`eml`); it is acceptable for
+/// a local single-user app where the single conversion worker bounds the blast
+/// radius to one background job.
 pub fn html(bytes: &[u8]) -> minutist_common::AppResult<String> {
     let html_str = String::from_utf8_lossy(bytes);
     html_str_to_markdown(&html_str)
@@ -744,6 +758,24 @@ mod tests {
     fn passthrough_plain_text() {
         let out = passthrough(b"Hello world").unwrap();
         assert!(out.contains("Hello world"), "got: {out:?}");
+    }
+
+    #[test]
+    fn datetime_cell_renders_iso_not_serial() {
+        use calamine::{Data, ExcelDateTime, ExcelDateTimeType};
+        // Serial 45000 (1900 date system) is a real calendar date. It must
+        // render as an ISO-ish date string, never the raw serial number that
+        // `ExcelDateTime`'s Display would emit.
+        let dt = ExcelDateTime::new(45000.0, ExcelDateTimeType::DateTime, false);
+        let rendered = cell_to_str(&Data::DateTime(dt));
+        assert!(
+            !rendered.contains("45000"),
+            "date rendered as raw serial: {rendered:?}"
+        );
+        assert!(
+            rendered.contains('-') && rendered.len() >= 10,
+            "expected an ISO-ish date, got: {rendered:?}"
+        );
     }
 
     #[test]

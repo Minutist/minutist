@@ -195,8 +195,10 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # Pinned to current crates.io stable at Gate-A; bumping is coordinated (the
 # parsed document format is load-bearing for the summariser reference feed).
 #
-# calamine: XLSX / ODS spreadsheet reader (pure Rust).
-calamine = "0.35"
+# calamine: XLSX / ODS spreadsheet reader (pure Rust). The `dates` feature adds
+# `ExcelDateTime::as_datetime()` so date cells render as ISO text rather than the
+# raw serial number that `ExcelDateTime`'s Display emits.
+calamine = { version = "0.35", features = ["dates"] }
 # dom_smoothie: HTML readability extraction (Mozilla Readability port).
 dom_smoothie = "0.18"
 # htmd: HTML → Markdown conversion.

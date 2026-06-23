@@ -2162,7 +2162,7 @@ Each format is handled by a converter:
 | Extension | Converter |
 |---|---|
 | `txt`, `md` | passthrough |
-| `xlsx`, `ods` | `calamine` (sheet → pipe-table or TSV-style markdown) |
+| `xlsx`, `ods` | `calamine` (sheet → pipe-table or TSV-style markdown); date cells render as ISO via `ExcelDateTime::as_datetime()` (the `dates` feature), not the raw serial number |
 | `html`, `htm` | `dom_smoothie` readability extract → `htmd` markdown |
 | `eml` | `mail-parser` → HTML body → `dom_smoothie` + `htmd`; plain-text body passthrough |
 | `pdf` | `pdf-extract` (digital text extraction only) |
@@ -2199,9 +2199,18 @@ sandboxing"). Before parsing, two limits are enforced and any violation is
 returned as `AppError::InvalidInput`:
 
 1. `MAX_INPUT_BYTES` (50 MiB) — checked on `bytes.len()` before parsing begins.
-2. Zip-decompression bound — for `pptx` / `xlsx` / `ods`, cumulative
+2. Zip-decompression bound — for `pptx` / `xlsx` / `ods` / `docx`, cumulative
    uncompressed size and entry count are tracked via `zip`'s `by_index` sizing
    metadata; abort if a zip-bomb ratio is exceeded.
+
+`ext` is a ROUTING HINT, not a validated assertion about the bytes — the caller
+passes bytes and extension separately and does not sniff content. Each converter
+therefore self-defends on its own input; a payload mislabelled to a non-zip
+extension reaches that format's converter (bounded by `MAX_INPUT_BYTES`), never
+the zip guard. The non-zip structural parsers (`html` / `eml`) have no bound
+beyond `MAX_INPUT_BYTES` — that 50 MiB cap is their deliberate ceiling, with the
+single conversion worker bounding the blast radius of a pathological document to
+one background job.
 
 Crate-local `thiserror` `Error` converts to `common::AppError` via `From`.
 No `anyhow` in any public signature.

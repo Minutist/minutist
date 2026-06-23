@@ -283,6 +283,8 @@ jobs:
             target/release/bundle/**/*.sig
             target/release/bundle/**/*.tar.gz
             target/release/bundle/**/*.zip
+            !target/release/bundle/deb/**
+            !target/release/bundle/rpm/**
 
   # Free-tier build: --no-default-features omits mcp-server/rmcp.
   # Linux-only at this stage to contain runner costs (the connected matrix

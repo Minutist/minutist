@@ -410,6 +410,18 @@ pub struct Settings {
     #[serde(default)]
     pub diarization_enabled: bool,
 
+    /// Whether the voiceprint enrolment flow is active (issue #0003).
+    ///
+    /// Enrolment is an explicit, opt-in, per-speaker operation: when `true`,
+    /// renaming a speaker in the UI triggers `Orchestrator::enrol_voiceprint`,
+    /// which extracts a CAM++ centroid from clean segments for that label and
+    /// stores it in `voiceprints.db`. Default `false` satisfies the
+    /// collection-time consent obligation (BIPA / GDPR Art. 9 — no voiceprint
+    /// is created without an explicit user opt-in). An older store written
+    /// before this field existed deserialises to `false` via `#[serde(default)]`.
+    #[serde(default)]
+    pub voiceprint_enrolment_enabled: bool,
+
     /// Whether the first-run onboarding flow has been completed (Phase 7).
     ///
     /// The webview gates the main UI behind this: `false` shows the onboarding
@@ -711,6 +723,7 @@ impl Default for Settings {
             live_agent_digest_unresolved_references: default_digest_toggle_true(),
             live_agent_attachment_budget_chars: default_live_agent_attachment_budget_chars(),
             live_agent_system_prompt: default_live_agent_system_prompt(),
+            voiceprint_enrolment_enabled: false,
         }
     }
 }
@@ -773,6 +786,7 @@ mod tests {
             live_agent_digest_unresolved_references: true,
             live_agent_attachment_budget_chars: 40_000,
             live_agent_system_prompt: "Custom live prompt.".to_string(),
+            voiceprint_enrolment_enabled: true,
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -786,6 +800,7 @@ mod tests {
         assert!(!restored.live_agent_digest_decisions);
         assert_eq!(restored.live_agent_attachment_budget_chars, 40_000);
         assert_eq!(restored.live_agent_system_prompt, "Custom live prompt.");
+        assert!(restored.voiceprint_enrolment_enabled);
         assert_eq!(original, restored);
     }
 

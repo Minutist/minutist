@@ -226,44 +226,49 @@ impl OnlineClusterer {
     }
 }
 
-/// Unit-normalise `x`, rejecting non-finite components or a zero norm (cosine
-/// is undefined there). `x` is assumed non-empty (the caller checks).
+/// Unit-normalise `x`, rejecting non-finite components or a zero/overflow norm
+/// (cosine is undefined there). `x` is assumed non-empty (the caller checks).
+///
+/// Validates the input fully, then delegates the actual normalisation to
+/// [`minutist_common::voiceprint_math::unit_normalise`]. The common function is
+/// a no-op on degenerate inputs; the explicit pre-check here converts those
+/// cases into `AppError::InvalidInput` as the clusterer requires.
 fn unit_normalise(x: &[f32]) -> AppResult<Vec<f32>> {
-    let mut sum_sq = 0.0f32;
+    // Reject non-finite components (NaN, ±Inf): the norm would be undefined.
     for &v in x {
         if !v.is_finite() {
             return Err(
                 Error::InvalidInput("embedding contains a non-finite value".to_string()).into(),
             );
         }
-        sum_sq += v * v;
     }
-    // Each component is finite, but the sum of squares can still overflow to
-    // `+inf` for very large (yet finite) components, which would yield a silent
-    // all-zero "unit" vector. Reject both that and the all-zero (zero-norm)
-    // case — cosine is undefined for either.
+    // Compute the norm; reject zero (cosine undefined) and overflow to +inf
+    // (very large but finite components — the common function's no-op path).
+    let sum_sq: f32 = x.iter().map(|&v| v * v).sum();
     let norm = sum_sq.sqrt();
     if !norm.is_finite() || norm == 0.0 {
         return Err(
             Error::InvalidInput("embedding has a zero or non-finite norm".to_string()).into(),
         );
     }
-    Ok(x.iter().map(|&v| v / norm).collect())
+    let mut out = x.to_vec();
+    minutist_common::voiceprint_math::unit_normalise(&mut out);
+    Ok(out)
 }
 
 /// True cosine of a unit vector `unit` against a running-mean centroid `c`:
 /// `dot(unit, c) / ||c||` (since `||unit|| == 1`). Returns 0 for a degenerate
 /// (zero/non-finite-norm) centroid.
+///
+/// Delegates to [`minutist_common::voiceprint_math::cosine_unit`] for the dot
+/// product, then divides by the centroid norm — the centroid is a running mean
+/// of unit vectors and is NOT renormalised between updates, so the true cosine
+/// requires the extra division.
 fn cosine_unit_vs_centroid(unit: &[f32], c: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut c_sq = 0.0f32;
-    for (&u, &cv) in unit.iter().zip(c.iter()) {
-        dot += u * cv;
-        c_sq += cv * cv;
-    }
+    let c_sq: f32 = c.iter().map(|&v| v * v).sum();
     let c_norm = c_sq.sqrt();
     if c_norm > 0.0 {
-        dot / c_norm
+        minutist_common::voiceprint_math::cosine_unit(unit, c) / c_norm
     } else {
         0.0
     }

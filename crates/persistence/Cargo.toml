@@ -27,6 +27,9 @@ thiserror = { workspace = true }
 # never calls `block_on`.
 tokio = { workspace = true }
 tracing = { workspace = true }
+# uuid: voiceprints.rs mints identity/centroid/contribution primary keys and
+# parses them back from the TEXT columns (issue #0003 VoiceprintStore).
+uuid = { workspace = true }
 # yrs: the Yjs CRDT port. `persistence` stores the authoritative per-meeting
 # notes document as `notes.ydoc` (lib0 v2 whole-state blob) and derives
 # `notes.json` / `notes.md` from it. A third-party dependency (like sha2 /

@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (42 total)
+//! ## Commands (47 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -54,6 +54,11 @@
 //! | `sync_get_my_ticket` | `String` | WS4-B S5 |
 //! | `sync_add_peer` | `()` | WS4-B S5 |
 //! | `sync_now` | `()` | WS4-B S5 |
+//! | `list_voiceprints` | `Vec<VoiceprintIdentityInfo>` | #0003 WU8 |
+//! | `merge_voiceprint_identities` | `()` | #0003 WU8 |
+//! | `rename_voiceprint_identity` | `()` | #0003 WU8 |
+//! | `delete_voiceprint_identity` | `()` | #0003 WU8 |
+//! | `forget_meeting_voiceprints` | `()` | #0003 WU8 |
 //!
 //! The Phase-4 `re_summarise` stub (which returned `Unsupported`) was removed
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
@@ -301,6 +306,18 @@ pub struct IpcState {
     /// and shared here for `get_diagnostic_report` (#0014). Carries no
     /// machine-identifying detail (no hostname / user).
     pub platform: String,
+    /// The voiceprint library (`voiceprints.db`), opened at startup by `app-main`
+    /// via `persistence::voiceprints_db_path` against the effective data root.
+    ///
+    /// Shared here so `set_speaker_name` can trigger
+    /// `Orchestrator::enrol_voiceprint` when `settings.voiceprint_enrolment_enabled`
+    /// is `true`. Mirrors `IpcState::index` — an already-open handle, shared via
+    /// `Arc` so clones are cheap. `app-main` maps an open/migration failure to
+    /// enrolment-OFF by supplying an `Arc<Option<VoiceprintStore>>` that holds
+    /// `None`; enrolment commands check the `Option` and skip when `None`.
+    ///
+    /// No new dependency edge: `ipc-bridge` already depends on `persistence`.
+    pub voiceprints: Arc<Option<persistence::VoiceprintStore>>,
 }
 
 /// The live MCP endpoint surfaced to the Settings → MCP pane via
@@ -428,6 +445,49 @@ pub fn open_meeting_index(
     });
 
     (index_db_path, index)
+}
+
+// ---------------------------------------------------------------------------
+// Voiceprint store bootstrap helper
+// ---------------------------------------------------------------------------
+
+/// Open the `voiceprints.db` store for `app-main` to inject into [`IpcState`].
+///
+/// Resolves `voiceprints.db` under `app_data_root` via
+/// `persistence::voiceprints_db_path`, opens the store (running the
+/// forward-only migration runner), and wraps it in `Arc<Option<...>>`.
+///
+/// On any open or migration error the error is logged and `Arc::new(None)` is
+/// returned — the caller stores `None` on `IpcState::voiceprints`, and the
+/// `set_speaker_name` enrolment path skips silently when it observes `None`
+/// (the corruption-degrade-to-OFF contract from §2.2).
+///
+/// This helper mirrors [`open_meeting_index`]: it is startup-only and drives the
+/// async `open` on `tauri::async_runtime::block_on`. Keeping it here preserves
+/// the dependency table — `ipc-bridge` owns the `persistence` edge;
+/// `app-main` does not.
+pub fn open_voiceprints(app_data_root: &std::path::Path) -> Arc<Option<persistence::VoiceprintStore>> {
+    let db_path = persistence::voiceprints_db_path(app_data_root);
+    tauri::async_runtime::block_on(async move {
+        match persistence::VoiceprintStore::open(&db_path).await {
+            Ok(store) => {
+                tracing::info!(
+                    target: "ipc-bridge",
+                    path = %db_path.display(),
+                    "voiceprints.db opened"
+                );
+                Arc::new(Some(store))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    path = %db_path.display(),
+                    "voiceprints.db open failed ({e}); voiceprint enrolment degraded to OFF"
+                );
+                Arc::new(None)
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +666,13 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::get_mcp_server_info,
             commands::translate_meeting,
             commands::get_translations,
+            commands::reject_match,
+            commands::clear_all_voiceprints,
+            commands::list_voiceprints,
+            commands::merge_voiceprint_identities,
+            commands::rename_voiceprint_identity,
+            commands::delete_voiceprint_identity,
+            commands::forget_meeting_voiceprints,
             diagnostics::get_diagnostic_report,
             tunnel::tunnel_begin_pairing,
             tunnel::tunnel_poll_pairing,
@@ -787,16 +854,23 @@ mod tests {
             "sync_get_my_ticket",
             "sync_add_peer",
             "sync_now",
+            "reject_match",
+            "clear_all_voiceprints",
+            "list_voiceprints",
+            "merge_voiceprint_identities",
+            "rename_voiceprint_identity",
+            "delete_voiceprint_identity",
+            "forget_meeting_voiceprints",
         ];
 
         assert_eq!(
             expected.len(),
-            46,
-            "command ledger must be 46 (38 base; +4 WS4-B S5 sync commands \
-             (sync_status / sync_get_my_ticket / sync_add_peer / sync_now); +4 \
-             #0016 attachments commands (add_attachment / list_attachments / \
-             open_attachment / remove_attachment). The 38 is 39 − the #0015 merge \
-             of re_transcribe + rediarize_meeting into one reprocess command)"
+            53,
+            "command ledger must be 53 (46 pre-WU5; +2 #0003 WU5 commands \
+             (reject_match / clear_all_voiceprints); +5 #0003 WU8 commands \
+             (list_voiceprints / merge_voiceprint_identities / \
+             rename_voiceprint_identity / delete_voiceprint_identity / \
+             forget_meeting_voiceprints))"
         );
 
         // #0015 — the two former offline commands merged into `reprocess`; assert

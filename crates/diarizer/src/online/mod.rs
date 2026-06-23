@@ -152,3 +152,139 @@ impl OnlineDiarizer {
         &self.embedding_path
     }
 }
+
+/// Stateless speaker-embedding extractor: wraps a sherpa `EmbeddingExtractor`
+/// behind a `Mutex` and exposes a pure embedding + centroid surface for
+/// voiceprint enrolment.
+///
+/// Unlike [`OnlineDiarizer`], this type owns NO clusterer — it is a building
+/// block for the voiceprint enrolment flow (`persistence::VoiceprintStore`):
+/// the caller supplies a set of audio windows, obtains raw embeddings via
+/// [`VoiceprintExtractor::embed`], then builds a voiceprint centroid via
+/// [`VoiceprintExtractor::centroid`]. The clustering and storage decisions live
+/// entirely outside this type.
+///
+/// Diarizer-public, deliberately NOT in `common` (mirrors [`crate::SpeakerTurn`]).
+/// `open` mirrors [`OnlineDiarizer::open`] exactly: same `ExtractorConfig` build,
+/// same `EmbeddingExtractor::new`, same `Error::ModelLoad` mapping.
+pub struct VoiceprintExtractor {
+    embedding_path: PathBuf,
+    extractor: Mutex<EmbeddingExtractor>,
+}
+
+impl VoiceprintExtractor {
+    /// Open over the speaker-embedding ONNX model.
+    ///
+    /// Mirrors [`OnlineDiarizer::open`]'s loading + error mapping: builds
+    /// `ExtractorConfig { model: <path string>, provider: None, num_threads:
+    /// None, debug: false }`, calls `EmbeddingExtractor::new(cfg)`, and maps the
+    /// sherpa `eyre` error to `Error::ModelLoad`.
+    pub fn open(embedding_path: &Path) -> AppResult<Self> {
+        let extractor_config = ExtractorConfig {
+            model: embedding_path.display().to_string(),
+            provider: None,
+            num_threads: None,
+            debug: false,
+        };
+        let extractor =
+            EmbeddingExtractor::new(extractor_config).map_err(|e| Error::ModelLoad {
+                path: embedding_path.display().to_string(),
+                context: format!("{e:?}"),
+            })?;
+
+        tracing::debug!(
+            target: "diarizer",
+            embedding_size = extractor.embedding_size,
+            path = %embedding_path.display(),
+            "opened voiceprint extractor"
+        );
+
+        Ok(Self {
+            embedding_path: embedding_path.to_path_buf(),
+            extractor: Mutex::new(extractor),
+        })
+    }
+
+    /// The speaker-embedding model path.
+    pub fn embedding_path(&self) -> &Path {
+        &self.embedding_path
+    }
+
+    /// Extract a raw (un-normalised) speaker embedding for one audio window.
+    ///
+    /// `samples` must be 16 kHz mono f32 (rejects other sample rates as
+    /// `InvalidInput`, matching [`crate::online::OnlineDiarizer::assign_segment`]).
+    /// Returns the raw 192-D embedding vector as produced by the CAM++ model;
+    /// the caller is responsible for normalising when building a centroid.
+    ///
+    /// sherpa takes ownership of the sample buffer; the borrowed slice is cloned
+    /// into an owned `Vec` for the FFI call (same pattern as `assign_segment`).
+    pub fn embed(&self, samples: &[f32], sr: u32) -> AppResult<Vec<f32>> {
+        require_supported_sample_rate(sr)?;
+
+        if samples.is_empty() {
+            return Err(Error::InvalidInput(
+                "voiceprint extractor requires a non-empty audio window".to_string(),
+            )
+            .into());
+        }
+
+        let mut extractor = self
+            .extractor
+            .lock()
+            .map_err(|_| Error::Inference("voiceprint extractor mutex poisoned".to_string()))?;
+
+        extractor
+            .compute_speaker_embedding(samples.to_vec(), REQUIRED_SAMPLE_RATE)
+            .map_err(|e| {
+                Error::Inference(format!("sherpa compute_speaker_embedding failed: {e:?}"))
+            })
+            .map_err(Into::into)
+    }
+
+    /// Build a [`crate::Voiceprint`] centroid from one or more audio windows.
+    ///
+    /// Each window is embedded independently; the resulting raw vectors are
+    /// unit-normalised and then averaged + re-normalised via
+    /// [`minutist_common::voiceprint_math`]:
+    ///
+    /// ```text
+    /// centroid = unit_normalise(mean(unit_normalise(embed(w)) for w in windows))
+    /// ```
+    ///
+    /// This matches the [`crate::online::clusterer::OnlineClusterer`]
+    /// running-mean-of-unit-vectors rule: both the online clusterer and this
+    /// centroid builder operate in the same unit-vector space, so a voiceprint
+    /// produced here is directly comparable (via cosine) to a centroid the online
+    /// clusterer has accumulated.
+    ///
+    /// Rejects `sr != 16000`, an empty `windows` slice, or any window whose
+    /// embedding is degenerate (zero/non-finite norm — `unit_normalise` is a
+    /// no-op on those).
+    pub fn centroid(&self, windows: &[&[f32]], sr: u32) -> AppResult<crate::Voiceprint> {
+        require_supported_sample_rate(sr)?;
+
+        if windows.is_empty() {
+            return Err(
+                Error::InvalidInput("centroid requires at least one audio window".to_string())
+                    .into(),
+            );
+        }
+
+        // Embed + unit-normalise each window.
+        let mut unit_vecs: Vec<Vec<f32>> = Vec::with_capacity(windows.len());
+        for &window in windows {
+            let mut emb = self.embed(window, sr)?;
+            minutist_common::voiceprint_math::unit_normalise(&mut emb);
+            unit_vecs.push(emb);
+        }
+
+        // Count-weighted merge (equal counts of 1 for independently-normalised
+        // windows) via common::voiceprint_math::weighted_merge, then
+        // unit-normalise the mean — exactly the OnlineClusterer discipline.
+        let pairs: Vec<(&[f32], u64)> = unit_vecs.iter().map(|v| (v.as_slice(), 1u64)).collect();
+        let vector = minutist_common::voiceprint_math::weighted_merge(&pairs);
+
+        Ok(crate::Voiceprint { vector })
+    }
+}

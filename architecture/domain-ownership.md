@@ -97,6 +97,25 @@ restated. Adding any other edge requires updating
   `crates/ipc-bridge/src/live_agent.rs` (systems-engineer). The held-context
   backend (S2a) lives in `crates/chat-agent/src/live.rs` (ml-runtime-engineer).
   Neither adds a new dependency edge beyond what is already in the table.
+- **Voiceprint identity types + maths (issue #0003 WU0 — one-way door).**
+  `VoiceprintIdentityId` and `VoiceprintCentroidId` are UUID newtypes added to
+  `common` by the architecture-owner. Adding them is a **one-way-door** per
+  parallel-work rule 2 — many downstream changes (persistence schema, IPC
+  commands, orchestrator wiring) follow. The dependency table in `components.md`
+  is **unchanged**: `diarizer` and `persistence` already depend on `common` and
+  gain no new edge here.
+
+  `common::voiceprint_math` (three pure functions: `unit_normalise`,
+  `cosine_unit`, `weighted_merge`) is also architecture-owner territory: it is
+  the canonical centroid-maths implementation shared by `diarizer` (embedding
+  extraction) and `persistence` (centroid cache recomputation). Both crates
+  already depend on `common` — no new edge.
+
+  `persistence` (data-engineer) gains `voiceprints.db` within its owned scope
+  (`{app-data}/voiceprints.db` — the sixth durable `{app-data}` entry). It
+  remains a `common`-only crate; no `diarizer` edge is permitted or needed
+  (the pure maths live in `common`; the embedding extraction stays in
+  `diarizer`; only the final `Vec<f32>` bytes cross into `persistence`).
 
 ## Role definitions
 

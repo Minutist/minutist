@@ -28,6 +28,7 @@ import type { GpuAcceleration, Theme } from "../ipc/bindings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
 import { OutputLanguagePicker } from "./OutputLanguagePicker";
+import { VoiceprintPane } from "./VoiceprintPane";
 import "./SettingsDrawer.css";
 
 // Error boundary for the lazy MCP pane. A chunk-load failure is silently
@@ -292,6 +293,8 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             </Suspense>
           </McpPaneErrorBoundary>
         )}
+
+        <VoiceprintPane />
 
         <footer className="settings-drawer__footer">
           <button

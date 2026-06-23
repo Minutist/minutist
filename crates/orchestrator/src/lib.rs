@@ -35,6 +35,7 @@
 //! `ipc-bridge` and `app-main`.
 
 pub mod error;
+pub mod matcher;
 mod runner;
 mod state;
 
@@ -999,6 +1000,280 @@ impl Orchestrator {
         result
     }
 
+    /// Enrol a speaker voiceprint for `label` in `meeting_id` into `store`.
+    ///
+    /// Runs on a `spawn_blocking` thread, holding the per-meeting offline claim
+    /// for the duration so that a concurrent `reprocess` cannot rewrite
+    /// `transcript.json` and invalidate the label→segment mapping mid-enrolment.
+    ///
+    /// Steps (all on the blocking thread):
+    /// 1. Read `transcript.json` for `meeting_id`.
+    /// 2. Read and decode `audio.opus` (pause-INCLUDING PCM).
+    /// 3. Filter to **clean** segments for `label` (§2.3.1 filter): `speaker_id ==
+    ///    label`, `shared_speakers` empty, duration ≥ 1.0 s.
+    /// 4. Map each clean segment through the pause-excl → incl clock mapper
+    ///    (`runner::pcm_window_for_excluding_range`) to get the correct PCM slice.
+    /// 5. Build a centroid via `diarizer::VoiceprintExtractor::centroid`.
+    /// 6. Call `VoiceprintStore::enrol` with the centroid vector, `name`, `model_id`,
+    ///    `meeting_id`, and `label`.
+    ///
+    /// Skips silently (returns `Ok(())`) when there are no clean windows above the
+    /// minimum duration — enrolment is not forced. Uses `claim_offline` / `release_offline`
+    /// so a `reprocess` racing this call is rejected until enrolment finishes.
+    ///
+    /// Returns the `VoiceprintIdentityId` on success, or `Ok(None)` when skipped.
+    /// Errors from the extractor or store are propagated; the caller (ipc-bridge)
+    /// is expected to log-and-swallow so a rename never fails because of enrolment.
+    pub async fn enrol_voiceprint(
+        &self,
+        meeting_id: MeetingId,
+        label: String,
+        name: String,
+        store: &persistence::VoiceprintStore,
+    ) -> AppResult<Option<minutist_common::VoiceprintIdentityId>> {
+        // Hold the claim so that a concurrent reprocess cannot rewite
+        // transcript.json while we read it. Best-effort: if the claim cannot
+        // be taken (a reprocess or re-transcribe is already running), we skip
+        // enrolment rather than blocking the rename.
+        if self.claim_offline(meeting_id).await.is_err() {
+            tracing::debug!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                label = %label,
+                "enrol_voiceprint: offline claim unavailable, skipping enrolment"
+            );
+            return Ok(None);
+        }
+        let result = self
+            .enrol_voiceprint_claimed(meeting_id, label, name, store)
+            .await;
+        self.release_offline().await;
+        result
+    }
+
+    /// The enrol_voiceprint body under the held offline claim.
+    async fn enrol_voiceprint_claimed(
+        &self,
+        meeting_id: MeetingId,
+        label: String,
+        name: String,
+        store: &persistence::VoiceprintStore,
+    ) -> AppResult<Option<minutist_common::VoiceprintIdentityId>> {
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+        let registry = Arc::clone(&self.model_registry);
+
+        // Resolve the embedding model path synchronously (no download — must be
+        // Available for the offline diarizer to have run at all). Mirrors the
+        // `build_online_diarizer` local-only resolve.
+        let emb_id = minutist_common::ModelId::from(runner::DIARIZE_EMB_MODEL_ID);
+        let emb_dir_opt = {
+            use minutist_common::ModelStatusState;
+            registry
+                .list_models()
+                .into_iter()
+                .find(|s| s.id == emb_id)
+                .and_then(|s| match s.status {
+                    ModelStatusState::Available { local_dir } => Some(local_dir),
+                    _ => None,
+                })
+        };
+        let emb_dir = match emb_dir_opt {
+            Some(d) => d,
+            None => {
+                tracing::debug!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    label = %label,
+                    "enrol_voiceprint: embedding model not available; skipping"
+                );
+                return Ok(None);
+            }
+        };
+
+        let label_clone = label.clone();
+        let name_clone = name.clone();
+        let model_id_str = runner::DIARIZE_EMB_MODEL_ID.to_string();
+
+        // The heavy work (read PCM + transcript, extract embeddings) runs on
+        // spawn_blocking. The store async operations are awaited afterwards.
+        // Returns `(centroid, window_count)` so the caller can use the count
+        // as the contribution weight when refining an existing identity.
+        let centroid_result = tokio::task::spawn_blocking(move || -> AppResult<Option<(diarizer::Voiceprint, u64)>> {
+            use runner::find_file_in_dir;
+
+            let emb_onnx = find_file_in_dir(
+                std::path::Path::new(&emb_dir),
+                |name| name.ends_with(".onnx"),
+            )?;
+
+            let extractor = diarizer::VoiceprintExtractor::open(&emb_onnx)?;
+
+            let pcm = persistence::read_audio_pcm(&meeting_dir)?;
+            let segments = persistence::read_transcript(&meeting_dir)?;
+
+            // §2.3.1 cleanliness filter: speaker_id == label, shared_speakers empty,
+            // duration >= 1.0 s (1000 ms).
+            const MIN_CLEAN_DURATION_MS: u64 = 1000;
+            let clean_segs: Vec<&Segment> = segments
+                .iter()
+                .filter(|seg| {
+                    seg.speaker_id.as_deref() == Some(&label_clone)
+                        && seg.shared_speakers.is_empty()
+                        && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
+                })
+                .collect();
+
+            if clean_segs.is_empty() {
+                tracing::debug!(
+                    target: "orchestrator",
+                    label = %label_clone,
+                    "enrol_voiceprint: no clean segments above minimum duration; skipping"
+                );
+                return Ok(None);
+            }
+
+            // Map each clean segment through the pause-excl → incl clock mapper
+            // (§2.3 clock-mismatch hazard). Collect only those windows that the
+            // mapper resolves to a non-empty PCM slice.
+            let mut windows: Vec<Vec<f32>> = Vec::with_capacity(clean_segs.len());
+            for seg in &clean_segs {
+                if let Some(range) =
+                    runner::pcm_window_for_excluding_range(&pcm, seg.start_ms, seg.end_ms)
+                {
+                    let window = pcm[range].to_vec();
+                    if !window.is_empty() {
+                        windows.push(window);
+                    }
+                }
+            }
+
+            if windows.is_empty() {
+                tracing::debug!(
+                    target: "orchestrator",
+                    label = %label_clone,
+                    "enrol_voiceprint: clock mapper yielded no usable PCM windows; skipping"
+                );
+                return Ok(None);
+            }
+
+            let window_count = windows.len() as u64;
+            let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
+            let centroid = extractor.centroid(&window_refs, 16_000)?;
+
+            tracing::debug!(
+                target: "orchestrator",
+                label = %label_clone,
+                windows = window_count,
+                dim = centroid.dim(),
+                "enrol_voiceprint: centroid built"
+            );
+
+            Ok(Some((centroid, window_count)))
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("enrol_voiceprint spawn_blocking join failed: {e}"),
+        })??;
+
+        let (centroid, window_count) = match centroid_result {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+
+        // If an identity already exists for this display_name + model, this is a
+        // confirmed subsequent association: call refine rather than enrol.
+        // The UI rename path is always a confirmed association (§2.9.3 trigger (a)).
+        let existing_id = store
+            .find_identity_by_name_and_model(&name_clone, &model_id_str)
+            .await?;
+
+        let identity_id = if let Some(id) = existing_id {
+            store
+                .refine(id, &centroid.vector, window_count, &model_id_str, meeting_id, &label)
+                .await?;
+            tracing::info!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                label = %label,
+                identity_id = %id.0,
+                windows = window_count,
+                "voiceprint refined (confirmed subsequent association)"
+            );
+            id
+        } else {
+            let dim = centroid.dim();
+            let id = store
+                .enrol(&name_clone, &centroid.vector, dim, &model_id_str, meeting_id, &label)
+                .await?;
+            tracing::info!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                label = %label,
+                identity_id = %id.0,
+                "voiceprint enrolled"
+            );
+            id
+        };
+
+        Ok(Some(identity_id))
+    }
+
+    /// Correct a false-accept match: remove the name overlay for `label` in
+    /// `meeting_id` and drop that meeting/label's contribution from
+    /// `identity_id`'s gallery, then recompute the affected centroid (§2.4
+    /// correction path — `reject_match`).
+    ///
+    /// Steps:
+    /// 1. Clear `speaker_names[label]` for `meeting_id` via
+    ///    `persistence::meeting_ops::set_speaker_name(..., "")` (empty name =
+    ///    remove the mapping — the same write as "unname a speaker").
+    /// 2. Load all centroids for `identity_id` via `VoiceprintStore::all`, filter
+    ///    to the identity, then call `VoiceprintStore::forget_contribution` on each
+    ///    centroid. The method is idempotent when no matching contribution exists.
+    ///
+    /// The name-clear is best-effort: if the meeting folder is absent (already
+    /// deleted) it returns `MeetingNotFound`; the caller (`ipc-bridge`) decides
+    /// whether to surface this. The contribution drop is also best-effort.
+    pub async fn reject_match(
+        &self,
+        meeting_id: MeetingId,
+        label: String,
+        identity_id: minutist_common::VoiceprintIdentityId,
+        model_id: &str,
+        store: &persistence::VoiceprintStore,
+    ) -> AppResult<()> {
+        // Step 1: clear the name overlay — empty string removes the mapping.
+        let _ = persistence::meeting_ops::set_speaker_name(
+            &self.persistence_root,
+            meeting_id,
+            &label,
+            "",
+        )
+        .await;
+        // Ignore MeetingNotFound (folder may have been deleted already); propagate
+        // other errors.
+
+        // Step 2: iterate the identity's gallery centroids and drop the
+        // (meeting_id, label) contribution from each. The forget_contribution
+        // call is idempotent when no row matches.
+        let gallery = store.all(model_id).await?;
+        for entry in gallery.iter().filter(|e| e.identity_id == identity_id) {
+            store
+                .forget_contribution(entry.centroid_id, meeting_id, &label)
+                .await?;
+        }
+
+        tracing::info!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            label = %label,
+            identity_id = %identity_id.0,
+            "reject_match: name overlay cleared and contribution dropped"
+        );
+
+        Ok(())
+    }
+
     /// The reprocess body, run while the SINGLE offline claim is held. Split out
     /// so [`Self::reprocess`] can guarantee the claim is released on every exit
     /// path (success and error).
@@ -1020,6 +1295,13 @@ impl Orchestrator {
         meeting_id: MeetingId,
     ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        // §2.6 snapshot: capture old speaker_names + transcript BEFORE the
+        // re-transcribe overwrites transcript.json. The snapshot is passed to
+        // `rediarize_inner_with_snapshot` so it can restore matched names after
+        // the fresh diarize pass. Best-effort: a snapshot failure is logged and
+        // the re-map is skipped for this run; the reprocess itself continues.
+        let pre_snapshot = self.capture_reprocess_snapshot(meeting_id, &meeting_dir).await;
 
         // Timeout budget under the single claim: each sub-step keeps its own
         // `retranscribe_timeout(duration_ms)` watchdog (the ASR run inside
@@ -1069,12 +1351,67 @@ impl Orchestrator {
             })??;
         let backend = self.build_split_backend().await;
 
-        self.rediarize_inner(
+        // The reprocess path does not pre-load the gallery; the prune-veto requires
+        // the store which is held by ipc-bridge. Pass Vec::new() here — the veto
+        // will be a no-op for the reprocess path. The ipc-bridge calls
+        // apply_voiceprint_matches after reprocess to handle post-diarize matching.
+        self.rediarize_inner_with_snapshot_and_gallery(
             index,
             meeting_id,
             DiarizationJob::Production { diarizer, backend },
+            pre_snapshot,
+            Vec::new(),
         )
         .await
+    }
+
+    /// Capture an optional pre-reprocess snapshot of `(old_speaker_names, old_segments)`.
+    ///
+    /// Used by the `reprocess` path to snapshot the old state BEFORE re-transcribe
+    /// overwrites `transcript.json`. Returns `None` when enrolment is disabled, when
+    /// old names are empty, or when the read fails (best-effort).
+    async fn capture_reprocess_snapshot(
+        &self,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+    ) -> Option<(std::collections::BTreeMap<String, String>, Vec<Segment>)> {
+        if !self.settings.current().voiceprint_enrolment_enabled {
+            return None;
+        }
+        let snap_dir = meeting_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || -> AppResult<(std::collections::BTreeMap<String, String>, Vec<Segment>)> {
+            let meta = persistence::read_metadata(&snap_dir)?;
+            let segs = persistence::read_transcript(&snap_dir)?;
+            Ok((meta.speaker_names, segs))
+        })
+        .await
+        {
+            Ok(Ok(pair)) => {
+                if pair.0.is_empty() {
+                    None
+                } else {
+                    Some(pair)
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "reprocess pre-snapshot read failed; ephemeral re-map skipped"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "reprocess pre-snapshot join failed; ephemeral re-map skipped"
+                );
+                None
+            }
+        }
     }
 
     /// Atomically claim the recorder for an offline operation (re-transcribe /
@@ -1406,11 +1743,23 @@ impl Orchestrator {
     /// - `AppError::ModelLoad` / `AppError::ModelDownload` if a diarize model is
     ///   not available or fails to load.
     /// - `AppError::Inference` if sherpa diarization fails.
-    pub async fn rediarize(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
+    /// Re-diarize a completed meeting, overlaying fresh speaker labels on the
+    /// existing transcript.
+    ///
+    /// `voiceprint_store` is optional. When `Some`, the prune-veto pass (§2.5)
+    /// loads the enrolled gallery and may rescue low-share clusters that match an
+    /// enrolled speaker above `T_ACCEPT`. When `None` (or when
+    /// `voiceprint_enrolment_enabled` is OFF), the prune runs normally.
+    pub async fn rediarize(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        voiceprint_store: Option<&persistence::VoiceprintStore>,
+    ) -> AppResult<()> {
         // Atomic claim/release (TIMELINE-DRIFT #5): rediarize also rewrites
         // `transcript.json`, so it must claim the slot just like re_transcribe.
         self.claim_offline(meeting_id).await?;
-        let result = self.rediarize_claimed(index, meeting_id).await;
+        let result = self.rediarize_claimed(index, meeting_id, voiceprint_store).await;
         self.release_offline().await;
         result
     }
@@ -1421,6 +1770,7 @@ impl Orchestrator {
         &self,
         index: &MeetingIndex,
         meeting_id: MeetingId,
+        voiceprint_store: Option<&persistence::VoiceprintStore>,
     ) -> AppResult<()> {
         // Build the production diarizer off the async worker threads (the model
         // load is heavy). It is handed to the shared inner path inside a
@@ -1450,10 +1800,15 @@ impl Orchestrator {
         // with the sherpa diarizer models).
         let backend = self.build_split_backend().await;
 
-        self.rediarize_inner(
+        // Pre-load the voiceprint gallery for the §2.5 prune-veto pass. The gallery
+        // is a plain Vec so it can be moved into the spawn_blocking closure.
+        let gallery = load_voiceprint_gallery(voiceprint_store, meeting_id).await;
+
+        self.rediarize_inner_with_gallery(
             index,
             meeting_id,
             DiarizationJob::Production { diarizer, backend },
+            gallery,
         )
         .await
     }
@@ -1514,6 +1869,80 @@ impl Orchestrator {
         }
     }
 
+    /// Build a `VoiceprintExtractor` for the §2.5 prune-veto pass, best-effort.
+    ///
+    /// Returns `None` on ANY failure (model not downloaded, `.onnx` not located,
+    /// open error) so the diarization pass degrades to no-veto — missing model
+    /// files must never block the diarization. The extractor is opened on a
+    /// `spawn_blocking` thread (the heavy `EmbeddingExtractor::new` load is
+    /// synchronous). The gallery is pre-loaded by the caller and passed separately.
+    async fn build_prune_veto_extractor(
+        &self,
+        meeting_id: MeetingId,
+    ) -> Option<diarizer::VoiceprintExtractor> {
+        use minutist_common::ModelStatusState;
+        use runner::{find_file_in_dir, DIARIZE_EMB_MODEL_ID};
+
+        let emb_id = minutist_common::ModelId::from(DIARIZE_EMB_MODEL_ID);
+        let registry = Arc::clone(&self.model_registry);
+
+        let emb_onnx_opt: Option<std::path::PathBuf> =
+            tokio::task::spawn_blocking(move || -> Option<std::path::PathBuf> {
+                let local_dir = registry
+                    .list_models()
+                    .into_iter()
+                    .find(|s| s.id == emb_id)
+                    .and_then(|s| match s.status {
+                        ModelStatusState::Available { local_dir } => Some(local_dir),
+                        _ => None,
+                    });
+                let local_dir = local_dir?;
+                find_file_in_dir(std::path::Path::new(&local_dir), |name| {
+                    name.ends_with(".onnx")
+                })
+                .ok()
+            })
+            .await
+            .unwrap_or(None);
+
+        let emb_onnx = match emb_onnx_opt {
+            Some(p) => p,
+            None => {
+                tracing::debug!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    "prune-veto: embedding model not available; skipping"
+                );
+                return None;
+            }
+        };
+
+        // Open the extractor on spawn_blocking (heavy ONNX load).
+        match tokio::task::spawn_blocking(move || diarizer::VoiceprintExtractor::open(&emb_onnx))
+            .await
+        {
+            Ok(Ok(ext)) => Some(ext),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "prune-veto: VoiceprintExtractor open failed; skipping"
+                );
+                None
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    error = %join_err,
+                    "prune-veto: extractor build join failed; skipping"
+                );
+                None
+            }
+        }
+    }
+
     /// Shared diarization-and-persist core for the user-triggered re-diarize.
     ///
     /// Driven by the production [`Self::rediarize`] (a
@@ -1532,13 +1961,100 @@ impl Orchestrator {
     /// [`Self::finalise_diarization`] to rewrite `transcript.json` + update
     /// `metadata.json`, and finally refreshes the supplied index row's
     /// `speaker_count` (`upsert`).
+    /// Convenience wrapper with no pre-snapshot and no gallery (stub/test paths).
+    #[cfg_attr(not(any(test, feature = "test-source")), allow(dead_code))]
     async fn rediarize_inner(
         &self,
         index: &MeetingIndex,
         meeting_id: MeetingId,
         job: DiarizationJob,
     ) -> AppResult<()> {
+        self.rediarize_inner_with_snapshot_and_gallery(index, meeting_id, job, None, Vec::new())
+            .await
+    }
+
+    /// Convenience wrapper with a pre-loaded gallery but no pre-snapshot (production
+    /// rediarize path where the store is available).
+    async fn rediarize_inner_with_gallery(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        job: DiarizationJob,
+        gallery: Vec<persistence::StoredVoiceprint>,
+    ) -> AppResult<()> {
+        self.rediarize_inner_with_snapshot_and_gallery(index, meeting_id, job, None, gallery)
+            .await
+    }
+
+    /// Inner re-diarize body that accepts an optional pre-computed snapshot of
+    /// `(old_speaker_names, old_segments)`.
+    ///
+    /// When `pre_snapshot` is `Some`, it was captured before a re-transcribe step
+    /// overwrote `transcript.json` (the `reprocess` path). When `None`, this
+    /// method reads the snapshot itself from the current on-disk state — correct
+    /// for the standalone `rediarize` path where the transcript has not yet been
+    /// overwritten.
+    ///
+    /// `gallery` is the voiceprint library for the §2.5 prune-veto pass. An empty
+    /// Vec disables the veto pass (the prune runs normally). The gallery is
+    /// pre-loaded by the caller (from `VoiceprintStore::all(model_id)`) so the
+    /// spawn_blocking thread has a plain Vec with no DB handle.
+    async fn rediarize_inner_with_snapshot_and_gallery(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: MeetingId,
+        job: DiarizationJob,
+        pre_snapshot: Option<(std::collections::BTreeMap<String, String>, Vec<Segment>)>,
+        gallery: Vec<persistence::StoredVoiceprint>,
+    ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+
+        // §2.6 re-map: when voiceprint enrolment is enabled, ensure we have a
+        // snapshot of old speaker_names + old transcript BEFORE the fresh diarize
+        // rewrites them. On the reprocess path the caller provides `pre_snapshot`
+        // (captured before re-transcribe); on the standalone rediarize path we read
+        // it here while the transcript still holds the pre-diarize state.
+        let old_snapshot: Option<(
+            std::collections::BTreeMap<String, String>,
+            Vec<Segment>,
+        )> = if self.settings.current().voiceprint_enrolment_enabled {
+            match pre_snapshot {
+                Some(snap) => {
+                    if snap.0.is_empty() { None } else { Some(snap) }
+                }
+                None => {
+                    let snap_dir = meeting_dir.clone();
+                    match tokio::task::spawn_blocking(move || -> AppResult<(std::collections::BTreeMap<String, String>, Vec<Segment>)> {
+                        let meta = persistence::read_metadata(&snap_dir)?;
+                        let segs = persistence::read_transcript(&snap_dir)?;
+                        Ok((meta.speaker_names, segs))
+                    })
+                    .await
+                    .map_err(|e| AppError::Internal {
+                        context: format!("rediarize pre-snapshot join failed: {e}"),
+                    })? {
+                        Ok(pair) => {
+                            if pair.0.is_empty() {
+                                None
+                            } else {
+                                Some(pair)
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "orchestrator",
+                                meeting_id = %meeting_id.0,
+                                error = %e,
+                                "rediarize pre-snapshot failed; proceeding without ephemeral re-map"
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         // Read the recording length to size the timeout (a small metadata read on
         // a blocking thread).
@@ -1569,6 +2085,20 @@ impl Orchestrator {
             label: "Identifying speakers…".to_string(),
         });
 
+        // §2.5 prune-veto: build the second VoiceprintExtractor best-effort, gated
+        // on voiceprint_enrolment_enabled and model availability. The gallery was
+        // pre-loaded by the caller from VoiceprintStore::all(model_id) and passed in
+        // as `gallery`; the extractor is built here (heavy ONNX load, blocking).
+        // When either is absent (model not downloaded, gallery empty), the veto pass
+        // is a no-op and the prune runs normally.
+        let prune_veto_extractor = if self.settings.current().voiceprint_enrolment_enabled
+            && !gallery.is_empty()
+        {
+            self.build_prune_veto_extractor(meeting_id).await
+        } else {
+            None
+        };
+
         // Bound the (uninterruptible) sherpa `compute` + re-ASR split: a
         // pathologically slow or hung pass on a long recording must not block
         // forever (the original on-stop hang). On timeout we return BEFORE
@@ -1577,9 +2107,16 @@ impl Orchestrator {
         // completes) is dropped. `tokio` cannot cancel a `spawn_blocking` thread,
         // so a true infinite hang leaks one thread until process exit; the budget
         // bounds the wait, not the thread.
-        let (segments, speaker_count) = match tokio::time::timeout(
+        let (segments, speaker_count, veto_names) = match tokio::time::timeout(
             budget,
-            run_diarization_blocking(meeting_dir.clone(), job, self.event_tx.clone(), meeting_id),
+            run_diarization_blocking(
+                meeting_dir.clone(),
+                job,
+                prune_veto_extractor,
+                gallery,
+                self.event_tx.clone(),
+                meeting_id,
+            ),
         )
         .await
         {
@@ -1598,6 +2135,58 @@ impl Orchestrator {
 
         self.finalise_diarization(meeting_id, &meeting_dir, &segments, speaker_count)
             .await?;
+
+        // Write any prune-veto names (enrolled quiet speakers rescued by the veto
+        // pass) to speaker_names. This is a second metadata write after
+        // finalise_diarization's clear, the same pattern as apply_voiceprint_matches.
+        // The offline claim is still held throughout, so no concurrent op races this.
+        if !veto_names.is_empty() {
+            let meeting_dir_veto = meeting_dir.clone();
+            let veto_names_copy = veto_names.clone();
+            let write_result = tokio::task::spawn_blocking(move || -> AppResult<()> {
+                let mut meta = persistence::read_metadata(&meeting_dir_veto)?;
+                for (letter, name) in &veto_names_copy {
+                    meta.speaker_names.insert(letter.clone(), name.clone());
+                }
+                persistence::write_metadata(&meeting_dir_veto, &meta)
+            })
+            .await;
+            match write_result {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        target: "orchestrator",
+                        meeting_id = %meeting_id.0,
+                        count = veto_names.len(),
+                        "prune-veto: wrote enrolled-speaker names to speaker_names"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "orchestrator",
+                        meeting_id = %meeting_id.0,
+                        error = %e,
+                        "prune-veto: names write failed (best-effort); continuing"
+                    );
+                }
+                Err(join_err) => {
+                    tracing::warn!(
+                        target: "orchestrator",
+                        meeting_id = %meeting_id.0,
+                        error = %join_err,
+                        "prune-veto: names write join failed (best-effort); continuing"
+                    );
+                }
+            }
+        }
+
+        // §2.6 ephemeral re-map: if we snapshotted old names before the diarize,
+        // try to restore names to the fresh clusters via timeline-coherence and
+        // (when the embedding model is available) centroid matching. Best-effort:
+        // errors are logged; the meeting is left with cleared names, not failed.
+        if let Some((old_names, old_segments)) = old_snapshot {
+            self.apply_ephemeral_remap(meeting_id, &meeting_dir, old_names, old_segments, &segments)
+                .await;
+        }
 
         // Refresh the index row's speaker_count (and keep the excerpt current).
         let meeting_dir_for_meta = meeting_dir.clone();
@@ -1681,6 +2270,635 @@ impl Orchestrator {
         });
 
         Ok(())
+    }
+
+    /// Apply voiceprint matches for `meeting_id` after a completed diarisation pass.
+    ///
+    /// Runs the §2.4 global greedy assignment against the stored gallery. For each
+    /// accepted match (sim >= `T_ACCEPT` with margin), restores the matched name
+    /// into `speaker_names`. For each uncertain match (`T_REJECT <= sim <
+    /// T_ACCEPT`), emits `AppEvent::VoiceprintSuggestions` so the UI can present
+    /// the "is this \<Name\>?" affordance.
+    ///
+    /// Called by ipc-bridge after `reprocess` or a standalone `rediarize`
+    /// completes, gated on `voiceprint_enrolment_enabled`. Best-effort: errors
+    /// are logged and the meeting is left with cleared names rather than
+    /// propagated.
+    ///
+    /// This is a second write to `metadata.json` (after `finalise_diarization`'s
+    /// transcript + meta write). The offline claim is still held by the caller,
+    /// so no concurrent op can race this write.
+    pub async fn apply_voiceprint_matches(
+        &self,
+        meeting_id: MeetingId,
+        store: &persistence::VoiceprintStore,
+    ) -> AppResult<()> {
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+        let model_id = runner::DIARIZE_EMB_MODEL_ID.to_string();
+
+        // Read the fresh transcript to know which labels exist.
+        let meeting_dir_r = meeting_dir.clone();
+        let segments = tokio::task::spawn_blocking(move || persistence::read_transcript(&meeting_dir_r))
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("apply_voiceprint_matches transcript read join failed: {e}"),
+            })??;
+
+        let (matched_names, uncertain) = match self
+            .compute_voiceprint_matches(meeting_id, &meeting_dir, &segments, store, &model_id)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "apply_voiceprint_matches: matching failed (best-effort); speaker names unchanged"
+                );
+                return Ok(());
+            }
+        };
+
+        if matched_names.is_empty() && uncertain.is_empty() {
+            return Ok(());
+        }
+
+        // Update speaker_names: restore accepted matches on top of the cleared map.
+        if !matched_names.is_empty() {
+            let meeting_dir_w = meeting_dir.clone();
+            let names_copy = matched_names.clone();
+            tokio::task::spawn_blocking(move || -> AppResult<()> {
+                let mut meta = persistence::read_metadata(&meeting_dir_w)?;
+                // speaker_names was cleared by finalise_diarization; restore accepted ones.
+                for (label, name) in &names_copy {
+                    meta.speaker_names.insert(label.clone(), name.clone());
+                }
+                persistence::write_metadata(&meeting_dir_w, &meta)
+            })
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("apply_voiceprint_matches metadata write join failed: {e}"),
+            })??;
+
+            tracing::info!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                accepted_count = matched_names.len(),
+                "voiceprint matching restored accepted names"
+            );
+        }
+
+        // Emit uncertain suggestions for the UI affordance.
+        if !uncertain.is_empty() {
+            self.emit(AppEvent::VoiceprintSuggestions {
+                meeting_id,
+                suggestions: uncertain,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Compute voiceprint matches for all fresh diariser labels in `segments`.
+    ///
+    /// For each unique label, extracts a centroid from clean PCM windows (the
+    /// same §2.3.1 filter and clock mapper used by `enrol_voiceprint_claimed`),
+    /// then runs `matcher::assign_identities` against the stored gallery.
+    ///
+    /// Returns `(accepted_names, uncertain_suggestions)` where:
+    /// - `accepted_names`: label → display_name for matches in the Accept band.
+    /// - `uncertain_suggestions`: one entry per Uncertain-band match.
+    ///
+    /// Best-effort: if the embedding model is absent, returns two empty maps so
+    /// the caller falls back to `speaker_names.clear()`.
+    async fn compute_voiceprint_matches(
+        &self,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+        segments: &[Segment],
+        store: &persistence::VoiceprintStore,
+        model_id: &str,
+    ) -> AppResult<(
+        std::collections::BTreeMap<String, String>,
+        Vec<minutist_common::VoiceprintSuggestion>,
+    )> {
+        use crate::matcher::{assign_identities, MatchBand, QueryCluster};
+
+        // Collect the distinct labels from the fresh segments.
+        let labels: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            segments
+                .iter()
+                .filter_map(|s| s.speaker_id.clone())
+                .filter(|l| seen.insert(l.clone()))
+                .collect()
+        };
+
+        if labels.is_empty() {
+            return Ok(Default::default());
+        }
+
+        // Load the gallery filtered to the active model. If no enrolled speakers,
+        // there is nothing to match against.
+        let gallery = store.all(model_id).await?;
+        if gallery.is_empty() {
+            return Ok(Default::default());
+        }
+
+        // Resolve the embedding model path; skip if not locally available.
+        let registry = Arc::clone(&self.model_registry);
+        let emb_id = minutist_common::ModelId::from(runner::DIARIZE_EMB_MODEL_ID);
+        let emb_dir_opt = {
+            use minutist_common::ModelStatusState;
+            registry
+                .list_models()
+                .into_iter()
+                .find(|s| s.id == emb_id)
+                .and_then(|s| match s.status {
+                    ModelStatusState::Available { local_dir } => Some(local_dir),
+                    _ => None,
+                })
+        };
+        let emb_dir = match emb_dir_opt {
+            Some(d) => d,
+            None => {
+                tracing::debug!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    "compute_voiceprint_matches: embedding model not available; skipping"
+                );
+                return Ok(Default::default());
+            }
+        };
+
+        let meeting_dir_owned = meeting_dir.to_path_buf();
+        let segments_owned = segments.to_vec();
+        let model_id_str = model_id.to_string();
+
+        // Extract a centroid for every label on spawn_blocking.
+        let query_clusters: Vec<QueryCluster> = tokio::task::spawn_blocking(move || -> AppResult<Vec<QueryCluster>> {
+            use runner::find_file_in_dir;
+
+            let emb_onnx = find_file_in_dir(
+                std::path::Path::new(&emb_dir),
+                |name| name.ends_with(".onnx"),
+            )?;
+            let extractor = diarizer::VoiceprintExtractor::open(&emb_onnx)?;
+            let pcm = persistence::read_audio_pcm(&meeting_dir_owned)?;
+
+            const MIN_CLEAN_DURATION_MS: u64 = 1000;
+            let mut clusters = Vec::new();
+
+            for label in &labels {
+                let clean_segs: Vec<&Segment> = segments_owned
+                    .iter()
+                    .filter(|seg| {
+                        seg.speaker_id.as_deref() == Some(label.as_str())
+                            && seg.shared_speakers.is_empty()
+                            && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
+                    })
+                    .collect();
+
+                if clean_segs.is_empty() {
+                    tracing::debug!(
+                        target: "orchestrator",
+                        label = %label,
+                        "compute_voiceprint_matches: no clean segments for label, skipping"
+                    );
+                    continue;
+                }
+
+                let mut windows: Vec<Vec<f32>> = Vec::with_capacity(clean_segs.len());
+                for seg in &clean_segs {
+                    if let Some(range) = runner::pcm_window_for_excluding_range(
+                        &pcm,
+                        seg.start_ms,
+                        seg.end_ms,
+                    ) {
+                        let window = pcm[range].to_vec();
+                        if !window.is_empty() {
+                            windows.push(window);
+                        }
+                    }
+                }
+
+                if windows.is_empty() {
+                    continue;
+                }
+
+                let window_count = windows.len() as u64;
+                let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
+                match extractor.centroid(&window_refs, 16_000) {
+                    Ok(centroid) => clusters.push(QueryCluster {
+                        label: label.clone(),
+                        centroid: centroid.vector,
+                        window_count,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "orchestrator",
+                            label = %label,
+                            error = %e,
+                            "compute_voiceprint_matches: centroid extraction failed for label"
+                        );
+                    }
+                }
+            }
+
+            let _ = model_id_str; // silence dead-code warning — used in the outer scope
+            Ok(clusters)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("voiceprint match extraction join failed: {e}"),
+        })??;
+
+        if query_clusters.is_empty() {
+            return Ok(Default::default());
+        }
+
+        // Run the global greedy assignment.
+        let assignments = assign_identities(&query_clusters, &gallery);
+
+        let mut accepted: std::collections::BTreeMap<String, String> = Default::default();
+        let mut uncertain_out: Vec<minutist_common::VoiceprintSuggestion> = Vec::new();
+
+        for m in assignments {
+            match m.band {
+                MatchBand::Accept => {
+                    accepted.insert(m.query_label, m.display_name);
+                }
+                MatchBand::Uncertain => {
+                    uncertain_out.push(minutist_common::VoiceprintSuggestion {
+                        label: m.query_label,
+                        display_name: m.display_name,
+                        identity_id: m.identity_id,
+                        model_id: model_id.to_string(),
+                        similarity: m.similarity,
+                    });
+                }
+                MatchBand::Reject => {} // nothing to do
+            }
+        }
+
+        if !accepted.is_empty() {
+            tracing::info!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                accepted_count = accepted.len(),
+                uncertain_count = uncertain_out.len(),
+                "voiceprint matching applied accepted names"
+            );
+        }
+
+        Ok((accepted, uncertain_out))
+    }
+
+    /// Restore speaker names from the pre-reprocess snapshot after a fresh diarize
+    /// has re-lettered the clusters (§2.6 clear-then-restore-matched).
+    ///
+    /// Attempts two matching strategies for each fresh label, in order:
+    /// 1. **Centroid matching** (requires the embedding model): extracts centroids
+    ///    for both the fresh clusters and the old named labels from the same meeting,
+    ///    then runs `assign_identities` to find accept-band matches.
+    /// 2. **Timeline coherence fallback**: computes Jaccard temporal overlap between
+    ///    each fresh label's total speech span and each old label's total speech
+    ///    span. If the overlap clears [`TIMELINE_JACCARD_THRESHOLD`], the name is
+    ///    restored — this makes the re-map testable without a real embedding model
+    ///    and guards against mis-transfer when segment boundaries shift across
+    ///    reprocess runs.
+    ///
+    /// Only accept-band centroid matches or timeline-coherent pairs produce a
+    /// name transfer. Ambiguous pairs (two old labels with equal best overlap for
+    /// the same fresh label, or `< TIMELINE_JACCARD_THRESHOLD`) are skipped —
+    /// the fresh label stays unlabelled. This is **clear-then-restore-matched**,
+    /// not blanket retention.
+    ///
+    /// Best-effort: any failure (read, extractor, write) is logged but does not
+    /// propagate — the meeting is left with cleared names, not errored.
+    async fn apply_ephemeral_remap(
+        &self,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+        old_names: std::collections::BTreeMap<String, String>,
+        old_segments: Vec<Segment>,
+        new_segments: &[Segment],
+    ) {
+        // Collect the distinct fresh labels.
+        let new_labels: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            new_segments
+                .iter()
+                .filter_map(|s| s.speaker_id.clone())
+                .filter(|l| seen.insert(l.clone()))
+                .collect()
+        };
+        if new_labels.is_empty() || old_names.is_empty() {
+            return;
+        }
+
+        // --- Strategy 1: centroid matching (requires embedding model) ----------
+        let centroid_matches: std::collections::BTreeMap<String, String> =
+            self.ephemeral_centroid_match(meeting_id, meeting_dir, &old_names, &old_segments, new_segments)
+                .await
+                .unwrap_or_default();
+
+        // --- Strategy 2: timeline coherence fallback ---------------------------
+        // For any fresh label not already covered by centroid matching, check
+        // whether its total speech span overlaps an old label's span clearly enough
+        // (Jaccard >= TIMELINE_JACCARD_THRESHOLD) to accept the name transfer.
+        let mut restored: std::collections::BTreeMap<String, String> = centroid_matches;
+
+        for new_label in &new_labels {
+            if restored.contains_key(new_label.as_str()) {
+                continue; // already matched by centroid
+            }
+            let new_span_ms = total_speech_ms(new_segments, new_label);
+            if new_span_ms == 0 {
+                continue;
+            }
+            let mut best: Option<(&str, f64)> = None;
+            for (old_label, name) in &old_names {
+                let old_span_ms = total_speech_ms(&old_segments, old_label);
+                let jaccard = timeline_jaccard(new_segments, new_label, &old_segments, old_label);
+                if old_span_ms == 0 || jaccard < TIMELINE_JACCARD_THRESHOLD {
+                    continue;
+                }
+                match best {
+                    None => best = Some((name.as_str(), jaccard)),
+                    Some((_, prev_j)) => {
+                        if (jaccard - prev_j).abs() < 1e-9 {
+                            // Tie: two old labels overlap equally — ambiguous, skip.
+                            best = None;
+                            break;
+                        } else if jaccard > prev_j {
+                            best = Some((name.as_str(), jaccard));
+                        }
+                    }
+                }
+            }
+            if let Some((name, jaccard)) = best {
+                tracing::debug!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    new_label = %new_label,
+                    name = %name,
+                    jaccard,
+                    "ephemeral re-map: timeline-coherence accepted"
+                );
+                restored.insert(new_label.clone(), name.to_string());
+            }
+        }
+
+        if restored.is_empty() {
+            tracing::debug!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                "ephemeral re-map: no names restored"
+            );
+            return;
+        }
+
+        // Write the restored names back into metadata.json (on top of the cleared map).
+        let meeting_dir_w = meeting_dir.to_path_buf();
+        let names_copy = restored.clone();
+        let write_result = tokio::task::spawn_blocking(move || -> AppResult<()> {
+            let mut meta = persistence::read_metadata(&meeting_dir_w)?;
+            // speaker_names was cleared by finalise_diarization; restore matched ones.
+            for (label, name) in &names_copy {
+                meta.speaker_names.insert(label.clone(), name.clone());
+            }
+            persistence::write_metadata(&meeting_dir_w, &meta)
+        })
+        .await;
+
+        match write_result {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    restored_count = restored.len(),
+                    "ephemeral re-map: restored names after reprocess"
+                );
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "ephemeral re-map: metadata write failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "ephemeral re-map: metadata write join failed"
+                );
+            }
+        }
+    }
+
+    /// Attempt centroid-based name matching between fresh clusters and old named
+    /// labels from the same meeting (§2.6 strategy 1).
+    ///
+    /// Extracts a centroid for each old named label (from the pre-reprocess
+    /// transcript + audio) and for each fresh label (from the post-diarize
+    /// transcript + the same audio), then runs `assign_identities` treating the
+    /// old named centroids as the "gallery". Returns accept-band matches only.
+    ///
+    /// Returns an empty map — not an error — when the embedding model is absent
+    /// or when either side has no extractable centroids.
+    async fn ephemeral_centroid_match(
+        &self,
+        meeting_id: MeetingId,
+        meeting_dir: &std::path::Path,
+        old_names: &std::collections::BTreeMap<String, String>,
+        old_segments: &[Segment],
+        new_segments: &[Segment],
+    ) -> AppResult<std::collections::BTreeMap<String, String>> {
+        use crate::matcher::{assign_identities, MatchBand, QueryCluster};
+        use persistence::StoredVoiceprint;
+
+        // Resolve the embedding model path; skip gracefully if absent.
+        let registry = Arc::clone(&self.model_registry);
+        let emb_id = minutist_common::ModelId::from(runner::DIARIZE_EMB_MODEL_ID);
+        let emb_dir_opt = {
+            use minutist_common::ModelStatusState;
+            registry
+                .list_models()
+                .into_iter()
+                .find(|s| s.id == emb_id)
+                .and_then(|s| match s.status {
+                    ModelStatusState::Available { local_dir } => Some(local_dir),
+                    _ => None,
+                })
+        };
+        let emb_dir = match emb_dir_opt {
+            Some(d) => d,
+            None => {
+                tracing::debug!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    "ephemeral_centroid_match: embedding model not available; skipping"
+                );
+                return Ok(Default::default());
+            }
+        };
+
+        let meeting_dir_owned = meeting_dir.to_path_buf();
+        let old_names_owned = old_names.clone();
+        let old_segments_owned = old_segments.to_vec();
+        let new_segments_owned = new_segments.to_vec();
+
+        let result = tokio::task::spawn_blocking(move || -> AppResult<std::collections::BTreeMap<String, String>> {
+            use runner::find_file_in_dir;
+            use minutist_common::VoiceprintIdentityId;
+
+            let emb_onnx = find_file_in_dir(
+                std::path::Path::new(&emb_dir),
+                |name| name.ends_with(".onnx"),
+            )?;
+            let extractor = diarizer::VoiceprintExtractor::open(&emb_onnx)?;
+            let pcm = persistence::read_audio_pcm(&meeting_dir_owned)?;
+
+            const MIN_CLEAN_DURATION_MS: u64 = 1000;
+
+            // Build an ephemeral gallery from the old named labels.
+            // Each old label becomes a `StoredVoiceprint` (with a placeholder
+            // `VoiceprintIdentityId`) so `assign_identities` can score them.
+            let mut gallery: Vec<StoredVoiceprint> = Vec::new();
+            // Map from ephemeral identity id back to the display name.
+            let mut id_to_name: std::collections::HashMap<VoiceprintIdentityId, String> = Default::default();
+
+            for (old_label, name) in &old_names_owned {
+                let clean_segs: Vec<&Segment> = old_segments_owned
+                    .iter()
+                    .filter(|seg| {
+                        seg.speaker_id.as_deref() == Some(old_label.as_str())
+                            && seg.shared_speakers.is_empty()
+                            && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
+                    })
+                    .collect();
+                if clean_segs.is_empty() {
+                    continue;
+                }
+                let mut windows: Vec<Vec<f32>> = Vec::new();
+                for seg in &clean_segs {
+                    if let Some(range) =
+                        runner::pcm_window_for_excluding_range(&pcm, seg.start_ms, seg.end_ms)
+                    {
+                        let w = pcm[range].to_vec();
+                        if !w.is_empty() {
+                            windows.push(w);
+                        }
+                    }
+                }
+                if windows.is_empty() {
+                    continue;
+                }
+                let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
+                match extractor.centroid(&window_refs, 16_000) {
+                    Ok(vp) => {
+                        let eph_id = VoiceprintIdentityId::new();
+                        let dim = vp.vector.len();
+                        id_to_name.insert(eph_id, name.clone());
+                        gallery.push(StoredVoiceprint {
+                            identity_id: eph_id,
+                            centroid_id: minutist_common::VoiceprintCentroidId::new(),
+                            display_name: name.clone(),
+                            embedding: vp.vector,
+                            dim,
+                            sample_count: windows.len() as u64,
+                            model_id: runner::DIARIZE_EMB_MODEL_ID.to_string(),
+                            condition_label: None,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "orchestrator",
+                            old_label = %old_label,
+                            error = %e,
+                            "ephemeral_centroid_match: centroid extraction failed for old label"
+                        );
+                    }
+                }
+            }
+
+            if gallery.is_empty() {
+                return Ok(Default::default());
+            }
+
+            // Extract centroids for fresh labels.
+            let mut queries: Vec<QueryCluster> = Vec::new();
+            for label in new_segments_owned.iter().filter_map(|s| s.speaker_id.as_ref()).collect::<std::collections::HashSet<_>>() {
+                let clean_segs: Vec<&Segment> = new_segments_owned
+                    .iter()
+                    .filter(|seg| {
+                        seg.speaker_id.as_deref() == Some(label.as_str())
+                            && seg.shared_speakers.is_empty()
+                            && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
+                    })
+                    .collect();
+                if clean_segs.is_empty() {
+                    continue;
+                }
+                let mut windows: Vec<Vec<f32>> = Vec::new();
+                for seg in &clean_segs {
+                    if let Some(range) =
+                        runner::pcm_window_for_excluding_range(&pcm, seg.start_ms, seg.end_ms)
+                    {
+                        let w = pcm[range].to_vec();
+                        if !w.is_empty() {
+                            windows.push(w);
+                        }
+                    }
+                }
+                if windows.is_empty() {
+                    continue;
+                }
+                let window_count = windows.len() as u64;
+                let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
+                match extractor.centroid(&window_refs, 16_000) {
+                    Ok(vp) => queries.push(QueryCluster {
+                        label: label.clone(),
+                        centroid: vp.vector,
+                        window_count,
+                    }),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "orchestrator",
+                            label = %label,
+                            error = %e,
+                            "ephemeral_centroid_match: centroid extraction failed for fresh label"
+                        );
+                    }
+                }
+            }
+
+            if queries.is_empty() {
+                return Ok(Default::default());
+            }
+
+            let assignments = assign_identities(&queries, &gallery);
+            let mut result: std::collections::BTreeMap<String, String> = Default::default();
+            for m in assignments {
+                if m.band == MatchBand::Accept {
+                    if let Some(name) = id_to_name.get(&m.identity_id) {
+                        result.insert(m.query_label, name.clone());
+                    }
+                }
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("ephemeral_centroid_match spawn_blocking join failed: {e}"),
+        })?;
+
+        result
     }
 
     /// Enumerate available audio-input devices.
@@ -1775,6 +2993,99 @@ impl Orchestrator {
 /// the 720 ms VAD hangover and the zero-gap 10 s force-split.
 const MERGE_GAP_MS: u64 = 1500;
 
+/// Minimum Jaccard temporal overlap required between a fresh cluster's total
+/// speech span and an old named cluster's total speech span for the
+/// timeline-coherence fallback in `apply_ephemeral_remap` to accept the name
+/// transfer. A value of 0.50 means the intersection must cover at least half the
+/// union of the two spans.
+///
+/// **Placeholder — WU6 calibrates** this alongside the cosine thresholds once a
+/// multi-session corpus is available. It is intentionally named as a constant
+/// (not a magic literal) so WU6 can swap the value without changing call sites.
+const TIMELINE_JACCARD_THRESHOLD: f64 = 0.50;
+
+/// Total duration of non-overlapping speech attributed to `label` in `segments` (ms).
+///
+/// Sums the duration of every segment whose `speaker_id == label`. Does not
+/// de-duplicate overlapping time ranges (the diarizer produces non-overlapping
+/// segments per label in practice, so this is exact for the use case).
+fn total_speech_ms(segments: &[Segment], label: &str) -> u64 {
+    segments
+        .iter()
+        .filter(|s| s.speaker_id.as_deref() == Some(label))
+        .map(|s| s.end_ms.saturating_sub(s.start_ms))
+        .sum()
+}
+
+/// Jaccard temporal overlap between the speech spans of `new_label` (in
+/// `new_segs`) and `old_label` (in `old_segs`).
+///
+/// Computes the intersection and union of the two sets of `[start_ms, end_ms)`
+/// intervals (as continuous coverage), then returns `intersection / union`.
+/// Returns `0.0` when either set is empty or the union is zero.
+///
+/// Uses a merge-then-scan approach: each set of intervals is sorted and merged
+/// into non-overlapping coverage; intersection and union are derived from the
+/// merged representations.
+fn timeline_jaccard(new_segs: &[Segment], new_label: &str, old_segs: &[Segment], old_label: &str) -> f64 {
+    fn merged_intervals(segs: &[Segment], label: &str) -> Vec<(u64, u64)> {
+        let mut ivs: Vec<(u64, u64)> = segs
+            .iter()
+            .filter(|s| s.speaker_id.as_deref() == Some(label) && s.end_ms > s.start_ms)
+            .map(|s| (s.start_ms, s.end_ms))
+            .collect();
+        ivs.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (lo, hi) in ivs {
+            match merged.last_mut() {
+                Some((_, prev_hi)) if lo <= *prev_hi => {
+                    if hi > *prev_hi {
+                        *prev_hi = hi;
+                    }
+                }
+                _ => merged.push((lo, hi)),
+            }
+        }
+        merged
+    }
+
+    let new_ivs = merged_intervals(new_segs, new_label);
+    let old_ivs = merged_intervals(old_segs, old_label);
+    if new_ivs.is_empty() || old_ivs.is_empty() {
+        return 0.0;
+    }
+
+    // Compute total coverage of each set.
+    let new_total: u64 = new_ivs.iter().map(|(a, b)| b - a).sum();
+    let old_total: u64 = old_ivs.iter().map(|(a, b)| b - a).sum();
+
+    // Intersection: sorted two-pointer scan.
+    let mut intersection: u64 = 0;
+    let mut ni = 0;
+    let mut oi = 0;
+    while ni < new_ivs.len() && oi < old_ivs.len() {
+        let (nlo, nhi) = new_ivs[ni];
+        let (olo, ohi) = old_ivs[oi];
+        let lo = nlo.max(olo);
+        let hi = nhi.min(ohi);
+        if hi > lo {
+            intersection += hi - lo;
+        }
+        if nhi < ohi {
+            ni += 1;
+        } else {
+            oi += 1;
+        }
+    }
+
+    let union = new_total + old_total - intersection;
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
 /// How a diarization+split pass obtains its turns + re-ASR backend (#0015 phase
 /// 4). Both variants converge on [`diarize_split_merge`] (the model-free core);
 /// the variant only decides where the turns + backend come from.
@@ -1801,18 +3112,40 @@ enum DiarizationJob {
 /// from `job`, and run the [`diarize_split_merge`] core, all on a
 /// `spawn_blocking` thread.
 ///
-/// Returns the (possibly split) segments with `speaker_id` overlaid and the
-/// distinct speaker count. The `job` carries either the production
-/// `SherpaDiarizer` (+ best-effort Qwen backend) or stub-supplied turns + backend
-/// (the default-suite seam), so a `SherpaDiarizer` and a model-free stub both
-/// drive the SAME split core.
+/// Returns the (possibly split) segments with `speaker_id` overlaid, the distinct
+/// speaker count, and any vetoed-cluster names `(letter, display_name)` that the
+/// caller must write to `speaker_names` after `finalise_diarization` clears the map.
+///
+/// `prune_veto_extractor` is `Some` when the embedding model is locally available;
+/// `gallery` is the active-model voiceprint library. When either is absent, the
+/// veto pass is skipped (graceful degradation — the prune runs normally). When
+/// both are present, a second `VoiceprintExtractor` pass runs over each low-share
+/// candidate cluster's PCM windows (after `compute_turns`, before `diarize_split_merge`)
+/// to build a centroid and match against the gallery via `matcher::assign_identities`.
+/// Accept-band matches (with the query-side noise guard) produce veto verdicts that
+/// are passed into `diarize_split_merge` so those clusters survive the prune.
+///
+/// The `job` carries either the production `SherpaDiarizer` (+ best-effort Qwen
+/// backend) or stub-supplied turns + backend (the default-suite seam), so a
+/// `SherpaDiarizer` and a model-free stub both drive the SAME split core.
+///
+/// VRAM sequencing (§2.5): the `SherpaDiarizer` holds the segmentation model; the
+/// `prune_veto_extractor` holds the embedding model (same as the diarizer's internal
+/// one, but a separate instance opened before the diarizer drop). The Qwen re-ASR
+/// `backend` is the VRAM-heavy component; it is moved into `diarize_split_merge` and
+/// dropped there. The extractor is a lightweight embedding-only model and is dropped
+/// at the end of the veto pass, before `diarize_split_merge` starts — so the peak
+/// VRAM budget is (sherpa-seg + sherpa-emb + extractor) for the veto pass, then
+/// (sherpa-seg + sherpa-emb + Qwen) for the split — never all three simultaneously.
 async fn run_diarization_blocking(
     meeting_dir: PathBuf,
     job: DiarizationJob,
+    prune_veto_extractor: Option<diarizer::VoiceprintExtractor>,
+    gallery: Vec<persistence::StoredVoiceprint>,
     event_tx: broadcast::Sender<AppEvent>,
     meeting_id: MeetingId,
-) -> AppResult<(Vec<Segment>, u32)> {
-    tokio::task::spawn_blocking(move || -> AppResult<(Vec<Segment>, u32)> {
+) -> AppResult<(Vec<Segment>, u32, Vec<(String, String)>)> {
+    tokio::task::spawn_blocking(move || -> AppResult<(Vec<Segment>, u32, Vec<(String, String)>)> {
         let pcm = persistence::read_audio_pcm(&meeting_dir)?;
         let segments = persistence::read_transcript(&meeting_dir)?;
 
@@ -1835,6 +3168,23 @@ async fn run_diarization_blocking(
             } => (turns, config, backend),
         };
 
+        // §2.5 prune-veto: if the embedding model is available, run a second
+        // VoiceprintExtractor pass over each low-share candidate cluster's PCM
+        // to build a centroid and match against the gallery. Accept-band matches
+        // (with the query-side noise guard) produce veto verdicts for diarize_split_merge.
+        //
+        // "Low-share candidate" = a cluster that WOULD be pruned by the share or
+        // count floors if no veto were applied. This limits the extra embedding
+        // work to only the clusters at risk — never the dominant speakers.
+        let veto_verdicts: Vec<(i32, String)> = if let Some(extractor) = prune_veto_extractor {
+            compute_prune_veto_verdicts(&turns, &pcm, &config, &extractor, &gallery, meeting_id)
+        } else {
+            Vec::new()
+        };
+        // Drop the extractor before the split: its VRAM is freed before the Qwen
+        // backend enters (§2.5 VRAM sequencing note above).
+        // (prune_veto_extractor is moved into `extractor` above or already None)
+
         // `Box<dyn AsrBackend + Send>` → `Box<dyn AsrBackend>` for the core (the
         // split runs on this one thread; the `Send` bound is only needed to move
         // the backend into the closure).
@@ -1845,6 +3195,7 @@ async fn run_diarization_blocking(
             &pcm,
             backend,
             &config,
+            &veto_verdicts,
             &event_tx,
             meeting_id,
         )
@@ -1937,17 +3288,34 @@ fn dominant_cluster(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> Option
 /// pause-INCLUDING clock the turns + PCM share, and a sub-clip's `start_ms` is
 /// mapped back to the EXCLUDING transcript clock by the inverse. INCLUDING-clock
 /// turns are NEVER compared against EXCLUDING-clock segment bounds.
+/// `veto_verdicts` is a list of `(cluster_id, display_name)` pairs for low-share
+/// clusters the orchestrator has vetoed from pruning (§2.5 prune-veto). Each
+/// cluster in the list matched an enrolled voiceprint above `T_ACCEPT` (with the
+/// query-side noise guard) and must survive the share prune + cap. After
+/// `overlay_speakers` assigns letters, the cluster→letter map is used to convert
+/// each vetoed cluster id to its final letter and collect `(letter, name)` pairs
+/// returned as the third tuple element so the caller can write them to
+/// `speaker_names` after `finalise_diarization` clears the map.
+///
+/// An empty `veto_verdicts` is the no-veto baseline (the prune runs normally).
 fn diarize_split_merge(
     turns: &[SpeakerTurn],
     segments: Vec<Segment>,
     pcm: &[f32],
     mut backend: Option<Box<dyn minutist_common::AsrBackend>>,
     config: &diarizer::DiarizerConfig,
+    veto_verdicts: &[(i32, String)],
     event_tx: &broadcast::Sender<AppEvent>,
     meeting_id: MeetingId,
-) -> AppResult<(Vec<Segment>, u32)> {
+) -> AppResult<(Vec<Segment>, u32, Vec<(String, String)>)> {
+    // Extract cluster ids for the veto; names are resolved below once the
+    // cluster→letter map is available.
+    let veto_ids: Vec<i32> = veto_verdicts.iter().map(|(id, _)| *id).collect();
+
     // 1. Overlay labels + flag mixed Qwen segments; keep the cluster→letter map.
-    let (mut segments, _count, cluster_letters) = diarizer::overlay_speakers(turns, segments, config);
+    // Pass the veto ids so surviving_clusters rescues low-share enrolled speakers.
+    let (mut segments, _count, cluster_letters) =
+        diarizer::overlay_speakers(turns, segments, config, &veto_ids);
 
     // 2. Collapse fragments so a turn reads as one row (#0015 phase 1).
     diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);
@@ -1994,7 +3362,214 @@ fn diarize_split_merge(
     // (it lives no longer than this fn).
     drop(backend);
 
-    Ok((segments, count))
+    // 5. Resolve vetoed cluster ids to their assigned letters so the caller can
+    // write the pre-matched names to speaker_names after finalise_diarization clears
+    // the map. Clusters that did not survive (e.g. were absent from the turns and
+    // got no segments) are silently dropped — only present letters carry names.
+    let veto_names: Vec<(String, String)> = veto_verdicts
+        .iter()
+        .filter_map(|(cluster_id, name)| {
+            cluster_letters
+                .iter()
+                .find(|(cid, _)| *cid == *cluster_id)
+                .map(|(_, letter)| (letter.clone(), name.clone()))
+        })
+        .collect();
+
+    Ok((segments, count, veto_names))
+}
+
+/// §2.5 prune-veto second pass: determine which low-share candidate clusters match
+/// an enrolled voiceprint above the accept threshold.
+///
+/// "Low-share candidate" = a cluster that WOULD be pruned by the share or count
+/// floor of `config` if no veto applied. The pass is limited to these candidates —
+/// never the dominant speakers — to keep the extra embedding work proportional.
+///
+/// For each candidate cluster, gathers all turn windows whose pause-INCLUDING PCM
+/// range is non-empty (the turns are already on the pause-INCLUDING clock, so no
+/// clock mapper is needed here — we use the turns directly). Embeds + builds a
+/// centroid via `extractor.centroid`. Applies the query-side noise guard (§2.4):
+/// when `window_count < diarizer::PRUNE_VETO_MIN_WINDOWS`, the accept threshold
+/// is `matcher::T_ACCEPT_NOISY`; otherwise `matcher::T_ACCEPT`.
+///
+/// Runs `matcher::assign_identities` treating each candidate cluster as a query.
+/// Returns `(cluster_id, display_name)` pairs for accept-band matches only.
+///
+/// Errors in individual cluster embeddings are logged + skipped (best-effort).
+fn compute_prune_veto_verdicts(
+    turns: &[SpeakerTurn],
+    pcm: &[f32],
+    config: &diarizer::DiarizerConfig,
+    extractor: &diarizer::VoiceprintExtractor,
+    gallery: &[persistence::StoredVoiceprint],
+    meeting_id: MeetingId,
+) -> Vec<(i32, String)> {
+    use crate::matcher::{assign_identities, MatchBand, QueryCluster, T_ACCEPT, T_ACCEPT_NOISY, NOISE_GUARD_MIN_WINDOWS};
+
+    if gallery.is_empty() {
+        return Vec::new();
+    }
+
+    // Identify low-share candidate clusters: tally per-cluster turn duration from
+    // the raw turns, then apply the same share + count floors as surviving_clusters.
+    // A cluster is a candidate if it would fail the prune (below share OR below
+    // segment count) — we only run the extra embedding pass on those.
+    let prune_active = config.min_cluster_share > 0.0 || config.min_cluster_segments > 0;
+    if !prune_active {
+        // No prune is active; no cluster is at risk; skip the veto pass.
+        return Vec::new();
+    }
+
+    // Tally per-cluster total turn duration (pause-INCLUDING ms from the turns).
+    let mut cluster_ids: Vec<i32> = Vec::new();
+    let mut cluster_dur: Vec<u64> = Vec::new();
+    let mut cluster_turn_count: Vec<usize> = Vec::new();
+    for t in turns {
+        let dur = t.end_ms.saturating_sub(t.start_ms);
+        match cluster_ids.iter().position(|&id| id == t.cluster) {
+            Some(i) => {
+                cluster_dur[i] += dur;
+                cluster_turn_count[i] += 1;
+            }
+            None => {
+                cluster_ids.push(t.cluster);
+                cluster_dur.push(dur);
+                cluster_turn_count.push(1);
+            }
+        }
+    }
+
+    if cluster_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let total_dur: u64 = cluster_dur.iter().sum();
+
+    // Select low-share candidates (those that would be pruned).
+    let candidates: Vec<i32> = cluster_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &id)| {
+            let share = if total_dur > 0 {
+                cluster_dur[i] as f32 / total_dur as f32
+            } else {
+                0.0
+            };
+            let below_share = config.min_cluster_share > 0.0 && share < config.min_cluster_share;
+            let below_count = config.min_cluster_segments > 0
+                && cluster_turn_count[i] < config.min_cluster_segments;
+            if below_share || below_count {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    tracing::debug!(
+        target: "orchestrator",
+        meeting_id = %meeting_id.0,
+        candidate_count = candidates.len(),
+        "prune-veto: running second embedding pass for low-share clusters"
+    );
+
+    // For each candidate cluster, gather all turn windows' PCM and build a centroid.
+    // Turns are on the pause-INCLUDING clock; PCM is pause-INCLUDING — no clock mapper.
+    const SR: u32 = 16_000;
+    let mut queries: Vec<QueryCluster> = Vec::new();
+
+    for &cluster_id in &candidates {
+        // Collect all turn PCM windows for this cluster.
+        let windows: Vec<Vec<f32>> = turns
+            .iter()
+            .filter(|t| t.cluster == cluster_id)
+            .filter_map(|t| {
+                let start_sample = (t.start_ms as usize * SR as usize) / 1000;
+                let end_sample = (t.end_ms as usize * SR as usize) / 1000;
+                if start_sample >= end_sample || end_sample > pcm.len() {
+                    return None;
+                }
+                let window = pcm[start_sample..end_sample].to_vec();
+                if window.is_empty() {
+                    None
+                } else {
+                    Some(window)
+                }
+            })
+            .collect();
+
+        if windows.is_empty() {
+            tracing::debug!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                cluster_id,
+                "prune-veto: no usable PCM windows for candidate cluster; skipping"
+            );
+            continue;
+        }
+
+        let window_count = windows.len() as u64;
+        let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
+
+        let centroid = match extractor.centroid(&window_refs, SR) {
+            Ok(vp) => vp,
+            Err(e) => {
+                tracing::debug!(
+                    target: "orchestrator",
+                    meeting_id = %meeting_id.0,
+                    cluster_id,
+                    error = %e,
+                    "prune-veto: centroid extraction failed; skipping"
+                );
+                continue;
+            }
+        };
+
+        queries.push(QueryCluster {
+            label: cluster_id.to_string(),
+            centroid: centroid.vector,
+            window_count,
+        });
+    }
+
+    if queries.is_empty() {
+        return Vec::new();
+    }
+
+    let assigned = assign_identities(&queries, gallery);
+
+    // Collect accept-band matches only; map the label (stringified cluster_id) back
+    // to i32. Apply the query-side noise guard (§2.4): the effective accept threshold
+    // is ALREADY applied inside assign_identities via the QueryCluster.window_count
+    // field (the matcher reads NOISE_GUARD_MIN_WINDOWS and T_ACCEPT_NOISY). Matches
+    // in the Uncertain band are NOT vetoed — they fall to the normal suggestion flow.
+    let _ = (T_ACCEPT, T_ACCEPT_NOISY, NOISE_GUARD_MIN_WINDOWS); // silence dead-code lint
+    let verdicts: Vec<(i32, String)> = assigned
+        .into_iter()
+        .filter(|m| m.band == MatchBand::Accept)
+        .filter_map(|m| {
+            m.query_label
+                .parse::<i32>()
+                .ok()
+                .map(|id| (id, m.display_name))
+        })
+        .collect();
+
+    if !verdicts.is_empty() {
+        tracing::info!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            vetoed_count = verdicts.len(),
+            "prune-veto: enrolled quiet speakers rescued from pruning"
+        );
+    }
+
+    verdicts
 }
 
 /// Split one kept mixed Qwen segment into single-speaker sub-segments by
@@ -2240,6 +3815,34 @@ fn diarizer_descriptor() -> ModelDescriptor {
         name: runner::DIARIZE_SEG_MODEL_ID.to_string(),
         quantisation: None,
         version: runner::DIARIZE_SEG_MODEL_ID.to_string(),
+    }
+}
+
+/// Load the voiceprint gallery for the §2.5 prune-veto pass.
+///
+/// Calls `VoiceprintStore::all(model_id)` and returns the result as a plain Vec
+/// so the spawn_blocking thread can own it without a DB handle. Returns an empty
+/// Vec when the store is `None` (enrolment not enabled or store not open) or on
+/// any read error (best-effort — a gallery read failure degrades to no-veto, not
+/// a hard error).
+async fn load_voiceprint_gallery(
+    store: Option<&persistence::VoiceprintStore>,
+    meeting_id: MeetingId,
+) -> Vec<persistence::StoredVoiceprint> {
+    let Some(store) = store else {
+        return Vec::new();
+    };
+    match store.all(runner::DIARIZE_EMB_MODEL_ID).await {
+        Ok(gallery) => gallery,
+        Err(e) => {
+            tracing::warn!(
+                target: "orchestrator",
+                meeting_id = %meeting_id.0,
+                error = %e,
+                "prune-veto: gallery load failed (best-effort); skipping veto pass"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -2563,6 +4166,10 @@ impl Orchestrator {
     ) -> AppResult<()> {
         let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
 
+        // §2.6 snapshot: capture old speaker_names + transcript BEFORE the
+        // re-transcribe overwrites transcript.json. Mirrors `reprocess_claimed`.
+        let pre_snapshot = self.capture_reprocess_snapshot(meeting_id, &meeting_dir).await;
+
         // (a) Re-transcribe FIRST via the stub backend (no finalise).
         let segments = self
             .re_transcribe_segments_with_backend(meeting_id, &meeting_dir, asr_backend)
@@ -2579,7 +4186,8 @@ impl Orchestrator {
         })??;
 
         // (c) Diarize/split/merge over the fresh transcript, finalise ONCE.
-        self.rediarize_inner(
+        // Stub path (test-only): no gallery for the veto pass.
+        self.rediarize_inner_with_snapshot_and_gallery(
             index,
             meeting_id,
             DiarizationJob::Stub {
@@ -2587,6 +4195,8 @@ impl Orchestrator {
                 backend: split_backend,
                 config,
             },
+            pre_snapshot,
+            Vec::new(),
         )
         .await
     }

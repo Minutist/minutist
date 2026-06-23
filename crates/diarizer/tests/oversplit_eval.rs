@@ -103,7 +103,7 @@ fn count_with_prune(turns: &[SpeakerTurn], base: &[Segment], share: f32) -> u32 
     for s in &mut segs {
         s.words.clear();
     }
-    let (_segs, count, _map) = overlay_speakers(turns, segs, &cfg);
+    let (_segs, count, _map) = overlay_speakers(turns, segs, &cfg, &[]);
     count
 }
 
@@ -186,7 +186,7 @@ fn oversplit_count_vs_knob_sweep() {
         s.words.clear();
     }
     let (_new_segs, new_count, _map) =
-        overlay_speakers(&new_turns, new_segs, &DiarizerConfig::default());
+        overlay_speakers(&new_turns, new_segs, &DiarizerConfig::default(), &[]);
     eprintln!(
         "\n-- BEFORE/AFTER on this slice --\n  OLD (thr 0.75, no smoothing, no prune): {old_count}\
          \n  NEW (DiarizerConfig::default()):        {new_count}"

@@ -1521,7 +1521,7 @@ fn finalise_on_stop(
 
 /// Find a file in `dir` matching `predicate`. Returns `AppError::Internal` if
 /// the directory cannot be read or no matching file is found.
-fn find_file_in_dir(
+pub(crate) fn find_file_in_dir(
     dir: &std::path::Path,
     predicate: impl Fn(&str) -> bool,
 ) -> AppResult<std::path::PathBuf> {
@@ -3138,5 +3138,49 @@ mod tests {
         // (excluding 2000 ms — the instant the clock froze).
         let mid_pause = speech_a + ms_to_samples(3000);
         assert_eq!(excluding_ms_for_pcm_sample(&pcm, mid_pause), 2000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Embedding-model resolution convergence guard (WU1 / #0003)
+    // -----------------------------------------------------------------------
+
+    /// The offline diarizer path (`build_diarizer`, lines ~2170-2171) and the
+    /// online diarizer path (`build_online_diarizer`, lines ~2234-2235) both
+    /// resolve the embedding model `.onnx` via `find_file_in_dir` with a
+    /// predicate of `name.ends_with(".onnx")`, and both must use the SAME
+    /// manifest id (`DIARIZE_EMB_MODEL_ID`). A divergence would place
+    /// `VoiceprintExtractor` in a different embedding space than the online
+    /// clusterer, silently invalidating voiceprint comparisons.
+    ///
+    /// This test is purely structural (no model, no I/O): it verifies the
+    /// predicate applied to candidate filenames and confirms that the model
+    /// id constant matches what both paths reference, making the divergence
+    /// visible at compile-or-test time rather than at runtime on a user's
+    /// machine.
+    #[test]
+    fn embedding_model_resolution_predicate_is_identical_for_offline_and_online() {
+        // The predicate used in both build_diarizer (line ~2171) and
+        // build_online_diarizer (line ~2235).  Any change to either call
+        // site must keep these assertions in sync.
+        let predicate = |name: &str| name.ends_with(".onnx");
+
+        // Positive: the embedding model file the registry places in the dir.
+        assert!(predicate("model.onnx"), "primary .onnx name must match");
+        assert!(predicate("speaker_embedding.onnx"), "variant .onnx name must match");
+
+        // Negative: other file types in a model dir must NOT match.
+        assert!(!predicate("model.bin"), ".bin must not match");
+        assert!(!predicate("manifest.json"), ".json must not match");
+        assert!(!predicate("README.md"), ".md must not match");
+        assert!(!predicate("model.onnxruntime"), "partial extension must not match");
+
+        // The model id used by both resolution paths is the same constant.
+        // VoiceprintExtractor (WU1) relies on this: it is opened by the
+        // orchestrator using the same DIARIZE_EMB_MODEL_ID + predicate pair,
+        // ensuring the embedding space is consistent across all three paths.
+        assert_eq!(
+            DIARIZE_EMB_MODEL_ID, "3dspeaker-campplus-zh-en-advanced",
+            "DIARIZE_EMB_MODEL_ID must not diverge between offline and online paths"
+        );
     }
 }

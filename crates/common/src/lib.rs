@@ -21,6 +21,13 @@ use uuid::Uuid;
 #[cfg(feature = "llama-backend")]
 pub mod llama_backend;
 
+/// Pure, dependency-free vector math for voiceprint centroids.
+///
+/// Shared by `diarizer` (centroid building during extraction) and `persistence`
+/// (fold/merge/recompute inside `VoiceprintStore`) without introducing a
+/// `persistence → diarizer` edge. Both crates already depend on `common`.
+pub mod voiceprint_math;
+
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
@@ -125,6 +132,97 @@ impl Default for AttachmentId {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Stable identifier for a speaker identity in the voiceprint library. UUIDv4.
+/// Mirrors [`MeetingId`].
+///
+/// A `VoiceprintIdentityId` is assigned once on first enrolment and survives
+/// renames and merges — it is the stable primary key for the
+/// `voiceprint_identity` table in `{app-data}/voiceprints.db` (owned by
+/// `persistence`). Never placed in `Segment`; the diarizer label-to-name
+/// resolution at read time uses display names, not this id.
+///
+/// Adding this type is a one-way-door architecture-owner change
+/// (see `architecture/domain-ownership.md` — Parallel-work rules §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
+pub struct VoiceprintIdentityId(
+    // Use `#[specta(type = String)]` so the TS binding mirrors how serde
+    // emits a Uuid (a hyphenated lowercase string) without needing the
+    // optional `uuid` feature on the `specta` crate.
+    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
+);
+
+impl VoiceprintIdentityId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for VoiceprintIdentityId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Stable identifier for one acquisition-condition centroid within a
+/// voiceprint identity's gallery. UUIDv4. Mirrors [`MeetingId`].
+///
+/// A `VoiceprintCentroidId` is assigned once when a new condition gallery
+/// entry is created and persisted in the `voiceprint_centroid` table in
+/// `{app-data}/voiceprints.db` (owned by `persistence`). One identity can
+/// hold several centroid entries — one per distinct recording condition
+/// (e.g. in-person room mic vs VoIP). Matching runs over the flattened
+/// gallery: every centroid of every identity, with an identity's score being
+/// the maximum over its centroids.
+///
+/// Adding this type is a one-way-door architecture-owner change
+/// (see `architecture/domain-ownership.md` — Parallel-work rules §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
+pub struct VoiceprintCentroidId(
+    // Use `#[specta(type = String)]` so the TS binding mirrors how serde
+    // emits a Uuid (a hyphenated lowercase string) without needing the
+    // optional `uuid` feature on the `specta` crate.
+    #[cfg_attr(feature = "specta", specta(type = String))] pub Uuid,
+);
+
+impl VoiceprintCentroidId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for VoiceprintCentroidId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One uncertain-band voiceprint suggestion emitted on
+/// [`AppEvent::VoiceprintSuggestions`] (§2.4 — `T_reject <= sim < T_accept`).
+///
+/// Carries everything the UI needs to show "is this \<display_name\>?" and to
+/// confirm (`set_speaker_name`) or dismiss (`reject_match`) the suggestion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct VoiceprintSuggestion {
+    /// The diariser letter that received the uncertain match (e.g. `"A"`).
+    pub label: String,
+    /// Display name of the matched identity.
+    pub display_name: String,
+    /// Stable identity id — passed to `reject_match` when the user dismisses.
+    pub identity_id: VoiceprintIdentityId,
+    /// The embedding model id — also passed to `reject_match`.
+    pub model_id: String,
+    /// The cosine similarity (for optional display; not used by the matching
+    /// logic on the UI side).
+    pub similarity: f32,
 }
 
 /// Stable identifier for a model in the registry.
@@ -1229,6 +1327,27 @@ pub enum AppEvent {
     /// string the UI surfaces in a notification; the sync continues for other
     /// meetings.
     SyncError { context: String },
+
+    // --- Voiceprint matching (issue #0003 — WU5) --------------------------
+    // Rides the existing `AppEventPayload` newtype + the single
+    // `collect_events![AppEventPayload]` registration in `ipc-bridge` — no new
+    // event registration.
+    /// One or more diarizer labels landed in the uncertain match band
+    /// (`T_reject <= sim < T_accept` — §2.4) after a diarisation pass. The
+    /// webview shows an "is this \<name\>?" affordance for each suggestion so the
+    /// user can confirm or dismiss. A confirmed suggestion applies the name via
+    /// `set_speaker_name`; a dismissal calls `reject_match`. Unconfirmed
+    /// suggestions leave the label as the bare diariser letter.
+    ///
+    /// Only emitted when `voiceprint_enrolment_enabled` is ON and the gallery
+    /// returns at least one uncertain-band candidate.
+    VoiceprintSuggestions {
+        meeting_id: MeetingId,
+        /// Each suggestion carries the diariser label, the suggested name, the
+        /// matched identity id, the model id (needed by `reject_match`), and
+        /// the cosine similarity for display.
+        suggestions: Vec<VoiceprintSuggestion>,
+    },
 }
 
 // ---------------------------------------------------------------------------

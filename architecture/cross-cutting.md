@@ -722,11 +722,15 @@ constraints are binding on them):
   (the old label→name mapping is no longer valid); the `set_speaker_name` tool
   re-establishes names afterward. Names are an overlay applied at read time, never
   baked into `transcript.json`. The merged `reprocess` (#0015 phase 5) ALWAYS
-  diarizes, so it clears `speaker_names` on EVERY run — even a text-only repair
-  loses user-assigned names. This is the accepted product default (accept-and-warn,
-  2026-06-17): consistent with re-diarize's existing behaviour; the merged
-  reprocess tool carries the "RESETS speaker names" warning, and the durable fix is
-  embedding-anchored retention (#0003 voiceprints).
+  diarizes. When `voiceprint_enrolment_enabled` is ON, a `reprocess` re-identifies
+  known speakers from your library: enrolled speakers keep their names across a
+  re-letter (via global gallery centroid matching, WU5), and unenrolled speakers
+  who were named in this meeting are re-identified via ephemeral centroids and a
+  timeline-coherence fallback (WU4 — see below). Where neither the library nor the
+  ephemeral centroid matches, the user-typed name is still lost — the accept-and-warn
+  default is only partially lifted for unenrolled strangers. When the flag is OFF,
+  `speaker_names` is cleared unconditionally on every run (zero behaviour change for
+  users who have never opted in).
 
 - **The driver loop (`ipc-bridge`, on `spawn_blocking`).** `chat-agent`'s
   `ChatEngine` is stateless per call; the driver owns the conversation history and
@@ -1151,7 +1155,15 @@ change.
 │   When settings.data_directory is set to a valid absolute path they move
 │   to {data_directory}/ instead (see "data_directory override" below).
 │
-├── index.db                    libsql; owned by `persistence`
+├── index.db                    libsql; owned by `persistence`; derived,
+│                               rebuildable cache (see "index.db is a derived
+│                               rebuildable cache" below)
+├── collections.json            JSON array; owned by `persistence`; durable
+│                               collection definitions — NOT a rebuildable cache
+├── voiceprints.db              libsql; owned by `persistence`; durable voiceprint
+│                               library — NOT a rebuildable cache (see "Voiceprint
+│                               matching" below and "index.db is a derived
+│                               rebuildable cache" for the contrast)
 ├── meetings/{uuid}/            owned by `persistence` (and nobody else)
 │   ├── audio.opus
 │   ├── transcript.json
@@ -1190,15 +1202,19 @@ authoritative doc after a crash between its rename and the rest.
 
 **`settings.data_directory` override.** `app-main` reads
 `settings.data_directory` after loading settings and calls `resolve_data_roots`
-to derive the effective paths for `meetings/`, `models/`, and `index.db`.
-When the field is `Some(path)` and `path` is an absolute, creatable path, those
-three entries move under `path/`; `settings.store` and `logs/` always stay at
-the platform root (bootstrap constraints). An invalid value (relative, empty,
-or uncreatable) is logged via `tracing::error` and falls back to the platform
-default — startup is never aborted. The roots are fixed for the process
-lifetime; a change requires an app restart. Moving existing data is the user's
-responsibility (no automatic migration). There is currently no UI for this
-field; it must be set by editing `settings.store` directly.
+to derive the effective paths for `meetings/`, `models/`, `index.db`,
+`collections.json`, and `voiceprints.db`. When the field is `Some(path)` and
+`path` is an absolute, creatable path, those five entries move under `path/`;
+`settings.store` and `logs/` always stay at the platform root (bootstrap
+constraints). `collections.json` and `voiceprints.db` sit at the **same
+effective root** as `index.db` and move with the `data_directory` override —
+they are user-data files that must be co-located with the meetings they
+reference. An invalid value (relative, empty, or uncreatable) is logged via
+`tracing::error` and falls back to the platform default — startup is never
+aborted. The roots are fixed for the process lifetime; a change requires an app
+restart. Moving existing data is the user's responsibility (no automatic
+migration). There is currently no UI for this field; it must be set by editing
+`settings.store` directly.
 
 **`index.db` is a derived, rebuildable cache (binding — Phase 4, A6).** The
 per-meeting folders are the **source of truth**; `index.db` (the libsql
@@ -1212,6 +1228,343 @@ index `upsert` failure on stop is logged-and-swallowed, not fatal). The schema
 is versioned and the migration runner is **forward-only** (a `schema_version`
 gate; opening an empty DB or a prior-schema DB migrates up without data loss).
 Nothing depends on `index.db` being byte-stable or even present.
+
+## Voiceprint matching
+
+**Scope (issue #0003).** Cross-session speaker voiceprints: a speaker enrolled
+by name in one meeting can be automatically re-identified in later meetings,
+keeping their name across re-diarization without clearing `speaker_names`.
+
+**`voiceprints.db` is NOT a rebuildable cache.** Unlike `index.db`, a
+voiceprint is primary biometric data — it cannot be derived from the
+per-meeting folders without re-running the user-guided enrolment flow. A
+corrupt or missing `voiceprints.db` degrades enrolment to OFF and logs a
+`tracing::error`; it must never block the meeting list or the recording
+pipeline. The migration runner is forward-only (same discipline as `index.db`).
+
+**Recompute-from-contributions invariant (§2.9.1 — binding).** The
+`voiceprint_centroid.embedding` column is a *cache*, not primary data. Its
+value is always equal to
+`unit_normalise(Σ count_i · contribution_i.embedding / Σ count_i)`
+over the centroid's surviving contributions, and `sample_count = Σ count_i`.
+Any operation that adds, removes, or re-homes a contribution (enrol, refine,
+merge, forget_meeting) MUST call `recompute_centroid` in the same transaction.
+This makes refinement reversible: drop a contribution row, recompute, and the
+centroid is back to what it was before that contribution was folded in.
+
+**`model_id` hard-invalidation (§2.2).** Every `voiceprint_identity` row
+carries the `model_id` of the embedding model used to build it. Matching and
+refinement are valid only within the same model:
+- `VoiceprintStore::refine` rejects (returns `Error::InvalidState`) if the
+  incoming `model_id` differs from the identity's stored `model_id`.
+- `VoiceprintStore::all(model_id)` returns zero rows for a foreign `model_id`.
+  The caller MUST surface this as "N voiceprints from a previous model — re-enrol?",
+  NOT as a silently empty library. Silently discarding the old voiceprints on a
+  model upgrade would give users no indication that re-enrolment is needed.
+
+**Corruption degrade-to-off contract.** A `VoiceprintStore::open` failure
+(libsql error or migration error) returns the error to the caller, which maps it
+to enrolment-OFF: the voiceprint feature is silently disabled for the session and
+a `tracing::error!` is emitted. The meeting list, the recording pipeline, and the
+transcript-read path are never blocked. There is no auto-repair path
+(unlike `index.db`'s `rebuild_from_disk`) — voiceprints are primary data
+and cannot be reconstructed.
+
+**Thresholds (placeholders — WU6 calibration required).** The numbers below
+are documented placeholders. They have no grounding in any in-repo sweep; WU6
+assembles the labelled multi-session corpus and calibrates them.
+
+| Band | Cosine similarity | Action |
+|------|------------------|--------|
+| Accept | `sim >= T_accept` (placeholder `0.60`) | Auto-apply the matched display name |
+| Uncertain | `T_reject <= sim < T_accept` (placeholder `0.45..0.60`) | Suggest "is this \<Name\>?" — label shows the bare letter until confirmed |
+| Reject | `sim < T_reject` (placeholder `0.45`) | No name, anonymous letter only |
+
+**Refinement thresholds (placeholders — WU6):**
+- `FOLD_GATE = 0.70` — cosine similarity floor for folding a new contribution
+  into an existing centroid rather than creating a new condition entry. Not the
+  offline clustering distance `0.75`; a different metric for a different purpose.
+- `GALLERY_CAP = 4` — per-identity cap on the number of condition centroids.
+  Cap-and-merge merges the two closest centroids only if their cosine clears
+  `FOLD_GATE`; if no pair clears the gate, the cap is allowed to grow rather
+  than silently blur genuinely distinct conditions.
+- `REFINE_WEIGHT_CAP = 0.30` — a single meeting's contribution `count` is
+  clamped to `min(count, existing_sample_count × 0.30)` before folding, so one
+  adversarial meeting cannot dominate an established centroid. This is the
+  bounded-weight poison defence (§2.9.3); the test in `voiceprints::tests` ships
+  with the store.
+
+**Asymmetric by design:** `T_accept` is tuned for a low false-accept rate
+(labelling a stranger as a known person), NOT at EER. Per the design
+(§2.4), the genuine 5th percentile sets `T_reject`; the impostor 99th
+percentile sets `T_accept`.
+
+**Assignment policy (WU5 — `orchestrator::matcher`).** Matching a set of fresh
+diarizer clusters against the stored gallery is a global assignment problem, not
+independent per-cluster thresholding. The algorithm in `orchestrator::matcher`:
+
+1. Scores every `(query_label, identity)` pair by the **maximum cosine over the
+   identity's gallery centroids** (§2.9.1 flat-gallery rule). Identity score =
+   `max` over its centroids, so a person with an in-person centroid and a Teams
+   centroid matches a query from either condition without a blurred-mean penalty.
+2. Sorts all `(query, identity, score)` candidates descending by score.
+3. Assigns greedily: a candidate is accepted only if (a) neither the query label
+   nor the identity has already been assigned, (b) the score is `>= T_reject`,
+   and (c) the score beats the **runner-up score for that query by at least
+   `MIN_MARGIN`** (placeholder `0.05`). The margin requirement prevents two
+   similarly-scored identities from both winning the same cluster.
+4. The winning score is classified into the `Accept` / `Uncertain` / `Reject`
+   band using the query-side noise guard: when the fresh cluster has fewer than
+   `NOISE_GUARD_MIN_WINDOWS` (placeholder `3`) clean windows, `T_ACCEPT_NOISY`
+   (placeholder `0.70`) is used instead of `T_ACCEPT`, so a noisy centroid cannot
+   auto-accept.
+
+**`orchestrator::matcher` is a pure function** (`assign_identities`): it takes
+`&[QueryCluster]` and `&[StoredVoiceprint]` and returns `Vec<AssignedMatch>` with
+no side effects, so it is unit-testable with no model and no Tauri runtime.
+Tests ship with the module covering: two-clusters-one-identity global assignment,
+margin drop, query-side noise guard, identity-score-is-max-over-gallery-centroids,
+and empty-input guards.
+
+**`apply_voiceprint_matches` wiring (WU5).** After a `reprocess` (user-triggered
+or post-stop background pass) completes, `ipc-bridge` calls
+`Orchestrator::apply_voiceprint_matches(meeting_id, store)` when
+`voiceprint_enrolment_enabled` is ON. This method:
+1. Reads the fresh transcript to collect the distinct diarizer labels.
+2. Loads the gallery via `VoiceprintStore::all(model_id)`.
+3. Extracts a centroid for each label using the same §2.3.1 cleanliness filter
+   and clock mapper as `enrol_voiceprint_claimed` (on `spawn_blocking`).
+4. Calls `assign_identities` with the extracted `QueryCluster`s and the gallery.
+5. **Accept-band matches**: writes the matched display names back into
+   `metadata.json`'s `speaker_names` (a second write on top of
+   `finalise_diarization`'s `speaker_names.clear()`). This is the §2.6 re-map:
+   clear-then-restore-matched.
+6. **Uncertain-band matches**: collected into a
+   `AppEvent::VoiceprintSuggestions` event emitted on the shared bus. The
+   webview presents the "is this \<Name\>?" affordance for each suggestion.
+   Confirming calls `set_speaker_name` (which triggers `enrol_voiceprint` for
+   refinement — §2.9.3 trigger (c)); dismissing calls `reject_match`.
+7. **Reject-band matches and extraction failures**: silently omitted — the label
+   keeps its bare diarizer letter.
+
+`apply_voiceprint_matches` is best-effort: errors are logged and the meeting is
+left with cleared names, never propagated. The offline claim is still held by the
+`reprocess` caller, so no concurrent op can clobber the second metadata write.
+
+**Correction path (`reject_match` — WU5).** `Orchestrator::reject_match`
+(called by `ipc-bridge::commands::reject_match`) handles the "this isn't them"
+case: (a) it clears `speaker_names[label]` for `meeting_id` (empty-name write),
+and (b) it drops the `(meeting_id, label)` contribution from `identity_id`'s
+gallery via `VoiceprintStore::forget_contribution` on every centroid that matches.
+`forget_contribution` recomputes the centroid cache from surviving contributions
+(the §2.9.1 invariant), making the correction irreversible only at the centroid
+level — the contribution row is gone, but the centroid is rebuilt from what remains.
+The method is idempotent when no matching contribution exists.
+
+**`clear_all_voiceprints` (§4 privacy).** `ipc-bridge::commands::clear_all_voiceprints`
+wraps `VoiceprintStore::clear_all()` — deletes every identity, centroid, and
+contribution row. This is the local right-to-erasure path; the E2E sync path must
+also purge replicas (a separate sync concern, not in scope here).
+
+**`AppEvent::VoiceprintSuggestions`.** Emitted by
+`Orchestrator::apply_voiceprint_matches` (via `finalise_diarization`'s sibling
+method) when uncertain-band matches exist. Carries a `Vec<VoiceprintSuggestion>`,
+each with the diarizer `label`, `display_name`, `identity_id`, `model_id` (needed
+for `reject_match`), and `similarity`. Rides the existing `AppEventPayload`
+newtype — no new event registration needed.
+
+**Enrolment-enabled gate (consent obligation — §4 obligation 1).** Enrolment,
+re-identification, and the prune-veto are all gated on
+`settings.voiceprint_enrolment_enabled` (default `false`). The default-OFF
+contract satisfies the collection-time consent obligation (BIPA / GDPR Art. 9):
+no voiceprint is created or stored for any speaker until the user has
+explicitly opted in. An older settings store written before the field existed
+deserialises to `false` via `#[serde(default)]`, so a database upgrade can
+never silently activate enrolment. When OFF, `speaker_names.clear()` runs as
+before (zero behaviour change for users who have never opted in). When ON, the
+reprocess re-map (§2.6) restores matched names instead of clearing them.
+
+**WU3 enrolment-on-rename flow.** When `voiceprint_enrolment_enabled` is ON and
+the user renames a speaker label in the UI, `ipc-bridge::set_speaker_name`
+calls `Orchestrator::enrol_voiceprint(meeting_id, label, name, &VoiceprintStore)`
+after the name write, best-effort (errors are logged and swallowed). The method
+takes an offline claim (§2.3 — see below) and, if the model is locally
+available, collects all *clean* segments for that label from the stored
+transcript (§2.3.1 cleanliness filter: `speaker_id == label`,
+`shared_speakers.is_empty()`, duration ≥ 1000 ms), reads the corresponding PCM
+windows, and hands them to `VoiceprintExtractor::centroid`, which produces a
+single CAM++ embedding. Depending on whether an identity already exists for
+the given `display_name + model_id`, the embedding is written via
+`VoiceprintStore::enrol` (first association) or `VoiceprintStore::refine`
+(confirmed subsequent association — §2.9.3). If the model is absent, or if
+the claim is busy, the call returns `Ok(None)` and logs at `debug`; the
+rename itself is never blocked.
+
+**WU3b refinement-on-confirm (§2.9.3).** A confirmed association routes to
+`VoiceprintStore::refine` instead of `enrol` when an identity already exists
+for the same `display_name + model_id`. "Confirmed" is exactly one of:
+(a) the user typed/assigned the name via the UI rename (the WU3 path);
+(b) an auto-accept match `sim >= T_accept` with the assignment margin AND the
+meeting is finalised (WU5 feeds this); (c) the user accepted an uncertain-band
+suggestion (WU5). **Unconfirmed/uncertain matches never refine** — this is the
+primary slow-poison defence. `VoiceprintStore::find_identity_by_name_and_model`
+performs the lookup; when it returns `Some(id)`, `refine` is called with the
+centroid vector and the clean-window count as the contribution weight.
+
+The same `spawn_blocking` + offline-claim path used for enrolment (§2.3) is
+reused unchanged: the flag, lock discipline, and clock hazards all apply. The
+contribution's weight (`count` = number of clean windows) is clamped by
+`REFINE_WEIGHT_CAP` inside `VoiceprintStore::refine` to bound a single
+meeting's influence on an established centroid. Because contributions are
+retained (§2.9.1 invariant), a later `reject_match` (WU5) can drop the
+contribution and recompute — refinement is reversible. `FOLD_GATE` and
+`REFINE_WEIGHT_CAP` remain placeholder constants (WU6 calibrates them).
+
+**WU4 reprocess re-map (§2.6 — ephemeral centroid + timeline-coherence).** The
+`reprocess` path (re-transcribe → diarize → finalise) clears `speaker_names` in
+`finalise_diarization` unconditionally. When `voiceprint_enrolment_enabled` is ON,
+two additional steps surround this:
+
+1. **Pre-snapshot** (`capture_reprocess_snapshot`): Before the re-transcribe step
+   overwrites `transcript.json`, `reprocess_claimed` and `reprocess_with_inputs_claimed`
+   capture the current `(speaker_names, segments)` as an optional snapshot. This is
+   the only point where the old named state and old segment timestamps coexist — the
+   re-transcribe that follows will overwrite both.
+
+2. **Post-finalise re-map** (`apply_ephemeral_remap`): After `finalise_diarization`
+   clears names, the snapshot is used to attempt name restoration for each fresh
+   diarizer label via two strategies in order:
+   - **Centroid matching** (model-dependent): extracts a centroid from the old named
+     label's clean segments and from the fresh label's clean segments (using the
+     same §2.3.1 filter and clock mapper), then runs `assign_identities` treating
+     the old labels' centroids as an ephemeral gallery. Accept-band matches restore
+     the name. Skipped gracefully when the embedding model is absent.
+   - **Timeline-coherence fallback** (model-free): computes the Jaccard temporal
+     overlap between the fresh label's merged speech intervals and each old named
+     label's merged speech intervals. If the overlap clears `TIMELINE_JACCARD_THRESHOLD`
+     (placeholder `0.50`, calibrated in WU6) and the match is unambiguous (no tie),
+     the name is restored. This path makes the re-map testable in the default suite
+     without any embedding model.
+
+The result is **clear-then-restore-matched**: `finalise_diarization` always clears
+(preserving the invariant for the OFF path and for any label with no match), and the
+re-map only restores names where a match is found. Unmatched fresh labels stay
+anonymous. The offline claim is still held throughout, so no concurrent op can race
+the second metadata write.
+
+`TIMELINE_JACCARD_THRESHOLD = 0.50` is a placeholder pending WU6 calibration. It is
+named as a constant (not a magic literal) so WU6 can swap the value at one call site.
+The standalone `rediarize` path (no re-transcribe) also runs the ephemeral re-map via
+`rediarize_inner_with_snapshot`, but reads the snapshot itself from disk at the top of
+the pass (before `run_diarization_blocking` overwrites `transcript.json`).
+
+**Clock-mapper reuse (§2.3 — binding).** Transcript `Segment::start_ms` /
+`end_ms` are on the **pause-EXCLUDING** clock (recording wall time minus all
+accumulated pause durations at that point). `read_audio_pcm` returns
+**pause-INCLUDING** PCM (raw device samples). `enrol_voiceprint_claimed` uses
+`runner::pcm_window_for_excluding_range` — the same mapper used by Phase 4
+re-ASR — to convert each clean segment's excluding-clock interval to the
+correct PCM byte range. The W1 clamping decision is inherited: a segment whose
+start falls inside a pause region is silently discarded (returns `None`), not
+panicked; the enrolment loop skips `None` windows.
+
+**Offline-claim discipline (§2.3 — binding).** `enrol_voiceprint` calls
+`Orchestrator::claim_offline` before touching the transcript or PCM, and
+releases the claim in a `Drop` guard on all exit paths. If the claim is
+unavailable (i.e., a `reprocess` pass is running), the enrolment returns
+`Ok(None)` immediately — it never blocks waiting for the lock. This prevents
+the enrolment from reading a partially-written transcript mid-reprocess.
+
+**Pure vector maths.** `common::voiceprint_math` holds the three dependency-free
+functions used by both `diarizer` and `persistence`: `unit_normalise`,
+`cosine_unit`, and `weighted_merge`. No new crate edge is introduced — both
+crates already depend on `common`.
+
+**WU7 — prune-veto (§2.5).** A low-share diarizer cluster that would normally
+be dropped by the share-floor or speaker-count cap is kept when the orchestrator
+determines it matches an enrolled voiceprint. The veto is computed entirely
+OUTSIDE the diarizer (the diarizer must not read the store — no
+`diarizer → persistence` edge is created); the orchestrator computes a verdict
+list and passes it in as `veto_ids: &[i32]`.
+
+**Orchestrator flow (inside `run_diarization_blocking`):**
+
+1. Before the split-backend enters, `compute_prune_veto_verdicts` identifies
+   low-share candidate clusters from the raw `SpeakerTurn` tally — clusters
+   whose total attributed duration is below `DiarizerConfig::min_cluster_share`
+   of the total speech AND which contribute at least `PRUNE_VETO_MIN_WINDOWS`
+   (= 3) complete 1.5 s audio windows (the same noise guard as WU5's
+   `NOISE_GUARD_MIN_WINDOWS`). For each such candidate it extracts a centroid via
+   `VoiceprintExtractor::centroid` and runs `matcher::assign_identities` against
+   the gallery. Clusters where the accept-band verdict fires (`sim >= T_accept`)
+   are returned as `Vec<(i32, String)>` (cluster id, matched display name).
+
+2. The `VoiceprintExtractor` is consumed (dropped) before `diarize_split_merge`
+   starts the Qwen split backend. Peak VRAM never includes both.
+
+3. `diarize_split_merge` extracts `veto_ids` from the verdict list and passes
+   them into `diarizer::overlay_speakers`. After the merge pass it resolves
+   vetoed cluster ids back to their first-seen letters via the returned
+   cluster→letter map and assembles `veto_names: Vec<(String, String)>`
+   (letter → matched display name).
+
+4. After `finalise_diarization` (which always clears `speaker_names`), the
+   veto names are written in a second metadata write — the same append-after
+   pattern `apply_voiceprint_matches` uses. The offline claim is held throughout,
+   so no concurrent op can race the second write.
+
+**Gallery loading.** `load_voiceprint_gallery` is a new async free function in
+the orchestrator that calls `VoiceprintStore::all(DIARIZE_EMB_MODEL_ID).await`
+and returns a `Vec<StoredVoiceprint>` (best-effort; empty on error). The
+`rediarize` public method accepts `voiceprint_store: Option<&persistence::VoiceprintStore>`,
+loads the gallery at the top of the call, and threads it down through the chain.
+Paths that have no access to the store (the `reprocess` path, stub/test paths)
+pass `None`; the prune-veto is then a no-op (empty veto_ids).
+
+**Extractor instantiation.** `build_prune_veto_extractor` is a new async method
+on `Orchestrator` that opens a `VoiceprintExtractor` from the embedding model
+path (resolved via `DIARIZE_EMB_MODEL_ID`). It is best-effort: it returns
+`None` on any failure. When `gallery` is empty (no enrolled speakers) or
+`voiceprint_enrolment_enabled` is OFF, the orchestrator skips the extractor call
+entirely and passes `None` to `run_diarization_blocking`.
+
+**Diarizer-side invariant (binding).** Vetoed clusters pass through
+`surviving_clusters` with two specific exemptions:
+- They are not subject to the share-floor or segment-count-floor check.
+- They are not subject to the `max_speakers` cap; the cap yields one slot to
+  each vetoed cluster by dropping the lowest-share non-vetoed cluster first.
+A vetoed cluster that would otherwise survive (share above the floor) is unaffected —
+the veto only matters at the boundary.
+
+**`PRUNE_VETO_MIN_WINDOWS: u64 = 3` (diarizer constant — placeholder).** Matches
+`matcher::NOISE_GUARD_MIN_WINDOWS`. Calibrated in WU6 alongside the acceptance
+thresholds.
+
+**Enrolment-enabled gate (inherited from §4).** The prune-veto path is gated on
+`settings.voiceprint_enrolment_enabled` (default `false`). When OFF, `gallery`
+is never loaded and the extractor is never opened; `veto_ids` is always `&[]`.
+
+**WU8 — identity management (issue #0003 §2.9.4, §4).** Five new IPC commands
+and two new `VoiceprintStore` methods complete the management surface:
+
+- `VoiceprintStore::rename_identity(id, new_name)` — renames in place; trims
+  whitespace; rejects blank name. Unit-tested in `persistence::voiceprints::tests`.
+- `VoiceprintStore::identities_with_gallery()` — management-UI query: returns
+  every identity with per-condition `CentroidSummary` (no embedding bytes). Used
+  by `list_voiceprints`; safe for IPC.
+- `list_voiceprints` IPC — serialised as `VoiceprintIdentityInfo[]` (camelCase
+  via `#[serde(rename_all = "camelCase")]`; `ipc-bridge`-local type, NOT in
+  `common`, to keep `persistence` specta-free).
+- `merge_voiceprint_identities` / `rename_voiceprint_identity` /
+  `delete_voiceprint_identity` / `forget_meeting_voiceprints` IPC — thin
+  delegates to the corresponding `VoiceprintStore` methods; all best-effort
+  (silent no-op when the store is degraded-to-off).
+- `forget_meeting_voiceprints` is the §4 per-meeting erasure path exposed as a
+  command. The binding obligation (calling it from `delete_meeting`) is a
+  follow-up; the command is wired and callable from the UI now.
+- UI: `VoiceprintPane` (React, `ui/src/shell/VoiceprintPane.tsx`) — lists
+  identities, rename, delete, clear-all, and a two-step "merge these two people"
+  flow with surviving-name choice. Rendered inside `SettingsDrawer`.
 
 ## Note image assets
 

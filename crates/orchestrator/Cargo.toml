@@ -91,3 +91,15 @@ required-features = ["test-source"]
 [[test]]
 name = "reprocess"
 required-features = ["test-source"]
+
+[[test]]
+name = "enrol_voiceprint"
+required-features = ["test-source"]
+
+[[test]]
+name = "voiceprint_reprocess_remap"
+required-features = ["test-source"]
+
+[[test]]
+name = "voiceprint_matching_stubs"
+required-features = ["test-source"]

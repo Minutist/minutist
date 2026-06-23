@@ -19,10 +19,15 @@ import {
   setSpeakerName,
   deleteMeeting,
   reprocess,
+  rejectMatch,
 } from "../ipc/meetings";
 import { setMeetingCollection } from "../ipc/collections";
 import type { MeetingListEntry, MeetingState } from "../ipc/meetings";
-import type { CollectionId, MeetingId } from "../ipc/bindings";
+import type {
+  CollectionId,
+  MeetingId,
+  VoiceprintSuggestion,
+} from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
 
 export type { MeetingListEntry, MeetingState };
@@ -79,6 +84,21 @@ export type MeetingsStore = {
    * claim. Resets any user-assigned speaker names (the diarize step re-letters).
    */
   reprocess: (meetingId: MeetingId) => Promise<void>;
+  /**
+   * Pending uncertain-band voiceprint suggestions for the open meeting, keyed
+   * by `label`. Set when `AppEvent::VoiceprintSuggestions` arrives; cleared
+   * when the user confirms or dismisses each suggestion, or when the open
+   * meeting changes.
+   */
+  voiceprintSuggestions: VoiceprintSuggestion[];
+  /**
+   * Dismiss a voiceprint suggestion (without accepting the name) and call
+   * `reject_match` to drop that meeting/label contribution from the library.
+   * Best-effort: errors are logged, not surfaced to the user.
+   */
+  dismissVoiceprintSuggestion: (
+    suggestion: VoiceprintSuggestion,
+  ) => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -95,6 +115,7 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   lastError: null,
   reprocessingId: null,
   reprocessStartedMs: null,
+  voiceprintSuggestions: [],
 
   refresh: async () => {
     set({ loading: true });
@@ -115,7 +136,7 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   },
 
   open: async (meetingId) => {
-    set({ loading: true });
+    set({ loading: true, voiceprintSuggestions: [] });
     try {
       const state = await openMeeting(meetingId);
       set({
@@ -130,7 +151,7 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   },
 
   close: () => {
-    set({ openMeetingId: null, openMeetingState: null });
+    set({ openMeetingId: null, openMeetingState: null, voiceprintSuggestions: [] });
   },
 
   rename: async (meetingId, title) => {
@@ -205,6 +226,25 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
     }
   },
 
+  dismissVoiceprintSuggestion: async (suggestion) => {
+    const { openMeetingId } = get();
+    if (openMeetingId === null) return;
+    // Drop the suggestion immediately so the UI clears without waiting for the
+    // IPC round-trip.
+    set((s) => ({
+      voiceprintSuggestions: s.voiceprintSuggestions.filter(
+        (x) => !(x.label === suggestion.label && x.identity_id === suggestion.identity_id),
+      ),
+    }));
+    try {
+      await rejectMatch(openMeetingId, suggestion.label, suggestion.identity_id, suggestion.model_id);
+    } catch (err) {
+      // Best-effort: log but do not surface to the user (the suggestion is
+      // already gone from the UI; the backend may retry on next reprocess).
+      console.error("rejectMatch failed", err);
+    }
+  },
+
   handleEvent: (event) => {
     if (event.kind === "meeting_finalised") {
       // A just-stopped meeting finished finalising on disk. Stay on it: OPEN the
@@ -229,6 +269,15 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
       // list so the row shows the blurb without a manual reload. (The summary
       // PANE re-read is the summary store's job; this only touches the list.)
       void get().refresh();
+      return;
+    }
+    if (event.kind === "voiceprint_suggestions") {
+      // The matcher found uncertain-band hits for the open meeting. Only act if
+      // the event targets the currently open meeting — an event for a background
+      // meeting should not clobber the open view.
+      if (get().openMeetingId === event.meeting_id) {
+        set({ voiceprintSuggestions: event.suggestions });
+      }
       return;
     }
     if (event.kind !== "diarization_complete" && event.kind !== "transcript_ready")

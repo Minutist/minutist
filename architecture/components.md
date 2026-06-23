@@ -460,6 +460,50 @@ derived mirror for filtered listing. Collection *definitions* live in
 `{app-data}/collections.json`, owned by `persistence` (see below) — never in
 `index.db`, which is a wiped-and-rebuilt cache.
 
+**Voiceprint identity types (issue #0003 — WU0, one-way door).** Two UUID
+newtypes that mirror `MeetingId` exactly (same derive set, `#[serde(transparent)]`,
+`cfg_attr` specta, inner `#[specta(type = String)]` field):
+
+- `VoiceprintIdentityId` — the stable primary key for a speaker identity in
+  `{app-data}/voiceprints.db` (`voiceprint_identity` table, owned by
+  `persistence`). Survives renames and merges. Never placed on `Segment`; the
+  diarizer-label-to-name overlay at read time uses display names, not this id.
+- `VoiceprintCentroidId` — the primary key for one acquisition-condition
+  gallery entry within an identity (`voiceprint_centroid` table). One identity
+  holds several centroid entries — one per distinct recording condition (e.g.
+  in-person room mic vs VoIP). Matching runs over the flattened gallery: an
+  identity's score against a query is the maximum cosine over its centroids.
+
+Adding these types is a **one-way-door** architecture-owner change per
+`domain-ownership.md` — Parallel-work rules §2. The dependency table at the
+top of this file is **unchanged**: both `diarizer` and `persistence` already
+depend on `common`, and neither gains a new edge here.
+
+**`voiceprint_math` module (issue #0003 — WU0).** A new
+`pub mod voiceprint_math` in `common` exposes three pure, FFI-free functions:
+
+- `unit_normalise(v: &mut [f32])` — L2-normalise in place; no-op on a zero or
+  non-finite-norm vector (cosine undefined there).
+- `cosine_unit(a: &[f32], b: &[f32]) -> f32` — dot product of two already-unit
+  vectors; reduces to plain dot because `||a|| = ||b|| = 1`.
+- `weighted_merge(centroids: &[(&[f32], u64)]) -> Vec<f32>` — count-weighted
+  mean of N established centroids, then L2-normalised. This is the merge of
+  established means with different observation counts, **not** the Welford
+  one-observation running-mean (`c += (u - c) / (n + 1)`) used by
+  `OnlineClusterer::update_centroid`. Confusing the two produces incorrect
+  centroid caches; the distinction is documented in the module docstring.
+
+`diarizer` uses `unit_normalise` + `cosine_unit` when building per-cluster
+centroids from re-embedded audio windows. `persistence::VoiceprintStore` uses
+`unit_normalise` + `weighted_merge` when folding or recomputing the cached
+`voiceprint_centroid.embedding` after a contribution change. Because both
+crates already depend on `common`, hosting the maths here adds **no new
+dependency-table edge**.
+
+The `cos > 0.999` centroid-aligns-with-sample-mean discipline from
+`diarizer::online::clusterer` is retargeted at this module via unit tests in
+`voiceprint_math::tests`.
+
 **Stable surface — locked.** The trait signatures and event variants in
 this crate are the architectural contract that sub-agents implement
 against in parallel. Changes here ripple to every other crate and
@@ -897,6 +941,84 @@ rejection); the env-var-gated `tests/online_embedding.rs`
 runs `assign_segment` over committed real-speech fixtures, asserting distinct
 sticky labels for two speakers, label reuse on a speaker's repeat, one label for
 the single-speaker control, and `InvalidInput` for a non-16 kHz or empty buffer.
+
+**WU1 — voiceprint centroid surface (#0003).** The crate also exposes:
+
+- `pub struct Voiceprint { pub vector: Vec<f32> }` — a unit-length speaker
+  embedding centroid. Methods: `dim() -> usize` (vector length) and
+  `cosine(&Voiceprint) -> f32` (delegates to
+  `common::voiceprint_math::cosine_unit`). Diarizer-public, deliberately NOT
+  in `common` (mirrors `SpeakerTurn`).
+- `pub struct VoiceprintExtractor` — stateless extractor wrapping a
+  `Mutex<EmbeddingExtractor>`. Methods:
+  - `open(embedding_path: &Path) -> AppResult<Self>` — mirrors
+    `OnlineDiarizer::open` exactly: same `ExtractorConfig` build + same
+    `Error::ModelLoad` mapping.
+  - `embed(samples: &[f32], sr: u32) -> AppResult<Vec<f32>>` — rejects
+    `sr != 16000` (`InvalidInput`), rejects empty input, extracts one raw
+    192-D embedding via `compute_speaker_embedding`.
+  - `centroid(windows: &[&[f32]], sr: u32) -> AppResult<Voiceprint>` —
+    embeds each window, unit-normalises each result, then calls
+    `common::voiceprint_math::weighted_merge` (equal weights of 1) and
+    wraps the output as `Voiceprint`. This matches the `OnlineClusterer`
+    running-mean-of-unit-vectors rule exactly, so voiceprints are comparable
+    with online-clusterer centroids via cosine.
+
+The centroid math that was previously duplicated in
+`online/clusterer.rs` (`unit_normalise`, `cosine_unit_vs_centroid`) now
+delegates to `common::voiceprint_math` — ONE proven implementation. The
+Welford running-mean (`update_centroid`) stays diarizer-private and
+unchanged.
+
+No new crate-dependency edge: `common` is already a `diarizer` dependency.
+The orchestrator resolves the embedding model via `DIARIZE_EMB_MODEL_ID` +
+`find_file_in_dir(|name| name.ends_with(".onnx"))` for both the offline
+diarizer and any `VoiceprintExtractor` it opens — the model-resolution
+convergence guard test in `orchestrator/src/runner.rs` asserts this
+predicate is identical, so a future edit cannot silently place
+`VoiceprintExtractor` in a different embedding space than the diarizer.
+
+Tests: `src/lib.rs` default suite covers `Voiceprint::cosine` (self → 1,
+orthogonal → 0) and `voiceprint_centroid_cos_with_own_sample_gt_0999`
+(near-identical windows → centroid within 0.001 of each sample) and
+`voiceprint_centroid_aligns_with_plain_mean` (varied windows → centroid
+aligns with the unit-normalised plain mean, cos > 0.999). No model required.
+
+**WU7 — prune-veto (#0003, §2.5).** `overlay_speakers` and its internal helper
+`surviving_clusters` accept a fourth argument `veto_ids: &[i32]`. A cluster id in
+this slice is exempt from the share-floor prune AND from the `max_speakers` cap;
+the veto takes priority over both. When `veto_ids` is empty (the default) the
+behaviour is identical to the pre-WU7 code.
+
+Public-signature change:
+
+```
+pub fn overlay_speakers(
+    turns: &[SpeakerTurn],
+    segments: Vec<Segment>,
+    config: &DiarizerConfig,
+    veto_ids: &[i32],               // NEW — pass &[] for no veto
+) -> (Vec<Segment>, u32, Vec<(i32, String)>)
+```
+
+`surviving_clusters` (private) gains the same `veto_ids: &[i32]` parameter.
+`assign_speakers` (the one-shot `Diarizer` impl entry point) passes `&[]`
+internally — the veto is only exercised when the orchestrator calls
+`overlay_speakers` directly with a populated list.
+
+New constant: `pub const PRUNE_VETO_MIN_WINDOWS: u64 = 3` — the minimum number
+of 1.5 s audio windows a low-share candidate cluster must contribute before the
+orchestrator will attempt to embed it and check it against the gallery. Mirrors
+`matcher::NOISE_GUARD_MIN_WINDOWS`. Value is a placeholder; WU6 calibrates.
+
+No new dependency-table edge: `overlay_speakers` and `surviving_clusters` are
+pure logic consuming only the types already in scope.
+
+Tests (model-free): `prune_veto_keeps_low_share_enrolled_cluster` (veto cluster
+survives the share-floor), `prune_veto_non_enrolled_cluster_still_pruned` (vetoed
+cluster kept; adjacent non-vetoed cluster still pruned), and
+`prune_veto_exempt_from_cap` (vetoed cluster survives even when cap would exclude
+it, displacing the non-vetoed lowest-share cluster instead).
 
 ### `summariser`
 **Crate:** `crates/summariser`
@@ -1480,6 +1602,85 @@ site that replaces all segments. Re-diarize does NOT call `write_transcript`
 re-diarization. No new dependency edge — `persistence` still depends only on
 `common`.
 
+**Voiceprint library — `VoiceprintStore` + `voiceprints.db` (issue #0003, WU2).**
+`crates/persistence/src/voiceprints.rs` and `crates/persistence/src/voiceprints_migrations.rs`.
+
+`VoiceprintStore` is backed by a separate durable libsql database
+`{app-data}/voiceprints.db` (see `cross-cutting.md` — "Voiceprint matching" and
+"Filesystem layout"). Open via `VoiceprintStore::open(db_path)`, which runs the
+forward-only migration runner (`voiceprints_migrations::run`) before any query.
+A migration or open error is returned as `Error`; the caller maps it to
+enrolment-OFF (the corruption degrade-to-off contract).
+
+**Three-table schema (§2.9.1):**
+- `voiceprint_identity` — one row per enrolled speaker; stable across renames
+  and merges. Columns: `id` (VoiceprintIdentityId), `display_name`, `model_id`,
+  timestamps.
+- `voiceprint_centroid` — one acquisition-condition gallery entry per identity.
+  `embedding` is a cached `f32` LE blob: `unit_normalise(Σ count_i · contribution_i.embedding / Σ count_i)`.
+  `sample_count = Σ count_i`. `ON DELETE CASCADE` from identity.
+- `voiceprint_contribution` — one `(meeting_id, label)` that fed a centroid.
+  Retains the per-contribution centroid vector so the gallery centroid is
+  recomputable (and refinement reversible) by dropping contributions and calling
+  `weighted_merge` over survivors. `ON DELETE CASCADE` from centroid.
+
+**Invariant.** Any operation changing a centroid's contribution set MUST call the
+private `recompute_centroid` helper in the same transaction — `weighted_merge`
+over the surviving contributions, then update `embedding` and `sample_count`.
+
+**Public surface:**
+- `enrol(name, embedding, dim, model_id, source_meeting, label) -> AppResult<VoiceprintIdentityId>` —
+  create identity + first centroid + first contribution (the unit-normalised
+  `embedding`).
+- `refine(identity_id, contribution, count, model_id, meeting_id, label) -> AppResult<()>` —
+  (§2.9.3) rejects on `model_id` mismatch; finds the nearest gallery centroid by
+  cosine; folds if `sim >= FOLD_GATE`, else adds a new condition centroid;
+  cap-and-merges if the gallery exceeds `GALLERY_CAP = 4`; clamps `count` to
+  `min(count, existing_sample_count × REFINE_WEIGHT_CAP)` (bounded-weight poison
+  defence — §2.9.3).
+- `merge_identities(keep_id, merged_id) -> AppResult<()>` — re-homes centroids +
+  contributions from `merged_id` to `keep_id`, cap-and-merges `keep_id`, deletes
+  `merged_id`.
+- `rename_identity(id, new_name) -> AppResult<()>` — update `display_name` in
+  place; trims whitespace and rejects an empty result (WU8).
+- `delete_identity(id)`, `clear_all()`.
+- `forget_meeting(meeting_id) -> AppResult<()>` — drops every contribution whose
+  `meeting_id` matches, recomputes affected centroids, drops zero-contribution
+  centroids and zero-centroid identities (§4 meeting-granularity erasure).
+- `find_identity_by_name_and_model(display_name, model_id) -> AppResult<Option<VoiceprintIdentityId>>` —
+  exact-match lookup by `display_name + model_id`; used by the orchestrator to
+  decide enrol (first association) vs refine (confirmed subsequent association,
+  §2.9.3). Returns `None` when no such identity exists.
+- `all(model_id) -> AppResult<Vec<StoredVoiceprint>>` — flattened gallery for
+  `model_id`; returns zero rows for a foreign `model_id` (hard-invalidation —
+  caller surfaces "N voiceprints from a previous model").
+- `identities_with_gallery() -> AppResult<Vec<IdentityWithGallery>>` — every
+  identity with per-condition centroid summaries (`CentroidSummary`: centroid_id,
+  sample_count, condition_label — no embedding vector). Returns all identities
+  regardless of model_id. Used by the management UI; safe for IPC (no embedding
+  bytes — §2.2). Added WU8.
+
+**`StoredVoiceprint` POD** — owned by `persistence`; `embedding` bytes never cross
+IPC (they stay out of `common`/specta).
+
+**`IdentityWithGallery` + `CentroidSummary` PODs (WU8)** — management-UI query
+result; embedding-free, safe for IPC. `IdentityWithGallery` holds `identity_id`,
+`display_name`, `model_id`, and a `Vec<CentroidSummary>`.
+
+**Path helper:**
+- `voiceprints_db_path(app_data_root: &Path) -> PathBuf` — mirrors `index_db_path`;
+  `app-main` uses this when constructing the effective path after `resolve_data_roots`.
+
+**Threshold constants** (placeholders — calibrated by WU6): `FOLD_GATE = 0.70`,
+`GALLERY_CAP = 4`, `REFINE_WEIGHT_CAP = 0.30`.
+
+No new cross-component dependency edge — `persistence` depends on `common` for
+`voiceprint_math::weighted_merge` / `unit_normalise` / `cosine_unit`, which was
+already a permitted edge. The `uuid` workspace dep is added to `persistence/Cargo.toml`
+for generating contribution-row primary keys (plain `TEXT PRIMARY KEY`, no typed
+newtype); `uuid` is a third-party dep, not a crate-to-crate edge, so the
+dependency table above is unchanged.
+
 ### `orchestrator`
 **Crate:** `crates/orchestrator`
 **Owns:** the live recording state machine. Wires `audio-capture →
@@ -1815,6 +2016,60 @@ no second write). A (re-)diarization pass can re-letter speakers, so a
 user-set name map keyed on the OLD letters would silently mis-label; clearing is
 the only safe cross-consumer behaviour (an MCP client cannot re-map the way the
 UI could). See `cross-cutting.md` "Agent chat loop".
+
+**Issue #0003 WU3 — `Orchestrator::enrol_voiceprint(meeting_id, label, name,
+&VoiceprintStore) -> AppResult<Option<VoiceprintIdentityId>>`.** Enrols a
+speaker voiceprint from a finished meeting. Called by `ipc-bridge::set_speaker_name`
+after a successful name write, when `settings.voiceprint_enrolment_enabled` is
+true, with the shared `IpcState::voiceprints` store passed through.
+
+- **Lock discipline.** Takes the per-meeting offline claim
+  (`claim_offline`/`release_offline`) for the duration, so a concurrent
+  `reprocess` cannot rewrite `transcript.json` mid-enrolment. If the claim is
+  unavailable (a reprocess is in progress), enrolment returns `Ok(None)` (best-effort
+  skip) rather than blocking the rename — the rename itself always succeeds.
+- **Clock mapper.** Segment `start_ms`/`end_ms` are on the pause-EXCLUDING
+  transcript clock; `read_audio_pcm` returns pause-INCLUDING PCM.
+  `runner::pcm_window_for_excluding_range` (now `pub(crate)`, also used by the
+  #0015-phase-4 re-ASR split and `transcribe_pcm_window`) translates each clean
+  segment to the correct PCM slice. The W1 clamping decision applies: a segment
+  spanning a pause is clamped to the kept region that contains its start.
+- **Cleanliness filter (§2.3.1).** Only segments with `speaker_id == label`,
+  empty `shared_speakers`, and duration ≥ 1.0 s are used. If no clean segment
+  clears the minimum, enrolment is skipped (`Ok(None)`) — never forced.
+- **Model resolution.** Resolves the embedding ONNX via the same
+  `DIARIZE_EMB_MODEL_ID` / local-only `Available`-check as
+  `build_online_diarizer` (no download). Returns `Ok(None)` if the model is
+  absent (the diarizer models may not yet be downloaded on first use of the flag).
+- **No new dependency edge.** The orchestrator already depends on
+  `diarizer` + `persistence`. `ipc-bridge` already depends on both (via
+  `orchestrator` + `persistence` direct). The `VoiceprintStore` is passed in by
+  `ipc-bridge` so there is no `orchestrator → ipc-bridge` edge.
+
+**Issue #0003 WU3b — refinement-on-confirm wiring inside `enrol_voiceprint_claimed`.**
+After building the centroid, the method calls
+`VoiceprintStore::find_identity_by_name_and_model(name, model_id)` to check for an
+existing identity:
+
+- **None returned (first confirmed association):** calls `VoiceprintStore::enrol` to
+  create a new identity + centroid + contribution row, as before.
+- **Some(id) returned (subsequent confirmed association):** calls `VoiceprintStore::refine`
+  with `(id, centroid.vector, window_count, model_id, meeting_id, label)`. The
+  `window_count` (number of clean PCM windows used to build the centroid) is the
+  contribution weight. `refine` applies `REFINE_WEIGHT_CAP` internally; the
+  orchestrator passes the raw count.
+
+The spawn_blocking return type was widened from `Option<Voiceprint>` to
+`Option<(Voiceprint, u64)>` (centroid + window count) to carry the count through
+to the async store call. All other lock-discipline, clock-mapper, and
+cleanliness-filter behaviour is unchanged from WU3.
+
+**Confirmation gate (§2.9.3 — binding).** The UI rename path (WU3) is always a
+confirmed association: typing a name is trigger (a). Unconfirmed or uncertain-band
+matches (WU5, not yet wired) must NOT call `enrol_voiceprint` — they must wait
+for the explicit confirmation path before the centroid is folded. This is the
+primary slow-poison defence; the gating is in `ipc-bridge` (only `set_speaker_name`
+triggers enrolment), not in the orchestrator.
 
 ### `agent-tools`
 **Crate:** `crates/agent-tools` (Phase 9)
@@ -2661,6 +2916,15 @@ no audio. The webview's optimistic `preparing` flag clears on this event.
   updated map so the webview re-renders the transcript overlay without a
   reload. The same write is also reachable as the `set_speaker_name` agent
   tool; this is its direct UI path. Label + name capped at 512 chars.
+  **Issue #0003 WU3 (enrolment-on-rename):** after the name write, when
+  `settings.voiceprint_enrolment_enabled` is `true` AND a live
+  `VoiceprintStore` is on `IpcState::voiceprints`, the handler calls
+  `Orchestrator::enrol_voiceprint(meeting_id, label, name, store)`.
+  Enrolment errors are logged and swallowed so a rename never fails because
+  of an enrolment problem. The MCP/agent-tools `set_speaker_name` tool does
+  NOT enrol (it has no audio/diarizer access — accepted path asymmetry per
+  §2.3). No new dependency edge: `ipc-bridge → orchestrator` and
+  `ipc-bridge → persistence` already exist.
 - **Collections ("folders"), five commands.** `list_collections() ->
   Vec<Collection>`, `create_collection(name) -> Collection`,
   `rename_collection(collection_id, name) -> ()`,
@@ -2701,6 +2965,16 @@ acquire a direct `persistence` dependency. That helper drives libsql's async
 no-`block_on` rule binds command handlers, not bootstrap). `MeetingListEntry` /
 `MeetingState` are the canonical `common` types (Phase-4 precursors), so the
 generated bindings consume them directly with no mirror.
+
+**Issue #0003 WU3 — `IpcState::voiceprints: Arc<Option<VoiceprintStore>>`.** The
+voiceprint library handle, mirroring `IpcState::index` — an already-open handle
+shared via `Arc`. Opened at startup by the `ipc_bridge::open_voiceprints` helper
+(same `block_on` pattern as `open_meeting_index`), which resolves `voiceprints.db`
+via `persistence::voiceprints_db_path`. On any open or migration error the helper
+logs and returns `Arc::new(None)` (corruption-degrade-to-OFF contract — see
+`cross-cutting.md` "Voiceprint matching"). `set_speaker_name` checks the `Option`
+and skips enrolment when `None`. No new dependency edge: `ipc-bridge` already
+depends on `persistence`.
 
 **Phase 5 additions (20 commands total) — summary surface + the `summariser`
 edge (FR-30).** The Phase-4 `re_summarise` stub is **removed** and three real
@@ -2823,7 +3097,7 @@ omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
 `chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
 per-session cancel flags `cancel_chat_turn` raises, P1).
 
-The command ledger is now **42** (P6 21 + the four P9 chat commands = 25; P10's
+The command ledger is now **53** (P6 21 + the four P9 chat commands = 25; P10's
 `get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27;
 `prewarm_asr` = 28; `save_note_image` = 29; `set_speaker_name` = 30;
 `translate_meeting` + `get_translations` = 32; `get_diagnostic_report` = 33; the
@@ -2832,7 +3106,41 @@ WS4-A S5b tunnel surface's `tunnel_begin_pairing` + `tunnel_poll_pairing` +
 `set_connector_enabled` + `tunnel_status` = 39; #0015 merges `re_transcribe` +
 `rediarize_meeting` into `reprocess` (39 − 2 + 1 = 38); the Attachments WS's
 `add_attachment` + `list_attachments` + `open_attachment` + `remove_attachment`
-= 42), asserted by the `bindings_builder_registers_expected_command_ledger` test.
+= 42; the WS4-B S5 sync surface `sync_status` + `sync_get_my_ticket` +
+`sync_add_peer` + `sync_now` = 46; #0003 WU5 adds `reject_match` +
+`clear_all_voiceprints` = 48; #0003 WU8 adds `list_voiceprints` +
+`merge_voiceprint_identities` + `rename_voiceprint_identity` +
+`delete_voiceprint_identity` + `forget_meeting_voiceprints` = 53), asserted by
+the `bindings_builder_registers_expected_command_ledger` test.
+
+**Issue #0003 WU8 — identity management commands (53 commands total).**
+
+- `list_voiceprints() -> Vec<VoiceprintIdentityInfo>` — every enrolled identity
+  with per-condition gallery metadata; no embedding bytes (§2.2). Returns all
+  identities regardless of `model_id` (so the management UI can show and delete
+  stale identities from previous models). Silently returns `[]` when the store is
+  degraded-to-off.
+- `merge_voiceprint_identities(keep_id, merged_id) -> ()` — delegate to
+  `VoiceprintStore::merge_identities`. Caller UI must rename `keep_id` first if
+  the surviving name should differ; the IPC layer does not re-order the steps.
+- `rename_voiceprint_identity(identity_id, new_name) -> ()` — delegate to
+  `VoiceprintStore::rename_identity`. Trims whitespace; rejects blank name.
+- `delete_voiceprint_identity(identity_id) -> ()` — delegate to
+  `VoiceprintStore::delete_identity`. Cascades to all centroids + contributions.
+- `forget_meeting_voiceprints(meeting_id) -> ()` — delegate to
+  `VoiceprintStore::forget_meeting`. Must be called by `delete_meeting` (or any
+  path that removes a meeting) so biometric data does not outlive the audio that
+  generated it. Currently exposed as a standalone command so the UI / tests can
+  drive it; wiring into `delete_meeting` is a follow-up (#0003 §4 — the
+  "library-scoped erasure" obligation).
+
+**`VoiceprintIdentityInfo` + `CentroidInfo` specta types (WU8, `commands.rs`).**
+These are `ipc-bridge`-local types (not in `common`) because they carry only
+metadata — no embedding bytes. Both derive `serde::Serialize`, `serde::Deserialize`,
+`specta::Type`, and use `#[serde(rename_all = "camelCase")]` for the TypeScript
+surface. They are NOT added to `common` (the embedding-free PODs
+`IdentityWithGallery`/`CentroidSummary` live in `persistence`; the specta-typed
+IPC mirror lives here to keep `persistence` specta-free).
 
 **Connected-tier tunnel surface (`tunnel_begin_pairing` / `tunnel_poll_pairing` /
 `set_connector_enabled` / `tunnel_status`, WS4-A S5b).** The webview drives device

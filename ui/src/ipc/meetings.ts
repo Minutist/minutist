@@ -88,3 +88,18 @@ export async function deleteMeeting(meetingId: MeetingId): Promise<void> {
 export async function reprocess(meetingId: MeetingId): Promise<void> {
   unwrap(await commands.reprocess(meetingId));
 }
+
+/**
+ * Voiceprint correction path (#0003 §2.4): clear the uncertain-band
+ * auto-assigned name for `label` on `meetingId` and remove that
+ * meeting/label's embedding contribution from the identity's gallery so it
+ * does not bias future identifications.
+ */
+export async function rejectMatch(
+  meetingId: MeetingId,
+  label: string,
+  identityId: string,
+  modelId: string,
+): Promise<void> {
+  unwrap(await commands.rejectMatch(meetingId, label, identityId, modelId));
+}

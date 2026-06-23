@@ -6238,6 +6238,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "yrs",
 ]
 

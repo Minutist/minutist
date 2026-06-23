@@ -62,6 +62,8 @@ pub mod meeting_ops;
 pub mod metadata;
 pub mod migrations;
 pub mod notes;
+pub mod voiceprints;
+pub mod voiceprints_migrations;
 pub mod opus_encoder;
 pub mod reader;
 pub mod summary;
@@ -91,6 +93,7 @@ pub use reader::{
 pub use summary::{read_summary, summary_blurb, write_summary};
 pub use transcript::{write_transcript, TranscriptWriter};
 pub use translations::{clear_translations, merge_translations, read_translations};
+pub use voiceprints::{voiceprints_db_path, StoredVoiceprint, VoiceprintStore};
 pub use writer::MeetingWriter;
 
 #[cfg(test)]

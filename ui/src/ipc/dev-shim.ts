@@ -37,6 +37,7 @@ import type {
   Collection,
   CollectionId,
   SyncStatus,
+  VoiceprintIdentityId,
 } from "./bindings";
 import type { MeetingListEntry, MeetingState } from "./meetings";
 
@@ -744,6 +745,19 @@ export const devCommands = {
     return ok(null);
   },
   async syncNow(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  // Issue #0003 voiceprint correction / erasure paths. No-ops in the dev shim:
+  // the voiceprint store is not open (enrolment OFF) in `vite dev`.
+  async rejectMatch(
+    _meetingId: MeetingId,
+    _label: string,
+    _identityId: VoiceprintIdentityId,
+    _modelId: string,
+  ): Promise<Result<null, IpcError>> {
+    return ok(null);
+  },
+  async clearAllVoiceprints(): Promise<Result<null, IpcError>> {
     return ok(null);
   },
 };

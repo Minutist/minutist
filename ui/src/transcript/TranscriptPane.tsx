@@ -326,6 +326,51 @@ function SpeakerChip({
   );
 }
 
+/**
+ * Banner that surfaces uncertain-band voiceprint matches as "Is this
+ * \<Name\>?" prompts (#0003 §2.4). Shown only when the matcher places a
+ * speaker in the uncertain band (T_reject <= sim < T_accept).
+ *
+ * Accepting a suggestion writes the name via `setSpeakerName` (same path
+ * as the speaker chip rename). Dismissing calls `dismissVoiceprintSuggestion`
+ * which calls `reject_match` on the backend to drop that meeting/label
+ * contribution from the identity's gallery.
+ */
+function VoiceprintSuggestionBanner() {
+  const suggestions = useMeetingsStore((s) => s.voiceprintSuggestions);
+  const setSpeakerName = useMeetingsStore((s) => s.setSpeakerName);
+  const dismissVoiceprintSuggestion = useMeetingsStore(
+    (s) => s.dismissVoiceprintSuggestion,
+  );
+  if (suggestions.length === 0) return null;
+  return (
+    <ul className="transcript-pane__vp-suggestions" aria-label="Speaker identification suggestions">
+      {suggestions.map((s) => (
+        <li key={`${s.label}-${s.identity_id}`} className="transcript-pane__vp-suggestion">
+          <span className="transcript-pane__vp-question">
+            Is Speaker {s.label}{" "}
+            <strong>{s.display_name}</strong>?
+          </span>
+          <button
+            type="button"
+            className="transcript-pane__vp-btn transcript-pane__vp-btn--accept"
+            onClick={() => void setSpeakerName(s.label, s.display_name)}
+          >
+            Yes
+          </button>
+          <button
+            type="button"
+            className="transcript-pane__vp-btn transcript-pane__vp-btn--dismiss"
+            onClick={() => void dismissVoiceprintSuggestion(s)}
+          >
+            No
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function formatTimestamp(start_ms: number): string {
   const totalCentiseconds = Math.floor(start_ms / 10);
   const cs = totalCentiseconds % 100;
@@ -412,6 +457,7 @@ export function TranscriptPane() {
   return (
     <div className="transcript-pane">
       <TranscriptToolbar />
+      <VoiceprintSuggestionBanner />
       <div
         className="transcript-pane__scroll"
         ref={scrollRef}

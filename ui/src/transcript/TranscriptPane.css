@@ -345,3 +345,50 @@
 .transcript-pane__row:last-child .transcript-pane__timestamp {
   color: var(--accent);
 }
+
+/* ── Voiceprint suggestion banner (#0003 §2.4) ─────────────────────────────
+   Shown between the toolbar and the transcript scroll area when the matcher
+   places one or more speakers in the uncertain band. Each row is one
+   "Is Speaker X <Name>?" prompt with Yes / No buttons.
+*/
+.transcript-pane__vp-suggestions {
+  list-style: none;
+  margin: 0;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid var(--rule);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.transcript-pane__vp-suggestion {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--ink-2, var(--ink));
+}
+
+.transcript-pane__vp-question {
+  flex: 1;
+}
+
+.transcript-pane__vp-btn {
+  padding: 0.15rem 0.55rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--rule);
+  background: var(--sheet);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.transcript-pane__vp-btn:hover:not(:disabled) {
+  background: var(--hover, color-mix(in srgb, var(--accent) 12%, var(--sheet)));
+}
+
+.transcript-pane__vp-btn--accept {
+  border-color: var(--accent);
+  color: var(--accent);
+}

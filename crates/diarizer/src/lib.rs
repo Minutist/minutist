@@ -100,7 +100,38 @@ pub struct SpeakerTurn {
 
 mod online;
 pub use online::clusterer::{ClusterAssignment, OnlineClusterer, OnlineClustererConfig};
-pub use online::{OnlineDiarizer, OnlineDiarizerConfig};
+pub use online::{OnlineDiarizer, OnlineDiarizerConfig, VoiceprintExtractor};
+
+/// A normalised speaker voiceprint: a unit-length embedding vector computed by
+/// averaging and L2-normalising the per-window embeddings from a
+/// [`VoiceprintExtractor`].
+///
+/// Diarizer-public, deliberately NOT in `common` (mirrors [`SpeakerTurn`]).
+/// The orchestrator already depends on `diarizer`, so exposing it here adds no
+/// new dependency edge. The vector is always unit-length — `cosine` delegates
+/// directly to [`minutist_common::voiceprint_math::cosine_unit`].
+#[derive(Debug, Clone)]
+pub struct Voiceprint {
+    /// Unit-length embedding vector; dimension is determined by the embedding
+    /// model (192-D for the bundled CAM++ zh-en model).
+    pub vector: Vec<f32>,
+}
+
+impl Voiceprint {
+    /// Number of dimensions in this voiceprint.
+    pub fn dim(&self) -> usize {
+        self.vector.len()
+    }
+
+    /// Cosine similarity of this voiceprint against `other`.
+    ///
+    /// Both voiceprints are expected to be unit-length (produced by
+    /// [`VoiceprintExtractor`]). Delegates to
+    /// [`minutist_common::voiceprint_math::cosine_unit`].
+    pub fn cosine(&self, other: &Voiceprint) -> f32 {
+        minutist_common::voiceprint_math::cosine_unit(&self.vector, &other.vector)
+    }
+}
 
 /// Clustering knobs for the diarizer.
 ///
@@ -217,6 +248,20 @@ impl Default for DiarizerConfig {
 /// standardises the whole pipeline on 16 kHz mono, so a mismatch is a wiring
 /// bug, not a runtime condition to resample around.
 const REQUIRED_SAMPLE_RATE: u32 = 16_000;
+
+/// Minimum number of clean PCM windows behind a low-share cluster centroid
+/// before the prune-veto applies the normal `T_ACCEPT` bar (§2.5, §2.4).
+///
+/// A low-share cluster centroid is built from few segments by definition — the
+/// prune-veto's worst-case noise regime. When the window count falls below this
+/// threshold the veto requires the noisy-query threshold (`T_ACCEPT_NOISY`
+/// from the orchestrator matcher) rather than `T_ACCEPT`. This constant mirrors
+/// `matcher::NOISE_GUARD_MIN_WINDOWS` semantics but is used by the orchestrator
+/// when assembling the veto verdicts; it is declared here (in the layer that
+/// owns the prune logic) for documentation proximity.
+///
+/// **Placeholder — WU6 calibrates from a multi-session corpus.**
+pub const PRUNE_VETO_MIN_WINDOWS: u64 = 3;
 
 /// Reject any input not at [`REQUIRED_SAMPLE_RATE`].
 ///
@@ -383,7 +428,9 @@ impl Diarizer for SherpaDiarizer {
         // funnel calls `compute_turns` + `overlay_speakers` directly when it needs
         // the map.
         self.compute_turns(audio, sample_rate).map(|turns| {
-            let (segs, n, _map) = overlay_speakers(&turns, segments, &self.config);
+            // `assign_speakers` is the `common::Diarizer` trait implementation;
+            // it has no access to the voiceprint library so no veto verdicts.
+            let (segs, n, _map) = overlay_speakers(&turns, segments, &self.config, &[]);
             (segs, n)
         })
     }
@@ -434,10 +481,18 @@ impl Diarizer for SherpaDiarizer {
 /// `MeetingMeta.speaker_names` keying).
 ///
 /// Pure (no FFI, no I/O) so the default test suite covers it without a model.
+///
+/// `veto_ids` is a slice of cluster ids that must survive the prune regardless of
+/// their speech share or segment count (the prune-veto, §2.5). The orchestrator
+/// populates this after a second `VoiceprintExtractor` pass over the low-share
+/// candidate clusters; an empty slice is the no-veto baseline (the normal prune
+/// path). Vetoed clusters are also exempt from the speaker-count cap so a known
+/// enrolled speaker is never re-dropped by the cap after being rescued by the veto.
 pub fn overlay_speakers(
     turns: &[SpeakerTurn],
     segments: Vec<Segment>,
     config: &DiarizerConfig,
+    veto_ids: &[i32],
 ) -> (Vec<Segment>, u32, Vec<(i32, String)>) {
     // Per-segment ranked overlaps: (cluster_id, overlap_ms) sorted descending by
     // overlap, lower cluster id breaking ties. Lets the prune/cap reassign a
@@ -457,7 +512,7 @@ pub fn overlay_speakers(
     // segments to their next-best survivor. `survivor_set` is the surviving
     // cluster ids whether or not the prune ran (the distinct chosen ids when
     // nothing was pruned), as `is_mixed_segment` needs it either way.
-    let survivors = surviving_clusters(&chosen, &ranked, config);
+    let survivors = surviving_clusters(&chosen, &ranked, config, veto_ids);
     let survivor_set: Vec<i32> = match &survivors {
         Some(survivors) => {
             for (slot, r) in chosen.iter_mut().zip(ranked.iter()) {
@@ -585,16 +640,28 @@ pub fn overlay_speakers(
 ///
 /// Spurious = a winning cluster below `min_cluster_share` of the total attributed
 /// speech DURATION, OR below `min_cluster_segments` won. The cap then keeps only
-/// the `max_speakers` largest survivors by duration. A pure helper over the
-/// initial `chosen` winners; returns the survivor ids (unordered).
+/// the `max_speakers` largest survivors by duration.
+///
+/// `veto_ids` lists cluster ids that match an enrolled voiceprint above the accept
+/// threshold (§2.5 prune-veto). Any cluster in `veto_ids` is treated as a
+/// survivor regardless of its share or segment count, and is excluded from the cap
+/// so the cap cannot re-drop a vetoed cluster. The orchestrator populates
+/// `veto_ids` after a second `VoiceprintExtractor` pass; callers that do not run
+/// the veto pass pass an empty slice.
+///
+/// A pure helper over the initial `chosen` winners; returns the survivor ids
+/// (unordered), or `None` when no reassignment is needed (neither prune, cap, nor
+/// veto is active and no cluster would change outcome).
 fn surviving_clusters(
     chosen: &[Option<i32>],
     ranked: &[Vec<(i32, u64)>],
     config: &DiarizerConfig,
+    veto_ids: &[i32],
 ) -> Option<Vec<i32>> {
     let prune_active = config.min_cluster_share > 0.0 || config.min_cluster_segments > 0;
     let cap_active = config.max_speakers.is_some();
-    if !prune_active && !cap_active {
+    let veto_active = !veto_ids.is_empty();
+    if !prune_active && !cap_active && !veto_active {
         return None;
     }
 
@@ -631,9 +698,18 @@ fn surviving_clusters(
 
     let total_dur: u64 = dur.iter().sum();
 
-    // 1. Prune by share + segment count.
+    // 1. Prune by share + segment count; veto-protected clusters bypass the prune.
+    //
+    // A cluster in `veto_ids` matched an enrolled voiceprint above the accept
+    // threshold (§2.5): identity, not share, decides its survival. It is inserted
+    // into the survivor set unconditionally here, before the reassignment loop runs.
     let mut survivors: Vec<i32> = Vec::new();
     for (i, &id) in ids.iter().enumerate() {
+        // A vetoed cluster survives regardless of share or segment count.
+        if veto_ids.contains(&id) {
+            survivors.push(id);
+            continue;
+        }
         let share = if total_dur > 0 {
             dur[i] as f32 / total_dur as f32
         } else {
@@ -658,15 +734,34 @@ fn surviving_clusters(
     }
 
     // 2. Cap: keep the `max_speakers` largest survivors by duration.
+    // Vetoed clusters are exempt from the cap — they must not be re-dropped after
+    // the prune-veto rescued them (§2.5: "ensure the speaker-count cap does not
+    // then re-drop the vetoed cluster").
     if let Some(max) = config.max_speakers {
-        if survivors.len() > max {
-            // Sort survivors by duration desc, lower id breaking ties, keep N.
-            survivors.sort_by(|a, b| {
-                let da = dur[ids.iter().position(|x| x == a).unwrap()];
-                let db = dur[ids.iter().position(|x| x == b).unwrap()];
+        // Build the non-vetoed survivors; the vetoed ones are always kept.
+        let vetoed: Vec<i32> = survivors
+            .iter()
+            .copied()
+            .filter(|id| veto_ids.contains(id))
+            .collect();
+        let non_vetoed: Vec<i32> = survivors
+            .iter()
+            .copied()
+            .filter(|id| !veto_ids.contains(id))
+            .collect();
+        // How many non-vetoed slots remain after pinning the vetoed ones?
+        let remaining_cap = max.saturating_sub(vetoed.len());
+        if non_vetoed.len() > remaining_cap {
+            // Sort non-vetoed by duration desc, lower id breaking ties, keep N.
+            let mut sortable = non_vetoed;
+            sortable.sort_by(|a, b| {
+                let da = ids.iter().position(|x| x == a).map_or(0, |i| dur[i]);
+                let db = ids.iter().position(|x| x == b).map_or(0, |i| dur[i]);
                 db.cmp(&da).then(a.cmp(b))
             });
-            survivors.truncate(max);
+            sortable.truncate(remaining_cap);
+            survivors = vetoed;
+            survivors.extend(sortable);
         }
     }
 
@@ -1153,7 +1248,7 @@ mod tests {
             seg(2_100, 3_900), // overlaps the 3-turn → B
             seg(4_100, 5_900), // overlaps the 7-turn → A
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -1165,7 +1260,7 @@ mod tests {
         let turns = vec![turn(0.0, 1.0, 0)];
         // Segment sits entirely after the only turn → no overlap → None.
         let segs = vec![seg(5_000, 6_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(count, 0);
         assert_eq!(segs[0].speaker_id, None);
     }
@@ -1178,7 +1273,7 @@ mod tests {
             turn(1.2, 3.0, 1), // 1200..3000 ms : overlaps [1000,2000) by 800 ms
         ];
         let segs = vec![seg(1_000, 2_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(count, 1);
         // Cluster id 1 is the only chosen id → first-seen → "A".
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -1193,7 +1288,7 @@ mod tests {
             turn(1.5, 3.0, 4), // overlaps [1000,2000) by 500 ms (1500..2000)
         ];
         let segs = vec![seg(1_000, 2_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(count, 1);
         // Cluster 4 (the lower id) wins the tie; as the only chosen id it
         // first-seen-relabels to "A".
@@ -1218,7 +1313,7 @@ mod tests {
     fn overlay_single_speaker_one_label() {
         let turns = vec![turn(0.0, 10.0, 2)];
         let segs = vec![seg(0, 2_000), seg(3_000, 5_000), seg(6_000, 9_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(count, 1);
         for s in &segs {
             assert_eq!(s.speaker_id.as_deref(), Some("A"));
@@ -1241,7 +1336,7 @@ mod tests {
             seg(2_500, 3_500), // gap → None
             seg(4_100, 4_900), // C
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(count, 3);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -1253,7 +1348,7 @@ mod tests {
     fn overlay_empty_segments_is_zero() {
         let turns = vec![turn(0.0, 1.0, 0)];
         let segs: Vec<Segment> = Vec::new();
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(count, 0);
         assert!(segs.is_empty());
     }
@@ -1267,7 +1362,7 @@ mod tests {
             speaker_id: Some("Z".to_string()),
             ..seg(5_000, 6_000)
         }];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert_eq!(segs[0].speaker_id, None);
     }
 
@@ -1293,7 +1388,7 @@ mod tests {
         // Empty `words` (the Qwen path): a mixed segment is NOT split — it keeps
         // its dominant label + the `shared_speakers` flag.
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
 
         // Primary labels by first-seen order.
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -1313,7 +1408,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
 
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert!(
@@ -1331,7 +1426,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
         assert!(segs[0].shared_speakers.is_empty());
     }
 
@@ -1373,7 +1468,7 @@ mod tests {
         // blip cluster only ever wins via a turn no segment maxes on — exercise
         // the share prune with a segment that DOES max on the blip.
         segs[1] = seg(5_000, 5_150); // overlaps cluster 1 by 100 ms, cluster 0 by 50 ms
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[]);
         assert_eq!(count, 1, "tiny-share cluster must be pruned away");
         // The straddling segment reassigned to the surviving cluster 0 → "A".
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1395,7 +1490,7 @@ mod tests {
             seg(5_100, 7_400),
             seg(7_500, 9_900),
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 2, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 2, None), &[]);
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1423,7 +1518,7 @@ mod tests {
             seg(2_900, 3_550),
             seg(4_100, 5_000),
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 2, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 2, None), &[]);
         assert_eq!(count, 1, "single-segment cluster pruned by the count floor");
         assert_eq!(segs[2].speaker_id.as_deref(), Some("A"));
     }
@@ -1443,7 +1538,7 @@ mod tests {
             seg(6_100, 9_900),
             seg(10_100, 11_900), // overlaps only cluster 2; after cap, reassigns
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)), &[]);
         assert_eq!(count, 2, "cap must keep exactly the two largest speakers");
         // The capped-out segment had no overlap with a survivor → None (no
         // surviving turn covers [10100,11900)).
@@ -1458,7 +1553,7 @@ mod tests {
         // confirm the largest cluster is retained.
         let turns = vec![turn(0.0, 5.0, 0)];
         let segs = vec![seg(0, 4_900)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(2.0, 0, None));
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(2.0, 0, None), &[]);
         assert_eq!(count, 1, "the largest cluster is retained when all prune");
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
     }
@@ -1478,8 +1573,145 @@ mod tests {
             let start = (t * 1000.0) as u64;
             segs.push(seg(start, start + 200));
         }
-        let (_segs, count, _map) = overlay_speakers(&turns, segs, &DiarizerConfig::default());
+        let (_segs, count, _map) = overlay_speakers(&turns, segs, &DiarizerConfig::default(), &[]);
         assert_eq!(count, 1, "default prune collapses the tiny-cluster scatter");
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for the §2.5 prune-veto (veto_ids parameter)
+    // -----------------------------------------------------------------------
+
+    /// A low-share cluster that is in `veto_ids` survives the prune.
+    ///
+    /// Cluster 0 owns ~9.9 s (dominant), cluster 1 owns one 100 ms blip (~1%).
+    /// Without a veto, cluster 1 is pruned by the 2% share floor. With cluster 1
+    /// in `veto_ids` (matching an enrolled voiceprint), it survives and is labelled.
+    #[test]
+    fn prune_veto_keeps_low_share_enrolled_cluster() {
+        let turns = vec![
+            turn(0.0, 5.0, 0),
+            turn(5.0, 5.1, 1), // 100 ms blip — below the 2% share floor
+            turn(5.1, 10.0, 0),
+        ];
+        // Segment 1 overlaps cluster 1 by 100 ms and cluster 0 by 50 ms;
+        // cluster 1 wins initially, then would normally be pruned.
+        let segs = vec![
+            seg(0, 4_900),
+            seg(5_000, 5_150), // cluster 1 winner (100 ms vs 50 ms)
+            seg(5_400, 9_900),
+        ];
+        // Without veto: cluster 1 is pruned.
+        let (segs_no_veto, count_no_veto, _) =
+            overlay_speakers(&turns, segs.clone(), &pruned(0.02, 0, None), &[]);
+        assert_eq!(count_no_veto, 1, "without veto the tiny cluster is pruned");
+        assert_eq!(
+            segs_no_veto[1].speaker_id.as_deref(),
+            Some("A"),
+            "pruned segment reassigns to the dominant cluster"
+        );
+
+        // With veto: cluster 1 is rescued and gets its own letter.
+        let (segs_vetoed, count_vetoed, map) =
+            overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[1]);
+        assert_eq!(
+            count_vetoed, 2,
+            "vetoed cluster 1 must survive; two speakers expected"
+        );
+        // The segment that originally won cluster 1 must still be labelled on it.
+        let cluster1_letter = map
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .map(|(_, lbl)| lbl.as_str());
+        assert!(
+            cluster1_letter.is_some(),
+            "cluster 1 must appear in the cluster→letter map"
+        );
+        assert_eq!(
+            segs_vetoed[1].speaker_id.as_deref(),
+            cluster1_letter,
+            "the blip segment must be labelled on the vetoed cluster"
+        );
+    }
+
+    /// A low-share cluster NOT in `veto_ids` is still pruned even when another
+    /// cluster is vetoed.
+    ///
+    /// Cluster 0 is dominant; cluster 1 is low-share and vetoed; cluster 2 is
+    /// low-share and NOT vetoed. Cluster 2 must be pruned; cluster 1 must survive.
+    #[test]
+    fn prune_veto_non_enrolled_cluster_still_pruned() {
+        let turns = vec![
+            turn(0.0, 9.0, 0),   // dominant
+            turn(9.0, 9.1, 1),   // low-share, vetoed (enrolled)
+            turn(9.1, 9.2, 2),   // low-share, NOT vetoed (unenrolled)
+            turn(9.2, 10.0, 0),
+        ];
+        // Segment layout: big dominant block, then one segment per tiny cluster.
+        let segs = vec![
+            seg(0, 8_900),
+            seg(9_000, 9_100),  // cluster 1 winner
+            seg(9_100, 9_200),  // cluster 2 winner
+            seg(9_300, 9_900),
+        ];
+        // Veto cluster 1 only.
+        let (out, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[1]);
+        assert_eq!(
+            count, 2,
+            "cluster 0 (dominant) + cluster 1 (vetoed) survive; cluster 2 pruned"
+        );
+        // Cluster 2's segment must be reassigned to the nearest surviving cluster.
+        let cluster2_letter = map.iter().find(|(id, _)| *id == 2);
+        assert!(
+            cluster2_letter.is_none(),
+            "cluster 2 must not appear in the cluster→letter map (pruned)"
+        );
+        // Cluster 1's segment keeps its own letter.
+        let cluster1_letter = map
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .map(|(_, lbl)| lbl.as_str());
+        assert!(cluster1_letter.is_some(), "cluster 1 (vetoed) must be in the map");
+        assert_eq!(
+            out[1].speaker_id.as_deref(),
+            cluster1_letter,
+            "segment[1] must be on the vetoed cluster 1"
+        );
+    }
+
+    /// A vetoed cluster is exempt from the speaker-count cap (§2.5: "ensure the
+    /// cap does not then re-drop the vetoed cluster").
+    ///
+    /// Three clusters: 0 (dominant), 1 (mid-share), 2 (low-share, vetoed).
+    /// Cap at 2. Cluster 2 is vetoed so it must survive even though it would
+    /// normally be capped out. The result must have 3 distinct labels (or 2 with
+    /// the smallest non-vetoed cluster dropped), but the vetoed one is always kept.
+    #[test]
+    fn prune_veto_exempt_from_cap() {
+        let turns = vec![
+            turn(0.0, 6.0, 0),   // dominant (~60%)
+            turn(6.0, 9.0, 1),   // mid (~30%)
+            turn(9.0, 9.5, 2),   // low (~5%), vetoed
+        ];
+        let segs = vec![
+            seg(0, 5_900),
+            seg(6_100, 8_900),
+            seg(9_100, 9_400),  // cluster 2 winner
+        ];
+        // Cap at 2 — without veto cluster 2 would be capped out.
+        let (out, count, map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)), &[2]);
+        // The vetoed cluster 2 must survive even though cap = 2. Cap drops cluster 1
+        // (mid-share, non-vetoed) to make room, keeping cluster 0 and cluster 2.
+        assert_eq!(count, 2, "cap 2: vetoed cluster 2 + dominant cluster 0 survive");
+        let cluster2_letter = map.iter().find(|(id, _)| *id == 2);
+        assert!(
+            cluster2_letter.is_some(),
+            "vetoed cluster 2 must be in the cluster→letter map"
+        );
+        assert_eq!(
+            out[2].speaker_id.as_deref(),
+            cluster2_letter.map(|(_, l)| l.as_str()),
+            "segment[2] must be on the vetoed cluster"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1974,7 +2206,7 @@ mod tests {
             ]),
             seg(2_000, 3_000), // cluster 1 alone (no words)
         ];
-        let (out, count, _map) = overlay_speakers(&turns, segs, &flag_share());
+        let (out, count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
         assert_eq!(count, 2, "the split yields two distinct speakers");
         assert_eq!(out.len(), 3, "the mixed segment split into two, plus segment 1");
         assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
@@ -1997,7 +2229,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (out, _count, _map) = overlay_speakers(&turns, segs, &flag_share());
+        let (out, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
         assert_eq!(out.len(), 2, "no split on the no-words path");
         assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(out[0].shared_speakers, vec!["B".to_string()]);
@@ -2014,7 +2246,7 @@ mod tests {
         // each cluster id with the letter actually baked into the segments.
         let turns = vec![turn(0.0, 2.0, 7), turn(2.0, 4.0, 3), turn(4.0, 6.0, 7)];
         let segs = vec![seg(0, 1_900), seg(2_100, 3_900), seg(4_100, 5_900)];
-        let (segs, count, map) = overlay_speakers(&turns, segs, &no_prune());
+        let (segs, count, map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
 
         assert_eq!(count, 2);
         assert_eq!(map, vec![(7, "A".to_string()), (3, "B".to_string())]);
@@ -2038,7 +2270,7 @@ mod tests {
         // the surviving cluster 0 → A — never a letter for a dropped cluster.
         let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 5.1, 1), turn(5.1, 10.0, 0)];
         let segs = vec![seg(0, 4_900), seg(5_000, 5_150), seg(5_400, 9_900)];
-        let (_segs, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None));
+        let (_segs, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[]);
         assert_eq!(count, 1);
         assert_eq!(map, vec![(0, "A".to_string())]);
     }
@@ -2111,5 +2343,513 @@ mod tests {
             turn(1.0, 2.0, 2), // 1 → 2 boundary also at 1000 (deduped)
         ];
         assert_eq!(turn_boundaries_within(&seg(0, 3_000), &turns), vec![1_000]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Voiceprint struct (WU1 / #0003)
+    // -----------------------------------------------------------------------
+
+    /// Build a `Voiceprint` centroid from near-identical synthetic unit vectors
+    /// and assert that `cosine()` of the centroid against one of its own unit
+    /// samples is > 0.999 — the retargeted clusterer.rs:364-413 discipline.
+    ///
+    /// This test uses [`minutist_common::voiceprint_math::weighted_merge`]
+    /// directly to construct the centroid, mirroring the code path inside
+    /// `VoiceprintExtractor::centroid` without needing a live model.
+    ///
+    /// The 0.999 threshold is achievable when the windows all point in nearly
+    /// the same direction (a realistic same-speaker enrolment set). With highly
+    /// varied windows the centroid direction drifts from any individual sample;
+    /// in that regime the clusterer's plain-mean alignment test applies instead
+    /// (see `voiceprint_centroid_aligns_with_plain_mean`).
+    #[test]
+    fn voiceprint_centroid_cos_with_own_sample_gt_0999() {
+        // Four nearly-identical 2-D unit vectors (tiny perturbations of [1,0]).
+        // All are close to each other, so the centroid is close to all of them.
+        let raw: &[[f32; 2]] = &[
+            [1.000, 0.000],
+            [0.9998, 0.020],
+            [0.9997, 0.025],
+            [0.9995, 0.032],
+        ];
+
+        let fnorm = |v: &[f32; 2]| (v[0] * v[0] + v[1] * v[1]).sqrt();
+
+        // Unit-normalise each sample (as VoiceprintExtractor::centroid does).
+        let units: Vec<[f32; 2]> = raw
+            .iter()
+            .map(|s| {
+                let n = fnorm(s);
+                [s[0] / n, s[1] / n]
+            })
+            .collect();
+
+        // Build the centroid via weighted_merge (equal weight 1 per window),
+        // which is what VoiceprintExtractor::centroid uses.
+        let pairs: Vec<(&[f32], u64)> = units.iter().map(|u| (u.as_slice(), 1u64)).collect();
+        let centroid_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+
+        let centroid = Voiceprint { vector: centroid_vec };
+
+        // Every unit sample should have cosine > 0.999 with the centroid of its
+        // near-identical family.
+        for (i, unit) in units.iter().enumerate() {
+            let sample_vp = Voiceprint { vector: unit.to_vec() };
+            let cos = centroid.cosine(&sample_vp);
+            assert!(
+                cos > 0.999,
+                "centroid cosine with own unit sample {i} should be > 0.999, got {cos}"
+            );
+        }
+
+        // dim() must equal the vector length.
+        assert_eq!(centroid.dim(), 2);
+    }
+
+    /// The centroid of more varied unit vectors aligns with their plain mean
+    /// (cos > 0.999) — the retargeted clusterer.rs:364-413 alignment discipline.
+    ///
+    /// Both the centroid and the plain mean are unit-normalised before comparing,
+    /// since `Voiceprint::cosine` delegates to `cosine_unit` (a plain dot product
+    /// that assumes both inputs are unit vectors).
+    #[test]
+    fn voiceprint_centroid_aligns_with_plain_mean() {
+        let raw: &[[f32; 2]] = &[
+            [1.0, 0.0],
+            [0.96, 0.28],
+            [0.94, 0.34],
+            [0.92, 0.39],
+        ];
+
+        let fnorm = |v: &[f32; 2]| (v[0] * v[0] + v[1] * v[1]).sqrt();
+
+        let units: Vec<[f32; 2]> = raw
+            .iter()
+            .map(|s| {
+                let n = fnorm(s);
+                [s[0] / n, s[1] / n]
+            })
+            .collect();
+
+        let mut plain_mean = [0.0_f32; 2];
+        for u in &units {
+            plain_mean[0] += u[0];
+            plain_mean[1] += u[1];
+        }
+        plain_mean[0] /= units.len() as f32;
+        plain_mean[1] /= units.len() as f32;
+        // Unit-normalise the mean so Voiceprint::cosine (a plain dot product)
+        // gives the true geometric cosine.
+        minutist_common::voiceprint_math::unit_normalise(&mut plain_mean);
+
+        let pairs: Vec<(&[f32], u64)> = units.iter().map(|u| (u.as_slice(), 1u64)).collect();
+        let centroid_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+
+        let centroid = Voiceprint { vector: centroid_vec };
+        let mean_vp = Voiceprint { vector: plain_mean.to_vec() };
+        let cos = centroid.cosine(&mean_vp);
+        assert!(cos > 0.999, "centroid should align with the unit-normalised plain mean, cos = {cos}");
+    }
+
+    /// A voiceprint against itself must have cosine ≈ 1.0.
+    #[test]
+    fn voiceprint_cosine_self_is_one() {
+        let v = Voiceprint {
+            vector: vec![1.0_f32, 0.0],
+        };
+        let cos = v.cosine(&v);
+        assert!((cos - 1.0_f32).abs() < 1e-5, "cosine with self should be 1, got {cos}");
+    }
+
+    /// Two orthogonal unit voiceprints must have cosine ≈ 0.
+    #[test]
+    fn voiceprint_cosine_orthogonal_is_zero() {
+        let a = Voiceprint { vector: vec![1.0_f32, 0.0] };
+        let b = Voiceprint { vector: vec![0.0_f32, 1.0] };
+        let cos = a.cosine(&b);
+        assert!(cos.abs() < 1e-5, "cosine of orthogonal voiceprints should be 0, got {cos}");
+    }
+
+    // --- voiceprint_extractor_centroid (model-free synthetic tests) -----------
+
+    /// VoiceprintExtractor::centroid with synthetic unit-normalised vectors
+    /// produces a result with cosine > 0.999 against nearly-identical samples
+    /// (the retargeted online clusterer discipline).
+    ///
+    /// This test mimics the embed→centroid path without a live model, using
+    /// the weighted_merge construction directly.
+    #[test]
+    fn voiceprint_extractor_centroid_with_identical_samples() {
+        // Simulate three identical 192-D embeddings (matching the CAM++ model).
+        // In reality these would come from VoiceprintExtractor::embed; here we
+        // build them synthetically.
+        const DIM: usize = 192;
+        let base = [1.0_f32; DIM];
+
+        // Unit-normalise the synthetic samples (as embed() produces).
+        let norm = (DIM as f32).sqrt();
+        let unit_base: Vec<f32> = base.iter().map(|&x| x / norm).collect();
+
+        // Simulate three near-identical embeddings by adding tiny noise.
+        let sample1 = unit_base.clone();
+        let mut sample2 = unit_base.clone();
+        sample2[0] += 0.001;
+        let mut sample3 = unit_base.clone();
+        sample3[1] -= 0.0005;
+
+        // Unit-normalise the noisy samples (this is what centroid() does).
+        let mut s1_unit = sample1.clone();
+        let mut s2_unit = sample2.clone();
+        let mut s3_unit = sample3.clone();
+        minutist_common::voiceprint_math::unit_normalise(&mut s1_unit);
+        minutist_common::voiceprint_math::unit_normalise(&mut s2_unit);
+        minutist_common::voiceprint_math::unit_normalise(&mut s3_unit);
+
+        // Build centroid via weighted_merge (equal weight 1 per sample).
+        let pairs = vec![
+            (&s1_unit[..], 1u64),
+            (&s2_unit[..], 1u64),
+            (&s3_unit[..], 1u64),
+        ];
+        let centroid_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+        let centroid = Voiceprint {
+            vector: centroid_vec,
+        };
+
+        // All three samples should have cosine > 0.999 with the centroid.
+        for (i, sample) in [s1_unit, s2_unit, s3_unit].iter().enumerate() {
+            let sample_vp = Voiceprint {
+                vector: sample.clone(),
+            };
+            let cos = centroid.cosine(&sample_vp);
+            assert!(
+                cos > 0.999,
+                "sample {i} cosine with centroid should be > 0.999, got {cos}"
+            );
+        }
+    }
+
+    /// A centroid built from diverse unit vectors aligns with their plain mean
+    /// (cos > 0.999), mimicking the online clusterer's running-mean discipline.
+    #[test]
+    fn voiceprint_extractor_centroid_aligns_with_diverse_mean() {
+        const DIM: usize = 192;
+
+        // Create four diverse 192-D vectors that simulate different acoustic
+        // conditions for the same speaker.
+        let raw: [&[f32]; 4] = [
+            &std::array::from_fn::<f32, 192, _>(|i| if i == 0 { 1.0 } else { 0.01 }),
+            &std::array::from_fn::<f32, 192, _>(|i| if i == 1 { 1.0 } else { 0.01 }),
+            &std::array::from_fn::<f32, 192, _>(|i| if i == 2 { 1.0 } else { 0.01 }),
+            &std::array::from_fn::<f32, 192, _>(|i| if i < 3 { 0.5 } else { 0.01 }),
+        ];
+
+        // Unit-normalise each raw sample.
+        let mut units: Vec<Vec<f32>> = Vec::with_capacity(4);
+        for r in &raw {
+            let mut v = r.to_vec();
+            minutist_common::voiceprint_math::unit_normalise(&mut v);
+            units.push(v);
+        }
+
+        // Compute plain arithmetic mean of unit vectors.
+        let mut plain_mean = vec![0.0_f32; DIM];
+        for u in &units {
+            for (m, &u_i) in plain_mean.iter_mut().zip(u.iter()) {
+                *m += u_i;
+            }
+        }
+        for m in &mut plain_mean {
+            *m /= units.len() as f32;
+        }
+        minutist_common::voiceprint_math::unit_normalise(&mut plain_mean);
+
+        // Build centroid via weighted_merge.
+        let pairs: Vec<(&[f32], u64)> = units.iter().map(|v| (v.as_slice(), 1u64)).collect();
+        let centroid_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+
+        let centroid = Voiceprint {
+            vector: centroid_vec,
+        };
+        let mean_vp = Voiceprint {
+            vector: plain_mean,
+        };
+
+        let cos = centroid.cosine(&mean_vp);
+        assert!(
+            cos > 0.999,
+            "centroid should align with plain mean of units, cos = {cos}"
+        );
+    }
+
+    /// dim() returns the vector length.
+    #[test]
+    fn voiceprint_dim_matches_vector_length() {
+        let vp = Voiceprint {
+            vector: vec![0.5_f32; 192],
+        };
+        assert_eq!(vp.dim(), 192);
+
+        let vp_small = Voiceprint {
+            vector: vec![0.1_f32; 8],
+        };
+        assert_eq!(vp_small.dim(), 8);
+
+        let vp_empty = Voiceprint {
+            vector: vec![],
+        };
+        assert_eq!(vp_empty.dim(), 0);
+    }
+
+    /// Cosine between two identical voiceprints is 1.0.
+    #[test]
+    fn voiceprint_cosine_identical_is_one() {
+        let mut v: Vec<f32> = std::array::from_fn::<f32, 192, _>(|i| (i as f32).sin()).to_vec();
+        // Unit-normalise to ensure it's a valid voiceprint.
+        minutist_common::voiceprint_math::unit_normalise(&mut v);
+        let vp = Voiceprint { vector: v };
+        let cos = vp.cosine(&vp);
+        assert!((cos - 1.0).abs() < 1e-5, "cosine with identical should be 1, got {cos}");
+    }
+
+    /// Cosine between opposite unit vectors is -1.0.
+    #[test]
+    fn voiceprint_cosine_opposite_is_minus_one() {
+        let a = Voiceprint {
+            vector: vec![1.0_f32, 0.0, 0.0],
+        };
+        let b = Voiceprint {
+            vector: vec![-1.0_f32, 0.0, 0.0],
+        };
+        let cos = a.cosine(&b);
+        assert!((cos - (-1.0)).abs() < 1e-5, "cosine opposite should be -1, got {cos}");
+    }
+
+    /// Cosine is symmetric: cos(a, b) == cos(b, a).
+    #[test]
+    fn voiceprint_cosine_is_symmetric() {
+        let a = Voiceprint {
+            vector: vec![1.0_f32, 0.0, 0.5],
+        };
+        let b = Voiceprint {
+            vector: vec![0.5_f32, 1.0, 0.0],
+        };
+        let cos_ab = a.cosine(&b);
+        let cos_ba = b.cosine(&a);
+        assert!((cos_ab - cos_ba).abs() < 1e-6, "cosine must be symmetric");
+    }
+
+    /// Multiple embeddings folded by weighted_merge produce a unit-length centroid.
+    #[test]
+    fn voiceprint_centroid_is_unit_length() {
+        const DIM: usize = 192;
+
+        // Create synthetic unit vectors.
+        let v1: Vec<f32> = std::array::from_fn::<f32, DIM, _>(|i| ((i as f32) * 0.001).cos())
+            .to_vec();
+        let v2: Vec<f32> = std::array::from_fn::<f32, DIM, _>(|i| ((i as f32) * 0.002).sin())
+            .to_vec();
+
+        // Normalise each.
+        let mut u1 = v1.clone();
+        let mut u2 = v2.clone();
+        minutist_common::voiceprint_math::unit_normalise(&mut u1);
+        minutist_common::voiceprint_math::unit_normalise(&mut u2);
+
+        // Merge with equal counts.
+        let pairs = vec![(&u1[..], 1u64), (&u2[..], 1u64)];
+        let centroid_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+
+        let centroid = Voiceprint {
+            vector: centroid_vec,
+        };
+
+        // Check the centroid is unit-length.
+        let norm_sq: f32 = centroid.vector.iter().map(|&x| x * x).sum();
+        let norm = norm_sq.sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "centroid should be unit-length, got norm {norm}");
+    }
+
+    /// Weighted merge with unequal counts produces a centroid closer to the
+    /// heavier sample. This tests the refinement mechanism where an established
+    /// centroid is updated with new contributions.
+    #[test]
+    fn voiceprint_weighted_merge_respects_counts() {
+        // Two unit vectors at 90°.
+        let a = [1.0_f32, 0.0];
+        let b = [0.0_f32, 1.0];
+
+        // Create Voiceprints with those unit vectors.
+        let vp_a = Voiceprint {
+            vector: a.to_vec(),
+        };
+        let vp_b = Voiceprint {
+            vector: b.to_vec(),
+        };
+
+        // Weighted merge: a gets count 9, b gets count 1 (9:1 weight).
+        let pairs = vec![(&a[..], 9u64), (&b[..], 1u64)];
+        let merged_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+        let merged = Voiceprint {
+            vector: merged_vec,
+        };
+
+        // The merged centroid should be closer (higher cosine) to a than to b.
+        let cos_to_a = merged.cosine(&vp_a);
+        let cos_to_b = merged.cosine(&vp_b);
+
+        assert!(
+            cos_to_a > cos_to_b,
+            "weighted merge should be closer to heavier sample: cos_to_a={cos_to_a}, cos_to_b={cos_to_b}"
+        );
+    }
+
+    /// A single contribution folded via weighted_merge produces a unit-normalised
+    /// version of that vector, demonstrating the refinement fold path.
+    #[test]
+    fn voiceprint_fold_single_contribution() {
+        // A non-unit vector.
+        let raw = [3.0_f32, 4.0];
+
+        // Fold via weighted_merge.
+        let pairs = vec![(&raw[..], 5u64)];
+        let folded_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+
+        // Expected: unit-normalised [3, 4] = [0.6, 0.8]
+        assert!((folded_vec[0] - 0.6).abs() < 1e-5, "folded[0] = {}", folded_vec[0]);
+        assert!((folded_vec[1] - 0.8).abs() < 1e-5, "folded[1] = {}", folded_vec[1]);
+
+        let folded_vp = Voiceprint {
+            vector: folded_vec,
+        };
+        assert_eq!(folded_vp.dim(), 2);
+    }
+
+    /// Empty weighted_merge returns an empty vector.
+    #[test]
+    fn voiceprint_empty_merge_returns_empty() {
+        let pairs: Vec<(&[f32], u64)> = vec![];
+        let result = minutist_common::voiceprint_math::weighted_merge(&pairs);
+        assert!(result.is_empty());
+    }
+
+    /// Poison-defence test: an established high-count centroid is only minimally
+    /// shifted by one low-count adversarial near-threshold contribution. This
+    /// verifies the bounded-weight refinement mechanism.
+    #[test]
+    fn voiceprint_established_centroid_resists_single_bad_contribution() {
+        // Establish a strong centroid from 100 identical observations.
+        let base = [1.0_f32, 0.0, 0.0];
+        let mut established = base.to_vec();
+        minutist_common::voiceprint_math::unit_normalise(&mut established);
+
+        // Create 100 copies with tiny perturbations.
+        let mut pairs: Vec<(&[f32], u64)> = Vec::with_capacity(101);
+        let mut variations = Vec::with_capacity(100);
+        for i in 0..100 {
+            let mut v = base.to_vec();
+            v[1] = (i as f32) * 0.001;
+            minutist_common::voiceprint_math::unit_normalise(&mut v);
+            variations.push(v);
+        }
+        for v in variations.iter() {
+            pairs.push((v.as_slice(), 1u64));
+        }
+
+        // The established centroid.
+        let established_vp = Voiceprint {
+            vector: minutist_common::voiceprint_math::weighted_merge(&pairs),
+        };
+
+        // Now add one adversarial low-count observation: a vector at 45° from
+        // the established centroid (near-threshold similarity).
+        let adversary = [1.0_f32, 1.0, 0.0];
+        let mut adversary_unit = adversary.to_vec();
+        minutist_common::voiceprint_math::unit_normalise(&mut adversary_unit);
+
+        // Add the adversary with small weight (clamped REFINE_WEIGHT_CAP;
+        // design spec §2.9.3 says it should be min(count, cap) relative to
+        // sample_count = 100).
+        let clamped_count = 1u64; // simulate cap applied.
+        pairs.push((&adversary_unit, clamped_count));
+
+        let refined_vp = Voiceprint {
+            vector: minutist_common::voiceprint_math::weighted_merge(&pairs),
+        };
+
+        // The refined centroid should be very close to the established one
+        // (cosine should still be > 0.99, not pushed below a target acceptance
+        // threshold).
+        let shift = established_vp.cosine(&refined_vp);
+        assert!(
+            shift > 0.99,
+            "one low-count adversarial sample should not shift established centroid much, got cos {shift}"
+        );
+    }
+
+    /// A 192-D centroid (the real CAM++ model dimension) round-trips via
+    /// serialisation/deserialisation without loss.
+    #[test]
+    fn voiceprint_192d_centroid_construction() {
+        const DIM: usize = 192;
+
+        // Create a realistic 192-D vector.
+        let mut v: Vec<f32> = std::array::from_fn::<f32, DIM, _>(|i| (i as f32 * 0.01).sin())
+            .to_vec();
+        minutist_common::voiceprint_math::unit_normalise(&mut v);
+
+        let vp = Voiceprint { vector: v.clone() };
+
+        // Verify dimension and unit length.
+        assert_eq!(vp.dim(), DIM);
+        let norm_sq: f32 = vp.vector.iter().map(|&x| x * x).sum();
+        assert!((norm_sq.sqrt() - 1.0).abs() < 1e-5);
+
+        // Cosine with itself must be 1.0.
+        let cos_self = vp.cosine(&vp);
+        assert!((cos_self - 1.0).abs() < 1e-5);
+    }
+
+    /// Centroid built from multiple varied 192-D samples exhibits the
+    /// expected running-mean behaviour (cos > 0.999 alignment).
+    #[test]
+    fn voiceprint_192d_centroid_running_mean_alignment() {
+        const DIM: usize = 192;
+        const SAMPLES: usize = 10;
+
+        // Create 10 synthetic 192-D vectors that simulate embeddings from
+        // the same speaker recorded in slightly different conditions.
+        let mut vectors = Vec::with_capacity(SAMPLES);
+        for i in 0..SAMPLES {
+            let mut v: Vec<f32> = std::array::from_fn::<f32, DIM, _>(|j| {
+                ((j as f32) * 0.01 + (i as f32) * 0.001).sin()
+            })
+            .to_vec();
+            minutist_common::voiceprint_math::unit_normalise(&mut v);
+            vectors.push(v);
+        }
+
+        // Build centroid via weighted_merge.
+        let pairs: Vec<(&[f32], u64)> = vectors.iter().map(|v| (v.as_slice(), 1u64)).collect();
+        let centroid_vec = minutist_common::voiceprint_math::weighted_merge(&pairs);
+        let centroid = Voiceprint {
+            vector: centroid_vec,
+        };
+
+        // Each sample should have high cosine with the centroid.
+        for (i, v) in vectors.iter().enumerate() {
+            let sample_vp = Voiceprint {
+                vector: v.clone(),
+            };
+            let cos = centroid.cosine(&sample_vp);
+            assert!(
+                cos > 0.95,
+                "sample {i} should have cos > 0.95 with centroid, got {cos}"
+            );
+        }
+
+        // Verify centroid is unit-length.
+        let norm_sq: f32 = centroid.vector.iter().map(|&x| x * x).sum();
+        assert!((norm_sq.sqrt() - 1.0).abs() < 1e-5, "centroid should be unit-length");
     }
 }

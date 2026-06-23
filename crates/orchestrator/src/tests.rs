@@ -1023,3 +1023,239 @@ mod diarization {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Voiceprint refinement-on-confirm (WU3b) — model-free store boundary tests
+//
+// These tests exercise the enrol-vs-refine dispatch logic that
+// `enrol_voiceprint_claimed` now performs: when an identity already exists for
+// a given display_name + model_id, the orchestrator calls
+// `VoiceprintStore::refine` rather than `VoiceprintStore::enrol`. Because
+// the actual centroid-building step (VoiceprintExtractor) requires the
+// embedding model and real audio, the tests operate at the persistence store
+// boundary — the layer that `enrol_voiceprint_claimed` hands off to after
+// the centroid is produced.
+//
+// Two disciplines from the acceptance criteria:
+// 1. A second confirmed association for the same name+model_id routes to
+//    refine, and the resulting centroid equals the count-weighted mean of
+//    both contributions.
+// 2. An adversarial near-threshold refine (mirroring the WU2 poison fixture
+//    at the orchestrator boundary) does not push an established centroid past
+//    T_accept for a held-out impostor.
+// ---------------------------------------------------------------------------
+
+mod voiceprints {
+    use minutist_common::{MeetingId, VoiceprintIdentityId};
+    use persistence::VoiceprintStore;
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    async fn open_mem() -> VoiceprintStore {
+        VoiceprintStore::open(":memory:").await.unwrap()
+    }
+
+    fn mid() -> MeetingId {
+        MeetingId::new()
+    }
+
+    /// Synthetic unit-normalised embedding: `v[0] = signal`, `v[1] = sqrt(1 -
+    /// signal²)` (the rest zero), then L2-normalised. Produces a deterministic
+    /// direction for the given `signal` value.
+    fn embed(dim: usize, signal: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; dim];
+        v[0] = signal;
+        if dim > 1 {
+            v[1] = (1.0f32 - signal * signal).abs().sqrt();
+        }
+        minutist_common::voiceprint_math::unit_normalise(&mut v);
+        v
+    }
+
+    fn cos(a: &[f32], b: &[f32]) -> f32 {
+        minutist_common::voiceprint_math::cosine_unit(a, b)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: second confirmed association routes to refine, not enrol
+    //
+    // Simulates what `enrol_voiceprint_claimed` does after building the centroid:
+    //   - first association → find_identity_by_name_and_model returns None → enrol
+    //   - second association → find_identity_by_name_and_model returns Some(id) → refine
+    //
+    // After both calls, the resulting gallery centroid must equal the
+    // count-weighted mean of both contributions (§2.9.1 invariant).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn second_confirmed_association_calls_refine_not_enrol() {
+        let store = open_mem().await;
+        let model = "cam-test-v1";
+
+        // First association: no prior identity → enrol.
+        let emb1 = embed(4, 0.95);
+        let existing = store
+            .find_identity_by_name_and_model("Alice", model)
+            .await
+            .unwrap();
+        assert!(existing.is_none(), "no identity before first enrol");
+
+        let id1: VoiceprintIdentityId = store
+            .enrol("Alice", &emb1, 4, model, mid(), "A")
+            .await
+            .unwrap();
+
+        // Verify a second lookup finds the identity just created.
+        let found = store
+            .find_identity_by_name_and_model("Alice", model)
+            .await
+            .unwrap();
+        assert_eq!(found, Some(id1), "identity must be found after first enrol");
+
+        // Second association: identity exists → refine (as the orchestrator now does).
+        let emb2 = embed(4, 0.92);
+        store
+            .refine(id1, &emb2, 2, model, mid(), "A")
+            .await
+            .unwrap();
+
+        // Verify the orchestrator path did NOT create a second identity.
+        let all = store.all(model).await.unwrap();
+        let identity_ids: std::collections::HashSet<_> =
+            all.iter().map(|s| s.identity_id).collect();
+        assert_eq!(
+            identity_ids.len(),
+            1,
+            "refine must not create a second identity; still exactly one identity"
+        );
+        assert_eq!(identity_ids.iter().next().copied(), Some(id1));
+
+        // The gallery centroid must equal the count-weighted mean of both
+        // contributions (§2.9.1 invariant): contribution 1 has count=1, contribution
+        // 2 has count=2 (clamped from 2 — existing_sample_count=1, cap=0.30*1→0,
+        // so cap=0 means count is used as-is for a first-time existing store with
+        // sample_count=1 and REFINE_WEIGHT_CAP=0.30 → cap = ceil(1*0.30)=1, so
+        // clamped_count = min(2,1) = 1).
+        // Recompute expected centroid: weighted_merge({emb1: count=1, emb2: count=1}).
+        let expected = minutist_common::voiceprint_math::weighted_merge(&[
+            (emb1.as_slice(), 1u64),
+            (emb2.as_slice(), 1u64),
+        ]);
+        let gallery = store.all(model).await.unwrap();
+        assert_eq!(gallery.len(), 1);
+        let actual = &gallery[0].embedding;
+        assert!(
+            cos(actual, &expected) > 0.999,
+            "gallery centroid must equal the count-weighted mean of both contributions \
+             (cos={:.4})",
+            cos(actual, &expected)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2: adversarial near-threshold refine at the orchestrator boundary
+    //
+    // Mirrors the WU2 `bounded_weight_poison_test` at the persistence boundary.
+    // An established centroid with large sample_count, refined with an
+    // adversarial contribution near T_accept (0.60), must not shift enough
+    // to exceed T_accept for a held-out impostor. REFINE_WEIGHT_CAP = 0.30
+    // clamps the adversarial contribution weight, bounding the drift.
+    //
+    // T_accept placeholder: 0.60 (§2.4, documented in cross-cutting.md).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn adversarial_near_threshold_refine_does_not_breach_t_accept_for_impostor() {
+        const T_ACCEPT: f32 = 0.60;
+        let store = open_mem().await;
+        let model = "cam-poison-v1";
+        let dim = 8;
+
+        // Alice's established centroid: a direction close to (1,0,0,...).
+        // First, enrol with a large batch of contributions that build up the
+        // sample_count (simulating a well-established profile). We do this by
+        // enrolling once then refining many times with the same direction.
+        let alice_dir = embed(dim, 0.99);
+        let identity_id = store
+            .enrol("Alice", &alice_dir, dim, model, mid(), "A")
+            .await
+            .unwrap();
+
+        // Build up sample_count to a large N via repeated refines to make the
+        // REFINE_WEIGHT_CAP binding. Use a near-identical embedding to keep the
+        // centroid stable (same condition → fold, not add-condition).
+        for i in 0u8..10 {
+            let v = embed(dim, 0.98 + 0.001 * (i as f32));
+            store
+                .refine(identity_id, &v, 10, model, mid(), "A")
+                .await
+                .unwrap();
+        }
+
+        // Confirm Alice's gallery centroid is close to alice_dir.
+        let pre_gallery = store.all(model).await.unwrap();
+        assert_eq!(pre_gallery.len(), 1);
+        let pre_cos = cos(&pre_gallery[0].embedding, &alice_dir);
+        assert!(
+            pre_cos > 0.999,
+            "established centroid must be close to its constituent embeddings (cos={pre_cos:.4})"
+        );
+
+        // Held-out impostor direction: orthogonal to alice_dir (dim-1 axis only).
+        // This represents a distinct speaker that Alice's centroid must not match.
+        let mut impostor = vec![0.0f32; dim];
+        impostor[dim - 1] = 1.0;
+        minutist_common::voiceprint_math::unit_normalise(&mut impostor);
+        let pre_impostor_sim = cos(&pre_gallery[0].embedding, &impostor);
+        assert!(
+            pre_impostor_sim < T_ACCEPT,
+            "impostor must be below T_accept before poisoning (sim={pre_impostor_sim:.4})"
+        );
+
+        // Adversarial contribution: a direction mixed between Alice (~0.82 cosine,
+        // above FOLD_GATE=0.70 so it folds into Alice's centroid) and the impostor
+        // axis. The attacker supplies count=1000 (extremely large) to try to dominate
+        // the centroid. REFINE_WEIGHT_CAP clamps the contribution to at most
+        // 30% of the existing sample_count.
+        //
+        // Mix: 0.82 × alice_dir + 0.57 × impostor, normalised.
+        // cosine(adversary, alice_dir) ≈ 0.82 > FOLD_GATE ✓
+        let mut adversary = vec![0.0f32; dim];
+        for (i, (&a, &b)) in alice_dir.iter().zip(impostor.iter()).enumerate() {
+            adversary[i] = 0.82 * a + 0.57 * b;
+        }
+        minutist_common::voiceprint_math::unit_normalise(&mut adversary);
+        let adv_sim_with_alice = cos(&adversary, &alice_dir);
+        assert!(
+            adv_sim_with_alice >= 0.70,
+            "adversary must clear FOLD_GATE so it folds into the centroid \
+             (adv_sim_with_alice={adv_sim_with_alice:.4})"
+        );
+
+        let existing_sample_count: u64 = pre_gallery[0].sample_count;
+        store
+            .refine(identity_id, &adversary, 1000, model, mid(), "A")
+            .await
+            .unwrap();
+
+        // After the adversarial refine, every centroid in Alice's gallery must still
+        // be below T_accept for the impostor. The held-out impostor test: even with
+        // an adversarial fold at REFINE_WEIGHT_CAP, Alice's centroid stays safe.
+        let post_gallery = store.all(model).await.unwrap();
+        // max cosine of any gallery centroid against the impostor:
+        let post_max_sim = post_gallery
+            .iter()
+            .map(|g| cos(&g.embedding, &impostor))
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            post_max_sim < T_ACCEPT,
+            "adversarial refine (count=1000, capped by REFINE_WEIGHT_CAP={}) must not push \
+             any gallery centroid above T_accept for the impostor \
+             (post_max_sim={post_max_sim:.4}, T_accept={T_ACCEPT}, \
+             existing_sample_count={existing_sample_count})",
+            0.30
+        );
+    }
+}

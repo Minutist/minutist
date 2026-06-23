@@ -830,6 +830,14 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
             tracing::info!(target: "app-main", "meeting index opened");
 
+            // Open the voiceprint library (`voiceprints.db`). A corruption or
+            // migration failure degrades enrolment to OFF (the helper returns
+            // `Arc::new(None)`) and never blocks startup — mirrors the index
+            // rebuild above in that failures are logged and swallowed.
+            let voiceprints = ipc_bridge::open_voiceprints(&data_roots.index_db);
+
+            tracing::info!(target: "app-main", "voiceprints store opened");
+
             // Spawn the event forwarder so orchestrator events reach the webview.
             spawn_event_forwarder(orchestrator.clone(), app_handle.clone());
 
@@ -991,6 +999,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 logs_dir: logs_dir.clone(),
                 app_version: app_handle.package_info().version.to_string(),
                 platform: platform_string(),
+                voiceprints,
             });
 
             // Log the GPU probe + the resolved default plan at startup so the

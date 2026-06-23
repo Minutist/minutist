@@ -180,6 +180,28 @@ export const commands: Commands = {
   syncGetMyTicket: () => callCommand("syncGetMyTicket", []),
   syncAddPeer: (ticket) => callCommand("syncAddPeer", [ticket]),
   syncNow: (meetingId) => callCommand("syncNow", [meetingId]),
+  // Issue #0003 voiceprint correction path (§2.4). `rejectMatch` clears the
+  // speaker-name overlay for a label in a meeting and drops the contributing
+  // (meeting, label) observation from the identity's gallery, so a rejected
+  // match does not bias future identifications. `clearAllVoiceprints` is the
+  // §4 privacy right-to-erasure path. Both are best-effort: a missing store
+  // (enrolment OFF) is a silent no-op on the Rust side.
+  rejectMatch: (meetingId, label, identityId, modelId) =>
+    callCommand("rejectMatch", [meetingId, label, identityId, modelId]),
+  clearAllVoiceprints: () => callCommand("clearAllVoiceprints", []),
+  // Issue #0003 WU8 — identity management commands. `listVoiceprints` returns
+  // every enrolled identity with per-condition gallery metadata (no embedding
+  // bytes — §2.2). The mutation commands (rename / delete / merge / forget) are
+  // best-effort no-ops when the store is degraded-to-off.
+  listVoiceprints: () => callCommand("listVoiceprints", []),
+  mergeVoiceprintIdentities: (keepId, mergedId) =>
+    callCommand("mergeVoiceprintIdentities", [keepId, mergedId]),
+  renameVoiceprintIdentity: (identityId, newName) =>
+    callCommand("renameVoiceprintIdentity", [identityId, newName]),
+  deleteVoiceprintIdentity: (identityId) =>
+    callCommand("deleteVoiceprintIdentity", [identityId]),
+  forgetMeetingVoiceprints: (meetingId) =>
+    callCommand("forgetMeetingVoiceprints", [meetingId]),
 };
 
 // Re-export types that callers commonly need. `AppEvent` is the generated

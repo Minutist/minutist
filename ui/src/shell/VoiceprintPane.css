@@ -1,0 +1,187 @@
+/*
+ * Editorial Ink — voiceprint management pane.
+ *
+ * Rendered as a section inside the SettingsDrawer; reuses the group/field/hint
+ * tokens from SettingsDrawer.css and the btn tokens from TranscriptPane.css.
+ * Only introduces layout rules that aren't already covered by the parent.
+ */
+
+.vp-pane__error {
+  margin: 0;
+  padding: 0.4rem 0.7rem;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: var(--radius);
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+.vp-pane__hint {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--ink-faint);
+  line-height: 1.4;
+}
+
+.vp-pane__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.vp-pane__identity {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.7rem;
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+}
+
+.vp-pane__checkbox {
+  flex: none;
+  accent-color: var(--accent);
+}
+
+.vp-pane__identity-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.vp-pane__name {
+  font-weight: 500;
+  color: var(--ink);
+  font-size: 0.9rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.vp-pane__meta {
+  font-size: 0.75rem;
+  color: var(--ink-faint);
+}
+
+.vp-pane__actions {
+  flex: none;
+  display: flex;
+  gap: 0.4rem;
+}
+
+/* --- Rename form ---------------------------------------------------------- */
+
+.vp-pane__rename-form {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.vp-pane__rename-input {
+  font-family: var(--font-text);
+  font-size: 0.85rem;
+  padding: 0.22rem 0.5rem;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  background: var(--sheet);
+  color: var(--ink);
+  min-width: 8rem;
+}
+
+/* --- Toolbar -------------------------------------------------------------- */
+
+.vp-pane__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+/* --- Confirm box ---------------------------------------------------------- */
+
+.vp-pane__confirm-box {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.85rem;
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+}
+
+.vp-pane__confirm-title {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--ink);
+}
+
+.vp-pane__confirm-names {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.vp-pane__radio-label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.85rem;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.vp-pane__confirm-btns {
+  display: flex;
+  gap: 0.4rem;
+}
+
+/* --- Buttons -------------------------------------------------------------- */
+
+.vp-pane__btn {
+  font-family: var(--font-text);
+  font-size: 0.78rem;
+  padding: 0.25rem 0.65rem;
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
+  white-space: nowrap;
+}
+
+.vp-pane__btn:hover {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
+.vp-pane__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.vp-pane__btn--primary {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.vp-pane__btn--primary:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.vp-pane__btn--danger {
+  color: color-mix(in srgb, var(--accent) 70%, var(--ink-soft));
+}
+
+.vp-pane__btn--danger:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}

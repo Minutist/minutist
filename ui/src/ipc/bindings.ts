@@ -756,6 +756,135 @@ async getTranslations(meetingId: MeetingId, targetLanguage: string) : Promise<Re
 }
 },
 /**
+ * Reject a speaker-identity match for a specific meeting and label.
+ * 
+ * This is the §2.4 correction path: when the user indicates "this isn't
+ * them" for an auto-applied or confirmed name, this command (a) clears the
+ * `speaker_names` entry for `label` in `meeting_id` (the label reverts to
+ * its bare diarizer letter) and (b) drops the `(meeting_id, label)`
+ * contribution from `identity_id`'s gallery, recomputing the affected
+ * centroid so the rejected observation no longer influences future matches.
+ * 
+ * Silently succeeds when `voiceprint_enrolment_enabled` is OFF or when no
+ * `VoiceprintStore` is open (degraded-to-off at startup). Errors from the
+ * store or the name-clear are propagated to the caller.
+ * 
+ * The `model_id` parameter identifies which embedding model the identity
+ * belongs to (required to look up the gallery; use the active model id,
+ * e.g. `runner::DIARIZE_EMB_MODEL_ID`). Passing the wrong `model_id`
+ * results in a no-op contribution drop (the gallery lookup returns no rows
+ * for that model).
+ */
+async rejectMatch(meetingId: MeetingId, label: string, identityId: VoiceprintIdentityId, modelId: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reject_match", { meetingId, label, identityId, modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Clear the entire voiceprint library (§4 privacy — right to erasure).
+ * 
+ * Deletes every identity, centroid, and contribution from `voiceprints.db`.
+ * This is the local clear; a full erasure across synced peers is a separate
+ * operation (see §4 design — the E2E sync path must also purge replicas).
+ * 
+ * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
+ * Always succeeds on an already-empty library (idempotent).
+ */
+async clearAllVoiceprints() : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_all_voiceprints") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Return every enrolled speaker identity with per-condition gallery summaries.
+ * 
+ * Returns all identities regardless of embedding model (so the management UI
+ * can display and delete identities from previous models). Silently returns an
+ * empty list when the `VoiceprintStore` is not open (degraded-to-off).
+ */
+async listVoiceprints() : Promise<Result<VoiceprintIdentityInfo[], IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_voiceprints") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Merge two speaker identities: re-home every centroid from `merged_id` to
+ * `keep_id`, cap-and-merge the resulting gallery, then delete `merged_id`.
+ * 
+ * The caller's UI is responsible for showing a confirmation (including a
+ * "which name survives" choice — it must have renamed `keep_id` before
+ * calling if the desired name differs). This operation is not reversible
+ * once cap-and-merge collapses contributions.
+ * 
+ * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
+ */
+async mergeVoiceprintIdentities(keepId: VoiceprintIdentityId, mergedId: VoiceprintIdentityId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("merge_voiceprint_identities", { keepId, mergedId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Rename a speaker identity's display name.
+ * 
+ * The new name is trimmed of whitespace; passing a blank name is an error.
+ * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
+ */
+async renameVoiceprintIdentity(identityId: VoiceprintIdentityId, newName: string) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rename_voiceprint_identity", { identityId, newName }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Delete one speaker identity and all its centroids and contributions.
+ * 
+ * This is the per-identity variant of `clear_all_voiceprints`. The deleted
+ * identity's data cannot be recovered.
+ * 
+ * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
+ */
+async deleteVoiceprintIdentity(identityId: VoiceprintIdentityId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_voiceprint_identity", { identityId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Purge all voiceprint contributions from a deleted meeting, recomputing
+ * affected centroids, dropping zero-contribution centroids, and dropping
+ * zero-centroid identities (§4 meeting-granularity erasure — issue #0003).
+ * 
+ * Must be called by `delete_meeting` (or any path that removes a meeting)
+ * so the voiceprint library does not retain acoustic traces from meetings
+ * whose audio the user has deleted.
+ * 
+ * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
+ */
+async forgetMeetingVoiceprints(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("forget_meeting_voiceprints", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Assemble the diagnostic report (#0014). See the module docs for the source
  * priority (`last-crash.txt` then the rolling log tail) and the privacy
  * invariant.
@@ -1144,7 +1273,19 @@ export type AppEvent =
  * string the UI surfaces in a notification; the sync continues for other
  * meetings.
  */
-{ kind: "sync_error"; context: string }
+{ kind: "sync_error"; context: string } | 
+/**
+ * One or more diarizer labels landed in the uncertain match band
+ * (`T_reject <= sim < T_accept` — §2.4) after a diarisation pass. The
+ * webview shows an "is this \<name\>?" affordance for each suggestion so the
+ * user can confirm or dismiss. A confirmed suggestion applies the name via
+ * `set_speaker_name`; a dismissal calls `reject_match`. Unconfirmed
+ * suggestions leave the label as the bare diariser letter.
+ * 
+ * Only emitted when `voiceprint_enrolment_enabled` is ON and the gallery
+ * returns at least one uncertain-band candidate.
+ */
+{ kind: "voiceprint_suggestions"; meeting_id: MeetingId; suggestions: VoiceprintSuggestion[] }
 /**
  * Typed wrapper that gives `AppEvent` a stable tauri-specta event name.
  * 
@@ -1234,6 +1375,13 @@ export type AudioFormat = { codec: string; sample_rate: number; channels: number
  * compute alongside capture.
  */
 export type AudioMeterFrame = { peak: number; rms: number }
+/**
+ * One per-centroid summary returned by `list_voiceprints`.
+ * 
+ * No embedding vectors — safe for IPC (§2.2: embedding bytes must not cross
+ * the IPC boundary).
+ */
+export type CentroidInfo = { centroidId: string; sampleCount: number; conditionLabel: string | null }
 /**
  * One persisted chat message (the wire / on-disk shape).
  * 
@@ -1880,6 +2028,18 @@ llm_model_id?: ModelId | null;
  */
 diarization_enabled?: boolean; 
 /**
+ * Whether the voiceprint enrolment flow is active (issue #0003).
+ * 
+ * Enrolment is an explicit, opt-in, per-speaker operation: when `true`,
+ * renaming a speaker in the UI triggers `Orchestrator::enrol_voiceprint`,
+ * which extracts a CAM++ centroid from clean segments for that label and
+ * stores it in `voiceprints.db`. Default `false` satisfies the
+ * collection-time consent obligation (BIPA / GDPR Art. 9 — no voiceprint
+ * is created without an explicit user opt-in). An older store written
+ * before this field existed deserialises to `false` via `#[serde(default)]`.
+ */
+voiceprint_enrolment_enabled?: boolean; 
+/**
  * Whether the first-run onboarding flow has been completed (Phase 7).
  * 
  * The webview gates the main UI behind this: `false` shows the onboarding
@@ -2258,6 +2418,53 @@ export type TunnelStatus =
  * revoked (or rotated). The user must re-pair; the loop is not retrying.
  */
 "needs_repair"
+/**
+ * Stable identifier for a speaker identity in the voiceprint library. UUIDv4.
+ * Mirrors [`MeetingId`].
+ * 
+ * A `VoiceprintIdentityId` is assigned once on first enrolment and survives
+ * renames and merges — it is the stable primary key for the
+ * `voiceprint_identity` table in `{app-data}/voiceprints.db` (owned by
+ * `persistence`). Never placed in `Segment`; the diarizer label-to-name
+ * resolution at read time uses display names, not this id.
+ * 
+ * Adding this type is a one-way-door architecture-owner change
+ * (see `architecture/domain-ownership.md` — Parallel-work rules §2).
+ */
+export type VoiceprintIdentityId = string
+/**
+ * One identity with its gallery, returned by `list_voiceprints`.
+ */
+export type VoiceprintIdentityInfo = { identityId: VoiceprintIdentityId; displayName: string; modelId: string; centroids: CentroidInfo[] }
+/**
+ * One uncertain-band voiceprint suggestion emitted on
+ * [`AppEvent::VoiceprintSuggestions`] (§2.4 — `T_reject <= sim < T_accept`).
+ * 
+ * Carries everything the UI needs to show "is this \<display_name\>?" and to
+ * confirm (`set_speaker_name`) or dismiss (`reject_match`) the suggestion.
+ */
+export type VoiceprintSuggestion = { 
+/**
+ * The diariser letter that received the uncertain match (e.g. `"A"`).
+ */
+label: string; 
+/**
+ * Display name of the matched identity.
+ */
+display_name: string; 
+/**
+ * Stable identity id — passed to `reject_match` when the user dismisses.
+ */
+identity_id: VoiceprintIdentityId; 
+/**
+ * The embedding model id — also passed to `reject_match`.
+ */
+model_id: string; 
+/**
+ * The cosine similarity (for optional display; not used by the matching
+ * logic on the UI side).
+ */
+similarity: number }
 /**
  * Optional per-word timestamp data when the ASR model supports it.
  */

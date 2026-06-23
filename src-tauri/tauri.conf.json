@@ -19,7 +19,8 @@
         "resizable": true,
         "decorations": true,
         "closable": true,
-        "visible": true
+        "visible": true,
+        "dragDropEnabled": false
       }
     ],
     "security": {

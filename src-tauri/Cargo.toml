@@ -79,3 +79,9 @@ async-trait = { workspace = true, optional = true }
 [dev-dependencies]
 # Unit tests for the connected tunnel module (credential 0600 round-trip).
 tempfile = "3"
+# E2E test for the connected sync module (`sync.rs`): seeds meetings on disk and
+# projects the converged notes/media for comparison, mirroring the engine-level
+# `crates/sync/tests/{relay_live,blobs_live}.rs`. Test-only — app-main's
+# production code reaches `persistence` through `ipc-bridge`, never directly, so
+# this dev-dependency adds no runtime edge to the dependency table.
+persistence = { path = "../crates/persistence" }

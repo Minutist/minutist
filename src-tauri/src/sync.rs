@@ -302,3 +302,328 @@ fn resolve_relay_token(_settings: &SettingsHandle) -> Option<String> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end coverage of the connected-tier `SyncControl` glue
+    //! (`ConnectedSync`) through the DEPLOYED relay (`sync.minutist.ai`).
+    //!
+    //! This module compiles only under the `connected` feature (the whole `sync`
+    //! module is `#[cfg(feature = "connected")]`), so it is connected-gated by
+    //! construction. Where the engine-level `crates/sync/tests/{relay_live,
+    //! blobs_live}.rs` drive `SyncEngine` directly, these tests exercise the
+    //! app-main lifecycle and the exact methods the Tauri commands delegate to:
+    //! two real [`ConnectedSync`] instances, paired and reconciled THROUGH the
+    //! [`SyncControl`] trait (`my_ticket` / `add_peer` / `sync_now` / `status`),
+    //! proving the IPC surface plus the `SyncReady`/`SyncProgress` bus events on
+    //! top of the engine-level coverage.
+    //!
+    //! GATED: skips (with an `eprintln!`) unless `MINUTIST_SYNC_TOKEN` is set, so
+    //! a normal `cargo test` and CI never touch the network. The `sync` module is
+    //! declared in `main.rs`, so these live in the BINARY's test target (the `lib`
+    //! is a Tauri stub); target the binary to run them:
+    //!
+    //! ```sh
+    //! MINUTIST_SYNC_TOKEN=<relay-access-token> \
+    //!   cargo test -p minutist --bin minutist sync::tests -- --nocapture
+    //! ```
+    //!
+    //! ## Engine startup in a `#[tokio::test]`
+    //!
+    //! These tests drive the REAL [`ConnectedSync::new`], which spawns startup via
+    //! [`tauri::async_runtime::spawn`]. That call lazily initialises Tauri's OWN
+    //! multi-threaded tokio runtime (a `OnceLock<GlobalRuntime>`), independent of
+    //! the test's `#[tokio::test]` runtime, so the spawned `start_engine` future
+    //! runs and binds the iroh endpoint even though the test runtime is
+    //! current-thread. The test observes the bind by polling [`SyncControl::status`]
+    //! (which only locks the `Arc<Mutex<Runtime>>` the spawned task updates) until
+    //! it reads [`SyncStatus::Idle`], with a 20 s timeout — so no awaited-start
+    //! fallback was needed.
+
+    use std::path::Path;
+    use std::time::Duration;
+
+    use super::*;
+    use minutist_common::MeetingId;
+    use persistence::{save_note_asset, MeetingFolder, NotesStore};
+    use settings::{JsonFileStore, SettingsHandle};
+
+    /// How long to wait for a freshly-built `ConnectedSync`'s background engine
+    /// startup (identity load + token-gated relay bind) to reach `Idle`.
+    const BIND_TIMEOUT: Duration = Duration::from_secs(20);
+    /// Outer guard on a `sync_now` so a relay failure surfaces as a test failure
+    /// (timeout) rather than a hang.
+    const SYNC_NOW_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Read the live relay token from the gating env var, or `None` to skip.
+    fn relay_token() -> Option<String> {
+        match std::env::var(RELAY_TOKEN_ENV) {
+            Ok(t) if !t.is_empty() => Some(t),
+            _ => None,
+        }
+    }
+
+    /// A handle to a built `ConnectedSync` plus its event receiver and the temp
+    /// dirs that must outlive it (dropping a `TempDir` deletes its contents).
+    struct Device {
+        sync: Arc<ConnectedSync>,
+        events: broadcast::Receiver<AppEvent>,
+        /// The app-data BASE (holds the device key); kept alive for the test.
+        _app_data: tempfile::TempDir,
+        /// The meetings root (`{uuid}` folders); seeded and projected against.
+        meetings: tempfile::TempDir,
+    }
+
+    impl Device {
+        fn meetings_root(&self) -> &Path {
+            self.meetings.path()
+        }
+    }
+
+    /// Build a `SettingsHandle` with `connector_enabled = true` (the gate
+    /// `ConnectedSync::new` checks before it spawns startup). The store is a real
+    /// `JsonFileStore` over a tempdir-rooted path; the field defaults to `false`,
+    /// so it is flipped through the handle's `update` API (mirroring the field the
+    /// `settings` unit test at `crates/settings/src/lib.rs` sets) rather than by
+    /// hand-writing a settings file.
+    async fn connector_enabled_settings(app_data_base: &Path) -> SettingsHandle {
+        let store = JsonFileStore::new(app_data_base.join("settings.store"));
+        let handle = SettingsHandle::new(store).expect("build settings handle");
+        handle
+            .update(|s| s.connector_enabled = true)
+            .await
+            .expect("enable connector");
+        assert!(
+            handle.current().connector_enabled,
+            "settings handle must report the connector enabled"
+        );
+        handle
+    }
+
+    /// Build a real `ConnectedSync` (engine startup spawned via
+    /// `tauri::async_runtime::spawn`) with distinct `app_data_base` / `meetings`
+    /// tempdirs and a fresh `broadcast::channel(256)` whose receiver is retained
+    /// for event assertions, then poll `status()` until the background bind
+    /// reaches `Idle` (or fail on `Error` / the bind timeout). The relay defaults
+    /// to `SyncConfig::DEFAULT_RELAY_URL`; the token comes from
+    /// `MINUTIST_SYNC_TOKEN` via the production `resolve_relay_token` path.
+    async fn bound_device() -> Device {
+        let app_data = tempfile::TempDir::new().expect("app-data tempdir");
+        let meetings = tempfile::TempDir::new().expect("meetings tempdir");
+        let settings = connector_enabled_settings(app_data.path()).await;
+        let (event_tx, events) = broadcast::channel(256);
+
+        let sync = ConnectedSync::new(
+            settings,
+            event_tx,
+            app_data.path().to_path_buf(),
+            meetings.path().to_path_buf(),
+        );
+
+        let deadline = tokio::time::Instant::now() + BIND_TIMEOUT;
+        loop {
+            match sync.status().await {
+                SyncStatus::Idle => break,
+                SyncStatus::Error { message } => panic!("engine failed to bind: {message}"),
+                _ => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("engine did not reach Idle within {BIND_TIMEOUT:?}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+
+        Device {
+            sync,
+            events,
+            _app_data: app_data,
+            meetings,
+        }
+    }
+
+    /// The seed note's ProseMirror doc and its marker text.
+    fn seed_doc(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "doc",
+            "content": [{ "type": "paragraph",
+                "content": [{ "type": "text", "text": text }] }]
+        })
+    }
+
+    /// Project a meeting's authoritative `notes.ydoc` to ProseMirror JSON via
+    /// public `persistence` APIs, so two devices' converged state can be compared
+    /// independent of v1 encoding details (mirrors `relay_live.rs::projected`).
+    fn projected(root: &Path, meeting: MeetingId) -> serde_json::Value {
+        let v1 = NotesStore::read_ydoc_state(root, meeting)
+            .expect("read ydoc state")
+            .expect("meeting has a notes.ydoc");
+        let doc = persistence::ydoc::new_ydoc();
+        persistence::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
+        persistence::ydoc::ydoc_to_json(&doc)
+    }
+
+    /// Drain a receiver and report whether a `SyncReady` for `meeting` was seen.
+    /// Non-blocking: `sync_now` has already published all its events by the time
+    /// it returns, so every buffered event is present in the channel.
+    fn drained_sync_ready(rx: &mut broadcast::Receiver<AppEvent>, meeting: MeetingId) -> bool {
+        let mut seen = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let AppEvent::SyncReady { meeting_id } = ev {
+                if meeting_id == meeting {
+                    seen = true;
+                }
+            }
+        }
+        seen
+    }
+
+    /// Two paired `ConnectedSync`s reconcile a meeting (notes + media) through the
+    /// deployed relay, driven entirely through the `SyncControl` trait — the exact
+    /// methods the `sync_get_my_ticket` / `sync_add_peer` / `sync_now` commands
+    /// delegate to. Proves: pairing via tickets, notes convergence, byte-identical
+    /// media, and the `SyncReady` bus event on the initiator.
+    #[tokio::test]
+    async fn connected_sync_e2e_through_the_relay() {
+        let Some(_token) = relay_token() else {
+            eprintln!(
+                "SKIP connected_sync_e2e_through_the_relay: set MINUTIST_SYNC_TOKEN to run the live relay test"
+            );
+            return;
+        };
+        eprintln!(
+            "connected_sync_e2e: using relay {}",
+            SyncConfig::DEFAULT_RELAY_URL
+        );
+
+        let device_a = bound_device().await;
+        let device_b = bound_device().await;
+
+        // Mutual pairing THROUGH the trait: each side adds the other's ticket via
+        // `my_ticket` + `add_peer`. Sync requires it — B's accept side rejects an
+        // inbound connection from an unpaired peer, so A must be in B's directory
+        // (and vice versa) for the reconciliation below to be served.
+        let ticket_a = device_a.sync.my_ticket().await.expect("A ticket");
+        let ticket_b = device_b.sync.my_ticket().await.expect("B ticket");
+        device_a.sync.add_peer(ticket_b).await.expect("A pairs B");
+        device_b.sync.add_peer(ticket_a).await.expect("B pairs A");
+
+        // Let both endpoints home to the relay (the token-gated relay handshake)
+        // before the first dial.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Seed a meeting on A: notes (first write, no existing `notes.ydoc`) plus a
+        // synthetic `audio.opus` and one note asset, so the media phase of
+        // `sync_now` has content to reconcile. B holds nothing for this meeting.
+        let meeting = MeetingId::new();
+        let marker = "hello through ConnectedSync over the relay";
+        let json = seed_doc(marker);
+        MeetingFolder::ensure(device_a.meetings_root(), meeting).expect("ensure A meeting folder");
+        NotesStore::save(device_a.meetings_root(), meeting, &json, marker).expect("seed A notes");
+        let audio = b"OggS-synthetic-opus-payload-connected-sync".repeat(128);
+        std::fs::write(
+            device_a
+                .meetings_root()
+                .join(meeting.0.to_string())
+                .join("audio.opus"),
+            &audio,
+        )
+        .expect("seed A audio.opus");
+        let asset_bytes = b"\x89PNG\r\n\x1a\nsynthetic-asset-connected-sync".repeat(32);
+        let asset_name = save_note_asset(device_a.meetings_root(), meeting, &asset_bytes, "png")
+            .expect("seed A asset");
+        eprintln!(
+            "connected_sync_e2e: seeded A notes + audio={} bytes + asset {} ({} bytes)",
+            audio.len(),
+            asset_name,
+            asset_bytes.len()
+        );
+
+        // A reconciles the meeting against every paired peer (here, B) through the
+        // trait's `sync_now` — notes then media — under a 60 s guard so a relay
+        // failure is a timeout, not a hang.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(SYNC_NOW_TIMEOUT, device_a.sync.sync_now(meeting))
+            .await
+            .expect("sync_now timed out")
+            .expect("sync_now failed");
+        eprintln!(
+            "connected_sync_e2e: sync_now completed in {:?}",
+            started.elapsed()
+        );
+
+        // B must now hold A's notes, equal at the projection level.
+        let a_json = projected(device_a.meetings_root(), meeting);
+        let b_json = projected(device_b.meetings_root(), meeting);
+        assert_eq!(a_json, b_json, "B must converge to A's notes via the relay");
+        assert!(
+            serde_json::to_string(&b_json).unwrap().contains(marker),
+            "B's converged note must carry the seeded marker text"
+        );
+
+        // B must hold A's audio byte-for-byte.
+        let b_audio = std::fs::read(
+            device_b
+                .meetings_root()
+                .join(meeting.0.to_string())
+                .join("audio.opus"),
+        )
+        .expect("B must have audio.opus after sync_now");
+        assert_eq!(
+            b_audio, audio,
+            "B's audio must be byte-identical to A's after sync_now"
+        );
+
+        // B must hold A's asset byte-for-byte under the same portable filename.
+        let b_asset = persistence::read_note_asset(device_b.meetings_root(), meeting, &asset_name)
+            .expect("B must have the asset after sync_now");
+        assert_eq!(
+            b_asset, asset_bytes,
+            "B's asset must be byte-identical to A's after sync_now"
+        );
+
+        // A's event bus must carry a `SyncReady` for this meeting (the success
+        // terminal `sync_now` publishes). The receiver was retained from this
+        // device's construction, so it holds every event published since — drain
+        // it and look for the terminal `SyncReady`.
+        let mut device_a = device_a;
+        assert!(
+            drained_sync_ready(&mut device_a.events, meeting),
+            "A's bus must carry a SyncReady for the meeting after a successful sync_now"
+        );
+
+        eprintln!("connected_sync_e2e: PASS — converged through the relay via SyncControl");
+    }
+
+    /// A lone `ConnectedSync` with no paired peers: `sync_now` takes the
+    /// peer-empty branch — `Ok(())` plus a `SyncReady` on the bus — rather than
+    /// erroring. The engine still binds to the relay (gated), so this also
+    /// exercises the bind path with the connector enabled.
+    #[tokio::test]
+    async fn sync_now_with_no_peers_reports_ready() {
+        let Some(_token) = relay_token() else {
+            eprintln!(
+                "SKIP sync_now_with_no_peers_reports_ready: set MINUTIST_SYNC_TOKEN to run the live relay test"
+            );
+            return;
+        };
+
+        let mut device = bound_device().await;
+
+        let meeting = MeetingId::new();
+        let marker = "lone device note";
+        MeetingFolder::ensure(device.meetings_root(), meeting).expect("ensure meeting folder");
+        NotesStore::save(device.meetings_root(), meeting, &seed_doc(marker), marker)
+            .expect("seed notes");
+
+        tokio::time::timeout(SYNC_NOW_TIMEOUT, device.sync.sync_now(meeting))
+            .await
+            .expect("sync_now timed out")
+            .expect("sync_now (no peers) must be Ok");
+
+        assert!(
+            drained_sync_ready(&mut device.events, meeting),
+            "the peer-empty sync_now must publish a SyncReady for the meeting"
+        );
+    }
+}

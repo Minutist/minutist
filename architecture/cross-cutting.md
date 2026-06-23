@@ -1141,20 +1141,22 @@ Each public manifest function takes the per-meeting lock for the whole RMW (read
 the file, mutate, write atomically via tmp + fsync + rename). The RMW is
 synchronous `std::fs` on `spawn_blocking`, matching `chat.rs` and `assets.rs`.
 
-### `meetingdoc:` URI scheme
+### Opening an attachment original (host hand-off)
 
-Attachment originals are served to the frontend via a `meetingdoc:` custom-URI
-scheme, mirroring `meetingasset:` for note images. `app-main` registers
-`register_uri_scheme_protocol("meetingdoc", handler)` alongside the existing
-`meetingasset` handler. The handler delegates to `ipc_bridge::resolve_meeting_doc`
-(which joins `attachments/` + applies the `is_safe_asset_filename` traversal guard)
-and returns an empty 404 on any validation or read failure. The frontend builds
-`convertFileSrc("<meeting_id>/<hash>.<ext>", "meetingdoc")` and opens the file via
-`tauri-plugin-opener` (the OS opens the file in the user's default application).
+"Open" hands an attachment original to the HOST OS default application — the
+user's PDF reader / Word / Excel / image viewer — NOT a webview navigation or a
+custom-URI render. The `open_attachment` command (`ipc-bridge`) resolves the
+stored original's on-disk path via `persistence::attachment_original_path` (which
+applies the path-traversal guard) and passes it to `tauri-plugin-opener`'s Rust
+API (`app.opener().open_path`). The open happens server-side, so no filesystem
+path crosses the IPC boundary and no opener capability scope is needed (the
+capability system gates only JS-invoked commands, not the Rust manager API). The
+originals are real files (content-addressed `attachments/<hash>.<ext>`), so no
+temp file is written.
 
-The `content_type_for` map in `ipc-bridge` is extended to cover attachment MIME
-types (`application/pdf`, `application/vnd.ms-excel`, etc.) alongside the existing
-image types.
+There is no custom URI scheme for attachments: opening is a host hand-off, not a
+webview fetch. (Note images still use the separate `meetingasset:` scheme for
+inline `<img>` display — a different need.)
 
 ### Attachments — parser sandboxing (binding)
 

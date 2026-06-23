@@ -333,19 +333,16 @@ async listAttachments(meetingId: MeetingId) : Promise<Result<AttachmentEntry[], 
 }
 },
 /**
- * Validate that an attachment original is openable through the `meetingdoc:`
- * scheme.
+ * Open an attachment original in the HOST OS default application.
  * 
- * The original is served (REUSING the note-image custom-URI machinery) via the
- * sibling `meetingdoc:` scheme: the frontend builds
- * `convertFileSrc(<meeting_id>/<hash>.<ext>, MEETING_DOC_SCHEME)` and opens that
- * URL with `tauri-plugin-opener`; the `app-main` protocol handler resolves it
- * through [`crate::resolve_meeting_doc`] (same traversal guard + 404-on-failure
- * shape as `resolve_note_asset`, but joining `attachments/`). This command holds
- * the `persistence` edge `app-main` lacks, so it does the manifest lookup and
- * confirms the attachment exists; it returns no bytes and writes no temp file.
- * The frontend has the `<hash>.<ext>` filename on its [`AttachmentEntry`] from
- * `add_attachment` / `list_attachments`, so the URL is built webview-side.
+ * The stored original (`attachments/<hash>.<ext>`) is a real file on disk, so
+ * it is handed to the platform opener (`tauri-plugin-opener`) — the OS launches
+ * the user's PDF reader / Word / Excel / image viewer for it. The open happens
+ * server-side: this command holds the `persistence` edge to resolve the path and
+ * passes it to the opener via its Rust API (so no filesystem path crosses the
+ * IPC boundary and no opener capability scope is needed). The webview only ever
+ * asks "open attachment X"; it never navigates to the file itself.
+ * 
  * An absent attachment id is `AppError::InvalidInput`.
  */
 async openAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise<Result<null, IpcError>> {

@@ -917,44 +917,48 @@ pub async fn list_attachments(
         .map_err(IpcError::from)
 }
 
-/// Validate that an attachment original is openable through the `meetingdoc:`
-/// scheme.
+/// Open an attachment original in the HOST OS default application.
 ///
-/// The original is served (REUSING the note-image custom-URI machinery) via the
-/// sibling `meetingdoc:` scheme: the frontend builds
-/// `convertFileSrc(<meeting_id>/<hash>.<ext>, MEETING_DOC_SCHEME)` and opens that
-/// URL with `tauri-plugin-opener`; the `app-main` protocol handler resolves it
-/// through [`crate::resolve_meeting_doc`] (same traversal guard + 404-on-failure
-/// shape as `resolve_note_asset`, but joining `attachments/`). This command holds
-/// the `persistence` edge `app-main` lacks, so it does the manifest lookup and
-/// confirms the attachment exists; it returns no bytes and writes no temp file.
-/// The frontend has the `<hash>.<ext>` filename on its [`AttachmentEntry`] from
-/// `add_attachment` / `list_attachments`, so the URL is built webview-side.
+/// The stored original (`attachments/<hash>.<ext>`) is a real file on disk, so
+/// it is handed to the platform opener (`tauri-plugin-opener`) — the OS launches
+/// the user's PDF reader / Word / Excel / image viewer for it. The open happens
+/// server-side: this command holds the `persistence` edge to resolve the path and
+/// passes it to the opener via its Rust API (so no filesystem path crosses the
+/// IPC boundary and no opener capability scope is needed). The webview only ever
+/// asks "open attachment X"; it never navigates to the file itself.
+///
 /// An absent attachment id is `AppError::InvalidInput`.
 #[tauri::command]
 #[specta::specta]
 pub async fn open_attachment(
     meeting_id: MeetingId,
     attachment_id: AttachmentId,
+    app: tauri::AppHandle,
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
     let meetings_dir = state.meetings_dir.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+    let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, AppError> {
         let manifest = persistence::read_manifest(&meetings_dir, meeting_id)?;
-        let exists = manifest.iter().any(|e| e.id == attachment_id);
-        if exists {
-            Ok(())
-        } else {
-            Err(AppError::InvalidInput {
+        let entry = manifest.iter().find(|e| e.id == attachment_id).ok_or_else(|| {
+            AppError::InvalidInput {
                 context: format!("attachment {attachment_id:?} not found in meeting {meeting_id:?}"),
-            })
-        }
+            }
+        })?;
+        let filename = format!("{}.{}", entry.hash, entry.ext);
+        persistence::attachment_original_path(&meetings_dir, meeting_id, &filename)
     })
     .await
     .map_err(|e| AppError::Internal {
         context: format!("open_attachment task join failed: {e}"),
-    })?
-    .map_err(IpcError::from)
+    })??;
+
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| AppError::Internal {
+            context: format!("opening attachment in the host application failed: {e}"),
+        })?;
+    Ok(())
 }
 
 /// Remove an attachment from a meeting.

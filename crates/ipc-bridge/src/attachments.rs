@@ -1,16 +1,9 @@
-//! Meeting attachments — the `meetingdoc:` custom-URI resolver and the bounded
-//! background conversion worker.
-//!
-//! ## `meetingdoc:` scheme
+//! Meeting attachments — the bounded background conversion worker.
 //!
 //! Attachment originals live under `{meetings_dir}/<uuid>/attachments/` (NOT the
 //! notes `assets/` subdir — see `architecture/cross-cutting.md`, "Attachments").
-//! [`resolve_meeting_doc`] mirrors [`crate::resolve_note_asset`] exactly — same
-//! `/<uuid>/<filename>` path shape, same path-traversal guard (delegated to
-//! `persistence`), same 404-on-any-failure posture — but joins `attachments/`
-//! instead of `assets/`. `app-main` registers a sibling protocol handler under
-//! [`MEETING_DOC_SCHEME`] alongside the `meetingasset` one and the frontend opens
-//! an original via `convertFileSrc(<uuid>/<hash>.<ext>, MEETING_DOC_SCHEME)`.
+//! Opening an original hands its on-disk path to the host OS default application
+//! (`open_attachment` → `tauri-plugin-opener`); the bytes never cross the webview.
 //!
 //! ## Conversion worker
 //!
@@ -33,125 +26,6 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::chat_runtime::ChatHandles;
 use crate::commands;
-
-// ---------------------------------------------------------------------------
-// meetingdoc: URI scheme
-// ---------------------------------------------------------------------------
-
-/// The custom URI scheme name used to serve attachment ORIGINALS to the webview.
-///
-/// A sibling of [`crate::MEETING_ASSET_SCHEME`]: `app-main` registers a protocol
-/// handler under this name, and the frontend turns a stored `<hash>.<ext>`
-/// filename into a working URL via
-/// `convertFileSrc(<meeting_id>/<filename>, MEETING_DOC_SCHEME)`. The platform
-/// URL difference (`meetingdoc://localhost/<path>` vs
-/// `http://meetingdoc.localhost/<path>`) is invisible here — both deliver the
-/// same request path to the handler.
-pub const MEETING_DOC_SCHEME: &str = "meetingdoc";
-
-/// A resolved attachment original: its bytes plus the MIME content type to serve.
-pub struct ResolvedMeetingDoc {
-    /// The original file bytes.
-    pub bytes: Vec<u8>,
-    /// The `Content-Type` for the response, inferred from the extension.
-    pub content_type: &'static str,
-}
-
-/// Resolve a `meetingdoc:` request path to an attachment original's bytes +
-/// content type.
-///
-/// The request path is `/<meeting_id>/<filename>` (as produced by
-/// `convertFileSrc(<meeting_id>/<filename>, MEETING_DOC_SCHEME)`). Mirrors
-/// [`crate::resolve_note_asset`] step-for-step:
-///
-/// 1. Splits the path into exactly `meeting_id` + `filename` (rejecting any
-///    nested segment),
-/// 2. Parses `meeting_id` as a UUID,
-/// 3. Reads the bytes via `persistence::read_attachment_original`, which applies
-///    its own path-traversal guard on `filename`,
-/// 4. Infers the `Content-Type` from the filename extension.
-///
-/// Lives here (not in `app-main`) so the `persistence` dependency edge stays
-/// inside `ipc-bridge`. `app-main` calls this from its registered protocol
-/// handler and only shapes the HTTP response.
-///
-/// Returns `AppError::InvalidInput` for a malformed path / id, and surfaces the
-/// `persistence` error (traversal rejection → `InvalidInput`; missing file →
-/// `Io`) otherwise. The handler maps any error to a 404, so no detail leaks.
-pub fn resolve_meeting_doc(
-    meetings_dir: &Path,
-    request_path: &str,
-) -> Result<ResolvedMeetingDoc, AppError> {
-    // Strip the leading '/', then split into exactly two non-empty segments.
-    let trimmed = request_path.trim_start_matches('/');
-    let mut parts = trimmed.splitn(2, '/');
-    let (id_str, filename) = match (parts.next(), parts.next()) {
-        (Some(id), Some(file)) if !id.is_empty() && !file.is_empty() => (id, file),
-        _ => {
-            return Err(AppError::InvalidInput {
-                context: format!("malformed meetingdoc path: {request_path:?}"),
-            })
-        }
-    };
-    // `filename` must be a single segment — no further '/'.
-    if filename.contains('/') {
-        return Err(AppError::InvalidInput {
-            context: format!("meetingdoc path has nested segments: {request_path:?}"),
-        });
-    }
-
-    let uuid = uuid::Uuid::parse_str(id_str).map_err(|_| AppError::InvalidInput {
-        context: format!("meetingdoc path has a non-UUID meeting id: {id_str:?}"),
-    })?;
-    let meeting_id = MeetingId(uuid);
-
-    // `read_attachment_original` applies the path-traversal guard on `filename`.
-    let bytes = persistence::read_attachment_original(meetings_dir, meeting_id, filename)?;
-    let content_type = doc_content_type_for(filename);
-
-    Ok(ResolvedMeetingDoc {
-        bytes,
-        content_type,
-    })
-}
-
-/// Infer the `Content-Type` of an attachment original from its filename
-/// extension.
-///
-/// Covers the document types `doc_convert::supported_exts` accepts plus the
-/// common image types (attachments are documents, but the map degrades to
-/// `application/octet-stream` for anything unknown so the OS / webview falls back
-/// to a download). The extension set mirrors `doc_convert::supported_exts`.
-///
-/// `html`/`htm` originals are deliberately served as `text/plain` rather than
-/// `text/html`: an attachment original is untrusted reference material, and the
-/// handler serves it with `Content-Disposition: attachment` (a download, never
-/// an inline render), so the webview must never execute it as a document.
-pub(crate) fn doc_content_type_for(filename: &str) -> &'static str {
-    let ext = std::path::Path::new(filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "txt" => "text/plain; charset=utf-8",
-        "md" => "text/markdown; charset=utf-8",
-        // Served as plain text, never inline HTML — see the doc comment.
-        "html" | "htm" => "text/plain; charset=utf-8",
-        "pdf" => "application/pdf",
-        "eml" => "message/rfc822",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
-        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        // Image attachments — converted to markdown via the VLM OCR fallback,
-        // but the original is served back to the webview under its real type.
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "tiff" => "image/tiff",
-        _ => "application/octet-stream",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // GemmaVlm — the held-summariser-backed DocVlm fallback
@@ -574,73 +448,6 @@ mod tests {
     use minutist_common::AttachmentEntry;
 
     #[test]
-    fn resolve_meeting_doc_serves_saved_original_with_content_type() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        let root = tempdir.path();
-        let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
-
-        let bytes = b"%PDF-1.4 fake".to_vec();
-        let hash = persistence::save_attachment_original(root, id, &bytes, "pdf").expect("save");
-        let filename = format!("{hash}.pdf");
-
-        let path = format!("/{}/{}", id.0, filename);
-        let resolved = resolve_meeting_doc(root, &path).expect("resolve");
-        assert_eq!(resolved.bytes, bytes);
-        assert_eq!(resolved.content_type, "application/pdf");
-    }
-
-    #[test]
-    fn resolve_meeting_doc_rejects_malformed_and_traversal_paths() {
-        let tempdir = tempfile::TempDir::new().expect("tempdir");
-        let root = tempdir.path();
-        let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
-
-        for bad in ["", "/", "/only-one-segment", "/not-a-uuid/file.pdf"] {
-            assert!(
-                matches!(resolve_meeting_doc(root, bad), Err(AppError::InvalidInput { .. })),
-                "path {bad:?} should be rejected as InvalidInput"
-            );
-        }
-
-        let traversal = format!("/{}/../../etc/passwd", id.0);
-        assert!(resolve_meeting_doc(root, &traversal).is_err());
-        let nested = format!("/{}/sub/dir.pdf", id.0);
-        assert!(
-            matches!(resolve_meeting_doc(root, &nested), Err(AppError::InvalidInput { .. })),
-            "nested path should be rejected"
-        );
-    }
-
-    #[test]
-    fn doc_content_type_for_maps_known_extensions() {
-        assert_eq!(doc_content_type_for("a.pdf"), "application/pdf");
-        assert_eq!(doc_content_type_for("a.txt"), "text/plain; charset=utf-8");
-        assert_eq!(doc_content_type_for("a.md"), "text/markdown; charset=utf-8");
-        // html/htm originals are served as plain text (never inline HTML).
-        assert_eq!(doc_content_type_for("a.html"), "text/plain; charset=utf-8");
-        assert_eq!(doc_content_type_for("a.htm"), "text/plain; charset=utf-8");
-        assert_eq!(doc_content_type_for("a.eml"), "message/rfc822");
-        assert_eq!(
-            doc_content_type_for("a.xlsx"),
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        );
-        assert_eq!(
-            doc_content_type_for("a.docx"),
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        );
-        // Image attachments serve under their real type (the OCR fallback only
-        // touches the converted markdown, never the served original).
-        assert_eq!(doc_content_type_for("a.png"), "image/png");
-        assert_eq!(doc_content_type_for("a.jpg"), "image/jpeg");
-        assert_eq!(doc_content_type_for("a.jpeg"), "image/jpeg");
-        assert_eq!(doc_content_type_for("a.tiff"), "image/tiff");
-        assert_eq!(doc_content_type_for("a.bin"), "application/octet-stream");
-        assert_eq!(doc_content_type_for("noext"), "application/octet-stream");
-    }
-
-    #[test]
     fn find_mmproj_in_dir_picks_the_single_projector() {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let dir = tempdir.path();
@@ -931,49 +738,4 @@ mod tests {
         );
     }
 
-    /// `meetingdoc:` serves an original regardless of its conversion state — a
-    /// Pending or Failed conversion does not block opening the original bytes
-    /// (the conversion only produces the summariser-facing markdown sibling).
-    /// Pins the intended behaviour behind `open_attachment` / the protocol
-    /// handler, exercised here at the `resolve_meeting_doc` layer (the command
-    /// only adds a manifest-existence check on top).
-    #[test]
-    fn resolve_meeting_doc_serves_original_for_pending_and_failed_rows() {
-        for state in [
-            ConversionState::Pending,
-            ConversionState::Failed("converter blew up".to_string()),
-        ] {
-            let tempdir = tempfile::TempDir::new().expect("tempdir");
-            let root = tempdir.path();
-            let id = MeetingId::new();
-            persistence::MeetingFolder::create(root, id).expect("folder");
-
-            let bytes = b"%PDF-1.4 still openable".to_vec();
-            let hash =
-                persistence::save_attachment_original(root, id, &bytes, "pdf").expect("save");
-            persistence::add_manifest_entry(
-                root,
-                id,
-                AttachmentEntry {
-                    id: AttachmentId::new(),
-                    hash: hash.clone(),
-                    original_filename: "doc.pdf".to_string(),
-                    ext: "pdf".to_string(),
-                    byte_len: bytes.len() as u64,
-                    added_at: chrono::Utc::now().to_rfc3339(),
-                    conversion: state.clone(),
-                    converted_md_filename: None,
-                },
-            )
-            .expect("add manifest");
-
-            let path = format!("/{}/{}.pdf", id.0, hash);
-            let resolved = resolve_meeting_doc(root, &path)
-                .unwrap_or_else(|e| panic!("resolve for state {state:?} failed: {e}"));
-            assert_eq!(
-                resolved.bytes, bytes,
-                "original must open regardless of conversion state {state:?}"
-            );
-        }
-    }
 }

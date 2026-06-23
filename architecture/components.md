@@ -2809,25 +2809,25 @@ table.
   worker (see below). Returns the entry.
 - `list_attachments(meeting_id) -> Vec<AttachmentEntry>` — reads the manifest in
   order via `persistence::read_manifest`.
-- `open_attachment(meeting_id, attachment_id) -> ()` — serves the original via the
-  `meetingdoc:` custom-URI scheme (see below); the frontend builds
-  `convertFileSrc("<meeting_id>/<hash>.<ext>", "meetingdoc")` and opens it via
-  `tauri-plugin-opener` (already a workspace dep).
+- `open_attachment(meeting_id, attachment_id) -> ()` — opens the original in the
+  HOST OS default application (see below). Resolves the on-disk path via
+  `persistence::attachment_original_path` (path-traversal guard) and hands it to
+  `tauri-plugin-opener`'s Rust API (`app.opener().open_path`). `ipc-bridge`
+  depends on `tauri-plugin-opener` for this.
 - `remove_attachment(meeting_id, attachment_id) -> ()` — calls
   `persistence::remove_manifest_entry` (dedup-safe unlink inside persistence);
   emits `AppEvent::AttachmentRemoved`.
 
-**`meetingdoc:` URI scheme.** A sibling of the existing `meetingasset:` scheme
-(registered in `app-main` alongside it). `ipc-bridge` exposes
-`resolve_meeting_doc(meetings_dir, request_path) -> ResolvedMeetingDoc` +
-`MEETING_DOC_SCHEME`, mirroring `resolve_note_asset` / `MEETING_ASSET_SCHEME`
-but joining `attachments/` instead of `assets/`. The same `is_safe_asset_filename`
-path-traversal guard applies; any validation or read failure returns an empty 404.
-`content_type_for` is extended to cover the attachment MIME types (`pdf`,
-`xlsx`/`ods`, `eml`, `pptx`, etc.) alongside the existing image types. The `app-main`
-handler reads `meetings_dir` from `IpcState` and delegates parse + read to
-`ipc_bridge::resolve_meeting_doc` — `app-main` does not depend on `persistence`
-directly (same architecture as the `meetingasset:` handler).
+**Opening an original (host hand-off).** "Open" launches the user's default
+application for the file (PDF reader / Word / Excel / image viewer), NOT a webview
+navigation. `open_attachment` runs server-side: it resolves the stored original's
+absolute path (`attachments/<hash>.<ext>`, a real content-addressed file) and
+calls `app.opener().open_path`. Because the open uses the opener Rust API rather
+than a JS-invoked command, no opener capability scope is required and no filesystem
+path crosses the IPC boundary; no temp file is written. There is no attachment
+custom-URI scheme — note images keep the separate `meetingasset:` scheme for
+inline `<img>` display, but attachments are opened on the host, not fetched by the
+webview.
 
 **Bounded conversion worker (binding).** `IpcState` gains
 `attachment_convert_tx: tokio::sync::mpsc::Sender<ConvertJob>` (bounded — no

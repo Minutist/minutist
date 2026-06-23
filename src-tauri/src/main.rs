@@ -687,15 +687,6 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
         // an empty 404 (no detail leaks). See architecture/cross-cutting.md —
         // "Note image assets".
         .register_uri_scheme_protocol(ipc_bridge::MEETING_ASSET_SCHEME, serve_note_asset)
-        // Attachment-original protocol (`meetingdoc:`). A sibling of the
-        // `meetingasset:` scheme above that serves an attachment ORIGINAL's bytes
-        // from `{meetings_dir}/<uuid>/attachments/<file>` (#0016). The webview
-        // builds `convertFileSrc(<uuid>/<hash>.<ext>, "meetingdoc")` and opens it
-        // to view/download the original. All parsing + the path-traversal guard
-        // live in `ipc_bridge::resolve_meeting_doc` (the same shape as
-        // `resolve_note_asset`, joining `attachments/`); this handler only shapes
-        // the HTTP response, 404-ing on ANY failure so no detail leaks.
-        .register_uri_scheme_protocol(ipc_bridge::MEETING_DOC_SCHEME, serve_meeting_doc)
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // Mount events first so the event channel is ready before any
@@ -1292,58 +1283,6 @@ fn serve_note_asset(
                 target: "app-main",
                 path = %request.uri().path(),
                 "meetingasset request rejected: {e}"
-            );
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Vec::new())
-                .unwrap_or_else(|_| Response::new(Vec::new()))
-        }
-    }
-}
-
-/// Handle a `meetingdoc:` URI-scheme request: serve an attachment ORIGINAL's
-/// bytes from the meeting's `attachments/` directory (#0016).
-///
-/// The request URI path is `/<meeting_id>/<filename>` (as produced by
-/// `convertFileSrc(<meeting_id>/<filename>, "meetingdoc")` on the frontend). A
-/// sibling of [`serve_note_asset`]: all parsing + validation + the
-/// path-traversal guard live in `ipc_bridge::resolve_meeting_doc` (which owns the
-/// `persistence` edge); this handler only shapes the HTTP response (a `200` with
-/// the inferred `Content-Type`, or an empty `404` on ANY failure so no detail
-/// leaks).
-fn serve_meeting_doc(
-    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
-    request: tauri::http::Request<Vec<u8>>,
-) -> tauri::http::Response<Vec<u8>> {
-    use tauri::http::{header, Response, StatusCode};
-
-    let meetings_dir = {
-        let state = ctx.app_handle().state::<IpcState>();
-        state.meetings_dir.clone()
-    };
-
-    match ipc_bridge::resolve_meeting_doc(&meetings_dir, request.uri().path()) {
-        Ok(doc) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, doc.content_type)
-            // Attachment originals are untrusted reference material — serve them
-            // as a download, never an inline render, so the webview cannot be
-            // coerced into executing one (e.g. a hostile `.html` original). Pairs
-            // with `doc_content_type_for` remapping html/htm → text/plain.
-            .header(header::CONTENT_DISPOSITION, "attachment")
-            // The original is immutable (content-addressed filename), so it is
-            // safe for the webview to cache aggressively.
-            .header(
-                header::CACHE_CONTROL,
-                "private, max-age=31536000, immutable",
-            )
-            .body(doc.bytes)
-            .unwrap_or_else(|_| Response::new(Vec::new())),
-        Err(e) => {
-            tracing::debug!(
-                target: "app-main",
-                path = %request.uri().path(),
-                "meetingdoc request rejected: {e}"
             );
             Response::builder()
                 .status(StatusCode::NOT_FOUND)

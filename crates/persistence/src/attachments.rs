@@ -210,6 +210,24 @@ pub fn read_attachment_original(
     Ok(bytes)
 }
 
+/// Absolute path of an attachment original
+/// (`{root}/{meeting_id}/attachments/<filename>`), with the same
+/// path-traversal guard as [`read_attachment_original`]. Does NOT read the
+/// file — callers that hand the original to the host OS (opening it in the
+/// default application) use this to avoid loading the bytes.
+pub fn attachment_original_path(
+    root: &Path,
+    meeting_id: MeetingId,
+    filename: &str,
+) -> AppResult<PathBuf> {
+    if !is_safe_filename(filename) {
+        return Err(AppError::InvalidInput {
+            context: format!("rejected unsafe attachment filename: {filename:?}"),
+        });
+    }
+    Ok(attachments_dir(root, meeting_id).join(filename))
+}
+
 /// Write the converted markdown `md` to `attachments/<hash>.md` atomically.
 ///
 /// Returns the filename (`"<hash>.md"`) so the caller can store it on the

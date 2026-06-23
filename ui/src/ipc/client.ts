@@ -124,9 +124,10 @@ export const commands: Commands = {
   // Reference-material attachments. Originals are stored content-addressed under
   // the meeting's `attachments/` dir; `add_attachment` enqueues a background
   // doc→markdown conversion (the four attachment events stream the row state).
-  // `open_attachment` validates the original is reachable, then the webview
-  // opens it via the `meetingdoc:` scheme; remove is dedup-safe. The DEV shim
-  // and the Vitest mocks intercept at the `../ipc/attachments` seam, not here.
+  // `open_attachment` resolves the original's on-disk path server-side and hands
+  // it to the host OS default app via `tauri-plugin-opener`; remove is dedup-safe.
+  // The DEV shim and the Vitest mocks intercept at the `../ipc/attachments` seam,
+  // not here.
   addAttachment: (meetingId, bytes, ext, originalFilename) =>
     callCommand("addAttachment", [meetingId, bytes, ext, originalFilename]),
   listAttachments: (meetingId) => callCommand("listAttachments", [meetingId]),

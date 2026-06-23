@@ -12,24 +12,14 @@
  * background worker and reports through the four attachment `AppEvent`s — this
  * seam is the request side only.
  *
- * `open` does NOT return bytes or write a temp file: it asks the backend to
- * validate the original is reachable, then builds the per-platform webview URL
- * with `convertFileSrc(<meeting_id>/<hash>.<ext>, MEETING_DOC_SCHEME)` and hands
- * it to `tauri-plugin-opener`, which opens it in the OS default application. The
- * `app-main` `meetingdoc:` protocol handler resolves the bytes from
- * `{meetings_dir}/<meeting_id>/attachments/<filename>` (the sibling of the
- * verified `meetingasset:` scheme).
+ * `open` does NOT return bytes or write a temp file: it asks the backend, which
+ * resolves the stored original's on-disk path and hands it to the host OS
+ * default application via `tauri-plugin-opener` (the user's PDF reader / Word /
+ * Excel / image viewer). The path never crosses the IPC boundary; the webview
+ * never navigates to the file.
  */
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { commands, unwrap } from "./client";
 import type { AttachmentEntry, AttachmentId, MeetingId } from "./bindings";
-
-/**
- * The custom URI scheme the `app-main` protocol handler serves attachment
- * originals on. Mirrors `ipc_bridge::MEETING_DOC_SCHEME` — the sibling of
- * `meetingasset:` (note images), pointed at the meeting's `attachments/` dir.
- */
-export const MEETING_DOC_SCHEME = "meetingdoc";
 
 /**
  * Maximum permitted attachment size in bytes. Mirrors
@@ -72,24 +62,19 @@ export async function listAttachments(
 }
 
 /**
- * Open an attachment original in the OS default application.
+ * Open an attachment original in the host OS default application.
  *
- * Validates server-side that the original is reachable (the backend holds the
- * `persistence` edge `app-main` lacks), then converts the stored
- * `<hash>.<ext>` filename into a `meetingdoc:` webview URL and opens it via
- * `tauri-plugin-opener`. No bytes cross the wire and no temp file is written.
+ * The backend (which holds the `persistence` edge `app-main` lacks) resolves the
+ * stored original's on-disk path and hands it to `tauri-plugin-opener`, so the
+ * OS launches the user's PDF reader / Word / Excel / image viewer. No bytes
+ * cross the wire, no temp file is written, and the path never reaches the
+ * webview — this seam only asks the backend to open attachment `entry`.
  */
 export async function openAttachment(
   meetingId: MeetingId,
   entry: AttachmentEntry,
 ): Promise<void> {
   unwrap(await commands.openAttachment(meetingId, entry.id));
-  const url = convertFileSrc(
-    `${meetingId}/${entry.hash}.${entry.ext}`,
-    MEETING_DOC_SCHEME,
-  );
-  const { openUrl } = await import("@tauri-apps/plugin-opener");
-  await openUrl(url);
 }
 
 /** Remove an attachment (dedup-safe unlink happens server-side). */

@@ -2175,7 +2175,7 @@ Each format is handled by a converter:
 | `xlsx`, `ods` | `calamine` (sheet → pipe-table or TSV-style markdown); date cells render as ISO via `ExcelDateTime::as_datetime()` (the `dates` feature), not the raw serial number |
 | `html`, `htm` | `dom_smoothie` readability extract → `htmd` markdown |
 | `eml` | `mail-parser` → HTML body → `dom_smoothie` + `htmd`; plain-text body passthrough |
-| `pdf` | `pdf-extract` (digital text extraction only) |
+| `pdf` | `pdf_oxide` (pure-Rust digital text extraction, no native lib; a page that fails to decode is skipped, not fatal) |
 | `pptx` | `zip` open + `quick-xml` walk of `ppt/slides/slideN.xml` `<a:t>` runs (incl. table-cell text), one `## Slide N` per slide; per-slide `ppt/notesSlides/notesSlideN.xml` speaker notes appended as a `### Notes` block |
 | `docx` | `zip` open + `quick-xml` walk of `word/document.xml`: `<w:p>` → paragraph, `<w:t>` → text, `<w:tbl>`/`<w:tr>`/`<w:tc>` → markdown pipe-table |
 | `png`, `jpg`, `jpeg`, `tiff` | VLM OCR path only (no pure-Rust text content); returns `AppError::Unsupported` when `vlm` is `None` |
@@ -2192,9 +2192,9 @@ the markdown is canonical before it is stored.
 **VLM OCR flow (image attachments).** The VLM handles only inputs that have no
 pure-Rust text path:
 
-- **Digital PDFs** run `pdf-extract`; the extracted text is returned as-is. The
+- **Digital PDFs** run `pdf_oxide`; the extracted text is returned as-is. The
   VLM is never invoked for PDFs.
-- **Scanned / image-only PDFs** return near-empty text from `pdf-extract` and
+- **Scanned / image-only PDFs** return near-empty text from `pdf_oxide` and
   are rejected with `AppError::Unsupported`. PDF-page rasterisation/OCR is
   deferred (planning issue 0019) — there is no `pdfium` dependency in this build.
 - **Direct image attachments** (`png` / `jpg` / `jpeg` / `tiff`) have no

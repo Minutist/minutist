@@ -205,8 +205,12 @@ dom_smoothie = "0.18"
 htmd = "0.5"
 # mail-parser: .eml / MIME message parsing (headers + body parts).
 mail-parser = "0.11"
-# pdf-extract: digital-text PDF extraction (no OCR / no VLM).
-pdf-extract = "0.10"
+# pdf_oxide: digital-text PDF extraction (no OCR / no VLM). Pure-Rust,
+# MIT/Apache. Chosen over pdf-extract after a real-corpus benchmark: pdf-extract
+# (+ its lopdf / cff-parser / adobe-cmap-parser stack) panics on ~5% of real
+# datasheets (inline images, CFF fonts, CMaps); pdf_oxide reads them without
+# crashing and de-duplicates running headers/footers. See planning issue 0019.
+pdf_oxide = "0.3"
 # quick-xml: SAX-style XML reader used for the PPTX OOXML slide walk.
 quick-xml = "0.40"
 # zip: ZIP container reader used for PPTX / XLSX / ODS archives.

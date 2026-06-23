@@ -20,7 +20,7 @@ calamine      = { workspace = true }          # XLSX / ODS spreadsheet reader
 dom_smoothie  = { workspace = true }          # HTML readability extraction
 htmd          = { workspace = true }          # HTML → Markdown
 mail-parser   = { workspace = true }          # .eml parsing
-pdf-extract   = { workspace = true }          # Digital-text PDF extraction
+pdf_oxide     = { workspace = true }          # Digital-text PDF extraction (pure-Rust)
 quick-xml     = { workspace = true }          # PPTX OOXML walk (ppt/slides/*.xml)
 zip           = { workspace = true }          # PPTX / XLSX / ODS zip container + bomb guard
 

@@ -1174,9 +1174,11 @@ Textual-content bar for Office formats: `pptx` and `docx` extract text content
 notes) for the summariser feed, not faithful structure. `docx` uses the same
 `zip` + `quick-xml` walk as `pptx` (over `word/document.xml`), so no `docx-rs`
 production dependency is introduced. Known limitation: for a multi-column
-digital PDF, `pdf-extract` emits text in content-stream order, which may
-interleave columns rather than reading each top-to-bottom; all text is captured
-but cross-column reading order is not guaranteed (the summariser tolerates this).
+digital PDF, `pdf_oxide`'s default `extract_text` sorts spans into row bands (by
+Y then X), which interleaves side-by-side columns rather than reading each
+top-to-bottom; all text is captured but cross-column reading order is not
+guaranteed (the summariser tolerates this; `pdf_oxide`'s column-aware modes are a
+possible future refinement).
 
 `catch_unwind` requires `UnwindSafe`; inputs are wrapped in `AssertUnwindSafe`
 (the closure only reads `&[u8]` + `&str`). A caught panic is mapped to
@@ -1253,7 +1255,7 @@ held model / mmproj absent), they return `AppError::Unsupported`; the attachment
 row shows "Conversion failed" and the user can still open the original via "Open
 anyway".
 
-**Scanned / image-only PDFs are NOT supported.** `pdf-extract` returns
+**Scanned / image-only PDFs are NOT supported.** `pdf_oxide` returns
 near-empty text for them, and `doc-convert` then returns `AppError::Unsupported`
 rather than attempting OCR — the VLM is never invoked for a PDF in this build.
 PDF-page OCR needs page rasterisation (a PDFium runtime library bundled per
@@ -1266,8 +1268,11 @@ digital text extracts reliably.
 
 **Deferred.**
 - The PDF-image cases — scanned pages, embedded figures, and digital-PDF
-  table-structure recovery (`pdf-extract` flattens table grids to cell text) —
-  are tracked in `planning/issues/0019`; all need PDF-page rasterisation.
+  table-structure recovery (`pdf_oxide`'s plain-text extraction flattens table
+  grids to cell text) — are tracked in `planning/issues/0019`; all need PDF-page
+  rasterisation. Also tracked there: the rare digital PDF whose body font
+  `pdf_oxide` cannot decode (it extracts partial text — headings/notes — rather
+  than crashing), which a future pdfium/VLM quality-fallback could backstop.
 - Which VLM model does the OCR (Gemma-4 chosen; PaddleOCR-VL revisit) is
   `planning/issues/0018`.
 

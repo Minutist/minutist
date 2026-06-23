@@ -86,9 +86,10 @@ pub fn supported_exts() -> &'static [&'static str] {
 /// digital-text paths ignore it.
 ///
 /// Returns `AppError::InvalidInput` for oversize input, pathological zip
-/// archives, or an unsupported extension. Returns `AppError::Internal` when a
-/// parser returns a genuine error on otherwise valid-looking input. Parser
-/// panics are caught and mapped to `AppError::InvalidInput`.
+/// archives, an unreadable/corrupt PDF, or an unsupported extension. Returns
+/// `AppError::Internal` when a parser returns a genuine error on otherwise
+/// valid-looking input. Parser panics are caught and mapped to
+/// `AppError::InvalidInput`.
 ///
 /// Empty input is allowed and returns an empty string.
 pub fn convert_to_markdown(

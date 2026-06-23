@@ -69,7 +69,10 @@ impl From<ConvertError> for AppError {
             ConvertError::Email(msg) => AppError::Internal {
                 context: format!("email: {msg}"),
             },
-            ConvertError::Pdf(msg) => AppError::Internal {
+            // A PDF that fails to open or whose page count cannot be read is bad
+            // INPUT (corrupt / not a real PDF), not an internal fault — same bucket
+            // as a malformed zip archive and as a caught converter panic.
+            ConvertError::Pdf(msg) => AppError::InvalidInput {
                 context: format!("pdf: {msg}"),
             },
             ConvertError::Image(msg) => AppError::InvalidInput {

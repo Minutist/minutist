@@ -176,14 +176,73 @@ fn build_two_column_pdf(left: &[&str], right: &[&str]) -> Vec<u8> {
     doc.save_to_bytes().expect("serialise pdf")
 }
 
+/// Build a minimal single-page PDF whose content stream embeds an inline image
+/// (`BI ... ID <raw bytes> EI`) alongside text. This is the content-stream class
+/// that made the PREVIOUS engine (`pdf-extract`, via `lopdf`) panic — lopdf could
+/// not skip the inline-image binary payload to `EI` and failed the whole
+/// document. printpdf cannot emit inline images, so this is hand-built with a
+/// correct xref (a valid PDF, not a repair case). The surrounding text is long
+/// enough to clear the near-empty threshold so it takes the real extraction path.
+fn build_inline_image_pdf() -> Vec<u8> {
+    let text = "InlineImageProbe this digital pdf carries an inline image in its \
+                content stream alongside enough surrounding text to clear the near \
+                empty threshold so it converts as a real document not the fallback";
+    // 2x2 RGB inline-image payload: 12 raw bytes, including a NUL, to be the
+    // adversarial binary blob a naive content tokenizer walks into.
+    let img: [u8; 12] = [
+        0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00,
+    ];
+
+    let mut content: Vec<u8> = Vec::new();
+    content.extend_from_slice(format!("BT /F1 14 Tf 36 720 Td ({text}) Tj ET\n").as_bytes());
+    content.extend_from_slice(b"q 24 0 0 24 36 600 cm\n");
+    content.extend_from_slice(b"BI /W 2 /H 2 /CS /RGB /BPC 8 ID ");
+    content.extend_from_slice(&img);
+    content.extend_from_slice(b"\nEI\nQ\n");
+
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>".to_vec(),
+        {
+            let mut s = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+            s.extend_from_slice(&content);
+            s.extend_from_slice(b"\nendstream");
+            s
+        },
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+
+    let mut pdf: Vec<u8> = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.7\n");
+    let mut offsets = vec![0usize; objs.len() + 1];
+    for (i, body) in objs.iter().enumerate() {
+        offsets[i + 1] = pdf.len();
+        pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        pdf.extend_from_slice(body);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_pos = pdf.len();
+    let n = objs.len() + 1;
+    pdf.extend_from_slice(format!("xref\n0 {n}\n").as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for off in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_pos}\n%%EOF").as_bytes(),
+    );
+    pdf
+}
+
 #[test]
 fn pdf_multi_column_captures_all_text() {
     // Content-completeness bar: a two-column digital PDF must yield every word
     // from BOTH columns. Reading order across columns is NOT asserted —
-    // pdf-extract emits text in the PDF's content-stream order, which for a
-    // genuine multi-column layout may interleave the two columns rather than
-    // reading each column top-to-bottom. This is a documented known limitation
-    // (see architecture/cross-cutting.md); the summariser tolerates imperfect
+    // pdf_oxide sorts spans into row bands (by Y then X), so two columns sharing
+    // a vertical band are interleaved left/right rather than read each
+    // top-to-bottom. This is a documented known limitation (see
+    // architecture/cross-cutting.md); the summariser tolerates imperfect
     // ordering, so capturing all the text is the requirement here.
     // Use distinctive multi-syllable words; their combined non-whitespace length
     // must clear the 100-char near-empty threshold so the real extractor runs
@@ -216,6 +275,38 @@ fn pdf_multi_column_captures_all_text() {
             "expected column word {word:?} in extracted text, got: {out:?}"
         );
     }
+}
+
+#[test]
+fn pdf_with_inline_image_extracts_surrounding_text() {
+    // Regression lock-in for the pdf-extract -> pdf_oxide swap. An inline image
+    // (BI/ID <raw bytes> EI) in the content stream is the class that PANICKED the
+    // previous engine (lopdf could not skip the binary payload to EI, failing the
+    // whole document). pdf_oxide must extract the surrounding text without
+    // panicking — a panic would unwind and fail this test.
+    let bytes = build_inline_image_pdf();
+    let out = convert_to_markdown(&bytes, "pdf", None).expect("inline-image pdf converts");
+    assert!(
+        out.contains("InlineImageProbe"),
+        "expected surrounding text from a content stream with an inline image, got: {out:?}"
+    );
+}
+
+#[test]
+fn corrupt_pdf_is_classified_as_bad_input_not_internal() {
+    // A non-PDF / corrupt attachment is bad INPUT. The pdf() open / page_count
+    // failure path maps to AppError::InvalidInput (like a malformed zip and a
+    // caught converter panic), never AppError::Internal (an internal-fault signal).
+    let err = convert_to_markdown(b"\x89 not a pdf at all \x00\x01\x02 garbage", "pdf", None)
+        .unwrap_err();
+    assert!(
+        !matches!(err, AppError::Internal { .. }),
+        "a corrupt PDF must not classify as an Internal fault, got {err:?}"
+    );
+    assert!(
+        matches!(err, AppError::InvalidInput { .. } | AppError::Unsupported { .. }),
+        "expected InvalidInput (open failure) or Unsupported (near-empty), got {err:?}"
+    );
 }
 
 #[test]

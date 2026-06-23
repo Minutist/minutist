@@ -237,7 +237,7 @@ fn format_address(address: &mail_parser::Address) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// PDF via pdf-extract (digital text only)
+// PDF via pdf_oxide (pure-Rust digital text extraction; no OCR / no native lib)
 // ---------------------------------------------------------------------------
 
 /// Digital-text PDF extractor. Returns extracted text as plain paragraphs.
@@ -247,15 +247,14 @@ fn format_address(address: &mail_parser::Address) -> String {
 /// this build has no PDF-page rasterisation path, so only PDFs with a usable
 /// digital text layer convert. (PDF page OCR is tracked in planning issue 0019.)
 pub fn pdf(bytes: &[u8]) -> minutist_common::AppResult<String> {
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|e| ConvertError::Pdf(e.to_string()))?;
+    let text = extract_pdf_text(bytes).map_err(minutist_common::AppError::from)?;
 
     if is_near_empty_text(&text) {
         let non_ws = non_whitespace_count(&text);
         tracing::debug!(
             target: "doc-convert",
             non_ws,
-            "pdf-extract returned near-empty text; scanned/image-only PDF is unsupported"
+            "pdf text extraction returned near-empty text; scanned/image-only PDF is unsupported"
         );
         return Err(minutist_common::AppError::Unsupported {
             context: "scanned or image-only PDF — no extractable text \
@@ -265,6 +264,44 @@ pub fn pdf(bytes: &[u8]) -> minutist_common::AppResult<String> {
     }
 
     normalise(&text).map_err(minutist_common::AppError::from)
+}
+
+/// Extract the concatenated digital text of every page via `pdf_oxide`.
+///
+/// A page that fails to extract is SKIPPED rather than failing the whole
+/// document: real PDFs occasionally carry one page whose font/encoding the
+/// engine cannot decode, and the other pages still carry usable text for the
+/// summariser. (`convert_to_markdown` already runs this inside `catch_unwind`,
+/// so an internal engine panic is contained and surfaces as `InvalidInput`.)
+fn extract_pdf_text(bytes: &[u8]) -> Result<String> {
+    use pdf_oxide::PdfDocument;
+
+    let doc = PdfDocument::from_bytes(bytes.to_vec())
+        .map_err(|e| ConvertError::Pdf(format!("open: {e:?}")))?;
+    let pages = doc
+        .page_count()
+        .map_err(|e| ConvertError::Pdf(format!("page_count: {e:?}")))?;
+
+    let mut out = String::new();
+    let mut page_errors = 0usize;
+    for i in 0..pages {
+        match doc.extract_text(i) {
+            Ok(t) => {
+                out.push_str(&t);
+                out.push('\n');
+            }
+            Err(_) => page_errors += 1,
+        }
+    }
+    if page_errors > 0 {
+        tracing::debug!(
+            target: "doc-convert",
+            page_errors,
+            pages,
+            "pdf_oxide could not extract some pages; skipped them"
+        );
+    }
+    Ok(out)
 }
 
 /// Threshold below which extracted PDF text is treated as "no usable text

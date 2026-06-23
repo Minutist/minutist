@@ -800,6 +800,28 @@ fn normalise_attachment_ext(ext: &str) -> Result<String, AppError> {
     }
 }
 
+/// Validate the size/length caps on a candidate attachment, independent of the
+/// extension allowlist (see [`normalise_attachment_ext`]). Returns
+/// `AppError::InvalidInput` for an over-long filename or oversize bytes.
+fn check_attachment_limits(original_filename: &str, byte_len: usize) -> Result<(), AppError> {
+    if original_filename.chars().count() > MAX_ATTACHMENT_FILENAME_LEN {
+        return Err(AppError::InvalidInput {
+            context: format!(
+                "attachment filename too long (max {MAX_ATTACHMENT_FILENAME_LEN} characters)"
+            ),
+        });
+    }
+    if byte_len > doc_convert::MAX_INPUT_BYTES {
+        return Err(AppError::InvalidInput {
+            context: format!(
+                "attachment exceeds the {} MiB size limit",
+                doc_convert::MAX_INPUT_BYTES / 1024 / 1024
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Add a reference-material attachment to a meeting.
 ///
 /// Routes DIRECTLY to `persistence` (no orchestrator — attachments are
@@ -823,23 +845,7 @@ pub async fn add_attachment(
     state: State<'_, IpcState>,
 ) -> Result<AttachmentEntry, IpcError> {
     let ext = normalise_attachment_ext(&ext)?;
-    if original_filename.chars().count() > MAX_ATTACHMENT_FILENAME_LEN {
-        return Err(AppError::InvalidInput {
-            context: format!(
-                "attachment filename too long (max {MAX_ATTACHMENT_FILENAME_LEN} characters)"
-            ),
-        }
-        .into());
-    }
-    if bytes.len() > doc_convert::MAX_INPUT_BYTES {
-        return Err(AppError::InvalidInput {
-            context: format!(
-                "attachment exceeds the {} MiB size limit",
-                doc_convert::MAX_INPUT_BYTES / 1024 / 1024
-            ),
-        }
-        .into());
-    }
+    check_attachment_limits(&original_filename, bytes.len())?;
     let byte_len = bytes.len() as u64;
     let meetings_dir = state.meetings_dir.clone();
 
@@ -880,23 +886,14 @@ pub async fn add_attachment(
         hash: entry.hash.clone(),
         ext: entry_ext,
     };
-    if let Err(e) = state.attachment_convert_tx.try_send(job) {
-        let reason = match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => {
-                "conversion queue is full; try again shortly".to_string()
-            }
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
-                "conversion worker is not running".to_string()
-            }
-        };
-        crate::attachments::mark_failed(
-            &state.meetings_dir,
-            &state.event_tx,
-            meeting_id,
-            entry.id,
-            reason,
-        );
-    }
+    crate::attachments::enqueue_or_mark_failed(
+        &state.attachment_convert_tx,
+        &state.meetings_dir,
+        &state.event_tx,
+        meeting_id,
+        entry.id,
+        job,
+    );
 
     Ok(entry)
 }
@@ -2933,6 +2930,48 @@ mod tests {
         );
         assert!(out.contains("kept"), "the small attachment's body is retained");
         assert!(out.contains("[truncated]"), "the trimmed large attachment is marked");
+    }
+
+    #[test]
+    fn assemble_attachments_truncates_multibyte_body_on_char_boundary() {
+        // A multibyte body over a tight budget must truncate on a char boundary
+        // (`chars().take`), never mid-codepoint, and stay valid UTF-8 — a future
+        // refactor to byte-slicing would break this while passing the ASCII case.
+        let body = "é".repeat(500); // 500 chars, 1000 bytes
+        let out = assemble_attachments_markdown(vec![("doc.md".to_string(), body)], 120);
+        assert!(out.contains("[truncated]"), "expected truncation marker");
+        assert!(
+            !out.contains('\u{FFFD}'),
+            "no replacement char — no split codepoint: {out:?}"
+        );
+        assert!(out.contains('é'), "multibyte content preserved");
+        assert!(
+            std::str::from_utf8(out.as_bytes()).is_ok(),
+            "output must be valid UTF-8"
+        );
+    }
+
+    #[test]
+    fn check_attachment_limits_rejects_overlong_filename_and_oversize_bytes() {
+        // Within limits.
+        assert!(check_attachment_limits("notes.pdf", 1024).is_ok());
+
+        // Over-long filename (by char count) → InvalidInput.
+        let long = "x".repeat(MAX_ATTACHMENT_FILENAME_LEN + 1);
+        assert!(matches!(
+            check_attachment_limits(&long, 1),
+            Err(AppError::InvalidInput { .. })
+        ));
+
+        // Oversize bytes → InvalidInput.
+        assert!(matches!(
+            check_attachment_limits("ok.pdf", doc_convert::MAX_INPUT_BYTES + 1),
+            Err(AppError::InvalidInput { .. })
+        ));
+
+        // Exactly at the caps is allowed (the production checks are strict `>`).
+        let max_name = "x".repeat(MAX_ATTACHMENT_FILENAME_LEN);
+        assert!(check_attachment_limits(&max_name, doc_convert::MAX_INPUT_BYTES).is_ok());
     }
 
     /// `save_note_asset` (the persistence body the command calls) round-trips an

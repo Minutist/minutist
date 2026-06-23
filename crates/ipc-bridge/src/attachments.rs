@@ -542,6 +542,32 @@ pub(crate) fn mark_failed(
     });
 }
 
+/// Enqueue a conversion job, or record the attachment as Failed if the bounded
+/// worker queue cannot accept it. `try_send` never blocks the caller: a full
+/// queue is back-pressure and a closed channel means the worker is gone — both
+/// surface as a Failed row + [`AppEvent::AttachmentConversionFailed`] so the UI
+/// shows a clear state rather than a permanent `Pending`.
+pub(crate) fn enqueue_or_mark_failed(
+    tx: &mpsc::Sender<ConvertJob>,
+    meetings_dir: &Path,
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+    attachment_id: AttachmentId,
+    job: ConvertJob,
+) {
+    if let Err(e) = tx.try_send(job) {
+        let reason = match e {
+            mpsc::error::TrySendError::Full(_) => {
+                "conversion queue is full; try again shortly".to_string()
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                "conversion worker is not running".to_string()
+            }
+        };
+        mark_failed(meetings_dir, event_tx, meeting_id, attachment_id, reason);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +728,138 @@ mod tests {
             evt,
             AppEvent::AttachmentConversionFailed { attachment_id: aid, .. } if aid == attachment_id
         ));
+    }
+
+    /// Seed a saved original + a Pending manifest row, returning its id.
+    fn seed_pending(root: &Path, id: MeetingId, ext: &str) -> AttachmentId {
+        let bytes = b"seed bytes".to_vec();
+        let hash = persistence::save_attachment_original(root, id, &bytes, ext).expect("save");
+        let attachment_id = AttachmentId::new();
+        persistence::add_manifest_entry(
+            root,
+            id,
+            AttachmentEntry {
+                id: attachment_id,
+                hash,
+                original_filename: format!("seed.{ext}"),
+                ext: ext.to_string(),
+                byte_len: bytes.len() as u64,
+                added_at: chrono::Utc::now().to_rfc3339(),
+                conversion: ConversionState::Pending,
+                converted_md_filename: None,
+            },
+        )
+        .expect("add manifest");
+        attachment_id
+    }
+
+    fn job_for(id: MeetingId, attachment_id: AttachmentId) -> ConvertJob {
+        ConvertJob {
+            meeting_id: id,
+            attachment_id,
+            hash: String::new(),
+            ext: "txt".to_string(),
+        }
+    }
+
+    #[test]
+    fn enqueue_or_mark_failed_marks_failed_when_queue_closed() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+        persistence::MeetingFolder::create(root, id).expect("folder");
+        let attachment_id = seed_pending(root, id, "txt");
+
+        // A dropped receiver → try_send fails Closed.
+        let (tx, rx) = mpsc::channel::<ConvertJob>(4);
+        drop(rx);
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+
+        enqueue_or_mark_failed(&tx, root, &event_tx, id, attachment_id, job_for(id, attachment_id));
+
+        let manifest = persistence::read_manifest(root, id).expect("manifest");
+        let row = manifest.iter().find(|e| e.id == attachment_id).expect("row");
+        assert!(
+            matches!(row.conversion, ConversionState::Failed(_)),
+            "closed queue must mark the row Failed, got {:?}",
+            row.conversion
+        );
+        let evt = event_rx.try_recv().expect("event emitted");
+        assert!(matches!(
+            evt,
+            AppEvent::AttachmentConversionFailed { attachment_id: aid, .. } if aid == attachment_id
+        ));
+    }
+
+    #[test]
+    fn enqueue_or_mark_failed_marks_failed_when_queue_full() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+        persistence::MeetingFolder::create(root, id).expect("folder");
+        let attachment_id = seed_pending(root, id, "txt");
+
+        // Capacity-1 channel, pre-filled so the next try_send is Full.
+        let (tx, _rx) = mpsc::channel::<ConvertJob>(1);
+        tx.try_send(job_for(id, attachment_id)).expect("prime the queue");
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+
+        enqueue_or_mark_failed(&tx, root, &event_tx, id, attachment_id, job_for(id, attachment_id));
+
+        let manifest = persistence::read_manifest(root, id).expect("manifest");
+        let row = manifest.iter().find(|e| e.id == attachment_id).expect("row");
+        assert!(
+            matches!(row.conversion, ConversionState::Failed(_)),
+            "full queue must mark the row Failed, got {:?}",
+            row.conversion
+        );
+        assert!(event_rx.try_recv().is_ok(), "a failure event must be emitted");
+    }
+
+    #[test]
+    fn requeue_pending_reenqueues_only_pending_and_skips_non_uuid_dirs() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+        persistence::MeetingFolder::create(root, id).expect("folder");
+
+        // One Pending row (must requeue) + one Ready row (must NOT).
+        let pending_id = seed_pending(root, id, "txt");
+        let ready_bytes = b"ready".to_vec();
+        let ready_hash =
+            persistence::save_attachment_original(root, id, &ready_bytes, "txt").expect("save");
+        persistence::add_manifest_entry(
+            root,
+            id,
+            AttachmentEntry {
+                id: AttachmentId::new(),
+                hash: ready_hash,
+                original_filename: "ready.txt".to_string(),
+                ext: "txt".to_string(),
+                byte_len: ready_bytes.len() as u64,
+                added_at: chrono::Utc::now().to_rfc3339(),
+                conversion: ConversionState::Ready,
+                converted_md_filename: Some("x.md".to_string()),
+            },
+        )
+        .expect("add ready");
+
+        // A non-UUID sibling dir must be skipped, not panic.
+        std::fs::create_dir(root.join("not-a-meeting")).expect("mkdir");
+
+        let (tx, mut rx) = mpsc::channel::<ConvertJob>(8);
+        requeue_pending(root, &tx);
+        drop(tx); // close so the drain terminates
+
+        let mut jobs = Vec::new();
+        while let Ok(job) = rx.try_recv() {
+            jobs.push(job);
+        }
+        assert_eq!(jobs.len(), 1, "exactly one Pending row requeued, got {jobs:?}");
+        assert_eq!(
+            jobs[0].attachment_id, pending_id,
+            "the requeued job must be the Pending row, not the Ready one"
+        );
     }
 
     /// Remove-then-convert ordering: when the manifest row is removed BEFORE its

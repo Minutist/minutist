@@ -231,3 +231,12 @@ pdfium-render = { version = "0.9", features = ["image_025"] }
 # attachments (png/jpg/jpeg/tiff) to PNG for the VLM, and by the doc-vlm spike
 # for bitmap fixtures.
 image = "0.25"
+
+[profile.dev]
+# Keep backtraces (file:line) but drop variable-level DWARF. Full debug info was
+# the dominant contributor to a multi-hundred-GB target/debug: every test and bin
+# statically links the native graph (sherpa-onnx, onnxruntime, libsql, llama-cpp,
+# pdf_oxide) with DWARF. Line-tables roughly halves the per-artifact size while
+# keeping usable backtraces. For a session that needs a debugger to inspect
+# variables, build with full info ad hoc: `CARGO_PROFILE_DEV_DEBUG=2 cargo build`.
+debug = "line-tables-only"

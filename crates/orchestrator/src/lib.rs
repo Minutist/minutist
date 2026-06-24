@@ -2524,9 +2524,42 @@ impl Orchestrator {
         let mut accepted: std::collections::BTreeMap<String, String> = Default::default();
         let mut uncertain_out: Vec<minutist_common::VoiceprintSuggestion> = Vec::new();
 
+        // Label -> (centroid, window_count) for refining auto-accepted matches.
+        let by_label: std::collections::HashMap<&str, (&[f32], u64)> = query_clusters
+            .iter()
+            .map(|q| (q.label.as_str(), (q.centroid.as_slice(), q.window_count)))
+            .collect();
+
         for m in assignments {
             match m.band {
                 MatchBand::Accept => {
+                    // Refinement-on-confirm (§2.9.3 trigger b): an Accept-band match
+                    // has cleared T_accept *and* the assignment margin, so fold this
+                    // meeting's centroid into the matched identity to strengthen it.
+                    // refine is idempotent per (identity, meeting), so re-running on a
+                    // later reprocess replaces rather than double-counts. Best-effort:
+                    // a refine failure must not block applying the name.
+                    if let Some((centroid, window_count)) = by_label.get(m.query_label.as_str()) {
+                        if let Err(e) = store
+                            .refine(
+                                m.identity_id,
+                                centroid,
+                                *window_count,
+                                model_id,
+                                meeting_id,
+                                &m.query_label,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "orchestrator",
+                                meeting_id = %meeting_id.0,
+                                identity_id = %m.identity_id.0,
+                                error = %e,
+                                "auto-accept refinement failed (best-effort; name still applied)"
+                            );
+                        }
+                    }
                     accepted.insert(m.query_label, m.display_name);
                 }
                 MatchBand::Uncertain => {

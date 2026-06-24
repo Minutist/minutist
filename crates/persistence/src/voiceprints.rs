@@ -338,6 +338,13 @@ impl VoiceprintStore {
     /// `count` is clamped to `min(count, existing_sample_count × REFINE_WEIGHT_CAP)`
     /// before folding, bounding the per-meeting influence on an established
     /// centroid (bounded-weight poison defence — §2.9.3).
+    ///
+    /// Idempotent per `(identity, meeting)`: any prior contribution from
+    /// `meeting_id` under this identity is dropped and replaced first, so an
+    /// auto-accept that re-confirms the same speaker on every reprocess does not
+    /// double-count the meeting's weight. If that drop empties the gallery (the
+    /// identity was enrolled solely from this meeting and is being re-refined from
+    /// it), the first centroid is recreated rather than erroring.
     pub async fn refine(
         &self,
         identity_id: VoiceprintIdentityId,
@@ -373,107 +380,147 @@ impl VoiceprintStore {
         let mut contrib_vec = contribution.to_vec();
         minutist_common::voiceprint_math::unit_normalise(&mut contrib_vec);
 
-        // 2. Load the gallery centroids for this identity.
-        let centroids = self.load_centroids(identity_id).await?;
-        if centroids.is_empty() {
-            return Err(Error::InvalidState(
-                "identity has no gallery centroids; use enrol for first contribution",
-            ));
-        }
-
-        // 3. Find the nearest centroid by cosine similarity.
-        let (best_centroid_id, best_sim) = {
-            let mut best_id = centroids[0].0;
-            let mut best_s =
-                minutist_common::voiceprint_math::cosine_unit(&contrib_vec, &centroids[0].1);
-            for (cid, cvec, _count) in &centroids[1..] {
-                let s = minutist_common::voiceprint_math::cosine_unit(&contrib_vec, cvec);
-                if s > best_s {
-                    best_s = s;
-                    best_id = *cid;
-                }
-            }
-            (best_id, best_s)
-        };
-
-        // Clamp count to bound per-meeting influence.
-        let total_existing: u64 = centroids.iter().map(|(_, _, c)| *c).sum();
-        let clamped_count = {
-            let cap = (total_existing as f64 * REFINE_WEIGHT_CAP).ceil() as u64;
-            if cap == 0 {
-                count
-            } else {
-                count.min(cap)
-            }
-        };
-
         let now = Utc::now().to_rfc3339();
         let blob = f32_slice_to_blob(&contrib_vec);
 
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
         let result = async {
-            if best_sim >= FOLD_GATE {
-                // Fold into the nearest centroid.
-                let contrib_id = uuid::Uuid::new_v4().to_string();
-                self.conn.execute(
-                    "INSERT INTO voiceprint_contribution
-                     (id, centroid_id, meeting_id, label, embedding, count, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    libsql::params![
-                        contrib_id,
-                        best_centroid_id.0.to_string(),
-                        meeting_id.0.to_string(),
-                        label,
-                        blob,
-                        clamped_count as i64,
-                        now.clone()
-                    ],
+            // Idempotency: a meeting contributes at most once to an identity.
+            // Drop any prior contribution from this meeting under this identity's
+            // centroids, recompute them, and GC any centroid the drop emptied — so
+            // a reprocess that re-confirms the same speaker (apply_voiceprint_matches
+            // runs on every reprocess) replaces its contribution instead of
+            // double-counting the meeting's weight. The identity is not GC'd here;
+            // a contribution is re-added below.
+            let prior_centroids: Vec<VoiceprintCentroidId> = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT id FROM voiceprint_centroid WHERE identity_id = ?1",
+                        libsql::params![identity_id.0.to_string()],
+                    )
+                    .await?;
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let s: String = row.get(0)?;
+                    if let Ok(u) = uuid::Uuid::parse_str(&s) {
+                        ids.push(VoiceprintCentroidId(u));
+                    }
+                }
+                ids
+            };
+            self.conn
+                .execute(
+                    "DELETE FROM voiceprint_contribution
+                     WHERE meeting_id = ?1
+                       AND centroid_id IN
+                           (SELECT id FROM voiceprint_centroid WHERE identity_id = ?2)",
+                    libsql::params![meeting_id.0.to_string(), identity_id.0.to_string()],
+                )
+                .await?;
+            for cid in &prior_centroids {
+                recompute_centroid(&self.conn, *cid, &now).await?;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM voiceprint_centroid
+                     WHERE identity_id = ?1
+                       AND id NOT IN
+                           (SELECT DISTINCT centroid_id FROM voiceprint_contribution)",
+                    libsql::params![identity_id.0.to_string()],
                 )
                 .await?;
 
-                recompute_centroid(&self.conn, best_centroid_id, &now).await?;
-            } else {
-                // Add a new condition centroid.
-                let new_centroid_id = VoiceprintCentroidId::new();
-                let contrib_id = uuid::Uuid::new_v4().to_string();
-                let dim = contrib_vec.len();
+            // Decide fold / new-condition / first against the post-dedup gallery.
+            let centroids = self.load_centroids(identity_id).await?;
+            let total_existing: u64 = centroids.iter().map(|(_, _, c)| *c).sum();
+            let clamped_count = {
+                let cap = (total_existing as f64 * REFINE_WEIGHT_CAP).ceil() as u64;
+                if cap == 0 {
+                    count
+                } else {
+                    count.min(cap)
+                }
+            };
 
-                self.conn.execute(
-                    "INSERT INTO voiceprint_centroid
-                     (id, identity_id, embedding, dim, sample_count, condition_label, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6)",
-                    libsql::params![
-                        new_centroid_id.0.to_string(),
-                        identity_id.0.to_string(),
-                        blob.clone(),
-                        dim as i64,
-                        clamped_count as i64,
-                        now.clone()
-                    ],
-                )
-                .await?;
+            let mut best_centroid_id: Option<VoiceprintCentroidId> = None;
+            let mut best_sim = f32::MIN;
+            for (cid, cvec, _c) in &centroids {
+                let s = minutist_common::voiceprint_math::cosine_unit(&contrib_vec, cvec);
+                if s > best_sim {
+                    best_sim = s;
+                    best_centroid_id = Some(*cid);
+                }
+            }
 
-                self.conn.execute(
-                    "INSERT INTO voiceprint_contribution
-                     (id, centroid_id, meeting_id, label, embedding, count, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    libsql::params![
-                        contrib_id,
-                        new_centroid_id.0.to_string(),
-                        meeting_id.0.to_string(),
-                        label,
-                        blob,
-                        clamped_count as i64,
-                        now.clone()
-                    ],
-                )
-                .await?;
+            match best_centroid_id {
+                Some(best_centroid_id) if best_sim >= FOLD_GATE => {
+                    // Fold into the nearest centroid.
+                    let contrib_id = uuid::Uuid::new_v4().to_string();
+                    self.conn
+                        .execute(
+                            "INSERT INTO voiceprint_contribution
+                             (id, centroid_id, meeting_id, label, embedding, count, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            libsql::params![
+                                contrib_id,
+                                best_centroid_id.0.to_string(),
+                                meeting_id.0.to_string(),
+                                label,
+                                blob,
+                                clamped_count as i64,
+                                now.clone()
+                            ],
+                        )
+                        .await?;
+                    recompute_centroid(&self.conn, best_centroid_id, &now).await?;
+                }
+                _ => {
+                    // A new condition centroid — or the first centroid when the
+                    // gallery was emptied by the idempotent dedup above.
+                    let new_centroid_id = VoiceprintCentroidId::new();
+                    let contrib_id = uuid::Uuid::new_v4().to_string();
+                    let dim = contrib_vec.len();
 
-                // Cap-and-merge if over GALLERY_CAP.
-                let updated_centroids = self.load_centroids(identity_id).await?;
-                if updated_centroids.len() > GALLERY_CAP {
-                    self.cap_and_merge(identity_id, &now).await?;
+                    self.conn
+                        .execute(
+                            "INSERT INTO voiceprint_centroid
+                             (id, identity_id, embedding, dim, sample_count, condition_label, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?6)",
+                            libsql::params![
+                                new_centroid_id.0.to_string(),
+                                identity_id.0.to_string(),
+                                blob.clone(),
+                                dim as i64,
+                                clamped_count as i64,
+                                now.clone()
+                            ],
+                        )
+                        .await?;
+
+                    self.conn
+                        .execute(
+                            "INSERT INTO voiceprint_contribution
+                             (id, centroid_id, meeting_id, label, embedding, count, created_at)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                            libsql::params![
+                                contrib_id,
+                                new_centroid_id.0.to_string(),
+                                meeting_id.0.to_string(),
+                                label,
+                                blob,
+                                clamped_count as i64,
+                                now.clone()
+                            ],
+                        )
+                        .await?;
+
+                    // Cap-and-merge if over GALLERY_CAP.
+                    let updated_centroids = self.load_centroids(identity_id).await?;
+                    if updated_centroids.len() > GALLERY_CAP {
+                        self.cap_and_merge(identity_id, &now).await?;
+                    }
                 }
             }
 
@@ -2491,6 +2538,70 @@ mod tests {
             "rejecting the only contribution must remove the orphaned centroid/identity, got {} rows",
             gallery_after.len()
         );
+    }
+
+    #[tokio::test]
+    async fn refine_is_idempotent_per_meeting() {
+        // Auto-accept refinement runs on every reprocess, so refining twice from
+        // the same meeting must replace (not double-count) that meeting's weight.
+        let store = open_mem().await;
+        let dim = 4;
+
+        let emb1 = synthetic_embedding(dim, 0.95);
+        let id = store
+            .enrol("Alice", &emb1, dim, "cam-v1", mid(1), "A")
+            .await
+            .unwrap();
+
+        let emb2 = synthetic_embedding(dim, 0.93);
+        store.refine(id, &emb2, 5, "cam-v1", mid(2), "A").await.unwrap();
+        let count_once: u64 = store
+            .all("cam-v1")
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.sample_count)
+            .sum();
+
+        // Re-refine from the SAME meeting — replaces, does not accumulate.
+        store.refine(id, &emb2, 5, "cam-v1", mid(2), "A").await.unwrap();
+        let count_twice: u64 = store
+            .all("cam-v1")
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v.sample_count)
+            .sum();
+
+        assert_eq!(
+            count_once, count_twice,
+            "re-refining the same meeting must not increase sample_count"
+        );
+    }
+
+    #[tokio::test]
+    async fn refine_same_meeting_as_sole_enrolment_is_stable() {
+        // Identity enrolled solely from meeting 1; auto-accept re-refines from
+        // meeting 1. The dedup empties the single centroid, so refine recreates it
+        // (no error, no orphan, no duplication) and repeated calls converge.
+        let store = open_mem().await;
+        let dim = 4;
+        let emb = synthetic_embedding(dim, 0.95);
+        let id = store
+            .enrol("Bob", &emb, dim, "cam-v1", mid(1), "A")
+            .await
+            .unwrap();
+
+        store.refine(id, &emb, 1, "cam-v1", mid(1), "A").await.unwrap();
+        let g2 = store.all("cam-v1").await.unwrap();
+        let c2: u64 = g2.iter().map(|v| v.sample_count).sum();
+
+        store.refine(id, &emb, 1, "cam-v1", mid(1), "A").await.unwrap();
+        let g3 = store.all("cam-v1").await.unwrap();
+        let c3: u64 = g3.iter().map(|v| v.sample_count).sum();
+
+        assert_eq!(g3.len(), 1, "identity should keep exactly one centroid");
+        assert_eq!(c2, c3, "repeated identical re-refine must be stable");
     }
 
     #[tokio::test]

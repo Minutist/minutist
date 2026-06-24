@@ -439,7 +439,14 @@ async setSpeakerName(meetingId: MeetingId, label: string, name: string) : Promis
 }
 },
 /**
- * Delete a meeting: removes the folder then the index row.
+ * Delete a meeting: removes the folder then the index row, then purges any
+ * voiceprint contributions that were derived from this meeting's audio (§4
+ * meeting-granularity erasure).
+ * 
+ * The voiceprint purge is best-effort: if the `VoiceprintStore` is not open
+ * (degraded-to-off) the step is skipped silently. The folder/index deletion
+ * runs first so a crash between the two steps leaves at most an orphaned
+ * voiceprint entry, not an orphaned meeting folder.
  * 
  * Routes to `persistence::meeting_ops::delete_meeting`.
  */
@@ -866,13 +873,13 @@ async deleteVoiceprintIdentity(identityId: VoiceprintIdentityId) : Promise<Resul
 }
 },
 /**
- * Purge all voiceprint contributions from a deleted meeting, recomputing
+ * Purge all voiceprint contributions from a specified meeting, recomputing
  * affected centroids, dropping zero-contribution centroids, and dropping
  * zero-centroid identities (§4 meeting-granularity erasure — issue #0003).
  * 
- * Must be called by `delete_meeting` (or any path that removes a meeting)
- * so the voiceprint library does not retain acoustic traces from meetings
- * whose audio the user has deleted.
+ * `delete_meeting` calls this automatically; this command is exposed for
+ * explicit invocation (e.g. clearing acoustic traces from a meeting whose
+ * audio was removed via an external path or by a future bulk-erase flow).
  * 
  * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
  */

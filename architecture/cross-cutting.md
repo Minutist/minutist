@@ -1337,8 +1337,13 @@ or post-stop background pass) completes, `ipc-bridge` calls
 4. Calls `assign_identities` with the extracted `QueryCluster`s and the gallery.
 5. **Accept-band matches**: writes the matched display names back into
    `metadata.json`'s `speaker_names` (a second write on top of
-   `finalise_diarization`'s `speaker_names.clear()`). This is the §2.6 re-map:
-   clear-then-restore-matched.
+   `finalise_diarization`'s `speaker_names.clear()`; the §2.6 re-map,
+   clear-then-restore-matched), AND refines the matched identity with this
+   meeting's centroid — §2.9.3 trigger (b). The refine targets the known
+   `identity_id` from the assignment (not a name lookup) and `refine` is
+   idempotent per `(identity, meeting)`, so running on every reprocess
+   strengthens the voiceprint without double-counting. A refine failure is
+   logged; the name is still applied.
 6. **Uncertain-band matches**: collected into a
    `AppEvent::VoiceprintSuggestions` event emitted on the shared bus. The
    webview presents the "is this \<Name\>?" affordance for each suggestion.
@@ -1357,8 +1362,10 @@ case: (a) it clears `speaker_names[label]` for `meeting_id` (empty-name write),
 and (b) it drops the `(meeting_id, label)` contribution from `identity_id`'s
 gallery via `VoiceprintStore::forget_contribution` on every centroid that matches.
 `forget_contribution` recomputes the centroid cache from surviving contributions
-(the §2.9.1 invariant), making the correction irreversible only at the centroid
-level — the contribution row is gone, but the centroid is rebuilt from what remains.
+(the §2.9.1 invariant); if dropping the contribution empties the centroid it is
+deleted, and an identity left with no centroids is deleted too — so rejecting the
+only match of a single-meeting identity removes it entirely and its (now stale)
+embedding can never re-match (`all()` additionally filters `sample_count > 0`).
 The method is idempotent when no matching contribution exists.
 
 **`clear_all_voiceprints` (§4 privacy).** `ipc-bridge::commands::clear_all_voiceprints`
@@ -1405,11 +1412,16 @@ rename itself is never blocked.
 for the same `display_name + model_id`. "Confirmed" is exactly one of:
 (a) the user typed/assigned the name via the UI rename (the WU3 path);
 (b) an auto-accept match `sim >= T_accept` with the assignment margin AND the
-meeting is finalised (WU5 feeds this); (c) the user accepted an uncertain-band
-suggestion (WU5). **Unconfirmed/uncertain matches never refine** — this is the
-primary slow-poison defence. `VoiceprintStore::find_identity_by_name_and_model`
-performs the lookup; when it returns `Some(id)`, `refine` is called with the
-centroid vector and the clean-window count as the contribution weight.
+meeting is finalised — `apply_voiceprint_matches` refines the matched
+`identity_id` directly; (c) the user accepted an uncertain-band suggestion (WU5).
+**Unconfirmed/uncertain matches never refine** — this is the primary slow-poison
+defence. For triggers (a)/(c) the rename path resolves the identity via
+`VoiceprintStore::find_identity_by_name_and_model` (a `Some(id)` routes to
+`refine` rather than `enrol`); trigger (b) already holds the matched
+`identity_id`. All three call `refine` with the centroid and the clean-window
+count as the contribution weight, and `refine` is idempotent per
+`(identity, meeting)` so a repeated reprocess replaces rather than accumulates a
+meeting's weight.
 
 The same `spawn_blocking` + offline-claim path used for enrolment (§2.3) is
 reused unchanged: the flag, lock discipline, and clock hazards all apply. The

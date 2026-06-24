@@ -285,7 +285,9 @@ mod tests {
         );
         assert_eq!(r.error_class, "diagnostic report");
         assert!(r.log_excerpt.contains("<redacted-id>"));
-        assert!(!r.log_excerpt.contains("3f2504e0-4f89-41d3-9a0c-0305e82c3301"));
+        assert!(!r
+            .log_excerpt
+            .contains("3f2504e0-4f89-41d3-9a0c-0305e82c3301"));
         assert!(r.backtrace.is_none());
 
         let r = assemble_report(
@@ -304,7 +306,11 @@ mod tests {
     #[test]
     fn newest_log_file_picks_latest_date_suffix() {
         let dir = tempfile::TempDir::new().unwrap();
-        for name in ["minutist.log.2026-06-10", "minutist.log.2026-06-14", "other.txt"] {
+        for name in [
+            "minutist.log.2026-06-10",
+            "minutist.log.2026-06-14",
+            "other.txt",
+        ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
         let picked = newest_log_file(dir.path()).unwrap();

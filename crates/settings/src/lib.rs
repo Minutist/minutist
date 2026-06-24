@@ -16,7 +16,7 @@
 
 use std::path::PathBuf;
 
-use minutist_common::{GpuAcceleration, ModelId};
+use minutist_common::{GpuAcceleration, LiveAgentMode, ModelId};
 use serde::{Deserialize, Serialize};
 
 pub mod error;
@@ -189,6 +189,63 @@ fn default_chat_system_prompt() -> String {
      Prefer calling a tool over guessing. Be concise and factual; cite \
      timestamps or speakers when relevant; do not invent information that is \
      not present in the meeting."
+        .to_string()
+}
+
+/// Default live-agent enabled mode: `Auto` (run iff the startup GPU probe
+/// finds a capable discrete GPU). An older store written before this field
+/// existed deserialises to `Auto` via `#[serde(default)]`.
+const fn default_live_agent_enabled() -> LiveAgentMode {
+    LiveAgentMode::Auto
+}
+
+/// Default live-agent cadence: minimum transcript segments before a refresh.
+/// 8 segments at the default meeting tempo (~1–2 per minute) is roughly
+/// 4–8 minutes between refreshes — enough new material to update the digest
+/// without over-refreshing. An older store deserialises to 8.
+const fn default_live_agent_min_segments() -> u32 {
+    8
+}
+
+/// Default live-agent cadence: minimum wall-clock seconds before a refresh.
+/// 45 s is the target floor: the debouncer fires only when BOTH the segment
+/// count AND the time thresholds are satisfied (whichever is stricter). An
+/// older store deserialises to 45.
+const fn default_live_agent_min_seconds() -> u32 {
+    45
+}
+
+/// Default per-category digest toggles — all ON so every category is included
+/// in the initial digest. Users disable individual categories in the settings
+/// pane. An older store written before these fields existed deserialises to
+/// `true` for each.
+const fn default_digest_toggle_true() -> bool {
+    true
+}
+
+/// Default live-agent attachment budget in chars (~80 000 chars ≈ 20 k tokens
+/// at the average E5 tokenisation ratio). Caps the total markdown fed from
+/// pinned attachments so the held `LlamaContext` (n_ctx = 32 768) is not
+/// exhausted by the prefix alone. An older store deserialises to this value.
+const fn default_live_agent_attachment_budget_chars() -> usize {
+    80_000
+}
+
+/// Default live-agent system prompt: a digest-maintenance instruction that
+/// emphasises updating the STANDING LIST rather than regenerating from scratch,
+/// so action items and open asks accumulate and are resolved as the meeting
+/// progresses rather than being discarded on each refresh.
+fn default_live_agent_system_prompt() -> String {
+    "You are a live meeting assistant maintaining a structured digest of an \
+     ongoing meeting. You receive the current standing digest and a batch of \
+     new transcript segments. UPDATE the digest in place: mark resolved items \
+     as resolved, add newly observed action items / decisions / open asks / \
+     attachment-sourced answers / unresolved references, and update existing \
+     items when more detail is available. Do NOT regenerate the entire list \
+     from scratch — preserve items from prior refreshes unless they are \
+     superseded. Return a complete updated digest in the structured format \
+     requested. Be concise and factual; do not invent information not present \
+     in the transcript or attached documents."
         .to_string()
 }
 
@@ -530,6 +587,74 @@ pub struct Settings {
     /// host. `#[serde(default = ...)]` defaults to the minutist.ai endpoint.
     #[serde(default = "default_relay_api_url")]
     pub relay_api_url: String,
+
+    // -----------------------------------------------------------------------
+    // Live in-meeting agent (Phase 9 auto-driver)
+    // -----------------------------------------------------------------------
+    /// Whether the live in-meeting agent runs during an active recording.
+    ///
+    /// `Auto` (the default) enables the agent when GPU acceleration is active
+    /// (a usable GPU is present AND `gpu_acceleration != Off`), as resolved by
+    /// `live_agent_should_run`. `On` enables unconditionally; `Off` disables.
+    /// Distinct from `gpu_acceleration`, which governs model-layer placement.
+    /// `#[serde(default)]` → `Auto` (the `LiveAgentMode::default()`); an older
+    /// store written before this field existed deserialises to `Auto`.
+    #[serde(default = "default_live_agent_enabled")]
+    pub live_agent_enabled: LiveAgentMode,
+
+    /// Minimum number of new transcript segments that must accumulate before
+    /// the live agent fires a digest refresh. The debouncer fires only when
+    /// BOTH `live_agent_min_segments` AND `live_agent_min_seconds` are
+    /// satisfied. Defaults to 8; an older store deserialises to 8.
+    #[serde(default = "default_live_agent_min_segments")]
+    pub live_agent_min_segments: u32,
+
+    /// Minimum wall-clock seconds that must elapse before the live agent fires
+    /// a digest refresh. The debouncer fires only when BOTH
+    /// `live_agent_min_segments` AND `live_agent_min_seconds` are satisfied.
+    /// Defaults to 45; an older store deserialises to 45.
+    #[serde(default = "default_live_agent_min_seconds")]
+    pub live_agent_min_seconds: u32,
+
+    /// Whether action items are included in the live digest panel.
+    /// Defaults to `true`; an older store deserialises to `true`.
+    #[serde(default = "default_digest_toggle_true")]
+    pub live_agent_digest_action_items: bool,
+
+    /// Whether decisions are included in the live digest panel.
+    /// Defaults to `true`; an older store deserialises to `true`.
+    #[serde(default = "default_digest_toggle_true")]
+    pub live_agent_digest_decisions: bool,
+
+    /// Whether open / unanswered asks are included in the live digest panel.
+    /// Defaults to `true`; an older store deserialises to `true`.
+    #[serde(default = "default_digest_toggle_true")]
+    pub live_agent_digest_open_asks: bool,
+
+    /// Whether attachment-sourced answers are included in the live digest panel.
+    /// Defaults to `true`; an older store deserialises to `true`.
+    #[serde(default = "default_digest_toggle_true")]
+    pub live_agent_digest_attachment_answers: bool,
+
+    /// Whether unresolved references are included in the live digest panel.
+    /// Defaults to `true`; an older store deserialises to `true`.
+    #[serde(default = "default_digest_toggle_true")]
+    pub live_agent_digest_unresolved_references: bool,
+
+    /// Maximum total characters of attachment markdown fed into the live
+    /// agent's pinned prefix. ~80 000 chars ≈ 20 k tokens, safely within the
+    /// held `LlamaContext`'s n_ctx = 32 768. An older store deserialises to
+    /// 80 000.
+    #[serde(default = "default_live_agent_attachment_budget_chars")]
+    pub live_agent_attachment_budget_chars: usize,
+
+    /// The system prompt passed to the live agent on every refresh. Instructs
+    /// the model to UPDATE the standing digest rather than regenerate it,
+    /// preserving the 'asked-for-but-missed' tracker across refreshes.
+    /// `#[serde(default = ...)]` → the built-in digest-maintenance instruction;
+    /// an older store written before this field existed adopts that default.
+    #[serde(default = "default_live_agent_system_prompt")]
+    pub live_agent_system_prompt: String,
 }
 
 impl Settings {
@@ -576,6 +701,16 @@ impl Default for Settings {
             connector_enabled: false,
             relay_url: default_relay_url(),
             relay_api_url: default_relay_api_url(),
+            live_agent_enabled: default_live_agent_enabled(),
+            live_agent_min_segments: default_live_agent_min_segments(),
+            live_agent_min_seconds: default_live_agent_min_seconds(),
+            live_agent_digest_action_items: default_digest_toggle_true(),
+            live_agent_digest_decisions: default_digest_toggle_true(),
+            live_agent_digest_open_asks: default_digest_toggle_true(),
+            live_agent_digest_attachment_answers: default_digest_toggle_true(),
+            live_agent_digest_unresolved_references: default_digest_toggle_true(),
+            live_agent_attachment_budget_chars: default_live_agent_attachment_budget_chars(),
+            live_agent_system_prompt: default_live_agent_system_prompt(),
         }
     }
 }
@@ -628,6 +763,16 @@ mod tests {
             connector_enabled: true,
             relay_url: "wss://relay.example/tunnel".to_string(),
             relay_api_url: "https://api.example".to_string(),
+            live_agent_enabled: LiveAgentMode::On,
+            live_agent_min_segments: 5,
+            live_agent_min_seconds: 30,
+            live_agent_digest_action_items: true,
+            live_agent_digest_decisions: false,
+            live_agent_digest_open_asks: true,
+            live_agent_digest_attachment_answers: false,
+            live_agent_digest_unresolved_references: true,
+            live_agent_attachment_budget_chars: 40_000,
+            live_agent_system_prompt: "Custom live prompt.".to_string(),
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
@@ -635,6 +780,12 @@ mod tests {
         assert_eq!(restored.output_language, "German");
         assert!(restored.connector_enabled);
         assert_eq!(restored.relay_url, "wss://relay.example/tunnel");
+        assert_eq!(restored.live_agent_enabled, LiveAgentMode::On);
+        assert_eq!(restored.live_agent_min_segments, 5);
+        assert_eq!(restored.live_agent_min_seconds, 30);
+        assert!(!restored.live_agent_digest_decisions);
+        assert_eq!(restored.live_agent_attachment_budget_chars, 40_000);
+        assert_eq!(restored.live_agent_system_prompt, "Custom live prompt.");
         assert_eq!(original, restored);
     }
 
@@ -1503,5 +1654,271 @@ mod tests {
         let loaded = store2.load().expect("reload");
         assert_eq!(loaded.theme, Theme::Dark);
         assert!(loaded.start_hidden);
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Live-agent fields: defaults + round-trip + missing-field
+    //    deserialisation (Phase 9 auto-driver, WU1)
+    // -----------------------------------------------------------------------
+
+    use minutist_common::{live_agent_should_run, GpuAcceleration, GpuProbe, LiveAgentMode};
+
+    #[test]
+    fn live_agent_enabled_defaults_to_auto() {
+        assert_eq!(
+            Settings::default().live_agent_enabled,
+            LiveAgentMode::Auto,
+            "live_agent_enabled must default to Auto (GPU-capability-gated)"
+        );
+    }
+
+    #[test]
+    fn live_agent_min_segments_defaults_to_eight() {
+        assert_eq!(
+            Settings::default().live_agent_min_segments,
+            8,
+            "live_agent_min_segments must default to 8"
+        );
+    }
+
+    #[test]
+    fn live_agent_min_seconds_defaults_to_forty_five() {
+        assert_eq!(
+            Settings::default().live_agent_min_seconds,
+            45,
+            "live_agent_min_seconds must default to 45"
+        );
+    }
+
+    #[test]
+    fn live_agent_digest_toggles_default_to_true() {
+        let s = Settings::default();
+        assert!(s.live_agent_digest_action_items);
+        assert!(s.live_agent_digest_decisions);
+        assert!(s.live_agent_digest_open_asks);
+        assert!(s.live_agent_digest_attachment_answers);
+        assert!(s.live_agent_digest_unresolved_references);
+    }
+
+    #[test]
+    fn live_agent_attachment_budget_defaults_to_eighty_thousand() {
+        assert_eq!(
+            Settings::default().live_agent_attachment_budget_chars,
+            80_000,
+            "live_agent_attachment_budget_chars must default to 80_000"
+        );
+    }
+
+    #[test]
+    fn live_agent_system_prompt_defaults_to_nonempty_instruction() {
+        let prompt = Settings::default().live_agent_system_prompt;
+        assert!(
+            !prompt.is_empty(),
+            "default live-agent prompt must be non-empty"
+        );
+        // The instruction must emphasise updating the standing list.
+        assert!(
+            prompt.to_lowercase().contains("update"),
+            "default prompt must mention updating the digest"
+        );
+    }
+
+    #[test]
+    fn live_agent_fields_round_trip() {
+        let original = Settings {
+            live_agent_enabled: LiveAgentMode::Off,
+            live_agent_min_segments: 12,
+            live_agent_min_seconds: 60,
+            live_agent_digest_action_items: true,
+            live_agent_digest_decisions: false,
+            live_agent_digest_open_asks: true,
+            live_agent_digest_attachment_answers: false,
+            live_agent_digest_unresolved_references: true,
+            live_agent_attachment_budget_chars: 50_000,
+            live_agent_system_prompt: "Custom prompt.".to_string(),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(restored.live_agent_enabled, LiveAgentMode::Off);
+        assert_eq!(restored.live_agent_min_segments, 12);
+        assert_eq!(restored.live_agent_min_seconds, 60);
+        assert!(!restored.live_agent_digest_decisions);
+        assert!(!restored.live_agent_digest_attachment_answers);
+        assert_eq!(restored.live_agent_attachment_budget_chars, 50_000);
+        assert_eq!(restored.live_agent_system_prompt, "Custom prompt.");
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn live_agent_enabled_serialises_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LiveAgentMode::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(serde_json::to_string(&LiveAgentMode::On).unwrap(), "\"on\"");
+        assert_eq!(
+            serde_json::to_string(&LiveAgentMode::Off).unwrap(),
+            "\"off\""
+        );
+    }
+
+    #[test]
+    fn old_store_json_without_live_agent_fields_defaults() {
+        // A store written before any live-agent fields existed must deserialise
+        // all live-agent fields to their safe defaults.
+        let old_json = r#"{ "theme": "dark", "diarization_enabled": true }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert_eq!(
+            restored.live_agent_enabled,
+            LiveAgentMode::Auto,
+            "missing live_agent_enabled must deserialise to Auto"
+        );
+        assert_eq!(
+            restored.live_agent_min_segments, 8,
+            "missing live_agent_min_segments must deserialise to 8"
+        );
+        assert_eq!(
+            restored.live_agent_min_seconds, 45,
+            "missing live_agent_min_seconds must deserialise to 45"
+        );
+        assert!(
+            restored.live_agent_digest_action_items,
+            "missing live_agent_digest_action_items must deserialise to true"
+        );
+        assert!(
+            restored.live_agent_digest_decisions,
+            "missing live_agent_digest_decisions must deserialise to true"
+        );
+        assert!(
+            restored.live_agent_digest_open_asks,
+            "missing live_agent_digest_open_asks must deserialise to true"
+        );
+        assert!(
+            restored.live_agent_digest_attachment_answers,
+            "missing live_agent_digest_attachment_answers must deserialise to true"
+        );
+        assert!(
+            restored.live_agent_digest_unresolved_references,
+            "missing live_agent_digest_unresolved_references must deserialise to true"
+        );
+        assert_eq!(
+            restored.live_agent_attachment_budget_chars, 80_000,
+            "missing live_agent_attachment_budget_chars must deserialise to 80_000"
+        );
+        assert_eq!(
+            restored.live_agent_system_prompt,
+            default_live_agent_system_prompt(),
+            "missing live_agent_system_prompt must deserialise to the default instruction"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. live_agent_should_run: unit tests for Auto/On/Off × GPU capability
+    // -----------------------------------------------------------------------
+
+    fn discrete_probe() -> GpuProbe {
+        GpuProbe {
+            total_bytes: 24 * 1024 * 1024 * 1024, // 24 GiB discrete
+            free_bytes: 20 * 1024 * 1024 * 1024,
+            is_integrated: false,
+            name: "NVIDIA GeForce RTX 3090".to_string(),
+        }
+    }
+
+    fn integrated_probe() -> GpuProbe {
+        GpuProbe {
+            total_bytes: 16 * 1024 * 1024 * 1024, // 16 GiB iGPU (shared RAM)
+            free_bytes: 8 * 1024 * 1024 * 1024,
+            is_integrated: true,
+            name: "AMD Radeon 890M".to_string(),
+        }
+    }
+
+    #[test]
+    fn live_agent_should_run_off_always_false() {
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Off,
+            None,
+            GpuAcceleration::Auto
+        ));
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Off,
+            Some(&discrete_probe()),
+            GpuAcceleration::Auto
+        ));
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Off,
+            Some(&integrated_probe()),
+            GpuAcceleration::On
+        ));
+    }
+
+    #[test]
+    fn live_agent_should_run_on_always_true() {
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
+            None,
+            GpuAcceleration::Off
+        ));
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
+            Some(&discrete_probe()),
+            GpuAcceleration::Auto
+        ));
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
+            Some(&integrated_probe()),
+            GpuAcceleration::On
+        ));
+    }
+
+    #[test]
+    fn live_agent_should_run_auto_no_probe_is_false() {
+        assert!(
+            !live_agent_should_run(LiveAgentMode::Auto, None, GpuAcceleration::Auto),
+            "Auto with no probe (CPU-only build) must be false"
+        );
+    }
+
+    #[test]
+    fn live_agent_should_run_auto_gpu_accel_on_is_true() {
+        // Both discrete and integrated GPUs with acceleration active pass Auto.
+        assert!(
+            live_agent_should_run(
+                LiveAgentMode::Auto,
+                Some(&discrete_probe()),
+                GpuAcceleration::Auto
+            ),
+            "Auto with discrete GPU and accel on must be true"
+        );
+        assert!(
+            live_agent_should_run(
+                LiveAgentMode::Auto,
+                Some(&integrated_probe()),
+                GpuAcceleration::Auto
+            ),
+            "Auto with integrated GPU and accel on must be true (SP-LIVE E1)"
+        );
+    }
+
+    #[test]
+    fn live_agent_should_run_auto_accel_off_is_false() {
+        assert!(
+            !live_agent_should_run(
+                LiveAgentMode::Auto,
+                Some(&discrete_probe()),
+                GpuAcceleration::Off
+            ),
+            "Auto with accel=Off must be false (LLM would contend with CPU ASR)"
+        );
+        assert!(
+            !live_agent_should_run(
+                LiveAgentMode::Auto,
+                Some(&integrated_probe()),
+                GpuAcceleration::Off
+            ),
+            "Auto with integrated GPU and accel=Off must be false"
+        );
     }
 }

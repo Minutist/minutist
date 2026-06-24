@@ -246,14 +246,19 @@ mod tests {
 
     #[test]
     fn role_serialises_snake_case() {
-        assert_eq!(serde_json::to_value(Role::Assistant).unwrap(), json!("assistant"));
+        assert_eq!(
+            serde_json::to_value(Role::Assistant).unwrap(),
+            json!("assistant")
+        );
         assert_eq!(serde_json::to_value(Role::Tool).unwrap(), json!("tool"));
     }
 
     #[test]
     fn tools_json_wraps_descriptors_in_openai_function_shape() {
         let descs = vec![descriptor("get_transcript"), descriptor("get_summary")];
-        let s = tools_json(&descs).unwrap().expect("non-empty descriptors yield Some");
+        let s = tools_json(&descs)
+            .unwrap()
+            .expect("non-empty descriptors yield Some");
         let arr: Vec<Value> = serde_json::from_str(&s).unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], json!("function"));

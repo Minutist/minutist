@@ -12,6 +12,7 @@ import { useSyncStatusStore } from "../state/sync-status";
 import { useOperationProgressStore } from "../state/operation-progress";
 import { useTranslationsStore } from "../state/translations";
 import { useUpdateStore } from "../state/update";
+import { useLiveDigestStore } from "../state/liveDigest";
 
 /**
  * Mount the global Tauri event bridge exactly once.
@@ -39,6 +40,7 @@ export function useAppEventBridge(): void {
   );
   const handleTranslationsEvent = useTranslationsStore((s) => s.handleEvent);
   const handleUpdateEvent = useUpdateStore((s) => s.handleEvent);
+  const handleLiveDigestEvent = useLiveDigestStore((s) => s.handleEvent);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -56,6 +58,7 @@ export function useAppEventBridge(): void {
       handleOperationProgressEvent(event);
       handleTranslationsEvent(event);
       handleUpdateEvent(event);
+      handleLiveDigestEvent(event);
     })
       .then((fn) => {
         unlisten = fn;
@@ -82,5 +85,6 @@ export function useAppEventBridge(): void {
     handleOperationProgressEvent,
     handleTranslationsEvent,
     handleUpdateEvent,
+    handleLiveDigestEvent,
   ]);
 }

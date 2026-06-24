@@ -312,12 +312,8 @@ async fn run_convert_job(
         // `Option<Arc<dyn DocVlm>>` into the `Option<&dyn DocVlm>` the converter
         // takes.
         let md = doc_convert::convert_to_markdown(&bytes, &ext, vlm.as_deref())?;
-        let md_filename = persistence::save_attachment_markdown(
-            &meetings_dir_owned,
-            meeting_id,
-            &hash,
-            &md,
-        )?;
+        let md_filename =
+            persistence::save_attachment_markdown(&meetings_dir_owned, meeting_id, &hash, &md)?;
         // Flip the row to Ready inside the same blocking task (the manifest RMW
         // is brief synchronous std::fs under the per-meeting lock).
         let found = persistence::set_entry_conversion(
@@ -333,11 +329,7 @@ async fn run_convert_job(
             // existed, so the markdown we just wrote is now orphaned. Clean it up
             // (dedup-safe: only when no surviving row shares the hash) so the
             // remove-then-convert ordering leaves nothing behind.
-            persistence::unlink_orphan_attachment_markdown(
-                &meetings_dir_owned,
-                meeting_id,
-                &hash,
-            )?;
+            persistence::unlink_orphan_attachment_markdown(&meetings_dir_owned, meeting_id, &hash)?;
         }
         Ok(found)
     })
@@ -367,7 +359,13 @@ async fn run_convert_job(
                 "attachment removed during conversion; discarded converted markdown"
             );
         }
-        Ok(Err(e)) => mark_failed(meetings_dir, event_tx, meeting_id, attachment_id, e.to_string()),
+        Ok(Err(e)) => mark_failed(
+            meetings_dir,
+            event_tx,
+            meeting_id,
+            attachment_id,
+            e.to_string(),
+        ),
         Err(join_err) => mark_failed(
             meetings_dir,
             event_tx,

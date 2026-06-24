@@ -46,12 +46,14 @@
 
 mod backend;
 mod error;
+pub mod live;
 mod llama;
 mod types;
 mod window;
 
 pub use backend::{messages_json, tools_json, RawTurn, TurnBackend};
 pub use error::Error;
+pub use live::{LiveSession, LiveSessionBackend, LlamaLiveBackend, LlamaLiveConfig};
 pub use llama::{LlamaTurnBackend, LlamaTurnConfig};
 pub use types::{CancelFlag, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
 pub use window::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
@@ -252,7 +254,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome, TurnOutcome::Final("hello world".to_string()));
-        assert_eq!(streamed, "hello world", "tokens stream through the callback");
+        assert_eq!(
+            streamed, "hello world",
+            "tokens stream through the callback"
+        );
     }
 
     #[test]
@@ -409,7 +414,10 @@ mod tests {
             .unwrap();
         let seen = engine.backend.seen.lock().unwrap();
         let (_, tools) = seen.as_ref().unwrap();
-        assert!(tools.is_none(), "no descriptors ⇒ tools_json None (tool-less turn)");
+        assert!(
+            tools.is_none(),
+            "no descriptors ⇒ tools_json None (tool-less turn)"
+        );
     }
 
     // ----- Deterministic sampler selection ----------------------------------
@@ -442,7 +450,10 @@ mod tests {
         for desc in registry.descriptors() {
             let schema = serde_json::to_string(&desc.input_schema).unwrap();
             let grammar = LlamaTurnBackend::schema_grammar(&schema).unwrap_or_else(|e| {
-                panic!("tool {} schema must compile to a GBNF grammar: {e:?}", desc.name)
+                panic!(
+                    "tool {} schema must compile to a GBNF grammar: {e:?}",
+                    desc.name
+                )
             });
             assert!(
                 grammar.contains("root ::="),
@@ -461,13 +472,15 @@ mod tests {
         match trim_to_budget(&lens, 50, 10, 200) {
             TrimOutcome::Fits { drop_after_head } => {
                 assert!(drop_after_head >= 1, "eviction happened");
-                let surviving: usize =
-                    lens[0] + lens[1 + drop_after_head..].iter().sum::<usize>();
+                let surviving: usize = lens[0] + lens[1 + drop_after_head..].iter().sum::<usize>();
                 assert!(fits_budget(surviving, 50, 10, 200));
             }
             other => panic!("expected Fits, got {other:?}"),
         }
         // A single over-budget turn is the hard floor.
-        assert_eq!(trim_to_budget(&[50, 200], 50, 10, 200), TrimOutcome::HardFloor);
+        assert_eq!(
+            trim_to_budget(&[50, 200], 50, 10, 200),
+            TrimOutcome::HardFloor
+        );
     }
 }

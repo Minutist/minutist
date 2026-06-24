@@ -837,6 +837,98 @@ fn aggregate_talk_time(
 }
 
 // ---------------------------------------------------------------------------
+// list_attachments
+// ---------------------------------------------------------------------------
+
+pub struct ListAttachments;
+
+#[async_trait]
+impl Tool for ListAttachments {
+    fn name(&self) -> &'static str {
+        "list_attachments"
+    }
+    fn title(&self) -> &'static str {
+        "List meeting attachments"
+    }
+    fn description(&self) -> &'static str {
+        "List all attachments for a meeting (id, original filename, extension, conversion state, \
+         byte size, and — when conversion is Ready — the converted_md_filename to pass to \
+         get_attachment_markdown). Returns an empty list when the meeting has no attachments."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        meeting_id_schema()
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let root = ctx.meetings_dir.clone();
+        let entries = spawn_blocking_io(move || persistence::read_manifest(&root, id)).await?;
+        let n = entries.len();
+        // Project the agent-useful fields; omit the raw hash (content-address
+        // implementation detail) and `added_at` (not useful to the agent).
+        // `converted_md_filename` is included so the agent can chain directly into
+        // get_attachment_markdown without having to reconstruct the hash filename.
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "id": e.id,
+                    "original_filename": e.original_filename,
+                    "ext": e.ext,
+                    "conversion": e.conversion,
+                    "byte_len": e.byte_len,
+                    "converted_md_filename": e.converted_md_filename,
+                })
+            })
+            .collect();
+        Ok(ToolOutput::new(json!(rows), format!("{n} attachment(s)")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// get_attachment_markdown
+// ---------------------------------------------------------------------------
+
+pub struct GetAttachmentMarkdown;
+
+#[async_trait]
+impl Tool for GetAttachmentMarkdown {
+    fn name(&self) -> &'static str {
+        "get_attachment_markdown"
+    }
+    fn title(&self) -> &'static str {
+        "Get attachment as markdown"
+    }
+    fn description(&self) -> &'static str {
+        "Read the converted markdown for a meeting attachment. \
+         Pass the `converted_md_filename` value from the list_attachments row \
+         (present on entries whose conversion state is Ready) as the `filename` argument. \
+         Fails when the attachment has not been converted yet or the filename is unsafe."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "filename": { "type": "string", "description": "The converted markdown filename from the manifest row (e.g. \"<hash>.md\")" },
+            }),
+            &["meeting_id", "filename"],
+        )
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let filename = require_str(&args, "filename")?.to_string();
+        let root = ctx.meetings_dir.clone();
+        let markdown =
+            spawn_blocking_io(move || persistence::read_attachment_markdown(&root, id, &filename))
+                .await?;
+        let char_count = markdown.chars().count();
+        Ok(ToolOutput::new(
+            json!({ "markdown": markdown }),
+            format!("{char_count} chars"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Record-control tools (WRITE — MCP write-gated, off by default) — #62
 // ---------------------------------------------------------------------------
 //
@@ -931,7 +1023,10 @@ impl Tool for StopRecording {
         });
         Ok(ToolOutput::new(
             data,
-            format!("recording stopped ({} — {} ms)", meta.uuid.0, meta.duration_ms),
+            format!(
+                "recording stopped ({} — {} ms)",
+                meta.uuid.0, meta.duration_ms
+            ),
         ))
     }
 }

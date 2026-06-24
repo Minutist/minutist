@@ -138,6 +138,7 @@ pub mod diagnostics;
 pub mod error;
 pub mod events;
 pub mod inter_agent;
+pub mod live_agent;
 pub mod output_language;
 pub mod sync;
 pub mod tunnel;
@@ -160,6 +161,7 @@ pub use chat_runtime::ChatHandles;
 pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
 pub use inter_agent::spawn_inter_agent_driver;
+pub use live_agent::{spawn_live_agent, LiveAgentHandles};
 /// Re-exports so `app-main` can name these types without direct deps on
 /// `persistence` and `summariser`; both already appear in the public API
 /// (`open_meeting_index` returns `Arc<MeetingIndex>`; `IpcState::summariser`

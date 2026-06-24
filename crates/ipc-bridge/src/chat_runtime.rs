@@ -94,7 +94,10 @@ impl ChatHandles {
         let model_id = commands::resolve_llm_model_id(&self.settings.current());
         let available = self.orchestrator.list_models().into_iter().any(|m| {
             m.id == model_id
-                && matches!(m.status, minutist_common::ModelStatusState::Available { .. })
+                && matches!(
+                    m.status,
+                    minutist_common::ModelStatusState::Available { .. }
+                )
         });
         if !available {
             tracing::info!(

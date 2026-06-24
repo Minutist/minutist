@@ -31,9 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_tools::{ToolDescriptor, ToolOutput};
 use chat_agent::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};
-use chat_agent::{
-    CancelFlag, ChatEngine, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome,
-};
+use chat_agent::{CancelFlag, ChatEngine, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
 use minutist_common::{AppError, AppEvent, AppResult, ChatSessionId};
 
 /// The max number of tool-call iterations one turn may take before the driver
@@ -318,7 +316,12 @@ fn snap_to_group_boundary(history: &[ChatMessage], drop_after_head: usize) -> us
     let start = 1 + drop_after_head;
     // Search for the next group start (a User message) at or after `start`,
     // without ever reaching the final message (always retained).
-    for (idx, msg) in history.iter().enumerate().take(history.len() - 1).skip(start) {
+    for (idx, msg) in history
+        .iter()
+        .enumerate()
+        .take(history.len() - 1)
+        .skip(start)
+    {
         if msg.role == Role::User {
             return idx - 1;
         }
@@ -862,7 +865,11 @@ mod tests {
 
         let seen = engine.seen_histories.lock().unwrap();
         let second = &seen[1];
-        assert_eq!(second.len(), 5, "[system, user, assistant(calls), tool, tool]");
+        assert_eq!(
+            second.len(),
+            5,
+            "[system, user, assistant(calls), tool, tool]"
+        );
         assert_eq!(second[2].role, Role::Assistant);
         assert_eq!(
             second[2].tool_calls.len(),

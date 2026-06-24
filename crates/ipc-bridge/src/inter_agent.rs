@@ -383,7 +383,10 @@ mod tests {
         let tx = spawn_inter_agent_driver(handles, chat_in_flight, false, shutdown_rx);
 
         // The driver is running; the channel is open.
-        assert!(!tx.is_closed(), "driver channel must be open before shutdown");
+        assert!(
+            !tx.is_closed(),
+            "driver channel must be open before shutdown"
+        );
 
         // Fire the shutdown signal.
         shutdown_tx.send(true).expect("send shutdown");

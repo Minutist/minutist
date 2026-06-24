@@ -80,6 +80,24 @@ restated. Adding any other edge requires updating
   portability". Changing the probe or the plan is an architecture-owner change in
   `common`; changing only how a consumer uses the plan stays in that consumer.
 
+- **Live in-meeting agent common types (Phase 9 / WU2b).** The following
+  types and functions in `common` are owned by `architecture-owner`:
+  - `LiveDigestItem { text: String, resolved: bool, source: Option<String> }` —
+    one item in a digest category; derives `specta::Type`, crosses IPC.
+  - `LiveDigest { meeting_id, generated_at_ms, action_items, decisions,
+    open_asks, attachment_answers, unresolved_references }` — the full per-meeting
+    digest produced by the live agent on each refresh.
+  - `LiveAgentMode { Auto, On, Off }` — user preference for the live agent gate.
+    `Auto` resolves to GPU-acceleration-active (see `live_agent_should_run`).
+  - `live_agent_should_run(mode, probe, gpu_acceleration) -> bool` — pure gate
+    resolution; documented in `components.md` and `cross-cutting.md`.
+  - `AppEvent::LiveDigestUpdated` and `AppEvent::LiveDigestError` — the two
+    event variants emitted by `ipc-bridge`'s live-agent driver.
+  The live-agent driver implementation (S2b) lives in
+  `crates/ipc-bridge/src/live_agent.rs` (systems-engineer). The held-context
+  backend (S2a) lives in `crates/chat-agent/src/live.rs` (ml-runtime-engineer).
+  Neither adds a new dependency edge beyond what is already in the table.
+
 ## Role definitions
 
 ### `architecture-owner`

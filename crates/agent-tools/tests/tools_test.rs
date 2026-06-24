@@ -168,6 +168,8 @@ async fn registry_v1_has_the_documented_tool_set() {
         "relisten_section",
         "resummarise",
         "speaker_talk_time",
+        "list_attachments",
+        "get_attachment_markdown",
         "set_speaker_name",
         "rename_meeting",
         "reprocess_meeting",
@@ -679,6 +681,207 @@ async fn resummarise_threads_instruction_through_as_prompt() {
     // resummarise must NOT write summary.md.
     let dir = root.join(id.0.to_string());
     assert!(persistence::read_summary(&dir).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Attachment tools
+// ---------------------------------------------------------------------------
+
+/// Seed a Ready attachment into `meetings_dir` for `meeting_id` and return the
+/// converted markdown filename so tests can pass it to `get_attachment_markdown`.
+fn seed_attachment(
+    meetings_dir: &std::path::Path,
+    meeting_id: minutist_common::MeetingId,
+    original_name: &str,
+    ext: &str,
+    markdown: &str,
+) -> String {
+    let bytes = format!("dummy content for {original_name}").into_bytes();
+    let hash = persistence::save_attachment_original(meetings_dir, meeting_id, &bytes, ext)
+        .expect("save original");
+    let md_filename =
+        persistence::save_attachment_markdown(meetings_dir, meeting_id, &hash, markdown)
+            .expect("save markdown");
+    let entry = minutist_common::AttachmentEntry {
+        id: minutist_common::AttachmentId::new(),
+        hash: hash.clone(),
+        original_filename: original_name.to_string(),
+        ext: ext.to_string(),
+        byte_len: bytes.len() as u64,
+        added_at: "2026-06-22T10:00:00Z".to_string(),
+        conversion: minutist_common::ConversionState::Ready,
+        converted_md_filename: Some(md_filename.clone()),
+    };
+    persistence::add_manifest_entry(meetings_dir, meeting_id, entry).expect("add manifest entry");
+    md_filename
+}
+
+#[tokio::test]
+async fn list_attachments_returns_empty_for_meeting_with_none() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "list_attachments",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    assert!(arr.is_empty(), "no attachments → empty list");
+    assert_eq!(out.summary.as_deref(), Some("0 attachment(s)"));
+}
+
+#[tokio::test]
+async fn list_attachments_returns_manifest_rows() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+    seed_attachment(&root, id, "slides.pptx", "pptx", "# Slides\n\nContent.");
+    seed_attachment(&root, id, "report.pdf", "pdf", "# Report\n\nData.");
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "list_attachments",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
+        .await
+        .unwrap();
+    let arr = out.data.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "two attachments must be listed");
+    // Check projected fields are present and no hash field leaks.
+    let row = &arr[0];
+    assert!(row.get("id").is_some(), "id field present");
+    assert!(
+        row.get("original_filename").is_some(),
+        "original_filename present"
+    );
+    assert!(row.get("ext").is_some(), "ext present");
+    assert!(row.get("conversion").is_some(), "conversion present");
+    assert!(row.get("byte_len").is_some(), "byte_len present");
+    assert!(
+        row.get("converted_md_filename").is_some(),
+        "converted_md_filename must be projected so the agent can chain into get_attachment_markdown"
+    );
+    assert!(
+        row.get("hash").is_none(),
+        "hash must not be projected to the agent"
+    );
+}
+
+#[tokio::test]
+async fn list_attachments_exposes_converted_md_filename_for_chaining() {
+    // Verify that the JSON rows from list_attachments carry `converted_md_filename`
+    // so an agent can pass it directly to get_attachment_markdown without knowing
+    // the hash. This exercises the list→get chain through the projected JSON.
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+    seed_attachment(&root, id, "agenda.md", "md", "# Agenda\n\nItems.");
+
+    // Step 1: list_attachments — extract converted_md_filename from the JSON row.
+    let list_out = reg
+        .dispatch(
+            &ctx,
+            "list_attachments",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
+        .await
+        .unwrap();
+    let arr = list_out.data.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let row = &arr[0];
+    let md_filename = row
+        .get("converted_md_filename")
+        .and_then(|v| v.as_str())
+        .expect("converted_md_filename must be present in the list row for a Ready attachment");
+
+    // Step 2: get_attachment_markdown — use the filename extracted from the row.
+    let get_out = reg
+        .dispatch(
+            &ctx,
+            "get_attachment_markdown",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "filename": md_filename }),
+        )
+        .await
+        .expect("get_attachment_markdown must succeed with filename from list_attachments row");
+    assert_eq!(
+        get_out.data["markdown"].as_str().unwrap(),
+        "# Agenda\n\nItems.",
+        "markdown content must match what was seeded"
+    );
+}
+
+#[tokio::test]
+async fn list_attachments_is_read_and_mcp_exposed() {
+    let reg = ToolRegistry::v1(false);
+    let tool = reg.get("list_attachments").expect("registered");
+    assert!(!tool.is_write(), "list_attachments must not be a write");
+    assert!(
+        tool.expose_over_mcp(),
+        "list_attachments must be MCP-exposed by default"
+    );
+}
+
+#[tokio::test]
+async fn get_attachment_markdown_returns_content() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+    let md_filename = seed_attachment(&root, id, "brief.md", "md", "# Brief\n\nKey points.");
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "get_attachment_markdown",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "filename": md_filename }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out.data["markdown"].as_str().unwrap(),
+        "# Brief\n\nKey points."
+    );
+}
+
+#[tokio::test]
+async fn get_attachment_markdown_rejects_traversal_filename() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
+
+    for evil in ["../secret.md", "sub/dir.md", "..", ".", "", "..\\win.md"] {
+        let err = reg
+            .dispatch(
+                &ctx,
+                "get_attachment_markdown",
+                serde_json::json!({ "meeting_id": id.0.to_string(), "filename": evil }),
+            )
+            .await
+            .expect_err(&format!("traversal filename {evil:?} must be rejected"));
+        assert!(
+            matches!(err, minutist_common::AppError::InvalidInput { .. }),
+            "expected InvalidInput for {evil:?}, got {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn get_attachment_markdown_is_read_and_mcp_exposed() {
+    let reg = ToolRegistry::v1(false);
+    let tool = reg.get("get_attachment_markdown").expect("registered");
+    assert!(
+        !tool.is_write(),
+        "get_attachment_markdown must not be a write"
+    );
+    assert!(
+        tool.expose_over_mcp(),
+        "get_attachment_markdown must be MCP-exposed by default"
+    );
 }
 
 // ---------------------------------------------------------------------------

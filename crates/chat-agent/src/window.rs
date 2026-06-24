@@ -94,7 +94,12 @@ pub fn trim_to_budget(
     // The minimal surviving window is [head] + [most-recent message]. If that
     // already overflows, eviction cannot help.
     let last_len = token_lens[n - 1];
-    if !fits_budget(head_len.saturating_add(last_len), max_tokens, reserve, n_ctx) {
+    if !fits_budget(
+        head_len.saturating_add(last_len),
+        max_tokens,
+        reserve,
+        n_ctx,
+    ) {
         return TrimOutcome::HardFloor;
     }
 
@@ -169,11 +174,12 @@ mod tests {
                 );
                 // Verify the surviving prompt actually fits, and that the policy
                 // dropped no more than necessary.
-                let surviving: usize =
-                    lens[0] + lens[1 + drop_after_head..].iter().sum::<usize>();
+                let surviving: usize = lens[0] + lens[1 + drop_after_head..].iter().sum::<usize>();
                 assert!(fits_budget(surviving, 50, 10, 200), "survivors must fit");
                 let one_fewer: usize = lens[0]
-                    + lens[1 + drop_after_head.saturating_sub(1)..].iter().sum::<usize>();
+                    + lens[1 + drop_after_head.saturating_sub(1)..]
+                        .iter()
+                        .sum::<usize>();
                 if drop_after_head > 1 {
                     assert!(
                         !fits_budget(one_fewer, 50, 10, 200),

@@ -172,13 +172,16 @@ used, not added here.
 `ModelStatus`, `MeetingListEntry`, `Collection`, `CollectionId`, `NotesDocument`,
 `NoteBlock`, `MeetingState`,
 `InterAgentRequest`, `InterAgentReply`,
-`AttachmentId`, `ConversionState`, `AttachmentEntry`),
+`AttachmentId`, `ConversionState`, `AttachmentEntry`,
+`LiveDigestItem`, `LiveDigest`, `LiveAgentMode`),
 trait definitions (`AsrBackend`, `Diarizer`,
-`Summariser`, `DocVlm`), the shared `AppError` enum + `AppResult<T>` alias, and the
-`apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` helper — the
+`Summariser`, `DocVlm`), the shared `AppError` enum + `AppResult<T>` alias,
+`apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` — the
 single canonical speaker-name overlay (raw diarizer label → display name),
 shared by the agent read tools and the summariser input path so a summary
-refers to "Alice", not "A".
+refers to "Alice", not "A", and `live_agent_should_run(mode, Option<&GpuProbe>, GpuAcceleration) -> bool`
+— a pure helper that resolves `LiveAgentMode` against the GPU probe + acceleration setting without any
+llama.cpp dependency (used by `ipc-bridge` WU2b; fully unit-tested).
 `NoteBlock { at_ms: Option<u64>, text }` (#70) is a note paragraph for the
 summariser — anchored ones carry the `data-anchor-ms` recording-clock
 timestamp; `Summariser::summarise` takes `&[NoteBlock]` (not flat markdown) so
@@ -235,6 +238,69 @@ against its held `LlamaSummariser` without introducing a new workspace edge from
 absent VLM), `Some(GemmaVlm)` in production. Adding this trait is an
 architecture-owner change; all downstream consumers are updated in the same
 commit.
+
+**Live in-meeting agent — shared types (Phase 9 auto-driver, WU1).** Three new
+public types and two new `AppEvent` variants that ride the existing
+`AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
+registration — no second registration. One pure public function.
+
+- `LiveDigestItem { text: String, resolved: bool, source: Option<String> }` —
+  one item in a digest category. `resolved` is the standing-list flag: `false`
+  while outstanding, `true` once resolved or answered. The live agent carries
+  this flag forward across refreshes so resolved items are not re-added. Serde
+  derives; `specta::Type` (crosses IPC via `LiveDigest`); `source` is
+  `#[serde(default, skip_serializing_if = "Option::is_none")]` so the common
+  source-less case stays compact.
+
+- `LiveDigest { meeting_id, generated_at_ms, action_items, decisions, open_asks,
+  attachment_answers, unresolved_references }` — the full digest payload produced
+  by the live agent on each refresh. Each category is a `Vec<LiveDigestItem>`.
+  `generated_at_ms` is wall-clock epoch milliseconds. Serde derives; `specta::Type`;
+  serialises as the existing `AppEvent` nested JSON shape.
+
+- `LiveAgentMode { Auto, On, Off }` — whether the live agent runs during an active
+  recording. `Auto` (the default, `Default = Auto`) enables when GPU acceleration is
+  active: a usable GPU is present AND `gpu_acceleration != Off`. `On`/`Off` are hard
+  overrides. Serialises `rename_all = "snake_case"`. **Distinct from**
+  `GpuAcceleration`: `LiveAgentMode::Auto` is a GPU-acceleration-active gate (run vs
+  skip); `GpuAcceleration::Auto` is a VRAM-budget gate (GPU vs CPU layers — it uses
+  `resolve_gpu_plan`'s thresholds, which `LiveAgentMode::Auto` does NOT).
+  The `settings.live_agent_enabled` field uses this type; `ipc-bridge` (WU2b) calls
+  `live_agent_should_run` to resolve it.
+
+- `live_agent_should_run(mode: LiveAgentMode, probe: Option<&GpuProbe>, gpu_acceleration: GpuAcceleration) -> bool` —
+  pure resolution of `LiveAgentMode`. `Off` → `false`; `On` → `true`; `Auto` →
+  `true` iff `probe` is `Some` AND `gpu_acceleration != Off`. This is a
+  **GPU-acceleration-active proxy** — the LLM runs on the GPU rather than contending
+  with CPU-bound ASR. Does NOT inspect `probe.is_integrated` (the AMD Radeon 890M,
+  integrated + Vulkan, is the validated SP-LIVE hardware). Does NOT invoke
+  `resolve_gpu_plan`. Lives in `common` so consumers can call it without implementing
+  the gate. Fully unit-tested.
+
+Two `AppEvent` variants (placed in a `--- Live agent ---` comment block after
+`ChatContextTrimmed`):
+
+- `LiveDigestUpdated { meeting_id: MeetingId, digest: LiveDigest }` — the live
+  agent produced a full replacement digest. Lossy-broadcast-safe: a dropped event
+  is recovered on the next refresh (same pattern as `ChatTurnComplete.final_text`).
+- `LiveDigestError { meeting_id: MeetingId, message: String }` — the live agent
+  failed to produce a digest; the panel retains the last valid digest.
+
+**Phase 9 — live digest panel (S3, webview only).** `ui/src/state/liveDigest.ts`
+and `ui/src/shell/LiveDigestPanel.tsx` are purely internal to the webview layer.
+The store is event-driven (no IPC command): `live_digest_updated` overwrites the
+entry for the meeting wholesale (lossy-broadcast-safe, same pattern as
+`ChatTurnComplete.final_text`); `live_digest_error` stores the message and retains
+the last valid digest. The panel toggle in `MainWindow` is gated on whether the backend has sent any
+digest event for the active meeting (`digestFor(activeMeetingId) !== null`), NOT
+on `live_agent_enabled`. This avoids mirroring GPU-probe state to the frontend:
+when `mode=Off` the backend never spawns and no event fires so the toggle stays
+hidden; when `mode=On` or `Auto` with GPU active the toggle appears once the
+first digest event arrives (≤ one cadence interval). `MainWindow` reads from
+`useLiveDigestStore` for this gate (no new seam; the store is already populated
+by the existing event-listener path). No new Cargo edge, no new public IPC
+command — all types (`LiveDigest`, `LiveDigestItem`, `LiveDigestUpdated`,
+`LiveDigestError`) were already in `bindings.ts` from WU1.
 
 **Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
 newtype mirroring `MeetingId`); six chat `AppEvent` variants (`ChatToken`,
@@ -1809,10 +1875,10 @@ inter-agent bridge SENDER (`mpsc::Sender<(InterAgentRequest, oneshot)>`, set via
 internal agent so it cannot message itself). The bridge uses only `common` types
 + tokio channels — no `chat-agent` edge.
 
-**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 20 base v1
+**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 22 base v1
 tools in insertion order; `ipc-bridge` passes `false` (the internal agent must
 not message itself) and `app-main` passes `true` for the MCP registry instance,
-which APPENDS `send_to_internal_agent` (21 tools). `descriptors()` /
+which APPENDS `send_to_internal_agent` (23 tools). `descriptors()` /
 `mcp_tool_descriptors()` are pure name/description/schema projections (single
 source of truth); `mcp_tool_descriptors()` honours `expose_over_mcp()`.
 **`mcp_tool_descriptors_gated(allow_writes)`** (Phase 10) composes the
@@ -1827,7 +1893,15 @@ then `execute`.
 **v1 tools.** Read/compute: `list_meetings`, `search_meetings`, `get_meeting`,
 `get_transcript`, `get_transcript_slice`, `get_summary`, `get_notes`,
 `get_metadata`, `get_recording_state`, `search_within_transcript`,
-`relisten_section`, `resummarise`, `speaker_talk_time`. Writes:
+`relisten_section`, `resummarise`, `speaker_talk_time`, `list_attachments`
+(returns manifest rows — id, filename, ext, conversion state, byte size, and
+`converted_md_filename` when Ready — for a meeting; backed by
+`persistence::read_manifest`), `get_attachment_markdown`
+(reads the converted markdown for a Ready attachment; the `filename` argument
+is the `converted_md_filename` value from the manifest row; backed by
+`persistence::read_attachment_markdown`, which applies the path-traversal guard
+before any filesystem access). No new dependency-table edge
+— `agent-tools` already depends on `persistence`. Writes:
 `set_speaker_name`, `rename_meeting` (both MCP-allowlisted — reversible, low
 blast radius), `reprocess_meeting` (internal-only — heavy; re-transcribes then
 re-diarizes under one claim; #0015 merged the former `retranscribe_meeting` +
@@ -1944,6 +2018,46 @@ oldest non-pinned turns until the re-tokenised windowed prompt fits `prompt +
 max_tokens + reserve <= n_ctx`, and reports a hard floor (`HARD_FLOOR_REJECT`)
 when a single turn is genuinely too large (the driver rejects it as
 `AppError::InvalidInput`).
+
+**Live-session engine (`live.rs` — SP-LIVE E2, S2a).** An explicit departure
+from the stateless-fresh-context turn engine above. The live in-meeting agent
+requires holding one `LlamaContext` for an entire recording session so the
+attachment prefix is prefilled once rather than re-paid on each cadence tick
+(~40 s vs ~4.5 s warm decode — see `cross-cutting.md` "Live in-meeting agent").
+The surface is:
+
+- `LiveSessionBackend` trait — the testable seam, mirroring `TurnBackend`.
+  Two operations: `prefill_prefix(text) -> Result<usize, Error>` (chunked-prefill
+  the pinned system + attachments text ONCE, retaining KV state) and
+  `refresh(tail, cfg, cancel, token_cb) -> Result<RawTurn, Error>` (append the
+  incremental transcript tail to the held KV cache and decode the digest answer
+  WITHOUT re-prefilling the prefix).
+
+- `LlamaLiveBackend<'m>` — the real impl. Borrows `&LlamaModel` from the same
+  `LlamaSummariser` substrate (`ipc-bridge` lends it), builds one `LlamaContext`
+  at construction (n_ctx = 32 768, KV-quant OFF per SP-LIVE E3), tracks `n_past`,
+  and extends it on each `refresh` call rather than destroying or re-prefilling.
+  Internally tracks `prior_gen_pruned` (set when a refresh prunes its generated
+  tokens via `clear_kv_cache_seq`) and `last_kv_token` (the last token written to
+  the retained KV). An empty-tail `refresh` following a prune re-decodes
+  `last_kv_token` with logits enabled before sampling — this repopulates the
+  logit buffer from the still-valid KV state, avoiding incoherent output on the
+  stale slot left by the prune. These are private implementation fields; the
+  public API surface is unchanged.
+  `LlamaContext` is `!Send`; `LlamaLiveBackend` is therefore also `!Send`. The
+  S2b driver in `ipc-bridge` owns the dedicated thread and calls these methods
+  only from there — this crate never asserts `Send` on it.
+
+- `LiveSession<B: LiveSessionBackend>` — the driver type. Enforces the
+  invariant: `seed_prefix` is idempotent (second call is a no-op); `refresh`
+  passes only the new tail since the last call; `refresh` before `seed_prefix`
+  is an `AppError::Inference` (incoherent KV state). Generic over the backend
+  so unit tests drive the full loop with a `StubLiveBackend` (no FFI, no model)
+  asserting prefix-once and tail-only discipline.
+
+**No new dependency edge.** `llama-cpp-2` is already a hard dep (used by
+`LlamaTurnBackend`); `summariser::plan_prefill` is already reused for chunked
+prefill in `llama.rs`. No new crate or workspace edge is introduced by `live.rs`.
 
 ### `mcp-server`
 **Crate:** `crates/mcp-server` (Phase 10)
@@ -2142,6 +2256,28 @@ older store written before the field existed deserialises to `"auto"`. The
 resolved language name is appended to the summariser and chat system prompts by
 `ipc-bridge` — the transcript itself is never touched. No new dependency edge
 on the `settings` crate. See the `ipc-bridge` "Output-language resolution" note.
+
+**Live-agent fields (Phase 9 auto-driver, WU1).** Ten new fields, all
+`#[serde(default = ...)]` so an older store written before any of them existed
+deserialises to the defaults below:
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `live_agent_enabled` | `LiveAgentMode` | `Auto` | Whether the live agent runs. `Auto` = discrete-GPU-presence gate (NOT a VRAM-budget check, NOT `resolve_gpu_plan`); `On` = always; `Off` = never. Resolved by `live_agent_should_run` in `common`. |
+| `live_agent_min_segments` | `u32` | `8` | Minimum new transcript segments before a digest refresh fires. |
+| `live_agent_min_seconds` | `u32` | `45` | Minimum wall-clock seconds before a digest refresh fires. Both thresholds must be met. |
+| `live_agent_digest_action_items` | `bool` | `true` | Include action items in the digest panel. |
+| `live_agent_digest_decisions` | `bool` | `true` | Include decisions in the digest panel. |
+| `live_agent_digest_open_asks` | `bool` | `true` | Include open / unanswered asks in the digest panel. |
+| `live_agent_digest_attachment_answers` | `bool` | `true` | Include attachment-sourced answers in the digest panel. |
+| `live_agent_digest_unresolved_references` | `bool` | `true` | Include unresolved references in the digest panel. |
+| `live_agent_attachment_budget_chars` | `usize` | `80_000` | Max chars of attachment markdown in the pinned prefix (~20 k tokens; fits within n_ctx = 32 768). |
+| `live_agent_system_prompt` | `String` | (built-in) | System prompt emphasising UPDATE-the-standing-list-don't-regenerate, per §3 of the SP-LIVE spec. |
+
+`LiveAgentMode` is a `common` type (serde `rename_all = "snake_case"`; `Default = Auto`;
+`specta::Type` so it crosses IPC). All ten fields are added to the hand-written
+`Default` impl. No new `settings` dependency edge (`LiveAgentMode` / `GpuProbe`
+are already in `common` which `settings` already depends on).
 
 ### `doc-convert`
 **Crate:** `crates/doc-convert`
@@ -2872,6 +3008,50 @@ and passes the resulting `attachments_markdown: &str` into `summarise`. An empty
 manifest (or no Ready entries) passes `""`, producing byte-identical output to the
 no-attachment path. `summarise_meeting_inner` (the `#[cfg(test)]` stub path) passes
 `""` to preserve existing test behaviour.
+
+**Live in-meeting agent auto-driver (`ipc-bridge::live_agent`, Phase 9 / WU2b).**
+`spawn_live_agent(handles, meeting_id, gpu_probe, shutdown)` wires the held-context
+digest-refresh loop for one active recording session. No new command or new
+dependency edge — it uses the existing `ipc-bridge → chat-agent` (for `LiveSession`
+/ `LiveSessionBackend` / `SamplerConfig` / `CancelFlag`) and `ipc-bridge →
+persistence` (for `read_attachments_markdown_parts`) edges already in the table.
+
+The driver has two halves:
+- **Async driver task** (`tauri::async_runtime::spawn`): subscribes to the
+  orchestrator's broadcast (`TranscriptSegment`, `StateChanged`), accumulates the
+  tail buffer, and evaluates the pure `should_refresh(new_segments, elapsed_secs,
+  in_flight, min_segments, min_seconds) -> bool` cadence gate.
+- **Dedicated `std::thread` worker**: owns the `!Send`
+  `LiveSession<LlamaLiveBackend>` for the session lifetime. Borrows `&LlamaModel`
+  from the shared `Arc<LlamaSummariser>` (same held cell as chat/summarise) via a
+  raw-pointer lifetime extension that is safe because the Arc outlives the session
+  by stack-declaration order. The test-only stub `WorkerBackend` (`#[cfg(test)]`)
+  drives the protocol without a model.
+  Communication uses two bounded `tokio::sync::mpsc` channels (depth 1) so
+  in-flight is enforced without a separate mutex.
+
+**Context overflow policy (v1).** On `Error::ContextOverflow` from `refresh`, the
+driver emits one `LiveDigestError` ("context window filled") and sets a permanent
+`capacity_exhausted` flag — no further refresh dispatches for the session.
+Re-seeding mid-recording is not attempted (prohibitive prefill cost).
+
+The prefix (system prompt + category-toggle instructions + attachment markdown, budgeted
+to `settings.live_agent_attachment_budget_chars`) is built once at session spawn and
+seeded into the `LlamaContext` at worker startup — BEFORE the cadence loop — so the
+~40 s prefill runs at meeting start, not mid-recording (the binding SP-LIVE
+pin-at-start decision). The seed honours the worker `CancelFlag`, so a Start-then-Stop
+during the prefill aborts promptly. Subsequent `seed_prefix`
+calls are no-ops (`LiveSession` enforces this). Each subsequent request appends the
+new transcript tail (plus the prior digest JSON for standing-list update) and decodes
+a fresh `LiveDigest`. Results are parsed by `parse_digest`, which preserves `resolved
+= true` flags from prior items (model forgetfulness guard), and emitted as
+`AppEvent::LiveDigestUpdated` / `AppEvent::LiveDigestError`.
+
+The `app-main` watcher task subscribes to `StateChanged`, calls `spawn_live_agent`
+on `Recording` (only when `live_agent_should_run(settings.live_agent_enabled,
+gpu_probe, settings.gpu_acceleration)` returns `true` — `Auto` enables when a GPU is
+present AND `gpu_acceleration != Off`, so the LLM decode lands on the GPU off the
+CPU-ASR path), and raises the returned `watch::Sender` on `Idle`/`Stopping`/`Finalising`.
 
 ### `app-main` (bin)
 **Crate:** `src-tauri/` (Tauri convention)

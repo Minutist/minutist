@@ -6,6 +6,7 @@ import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
 import { useReportProblemStore } from "../state/report-problem";
 import { useSyncStatusStore } from "../state/sync-status";
+import { useLiveDigestStore } from "../state/liveDigest";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
@@ -16,6 +17,7 @@ import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
 import { AttachmentsPane } from "./AttachmentsPane";
 import { ChatView } from "./ChatView";
+import { LiveDigestPanel } from "./LiveDigestPanel";
 import { SettingsDrawer } from "./SettingsDrawer";
 import { About } from "./About";
 import { UpdateBanner } from "./UpdateBanner";
@@ -79,6 +81,7 @@ export function MainWindow() {
   const refreshSettings = useRecordingStore((s) => s.refreshSettings);
   const prewarmAsr = useRecordingStore((s) => s.prewarmAsr);
   const lastError = useRecordingStore((s) => s.lastError);
+  const settings = useRecordingStore((s) => s.settings);
   const syncReadyNotifications = useSyncStatusStore(
     (s) => s.pendingReadyNotifications,
   );
@@ -94,6 +97,7 @@ export function MainWindow() {
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
+  const digestFor = useLiveDigestStore((s) => s.digestFor);
   // Re-processing (re-transcribe / re-identify speakers) is a rare action that
   // lives in the transcript pane's action toolbar (#67) — see TranscriptPane —
   // not on this heading or the meeting list.
@@ -145,6 +149,18 @@ export function MainWindow() {
   // (unlike summary). Hidden by default; one click on the toggle reveals it.
   const showAttachmentsPane = inWorkspace && activeMeetingId !== null;
 
+  // The live digest panel toggle is offered once the backend has signalled it
+  // is active for this meeting — i.e. after the first `live_digest_updated` or
+  // `live_digest_error` event arrives. This avoids re-deriving the Auto gate in
+  // the frontend (which would require mirroring GPU-probe state to the UI) and
+  // ensures the toggle only appears when there is actually something to show.
+  // When `mode=Off` the backend never spawns the agent so no event ever fires
+  // and the panel stays hidden. When `mode=On` or `Auto` with GPU active the
+  // first digest event (≤ one cadence interval after the agent seeds) unlocks it.
+  const showLiveDigestPane =
+    activeMeetingId !== null &&
+    digestFor(activeMeetingId) !== null;
+
   // Pane visibility (FR-21/FR-30). Panes are included/excluded from the Group
   // rather than collapsed to zero width. Reset to the per-mode default whenever
   // the workspace is (re-)entered or the mode flips (see the effect below).
@@ -156,6 +172,8 @@ export function MainWindow() {
   const [chatShown, setChatShown] = useState(false);
   // Attachments are OFF by default; one click on the toggle reveals the column.
   const [attachmentsShown, setAttachmentsShown] = useState(false);
+  // Live digest is OFF by default; one click on the toggle reveals the column.
+  const [liveDigestShown, setLiveDigestShown] = useState(false);
 
   // The About dialog (Phase 7, S6) is hidden by default; a header affordance
   // opens it. Presentational overlay; closing returns to the prior surface.
@@ -194,6 +212,7 @@ export function MainWindow() {
     setSummaryShown(true); // only rendered when showSummaryPane (finished meeting)
     setChatShown(false); // chat is one click away on the toggle
     setAttachmentsShown(false); // attachments are one click away on the toggle
+    setLiveDigestShown(false); // live digest is one click away on the toggle
   }, [inWorkspace, showSummaryPane]);
 
   // How many panes are currently visible — used to forbid hiding the last one.
@@ -202,7 +221,8 @@ export function MainWindow() {
     (transcriptShown ? 1 : 0) +
     (showSummaryPane && summaryShown ? 1 : 0) +
     (showChatPane && chatShown ? 1 : 0) +
-    (showAttachmentsPane && attachmentsShown ? 1 : 0);
+    (showAttachmentsPane && attachmentsShown ? 1 : 0) +
+    (showLiveDigestPane && liveDigestShown ? 1 : 0);
 
   function togglePane(shown: boolean, setShown: (next: boolean) => void) {
     // Never hide the last visible pane — the workspace must show something.
@@ -318,6 +338,18 @@ export function MainWindow() {
                   }
                 >
                   Attachments
+                </button>
+              )}
+              {showLiveDigestPane && (
+                <button
+                  type="button"
+                  className="main-window__view-seg"
+                  aria-pressed={liveDigestShown}
+                  onClick={() =>
+                    togglePane(liveDigestShown, setLiveDigestShown)
+                  }
+                >
+                  Digest
                 </button>
               )}
             </div>
@@ -491,6 +523,36 @@ export function MainWindow() {
                   defaultSize="30%"
                 >
                   <AttachmentsPane meetingId={activeMeetingId} />
+                </Panel>
+              ),
+            showLiveDigestPane &&
+              liveDigestShown &&
+              activeMeetingId !== null && (
+                <Panel
+                  key="live-digest"
+                  id="live-digest"
+                  className="main-window__pane main-window__pane--live-digest"
+                  minSize="18%"
+                  defaultSize="28%"
+                >
+                  <LiveDigestPanel
+                    meetingId={activeMeetingId}
+                    showActionItems={
+                      settings?.live_agent_digest_action_items ?? true
+                    }
+                    showDecisions={
+                      settings?.live_agent_digest_decisions ?? true
+                    }
+                    showOpenAsks={
+                      settings?.live_agent_digest_open_asks ?? true
+                    }
+                    showAttachmentAnswers={
+                      settings?.live_agent_digest_attachment_answers ?? true
+                    }
+                    showUnresolvedReferences={
+                      settings?.live_agent_digest_unresolved_references ?? true
+                    }
+                  />
                 </Panel>
               ),
           ])}

@@ -16,7 +16,10 @@
 
 use std::path::PathBuf;
 
-use chat_agent::{CancelFlag, ChatEngine, ChatMessage, LlamaTurnBackend, LlamaTurnConfig, SamplerConfig, TurnEngine, TurnOutcome};
+use chat_agent::{
+    CancelFlag, ChatEngine, ChatMessage, LlamaTurnBackend, LlamaTurnConfig, SamplerConfig,
+    TurnEngine, TurnOutcome,
+};
 use summariser::{LlamaSummariser, SummariserConfig};
 
 use agent_tools::ToolDescriptor;
@@ -110,7 +113,13 @@ fn real_turn_can_request_a_tool() {
     };
 
     let outcome = engine
-        .run_turn(&history, &descriptors, &cfg, &CancelFlag::new(), &mut |_| {})
+        .run_turn(
+            &history,
+            &descriptors,
+            &cfg,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
         .expect("a tool-offering turn must succeed");
 
     // Loosely asserted: the model MAY answer directly or request the tool;

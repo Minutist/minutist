@@ -35,7 +35,7 @@ that.
 | Audio mixer (mic + loopback) | A `spawn`/`spawn_blocking` task draining the two per-source 16 kHz batch channels; SUMS sample-wise, clamps, meters, and forwards the single mixed stream. Only present when system-audio capture is on; mic-only otherwise. Never blocks the RT callbacks (those feed the upstream rings). **Starvation valve:** if one source is idle (e.g. loopback when nothing is playing through the speakers) the mixer must NOT wait to pair samples — past a ~30 ms skew (`mixer::MAX_SKEW_SAMPLES`) it zero-fills the idle source and emits the live one, else the mic is buffered forever (silent transcript + dead meter). The cap also sets the meter/mic-latency cadence on the idle-loopback path (~30 Hz). |
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
-| Diarization (offline) | One-shot `spawn_blocking` task — the authoritative pass — spawned as a background job by `ipc-bridge` *after* stop (decoupled from the stop response), or by user action (re-diarize). |
+| Diarization (offline) | One-shot `spawn_blocking` task triggered on stop or user action — the authoritative pass. |
 | Diarization (live, Phase B) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from the runner's drain-loop thread (`spawn_blocking`) at SegmentEnd — gated on the `diarization_enabled` setting AND the embedding model being locally `Available` (no download, no block at start; the heavy `EmbeddingExtractor` load is built on `spawn_blocking` before the runner spawns). Best-effort/additive: any failure degrades to "no label" without affecting recording/transcription. See the live-vs-offline note below. |
 | Summarisation | One-shot `spawn_blocking` task triggered by user action. |
 | Attachment conversion | A SINGLE long-lived worker task (`tauri::async_runtime::spawn`, same pattern as `spawn_event_forwarder`). Jobs arrive on a **bounded** `tokio::sync::mpsc` channel; the worker processes them one at a time, each on `spawn_blocking`. Best-effort: every error is logged (`target: "ipc-bridge"`); the worker never panics. Back-pressure: `add_attachment` uses `try_send`; a full queue marks the entry `Failed("conversion queue full")` immediately. |
@@ -122,8 +122,7 @@ drain-loop thread and rides a parallel `speaker_ids` column
 `AppEvent::TranscriptSegment` and persisted via `WriterCommand::WriteSegment`
 (into `transcript.json`) DURING recording. The on-stop pass remains
 authoritative: when `diarization_enabled` is true, the whole-transcript
-rewrite (a background pass `ipc-bridge` spawns *after* stop, not inline in
-`stop()`) overwrites the live labels with the offline result. The
+rewrite on stop overwrites the live labels with the offline result. The
 wiring adds no dependency edge (the `orchestrator → diarizer` edge pre-exists)
 and no `common`-level online trait (the live path is a concrete struct;
 the existing `common::Diarizer` trait stays offline-only).
@@ -805,6 +804,173 @@ constraints are binding on them):
   allocates a fresh `LlamaContext` (clean KV cache).
   A single in-flight turn per session is enforced via
   `IpcState::chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`.
+
+## Live in-meeting agent (auto-driver)
+
+The live in-meeting agent (Phase 9 / WU2b) runs a digest-refresh loop during
+an active recording, driven by incoming `TranscriptSegment` events and gated by
+the `live_agent_min_segments` / `live_agent_min_seconds` cadence settings.
+Meeting attachments are pinned in the `LlamaContext` prefix once at recording
+start. Cross-cutting rules:
+
+- **HELD context, not fresh per turn.** The Phase-9 chat loop ("Agent chat
+  loop" above) allocates a **fresh** `LlamaContext` per assistant turn. The live
+  agent holds **one** `LlamaContext` for the entire live session on a dedicated
+  single-owned thread (SP-LIVE E2). The attachment prefix is prefilled ONCE at
+  recording start (~40 s for a moderately sized slide deck) and the context is
+  extended with each digest refresh by appending only the incremental transcript
+  tail. The fresh-per-turn pattern would re-pay the ~40 s prefill cost on every
+  cadence tick, making live operation unusable. `LlamaContext` is `!Send`; the
+  dedicated thread owns it exclusively.
+
+  *Implementation (S2a — `chat-agent::live`).* The held-context loop is
+  implemented in `crates/chat-agent/src/live.rs` as `LiveSessionBackend` (the
+  testable seam) + `LlamaLiveBackend` (the real impl, `!Send`, borrows
+  `&LlamaModel` from the shared `summariser` substrate) + `LiveSession<B>`
+  (the driver enforcing prefix-once and tail-only discipline).
+
+  *Implementation (S2b — `ipc-bridge::live_agent`).* The auto-driver is in
+  `crates/ipc-bridge/src/live_agent.rs`. It owns:
+  - A `tauri::async_runtime` task (the async driver) that subscribes to
+    `TranscriptSegment` events, accumulates the tail buffer, and evaluates the
+    cadence gate via the pure `should_refresh(new_segments, elapsed_secs,
+    in_flight, min_segments, min_seconds) -> bool` function.
+  - A dedicated `std::thread` (the worker) that constructs
+    `LiveSession<LlamaLiveBackend>` on startup — the `!Send` held-context
+    session. The worker borrows `&LlamaModel` from the shared
+    `Arc<LlamaSummariser>` (same cell as chat/summarise), using a raw-pointer
+    lifetime extension that is safe because the Arc is declared before the
+    session on the same stack frame (reverse-declaration drop order guarantees
+    the Arc outlives the borrow). The test-only stub `WorkerBackend`
+    (`#[cfg(test)]`) exercises the driver protocol without a model.
+  - Two bounded `tokio::sync::mpsc` channels (depth 1 each) between the driver
+    and worker, enforcing single-in-flight without a separate mutex.
+  - The prefix is built on the worker thread (`build_prefix`) at session start,
+    then seeded via `seed_prefix_typed` BEFORE the request loop (pin-at-start).
+    `build_prefix` calls `persistence::read_attachments_markdown_parts`
+    (synchronous filesystem I/O) and must not run on the async driver task.
+  - A `startup_cancel: CancelFlag` is created in `spawn_live_agent`, cloned for
+    the driver task, and passed to the worker. The driver raises it on any
+    shutdown path so a Stop during the ~40 s prefix seed aborts promptly and
+    unblocks the driver's join on the worker thread.
+  - The worker thread `JoinHandle` is retained by the async driver task and
+    joined after the driver loop exits, ensuring the worker is reaped rather
+    than leaked.
+  The watcher task in `app-main` subscribes to `StateChanged` and calls
+  `spawn_live_agent` on `Recording`; it raises the returned `watch::Sender`
+  on `Idle` / `Stopping` / `Finalising` to tear down the driver.
+
+  *Error handling policy.* Both `RefreshResult::Err` (decode error, M1/M2
+  triggered) and `RefreshResult::CapacityExhausted` are terminal: the driver
+  sets a `terminal` flag on receipt, emits one `LiveDigestError` event, and
+  dispatches no further refreshes. The worker also stops after a terminal
+  result. A single error path covers both cases, consistent with the teardown
+  on decode failure (M3).
+
+  *Context overflow policy (v1).* When `LlamaLiveBackend::refresh` returns
+  `Error::ContextOverflow` the driver emits ONE `LiveDigestError` event
+  (user-visible "context window filled") and sets a permanent
+  `capacity_exhausted` flag that stops all further refresh dispatches for the
+  session. Re-seeding mid-recording is NOT attempted (it costs another ~40 s
+  prefill, starving ASR). The prior digest items are preserved in the event
+  store. Recovery is the next recording session (fresh context).
+  The driver calls `LiveSession::seed_prefix_typed` and `LiveSession::refresh_typed`
+  (returning `Result<_, chat_agent::Error>`) rather than the `AppResult` wrappers,
+  so `ContextOverflow` can be matched structurally. The `From<Error> for AppError`
+  impl maps `ContextOverflow` to `AppError::InvalidInput`, erasing the variant —
+  string-matching over `AppError::Display` would be fragile and is not used.
+
+  *KV retention policy.* The held context accumulates **prefix + transcript tail
+  only**. Generated digest-answer tokens are decoded ephemerally into the KV and
+  then pruned via `clear_kv_cache_seq` after every refresh (on completion and
+  on cancel). This keeps capacity growth proportional to the transcript and
+  prevents cancelled partial answers from poisoning subsequent refreshes.
+  `clear_kv_cache_seq` returns `Result<bool, KvCacheConversionError>`; a `false` or
+  `Err` means the KV state is unrecoverable — the backend returns `Err` and the
+  driver tears down the session.
+
+  *Cancellability.* `prefill_prefix` and the tail-prefill loop in `refresh` both
+  accept a `&CancelFlag` and check it between decoded chunks. A raised flag during
+  the ~40 s prefix prefill prunes any partially-decoded KV range and returns
+  `Error::Inference("cancelled")` so the driver can tear down promptly. Both
+  the tail-prefill loop (inside `refresh`) and the generation loop already checked
+  the flag; the prefix prefill was the missing path.
+
+  *Tail-prefill transactional safety.* The tail-prefill loop in `refresh` captures
+  `n_past` before the first batch. A mid-loop decode failure prunes the partial
+  range (`clear_kv_cache_seq` to the pre-loop position) and returns `Err` without
+  advancing `n_past`, leaving the context consistent. The driver tears down on any
+  non-overflow `Err` (the held-context invariant is broken once a decode fails).
+
+- **Cadence gate.** `should_refresh` is a **pure** function with no side effects.
+  It returns `true` when ALL of: `new_segments >= min_segments`, `elapsed_secs >=
+  min_seconds`, and `!in_flight`. The AND gate (not OR) prevents premature
+  refreshes during sparse meetings with few utterances.
+
+- **Standing-list update discipline.** Each refresh prompt includes the prior
+  digest (JSON-serialised) so the model UPDATEs existing items (flips `resolved`,
+  adds new items) rather than regenerating from scratch. `parse_digest` carries
+  forward `resolved = true` from prior items matching by text (case-insensitive)
+  even if the model emits `resolved: false` for them (model forgetfulness guard).
+  For `open_asks` specifically, the driver accumulates items across refreshes:
+  prior unresolved asks not mentioned by the model are carried forward (the model
+  may omit them to save tokens), while items the model marks `resolved: true` are
+  promoted to resolved and retained. This implements the "tracker maintained across
+  refreshes" contract from SP-LIVE. Other categories (action_items, decisions,
+  attachment_answers, unresolved_references) apply the base standing-list rule
+  (resolved-flag-only carry-forward from matched items).
+
+- **Pin-at-start constraint.** The ~40 s one-time attachment prefill MUST NOT run
+  mid-recording (it would starve ASR inference and block the recording UI). The
+  prefix is built on the worker thread at session spawn, before the first cadence
+  fire. Subsequent `seed_prefix` calls on the same `LiveSession` are no-ops.
+
+- **ASR(CPU) vs LLM(GPU): no contention (SP-LIVE E1 GO).** ASR (`asr-runtime` /
+  `asr-parakeet`) runs on CPU via `sherpa-onnx` or llama.cpp CPU layers. The live
+  agent (and the summariser) run on the GPU via Vulkan. These are distinct compute
+  resources; there is no hardware contention between a live decode refresh and a
+  concurrent ASR pass.
+
+- **LLM-vs-LLM contention (v1 known hazard).** The live agent holds a dedicated
+  `LlamaContext` (n_ctx = 32 768) but borrows the same `Arc<LlamaSummariser>` model
+  (and therefore the same `LlamaModel`) that the chat and post-stop summarise paths
+  use. A live digest decode concurrent with a user chat turn or a post-stop summary
+  decode is a GPU-level contention: both share the single Vulkan device and the same
+  loaded model weights. In v1 this is accepted without a guard because:
+  (a) the cadence gate fires at most every `live_agent_min_seconds` (default 45 s);
+  (b) post-stop summarise only starts after recording ends (at which point the live
+  agent tears down); and (c) chat is user-initiated — simultaneous use is unlikely
+  during an active meeting. The `LlamaContext`s are distinct (no shared KV state);
+  llama.cpp serialises concurrent `decode` calls via internal locks.
+  WU2b should add a coordination guard (e.g. the live agent skips a refresh while
+  a foreground chat/summarise decode holds the model) if field testing reveals
+  throughput degradation.
+
+- **`LiveAgentMode::Auto` = GPU-acceleration-active gated.**
+  `settings.live_agent_enabled` defaults to `Auto`.
+  `live_agent_should_run(mode, probe, gpu_acceleration)` in `common` resolves it:
+  `Auto` is `true` when the probe is `Some` AND `gpu_acceleration != Off`. This is a
+  **GPU-acceleration-active proxy** — the LLM runs on the GPU rather than contending
+  with the CPU-bound ASR path. It does NOT inspect `probe.is_integrated` (the AMD
+  Radeon 890M, an integrated GPU running Vulkan, is the validated SP-LIVE E1 hardware
+  and must resolve `true`). It does NOT consult `resolve_gpu_plan`'s VRAM-budget
+  thresholds. `Off` disables unconditionally; `On` enables unconditionally.
+  WU2b should refine this to a VRAM-headroom check once the live-context cost is measured.
+
+- **KV quantisation: OFF.** q8_0 KV quantisation costs ~15 % decode throughput for
+  memory savings the 36 GB test GPU does not need. Not applied to the live agent
+  context. n_ctx = 32 768.
+
+- **Digest panel is PASSIVE.** The live agent never writes to the transcript,
+  notes, or metadata. It is a read/compute-only agent in v1. The digest panel
+  receives `AppEvent::LiveDigestUpdated` events and updates passively; it does NOT
+  interrupt the user or modify any meeting document.
+
+- **Events ride the existing bus.** `LiveDigestUpdated` and `LiveDigestError` ride
+  the existing `AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
+  registration — no new event registration. Both are lossy-broadcast-safe
+  (`LiveDigestUpdated` carries the full replacement digest; a lagged subscriber
+  recovers on the next refresh).
 
 ## MCP transport (Phase 10)
 

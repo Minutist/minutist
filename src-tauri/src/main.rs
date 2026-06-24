@@ -1206,6 +1206,116 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 });
             }
 
+            // Live in-meeting agent (Phase 9 / WU2b): subscribe to StateChanged
+            // events and spawn a live-agent driver when a recording starts.
+            // The watcher task exits only when the orchestrator event channel
+            // closes (app exit). Each recording session gets its own driver task +
+            // worker thread; the (watch::Sender, MeetingId) pair in
+            // `live_agent_shutdown` is the teardown handle for the active session.
+            //
+            // Guard: `live_agent_should_run` — only spawns when the mode is On or
+            // Auto-with-discrete-GPU. When the mode is Off (or Auto without a
+            // qualifying GPU), the watcher loop discards StateChanged(Recording)
+            // without spawning anything.
+            {
+                let la_orchestrator = orchestrator.clone();
+                let la_meetings_dir = notes_meetings_dir.clone();
+                let la_event_tx = ipc_event_tx.clone();
+                let la_settings = settings_handle.clone();
+                let la_summariser = summariser_cell.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut events = la_orchestrator.subscribe_events();
+                    // Shutdown sender for the currently active session (if any).
+                    let mut live_agent_shutdown: Option<(
+                        tokio::sync::watch::Sender<bool>,
+                        minutist_common::MeetingId,
+                    )> = None;
+
+                    // Probe the GPU once at watcher start (the probe value does
+                    // not change during a session, so querying once is fine).
+                    let gpu_probe = minutist_common::probe_primary_gpu();
+
+                    loop {
+                        let event = events.recv().await;
+                        match event {
+                            Ok(minutist_common::AppEvent::StateChanged { state }) => {
+                                use minutist_common::RecordingState;
+                                match &state {
+                                    RecordingState::Recording { meeting_id, .. } => {
+                                        let meeting_id = *meeting_id;
+                                        // Stop any prior session first (safety net for
+                                        // edge cases — only one recording at a time).
+                                        if let Some((tx, _)) = live_agent_shutdown.take() {
+                                            let _ = tx.send(true);
+                                        }
+
+                                        let s = la_settings.current();
+                                        if !minutist_common::live_agent_should_run(
+                                            s.live_agent_enabled,
+                                            gpu_probe.as_ref(),
+                                            s.gpu_acceleration,
+                                        ) {
+                                            continue;
+                                        }
+
+                                        let (shutdown_tx, shutdown_rx) =
+                                            tokio::sync::watch::channel(false);
+                                        ipc_bridge::spawn_live_agent(
+                                            ipc_bridge::LiveAgentHandles {
+                                                orchestrator: la_orchestrator.clone(),
+                                                meetings_dir: la_meetings_dir.clone(),
+                                                event_tx: la_event_tx.clone(),
+                                                settings: la_settings.clone(),
+                                                summariser: la_summariser.clone(),
+                                            },
+                                            meeting_id,
+                                            shutdown_rx,
+                                        );
+                                        live_agent_shutdown = Some((shutdown_tx, meeting_id));
+
+                                        tracing::info!(
+                                            target: "app-main",
+                                            meeting_id = %meeting_id.0,
+                                            "live-agent spawned for recording"
+                                        );
+                                    }
+                                    RecordingState::Idle
+                                    | RecordingState::Stopping { .. }
+                                    | RecordingState::Finalising { .. } => {
+                                        // Recording ended — tear down the active driver.
+                                        if let Some((tx, mid)) = live_agent_shutdown.take() {
+                                            tracing::info!(
+                                                target: "app-main",
+                                                meeting_id = %mid.0,
+                                                "live-agent shutdown signalled (recording ended)"
+                                            );
+                                            let _ = tx.send(true);
+                                        }
+                                    }
+                                    // Paused: keep the driver running.
+                                    RecordingState::Paused { .. } => {}
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!(
+                                    target: "app-main",
+                                    dropped = n,
+                                    "live-agent watcher subscriber lagged"
+                                );
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!(
+                                    target: "app-main",
+                                    "live-agent watcher: event channel closed; exiting"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+
             // Build the tray icon.
             build_tray(app)?;
 

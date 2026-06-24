@@ -65,7 +65,7 @@ pub fn resolve_output_language(setting: &str) -> Option<String> {
 /// lowercased.
 fn primary_subtag(locale: &str) -> &str {
     let end = locale
-        .find(|c| c == '-' || c == '_')
+        .find(['-', '_'])
         .unwrap_or(locale.len());
     &locale[..end]
 }

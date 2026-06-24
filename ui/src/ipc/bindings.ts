@@ -1083,6 +1083,18 @@ export type AppEvent =
  */
 { kind: "chat_context_trimmed"; session_id: ChatSessionId; dropped_turns: number } | 
 /**
+ * The live in-meeting agent produced a refreshed digest for an active
+ * meeting. The payload is the FULL replacement digest; the webview
+ * replaces the previous digest wholesale rather than patching. Lossy-
+ * broadcast-safe: a dropped event is recovered on the next refresh.
+ */
+{ kind: "live_digest_updated"; meeting_id: MeetingId; digest: LiveDigest } | 
+/**
+ * The live agent encountered an error producing a digest refresh. The
+ * panel shows `message` and retains the last valid digest, if any.
+ */
+{ kind: "live_digest_error"; meeting_id: MeetingId; message: string } | 
+/**
  * The in-process MCP server bound its loopback Streamable HTTP listener.
  * `app-main` emits this after `mcp_server::serve` returns the bound addr so
  * the Settings → MCP pane can show the live endpoint URL. The bearer token
@@ -1433,6 +1445,107 @@ export type GpuAcceleration =
  * stable even though the derive lives here rather than in `common`.
  */
 export type IpcError = { code: "io"; context: string } | { code: "model_load"; model_id: string; context: string } | { code: "model_not_found"; model_id: string } | { code: "model_download"; context: string } | { code: "inference"; backend: string; context: string } | { code: "invalid_input"; context: string } | { code: "cancelled" } | { code: "unsupported"; context: string } | { code: "internal"; context: string }
+/**
+ * Whether the live in-meeting agent runs during an active recording.
+ * 
+ * `Auto` (the default) enables when GPU acceleration is ACTIVE: a usable GPU
+ * is present (probe is `Some`) AND `gpu_acceleration != Off`. This ensures the
+ * live agent's `LlamaContext` (n_ctx = 32 768) runs on the GPU and does not
+ * contend with the CPU-bound ASR path. On the AMD Radeon 890M (integrated,
+ * Vulkan on) with `gpu_acceleration = Auto`, this resolves `true` — the
+ * validated SP-LIVE hardware.
+ * 
+ * This is **distinct from** [`GpuAcceleration`], which governs model-layer
+ * placement (GPU vs CPU). `LiveAgentMode::Auto` means "run iff a GPU is active";
+ * `GpuAcceleration::Auto` means "offload layers iff they fit in the VRAM budget".
+ * 
+ * Serialises as snake_case (`"auto"` / `"on"` / `"off"`) to match the
+ * established `GpuAcceleration` pattern and the TypeScript binding shape.
+ */
+export type LiveAgentMode = 
+/**
+ * Enable the live agent when GPU acceleration is active: a usable GPU is
+ * present (`probe.is_some()`) AND `gpu_acceleration != Off`. This is the
+ * recommended default: users with a GPU (integrated or discrete) running
+ * with acceleration on get the feature automatically; users on CPU-only
+ * builds or with acceleration forced off are not affected.
+ */
+"auto" | 
+/**
+ * Always enable the live agent regardless of GPU capability. Use when the
+ * user explicitly wants the feature even on a slow host (slower refreshes
+ * are acceptable trade-off).
+ */
+"on" | 
+/**
+ * Permanently disable the live agent regardless of GPU capability.
+ */
+"off"
+/**
+ * The full live digest payload produced by the live agent on each refresh.
+ * 
+ * Each category is a `Vec<LiveDigestItem>` with a `resolved` flag that the
+ * agent carries forward across refreshes (the 'asked-for-but-missed' tracker
+ * pattern — the list accumulates and is marked resolved rather than being
+ * regenerated wholesale). `generated_at_ms` is wall-clock epoch milliseconds
+ * for display; `meeting_id` scopes the digest to one meeting.
+ * 
+ * Crosses IPC (derives `specta::Type`, serialises snake_case) and rides the
+ * existing `AppEventPayload` + `collect_events![AppEventPayload]` channel.
+ */
+export type LiveDigest = { meeting_id: MeetingId; 
+/**
+ * Wall-clock epoch milliseconds when this digest was generated.
+ */
+generated_at_ms: number; 
+/**
+ * Tasks or follow-ups explicitly requested or implied during the meeting.
+ */
+action_items: LiveDigestItem[]; 
+/**
+ * Commitments, conclusions, or choices reached during the meeting.
+ */
+decisions: LiveDigestItem[]; 
+/**
+ * Questions posed during the meeting that have not yet received an answer.
+ */
+open_asks: LiveDigestItem[]; 
+/**
+ * Questions answered from pinned attachment context (documents, slides,
+ * etc. attached before the meeting started).
+ */
+attachment_answers: LiveDigestItem[]; 
+/**
+ * Terms, acronyms, or references mentioned but not explained in the
+ * transcript (potential knowledge gaps surfaced for the attendee).
+ */
+unresolved_references: LiveDigestItem[] }
+/**
+ * One item in a live digest category (action item, decision, open ask, etc.).
+ * 
+ * `resolved` carries the standing-list state: `false` = outstanding, `true` =
+ * resolved / answered. The live agent updates this flag across digest refreshes
+ * rather than regenerating the list from scratch, so once an action item is
+ * marked resolved it stays resolved even as new segments arrive. `source` is an
+ * optional short attribution string (e.g. `"from slide deck"` for attachment-
+ * sourced answers) shown in the panel.
+ */
+export type LiveDigestItem = { 
+/**
+ * The item text (plain English; one sentence).
+ */
+text: string; 
+/**
+ * `true` once the item is resolved, answered, or confirmed; `false` while
+ * it is still outstanding. Carried forward across refreshes so the
+ * standing list accumulates without full regeneration.
+ */
+resolved: boolean; 
+/**
+ * Optional short attribution (e.g. `"slide deck"`, `"Alice"`). Absent for
+ * most items; present when the source is worth surfacing in the panel.
+ */
+source?: string | null }
 /**
  * The live MCP endpoint surfaced to the Settings → MCP pane via
  * `get_mcp_server_info` (Phase 10). The bearer `token` is sensitive: it is
@@ -1940,7 +2053,72 @@ relay_url?: string;
  * defaults to the minutist.ai endpoint. Must be `https://` for an off-machine
  * host. `#[serde(default = ...)]` defaults to the minutist.ai endpoint.
  */
-relay_api_url?: string }
+relay_api_url?: string; 
+/**
+ * Whether the live in-meeting agent runs during an active recording.
+ * 
+ * `Auto` (the default) enables the agent when GPU acceleration is active
+ * (a usable GPU is present AND `gpu_acceleration != Off`), as resolved by
+ * `live_agent_should_run`. `On` enables unconditionally; `Off` disables.
+ * Distinct from `gpu_acceleration`, which governs model-layer placement.
+ * `#[serde(default)]` → `Auto` (the `LiveAgentMode::default()`); an older
+ * store written before this field existed deserialises to `Auto`.
+ */
+live_agent_enabled?: LiveAgentMode; 
+/**
+ * Minimum number of new transcript segments that must accumulate before
+ * the live agent fires a digest refresh. The debouncer fires only when
+ * BOTH `live_agent_min_segments` AND `live_agent_min_seconds` are
+ * satisfied. Defaults to 8; an older store deserialises to 8.
+ */
+live_agent_min_segments?: number; 
+/**
+ * Minimum wall-clock seconds that must elapse before the live agent fires
+ * a digest refresh. The debouncer fires only when BOTH
+ * `live_agent_min_segments` AND `live_agent_min_seconds` are satisfied.
+ * Defaults to 45; an older store deserialises to 45.
+ */
+live_agent_min_seconds?: number; 
+/**
+ * Whether action items are included in the live digest panel.
+ * Defaults to `true`; an older store deserialises to `true`.
+ */
+live_agent_digest_action_items?: boolean; 
+/**
+ * Whether decisions are included in the live digest panel.
+ * Defaults to `true`; an older store deserialises to `true`.
+ */
+live_agent_digest_decisions?: boolean; 
+/**
+ * Whether open / unanswered asks are included in the live digest panel.
+ * Defaults to `true`; an older store deserialises to `true`.
+ */
+live_agent_digest_open_asks?: boolean; 
+/**
+ * Whether attachment-sourced answers are included in the live digest panel.
+ * Defaults to `true`; an older store deserialises to `true`.
+ */
+live_agent_digest_attachment_answers?: boolean; 
+/**
+ * Whether unresolved references are included in the live digest panel.
+ * Defaults to `true`; an older store deserialises to `true`.
+ */
+live_agent_digest_unresolved_references?: boolean; 
+/**
+ * Maximum total characters of attachment markdown fed into the live
+ * agent's pinned prefix. ~80 000 chars ≈ 20 k tokens, safely within the
+ * held `LlamaContext`'s n_ctx = 32 768. An older store deserialises to
+ * 80 000.
+ */
+live_agent_attachment_budget_chars?: number; 
+/**
+ * The system prompt passed to the live agent on every refresh. Instructs
+ * the model to UPDATE the standing digest rather than regenerate it,
+ * preserving the 'asked-for-but-missed' tracker across refreshes.
+ * `#[serde(default = ...)]` → the built-in digest-maintenance instruction;
+ * an older store written before this field existed adopts that default.
+ */
+live_agent_system_prompt?: string }
 /**
  * Built-in summary prompt presets (Phase 9 — D4).
  * 

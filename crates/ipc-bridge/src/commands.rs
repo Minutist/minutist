@@ -36,8 +36,8 @@ use chat_agent::{LlamaTurnBackend, LlamaTurnConfig, TurnEngine};
 use minutist_common::{
     AppError, AppEvent, AppResult, AttachmentEntry, AttachmentId, AudioDevice, ChatMessage,
     ChatRole, ChatSession, ChatSessionId, Collection, CollectionId, ConversionState, MeetingId,
-    MeetingListEntry, MeetingMeta, MeetingState, ModelId, ModelStatus, NotesDocument, OperationKind,
-    RecordingState, Summariser,
+    MeetingListEntry, MeetingMeta, MeetingState, ModelId, ModelStatus, NotesDocument,
+    OperationKind, RecordingState, Summariser,
 };
 use persistence::{collections, meeting_ops, ChatStore, NotesStore};
 use settings::Settings;
@@ -45,10 +45,10 @@ use summariser::{LlamaSummariser, SummariseProgress, SummariserConfig};
 use tauri::State;
 use tokio::sync::broadcast;
 
+use crate::attachments::ConvertJob;
 use crate::chat::{
     engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX,
 };
-use crate::attachments::ConvertJob;
 use crate::chat_runtime::ChatHandles;
 use crate::output_language::resolve_output_language;
 use crate::{error::IpcError, IpcState};
@@ -312,9 +312,7 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
                 let handles = handles.clone();
                 async move {
                     match pass {
-                        PostStopPass::Reprocess => {
-                            orchestrator.reprocess(&index, meeting_id).await
-                        }
+                        PostStopPass::Reprocess => orchestrator.reprocess(&index, meeting_id).await,
                         // Map the held-summarise `IpcError` back to `AppError` for
                         // the shared per-pass error logging; the markdown result is
                         // discarded (the summary is persisted + `SummaryReady`
@@ -348,10 +346,7 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
                                         // terminal on the error path) so the pane
                                         // falls back to the manual action instead
                                         // of spinning forever.
-                                        emit_summary_unavailable(
-                                            &handles.event_tx,
-                                            meeting_id,
-                                        );
+                                        emit_summary_unavailable(&handles.event_tx, meeting_id);
                                         Err(AppError::from(e))
                                     }
                                 }
@@ -1078,9 +1073,7 @@ pub async fn set_speaker_name(
 ) -> Result<std::collections::BTreeMap<String, String>, IpcError> {
     const MAX_SPEAKER_NAME_LEN: usize = 512;
     let name = name.trim().to_string();
-    if label.chars().count() > MAX_SPEAKER_NAME_LEN
-        || name.chars().count() > MAX_SPEAKER_NAME_LEN
-    {
+    if label.chars().count() > MAX_SPEAKER_NAME_LEN || name.chars().count() > MAX_SPEAKER_NAME_LEN {
         return Err(IpcError::from(minutist_common::AppError::InvalidInput {
             context: format!("speaker label/name too long (max {MAX_SPEAKER_NAME_LEN} characters)"),
         }));
@@ -1213,9 +1206,14 @@ pub async fn set_meeting_collection(
     collection_id: Option<CollectionId>,
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
-    meeting_ops::set_meeting_collection(&state.meetings_dir, &state.index, meeting_id, collection_id)
-        .await
-        .map_err(IpcError::from)
+    meeting_ops::set_meeting_collection(
+        &state.meetings_dir,
+        &state.index,
+        meeting_id,
+        collection_id,
+    )
+    .await
+    .map_err(IpcError::from)
 }
 
 /// Reprocess a meeting offline (FR-33 + FR-11 action): re-transcribe THEN
@@ -1241,10 +1239,7 @@ pub async fn set_meeting_collection(
 /// the orchestrator refreshes the index row without owning one.
 #[tauri::command]
 #[specta::specta]
-pub async fn reprocess(
-    meeting_id: MeetingId,
-    state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+pub async fn reprocess(meeting_id: MeetingId, state: State<'_, IpcState>) -> Result<(), IpcError> {
     state
         .orchestrator
         .reprocess(&state.index, meeting_id)
@@ -1361,14 +1356,15 @@ async fn run_held_summarise(
         );
         Vec::new()
     });
-    let attachments_markdown =
-        assemble_attachments_markdown(attachment_parts, attachments_budget);
+    let attachments_markdown = assemble_attachments_markdown(attachment_parts, attachments_budget);
     // Resolve the preset-aware effective prompt (Phase 9 — D4): the user's
     // custom `summary_system_prompt` override when non-empty, else the built-in
     // prompt for the selected `summary_preset`. The output-language instruction
     // is appended last so it wins over any conflicting text in a custom prompt.
-    let system_prompt =
-        apply_output_language(&current.effective_summary_prompt(), &current.output_language);
+    let system_prompt = apply_output_language(
+        &current.effective_summary_prompt(),
+        &current.output_language,
+    );
 
     // Heavy, synchronous summarise work on a blocking thread (the held model's
     // `summarise` builds a fresh `LlamaContext` and decodes). The held handle is
@@ -1534,12 +1530,20 @@ fn summarise_meeting_with_progress(
             let (phase, fraction, label): (u8, f32, &str) = match progress {
                 SummariseProgress::Prefill { done, total } => (
                     1,
-                    if total == 0 { 1.0 } else { done as f32 / total as f32 },
+                    if total == 0 {
+                        1.0
+                    } else {
+                        done as f32 / total as f32
+                    },
                     "Reading the meeting…",
                 ),
                 SummariseProgress::Generate { done, max } => (
                     2,
-                    if max == 0 { 1.0 } else { done as f32 / max as f32 },
+                    if max == 0 {
+                        1.0
+                    } else {
+                        done as f32 / max as f32
+                    },
                     "Writing the summary…",
                 ),
             };
@@ -1790,7 +1794,9 @@ pub(crate) fn assemble_attachments_markdown(
         .iter()
         .enumerate()
         .map(|(i, (filename, _))| {
-            share.saturating_sub(header_overhead(filename, i > 0)).max(1)
+            share
+                .saturating_sub(header_overhead(filename, i > 0))
+                .max(1)
         })
         .min()
         .unwrap_or(1);
@@ -2305,9 +2311,11 @@ pub async fn translate_meeting(
                 )
             })
             .await
-            .map_err(|e| IpcError::from(AppError::Internal {
-                context: format!("translate_meeting task join failed: {e}"),
-            }))
+            .map_err(|e| {
+                IpcError::from(AppError::Internal {
+                    context: format!("translate_meeting task join failed: {e}"),
+                })
+            })
             .and_then(|r| r.map_err(IpcError::from))
         }
         Err(e) => Err(e),
@@ -2857,7 +2865,10 @@ mod tests {
         // Rejected as InvalidInput — non-image / executable / path-y extensions.
         for evil in ["svg", "exe", "txt", "", "png.exe", "../png", "bmp"] {
             assert!(
-                matches!(normalise_image_ext(evil), Err(AppError::InvalidInput { .. })),
+                matches!(
+                    normalise_image_ext(evil),
+                    Err(AppError::InvalidInput { .. })
+                ),
                 "ext {evil:?} must be rejected"
             );
         }
@@ -2896,7 +2907,10 @@ mod tests {
         // Budget grows with n_ctx (40% of the window × ~4 chars/token).
         let small = attachments_markdown_budget_chars(8_192);
         let large = attachments_markdown_budget_chars(32_768);
-        assert!(large > small, "a larger context window must allow more chars");
+        assert!(
+            large > small,
+            "a larger context window must allow more chars"
+        );
         assert!(small > 0);
     }
 
@@ -2913,7 +2927,10 @@ mod tests {
         let out = assemble_attachments_markdown(parts, 1_000);
         assert!(out.contains("## Attachment: a.txt"));
         assert!(out.contains("## Attachment: b.txt"));
-        assert!(!out.contains("[truncated]"), "within budget must not truncate");
+        assert!(
+            !out.contains("[truncated]"),
+            "within budget must not truncate"
+        );
     }
 
     #[test]
@@ -2927,13 +2944,22 @@ mod tests {
             ("small.txt".to_string(), "kept".to_string()),
         ];
         let out = assemble_attachments_markdown(parts, 400);
-        assert!(out.contains("## Attachment: big.txt"), "first header survives");
+        assert!(
+            out.contains("## Attachment: big.txt"),
+            "first header survives"
+        );
         assert!(
             out.contains("## Attachment: small.txt"),
             "second header survives (not starved)"
         );
-        assert!(out.contains("kept"), "the small attachment's body is retained");
-        assert!(out.contains("[truncated]"), "the trimmed large attachment is marked");
+        assert!(
+            out.contains("kept"),
+            "the small attachment's body is retained"
+        );
+        assert!(
+            out.contains("[truncated]"),
+            "the trimmed large attachment is marked"
+        );
     }
 
     #[test]
@@ -3173,7 +3199,10 @@ mod tests {
         // Confirm on-disk metadata reflects the name.
         let folder = root.join(meeting_id.0.to_string());
         let meta = persistence::read_metadata(&folder).expect("read metadata");
-        assert_eq!(meta.speaker_names.get("A").map(String::as_str), Some("Alice"));
+        assert_eq!(
+            meta.speaker_names.get("A").map(String::as_str),
+            Some("Alice")
+        );
 
         // Add a second speaker name without clobbering the first.
         let names2 = meeting_ops::set_speaker_name(root, meeting_id, "B", "Bob")
@@ -3712,9 +3741,33 @@ mod tests {
 
         // Write a 3-segment transcript.
         let segments = vec![
-            Segment { start_ms: 0,    end_ms: 1000, text: "Hello world.".into(),        speaker_id: None, confidence: None, words: vec![], shared_speakers: vec![] },
-            Segment { start_ms: 1000, end_ms: 2000, text: "This is a test.".into(),     speaker_id: None, confidence: None, words: vec![], shared_speakers: vec![] },
-            Segment { start_ms: 2000, end_ms: 3000, text: "Goodbye for now.".into(),    speaker_id: None, confidence: None, words: vec![], shared_speakers: vec![] },
+            Segment {
+                start_ms: 0,
+                end_ms: 1000,
+                text: "Hello world.".into(),
+                speaker_id: None,
+                confidence: None,
+                words: vec![],
+                shared_speakers: vec![],
+            },
+            Segment {
+                start_ms: 1000,
+                end_ms: 2000,
+                text: "This is a test.".into(),
+                speaker_id: None,
+                confidence: None,
+                words: vec![],
+                shared_speakers: vec![],
+            },
+            Segment {
+                start_ms: 2000,
+                end_ms: 3000,
+                text: "Goodbye for now.".into(),
+                speaker_id: None,
+                confidence: None,
+                words: vec![],
+                shared_speakers: vec![],
+            },
         ];
         let seg_json = serde_json::to_vec_pretty(&segments).expect("serialise");
         std::fs::write(folder.transcript_path(), seg_json).expect("write transcript");
@@ -3728,23 +3781,26 @@ mod tests {
         let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(8);
         let meetings_dir = root.to_path_buf();
 
-        translate_meeting_blocking(
-            &meetings_dir,
-            meeting_id,
-            "Spanish",
-            &summariser,
-            &event_tx,
-        )
-        .expect("translation must succeed");
+        translate_meeting_blocking(&meetings_dir, meeting_id, "Spanish", &summariser, &event_tx)
+            .expect("translation must succeed");
 
         // All three segments must be in the sidecar.
         let meeting_dir = root.join(meeting_id.0.to_string());
         let all = persistence::read_translations(&meeting_dir).expect("read translations");
         let spanish = all.get("Spanish").expect("Spanish key present");
         assert_eq!(spanish.len(), 3, "all 3 segments must be persisted");
-        assert!(!spanish[&0].trim().is_empty(), "segment 0 must be non-empty");
-        assert!(!spanish[&1].trim().is_empty(), "segment 1 must be non-empty");
-        assert!(!spanish[&2].trim().is_empty(), "segment 2 must be non-empty");
+        assert!(
+            !spanish[&0].trim().is_empty(),
+            "segment 0 must be non-empty"
+        );
+        assert!(
+            !spanish[&1].trim().is_empty(),
+            "segment 1 must be non-empty"
+        );
+        assert!(
+            !spanish[&2].trim().is_empty(),
+            "segment 2 must be non-empty"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3901,7 +3957,10 @@ mod tests {
     #[tokio::test]
     async fn post_stop_chain_skips_summarise_when_disabled() {
         let passes = post_stop_passes(false, false, /* auto_summarise */ false);
-        assert!(passes.is_empty(), "auto-summarise off + nothing else → no passes");
+        assert!(
+            passes.is_empty(),
+            "auto-summarise off + nothing else → no passes"
+        );
 
         let mut summarise_calls = 0u32;
         run_post_stop_passes(&passes, MeetingId::new(), |pass| {
@@ -3911,7 +3970,10 @@ mod tests {
             async { Ok(()) }
         })
         .await;
-        assert_eq!(summarise_calls, 0, "summarise pass must not run when disabled");
+        assert_eq!(
+            summarise_calls, 0,
+            "summarise pass must not run when disabled"
+        );
     }
 
     /// A failed reprocess (InvalidInput = busy, OR any other error) is tolerated
@@ -3939,9 +4001,7 @@ mod tests {
             run_post_stop_passes(&passes, MeetingId::new(), |pass| {
                 calls.push(pass);
                 let result = match pass {
-                    PostStopPass::Reprocess => {
-                        Err(first_err.take().expect("one reprocess call"))
-                    }
+                    PostStopPass::Reprocess => Err(first_err.take().expect("one reprocess call")),
                     PostStopPass::Summarise => Ok(()),
                 };
                 async move { result }

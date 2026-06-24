@@ -30,9 +30,9 @@ use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::ChatTemplateResult;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
-use llama_cpp_2::model::ChatTemplateResult;
 use llama_cpp_2::sampling::LlamaSampler;
 
 use summariser::plan_prefill;
@@ -179,10 +179,7 @@ impl<'m> LlamaTurnBackend<'m> {
     /// (which carries its own `<tool_call>`-style triggers); falls back to
     /// compiling the rendered tools' grammar lazily on a generic trigger when
     /// the template emitted none.
-    fn lazy_grammar(
-        &self,
-        rendered: &ChatTemplateResult,
-    ) -> Result<Option<LlamaSampler>, Error> {
+    fn lazy_grammar(&self, rendered: &ChatTemplateResult) -> Result<Option<LlamaSampler>, Error> {
         // Template-emitted grammar: snap it lazily after the template's triggers
         // (so free-text turns are unconstrained, tool-call turns are forced to
         // valid JSON). Word triggers only — token triggers carry ids we honour.
@@ -489,6 +486,9 @@ mod tests {
             content_delta(&json!({ "content": "yo" }).to_string()),
             Some("yo".to_string())
         );
-        assert_eq!(content_delta(&json!({ "role": "assistant" }).to_string()), None);
+        assert_eq!(
+            content_delta(&json!({ "role": "assistant" }).to_string()),
+            None
+        );
     }
 }

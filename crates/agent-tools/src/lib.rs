@@ -298,6 +298,8 @@ impl ToolRegistry {
             Arc::new(tools::RelistenSection),
             Arc::new(tools::Resummarise),
             Arc::new(tools::SpeakerTalkTime),
+            Arc::new(tools::ListAttachments),
+            Arc::new(tools::GetAttachmentMarkdown),
             // Writes (MCP exposure per the allowlist on each impl).
             Arc::new(tools::SetSpeakerName),
             Arc::new(tools::RenameMeeting),
@@ -555,9 +557,7 @@ pub(crate) fn require_bounded_str<'a>(
     let s = require_str(args, field)?;
     if s.chars().count() > MAX_NAME_LEN {
         return Err(AppError::InvalidInput {
-            context: format!(
-                "argument `{field}` is too long (max {MAX_NAME_LEN} characters)"
-            ),
+            context: format!("argument `{field}` is too long (max {MAX_NAME_LEN} characters)"),
         });
     }
     Ok(s)

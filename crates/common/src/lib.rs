@@ -698,6 +698,124 @@ pub struct InterAgentReply {
 }
 
 // ---------------------------------------------------------------------------
+// Live in-meeting agent (Phase 9 auto-driver)
+// ---------------------------------------------------------------------------
+
+/// One item in a live digest category (action item, decision, open ask, etc.).
+///
+/// `resolved` carries the standing-list state: `false` = outstanding, `true` =
+/// resolved / answered. The live agent updates this flag across digest refreshes
+/// rather than regenerating the list from scratch, so once an action item is
+/// marked resolved it stays resolved even as new segments arrive. `source` is an
+/// optional short attribution string (e.g. `"from slide deck"` for attachment-
+/// sourced answers) shown in the panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct LiveDigestItem {
+    /// The item text (plain English; one sentence).
+    pub text: String,
+    /// `true` once the item is resolved, answered, or confirmed; `false` while
+    /// it is still outstanding. Carried forward across refreshes so the
+    /// standing list accumulates without full regeneration.
+    pub resolved: bool,
+    /// Optional short attribution (e.g. `"slide deck"`, `"Alice"`). Absent for
+    /// most items; present when the source is worth surfacing in the panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// The full live digest payload produced by the live agent on each refresh.
+///
+/// Each category is a `Vec<LiveDigestItem>` with a `resolved` flag that the
+/// agent carries forward across refreshes (the 'asked-for-but-missed' tracker
+/// pattern — the list accumulates and is marked resolved rather than being
+/// regenerated wholesale). `generated_at_ms` is wall-clock epoch milliseconds
+/// for display; `meeting_id` scopes the digest to one meeting.
+///
+/// Crosses IPC (derives `specta::Type`, serialises snake_case) and rides the
+/// existing `AppEventPayload` + `collect_events![AppEventPayload]` channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct LiveDigest {
+    pub meeting_id: MeetingId,
+    /// Wall-clock epoch milliseconds when this digest was generated.
+    pub generated_at_ms: u64,
+    /// Tasks or follow-ups explicitly requested or implied during the meeting.
+    pub action_items: Vec<LiveDigestItem>,
+    /// Commitments, conclusions, or choices reached during the meeting.
+    pub decisions: Vec<LiveDigestItem>,
+    /// Questions posed during the meeting that have not yet received an answer.
+    pub open_asks: Vec<LiveDigestItem>,
+    /// Questions answered from pinned attachment context (documents, slides,
+    /// etc. attached before the meeting started).
+    pub attachment_answers: Vec<LiveDigestItem>,
+    /// Terms, acronyms, or references mentioned but not explained in the
+    /// transcript (potential knowledge gaps surfaced for the attendee).
+    pub unresolved_references: Vec<LiveDigestItem>,
+}
+
+/// Whether the live in-meeting agent runs during an active recording.
+///
+/// `Auto` (the default) enables when GPU acceleration is ACTIVE: a usable GPU
+/// is present (probe is `Some`) AND `gpu_acceleration != Off`. This ensures the
+/// live agent's `LlamaContext` (n_ctx = 32 768) runs on the GPU and does not
+/// contend with the CPU-bound ASR path. On the AMD Radeon 890M (integrated,
+/// Vulkan on) with `gpu_acceleration = Auto`, this resolves `true` — the
+/// validated SP-LIVE hardware.
+///
+/// This is **distinct from** [`GpuAcceleration`], which governs model-layer
+/// placement (GPU vs CPU). `LiveAgentMode::Auto` means "run iff a GPU is active";
+/// `GpuAcceleration::Auto` means "offload layers iff they fit in the VRAM budget".
+///
+/// Serialises as snake_case (`"auto"` / `"on"` / `"off"`) to match the
+/// established `GpuAcceleration` pattern and the TypeScript binding shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum LiveAgentMode {
+    /// Enable the live agent when GPU acceleration is active: a usable GPU is
+    /// present (`probe.is_some()`) AND `gpu_acceleration != Off`. This is the
+    /// recommended default: users with a GPU (integrated or discrete) running
+    /// with acceleration on get the feature automatically; users on CPU-only
+    /// builds or with acceleration forced off are not affected.
+    #[default]
+    Auto,
+    /// Always enable the live agent regardless of GPU capability. Use when the
+    /// user explicitly wants the feature even on a slow host (slower refreshes
+    /// are acceptable trade-off).
+    On,
+    /// Permanently disable the live agent regardless of GPU capability.
+    Off,
+}
+
+/// Decide whether the live agent should run given the user's mode preference,
+/// the GPU probe result, and the GPU-acceleration setting.
+///
+/// PURE — takes all inputs as parameters so it is unit-testable without a GPU.
+///
+/// - `Off` → always `false`.
+/// - `On` → always `true` (user override; no capability check).
+/// - `Auto` → `true` iff `probe` is `Some` AND `gpu_acceleration != Off`.
+///   This is a **GPU-acceleration-active proxy**: a usable GPU exists and the
+///   user has not forced CPU mode. The live agent's `LlamaContext` then runs on
+///   the GPU, off the CPU-bound ASR path.
+///   Does NOT inspect `probe.is_integrated` — the AMD 890M (integrated, Vulkan
+///   on) is the validated SP-LIVE hardware and must resolve `true`.
+///   Does NOT invoke `resolve_gpu_plan` or inspect VRAM bytes. WU2b should
+///   refine this to a VRAM-headroom check once the held-context cost is measured.
+pub fn live_agent_should_run(
+    mode: LiveAgentMode,
+    probe: Option<&GpuProbe>,
+    gpu_acceleration: GpuAcceleration,
+) -> bool {
+    match mode {
+        LiveAgentMode::Off => false,
+        LiveAgentMode::On => true,
+        LiveAgentMode::Auto => probe.is_some() && gpu_acceleration != GpuAcceleration::Off,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Recording state
 // ---------------------------------------------------------------------------
 
@@ -1031,6 +1149,30 @@ pub enum AppEvent {
     ChatContextTrimmed {
         session_id: ChatSessionId,
         dropped_turns: u32,
+    },
+
+    // --- Live agent ----------------------------------------------------------
+    // These ride the existing `AppEventPayload` newtype + the single
+    // `collect_events![AppEventPayload]` registration in `ipc-bridge` — no new
+    // event registration needed. The live agent refreshes the digest on a
+    // debounced cadence driven by `TranscriptSegment` events; each refresh
+    // emits a full replacement digest so a lagged subscriber can safely drop
+    // intermediate updates (lossy-broadcast-safe, same approach as
+    // `ChatTurnComplete.final_text`).
+    /// The live in-meeting agent produced a refreshed digest for an active
+    /// meeting. The payload is the FULL replacement digest; the webview
+    /// replaces the previous digest wholesale rather than patching. Lossy-
+    /// broadcast-safe: a dropped event is recovered on the next refresh.
+    LiveDigestUpdated {
+        meeting_id: MeetingId,
+        digest: LiveDigest,
+    },
+    /// The live agent encountered an error producing a digest refresh. The
+    /// panel shows `message` and retains the last valid digest, if any.
+    LiveDigestError {
+        meeting_id: MeetingId,
+        /// A concise human-readable description of what went wrong.
+        message: String,
     },
 
     // --- MCP server (Phase 10) -------------------------------------------
@@ -2312,6 +2454,208 @@ mod tests {
         assert!(!json.contains("title"), "absent title must be omitted");
         let back: ChatSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, untitled);
+    }
+
+    // -----------------------------------------------------------------------
+    // live_agent_should_run — Off/On/Auto × probe/accel variants
+    // -----------------------------------------------------------------------
+
+    fn make_gpu_probe(total_gib: u64, is_integrated: bool) -> GpuProbe {
+        GpuProbe {
+            total_bytes: total_gib * 1024 * 1024 * 1024,
+            free_bytes: total_gib * 1024 * 1024 * 1024,
+            is_integrated,
+            name: if is_integrated {
+                "Test Integrated GPU".to_string()
+            } else {
+                "Test Discrete GPU".to_string()
+            },
+        }
+    }
+
+    #[test]
+    fn live_agent_off_always_returns_false() {
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Off,
+            None,
+            GpuAcceleration::Auto
+        ));
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Off,
+            Some(&make_gpu_probe(24, false)),
+            GpuAcceleration::Auto
+        ));
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Off,
+            Some(&make_gpu_probe(8, true)),
+            GpuAcceleration::On
+        ));
+    }
+
+    #[test]
+    fn live_agent_on_always_returns_true() {
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
+            None,
+            GpuAcceleration::Off
+        ));
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
+            Some(&make_gpu_probe(4, false)),
+            GpuAcceleration::Auto
+        ));
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
+            Some(&make_gpu_probe(8, true)),
+            GpuAcceleration::On
+        ));
+    }
+
+    #[test]
+    fn live_agent_auto_no_probe_returns_false() {
+        // No GPU probe → Auto gates off regardless of accel setting.
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Auto,
+            None,
+            GpuAcceleration::Auto
+        ));
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Auto,
+            None,
+            GpuAcceleration::On
+        ));
+    }
+
+    #[test]
+    fn live_agent_auto_accel_off_returns_false() {
+        // Probe present but gpu_acceleration=Off → Auto gates off.
+        // The LLM would run on CPU, contending with ASR.
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Auto,
+            Some(&make_gpu_probe(36, false)),
+            GpuAcceleration::Off
+        ));
+        assert!(!live_agent_should_run(
+            LiveAgentMode::Auto,
+            Some(&make_gpu_probe(8, true)),
+            GpuAcceleration::Off
+        ));
+    }
+
+    #[test]
+    fn live_agent_auto_integrated_gpu_accel_on_returns_true() {
+        // Integrated GPU with acceleration active (e.g. AMD Radeon 890M, Vulkan
+        // on) → Auto enables. The is_integrated flag is NOT a gate; the GPU-
+        // acceleration-active proxy is the correct discriminator (SP-LIVE E1).
+        assert!(live_agent_should_run(
+            LiveAgentMode::Auto,
+            Some(&make_gpu_probe(16, true)),
+            GpuAcceleration::Auto
+        ));
+        assert!(live_agent_should_run(
+            LiveAgentMode::Auto,
+            Some(&make_gpu_probe(16, true)),
+            GpuAcceleration::On
+        ));
+    }
+
+    #[test]
+    fn live_agent_auto_discrete_gpu_accel_on_returns_true() {
+        // Discrete GPU with acceleration active → Auto enables.
+        assert!(live_agent_should_run(
+            LiveAgentMode::Auto,
+            Some(&make_gpu_probe(4, false)),
+            GpuAcceleration::Auto
+        ));
+        assert!(live_agent_should_run(
+            LiveAgentMode::Auto,
+            Some(&make_gpu_probe(24, false)),
+            GpuAcceleration::On
+        ));
+    }
+
+    #[test]
+    fn live_agent_mode_default_is_auto() {
+        assert_eq!(LiveAgentMode::default(), LiveAgentMode::Auto);
+    }
+
+    #[test]
+    fn live_agent_mode_serialises_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&LiveAgentMode::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(serde_json::to_string(&LiveAgentMode::On).unwrap(), "\"on\"");
+        assert_eq!(
+            serde_json::to_string(&LiveAgentMode::Off).unwrap(),
+            "\"off\""
+        );
+    }
+
+    #[test]
+    fn live_digest_and_item_round_trip() {
+        let mid = MeetingId::new();
+        let digest = LiveDigest {
+            meeting_id: mid,
+            generated_at_ms: 1_700_000_000_000,
+            action_items: vec![LiveDigestItem {
+                text: "Alice to send the report".to_string(),
+                resolved: false,
+                source: None,
+            }],
+            decisions: vec![LiveDigestItem {
+                text: "Launch date moved to Q3".to_string(),
+                resolved: true,
+                source: Some("slide deck".to_string()),
+            }],
+            open_asks: vec![],
+            attachment_answers: vec![],
+            unresolved_references: vec![],
+        };
+        let json = serde_json::to_string(&digest).unwrap();
+        let back: LiveDigest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.meeting_id, mid);
+        assert_eq!(back.action_items.len(), 1);
+        assert!(!back.action_items[0].resolved);
+        assert!(back.action_items[0].source.is_none());
+        assert_eq!(back.decisions.len(), 1);
+        assert!(back.decisions[0].resolved);
+        assert_eq!(back.decisions[0].source.as_deref(), Some("slide deck"));
+        // Absent `source` is omitted from the wire shape.
+        assert!(
+            !json.contains("\"source\":null"),
+            "absent source must be omitted not null"
+        );
+    }
+
+    #[test]
+    fn app_event_live_digest_updated_serialises_with_tag() {
+        let mid = MeetingId::new();
+        let e = AppEvent::LiveDigestUpdated {
+            meeting_id: mid,
+            digest: LiveDigest {
+                meeting_id: mid,
+                generated_at_ms: 0,
+                action_items: vec![],
+                decisions: vec![],
+                open_asks: vec![],
+                attachment_answers: vec![],
+                unresolved_references: vec![],
+            },
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"live_digest_updated\""));
+    }
+
+    #[test]
+    fn app_event_live_digest_error_serialises_with_tag() {
+        let e = AppEvent::LiveDigestError {
+            meeting_id: MeetingId::new(),
+            message: "context overflow".to_string(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"kind\":\"live_digest_error\""));
+        assert!(json.contains("context overflow"));
     }
 
     #[test]

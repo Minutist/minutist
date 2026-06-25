@@ -1,0 +1,50 @@
+[package]
+name = "headless"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# WS4-B: the user-installed headless server daemon (`minutist-hub`). The user
+# runs it as an always-on service on their OWN hardware; it pairs into the device
+# mesh exactly like a desktop and holds meeting plaintext — but on hardware the
+# user owns, so it stays within the same trust boundary as the desktop (it is NOT
+# the hosted relay, which only ever brokers ciphertext). Two capabilities behind
+# one binary, by configuration: an always-on sync hub now, a GPU processing node
+# post-launch.
+#
+# It is a SECOND workspace binary beside `src-tauri` (app-main): a standalone
+# `cargo build` target with no Tauri / webview pipeline, so it cross-compiles to
+# a server target and packages as a systemd unit or a minimal OCI image. It is
+# always-compiled under `cargo build --workspace` (like `sync`) but the desktop
+# free/connected artefacts never link it. It takes no `tauri::*` / `ipc-bridge`
+# edge; it wires `sync::SyncEngine` into a daemon directly.
+
+[[bin]]
+name = "minutist-hub"
+path = "src/main.rs"
+
+[dependencies]
+minutist-common = { path = "../common" }
+sync = { path = "../sync" }
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true, features = ["signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+# Validate a peer pairing ticket in `add-peer` before writing it to the peers
+# file (fail fast). Same EXACT pin as `sync`, which owns the ticket round-trip.
+iroh-tickets = "=1.0.0"
+
+[dev-dependencies]
+tempfile = "3"
+# The gated hub_e2e integration test spawns the built binary and drives two
+# SyncEngines through it. Integration tests don't inherit [dependencies], so the
+# crates they touch are restated here.
+sync = { path = "../sync" }
+persistence = { path = "../persistence" }
+minutist-common = { path = "../common" }
+iroh = "=1.0.0"
+uuid = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["process"] }

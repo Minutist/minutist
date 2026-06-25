@@ -1229,6 +1229,27 @@ is versioned and the migration runner is **forward-only** (a `schema_version`
 gate; opening an empty DB or a prior-schema DB migrates up without data loss).
 Nothing depends on `index.db` being byte-stable or even present.
 
+**Headless server data root (`headless` / `minutist-hub`).** The headless server
+(WS4-B; see "Headless server daemon") runs over its OWN data root, supplied as an
+absolute path at startup (`--data-dir`), entirely separate from any desktop's
+`{app-data}`:
+
+```
+{data-dir}/                     absolute; supplied via --data-dir
+├── sync_node_key               0600 ed25519 device identity; owned by `sync`
+├── peers                       paired-device tickets (one per line); via `add-peer`
+├── logs/                       rolling tracing appender (minutist-hub.log)
+└── meetings/                   owned by `persistence`, reached through `sync`
+    ├── {uuid}/                 per-meeting folders (notes.ydoc, audio.opus, …;
+    │                           same layout as the desktop's meetings/)
+    └── .blobs/                 iroh-blobs content store (redb); owned by `sync`
+```
+
+It has no `settings.store` / `mcp_token` / `tunnel_device.json` / `models/` — the
+hub neither serves the UI nor, in the sync-hub role, runs models. The
+single-writer rule applies per data root: the daemon must be the sole process
+over its root, and must never point at a desktop's `{app-data}`.
+
 ## Voiceprint matching
 
 **Scope (issue #0003).** Cross-session speaker voiceprints: a speaker enrolled
@@ -1823,6 +1844,13 @@ architecture-doc update and an explicit recorded product decision.
 - Integration tests that exercise the orchestrator live in
   `crates/orchestrator/tests/`.
 - The Tauri main binary is not unit-tested directly; it's wiring.
+- Live sync is covered at two layers, all gated on `MINUTIST_SYNC_TOKEN` so a
+  normal `cargo test` / CI never touches the network: the engine layer
+  (`crates/sync/tests/{relay_live,blobs_live}.rs`) and the app-glue layer
+  (`src-tauri/src/sync.rs` ConnectedSync). The headless hub adds a third:
+  `crates/headless/tests/hub_e2e.rs` spawns the real `minutist-hub` binary as an
+  always-on middle peer and asserts two devices converge **through** it over the
+  deployed relay.
 
 Test fixtures (sample WAV files, expected transcripts) live under
 `tests/fixtures/` at the repo root and are git-lfs'd if they exceed
@@ -2107,6 +2135,86 @@ The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server
 **Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper".
 
 **Connected-tier tunnel (`tunnel-client`).** The `connected`-feature gating extends to the app-side relay tunnel (WS4-A): `tunnel-client` is part of the connected surface (the free build has no relay), so `app-main`'s optional edge on it is gated by the same `connected` feature as `mcp-server`, added when the tunnel is wired in WS4-A S5. The crate itself lives in the workspace unconditionally (compiled by the workspace build / `cargo test`) and is simply not pulled into the free binary — the same pattern `mcp-server` followed before Phase 10. The tunnel does **not** add a listening socket: it dials OUTBOUND to the relay (no inbound port), and replays relayed requests against the existing loopback `mcp-server`. The internal `mcp_token` bearer doubles as the relay↔app secret here, applied app-side to the loopback replay only and never sent outbound to the relay (see the "Token storage and file permissions" / "Token lifetime and the connected-relay path" notes above). The tunnel **device credential** secret (`tunnel_device.json`, 0600) is introduced by S5 pairing, not S3b.
+
+## Headless server daemon
+
+The `headless` crate is a SECOND workspace binary (`minutist-hub`) beside
+`app-main` — the user-installed headless server (WS4-B): an always-on
+device-sync hub now, a GPU processing node post-launch. It is NOT a Tauri binary
+and NOT a build variant of `app-main`; it is its own `cargo build` target, always
+compiled under `cargo build --workspace` (like `sync`) but never linked by the
+desktop free/connected `src-tauri` artefacts. The cross-cutting conventions apply
+to it as follows:
+
+- **Entry point + runtime.** `#[tokio::main]` multi-threaded scheduler in the
+  daemon's own `main`; plain `tokio::spawn`, **never** `tauri::async_runtime::spawn`
+  (there is no Tauri runtime here). All channels bounded, as everywhere.
+- **No Tauri / IPC edges.** No `tauri::*` / `tauri-specta` / `ipc-bridge`
+  imports (a reviewer finding if any appear). The daemon wires `sync::SyncEngine`
+  directly; it carries no command/event surface.
+- **Tracing.** Configured in the daemon's own entry point — a stderr writer
+  (captured by journald under systemd) honouring `RUST_LOG`, defaulting to
+  `info`, plus a rolling file appender under `{data_dir}/logs/` once the data
+  root resolves. No `println!` / `eprintln!` for logging — the one-shot CLI
+  subcommands (`print-ticket` / `add-peer`) do write their result to stdout via
+  `println!`, but that is command output, not logging, and they do not initialise
+  the subscriber so stdout stays clean. The relay access token is never logged
+  (only whether one is set), mirroring the redacted `SyncConfig` Debug.
+- **Configuration + data root.** The data root is an absolute path supplied at
+  startup (CLI `--data-dir` / config file / env), resolved BEFORE settings load —
+  it is a startup argument, not a settings field. Other settings read from a
+  `settings.store` under the daemon's own root.
+- **Operator surface.** The daemon has no GUI; pairing is via one-shot CLI
+  subcommands. `print-ticket` binds the engine briefly and prints this device's
+  pairing ticket to stdout (paste it into a desktop's Sync settings). `add-peer
+  <ticket>` validates a peer's ticket and appends it to `{data_dir}/peers` (one
+  ticket per line; `#` comments and blank lines ignored). The running daemon
+  re-reads `peers` on a fixed interval, so a peer added while it runs is authorised
+  without a restart — sync is mutual, so the peer must also add the hub's ticket. A
+  Unix-domain-socket admin API is the eventual production surface; this CLI/file
+  surface is the first cut.
+- **Convergence (push-on-reconnect).** `SyncEngine` fires a bounded "peer arrived"
+  broadcast (`subscribe_peer_events`) each time a peer opens an authorised inbound
+  sync connection. The daemon reacts by calling `SyncEngine::push_all_to(peer)`,
+  which reconciles EVERY meeting the hub holds back to that peer (relay-addressed,
+  per-meeting notes + media, failures logged-and-skipped), debounced per peer. So a
+  device that reconnects to deposit one meeting also collects every other meeting
+  the hub accumulated while it was away — true convergence through the hub, not
+  passive responding. The reciprocal push is **raced against the shutdown signal**,
+  so a `SIGTERM` mid-push is honoured promptly (the push future is dropped — safe
+  and idempotent, since notes writes are atomic and media is content-addressed). A
+  `Lagged` peer-event (arrivals dropped under load) is recovered by reconciling
+  EVERY known peer, so no arrival is permanently missed. The desktop does not
+  subscribe to peer events.
+- **Single-writer per data root.** The daemon owns an entirely separate data root
+  from any desktop (`settings.store`, `logs/`, `index.db`, `meetings/{uuid}/`
+  under it; the device key at the root). Two processes must never share one root
+  (libsql's WAL locking is the backstop, not a substitute for the discipline).
+  See `containers.md` — "Process model".
+- **Error boundary.** Uses `common::AppError` (or a daemon-local `thiserror` type
+  converting to it) — never `IpcError` / `tauri-specta` shapes.
+- **Trust position.** It holds meeting plaintext, but on the user's own hardware,
+  so it sits in the same trust boundary as the desktop (the free-build D4 network
+  claim is about Minutist-operated servers seeing content; this is the user's own
+  machine). It is NOT the relay, which only ever brokers ciphertext.
+- **GPU features (post-launch).** The GPU node forwards backend features to
+  `llama-cpp-2` / `sherpa-rs` behind the same Cargo feature names as the desktop,
+  conditional on the target GPU (a CPU-only build needs no GPU SDK); see "GPU
+  portability". That phase adds the ML-runtime crate edges as a separate
+  architecture-doc update.
+- **Packaging artefacts.** Static repo files under `packaging/`, NOT built by the
+  Rust workspace: a multi-stage `Dockerfile` (its builder stage also produces a
+  glibc-compatible binary for bare-metal installs), a systemd unit
+  (`minutist-hub.service` — `DynamicUser` + `StateDirectory`, `SIGTERM` stop), and
+  the Windows service install via WinSW (`packaging/windows/`), which relies on the
+  daemon's cross-platform Ctrl-C shutdown so no Windows-specific Rust code is
+  needed. See `packaging/README.md`.
+
+The cleanliness invariant for the free desktop build is unchanged: `cargo build
+-p minutist --no-default-features` takes no edge to `headless` and pulls no new
+deps. `headless` being a workspace member only means `cargo build --workspace`
+compiles it — exactly as `sync` compiles unconditionally while the `app-main ->
+sync` edge stays connected-gated.
 
 ## What's not decided here
 

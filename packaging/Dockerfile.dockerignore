@@ -1,0 +1,16 @@
+# Build-context excludes for `packaging/Dockerfile` (BuildKit honours a
+# `<dockerfile>.dockerignore` over the repo-root `.dockerignore`). Unlike the
+# root ignore — which is for the CI-runner image and excludes all source — this
+# build COMPILES the workspace, so the source crates MUST be sent. Only the heavy
+# or build-irrelevant trees are excluded.
+target/
+target-ci-local/
+src-tauri/target/
+**/node_modules/
+ui/dist/
+dist-windows/
+.git/
+.claude/
+.playwright-mcp/
+planning/
+context/

@@ -192,6 +192,13 @@ fn default_chat_system_prompt() -> String {
         .to_string()
 }
 
+/// Default for `diarization_enabled`: `true` (on by default, 2026-06-25). Used
+/// for a fresh install and for an older store that predates the field. A store
+/// that explicitly persisted `false` keeps it (serde reads the stored value).
+const fn default_diarization_enabled() -> bool {
+    true
+}
+
 /// Default live-agent enabled mode: `Off`. The in-meeting co-pilot is opt-in
 /// until validated on real hardware; `Auto` would silently run an LLM during
 /// every accelerated recording (and `Auto` itself never enables on a
@@ -439,11 +446,14 @@ pub struct Settings {
 
     /// Whether the post-recording diarization pass runs (FR-11).
     ///
-    /// Diarization is post-hoc and off by default: the orchestrator gates its
+    /// **On by default** as of 2026-06-25 (product decision — "Identify
+    /// speakers" is the expected default; supersedes FR-11's original
+    /// off-by-default). Diarization is post-hoc: the orchestrator gates its
     /// on-stop diarizer pass (and the user-triggered re-diarize) on this flag.
-    /// `#[serde(default)]` defaults to `false`; an older store written before
-    /// this field existed deserialises to `false`.
-    #[serde(default)]
+    /// `default_diarization_enabled` returns `true`, so both a fresh install and
+    /// an older store that predates this field default to on; a user who
+    /// explicitly turned it off keeps that choice (their store persists `false`).
+    #[serde(default = "default_diarization_enabled")]
     pub diarization_enabled: bool,
 
     /// Whether the voiceprint enrolment flow is active (issue #0003).
@@ -746,7 +756,7 @@ impl Default for Settings {
             autosave_interval_secs: default_autosave_interval_secs(),
             summary_system_prompt: String::new(),
             llm_model_id: None,
-            diarization_enabled: false,
+            diarization_enabled: default_diarization_enabled(),
             onboarding_completed: false,
             gpu_acceleration: default_gpu_acceleration(),
             capture_system_audio: true,
@@ -962,10 +972,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn diarization_enabled_defaults_to_false() {
+    fn diarization_enabled_defaults_to_true() {
         assert!(
-            !Settings::default().diarization_enabled,
-            "diarization is post-hoc and off by default (FR-11)"
+            Settings::default().diarization_enabled,
+            "diarization is on by default (2026-06-25 product decision — Identify speakers)"
         );
     }
 
@@ -982,14 +992,14 @@ mod tests {
     }
 
     #[test]
-    fn old_store_json_without_diarization_field_defaults_to_false() {
+    fn old_store_json_without_diarization_field_defaults_to_true() {
         // A settings store written before `diarization_enabled` existed (it
         // still carries the Phase-3/Phase-5 fields).
         let old_json = r#"{ "theme": "dark", "start_hidden": true, "autosave_interval_secs": 5 }"#;
         let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
         assert!(
-            !restored.diarization_enabled,
-            "missing diarization_enabled must deserialise to false (FR-11 default)"
+            restored.diarization_enabled,
+            "missing diarization_enabled now deserialises to true (on-by-default, 2026-06-25)"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);
@@ -1576,15 +1586,15 @@ mod tests {
         let handle = SettingsHandle::new(JsonFileStore::new(path)).expect("handle");
 
         // No `subscribe()` anywhere — the channel has zero live receivers.
-        assert!(!handle.current().diarization_enabled, "default is off");
+        assert!(handle.current().diarization_enabled, "default is on");
 
         handle
-            .update(|s| s.diarization_enabled = true)
+            .update(|s| s.diarization_enabled = false)
             .await
             .expect("update");
 
         assert!(
-            handle.current().diarization_enabled,
+            !handle.current().diarization_enabled,
             "current() must reflect the update even with no live subscriber"
         );
 
@@ -1594,7 +1604,7 @@ mod tests {
             .await
             .expect("update");
         assert_eq!(handle.current().theme, Theme::Light);
-        assert!(handle.current().diarization_enabled, "prior field retained");
+        assert!(!handle.current().diarization_enabled, "prior field retained");
     }
 
     // -----------------------------------------------------------------------
@@ -1627,13 +1637,14 @@ mod tests {
         let mut rx = handle.subscribe();
         rx.borrow_and_update();
 
-        let result = handle.update(|s| s.diarization_enabled = true).await;
+        let result = handle.update(|s| s.diarization_enabled = false).await;
         assert!(result.is_err(), "save failure must propagate as an error");
 
         // The change was NOT published: `current()` (which reads the watch
-        // value, kept current by `send_replace`) still reflects the old value.
+        // value, kept current by `send_replace`) still reflects the old value
+        // (the on-by-default true), not the failed-save false.
         assert!(
-            !handle.current().diarization_enabled,
+            handle.current().diarization_enabled,
             "a failed save must not publish the change (persist-before-publish)"
         );
 

@@ -1116,7 +1116,8 @@ Spike-4's TitaNet, which is VoxCeleb-trained and not cleanly redistributable in
 a paid product; ERes2NetV2 (same license) is the
 swap-in accuracy upgrade. The orchestrator owns the lifecycle: it builds the
 diarizer (resolving both model dirs via `model-registry`), runs the on-stop pass
-(gated on `settings.diarization_enabled`, default off) and the `rediarize`
+(gated on `settings.diarization_enabled`, default **on** as of 2026-06-25 — see
+`settings`'s `default_diarization_enabled`) and the `rediarize`
 re-pass, and emits `AppEvent::DiarizationComplete` on its shared bus. Ship the
 MIT + Apache NOTICE/attribution (the k2-fsa / HF mirrors don't carry the
 upstream notices).

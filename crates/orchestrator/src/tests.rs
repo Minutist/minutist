@@ -980,16 +980,20 @@ mod diarization {
         );
     }
 
-    /// With `diarization_enabled = false` (the default), `stop()` runs no
-    /// diarization pass: the returned `MeetingMeta` and the on-disk transcript
-    /// keep every `speaker_id == None`, `speaker_count == 0`, and NO
-    /// `DiarizationComplete` event is emitted.
+    /// With `diarization_enabled = false`, `stop()` runs no diarization pass:
+    /// the returned `MeetingMeta` and the on-disk transcript keep every
+    /// `speaker_id == None`, `speaker_count == 0`, and NO `DiarizationComplete`
+    /// event is emitted. (Diarization is on by default since 2026-06-25, so this
+    /// OFF-path test disables it explicitly.)
     #[tokio::test]
     async fn stop_with_diarization_disabled_leaves_segments_unlabelled() {
         let _ = tracing_subscriber::fmt::try_init();
         let dir = tempfile::tempdir().expect("tempdir");
         let orch = test_orchestrator(dir.path().to_path_buf());
-        // The default SettingsHandle has diarization_enabled = false.
+        orch.settings_handle_for_test()
+            .update(|s| s.diarization_enabled = false)
+            .await
+            .expect("disable diarization_enabled");
         let mut event_rx = orch.subscribe_events();
 
         let source = DummyAudioSource::new(3200, 1600);

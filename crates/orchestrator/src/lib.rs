@@ -1621,8 +1621,8 @@ impl Orchestrator {
         // Announce the refreshed transcript so the webview re-reads it (the
         // meeting-list excerpt + any open-meeting view), mirroring how
         // `finalise_diarization` emits `DiarizationComplete`. Without this, a
-        // background re-transcribe with diarization OFF (the default) would leave
-        // the UI showing the stale/truncated transcript until a manual refresh.
+        // background re-transcribe with diarization OFF would leave the UI
+        // showing the stale/truncated transcript until a manual refresh.
         self.emit(AppEvent::TranscriptReady { meeting_id });
 
         tracing::info!(

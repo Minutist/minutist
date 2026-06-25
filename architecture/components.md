@@ -41,6 +41,7 @@ appears in:
 | `sync-ffi` | WS4-B (phone) | `common`, `sync`, `notes-crdt` ¶ |
 | `election` | WS4-B (producer-gate) | `common`, `persistence` |
 | `doc-convert` | Attachments WS | `common` |
+| `rag-retrieval` | RAG | `common` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※ |
 | `headless` (bin) | WS4-B | `common`, `persistence`, `sync`, `settings` ‖ |
@@ -337,7 +338,7 @@ used, not added here.
 `LiveDigestItem`, `LiveDigest`, `LiveAgentMode`,
 `ProcessingLifecycle`, `ProcessingClaim`, `HostRef`),
 trait definitions (`AsrBackend`, `Diarizer`,
-`Summariser`, `DocVlm`), the shared `AppError` enum + `AppResult<T>` alias,
+`Summariser`, `DocVlm`, `Embedder`), the shared `AppError` enum + `AppResult<T>` alias,
 `apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` — the
 single canonical speaker-name overlay (raw diarizer label → display name),
 shared by the agent read tools and the summariser input path so a summary
@@ -3177,6 +3178,36 @@ so a future `set-cookie`/`authorization` echo cannot transit the trust boundary.
 `run_tunnel` **refuses a non-`wss://` relay** (`TunnelError::Config`) before
 dialing — `ws://` is tolerated only for a loopback host, where cleartext never
 leaves the machine.
+
+### `rag-retrieval`
+**Crate:** `crates/rag-retrieval` (RAG)
+**Owns:** retrieval-augmented context for the meeting agent on the iGPU tier —
+chunking and cosine ranking, driven through the `common::Embedder` seam.
+Rationale: LLM prefill is the
+iGPU wall (~10 min for 20k tokens, SP-LIVE E5), so large attachments / long
+transcripts are RETRIEVED, not pinned (`planning/RAG_RETRIEVAL_PLAN.md`). This is
+**pure retrieval logic** — it depends ONLY on `common` (`AppResult` +
+`voiceprint_math` cosine) and does NOT pull `llama-cpp-2`. Surface:
+
+- `chunk_text(text, chunk_chars, overlap) -> Vec<Chunk>` — newline-aligned,
+  char-boundary-safe windows with overlap (≈256-token chunks per SP-LIVE E6).
+- `rank_top_k(query, items, k)` — top-k cosine ranking, reusing
+  `common::voiceprint_math::cosine_unit` (embeddings are L2-normalised, so cosine
+  is the dot product).
+- `Embedder` — the seam, defined in `common` alongside `Summariser` / `DocVlm`
+  (re-exported from `rag-retrieval` for convenience). The concrete BGE-M3 /
+  llama-backed impl lives in `ipc-bridge` (which owns the model substrate);
+  because the trait lives in `common` — which `ipc-bridge` already depends on —
+  that impl creates **no `ipc-bridge → rag-retrieval` edge**. Phase B adds
+  `ModelKind::Embed` + the BGE-M3 manifest entry, the concrete embedder, the
+  per-meeting libsql chunk/vector store (+ FTS5), and the `retrieve_chunks` tool
+  (and regenerates the TS bindings, since `ModelKind` crosses the IPC surface).
+- `RagChunk` / `DocType` — the pre-persistence chunk value (attachment | transcript); `persistence` assigns the durable row + identity columns (Phase B).
+
+**Planned embedder (Phase B):** BGE-M3 Q8_0 (MIT, on-demand download via a
+`ModelKind::Embed` manifest entry) — selected by SP-LIVE E6 (80% recall@5 on
+real-prose paraphrased queries vs Qwen3-Embedding-0.6B's 40%; see
+`research/sp-live-e6-embed-2026-06-25.md`).
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

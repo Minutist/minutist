@@ -1925,6 +1925,29 @@ pub trait DocVlm: Send + Sync {
     fn image_to_markdown(&self, png: &[u8]) -> AppResult<String>;
 }
 
+/// Injected text-embedding seam used by `rag-retrieval` to turn chunk and query
+/// text into vectors for cosine ranking, without `rag-retrieval` ever loading a
+/// model. The concrete BGE-M3 / llama-backed implementation lives in `ipc-bridge`
+/// (which owns the model substrate); `rag-retrieval` depends only on this trait.
+/// Sits alongside [`Summariser`] / [`DocVlm`] as a model-backed inference seam.
+///
+/// `Send + Sync`: implementations hold an `Arc`-wrapped model (safe with
+/// `unsafe impl`) and build their `!Sync` embeddings `LlamaContext` fresh per
+/// call (never stored), so the seam can be shared across the retrieval threads
+/// (`spawn_blocking`) that embed chunks at attach time and the query at ask time.
+pub trait Embedder: Send + Sync {
+    /// Embed `text` into a fixed-dimension, **L2-normalised** vector of length
+    /// [`Self::dim`].
+    ///
+    /// Implementations MUST return unit-length vectors so the retrieval cosine
+    /// reduces to a dot product. Used at attach time to embed chunks and at query
+    /// time to embed the question.
+    fn embed(&self, text: &str) -> AppResult<Vec<f32>>;
+
+    /// The embedding dimensionality (e.g. 1024 for BGE-M3).
+    fn dim(&self) -> usize;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -1,0 +1,26 @@
+[package]
+name = "rag-retrieval"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Owner role: ml-runtime-engineer.
+# Retrieval-augmented context for the meeting agent (iGPU tier): chunk attachment
+# / transcript markdown, embed each chunk, and rank chunks against a query by
+# cosine similarity so only the relevant slice is fed to the slow LLM (prefill is
+# the iGPU wall — see planning/RAG_RETRIEVAL_PLAN.md + research/sp-live-e5/e6).
+#
+# This crate is PURE retrieval logic — chunking, scoring, and the in-memory
+# search. It depends ONLY on `common` (AppResult, the shared cosine math in
+# `voiceprint_math`, and the `Embedder` seam — which lives in `common` alongside
+# `Summariser`/`DocVlm`); it does NOT pull `llama-cpp-2`. The concrete llama-backed
+# embedder is provided by `ipc-bridge` (which owns the model substrate) against
+# `common::Embedder`.
+
+[dependencies]
+minutist-common = { path = "../common" }
+serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

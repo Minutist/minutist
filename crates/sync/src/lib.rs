@@ -5,13 +5,13 @@
 //!
 //! - **Notes** — Yjs CRDT update frames over the sync ALPN protocol
 //!   ([`notes_proto`]) on the one [`SyncEngine`] endpoint. The authoritative
-//!   document is `persistence`'s `notes.ydoc`; received updates are merged with
-//!   [`persistence::NotesStore::apply_update`].
+//!   document is `notes-crdt`'s `notes.ydoc`; received updates are merged with
+//!   [`notes_crdt::NotesStore::apply_update`].
 //! - **Meeting media** — audio (`audio.opus`) and note assets, content-addressed
 //!   over `iroh-blobs` ([`blobs`]). The two sides exchange a media manifest of
 //!   `(relative-path, BLAKE3 hash)` pairs ([`media_proto`]) over the same sync
 //!   ALPN, then pull the blobs each is missing over the blobs ALPN, exporting to
-//!   the per-meeting paths `persistence` owns.
+//!   the per-meeting paths `notes-crdt` owns (via `MeetingFolder::ensure`).
 //!
 //! Both exchanges share one ALPN, dispatched by a leading
 //! [`notes_proto::StreamKind`] tag, so one paired-peer authorisation point covers

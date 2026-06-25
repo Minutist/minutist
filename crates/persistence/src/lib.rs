@@ -56,21 +56,26 @@ pub mod attachments;
 pub mod chat;
 pub mod collections;
 pub mod error;
-pub mod folder;
 pub mod index;
 pub mod meeting_ops;
 pub mod metadata;
 pub mod migrations;
-pub mod notes;
-pub mod voiceprints;
-pub mod voiceprints_migrations;
 pub mod opus_encoder;
 pub mod reader;
 pub mod summary;
 pub mod transcript;
 pub mod translations;
+pub mod voiceprints;
+pub mod voiceprints_migrations;
 pub mod writer;
-pub mod ydoc;
+
+// The notes-CRDT primitives moved to the leaf `notes-crdt` crate. Re-export the
+// modules (and their public items below) at their historical `persistence::*`
+// paths so callers — orchestrator, ipc-bridge, agent-tools, app-main, the sync
+// crate's dev-tests, the `yjs_interop` test — are unchanged. `persistence`
+// remains the sole writer under `{app-data}/meetings/`; it simply delegates the
+// notes-CRDT bodies to the leaf.
+pub use notes_crdt::{folder, notes, ydoc};
 
 // Public re-exports for the crate's primary surface.
 pub use assets::{read_note_asset, save_note_asset};
@@ -83,10 +88,9 @@ pub use attachments::{
 pub use chat::ChatStore;
 pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;
-pub use folder::MeetingFolder;
 pub use index::MeetingIndex;
-pub use metadata::write_metadata;
-pub use notes::{note_blocks_from_json, NotesData, NotesStore};
+// Moved to `notes-crdt`; re-exported at the historical `persistence::*` paths.
+pub use notes_crdt::{note_blocks_from_json, write_metadata, MeetingFolder, NotesData, NotesStore};
 pub use reader::{
     read_audio_pcm, read_meeting_state, read_metadata, read_note_blocks, read_transcript,
 };

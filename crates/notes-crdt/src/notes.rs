@@ -1,7 +1,7 @@
 //! `NotesStore` — standalone reader/writer for `notes.json` + `notes.md`.
 //!
-//! `NotesStore` is **independent of [`crate::MeetingWriter`]**: there is no
-//! shared open file handle. `MeetingWriter` owns `audio.opus`,
+//! `NotesStore` is **independent of `persistence`'s `MeetingWriter`**: there is
+//! no shared open file handle. `MeetingWriter` owns `audio.opus`,
 //! `transcript.json`, and `metadata.json` while a recording is in flight and
 //! never touches the notes files; `NotesStore` only ever reads/writes
 //! `notes.json` and `notes.md` and never touches the recording-owned files.
@@ -30,7 +30,7 @@
 //! (the projection self-heals if `notes.json` is missing or stale, exactly as
 //! the libsql index self-heals from the folders). A meeting that predates the
 //! groundwork has no `notes.ydoc`; it reads straight from `notes.json` and is
-//! seeded lazily on open by [`crate::reader::read_meeting_state`].
+//! seeded lazily on open by `persistence::reader::read_meeting_state`.
 //!
 //! # Atomic writes
 //!
@@ -69,7 +69,7 @@ pub struct NotesData {
 ///
 /// `NotesStore` holds no open file handle; every call resolves paths from the
 /// `(root, meeting_id)` pair. It is deliberately decoupled from
-/// [`crate::MeetingWriter`] — see the module docs.
+/// `persistence`'s `MeetingWriter` — see the module docs.
 pub struct NotesStore;
 
 impl NotesStore {
@@ -100,7 +100,7 @@ impl NotesStore {
     /// are removed by the rename; no `.tmp` residue remains on success.
     ///
     /// This does **not** create the meeting folder — the folder is owned by
-    /// [`crate::MeetingWriter`] and is expected to exist. Sibling files
+    /// `persistence`'s `MeetingWriter` and is expected to exist. Sibling files
     /// (`audio.opus`, `transcript.json`, `metadata.json`) are left untouched.
     ///
     /// # Refusal when `notes.ydoc` already exists
@@ -286,15 +286,13 @@ impl NotesStore {
                     .map_err(|context| minutist_common::AppError::Internal { context })?;
                 crate::ydoc::ydoc_to_json(&doc)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                match std::fs::read(&json_path) {
-                    Ok(bytes) => serde_json::from_slice(&bytes)
-                        .map_err(Error::Serialise)
-                        .map_err(minutist_common::AppError::from)?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => return Err(Error::Io(e).into()),
-                }
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::read(&json_path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .map_err(Error::Serialise)
+                    .map_err(minutist_common::AppError::from)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(Error::Io(e).into()),
+            },
             Err(e) => return Err(Error::Io(e).into()),
         };
 
@@ -370,11 +368,11 @@ impl NotesStore {
 fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
     use std::io::Write;
 
-    let parent = path.parent().ok_or_else(|| {
-        minutist_common::AppError::Internal {
+    let parent = path
+        .parent()
+        .ok_or_else(|| minutist_common::AppError::Internal {
             context: format!("notes path has no parent: {}", path.display()),
-        }
-    })?;
+        })?;
 
     // Temp filename derived from the target so concurrent saves of different
     // files (notes.json vs notes.md) don't collide on a shared temp name.
@@ -809,8 +807,14 @@ mod tests {
         NotesStore::save(&root, id, &representative_doc(), "body").expect("save");
 
         // All three files exist; notes.ydoc is the authoritative blob.
-        assert!(folder.join("notes.ydoc").exists(), "notes.ydoc must be written");
-        assert!(folder.join("notes.json").exists(), "derived notes.json must be written");
+        assert!(
+            folder.join("notes.ydoc").exists(),
+            "notes.ydoc must be written"
+        );
+        assert!(
+            folder.join("notes.json").exists(),
+            "derived notes.json must be written"
+        );
         assert!(folder.join("notes.md").exists(), "notes.md must be written");
         let ydoc = std::fs::read(folder.join("notes.ydoc")).expect("read ydoc");
         assert!(!ydoc.is_empty(), "notes.ydoc must carry the encoded state");
@@ -833,7 +837,10 @@ mod tests {
 
         // The refusal left notes.md (and the rest) at the first-save content.
         let loaded = NotesStore::load(&root, id).expect("load").expect("present");
-        assert_eq!(loaded.markdown, "body", "refused save must not touch notes.md");
+        assert_eq!(
+            loaded.markdown, "body",
+            "refused save must not touch notes.md"
+        );
     }
 
     #[test]
@@ -899,7 +906,10 @@ mod tests {
         // After seeding, notes.ydoc is authoritative: the load derives the same
         // document (structural round-trip).
         let loaded = NotesStore::load(&root, id).expect("load").expect("present");
-        assert_eq!(loaded.json, doc, "seeded notes.ydoc must derive the same doc");
+        assert_eq!(
+            loaded.json, doc,
+            "seeded notes.ydoc must derive the same doc"
+        );
 
         // Idempotent: a second seed is a no-op.
         assert!(
@@ -933,8 +943,13 @@ mod tests {
         let (_t2, root2, id2) = make_meeting();
         NotesStore::apply_update(&root2, id2, &v1, "md2").expect("apply update");
 
-        let loaded = NotesStore::load(&root2, id2).expect("load").expect("present");
-        assert_eq!(loaded.json, doc, "apply_update must derive the same document");
+        let loaded = NotesStore::load(&root2, id2)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            loaded.json, doc,
+            "apply_update must derive the same document"
+        );
         assert_eq!(loaded.markdown, "md2");
         assert!(root2.join(id2.0.to_string()).join("notes.ydoc").exists());
     }
@@ -945,7 +960,9 @@ mod tests {
     fn read_ydoc_state_absent_is_none() {
         let (_tempdir, root, id) = make_meeting();
         assert!(
-            NotesStore::read_ydoc_state(&root, id).expect("read").is_none(),
+            NotesStore::read_ydoc_state(&root, id)
+                .expect("read")
+                .is_none(),
             "a meeting with no notes.ydoc must yield None"
         );
     }
@@ -967,7 +984,9 @@ mod tests {
         .expect("seed legacy notes.json");
 
         // No notes.ydoc yet → editor would have no state to load.
-        assert!(NotesStore::read_ydoc_state(&root, id).expect("read").is_none());
+        assert!(NotesStore::read_ydoc_state(&root, id)
+            .expect("read")
+            .is_none());
 
         // The on-open seed (D-O2.7) writes notes.ydoc from the legacy JSON.
         assert!(NotesStore::seed_ydoc_if_needed(&root, id).expect("seed"));

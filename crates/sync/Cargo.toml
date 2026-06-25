@@ -9,15 +9,26 @@ authors.workspace = true
 # (a small custom QUIC protocol) and content-addressed meeting media (audio +
 # note assets, over `iroh-blobs`) directly between a user's own paired devices,
 # dialled through the self-hosted relay (sync.minutist.ai) with out-of-band
-# addressing. It depends on `common` (shared types / errors) and `persistence`
-# (read the authoritative `notes.ydoc` and the per-meeting media paths; apply
-# received updates). Part of the CONNECTED feature surface: the crate lives in
-# the workspace unconditionally (like `mcp-server` / `tunnel-client`) but the
-# app-main -> sync edge is wired behind the `connected` feature.
+# addressing. It depends on `common` (shared types / errors) and `notes-crdt`
+# (read the authoritative `notes.ydoc` via `NotesStore`; apply received updates;
+# `MeetingFolder::ensure` the inbound folder). It does NOT depend on
+# `persistence`: the notes-CRDT primitives were extracted into the leaf
+# `notes-crdt` crate so `sync`'s lib stays off the C-heavy graph (libsql /
+# audiopus / ogg) and cross-compiles to aarch64-linux-android. The integration
+# tests pull `persistence` as a DEV-dependency for `persistence::assets`
+# (note-image round-trips), which stays in `persistence`. Part of the CONNECTED
+# feature surface: the crate lives in the workspace unconditionally (like
+# `mcp-server` / `tunnel-client`) but the app-main -> sync edge is wired behind
+# the `connected` feature.
 
 [dependencies]
 minutist-common = { path = "../common" }
-persistence = { path = "../persistence" }
+# notes-crdt: the notes-CRDT primitives this crate transports — `NotesStore`
+# (read the authoritative `notes.ydoc`; merge received updates) and
+# `MeetingFolder::ensure` (the inbound-meeting folder seam). Depending on the
+# leaf instead of `persistence` keeps the C-heavy graph out of `sync`'s compile
+# path. The `yrs` pin matches transitively, so the on-the-wire encoding agrees.
+notes-crdt = { path = "../notes-crdt" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
@@ -42,11 +53,11 @@ iroh-tickets = "=1.0.0"
 # `iroh` in the tree so `Endpoint`/`Connection`/`EndpointId` unify across the
 # `.accept()`/`connect()`/`downloader()` boundary. Pinned EXACT alongside `iroh`.
 iroh-blobs = { version = "=0.103.0", features = ["fs-store"] }
-# yrs — the Yjs CRDT port. `persistence` owns the authoritative `notes.ydoc` and
+# yrs — the Yjs CRDT port. `notes-crdt` owns the authoritative `notes.ydoc` and
 # its projections; `sync` uses yrs only for the wire-level reconciliation math on
 # lib0-v1 update bytes (`encode_state_vector_from_update_v1` / `diff_updates_v1`),
 # never to materialise a doc or re-derive projections. Same workspace pin as
-# `persistence` so the two agree on the on-the-wire encoding.
+# `notes-crdt` so the two agree on the on-the-wire encoding.
 yrs = { workspace = true }
 # UUID — decode the fixed 16-byte meeting id off the wire back into a `MeetingId`.
 uuid = { workspace = true }
@@ -62,5 +73,10 @@ test-support = []
 # integration test against the relay-less path without a feature flag on the
 # command line.
 sync = { path = ".", features = ["test-support"] }
+# persistence: the integration tests round-trip note-image assets through
+# `persistence::assets` (`save_note_asset` / `read_note_asset`), which stays in
+# `persistence`. A dev-only edge — the production `sync` lib depends only on
+# `common` + `notes-crdt`, so the C-heavy graph never enters its compile path.
+persistence = { path = "../persistence" }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -182,7 +182,7 @@ fn write_collections_atomic(path: &Path, collections: &[Collection]) -> Result<(
 mod tests {
     use super::*;
     use crate::folder::MeetingFolder;
-    use crate::metadata::write_metadata;
+    use crate::write_metadata;
     use minutist_common::{AudioFormat, MeetingId, MeetingMeta};
     use tempfile::TempDir;
 

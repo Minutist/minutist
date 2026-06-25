@@ -28,7 +28,8 @@ appears in:
 | `asr-parakeet` | 8 | `common` |
 | `diarizer` | 6 | `common` |
 | `summariser` | 5 | `common` |
-| `persistence` | 1 (minimal) → 4 (full) | `common` |
+| `notes-crdt` | WS4-B | `common` |
+| `persistence` | 1 (minimal) → 4 (full) | `common`, `notes-crdt` |
 | `model-registry` | 2 | `common`, `settings` |
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
@@ -36,7 +37,7 @@ appears in:
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
-| `sync` | WS4-B | `common`, `persistence` |
+| `sync` | WS4-B | `common`, `notes-crdt` |
 | `doc-convert` | Attachments WS | `common` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
@@ -59,10 +60,15 @@ artifact omits it. See `cross-cutting.md` — "Build variants".
 Cargo feature as `mcp-server` / `tunnel-client` (it is part of the connected-tier
 surface — the free build does not sync). `sync` is a near-leaf transport crate:
 device-to-device sync over iroh, exchanging Yjs notes-update frames (a small
-custom ALPN protocol). Content-addressed meeting-media (audio + note assets) sync
-is the deferred S4 slice and is not present yet. It takes **no** workspace edge
-beyond `common` (shared types / errors) and `persistence` (read the authoritative
-`notes.ydoc` via `NotesStore`; apply received updates). The `ipc-bridge` trait injection
+custom ALPN protocol) and content-addressed meeting-media (audio + note assets).
+It takes **no** workspace edge beyond `common` (shared types / errors) and
+`notes-crdt` (read the authoritative `notes.ydoc` via `NotesStore`; apply
+received updates; `MeetingFolder::ensure` the inbound folder). It does **not**
+depend on `persistence`: the notes-CRDT primitives were extracted into the leaf
+`notes-crdt` crate (see its dependency-table row) so `sync`'s lib stays off the
+C-heavy graph (libsql / audiopus / ogg) and cross-compiles to mobile targets.
+`persistence::assets` (note-image round-trips) is reached only as a
+DEV-dependency by `sync`'s integration tests. The `ipc-bridge` trait injection
 (the `SyncControl` seam + `DisabledSync`, mirroring the `TunnelControl` seam)
 takes NO `sync` edge — `ipc-bridge` carries the trait + `DisabledSync`
 unconditionally and `app-main` injects the connected implementation. The
@@ -119,9 +125,10 @@ The notes-sync protocol exchanges yrs state vectors and computes the minimal
 lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
 operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —
 `sync` never materialises a yrs `Doc` and never re-derives the `notes.json` /
-`notes.md` projections; that stays in `persistence::NotesStore::apply_update`
-(`persistence` owns the one place that relaxes the document-opacity guarantee —
-see its "CRDT notes storage" section). `uuid` only decodes the fixed 16-byte
+`notes.md` projections; that stays in `notes_crdt::NotesStore::apply_update`
+(`notes-crdt` owns the one place that relaxes the document-opacity guarantee —
+see the `persistence` "CRDT notes storage" section, which documents the `ydoc`
+module now living in `notes-crdt`). `uuid` only decodes the fixed 16-byte
 meeting id off the wire back into a `common::MeetingId`.
 
 The media-sync protocol (WS4-B S4) multiplexes onto the same `SYNC_ALPN`: each
@@ -131,8 +138,9 @@ sides exchange a manifest of `(relative-path, BLAKE3 hash)` pairs for `audio.opu
 + each `assets/*` file (imported into the `iroh-blobs` store at
 `{meetings_root}/.blobs` — a dot-prefixed sibling that cannot collide with a
 `{uuid}` folder), then each pulls the blobs it lacks over the blobs ALPN and
-exports them to the per-meeting paths `persistence` owns
-(`MeetingFolder::ensure` creates the folder; `sync` writes only the media file).
+exports them to the per-meeting paths under the meetings root
+(`notes_crdt::MeetingFolder::ensure` creates the folder; `sync` writes only the
+media file).
 Imported and downloaded blobs are pinned with persistent named tags
 (`meeting/{id}/audio`, `meeting/{id}/asset/{name}`) so retention does not depend
 on GC state. `sync` reads/writes only `audio.opus` and `assets/*` under the
@@ -171,9 +179,10 @@ used, not added here.
   pause-INCLUDING Opus decoder and the `MeetingState` assembler), the libsql
   `index.db` index + forward-only migration runner + `rebuild_from_disk` +
   self-heal `reconcile_orphans`,
-  rename/delete meeting operations, and the `summary.md` path + I/O. It still
-  depends only on `common` (libsql / tokio are external crates, not workspace
-  components).
+  rename/delete meeting operations, and the `summary.md` path + I/O. As of
+  WS4-B it depends on `common` **and** the `notes-crdt` leaf (the extracted
+  notes-CRDT primitives it re-exports); libsql / tokio remain external crates,
+  not workspace components.
 - **`orchestrator`** appears in Phase 1 as a tiny state machine for
   start / stop / pause with the audio meter and capture lifecycle. The
   full live pipeline (VAD → ASR → transcript events → diarizer trigger)
@@ -1250,27 +1259,63 @@ failures (e.g. a SHA-256 mismatch from a stale manifest) are returned to the
 Manifest file URLs MUST pin an immutable commit revision; a moving ref (`main`)
 drifts when the upstream repo is re-uploaded and silently breaks hash verification.
 
+### `notes-crdt`
+**Crate:** `crates/notes-crdt`
+**Owns:** the notes-CRDT primitives — the Yjs (`yrs`) `ydoc` module (the
+authoritative `notes.ydoc` blob + its lossless ProseMirror-JSON conversion and
+the lib0 v1/v2 encoding hops), `NotesStore` (read/write `notes.ydoc` + derive
+`notes.json` / `notes.md`, plus `note_blocks_from_json`), the `MeetingFolder`
+on-disk layout (`{root}/{uuid}/`, including `ensure`), and the public
+`metadata.json` writer (`write_metadata` + the shared `write_metadata_atomic`).
+
+A **leaf** (depends only on `common`). Third-party deps: `yrs` (the Yjs CRDT
+port, workspace-pinned), `chrono`, `serde` / `serde_json`, `thiserror`,
+`tracing`. No libsql / audiopus / ogg — that is the point of the crate: keeping
+the C-heavy graph out of this leaf is what lets `sync` (which depends on
+`notes-crdt`, not `persistence`) cross-compile its lib to mobile targets
+(e.g. aarch64-linux-android).
+
+These primitives were extracted from `persistence`, which now depends on
+`notes-crdt` and **re-exports every symbol at its historical `persistence::*`
+paths** (`persistence::{MeetingFolder, NotesStore, NotesData,
+note_blocks_from_json, write_metadata}` and the `persistence::{ydoc, notes,
+folder}` modules). So `persistence`'s consumers — orchestrator, ipc-bridge,
+agent-tools, app-main — are unchanged, and `persistence` stays the sole writer
+under `{app-data}/meetings/`; it simply delegates the notes-CRDT bodies to the
+leaf. The `notes-crdt` `Error` is a light subset (`Io` / `FolderExists` /
+`Serialise` / `InvalidState` / `MeetingNotFound`) with a `From<notes_crdt::Error>
+for common::AppError`; `persistence::error` keeps the libsql / audiopus variants
+and adds `From<notes_crdt::Error>` so its own `Error` absorbs the leaf's.
+
+The behaviour of the moved code is documented in the `persistence` "CRDT notes
+storage" / "Note image assets" sections below — they describe the same `ydoc` /
+`NotesStore` / `MeetingFolder` surface regardless of which crate now hosts the
+bodies. See `planning/DESIGN_notes-crdt.md`.
+
 ### `persistence`
 **Crate:** `crates/persistence`
-**Owns:** the per-meeting folder layout, the libsql index schema and
-migrations, the collection ("folder") definitions store (`collections.json`),
-Opus audio encoding, Tiptap JSON I/O.
+**Owns:** the per-meeting folder layout (via the re-exported `notes-crdt`
+`MeetingFolder`), the libsql index schema and migrations, the collection
+("folder") definitions store (`collections.json`), Opus audio encoding,
+Tiptap JSON I/O (via the re-exported `notes-crdt` `NotesStore` / `ydoc`).
 
 **Opus encoder pin.** `audiopus = "0.3.0-rc.0"` (the explicit pre-release
 tag is required at workspace level; Cargo's semver does not resolve
 pre-releases from a `"0.3"` constraint). Container is Ogg via the `ogg`
 crate. Phase 1 writes 16 kHz mono 32 kbps.
 
-**CRDT notes dependency — `yrs`.** `yrs = "0.26"` (the Rust port of the Yjs
-CRDT) is a direct dependency of `persistence`, used to store the authoritative
-per-meeting notes document `notes.ydoc` and derive `notes.json` / `notes.md`
-from it (see "CRDT notes storage" below). It is a **third-party** dependency
-— like `sha2` / `libsql` / `audiopus` — **not** a crate-to-crate edge, so the
-dependency table above is unchanged (`persistence` still depends only on
-`common`). `yrs` is pure-Rust with no network surface and is embedded in BOTH
-build variants; only the sync *transport* is `connected`-gated (a separate
-crate). Durable whole-state blobs use the lib0 v2 encoding. See
-`planning/DESIGN_notes-crdt.md` D-O2.1/D-O2.2/D-O2.4.
+**CRDT notes dependency — `notes-crdt` (`yrs`).** The Yjs (`yrs`) CRDT
+machinery that stores the authoritative `notes.ydoc` and derives `notes.json` /
+`notes.md` from it (see "CRDT notes storage" below) now lives in the leaf
+`notes-crdt` crate; `persistence` depends on it (a crate-to-crate edge, in the
+dependency table above) and re-exports the surface at the historical paths. The
+underlying `yrs` is pure-Rust with no network surface and is embedded in BOTH
+build variants; only the sync *transport* is `connected`-gated (the `sync`
+crate). Durable whole-state blobs use the lib0 v2 encoding. The extraction left
+`persistence`'s public notes surface byte-for-byte identical to its callers — it
+exists so `sync` can transport the CRDT without `persistence`'s C-heavy graph
+(see the `notes-crdt` section above). See `planning/DESIGN_notes-crdt.md`
+D-O2.1/D-O2.2/D-O2.4.
 
 **Inputs:** typed write commands from orchestrator and IPC bridge.
 **Outputs:** typed read responses; emits no events itself.
@@ -1382,8 +1427,8 @@ round-trips verbatim).
   content hash uses the `sha2` crate, newly a direct dependency of
   `persistence` (already in the workspace dep set — `model-registry` uses it
   for model verification). This is a third-party dependency, not a
-  crate-to-crate edge, so the dependency table above is unchanged
-  (`persistence` still depends only on `common`).
+  crate-to-crate edge — it adds no row to the dependency table (`persistence`'s
+  only workspace edges are `common` and the `notes-crdt` leaf).
 - `read_note_asset(root, meeting_id, filename: &str) -> AppResult<Vec<u8>>` —
   **REJECTS** any `filename` containing a path separator or a `..` component
   (path-traversal guard, `AppError::InvalidInput`) before reading, so a request
@@ -1578,8 +1623,8 @@ listing. The async free fn `collections::delete_collection(app_data_root,
 meetings_root, index, id)` first clears the membership of every meeting filed
 under the collection (found via `MeetingIndex::ids_in_collection`, cleared through
 `set_meeting_collection(None)`) so no `metadata.json` keeps a dangling reference,
-then removes the definition. No new cross-component dependency edge —
-`persistence` still depends only on `common`.
+then removes the definition. No new cross-component dependency edge (this stays
+inside `persistence`; its workspace edges remain `common` and `notes-crdt`).
 
 **Summary hook (`summary` module + `MeetingFolder::summary_path()`).**
   `write_summary(meeting_dir, &str)` (atomic tmp+rename) and
@@ -1588,18 +1633,19 @@ then removes the definition. No new cross-component dependency edge —
   and the I/O seam.
 
 **Phase 6 surface growth — public atomic `write_metadata(meeting_dir,
-&MeetingMeta)`.** A public free function in the `metadata` module (re-exported
-at the crate root) that **atomically** (tmp + fsync + rename, matching the
-notes/summary writers) rewrites `metadata.json` inside an existing
-`{root}/{uuid}/` folder. It is the seam the orchestrator uses to update
-`metadata.json`'s `{ speaker_count, diarizer }` after the diarization pass while
-`persistence` stays the **sole** writer under `meetings/{uuid}/` (the diarizer
-itself never touches disk). It does not create the folder and leaves the sibling
-files (`audio.opus` / `transcript.json` / `notes.json`) untouched. The Phase-1
-`MeetingWriter::finalise` path now also writes through the same atomic
-implementation (via the crate-private `write_metadata_to_path`); `meeting_ops`'s
-rename re-uses the public function rather than its prior private copy. No new
-cross-component dependency edge — `persistence` still depends only on `common`.
+&MeetingMeta)`.** A public free function (now living in `notes-crdt`'s `metadata`
+module, re-exported at the `persistence` crate root) that **atomically** (tmp +
+fsync + rename, matching the notes/summary writers) rewrites `metadata.json`
+inside an existing `{root}/{uuid}/` folder. It is the seam the orchestrator uses
+to update `metadata.json`'s `{ speaker_count, diarizer }` after the diarization
+pass while `persistence` stays the **sole** writer under `meetings/{uuid}/` (the
+diarizer itself never touches disk). It does not create the folder and leaves the
+sibling files (`audio.opus` / `transcript.json` / `notes.json`) untouched. The
+Phase-1 `MeetingWriter::finalise` path (which stays in `persistence`) writes
+through the same atomic implementation by delegating its crate-private
+`write_metadata_to_path` to `notes_crdt::write_metadata_atomic`; `meeting_ops`'s
+rename re-uses the public function. No new workspace edge beyond the
+`persistence → notes-crdt` dependency added by the extraction.
 
 **Translations sidecar — `translations.json`.** The `translations` module
 holds per-language translations of transcript segments as a derived view. The

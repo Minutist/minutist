@@ -5,6 +5,7 @@ members = [
     "crates/audio-capture",
     "crates/vad-chunker",
     "crates/settings",
+    "crates/notes-crdt",
     "crates/persistence",
     "crates/model-registry",
     "crates/asr-runtime",

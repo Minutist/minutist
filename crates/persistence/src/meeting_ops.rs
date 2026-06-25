@@ -39,7 +39,7 @@ pub async fn rename_meeting(
     let mut meta = reader::read_metadata_inner(&folder)?;
     meta.title = new_title.to_string();
 
-    crate::metadata::write_metadata(&folder, &meta)?;
+    crate::write_metadata(&folder, &meta)?;
 
     // Refresh the index row to match the renamed meeting.
     let entry = list_entry_from(&folder)?;
@@ -79,7 +79,7 @@ pub async fn set_meeting_collection(
 
     let mut meta = reader::read_metadata_inner(&folder)?;
     meta.collection_id = collection_id;
-    crate::metadata::write_metadata(&folder, &meta)?;
+    crate::write_metadata(&folder, &meta)?;
 
     // Refresh the index row so the derived `collection_id` mirror matches.
     let entry = list_entry_from(&folder)?;
@@ -120,7 +120,7 @@ pub async fn set_speaker_name(
     } else {
         meta.speaker_names.insert(label.to_string(), name.to_string());
     }
-    crate::metadata::write_metadata(&folder, &meta)?;
+    crate::write_metadata(&folder, &meta)?;
 
     tracing::info!(
         target: "persistence",
@@ -191,7 +191,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::folder::MeetingFolder;
-    use crate::metadata::write_metadata;
+    use crate::write_metadata;
     use crate::reader::read_metadata;
 
     fn write_meta_with_no_names(root: &std::path::Path) -> MeetingId {

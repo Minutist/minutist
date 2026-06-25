@@ -5440,6 +5440,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "notes-crdt"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "minutist-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "yrs",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6272,6 +6286,7 @@ dependencies = [
  "chrono",
  "libsql",
  "minutist-common",
+ "notes-crdt",
  "ogg",
  "serde",
  "serde_json",
@@ -6282,7 +6297,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "yrs",
 ]
 
 [[package]]
@@ -8604,6 +8618,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-tickets",
  "minutist-common",
+ "notes-crdt",
  "persistence",
  "serde",
  "serde_json",

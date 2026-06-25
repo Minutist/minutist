@@ -33,7 +33,7 @@
 //! - **Durable on-disk blob (`notes.ydoc`)** uses the lib0 **v2** whole-state
 //!   encoding ([`encode_ydoc`] / [`decode_ydoc`]), the size-optimised
 //!   whole-document form (`planning/DESIGN_notes-crdt.md` D-O2.4 / OQ-C). v2 is
-//!   internal to `persistence` — the JS editor never sees it.
+//!   internal to the backend (this crate) — the JS editor never sees it.
 //! - **Editor interchange** uses lib0 **v1**: the JS `yjs` library (via
 //!   `@tiptap/extension-collaboration`) emits incremental updates with
 //!   `Y.encodeStateAsUpdate` (v1) and applies state with `Y.applyUpdate` (v1).
@@ -46,8 +46,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
-use yrs::types::xml::{XmlElementRef, XmlFragmentRef, XmlOut};
 use yrs::types::text::YChange;
+use yrs::types::xml::{XmlElementRef, XmlFragmentRef, XmlOut};
 use yrs::types::Attrs;
 use yrs::updates::decoder::Decode;
 use yrs::{
@@ -220,7 +220,10 @@ fn write_text_body(txn: &mut TransactionMut, text: &XmlTextRef, node: &Value) {
             let mark_type = mark.get("type").and_then(|t| t.as_str()).unwrap_or("");
             // A mark with no `attrs` round-trips as an empty object value, which
             // the read path renders back as a mark with no `attrs` key.
-            let mark_attrs = mark.get("attrs").cloned().unwrap_or(Value::Object(Map::new()));
+            let mark_attrs = mark
+                .get("attrs")
+                .cloned()
+                .unwrap_or(Value::Object(Map::new()));
             attrs.insert(mark_type.into(), json_to_any(&mark_attrs));
         }
     }
@@ -414,7 +417,11 @@ mod tests {
     /// Assert a document survives `JSON → yrs → JSON` unchanged, and also
     /// survives the durable v2 encode/decode hop (so the on-disk blob is faithful).
     fn assert_round_trips(input: Value) {
-        assert_eq!(round_trip(&input), input, "JSON -> yrs -> JSON must be lossless");
+        assert_eq!(
+            round_trip(&input),
+            input,
+            "JSON -> yrs -> JSON must be lossless"
+        );
 
         // Encode to the durable blob, decode, re-derive — the on-disk path.
         let doc = json_to_ydoc(&input);

@@ -71,9 +71,8 @@ impl MeetingFolder {
     /// Path to `summary.md` within the folder.
     ///
     /// `summary.md` holds the markdown summary produced by `summariser`
-    /// (Phase 5). Phase 4 lands only the path helper and the
-    /// [`crate::summary`] read/write I/O; the file is written by `summariser`
-    /// via `persistence` in Phase 5.
+    /// (Phase 5). The read/write I/O lives in `persistence::summary`; the file
+    /// is written by `summariser` via `persistence`.
     pub fn summary_path(&self) -> PathBuf {
         self.path.join("summary.md")
     }
@@ -81,7 +80,7 @@ impl MeetingFolder {
     /// Path to `notes.json` within the folder.
     ///
     /// `notes.json` holds the opaque Tiptap document (see [`crate::NotesStore`]).
-    /// It is written by `NotesStore`, never by `MeetingWriter`.
+    /// It is written by `NotesStore`, never by `persistence`'s `MeetingWriter`.
     pub fn notes_path(&self) -> PathBuf {
         self.path.join("notes.json")
     }
@@ -100,7 +99,7 @@ impl MeetingFolder {
     /// segments, indexed by segment position. It is a derived sidecar written
     /// by the translation commands in `ipc-bridge`; `write_transcript` clears
     /// it automatically when the transcript is replaced. See
-    /// [`crate::translations`].
+    /// `persistence::translations`.
     pub fn translations_path(&self) -> std::path::PathBuf {
         self.path.join("translations.json")
     }
@@ -171,12 +170,13 @@ impl MeetingFolder {
     /// Path to the `assets/` subdirectory within the folder.
     ///
     /// `assets/` holds pasted/dropped note image files (see
-    /// [`crate::save_note_asset`]). The files are referenced from `notes.json`
-    /// by bare filename (a portable, machine-independent reference) so the
-    /// meeting folder — including `assets/` — can be copied to another machine
-    /// and the notes still resolve. The directory is created lazily by
-    /// [`crate::save_note_asset`], and removed wholesale by
-    /// `meeting_ops::delete_meeting`'s `remove_dir_all` (no extra cleanup).
+    /// `persistence::save_note_asset`). The files are referenced from
+    /// `notes.json` by bare filename (a portable, machine-independent reference)
+    /// so the meeting folder — including `assets/` — can be copied to another
+    /// machine and the notes still resolve. The directory is created lazily by
+    /// `persistence::save_note_asset`, and removed wholesale by
+    /// `persistence::meeting_ops::delete_meeting`'s `remove_dir_all` (no extra
+    /// cleanup).
     pub fn assets_dir(&self) -> PathBuf {
         self.path.join("assets")
     }
@@ -186,8 +186,8 @@ impl MeetingFolder {
     /// `attachments/` holds uploaded document originals
     /// (`<sha256>.<ext>`) and their converted markdown siblings
     /// (`<sha256>.md`), plus the `attachments.json` manifest. The
-    /// directory is created lazily by [`crate::save_attachment_original`]
-    /// and removed wholesale by `meeting_ops::delete_meeting`'s
+    /// directory is created lazily by `persistence::save_attachment_original`
+    /// and removed wholesale by `persistence::meeting_ops::delete_meeting`'s
     /// `remove_dir_all` (no extra cleanup). "attachments/" is used rather
     /// than "resources/" to avoid collision with the repo-root `resources/`
     /// directory.
@@ -197,8 +197,8 @@ impl MeetingFolder {
 
     /// Path to `attachments/attachments.json` — the manifest of all attachment
     /// rows for this meeting. Written atomically (tmp+rename) by
-    /// [`crate::add_manifest_entry`] / [`crate::remove_manifest_entry`] /
-    /// [`crate::set_entry_conversion`].
+    /// `persistence::add_manifest_entry` / `persistence::remove_manifest_entry`
+    /// / `persistence::set_entry_conversion`.
     pub fn attachments_manifest_path(&self) -> PathBuf {
         self.attachments_dir().join("attachments.json")
     }
@@ -213,7 +213,17 @@ fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::read_metadata;
+    use minutist_common::MeetingMeta;
+
+    /// Read `metadata.json` from a meeting folder directly via `serde_json`.
+    ///
+    /// `notes-crdt` has no `reader` module (that stays in `persistence`, behind
+    /// the Opus decoder), so these tests parse the seeded `metadata.json` file
+    /// from disk rather than reaching for `persistence::read_metadata`.
+    fn read_metadata(meeting_dir: &std::path::Path) -> MeetingMeta {
+        let bytes = std::fs::read(meeting_dir.join("metadata.json")).expect("read metadata.json");
+        serde_json::from_slice(&bytes).expect("parse metadata.json")
+    }
 
     #[test]
     fn ensure_creates_folder_and_seeds_metadata() {
@@ -227,7 +237,7 @@ mod tests {
             "a placeholder metadata.json must be seeded"
         );
 
-        let meta = read_metadata(&path).expect("read seeded metadata");
+        let meta = read_metadata(&path);
         assert_eq!(meta.uuid, id);
         assert!(
             meta.title.is_empty(),
@@ -243,14 +253,14 @@ mod tests {
         // First call seeds the placeholder; overwrite it with a real title to
         // stand in for the authoritative metadata having synced across.
         let path = MeetingFolder::ensure(dir.path(), id).expect("first ensure");
-        let mut meta = read_metadata(&path).expect("read");
+        let mut meta = read_metadata(&path);
         meta.title = "Real meeting".to_string();
         crate::write_metadata(&path, &meta).expect("overwrite metadata");
 
         // A second ensure (a re-sync of the same meeting) must not clobber it.
         let path2 = MeetingFolder::ensure(dir.path(), id).expect("second ensure");
         assert_eq!(path, path2);
-        let reloaded = read_metadata(&path2).expect("re-read");
+        let reloaded = read_metadata(&path2);
         assert_eq!(
             reloaded.title, "Real meeting",
             "ensure must leave an existing metadata.json untouched"

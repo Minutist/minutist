@@ -97,7 +97,9 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 modelRegistry = component "model-registry" "Model download, hash verification, on-disk catalogue. Owns the model cache directory; everything that needs a model goes through it." "Rust crate: crates/model-registry"
 
-                persistence = component "persistence" "Per-meeting folder layout, libsql index, Opus audio encoding, Tiptap-JSON storage. Owns disk and database." "Rust crate: crates/persistence"
+                notesCrdt = component "notes-crdt" "Leaf carrying the notes-CRDT primitives extracted from persistence: the Yjs (yrs) notes.ydoc + its JSON/markdown projections (NotesStore, ydoc), the MeetingFolder layout, and the metadata.json writer. No libsql/audiopus/ogg, so sync can transport the CRDT and cross-compile to mobile. persistence re-exports it at the historical paths." "Rust crate: crates/notes-crdt"
+
+                persistence = component "persistence" "Per-meeting folder layout, libsql index, Opus audio encoding, Tiptap-JSON storage. Owns disk and database; delegates the notes-CRDT primitives to notes-crdt and re-exports them." "Rust crate: crates/persistence"
 
                 orchestrator = component "meeting-orchestrator" "The live recording state machine. Wires audio-capture → vad-chunker → asr-runtime → persistence, emits typed events for the UI. The only crate that depends on multiple other components." "Rust crate: crates/orchestrator"
 
@@ -182,6 +184,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.chatAgent    -> minutist.core.common "Uses interface types"
         minutist.core.appMain      -> minutist.core.common "Uses interface types"
         minutist.core.ipcBridge    -> minutist.core.common "Uses interface types"
+        minutist.core.notesCrdt    -> minutist.core.common "Uses interface types"
 
         // Live pipeline. Orchestrator wires the dataflow.
         minutist.core.audioCapture -> microphone "Captures audio" "cpal"
@@ -204,8 +207,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.diarizer    -> minutist.sherpaNative "Inference" "sherpa-rs FFI"
 
         // Persistence.
+        minutist.core.persistence -> minutist.core.notesCrdt "Delegates the notes-CRDT primitives; re-exports them"
         minutist.core.persistence -> minutist.sqliteDb "Index reads/writes" "libsql"
         minutist.core.persistence -> minutist.meetingFs "Per-meeting file I/O"
+        minutist.core.notesCrdt   -> minutist.meetingFs "notes.ydoc / notes.json / notes.md + metadata.json I/O"
 
         // Summarisation triggered by user action; orchestrator is bypassed once
         // the meeting is stopped — summariser reads from persistence directly.

@@ -2173,6 +2173,19 @@ to it as follows:
   without a restart — sync is mutual, so the peer must also add the hub's ticket. A
   Unix-domain-socket admin API is the eventual production surface; this CLI/file
   surface is the first cut.
+- **Observability (test/CI instrumentation).** `status` prints the hub's state as
+  JSON to stdout (endpoint id, relay, authorised peers, held meetings each with a
+  content digest of their notes) — a pure filesystem read, no engine bind, no
+  contact with the running daemon, so an automated harness uses it as a convergence
+  oracle without `docker exec`'ing into the data dir. The digest is sha256 of the
+  notes `ydoc` PROJECTED to canonical JSON, so it is stable across converged
+  replicas (the raw CRDT encoding is not). The daemon emits a stable
+  `minutist-hub ready` log marker once bound (a harness waits on it instead of
+  sleeping). The timing constants are env-overridable in milliseconds
+  (`MINUTIST_HUB_POLL_MS` / `MINUTIST_HUB_PUSH_DEBOUNCE_MS` /
+  `MINUTIST_HUB_SHUTDOWN_GRACE_MS`) for a sub-second test mode, and
+  `MINUTIST_HUB_LOG_JSON=1` switches tracing to a structured JSON formatter for
+  field-level event assertions. Production defaults are unchanged.
 - **Convergence (push-on-reconnect).** `SyncEngine` fires a bounded "peer arrived"
   broadcast (`subscribe_peer_events`) each time a peer opens an authorised inbound
   sync connection. The daemon reacts by calling `SyncEngine::push_all_to(peer)`,

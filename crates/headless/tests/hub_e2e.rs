@@ -38,6 +38,103 @@ fn projected(root: &std::path::Path, meeting: MeetingId) -> serde_json::Value {
     persistence::ydoc::ydoc_to_json(&doc)
 }
 
+/// Spawn the real minutist-hub daemon for a test: collapsed sub-second timers and
+/// piped stderr drained in the background, returning the child plus a signal that
+/// fires once the daemon logs its readiness marker. `kill_on_drop` cleans up.
+fn spawn_hub(
+    hub_dir: &std::path::Path,
+    relay_url: &str,
+    token: &str,
+) -> (tokio::process::Child, tokio::sync::oneshot::Receiver<()>) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"))
+        .args([
+            "--data-dir",
+            hub_dir.to_str().expect("utf8 hub dir"),
+            "--relay-url",
+            relay_url,
+        ])
+        .env("MINUTIST_SYNC_TOKEN", token)
+        .env("RUST_LOG", "hub=info,iroh=error,iroh_relay=error")
+        // Collapse the hub's timers so reconnect/push scenarios run sub-second.
+        .env("MINUTIST_HUB_POLL_MS", "200")
+        .env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", "200")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn minutist-hub");
+    let stderr = child.stderr.take().expect("hub stderr piped");
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // Drain stderr (so the daemon never blocks on a full pipe) and fire once ready.
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        let mut tx = Some(tx);
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains("minutist-hub ready") {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+    });
+    (child, rx)
+}
+
+/// Reconcile a meeting with `addr`, retrying until the relay-routed path succeeds
+/// or a budget elapses — replaces a fixed homing sleep (peers home at their pace).
+async fn sync_with_retry(
+    engine: &SyncEngine,
+    addr: &EndpointAddr,
+    meeting: MeetingId,
+    label: &str,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            engine.sync_notes(addr.clone(), meeting),
+        )
+        .await
+        {
+            Ok(Ok(())) => return,
+            other => {
+                assert!(
+                    start.elapsed() < Duration::from_secs(45),
+                    "{label} did not succeed within 45s: {other:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+/// The hub-side oracle: run `minutist-hub status` against a data dir and return a
+/// meeting's content digest (if held).
+fn status_digest(
+    data_dir: &std::path::Path,
+    relay_url: &str,
+    meeting: MeetingId,
+) -> Option<String> {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"))
+        .args([
+            "--data-dir",
+            data_dir.to_str().expect("utf8 data dir"),
+            "--relay-url",
+            relay_url,
+            "status",
+        ])
+        .output()
+        .expect("run status");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("parse status json");
+    let id = meeting.0.to_string();
+    json["meetings"]
+        .as_array()?
+        .iter()
+        .find(|m| m["id"] == id)
+        .and_then(|m| m["digest"].as_str().map(str::to_owned))
+}
+
 #[tokio::test]
 async fn notes_converge_through_a_running_hub() {
     let token = match std::env::var("MINUTIST_SYNC_TOKEN") {
@@ -83,26 +180,13 @@ async fn notes_converge_through_a_running_hub() {
     )
     .expect("write hub peers file");
 
-    // Launch the real daemon against the hub data dir (it reloads `hub_id` and the
-    // peers). kill_on_drop guarantees no orphan if an assertion panics.
-    let bin = env!("CARGO_BIN_EXE_minutist-hub");
-    let mut hub = tokio::process::Command::new(bin)
-        .args([
-            "--data-dir",
-            hub_dir.path().to_str().expect("utf8 hub dir"),
-            "--relay-url",
-            &relay_url,
-        ])
-        .env("MINUTIST_SYNC_TOKEN", &token)
-        .env("RUST_LOG", "hub=info,iroh=error,iroh_relay=error")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn minutist-hub");
-
-    // Let A, B, and the hub all bind and home to the token-gated relay.
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    // Launch the real daemon (collapsed timers; readiness via its stderr marker).
+    // It reloads `hub_id` and the peers; kill_on_drop cleans up on panic.
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, &token);
+    tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("hub did not become ready within 20s")
+        .expect("hub ready signal dropped");
 
     // Address the hub by relay only so the dial is brokered, not direct.
     let relay: RelayUrl = relay_url.parse().expect("relay url parses");
@@ -121,23 +205,9 @@ async fn notes_converge_through_a_running_hub() {
     persistence::MeetingFolder::ensure(dir_b.path(), meeting).expect("ensure B meeting folder");
     NotesStore::save(dir_a.path(), meeting, &json, "hello through the hub").expect("seed A");
 
-    // A pushes the note to the hub (the hub merges it as the responder).
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        engine_a.sync_notes(hub_addr.clone(), meeting),
-    )
-    .await
-    .expect("A->hub notes sync timed out")
-    .expect("A->hub notes sync failed");
-
-    // B pulls it from the hub (B is the initiator; it also applies the hub's diff).
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        engine_b.sync_notes(hub_addr.clone(), meeting),
-    )
-    .await
-    .expect("B<-hub notes sync timed out")
-    .expect("B<-hub notes sync failed");
+    // A pushes the note to the hub; B pulls it back (retry until all three home).
+    sync_with_retry(&engine_a, &hub_addr, meeting, "A->hub").await;
+    sync_with_retry(&engine_b, &hub_addr, meeting, "B<-hub").await;
 
     // B must now hold A's note, converged through the hub.
     let a_json = projected(dir_a.path(), meeting);
@@ -151,6 +221,17 @@ async fn notes_converge_through_a_running_hub() {
             .unwrap()
             .contains("hello through the hub"),
         "B's converged note must carry the seeded text"
+    );
+
+    // Hub-as-oracle: `minutist-hub status` reports the converged meeting with a
+    // content digest. (Content convergence is asserted above via `projected`; this
+    // confirms the status command surfaces the held meeting for a harness. A/B use
+    // the relay_live flat `meetings_root`, so status — which expects the daemon's
+    // `{data-dir}/meetings` layout — is meaningful only against the hub.)
+    let hub_dig = status_digest(hub_dir.path(), &relay_url, meeting);
+    assert!(
+        hub_dig.is_some(),
+        "hub status must report the converged meeting with a digest"
     );
 
     engine_a.shutdown().await.expect("shutdown a");
@@ -219,23 +300,11 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     )
     .expect("write hub peers");
 
-    let bin = env!("CARGO_BIN_EXE_minutist-hub");
-    let mut hub = tokio::process::Command::new(bin)
-        .args([
-            "--data-dir",
-            hub_dir.path().to_str().expect("utf8"),
-            "--relay-url",
-            &relay_url,
-        ])
-        .env("MINUTIST_SYNC_TOKEN", &token)
-        .env("RUST_LOG", "hub=info,iroh=error,iroh_relay=error")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn minutist-hub");
-
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, &token);
+    tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("hub did not become ready within 20s")
+        .expect("hub ready signal dropped");
 
     let relay: RelayUrl = relay_url.parse().expect("relay url");
     let hub_addr = EndpointAddr::new(hub_id).with_relay_url(relay);
@@ -256,13 +325,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
         "deposited by A while B was away",
     )
     .expect("seed A/X");
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        engine_a.sync_notes(hub_addr.clone(), meeting_x),
-    )
-    .await
-    .expect("A->hub timed out")
-    .expect("A->hub failed");
+    sync_with_retry(&engine_a, &hub_addr, meeting_x, "A->hub X").await;
 
     // B ARRIVES: it connects to deposit its OWN unrelated meeting Y. That inbound
     // connection fires the hub's peer-arrived event, which pushes ALL meetings
@@ -272,13 +335,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
         "content":[{"type":"text","text":"B's own meeting"}]}]});
     persistence::MeetingFolder::ensure(dir_b.path(), meeting_y).expect("ensure B/Y");
     NotesStore::save(dir_b.path(), meeting_y, &jy, "B's own meeting").expect("seed B/Y");
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        engine_b.sync_notes(hub_addr.clone(), meeting_y),
-    )
-    .await
-    .expect("B->hub timed out")
-    .expect("B->hub failed");
+    sync_with_retry(&engine_b, &hub_addr, meeting_y, "B->hub Y").await;
 
     // B must receive X from the hub's reciprocal push — without ever syncing X.
     let got_x = wait_for_meeting(dir_b.path(), meeting_x, Duration::from_secs(45)).await;
@@ -288,6 +345,16 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
             .unwrap()
             .contains("deposited by A while B was away"),
         "B's pushed copy of X must carry A's text"
+    );
+
+    // Hub-as-oracle: the hub's status reports BOTH meetings it accumulated.
+    assert!(
+        status_digest(hub_dir.path(), &relay_url, meeting_x).is_some(),
+        "hub status must report meeting X"
+    );
+    assert!(
+        status_digest(hub_dir.path(), &relay_url, meeting_y).is_some(),
+        "hub status must report meeting Y"
     );
 
     engine_a.shutdown().await.expect("shutdown a");

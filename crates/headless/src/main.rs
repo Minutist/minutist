@@ -24,6 +24,14 @@
 //! - `add-peer <ticket>` — register a peer device by its pairing ticket, appending
 //!   it to `{data-dir}/peers`. A running daemon re-reads that file periodically, so
 //!   the new peer is authorised without a restart.
+//! - `status` — print the hub's state as JSON to stdout and exit: endpoint id,
+//!   relay, authorised peers, and held meetings each with a content digest of their
+//!   notes. A read-only filesystem oracle for automated tests (it does not contact
+//!   the running daemon).
+//!
+//! Timing constants (poll / push-debounce / shutdown-grace) are overridable via
+//! env vars in milliseconds (a sub-second test mode) — see the constants below.
+//! `MINUTIST_HUB_LOG_JSON=1` switches tracing to a structured JSON formatter.
 //!
 //! The data root is entirely separate from any desktop's `{app-data}` — the
 //! single-writer rule applies per data root, so the daemon must never share a root
@@ -37,20 +45,33 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use iroh_tickets::endpoint::EndpointTicket;
-use minutist_common::{AppError, AppResult};
+use minutist_common::{AppError, AppResult, MeetingId};
+use serde::Serialize;
+use sha2::Digest;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use tokio::sync::broadcast::error::RecvError;
 
-/// How long to wait for the sync engine to drain before forcing exit on shutdown.
+/// Default shutdown drain window; override `MINUTIST_HUB_SHUTDOWN_GRACE_MS`.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
-/// How often the running daemon re-reads `{data-dir}/peers` so an `add-peer` made
-/// while it is running is honoured without a restart.
+/// Default peers-file re-read interval (honours `add-peer` without a restart);
+/// override `MINUTIST_HUB_POLL_MS`.
 const PEER_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Minimum gap between reciprocal pushes to the same peer, so a peer that
-/// reconnects rapidly is not re-pushed on every connection.
+/// Default minimum gap between reciprocal pushes to the same peer (so a rapidly
+/// reconnecting peer is not re-pushed every time); override
+/// `MINUTIST_HUB_PUSH_DEBOUNCE_MS`.
 const PEER_PUSH_DEBOUNCE: Duration = Duration::from_secs(15);
+
+/// A timing default overridable via an env var (milliseconds), so a test mode can
+/// collapse the hub's timers to sub-second without touching production defaults.
+fn dur_or_env(var: &str, default: Duration) -> Duration {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
 
 /// Command-line surface for the daemon.
 #[derive(Debug, Parser)]
@@ -91,6 +112,9 @@ enum Command {
         /// (or shown in a desktop's Sync settings).
         ticket: String,
     },
+    /// Print the hub's state as JSON (endpoint id, relay, authorised peers, held
+    /// meetings + a content digest of each). A read-only oracle for tests.
+    Status,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -102,6 +126,7 @@ async fn main() -> AppResult<()> {
         None => run_daemon(&data_dir, cli.relay_url, cli.relay_token).await,
         Some(Command::PrintTicket) => print_ticket(&data_dir, cli.relay_url, cli.relay_token).await,
         Some(Command::AddPeer { ticket }) => add_peer(&data_dir, &ticket),
+        Some(Command::Status) => print_status(&data_dir, cli.relay_url),
     }
 }
 
@@ -132,6 +157,11 @@ async fn run_daemon(
     // (`journalctl` surfaces it). The ticket carries only public addressing.
     tracing::info!(target: "hub", ticket = %engine.my_ticket(), "pairing ticket");
 
+    // Stable readiness marker for an automated harness / `docker logs`: the hub is
+    // bound and accepting. Relay homing follows lazily; an inbound dial that beats
+    // it simply retries.
+    tracing::info!(target: "hub", "minutist-hub ready");
+
     // Authorise paired peers from the `peers` file, then keep re-reading it so an
     // `add-peer` made while the daemon runs is picked up without a restart.
     let mut seen: HashSet<String> = HashSet::new();
@@ -142,14 +172,15 @@ async fn run_daemon(
     // engine's graceful shutdown stalls (e.g. the relay actor is mid-reconnect),
     // log it and exit anyway — returning from `main` drops the runtime, which
     // aborts any lingering tasks.
-    match tokio::time::timeout(SHUTDOWN_GRACE, engine.shutdown()).await {
+    let grace = dur_or_env("MINUTIST_HUB_SHUTDOWN_GRACE_MS", SHUTDOWN_GRACE);
+    match tokio::time::timeout(grace, engine.shutdown()).await {
         Ok(Ok(())) => tracing::info!(target: "hub", "minutist-hub stopped"),
         Ok(Err(e)) => {
             tracing::warn!(target: "hub", error = %e, "sync engine shutdown error; exiting")
         }
         Err(_) => tracing::warn!(
             target: "hub",
-            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            grace_ms = grace.as_millis() as u64,
             "sync engine shutdown did not finish within the grace window; exiting"
         ),
     }
@@ -169,7 +200,8 @@ async fn print_ticket(
     // Command output (the purpose of this subcommand), not logging — println is
     // the right channel here, distinct from the daemon's tracing.
     println!("{ticket}");
-    let _ = tokio::time::timeout(SHUTDOWN_GRACE, engine.shutdown()).await;
+    let grace = dur_or_env("MINUTIST_HUB_SHUTDOWN_GRACE_MS", SHUTDOWN_GRACE);
+    let _ = tokio::time::timeout(grace, engine.shutdown()).await;
     Ok(())
 }
 
@@ -207,6 +239,101 @@ fn add_peer(data_dir: &Path, ticket: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// JSON shape printed by the `status` subcommand.
+#[derive(Serialize)]
+struct HubStatus {
+    endpoint_id: String,
+    relay_url: String,
+    /// Authorised peers (their `EndpointId`s), resolved from the peers file.
+    peers: Vec<String>,
+    /// Meetings the hub holds, each with a content digest of its notes.
+    meetings: Vec<MeetingStatus>,
+}
+
+#[derive(Serialize)]
+struct MeetingStatus {
+    id: String,
+    ydoc_present: bool,
+    /// sha256 (hex) of the meeting's notes projected to canonical JSON, or null if
+    /// it has no `notes.ydoc` yet. Comparable across converged devices.
+    digest: Option<String>,
+}
+
+/// Print the hub's state as JSON to stdout and exit. A pure filesystem read (no
+/// tracing init, no engine bind; it does NOT contact the running daemon), so an
+/// automated harness can use it as an oracle: which peers are authorised and which
+/// meetings the hub holds, with a per-meeting notes digest for convergence
+/// assertions.
+fn print_status(data_dir: &Path, relay_url: String) -> AppResult<()> {
+    let endpoint_id = DeviceIdentity::load_or_generate(data_dir)?
+        .endpoint_id()
+        .to_string();
+
+    let peers: Vec<String> = read_peer_tickets(data_dir)
+        .iter()
+        .filter_map(|t| t.parse::<EndpointTicket>().ok())
+        .map(|t| iroh::EndpointAddr::from(t).id.to_string())
+        .collect();
+
+    let meetings_root = data_dir.join("meetings");
+    let mut meetings: Vec<MeetingStatus> = list_meeting_ids(&meetings_root)
+        .into_iter()
+        .map(|id| {
+            let digest = meeting_digest(&meetings_root, id);
+            MeetingStatus {
+                id: id.0.to_string(),
+                ydoc_present: digest.is_some(),
+                digest,
+            }
+        })
+        .collect();
+    meetings.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let status = HubStatus {
+        endpoint_id,
+        relay_url,
+        peers,
+        meetings,
+    };
+    let json = serde_json::to_string_pretty(&status).map_err(|e| AppError::Internal {
+        context: format!("serialising status: {e}"),
+    })?;
+    println!("{json}");
+    Ok(())
+}
+
+/// The meeting ids on disk — `{uuid}` folders directly under `meetings_root` (the
+/// dot-prefixed `.blobs` store and any non-UUID entry are skipped).
+fn list_meeting_ids(meetings_root: &Path) -> Vec<MeetingId> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(meetings_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                out.push(MeetingId(uuid));
+            }
+        }
+    }
+    out
+}
+
+/// sha256 (hex) of a meeting's `notes.ydoc` PROJECTED to canonical JSON — stable
+/// across devices that have converged on the same content (the raw CRDT encoding
+/// differs by client history; the projection does not). `None` if no `notes.ydoc`.
+fn meeting_digest(meetings_root: &Path, meeting: MeetingId) -> Option<String> {
+    let state = persistence::NotesStore::read_ydoc_state(meetings_root, meeting).ok()??;
+    let doc = persistence::ydoc::new_ydoc();
+    persistence::ydoc::apply_update_v1(&doc, &state).ok()?;
+    let json = persistence::ydoc::ydoc_to_json(&doc);
+    let bytes = serde_json::to_vec(&json).ok()?;
+    Some(format!("{:x}", sha2::Sha256::digest(&bytes)))
+}
+
 /// Build and start the sync engine for `data_dir` against the given relay.
 async fn start_engine(
     data_dir: &Path,
@@ -242,7 +369,8 @@ async fn start_engine(
 /// meeting it holds to that peer (debounced per peer) — so a device that
 /// reconnects both deposits and collects, converging through the hub.
 async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut HashSet<String>) {
-    let mut poll = tokio::time::interval(PEER_POLL_INTERVAL);
+    let mut poll = tokio::time::interval(dur_or_env("MINUTIST_HUB_POLL_MS", PEER_POLL_INTERVAL));
+    let debounce = dur_or_env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", PEER_PUSH_DEBOUNCE);
     let mut peer_events = engine.subscribe_peer_events();
     let mut last_push: HashMap<_, Instant> = HashMap::new();
 
@@ -273,7 +401,7 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
                     let now = Instant::now();
                     let due = last_push
                         .get(&peer)
-                        .map(|t| now.duration_since(*t) >= PEER_PUSH_DEBOUNCE)
+                        .map(|t| now.duration_since(*t) >= debounce)
                         .unwrap_or(true);
                     if !due {
                         continue;
@@ -384,14 +512,23 @@ fn init_tracing(data_dir: &Path) -> tracing_appender::non_blocking::WorkerGuard 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let file_layer = fmt::layer().with_writer(non_blocking).with_ansi(false);
-    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    let json = std::env::var("MINUTIST_HUB_LOG_JSON").is_ok_and(|v| v == "1" || v == "true");
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(file_layer)
-        .with(stderr_layer)
-        .init();
+    // Opt-in structured (JSON) output so a harness asserts on fields rather than
+    // substring-matching the human formatter; default stays human-readable.
+    if json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().json().with_writer(non_blocking))
+            .with(fmt::layer().json().with_writer(std::io::stderr))
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+            .with(fmt::layer().with_writer(std::io::stderr))
+            .init();
+    }
 
     guard
 }
@@ -445,5 +582,33 @@ mod tests {
         assert!(matches!(err, AppError::InvalidInput { .. }));
         // Nothing should have been written.
         assert!(!peers_path(base.path()).exists());
+    }
+
+    #[test]
+    fn status_helpers_list_and_digest_meetings() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let root = base.path();
+        assert!(list_meeting_ids(root).is_empty());
+
+        // A meeting with notes: listed, with a deterministic digest.
+        let m = MeetingId(uuid::Uuid::new_v4());
+        persistence::MeetingFolder::ensure(root, m).expect("ensure folder");
+        let json = serde_json::json!({
+            "type": "doc",
+            "content": [{ "type": "paragraph",
+                "content": [{ "type": "text", "text": "status helper test" }] }]
+        });
+        persistence::NotesStore::save(root, m, &json, "status helper test").expect("save notes");
+
+        assert_eq!(list_meeting_ids(root), vec![m]);
+        let d1 = meeting_digest(root, m).expect("digest present");
+        let d2 = meeting_digest(root, m).expect("digest present again");
+        assert_eq!(d1, d2, "digest is deterministic for unchanged content");
+        assert_eq!(d1.len(), 64, "sha256 hex digest");
+
+        // A meeting folder with no notes.ydoc → no digest.
+        let empty = MeetingId(uuid::Uuid::new_v4());
+        persistence::MeetingFolder::ensure(root, empty).expect("ensure empty");
+        assert_eq!(meeting_digest(root, empty), None);
     }
 }

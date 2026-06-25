@@ -3,7 +3,7 @@
  *
  * Covers the `formatElapsed` helper and the component's state-driven label +
  * live-dot behaviour: idle shows "Ready" with no clock and no pulsing dot;
- * recording shows the "Recording" label, the live dot, and an elapsed clock
+ * recording shows the "In progress" label, the live dot, and an elapsed clock
  * derived from `started_at_ms`.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
@@ -65,7 +65,7 @@ describe("RecordingStatus", () => {
     ).toBeNull();
   });
 
-  it("shows the Recording label, the live dot, and an elapsed clock", () => {
+  it("shows the In progress label, the live dot, and an elapsed clock", () => {
     const nowSpy = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
     setState({
       kind: "recording",
@@ -76,12 +76,25 @@ describe("RecordingStatus", () => {
 
     const status = screen.getByRole("status");
     expect(status).toHaveAttribute("data-state", "recording");
-    expect(screen.getByText("Recording")).toBeInTheDocument();
+    expect(screen.getByText("In progress")).toBeInTheDocument();
     expect(
       status.querySelector(".recording-status__dot--live"),
     ).not.toBeNull();
     expect(screen.getByText("1:05")).toBeInTheDocument();
 
     nowSpy.mockRestore();
+  });
+
+  it("shows the On hold label and no clock when paused", () => {
+    setState({ kind: "paused", meeting_id: "m1", paused_at_ms: 1_000_000 });
+    render(<RecordingStatus />);
+
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("data-state", "paused");
+    expect(screen.getByText("On hold")).toBeInTheDocument();
+    // Paused carries paused_at_ms, not start — no (misleading) elapsed clock.
+    expect(status.querySelector(".recording-status__elapsed")).toBeNull();
+    // The live (pulsing) dot is recording-only.
+    expect(status.querySelector(".recording-status__dot--live")).toBeNull();
   });
 });

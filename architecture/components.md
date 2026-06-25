@@ -2307,32 +2307,38 @@ The surface is:
 
 - `LiveSessionBackend` trait — the testable seam, mirroring `TurnBackend`.
   Two operations: `prefill_prefix(text) -> Result<usize, Error>` (chunked-prefill
-  the pinned system + attachments text ONCE, retaining KV state) and
-  `refresh(tail, cfg, cancel, token_cb) -> Result<RawTurn, Error>` (append the
-  incremental transcript tail to the held KV cache and decode the digest answer
+  the pinned prefix — the OPEN user turn: system + categories + attachments —
+  ONCE, retaining KV state and recording its length) and
+  `refresh(tail, cfg, cancel, token_cb) -> Result<RawTurn, Error>` (prune the KV
+  back to the pinned prefix, append the fresh tail, decode the digest answer
   WITHOUT re-prefilling the prefix).
 
 - `LlamaLiveBackend<'m>` — the real impl. Borrows `&LlamaModel` from the same
   `LlamaSummariser` substrate (`ipc-bridge` lends it), builds one `LlamaContext`
-  at construction (n_ctx = 32 768, KV-quant OFF per SP-LIVE E3), tracks `n_past`,
-  and extends it on each `refresh` call rather than destroying or re-prefilling.
-  Internally tracks `prior_gen_pruned` (set when a refresh prunes its generated
-  tokens via `clear_kv_cache_seq`) and `last_kv_token` (the last token written to
-  the retained KV). An empty-tail `refresh` following a prune re-decodes
-  `last_kv_token` with logits enabled before sampling — this repopulates the
-  logit buffer from the still-valid KV state, avoiding incoherent output on the
-  stale slot left by the prune. These are private implementation fields; the
-  public API surface is unchanged.
+  at construction (n_ctx = 32 768, KV-quant OFF per SP-LIVE E3), and tracks
+  `n_past` + `prefix_len`. **Prune-to-prefix bounded context (issue 0022):** the
+  pinned prefix is prefilled once; each `refresh` calls `clear_kv_cache_seq` to
+  drop everything after `prefix_len` (the previous refresh's tail and its
+  generated answer), then decodes a fresh, bounded tail on top of the reused
+  prefix KV. The held context therefore never grows beyond `prefix + tail +
+  generation` and cannot overflow on a long meeting — the failure mode the
+  original cumulative-append design hit on its first live test. The prefix is
+  itself token-budgeted (capped at n_ctx/2 with truncation + a warning) so a
+  large attachment set cannot starve the window. Because every tail is non-empty
+  (it carries the chat-template suffix), the tail decode always repopulates
+  logits and no empty-tail logit-coherence guard is needed.
   `LlamaContext` is `!Send`; `LlamaLiveBackend` is therefore also `!Send`. The
   S2b driver in `ipc-bridge` owns the dedicated thread and calls these methods
   only from there — this crate never asserts `Send` on it.
 
 - `LiveSession<B: LiveSessionBackend>` — the driver type. Enforces the
   invariant: `seed_prefix` is idempotent (second call is a no-op); `refresh`
-  passes only the new tail since the last call; `refresh` before `seed_prefix`
-  is an `AppError::Inference` (incoherent KV state). Generic over the backend
-  so unit tests drive the full loop with a `StubLiveBackend` (no FFI, no model)
-  asserting prefix-once and tail-only discipline.
+  passes the whole volatile portion of the prompt (running digest + recent
+  window + template suffix), which the backend decodes on top of the reused
+  prefix; `refresh` before `seed_prefix` is an `AppError::Inference` (incoherent
+  KV state). Generic over the backend so unit tests drive the full loop with a
+  `StubLiveBackend` (no FFI, no model) asserting prefix-once discipline and that
+  `n_past` stays bounded across many refreshes.
 
 **No new dependency edge.** `llama-cpp-2` is already a hard dep (used by
 `LlamaTurnBackend`); `summariser::plan_prefill` is already reused for chunked
@@ -3365,22 +3371,35 @@ The driver has two halves:
   Communication uses two bounded `tokio::sync::mpsc` channels (depth 1) so
   in-flight is enforced without a separate mutex.
 
-**Context overflow policy (v1).** On `Error::ContextOverflow` from `refresh`, the
-driver emits one `LiveDigestError` ("context window filled") and sets a permanent
-`capacity_exhausted` flag — no further refresh dispatches for the session.
-Re-seeding mid-recording is not attempted (prohibitive prefill cost).
+**Context overflow policy (issue 0022).** The held context is bounded by design
+(prune-to-prefix each refresh + a token-budgeted prefix + a bounded transcript
+window), so it does not fill in normal operation. `Error::ContextOverflow` from
+`refresh` is a backstop only — if it ever fires the driver emits one
+`LiveDigestError` and marks the session terminal (no further refresh dispatches),
+rather than risk an inconsistent KV state.
 
-The prefix (system prompt + category-toggle instructions + attachment markdown, budgeted
-to `settings.live_agent_attachment_budget_chars`) is built once at session spawn and
-seeded into the `LlamaContext` at worker startup — BEFORE the cadence loop — so the
+**Chat-template framing (issue 0022).** The live backend is a pure KV engine and
+never applies a chat template itself; the driver hand-assembles the template and
+splits it across the held-context boundary. `build_prefix` emits the OPEN user
+turn — `LIVE_TURN_PREFIX` (`<bos><start_of_turn>user\n`) + system prompt +
+category-toggle instructions + the JSON contract + attachment markdown — and is
+seeded into the `LlamaContext` at worker startup, BEFORE the cadence loop, so the
 ~40 s prefill runs at meeting start, not mid-recording (the binding SP-LIVE
-pin-at-start decision). The seed honours the worker `CancelFlag`, so a Start-then-Stop
-during the prefill aborts promptly. Subsequent `seed_prefix`
-calls are no-ops (`LiveSession` enforces this). Each subsequent request appends the
-new transcript tail (plus the prior digest JSON for standing-list update) and decodes
-a fresh `LiveDigest`. Results are parsed by `parse_digest`, which preserves `resolved
-= true` flags from prior items (model forgetfulness guard), and emitted as
-`AppEvent::LiveDigestUpdated` / `AppEvent::LiveDigestError`.
+pin-at-start decision). The seed honours the worker `CancelFlag`. Each refresh's
+`build_effective_tail` is the whole volatile portion — the running digest JSON
+(for standing-list update), the recent transcript window (capped at
+`LIVE_WINDOW_BUDGET_CHARS`), and `LIVE_TURN_SUFFIX`
+(`<end_of_turn>\n<start_of_turn>model\n`), which closes the user turn and opens
+the model turn so the instruct model REPLIES with JSON instead of continuing the
+transcript. These are the Gemma turn markers (matching
+`summariser::gemma_turn_prompt`, the shipped `gemma-4-e4b-it` LLM whose baked
+template the vendored llama.cpp cannot render); a non-Gemma `llm_model_id` would
+need template-aware splitting (future work). Results are parsed by `parse_digest`,
+which preserves `resolved = true` flags from prior items (model forgetfulness
+guard), and emitted as `AppEvent::LiveDigestUpdated` / `AppEvent::LiveDigestError`.
+The driver emits an **initial empty `LiveDigestUpdated`** the moment it starts, so
+the UI reveals the live-digest toggle as soon as the agent is active rather than
+only after the first refresh (issue 0022 D4).
 
 The `app-main` watcher task subscribes to `StateChanged`, calls `spawn_live_agent`
 on `Recording` (only when `live_agent_should_run(settings.live_agent_enabled,

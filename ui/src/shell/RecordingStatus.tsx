@@ -70,13 +70,13 @@ export function RecordingStatus() {
     // backend transitions to `recording`. Without this the UI looks dead.
     label = "Preparing transcription model…";
   } else if (isRecording && start !== null) {
-    label = "Recording";
+    label = "In progress";
     elapsed = formatElapsed(now - start);
   } else if (isPaused) {
     // The paused state carries `paused_at_ms` (wall-clock of the pause), not
     // the recording start, so an accurate elapsed-since-start is not derivable
     // here. Show the state without a misleading clock.
-    label = "Paused";
+    label = "On hold";
   } else if (isStopping) {
     label = "Stopping…";
   } else if (isFinalising) {

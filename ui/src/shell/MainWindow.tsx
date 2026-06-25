@@ -149,14 +149,15 @@ export function MainWindow() {
   // (unlike summary). Hidden by default; one click on the toggle reveals it.
   const showAttachmentsPane = inWorkspace && activeMeetingId !== null;
 
-  // The live digest panel toggle is offered once the backend has signalled it
-  // is active for this meeting — i.e. after the first `live_digest_updated` or
-  // `live_digest_error` event arrives. This avoids re-deriving the Auto gate in
-  // the frontend (which would require mirroring GPU-probe state to the UI) and
-  // ensures the toggle only appears when there is actually something to show.
-  // When `mode=Off` the backend never spawns the agent so no event ever fires
-  // and the panel stays hidden. When `mode=On` or `Auto` with GPU active the
-  // first digest event (≤ one cadence interval after the agent seeds) unlocks it.
+  // The live digest panel toggle is offered once the backend has signalled the
+  // agent is active for this meeting. The driver emits an initial empty digest
+  // the moment it spawns (issue 0022), so the toggle appears as soon as the
+  // agent starts — not only after the first real refresh (≥ one cadence
+  // interval away, and on the first live test the only events that ever arrived
+  // were errors). This avoids re-deriving the Auto gate in the frontend (which
+  // would require mirroring GPU-probe state to the UI). When `mode=Off` the
+  // backend never spawns the agent, so no event fires and the panel stays
+  // hidden.
   const showLiveDigestPane =
     activeMeetingId !== null &&
     digestFor(activeMeetingId) !== null;

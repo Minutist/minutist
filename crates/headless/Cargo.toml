@@ -27,14 +27,25 @@ path = "src/main.rs"
 [dependencies]
 minutist-common = { path = "../common" }
 sync = { path = "../sync" }
+# Used directly by the `status` subcommand to project a meeting's notes.ydoc to a
+# content digest (NotesStore::read_ydoc_state + ydoc::{apply_update_v1,ydoc_to_json}).
+# Within the permitted phase-1 edge set (common/persistence/sync/settings).
+persistence = { path = "../persistence" }
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+# `json` adds the opt-in structured tracing formatter (MINUTIST_HUB_LOG_JSON=1).
+tracing-subscriber = { workspace = true, features = ["json"] }
 tracing-appender = { workspace = true }
-# Validate a peer pairing ticket in `add-peer` before writing it to the peers
-# file (fail fast). Same EXACT pin as `sync`, which owns the ticket round-trip.
+# Validate a peer pairing ticket in `add-peer`, and resolve a ticket to its
+# `EndpointId` for `status`. Same EXACT pin as `sync`, which owns the round-trip.
 iroh-tickets = "=1.0.0"
+iroh = "=1.0.0"
+# `status`: parse `{uuid}` meeting-folder names + digest the projected notes.
+uuid = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

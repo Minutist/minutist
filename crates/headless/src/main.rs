@@ -65,10 +65,15 @@ const PEER_PUSH_DEBOUNCE: Duration = Duration::from_secs(15);
 
 /// A timing default overridable via an env var (milliseconds), so a test mode can
 /// collapse the hub's timers to sub-second without touching production defaults.
+///
+/// A parsed `0` falls back to `default`: one of these timers feeds
+/// `tokio::time::interval`, which panics on a zero period, and "as fast as
+/// possible" is never a useful hub cadence — so zero is treated as unset.
 fn dur_or_env(var: &str, default: Duration) -> Duration {
     std::env::var(var)
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
         .map(Duration::from_millis)
         .unwrap_or(default)
 }

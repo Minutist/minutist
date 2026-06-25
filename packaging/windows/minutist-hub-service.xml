@@ -1,0 +1,33 @@
+<!--
+  WinSW service definition for the Minutist headless sync hub (template).
+
+  `install-service.ps1` fills the @PLACEHOLDERS@ and writes the result next to a
+  copy of WinSW renamed `minutist-hub-service.exe` (WinSW resolves the config
+  from its own basename). WinSW registers a real Windows service via the SCM, so
+  the daemon needs no Windows-specific code: on stop, WinSW sends Ctrl+C to the
+  console process and the daemon's cross-platform Ctrl-C handler drains the engine
+  and exits. (A hard kill after the stop timeout is also safe — notes are written
+  atomically and media is content-addressed.)
+-->
+<service>
+  <id>minutist-hub</id>
+  <name>Minutist sync hub</name>
+  <description>Minutist headless device-sync hub — an always-on peer your devices converge through.</description>
+
+  <executable>@BINARY@</executable>
+  <arguments>--data-dir "@DATA_DIR@"</arguments>
+  <workingdirectory>@DATA_DIR@</workingdirectory>
+
+  <!-- Relay access token. The file ACL is locked to SYSTEM/Administrators by the
+       installer; treat it as a secret. -->
+  <env name="MINUTIST_SYNC_TOKEN" value="@RELAY_TOKEN@"/>
+
+  <startmode>Automatic</startmode>
+  <onfailure action="restart" delay="5 sec"/>
+  <stoptimeout>15 sec</stoptimeout>
+
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+</service>

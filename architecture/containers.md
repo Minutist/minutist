@@ -12,6 +12,7 @@
 | **sherpa-onnx** | Bundled native lib, ONNX Runtime | Loaded on demand | Diarization (pyannote/segmentation-3.0 segmentation + 3D-Speaker CAM++ speaker embeddings + clustering). |
 | **libsql index** | SQLite file at `{app-data}/index.db` | Per app instance, persistent | Fast list / search over per-meeting metadata. |
 | **Meeting filesystem** | Per-meeting directories under `{app-data}/meetings/{uuid}/` | Persistent | Authoritative store for audio, transcript, notes, summary, metadata. |
+| **Minutist Server** | Rust headless binary (`minutist-hub`), tokio multi-threaded; systemd unit / OCI container | Always-on, user-installed (optional) | The user's own always-on node: a sync hub other devices converge through, and (post-launch) a GPU processing node. Pairs into the device mesh like a desktop; holds meeting plaintext in its OWN data root. The user owns the hardware, so it sits in the same trust boundary as the desktop — distinct from the hosted relay, which only ever brokers ciphertext. |
 
 ## Why two native libs and not one
 
@@ -41,6 +42,10 @@ mic ─▶ Rust core ─▶ webview              (audio meter; transcript events
                                             run summary, open meeting)
        Rust core ◀▶ llama.cpp             (ASR + summary inference, FFI)
        Rust core ◀▶ sherpa-onnx           (diarization inference, FFI)
+       Rust core ◀▶ Minutist Server       (notes + media sync over iroh QUIC;
+                                            converges through the user's own box)
+       Rust core ─▶ iroh relay            (NAT traversal / relay fallback;
+       Minutist Server ─▶ iroh relay       ciphertext only — never plaintext)
 
 External MCP client ─▶ Rust core      (Streamable HTTP, loopback,
                                        bearer; tools/list+call)
@@ -53,6 +58,16 @@ MCP server directly over loopback Streamable HTTP — never the filesystem or a
 native lib directly; it sees only the `agent-tools` registry the internal agent
 uses (read tools, the gated reversible writes, and `send_to_internal_agent`).
 
+The **Minutist Server** (when the user deploys one) is another peer in the device
+mesh: the desktop and the server reconcile notes (Yjs CRDT) and meeting media
+(content-addressed blobs) directly over iroh QUIC, so two sometimes-online
+devices converge through the user's own always-on box. The hosted iroh relay only
+brokers connectivity (NAT traversal / fallback) and sees ciphertext — for users
+who deploy the server there is no Minutist-resident copy of the data, even
+encrypted, unlike the deferred encrypted relay inbox. The server holds plaintext,
+but on hardware the user owns and controls, so it sits within the same trust
+boundary as the desktop; the relay never holds plaintext.
+
 ## Process model
 
 Single process. Tauri runs the Rust core; the webview runs in an
@@ -62,9 +77,13 @@ same process. No worker subprocesses in v1.
 The Phase-10 MCP HTTP listener is **not** a subprocess: it is a tokio task in the
 same Rust-core process (spawned from `setup()` via `tauri::async_runtime::spawn`),
 which is exactly the "move work to a dedicated tokio task pool" mitigation below
-— and it must be in-process to honour the single-writer rule (`persistence` is the
-sole opener of `index.db` + the meeting folders; a second process would violate
-it). There are no external helper processes.
+— and it must be in-process to honour the single-writer rule, which applies **per
+data root**: `persistence` is the sole opener of the `index.db` + meeting folders
+under a given `{app-data}` root, so two processes sharing one root would violate
+it. The desktop has no external helper processes sharing ITS root. The headless
+server (the **Minutist Server** in the Containers table) is a separate process —
+normally on a separate machine — but it runs over its OWN, non-overlapping data
+root, so it never contends with the desktop for the same files.
 
 If profiling shows the ASR or summarisation workload starves the UI
 thread, the first mitigation is to move that work to a dedicated tokio

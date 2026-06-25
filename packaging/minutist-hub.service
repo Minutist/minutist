@@ -1,0 +1,49 @@
+# systemd unit for the Minutist headless sync hub.
+#
+# Install (as root):
+#   install -m 0755 minutist-hub            /usr/local/bin/minutist-hub
+#   install -m 0644 minutist-hub.service    /etc/systemd/system/minutist-hub.service
+#   install -d -m 0700                       /etc/minutist-hub
+#   printf 'MINUTIST_SYNC_TOKEN=%s\n' "<relay token>" > /etc/minutist-hub/minutist-hub.env
+#   chmod 0600 /etc/minutist-hub/minutist-hub.env
+#   systemctl daemon-reload && systemctl enable --now minutist-hub
+#
+# Pair a desktop:  minutist-hub --data-dir /var/lib/minutist-hub print-ticket
+#                  minutist-hub --data-dir /var/lib/minutist-hub add-peer <desktop ticket>
+# (the running service re-reads its peers file, so add-peer needs no restart.)
+
+[Unit]
+Description=Minutist headless device-sync hub
+Documentation=https://github.com/Minutist/minutist
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as an unprivileged, system-managed dynamic user; StateDirectory creates and
+# owns /var/lib/minutist-hub (the daemon's data root: device key, peers, meetings,
+# logs). %S expands to /var/lib.
+DynamicUser=yes
+StateDirectory=minutist-hub
+# The relay access token (MINUTIST_SYNC_TOKEN=...). Optional ('-' = no error if
+# absent) so the unit loads before the operator drops the token in.
+EnvironmentFile=-/etc/minutist-hub/minutist-hub.env
+ExecStart=/usr/local/bin/minutist-hub --data-dir %S/minutist-hub
+# systemd sends SIGTERM on stop; the daemon drains within its bounded grace
+# window (< the default 90s TimeoutStopSec) and exits 0.
+Restart=on-failure
+RestartSec=5
+
+# Hardening — the daemon needs only its StateDirectory and outbound network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

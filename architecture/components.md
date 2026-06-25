@@ -40,6 +40,7 @@ appears in:
 | `doc-convert` | Attachments WS | `common` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
+| `headless` (bin) | WS4-B | `common`, `persistence`, `sync`, `settings` ‖ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
 Cargo feature (default ON). The free artifact is built with
@@ -70,6 +71,29 @@ that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
 `connected` Cargo feature exactly like the `mcp-server` / `tunnel-client` edges;
 the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
 — "Build variants".
+
+‖ `headless` (bin) is a SECOND workspace binary beside `app-main` — the
+user-installed headless server daemon (`minutist-hub`): an always-on sync hub
+now, a GPU processing node post-launch. It is **not** an edge of `app-main` and
+shares no code path with the desktop binary; there is no `app-main -> headless`
+edge at all. Its membership is **unconditional** — once listed in
+`[workspace].members` it compiles under `cargo build --workspace` exactly like
+`sync`, and is **not** feature-gated. (The "connected-gated" wording on the
+`sync`/`tunnel-client` footnotes refers to the `app-main -> sync` *edge*, never
+to whether the crate compiles.) The desktop free (`--no-default-features`) and
+connected `src-tauri` artefacts never link `headless`; it is built and shipped as
+its own binary, so the cleanliness invariant is that the free `src-tauri` build
+is unchanged and takes no edge to it — NOT that the crate is excluded from a
+workspace build. Phase-1 (sync-hub) dependencies are `common`, `persistence`,
+`sync`, `settings`; it takes NO `tauri::*` / `ipc-bridge` edge and wires
+`sync::SyncEngine` into a daemon directly. The crate grows into these edges as
+the daemon's steps land (the scaffold wires `common` + `sync`; `persistence` /
+`settings` join as used) — the table lists the permitted phase-1 set, exactly as
+the `sync` / `tunnel-client` footnotes describe their edges landing after the
+crate-add. The post-launch GPU node adds `orchestrator` + the ML-runtime crates
+(`asr-runtime` / `asr-parakeet` / `diarizer` / `summariser` / `model-registry`)
+as a SEPARATE table-update commit at that time. See `cross-cutting.md` —
+"Headless server daemon".
 
 **WS4-B S5 phase 3 (UI):** `ui/src/state/sync-status.ts` and
 `ui/src/shell/SyncSettingsPane.tsx` are purely internal to the webview layer; they

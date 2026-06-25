@@ -19,6 +19,7 @@ members = [
     "crates/sync",
     "crates/doc-convert",
     "crates/ipc-bridge",
+    "crates/headless",
     "src-tauri",
     "spikes/asr",
     "spikes/llm",

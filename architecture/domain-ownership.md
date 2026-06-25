@@ -33,6 +33,7 @@ role when work is parallel.
 | `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `persistence` |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
+| `headless` (bin) | systems-engineer | `crates/headless/**` | Same | `common`, `persistence`, `sync`, `settings` |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |
 
 The "Can call without doc update" column is the dependency rule
@@ -170,6 +171,20 @@ connective tissue (the device-to-device iroh sync engine), it shares the
 the feature in S5. It depends only on `common` (shared types) and `persistence`
 (the notes-CRDT store + meeting-media paths it transports) — it owns no domain
 logic of another crate, so it stays a near-leaf under one role.
+
+`headless` (WS4-B) is systems-engineer for the same reason as `sync` /
+`tunnel-client` / `mcp-server`: it is connective tissue, not a domain. It is the
+user-installed headless server daemon (`minutist-hub`) that wires
+`sync::SyncEngine` into a long-running service — an always-on sync hub now, a GPU
+processing node post-launch. It owns no domain logic of another crate, is NOT a
+Tauri binary, and takes no `ipc-bridge` / `tauri::*` edge. It runs over its own
+data root (an absolute path injected at startup via CLI/env), entirely separate
+from the desktop's `{app-data}`: it owns `settings.store`, `logs/`, `index.db`,
+and `meetings/{uuid}/` under THAT root, and never touches the desktop's
+`mcp_token` / `tunnel_device.json` / Tauri-managed paths. The single-writer rule
+applies per data root, so the daemon must never share a root with another
+process. The post-launch GPU node (adding the ML-runtime crates) is an
+architecture-owner decision at that time.
 
 ### `frontend-engineer`
 Owns everything under `ui/src/`. Knowledge expected: React 19, Tiptap +

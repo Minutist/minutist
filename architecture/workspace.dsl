@@ -48,6 +48,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
             tags "External" "Optional"
         }
 
+        irohRelay = softwareSystem "Sync relay (sync.minutist.ai)" "Self-hosted iroh relay. Brokers QUIC connectivity (NAT traversal / fallback) between a user's paired devices. Sees ciphertext only — never meeting plaintext. Server-side only, never shipped." {
+            tags "External" "Optional"
+        }
+
         // ----------------------------------------------------------------
         // The minutist system
         // ----------------------------------------------------------------
@@ -129,6 +133,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
             meetingFs = container "Meeting filesystem" "Per-meeting directory under {app-data}/meetings/{uuid}/. Holds audio.opus, transcript.json, notes.ydoc (authoritative CRDT), notes.json + notes.md (derived), summary.md, metadata.json." "Filesystem" {
                 tags "Container" "Storage"
             }
+
+            headlessHub = container "Minutist Server" "User-installed headless daemon (minutist-hub). An always-on sync hub other devices converge through, and post-launch a GPU processing node. Pairs into the device mesh like a desktop; holds meeting plaintext in its own data root, on hardware the user owns. Optional; not the relay." "Rust / tokio (headless)" {
+                tags "Container" "Backend"
+            }
         }
 
         // ----------------------------------------------------------------
@@ -141,6 +149,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist -> updateServer "Fetches signed updates" "HTTPS"
         minutist -> externalLlm "Optional: dispatches summary requests" "HTTP / loopback"
         mcpClient -> minutist "Reads meetings + messages the internal agent over MCP" "Streamable HTTP / loopback"
+        minutist -> irohRelay "Syncs paired devices (NAT traversal / relay fallback; ciphertext only)" "QUIC / HTTPS"
 
         // ----------------------------------------------------------------
         // Relationships — Container (Level 2)
@@ -157,6 +166,9 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core -> updateServer "Polls + applies signed updates"
         minutist.core -> externalLlm "Optional summary dispatch" "HTTP"
         mcpClient -> minutist.core "tools/list + tools/call (bearer + Host/Origin)" "Streamable HTTP / loopback"
+        minutist.core -> minutist.headlessHub "Reconciles notes + media over iroh QUIC (mutual device sync)"
+        minutist.core -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
+        minutist.headlessHub -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
 
         // ----------------------------------------------------------------
         // Relationships — Component (Level 3) — INSIDE the Rust core

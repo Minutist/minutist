@@ -41,6 +41,7 @@ use iroh::{
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use minutist_common::MeetingId;
+use tokio::sync::broadcast;
 
 use crate::address_lookup::PeerDirectory;
 use crate::blobs::BlobStore;
@@ -63,7 +64,22 @@ pub struct SyncEngine {
     /// Meetings root the protocols read/write through `persistence`
     /// (`{root}/{meeting_id}/...`). The inbound [`AcceptHook`] shares it.
     meetings_root: PathBuf,
+    /// The configured relay URL, kept so [`Self::push_all_to`] can address a peer
+    /// relay-only (id + relay) without a stored direct address.
+    relay_url: String,
+    /// Fires the [`EndpointId`] of a peer each time it opens an authorised inbound
+    /// sync connection ("peer arrived"). An always-on hub subscribes via
+    /// [`Self::subscribe_peer_events`] and reciprocally pushes (see
+    /// [`Self::push_all_to`]); the desktop ignores it. Bounded — a lagging receiver
+    /// drops the oldest ids, so the consumer is expected to recover on a
+    /// [`broadcast::error::RecvError::Lagged`] by reconciling all known peers
+    /// ([`Self::peer_ids`]); no arrival is then permanently missed.
+    peer_events: broadcast::Sender<EndpointId>,
 }
+
+/// Capacity of the peer-arrived broadcast channel. Small by design: a lagging hub
+/// subscriber drops the oldest ids, which the next inbound connection re-fires.
+const PEER_EVENTS_CAP: usize = 64;
 
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
@@ -95,7 +111,9 @@ impl SyncEngine {
             "sync endpoint bound"
         );
 
-        let router = Self::build_router(&endpoint, &blobs, &peers, &meetings_root);
+        let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
+        let router =
+            Self::build_router(&endpoint, &blobs, &peers, &meetings_root, peer_events.clone());
 
         Ok(Self {
             endpoint,
@@ -103,6 +121,8 @@ impl SyncEngine {
             peers,
             blobs,
             meetings_root,
+            relay_url: config.relay_url,
+            peer_events,
         })
     }
 
@@ -116,6 +136,7 @@ impl SyncEngine {
         blobs: &BlobStore,
         peers: &PeerDirectory,
         meetings_root: &Path,
+        peer_events: broadcast::Sender<EndpointId>,
     ) -> Router {
         let blobs_protocol = iroh_blobs::BlobsProtocol::new(blobs.inner(), None);
         Router::builder(endpoint.clone())
@@ -126,6 +147,7 @@ impl SyncEngine {
                     peers.clone(),
                     blobs.clone(),
                     endpoint.clone(),
+                    peer_events,
                 ),
             )
             .accept(
@@ -152,13 +174,19 @@ impl SyncEngine {
             .bind()
             .await
             .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;
-        let router = Self::build_router(&endpoint, &blobs, &peers, &meetings_root);
+        let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
+        let router =
+            Self::build_router(&endpoint, &blobs, &peers, &meetings_root, peer_events.clone());
         Ok(Self {
             endpoint,
             router,
             peers,
             blobs,
             meetings_root,
+            // The relay-less test path never addresses a peer relay-only, so it has
+            // no relay URL; `push_all_to` is unused here.
+            relay_url: String::new(),
+            peer_events,
         })
     }
 
@@ -236,6 +264,67 @@ impl SyncEngine {
     /// The connected `SyncControl` syncs a meeting against each of them.
     pub fn peer_ids(&self) -> Vec<EndpointId> {
         self.peers.ids()
+    }
+
+    /// Subscribe to "peer arrived" events: the [`EndpointId`] of each peer as it
+    /// opens an authorised inbound sync connection. An always-on hub reacts by
+    /// calling [`Self::push_all_to`] so a device that reconnects both deposits and
+    /// collects (convergence through the hub). The desktop does not subscribe.
+    pub fn subscribe_peer_events(&self) -> broadcast::Receiver<EndpointId> {
+        self.peer_events.subscribe()
+    }
+
+    /// The meeting ids this device holds on disk — the `{uuid}` folders directly
+    /// under [`Self::meetings_root`] (the dot-prefixed `.blobs` store and any
+    /// non-UUID entry are skipped).
+    pub fn local_meetings(&self) -> Vec<MeetingId> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.meetings_root) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                    out.push(MeetingId(uuid));
+                }
+            }
+        }
+        out
+    }
+
+    /// Reconcile EVERY meeting this device holds with `peer`, addressed relay-only
+    /// (id + the configured relay). This is the hub's reciprocal push: on a peer
+    /// arriving it pushes all it holds, so a device that reconnects to deposit one
+    /// meeting also collects every other meeting the hub has accumulated. Notes and
+    /// media are reconciled per meeting; a per-meeting failure is logged and
+    /// skipped so one bad meeting does not abort the rest. Returns how many
+    /// meetings reconciled without error.
+    pub async fn push_all_to(&self, peer: EndpointId) -> Result<usize> {
+        let relay: RelayUrl = self.relay_url.parse().map_err(|e| {
+            Error::Endpoint(format!(
+                "push_all_to needs a relay url, got {:?}: {e}",
+                self.relay_url
+            ))
+        })?;
+        let addr = EndpointAddr::new(peer).with_relay_url(relay);
+        let meetings = self.local_meetings();
+        tracing::debug!(target: "sync", peer = %peer, count = meetings.len(), "pushing all meetings to peer");
+        let mut reconciled = 0usize;
+        for meeting in meetings {
+            if let Err(e) = self.sync_notes(addr.clone(), meeting).await {
+                tracing::warn!(target: "sync", peer = %peer, meeting = %meeting.0, error = %e, "push notes failed");
+                continue;
+            }
+            if let Err(e) = self.sync_media(addr.clone(), meeting).await {
+                tracing::warn!(target: "sync", peer = %peer, meeting = %meeting.0, error = %e, "push media failed");
+                continue;
+            }
+            reconciled += 1;
+        }
+        Ok(reconciled)
     }
 
     /// Dial a peer on the [`SYNC_ALPN`]. The peer must already be resolvable —
@@ -379,6 +468,9 @@ struct AcceptHook {
     blobs: BlobStore,
     /// The endpoint, for the media responder's blob pulls.
     endpoint: Endpoint,
+    /// Fires the remote's id once it is authorised, so an always-on hub can push
+    /// back (see [`SyncEngine::subscribe_peer_events`]).
+    peer_events: broadcast::Sender<EndpointId>,
 }
 
 impl AcceptHook {
@@ -387,12 +479,14 @@ impl AcceptHook {
         peers: PeerDirectory,
         blobs: BlobStore,
         endpoint: Endpoint,
+        peer_events: broadcast::Sender<EndpointId>,
     ) -> Self {
         Self {
             meetings_root,
             peers,
             blobs,
             endpoint,
+            peer_events,
         }
     }
 }
@@ -415,6 +509,10 @@ impl ProtocolHandler for AcceptHook {
         }
 
         tracing::info!(target: "sync", peer = %peer, "accepted sync connection");
+
+        // Notify any subscriber (the always-on hub) that this peer is online so it
+        // can reciprocally push. Best-effort: `send` errors only with no receivers.
+        let _ = self.peer_events.send(peer);
 
         self.dispatch(&connection, peer)
             .await

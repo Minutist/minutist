@@ -199,6 +199,9 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # `ExcelDateTime::as_datetime()` so date cells render as ISO text rather than the
 # raw serial number that `ExcelDateTime`'s Display emits.
 calamine = { version = "0.35", features = ["dates"] }
+# csv: RFC-4180 CSV reader (pure Rust). Rendered as a markdown table, like the
+# spreadsheet formats.
+csv = "1"
 # dom_smoothie: HTML readability extraction (Mozilla Readability port).
 dom_smoothie = "0.18"
 # htmd: HTML → Markdown conversion.

@@ -30,6 +30,10 @@ pub enum ConvertError {
     #[error("email parse error: {0}")]
     Email(String),
 
+    /// A CSV record could not be parsed — treated as invalid input.
+    #[error("CSV parse error: {0}")]
+    Csv(String),
+
     #[error("PDF extraction error: {0}")]
     Pdf(String),
 
@@ -68,6 +72,10 @@ impl From<ConvertError> for AppError {
             },
             ConvertError::Email(msg) => AppError::Internal {
                 context: format!("email: {msg}"),
+            },
+            // A malformed CSV record is bad input (mismatched quoting etc.).
+            ConvertError::Csv(msg) => AppError::InvalidInput {
+                context: format!("csv: {msg}"),
             },
             // A PDF that fails to open or whose page count cannot be read is bad
             // INPUT (corrupt / not a real PDF), not an internal fault — same bucket

@@ -60,8 +60,8 @@ const MAX_ZIP_ENTRIES: usize = 10_000;
 /// [`convert_to_markdown`]; without one they return `AppError::Unsupported`.
 pub fn supported_exts() -> &'static [&'static str] {
     &[
-        "txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx", "docx", "png", "jpg",
-        "jpeg", "tiff",
+        "txt", "md", "csv", "tsv", "json", "yaml", "yml", "xml", "log", "xlsx", "ods", "html",
+        "htm", "eml", "pdf", "pptx", "docx", "png", "jpg", "jpeg", "tiff",
     ]
 }
 
@@ -135,6 +135,12 @@ pub fn convert_to_markdown(
 fn dispatch(bytes: &[u8], ext: &str, vlm: Option<&dyn DocVlm>) -> AppResult<String> {
     match ext {
         "txt" | "md" => converters::passthrough(bytes),
+        "csv" => converters::csv(bytes),
+        "tsv" => converters::tsv(bytes),
+        "json" => converters::fenced_text(bytes, "json"),
+        "yaml" | "yml" => converters::fenced_text(bytes, "yaml"),
+        "xml" => converters::fenced_text(bytes, "xml"),
+        "log" => converters::fenced_text(bytes, ""),
         "xlsx" | "ods" => converters::spreadsheet(bytes, ext),
         "html" | "htm" => converters::html(bytes),
         "eml" => converters::eml(bytes),

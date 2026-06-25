@@ -22,7 +22,10 @@ fn fixture(name: &str) -> Vec<u8> {
 #[test]
 fn supported_exts_covers_all_converters() {
     let exts = supported_exts();
-    for required in &["txt", "md", "xlsx", "ods", "html", "htm", "eml", "pdf", "pptx", "docx"] {
+    for required in &[
+        "txt", "md", "csv", "tsv", "json", "yaml", "yml", "xml", "log", "xlsx", "ods", "html",
+        "htm", "eml", "pdf", "pptx", "docx",
+    ] {
         assert!(
             exts.contains(required),
             "missing ext {required:?} in supported_exts()"
@@ -86,6 +89,54 @@ fn xlsx_converter_produces_table() {
         out.contains("Name") || out.contains("Revenue"),
         "expected header or data cell, got: {out:?}"
     );
+}
+
+#[test]
+fn csv_converter_produces_table_with_quoted_fields() {
+    // First row is the header; a quoted field carries an embedded comma that must
+    // NOT split the cell (RFC-4180 quoting handled by the `csv` crate).
+    let bytes = b"Name,Role,Note\nAcme Corp,\"Vendor, primary\",ok\nBeta Ltd,Client,\n";
+    let out = convert_to_markdown(bytes, "csv", None).expect("csv conversion");
+    assert!(out.contains('|'), "expected a markdown table, got: {out:?}");
+    assert!(out.contains("Name"), "header preserved, got: {out:?}");
+    assert!(out.contains("----"), "separator row present, got: {out:?}");
+    assert!(
+        out.contains("Vendor, primary"),
+        "quoted field with embedded comma kept as one cell, got: {out:?}"
+    );
+    assert!(out.contains("Acme Corp"), "data cell present, got: {out:?}");
+}
+
+#[test]
+fn tsv_converter_produces_table() {
+    let bytes = b"Name\tRole\nAcme Corp\tVendor\nBeta Ltd\tClient\n";
+    let out = convert_to_markdown(bytes, "tsv", None).expect("tsv conversion");
+    assert!(out.contains('|'), "expected a markdown table, got: {out:?}");
+    assert!(out.contains("Name"), "header preserved, got: {out:?}");
+    assert!(out.contains("Acme Corp"), "data cell present, got: {out:?}");
+}
+
+#[test]
+fn json_is_fenced_verbatim_not_markdown_mangled() {
+    // JSON carries markdown metacharacters that `normalise` would mangle if it
+    // were treated as markdown (`*` → emphasis, `[` → link). Fencing preserves it.
+    let bytes = br#"{"note": "use *asterisks* and [brackets] verbatim", "n": 1}"#;
+    let out = convert_to_markdown(bytes, "json", None).expect("json conversion");
+    assert!(out.contains("```json"), "expected a json code fence, got: {out:?}");
+    assert!(
+        out.contains(r#""use *asterisks* and [brackets] verbatim""#),
+        "content must be preserved verbatim, got: {out:?}"
+    );
+}
+
+#[test]
+fn fenced_text_widens_fence_past_internal_backticks() {
+    // Content containing a ``` run must not break out of the wrapping fence.
+    let bytes = b"line one\n```\nfake fence inside\n```\nline two\n";
+    let out = convert_to_markdown(bytes, "log", None).expect("log conversion");
+    // The outer fence must be longer than the internal 3-backtick run (>= 4).
+    assert!(out.contains("````"), "outer fence must widen past ``` , got: {out:?}");
+    assert!(out.contains("fake fence inside"), "content preserved, got: {out:?}");
 }
 
 // ---------------------------------------------------------------------------

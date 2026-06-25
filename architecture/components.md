@@ -2551,7 +2551,7 @@ are:
         vlm: Option<&dyn common::DocVlm>,
     ) -> AppResult<String>
     pub fn supported_exts() -> &'static [&'static str]
-      // ["txt","md","xlsx","ods","html","htm","eml","pdf","pptx","docx","png","jpg","jpeg","tiff"]
+      // ["txt","md","csv","tsv","json","yaml","yml","xml","log","xlsx","ods","html","htm","eml","pdf","pptx","docx","png","jpg","jpeg","tiff"]
 
 The `vlm` parameter carries the optional VLM injected by `ipc-bridge`; it is
 `None` in tests (which supply a stub impl) or when no vision context is loaded.
@@ -2563,7 +2563,10 @@ Each format is handled by a converter:
 | Extension | Converter |
 |---|---|
 | `txt`, `md` | passthrough |
-| `xlsx`, `ods` | `calamine` (sheet → pipe-table or TSV-style markdown); date cells render as ISO via `ExcelDateTime::as_datetime()` (the `dates` feature), not the raw serial number |
+| `csv` | `csv` crate → markdown table (first row = header), via the shared `rows_to_markdown_table` helper |
+| `tsv` | `csv` crate (tab delimiter) → markdown table, sharing the `csv` path |
+| `json`, `yaml`/`yml`, `xml`, `log` | wrapped verbatim in a fenced code block (these are NOT markdown — `normalise` would mangle them); the fence is sized longer than any backtick run inside, and the output is returned without a markdown round-trip |
+| `xlsx`, `ods` | `calamine` (sheet → pipe-table or TSV-style markdown via the shared `rows_to_markdown_table` helper); date cells render as ISO via `ExcelDateTime::as_datetime()` (the `dates` feature), not the raw serial number |
 | `html`, `htm` | `dom_smoothie` readability extract → `htmd` markdown |
 | `eml` | `mail-parser` → HTML body → `dom_smoothie` + `htmd`; plain-text body passthrough |
 | `pdf` | `pdf_oxide` (pure-Rust digital text extraction, no native lib; a page that fails to decode is skipped, not fatal) |

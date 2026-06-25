@@ -17,6 +17,7 @@ tracing = { workspace = true }
 
 # Document parsers (pinned to current crates.io at Gate-A, 2026-06-22)
 calamine      = { workspace = true }          # XLSX / ODS spreadsheet reader
+csv           = { workspace = true }          # CSV → markdown table
 dom_smoothie  = { workspace = true }          # HTML readability extraction
 htmd          = { workspace = true }          # HTML → Markdown
 mail-parser   = { workspace = true }          # .eml parsing

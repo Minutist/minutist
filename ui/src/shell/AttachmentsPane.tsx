@@ -32,6 +32,13 @@ import "./AttachmentsPane.css";
 const SUPPORTED_EXTS = [
   "txt",
   "md",
+  "csv",
+  "tsv",
+  "json",
+  "yaml",
+  "yml",
+  "xml",
+  "log",
   "xlsx",
   "ods",
   "html",

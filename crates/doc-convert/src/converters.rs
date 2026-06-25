@@ -80,44 +80,133 @@ pub fn spreadsheet(bytes: &[u8], ext: &str) -> minutist_common::AppResult<String
             continue;
         }
 
-        // Find the maximum column count across all rows for consistent tables.
-        let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        if col_count == 0 {
+        let table = rows_to_markdown_table(&rows);
+        if table.is_empty() {
             continue;
         }
-
-        // Header row
-        let header = &rows[0];
-        let padded_header: Vec<String> = (0..col_count)
-            .map(|i| header.get(i).cloned().unwrap_or_default())
-            .collect();
-        md.push('|');
-        for h in &padded_header {
-            md.push_str(&format!(" {} |", escape_pipe(h)));
-        }
-        md.push('\n');
-
-        // Separator row
-        md.push('|');
-        for _ in 0..col_count {
-            md.push_str(" --- |");
-        }
-        md.push('\n');
-
-        // Data rows (starting from index 1)
-        for row in rows.iter().skip(1) {
-            md.push('|');
-            for i in 0..col_count {
-                let cell = row.get(i).map(String::as_str).unwrap_or("");
-                md.push_str(&format!(" {} |", escape_pipe(cell)));
-            }
-            md.push('\n');
-        }
-
+        md.push_str(&table);
         md.push('\n');
     }
 
     normalise(&md).map_err(minutist_common::AppError::from)
+}
+
+/// Render a grid of string cells as a GitHub-flavoured markdown table: the first
+/// row is the header, every row padded to the widest row's column count. Returns
+/// an empty string for an empty grid (no columns) so callers can skip it. Shared
+/// by the spreadsheet (`xlsx`/`ods`) and `csv` converters.
+fn rows_to_markdown_table(rows: &[Vec<String>]) -> String {
+    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if col_count == 0 {
+        return String::new();
+    }
+
+    let mut md = String::new();
+    // Header row (row 0), padded to the full column count.
+    md.push('|');
+    for i in 0..col_count {
+        let h = rows[0].get(i).map(String::as_str).unwrap_or("");
+        md.push_str(&format!(" {} |", escape_pipe(h)));
+    }
+    md.push('\n');
+
+    // Separator row.
+    md.push('|');
+    for _ in 0..col_count {
+        md.push_str(" --- |");
+    }
+    md.push('\n');
+
+    // Data rows (from index 1).
+    for row in rows.iter().skip(1) {
+        md.push('|');
+        for i in 0..col_count {
+            let cell = row.get(i).map(String::as_str).unwrap_or("");
+            md.push_str(&format!(" {} |", escape_pipe(cell)));
+        }
+        md.push('\n');
+    }
+
+    md
+}
+
+// ---------------------------------------------------------------------------
+// CSV via the `csv` crate (rendered as a markdown table, like spreadsheets)
+// ---------------------------------------------------------------------------
+
+/// CSV → markdown table (first row = header). RFC-4180, flexible field counts,
+/// quoted fields with embedded commas/newlines. Bounded by `MAX_INPUT_BYTES`.
+pub fn csv(bytes: &[u8]) -> minutist_common::AppResult<String> {
+    delimited(bytes, b',')
+}
+
+/// TSV → markdown table — like [`csv`] but tab-separated.
+pub fn tsv(bytes: &[u8]) -> minutist_common::AppResult<String> {
+    delimited(bytes, b'\t')
+}
+
+/// Parse a delimiter-separated file into rows and render a markdown table with
+/// the first row as the header. The parser is NOT told a header exists
+/// (`has_headers(false)`) so row 0 is preserved and rendered as the header.
+fn delimited(bytes: &[u8], delimiter: u8) -> minutist_common::AppResult<String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(bytes);
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for record in reader.records() {
+        let record = record.map_err(|e| ConvertError::Csv(e.to_string()))?;
+        rows.push(record.iter().map(str::to_string).collect());
+    }
+
+    let md = rows_to_markdown_table(&rows);
+    normalise(&md).map_err(minutist_common::AppError::from)
+}
+
+// ---------------------------------------------------------------------------
+// Structured plain-text (json / yaml / xml / log) — verbatim in a code fence
+// ---------------------------------------------------------------------------
+
+/// Wrap structured-text bytes (`json`/`yaml`/`xml`/`log`) verbatim in a fenced
+/// code block tagged `lang`, so the content reaches the summariser unaltered.
+///
+/// These formats are NOT markdown: running them through `normalise` would mangle
+/// them (emphasis from `*`/`_`, links from `[...]`, HTML from `<...>` tags). A
+/// fenced block preserves the content exactly and is itself canonical markdown,
+/// so the output is returned WITHOUT a markdown round-trip. The fence is made
+/// longer than the longest backtick run inside, so the content cannot break out.
+pub fn fenced_text(bytes: &[u8], lang: &str) -> minutist_common::AppResult<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let fence = "`".repeat(longest_backtick_run(&text).max(2) + 1);
+
+    let mut out = String::with_capacity(text.len() + fence.len() * 2 + lang.len() + 3);
+    out.push_str(&fence);
+    out.push_str(lang);
+    out.push('\n');
+    out.push_str(&text);
+    if !text.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&fence);
+    out.push('\n');
+    Ok(out)
+}
+
+/// Length of the longest run of consecutive backticks in `s` (0 if none).
+fn longest_backtick_run(s: &str) -> usize {
+    let mut max = 0;
+    let mut cur = 0;
+    for c in s.chars() {
+        if c == '`' {
+            cur += 1;
+            max = max.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    max
 }
 
 fn cell_to_str(cell: &calamine::Data) -> String {

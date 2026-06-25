@@ -134,7 +134,7 @@ pub fn read_meeting_state(meeting_dir: &Path) -> AppResult<MeetingState> {
     let seeded = NotesStore::seed_ydoc_if_needed(root, meta.uuid)?;
     if (seeded || meeting_dir.join("notes.ydoc").exists()) && meta.notes_format == 0 {
         meta.notes_format = 1;
-        crate::metadata::write_metadata(meeting_dir, &meta)?;
+        crate::write_metadata(meeting_dir, &meta)?;
     }
 
     let notes = NotesStore::load(root, meta.uuid)?.map(|data| {

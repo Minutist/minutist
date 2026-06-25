@@ -205,8 +205,8 @@ pub async fn respond_media_sync(
     peer_manifest.validate()?;
 
     // A meeting syncing media to a device that lacks its folder must not fail for
-    // want of the directory; `persistence` owns the folder/metadata creation.
-    persistence::MeetingFolder::ensure(root, meeting_id)
+    // want of the directory; `notes-crdt` owns the folder/metadata creation.
+    notes_crdt::MeetingFolder::ensure(root, meeting_id)
         .map_err(|e| Error::Protocol(format!("ensuring inbound meeting folder: {e}")))?;
 
     // Import our own media (stages our blobs for the peer to fetch + our manifest).

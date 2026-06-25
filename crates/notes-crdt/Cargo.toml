@@ -1,0 +1,32 @@
+[package]
+name = "notes-crdt"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Leaf crate carrying the notes-CRDT primitives shared by `persistence` (which
+# re-exports them at its existing paths) and `sync` (which transports the
+# `notes.ydoc` state). Pure-Rust: the Yjs (`yrs`) JSON↔CRDT port, the
+# `NotesStore` reader/writer for `notes.ydoc` + its projections, the
+# `MeetingFolder` layout, and the `metadata.json` writer. No libsql / audiopus /
+# ogg, so it cross-compiles cleanly (e.g. aarch64-linux-android) and keeps
+# `sync` off the C-heavy persistence graph.
+
+[dependencies]
+minutist-common = { path = "../common" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# tracing: the moved bodies log meeting ids (never content) under the
+# `target: "persistence"` stream, matching the rest of the meeting-storage surface.
+tracing = { workspace = true }
+# yrs: the Yjs CRDT port. Stores the authoritative per-meeting notes document as
+# `notes.ydoc` (lib0 v2 whole-state blob) and derives `notes.json` / `notes.md`
+# from it. Same workspace pin as `persistence` / `sync` so the on-the-wire
+# encoding agrees across the three crates.
+yrs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -2,11 +2,11 @@
 //!
 //! A small custom iroh protocol (ALPN [`SYNC_ALPN`]) reconciles one meeting's
 //! Yjs CRDT document between two of a user's paired devices. The authoritative
-//! local document is `persistence`'s `notes.ydoc`. The exchange is a
+//! local document is `notes-crdt`'s `notes.ydoc`. The exchange is a
 //! state-vector / minimal-diff reconciliation:
 //!
 //! - each side reads its local state as a lib0-**v1** whole-state update with
-//!   [`persistence::NotesStore::read_ydoc_state`] (an absent `notes.ydoc` is the
+//!   [`notes_crdt::NotesStore::read_ydoc_state`] (an absent `notes.ydoc` is the
 //!   empty-document state),
 //! - each side derives its [state vector] from that v1 state
 //!   ([`yrs::encode_state_vector_from_update_v1`]) and sends it to the peer,
@@ -14,8 +14,8 @@
 //!   has not yet seen ([`yrs::diff_updates_v1`] of the peer's local state against
 //!   the sender's state vector),
 //! - each side merges the inbound diff with
-//!   [`persistence::NotesStore::apply_update`], which re-derives `notes.json` /
-//!   `notes.md` (`persistence` owns projection-writing — sync never touches it).
+//!   [`notes_crdt::NotesStore::apply_update`], which re-derives `notes.json` /
+//!   `notes.md` (`notes-crdt` owns projection-writing — sync never touches it).
 //!
 //! yrs merge is commutative and idempotent, so the exchange is order-independent
 //! and re-running it is a no-op once both sides have converged.
@@ -59,7 +59,7 @@ use std::path::Path;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use minutist_common::MeetingId;
-use persistence::NotesStore;
+use notes_crdt::NotesStore;
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
@@ -121,7 +121,7 @@ fn local_v1_state(root: &Path, meeting_id: MeetingId) -> Result<Vec<u8>> {
 /// meeting whose `notes.ydoc` does not exist yet.
 fn empty_v1_state() -> Vec<u8> {
     // `yrs::Update::default().encode_v1()` is the empty update; deriving it from
-    // an empty `StateVector` keeps this in lock-step with how `persistence`
+    // an empty `StateVector` keeps this in lock-step with how `notes-crdt`
     // encodes whole state (`encode_state_as_update_v1` of the default SV).
     yrs::Update::default().encode_v1()
 }
@@ -148,12 +148,12 @@ fn is_noop_update(diff: &[u8]) -> Result<bool> {
     Ok(update.is_empty() && update.delete_set().is_empty())
 }
 
-/// Merge an inbound v1 diff into the meeting's `notes.ydoc` via `persistence`,
+/// Merge an inbound v1 diff into the meeting's `notes.ydoc` via `notes-crdt`,
 /// preserving the existing `notes.md` projection.
 ///
-/// `persistence::NotesStore::apply_update` re-derives `notes.json` from the
+/// `notes_crdt::NotesStore::apply_update` re-derives `notes.json` from the
 /// merged doc but takes the markdown verbatim (rendering markdown needs the
-/// editor's typed schema, which neither `sync` nor `persistence` models). We
+/// editor's typed schema, which neither `sync` nor `notes-crdt` models). We
 /// therefore carry the meeting's current `notes.md` through unchanged: a CRDT
 /// sync must not blank an existing markdown export, and the editor re-renders it
 /// on next save.
@@ -163,8 +163,8 @@ fn is_noop_update(diff: &[u8]) -> Result<bool> {
 /// carries changes reaches `apply_update`.
 ///
 /// Before that merge, the meeting folder is ensured on disk via
-/// [`persistence::MeetingFolder::ensure`]: a brand-new meeting syncing to a device
-/// that lacks its folder must not fail for want of the directory. `persistence`
+/// [`notes_crdt::MeetingFolder::ensure`]: a brand-new meeting syncing to a device
+/// that lacks its folder must not fail for want of the directory. `notes-crdt`
 /// owns the folder/metadata creation (it seeds a placeholder `metadata.json` the
 /// authoritative one later overwrites); `sync` only triggers it. Ensuring runs
 /// only for a change-carrying diff, so an already-converged or empty meeting still
@@ -173,7 +173,7 @@ fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> 
     if is_noop_update(diff)? {
         return Ok(());
     }
-    persistence::MeetingFolder::ensure(root, meeting_id)
+    notes_crdt::MeetingFolder::ensure(root, meeting_id)
         .map_err(|e| Error::Protocol(format!("ensuring inbound meeting folder: {e}")))?;
     let notes_md = match NotesStore::load(root, meeting_id) {
         Ok(Some(data)) => data.markdown,
@@ -298,20 +298,20 @@ mod tests {
     fn diff_against_empty_sv_is_whole_state() {
         // A document's diff against the empty state vector equals re-applying its
         // whole state: the operand for a peer that has never seen the meeting.
-        let doc = persistence::ydoc::json_to_ydoc(&serde_json::json!({
+        let doc = notes_crdt::ydoc::json_to_ydoc(&serde_json::json!({
             "type": "doc",
             "content": [{ "type": "paragraph",
                 "content": [{ "type": "text", "text": "hi" }] }]
         }));
-        let v1 = persistence::ydoc::encode_state_v1(&doc);
+        let v1 = notes_crdt::ydoc::encode_state_v1(&doc);
         let empty_sv = state_vector_of(&empty_v1_state()).expect("empty sv");
         let diff = diff_against(&v1, &empty_sv).expect("diff");
 
-        let target = persistence::ydoc::new_ydoc();
-        persistence::ydoc::apply_update_v1(&target, &diff).expect("apply diff");
+        let target = notes_crdt::ydoc::new_ydoc();
+        notes_crdt::ydoc::apply_update_v1(&target, &diff).expect("apply diff");
         assert_eq!(
-            persistence::ydoc::ydoc_to_json(&target),
-            persistence::ydoc::ydoc_to_json(&doc),
+            notes_crdt::ydoc::ydoc_to_json(&target),
+            notes_crdt::ydoc::ydoc_to_json(&doc),
             "diff against empty sv must reconstruct the whole document"
         );
     }
@@ -319,22 +319,22 @@ mod tests {
     #[test]
     fn diff_against_own_sv_is_empty() {
         // A document reconciled against its own state vector owes nothing.
-        let doc = persistence::ydoc::json_to_ydoc(&serde_json::json!({
+        let doc = notes_crdt::ydoc::json_to_ydoc(&serde_json::json!({
             "type": "doc",
             "content": [{ "type": "paragraph",
                 "content": [{ "type": "text", "text": "x" }] }]
         }));
-        let v1 = persistence::ydoc::encode_state_v1(&doc);
+        let v1 = notes_crdt::ydoc::encode_state_v1(&doc);
         let sv = state_vector_of(&v1).expect("sv");
         let diff = diff_against(&v1, &sv).expect("diff");
 
         // Applying the (empty) diff is a no-op merge.
         let target =
-            persistence::ydoc::decode_ydoc(&persistence::ydoc::encode_ydoc(&doc)).expect("decode");
-        let before = persistence::ydoc::ydoc_to_json(&target);
-        persistence::ydoc::apply_update_v1(&target, &diff).expect("apply empty diff");
+            notes_crdt::ydoc::decode_ydoc(&notes_crdt::ydoc::encode_ydoc(&doc)).expect("decode");
+        let before = notes_crdt::ydoc::ydoc_to_json(&target);
+        notes_crdt::ydoc::apply_update_v1(&target, &diff).expect("apply empty diff");
         assert_eq!(
-            persistence::ydoc::ydoc_to_json(&target),
+            notes_crdt::ydoc::ydoc_to_json(&target),
             before,
             "diff against own sv must be a no-op"
         );

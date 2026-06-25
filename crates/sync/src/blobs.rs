@@ -155,7 +155,7 @@ impl BlobStore {
     /// real copy to the per-meeting path, creating the immediate parent
     /// (`assets/`) if needed. The returned path is the absolute export target.
     ///
-    /// The caller ensures the meeting folder via `persistence::MeetingFolder`
+    /// The caller ensures the meeting folder via `notes_crdt::MeetingFolder`
     /// before reconciling media; this method writes only the media file itself.
     pub async fn download(
         &self,

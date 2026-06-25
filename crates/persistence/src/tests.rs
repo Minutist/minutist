@@ -540,7 +540,7 @@ fn write_synthetic_meeting(
     meta.title = title.to_string();
     meta.started_at = started_at.to_string();
     meta.speaker_count = 2;
-    crate::metadata::write_metadata(folder.path(), &meta).expect("write metadata");
+    crate::write_metadata(folder.path(), &meta).expect("write metadata");
 
     if !segments.is_empty() {
         let mut tw = TranscriptWriter::open(&folder).expect("open transcript");
@@ -1052,7 +1052,7 @@ fn test_read_meeting_state_seeds_legacy_notes_and_flips_format() {
     let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
     let mut meta = dummy_meta(id, 5_000);
     meta.notes_format = 0;
-    crate::metadata::write_metadata(folder.path(), &meta).expect("write metadata");
+    crate::write_metadata(folder.path(), &meta).expect("write metadata");
 
     let notes_json = serde_json::json!({
         "type": "doc",
@@ -1098,7 +1098,7 @@ fn test_read_meeting_state_seed_is_noop_when_no_notes() {
     let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
     let mut meta = dummy_meta(id, 5_000);
     meta.notes_format = 0;
-    crate::metadata::write_metadata(folder.path(), &meta).expect("write metadata");
+    crate::write_metadata(folder.path(), &meta).expect("write metadata");
 
     let folder_dir = root.join(id.0.to_string());
     let state = reader::read_meeting_state(&folder_dir).expect("read state");
@@ -1192,7 +1192,7 @@ fn test_write_metadata_round_trip_leaves_siblings_untouched() {
     let mut meta = dummy_meta(id, 5_000);
     meta.speaker_count = 0;
     meta.diarizer = None;
-    crate::metadata::write_metadata(folder.path(), &meta).expect("initial write");
+    crate::write_metadata(folder.path(), &meta).expect("initial write");
 
     // The Phase-6 orchestrator overlay: bump speaker_count and stamp the
     // diarizer descriptor, then atomically rewrite metadata.json.
@@ -1202,7 +1202,7 @@ fn test_write_metadata_round_trip_leaves_siblings_untouched() {
         quantisation: None,
         version: "3.0".to_string(),
     });
-    crate::metadata::write_metadata(folder.path(), &meta).expect("diarization update write");
+    crate::write_metadata(folder.path(), &meta).expect("diarization update write");
 
     // read_metadata reflects the updated fields.
     let back = reader::read_metadata(folder.path()).expect("read metadata");

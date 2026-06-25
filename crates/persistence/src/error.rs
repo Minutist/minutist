@@ -40,6 +40,21 @@ impl From<audiopus::Error> for Error {
     }
 }
 
+impl From<notes_crdt::Error> for Error {
+    fn from(e: notes_crdt::Error) -> Self {
+        // The notes-CRDT error is a strict subset of this crate's variants
+        // (the leaf carries none of the libsql / audiopus cases), so each maps
+        // onto its `persistence` counterpart 1:1.
+        match e {
+            notes_crdt::Error::Io(inner) => Error::Io(inner),
+            notes_crdt::Error::FolderExists(path) => Error::FolderExists(path),
+            notes_crdt::Error::Serialise(inner) => Error::Serialise(inner),
+            notes_crdt::Error::InvalidState(msg) => Error::InvalidState(msg),
+            notes_crdt::Error::MeetingNotFound(id) => Error::MeetingNotFound(id),
+        }
+    }
+}
+
 impl From<Error> for AppError {
     fn from(e: Error) -> Self {
         match e {

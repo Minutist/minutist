@@ -11,6 +11,13 @@ authors.workspace = true
 
 [dependencies]
 minutist-common = { path = "../common" }
+# notes-crdt: the extracted notes-CRDT primitives (yrs `ydoc`, `NotesStore`,
+# `MeetingFolder`, the `metadata.json` writer). `persistence` re-exports these at
+# their historical paths so its callers are unchanged. The split keeps the
+# C-heavy graph (libsql / audiopus / ogg) out of `sync`'s compile path. A
+# leaf workspace crate (depends only on `common`); see the dependency table in
+# `architecture/components.md`.
+notes-crdt = { path = "../notes-crdt" }
 audiopus = { workspace = true }
 chrono = { workspace = true }
 libsql = { workspace = true }
@@ -30,12 +37,6 @@ tracing = { workspace = true }
 # uuid: voiceprints.rs mints identity/centroid/contribution primary keys and
 # parses them back from the TEXT columns (issue #0003 VoiceprintStore).
 uuid = { workspace = true }
-# yrs: the Yjs CRDT port. `persistence` stores the authoritative per-meeting
-# notes document as `notes.ydoc` (lib0 v2 whole-state blob) and derives
-# `notes.json` / `notes.md` from it. A third-party dependency (like sha2 /
-# libsql / audiopus), not a crate-to-crate edge. See
-# `planning/DESIGN_notes-crdt.md` D-O2.1/D-O2.2/D-O2.4.
-yrs = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

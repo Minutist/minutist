@@ -22,7 +22,8 @@ role when work is parallel.
 | `diarizer` | ml-runtime-engineer | `crates/diarizer/**` | Same | `common` |
 | `summariser` | ml-runtime-engineer | `crates/summariser/**` | Same | `common` |
 | `model-registry` | ml-runtime-engineer | `crates/model-registry/**` | Same | `common`, `settings` |
-| `persistence` | data-engineer | `crates/persistence/**` | Same | `common` |
+| `notes-crdt` | data-engineer | `crates/notes-crdt/**` | Same | `common` |
+| `persistence` | data-engineer | `crates/persistence/**` | Same | `common`, `notes-crdt` |
 | `doc-convert` | data-engineer | `crates/doc-convert/**` | Same | `common` only — NO other workspace-component edge |
 | `settings` | data-engineer | `crates/settings/**` | Same | `common` |
 | `orchestrator` | systems-engineer | `crates/orchestrator/**` | Same | `common` + all live-pipeline crates per table in `components.md` |
@@ -30,7 +31,7 @@ role when work is parallel.
 | `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
 | `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |
-| `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `persistence` |
+| `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `notes-crdt` |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | `headless` (bin) | systems-engineer | `crates/headless/**` | Same | `common`, `persistence`, `sync`, `settings` |
@@ -142,9 +143,21 @@ crates among agents — possible because the crates don't depend on each
 other.
 
 ### `data-engineer`
-Owns persistence and settings. Knowledge expected: libsql, SQLite schema
-migrations, file-format design (Opus encode, Tiptap JSON), settings
-store semantics.
+Owns persistence, the notes-CRDT leaf, and settings. Knowledge expected:
+libsql, SQLite schema migrations, file-format design (Opus encode, Tiptap
+JSON), the Yjs (`yrs`) CRDT and its lib0 v1/v2 encodings, settings store
+semantics.
+
+`notes-crdt` is a leaf carved out of `persistence` (depends only on `common`):
+the Yjs `ydoc` JSON↔CRDT conversion, the `NotesStore` reader/writer for
+`notes.ydoc` + its `notes.json` / `notes.md` projections, the `MeetingFolder`
+layout, and the `metadata.json` writer. `persistence` depends on it and
+re-exports every symbol at the historical `persistence::*` paths, so the split
+is invisible to `persistence`'s consumers. The extraction exists so `sync` can
+transport / merge the notes CRDT without pulling in `persistence`'s C-heavy
+graph (libsql / audiopus / ogg) — which is what lets `sync`'s lib cross-compile
+to mobile targets. `notes-crdt` owns no other crate's domain logic and takes no
+edge beyond `common`.
 
 ### `systems-engineer`
 Owns orchestrator, IPC bridge, and the app-main wiring. The connective
@@ -168,9 +181,15 @@ under one role.
 connective tissue (the device-to-device iroh sync engine), it shares the
 `connected`-feature gating with `mcp-server` / `tunnel-client`, and `app-main`
 (systems-engineer) is the assembler that injects its config and wires it behind
-the feature in S5. It depends only on `common` (shared types) and `persistence`
-(the notes-CRDT store + meeting-media paths it transports) — it owns no domain
-logic of another crate, so it stays a near-leaf under one role.
+the feature in S5. It depends only on `common` (shared types) and `notes-crdt`
+(the `NotesStore` it reads/merges + `MeetingFolder::ensure` for inbound folders)
+— it owns no domain logic of another crate, so it stays a near-leaf under one
+role. It does NOT depend on `persistence`: the notes-CRDT primitives were
+extracted into the leaf `notes-crdt` crate so `sync`'s lib stays off the C-heavy
+graph and cross-compiles to mobile. The meeting-media path (`audio.opus` +
+`assets/*`) is written by `sync` itself under the meetings root after
+`MeetingFolder::ensure`; `persistence::assets` (which stays in `persistence`)
+is reached only as a DEV-dependency by `sync`'s integration tests.
 
 `headless` (WS4-B) is systems-engineer for the same reason as `sync` /
 `tunnel-client` / `mcp-server`: it is connective tissue, not a domain. It is the

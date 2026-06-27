@@ -566,14 +566,21 @@ derived outputs, and is by construction the sole `Artifacts` sender (so no
 version field is needed on derived outputs).
 
 **Transport is NOT in `common`:** `metadata.json` does not sync today, so the
-lifecycle has no transport on its own. It rides a new bidirectional
-Discovery/lifecycle `StreamKind` in `sync` (carrying `(MeetingId,
-ProcessingLifecycle)` per meeting, also completing the deferred S5 meeting-list
-discovery) — NOT `metadata.json`-as-a-blob, NOT the `Artifacts` frame (which is
+lifecycle has no transport on its own. It rides the bidirectional
+`StreamKind::Discovery` (tag `3`, **appended** so the tag stays the wire
+contract) in `sync`'s `discovery_proto` — **built**: each side advertises the
+`(MeetingId, ProcessingLifecycle)` of every meeting it holds over one
+length-prefixed JSON frame each way, also completing the deferred meeting-list
+discovery. NOT `metadata.json`-as-a-blob, NOT the `Artifacts` frame (which is
 processor→consumer derived outputs, and the claim must propagate *before*
-processing), NOT the notes-CRDT. That `StreamKind` and the receive path that
-writes the propagated `processing` into the local `metadata.json` are `sync`'s
-domain, landed as separate PRs gated on this one. Full design + the binding §7
+processing), NOT the notes-CRDT. `sync` *reads* a meeting's `processing` from its
+`metadata.json` (via `common::MeetingMeta` + `serde_json` — both already `sync`
+deps, so no new edge) to advertise, and **emits** each received `(MeetingId,
+ProcessingLifecycle)` on `SyncEngine::subscribe_lifecycle_events`; it never
+*writes* `metadata.json` (it has no `persistence` edge). The consumer that
+persists a received state via `persistence::apply_processing_lifecycle` lives in
+a crate depending on both `sync` and `persistence` (`ipc-bridge` / `headless`).
+`SyncEngine::discover_with` is the initiator surface. Full design + the binding §7
 decisions: `planning/DESIGN_processing-lifecycle.md`.
 
 Adding these types is an architecture-owner change. The dependency table at the

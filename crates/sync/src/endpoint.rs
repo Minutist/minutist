@@ -40,14 +40,14 @@ use iroh::{
     RelayUrl,
 };
 use iroh_tickets::endpoint::EndpointTicket;
-use minutist_common::MeetingId;
+use minutist_common::{MeetingId, ProcessingLifecycle};
 use tokio::sync::broadcast;
 
 use crate::address_lookup::PeerDirectory;
 use crate::blobs::BlobStore;
 use crate::identity::DeviceIdentity;
 use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
-use crate::{media_proto, Error, Result, SyncConfig};
+use crate::{discovery_proto, media_proto, Error, Result, SyncConfig};
 
 /// Owns the iroh endpoint, the out-of-band peer directory, the content-addressed
 /// blob store, and the router that accepts inbound sync connections for one
@@ -75,11 +75,24 @@ pub struct SyncEngine {
     /// [`broadcast::error::RecvError::Lagged`] by reconciling all known peers
     /// ([`Self::peer_ids`]); no arrival is then permanently missed.
     peer_events: broadcast::Sender<EndpointId>,
+    /// Fires each `(MeetingId, ProcessingLifecycle)` received from a discovery
+    /// exchange ([`crate::discovery_proto`]). A consumer in a crate depending on
+    /// both `sync` and `persistence` (ipc-bridge / headless) subscribes via
+    /// [`Self::subscribe_lifecycle_events`] and persists each via
+    /// `persistence::apply_processing_lifecycle` — `sync` has no `persistence`
+    /// edge, so it emits rather than writes. Bounded; a consumer that hits
+    /// [`broadcast::error::RecvError::Lagged`] recovers by re-running discovery.
+    lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
 }
 
 /// Capacity of the peer-arrived broadcast channel. Small by design: a lagging hub
 /// subscriber drops the oldest ids, which the next inbound connection re-fires.
 const PEER_EVENTS_CAP: usize = 64;
+
+/// Capacity of the discovery lifecycle-event broadcast channel. Larger than the
+/// peer-arrival channel because one discovery exchange emits one event per
+/// meeting; a lagging consumer re-runs discovery to recover.
+const LIFECYCLE_EVENTS_CAP: usize = 256;
 
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
@@ -112,8 +125,15 @@ impl SyncEngine {
         );
 
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
-        let router =
-            Self::build_router(&endpoint, &blobs, &peers, &meetings_root, peer_events.clone());
+        let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
+        let router = Self::build_router(
+            &endpoint,
+            &blobs,
+            &peers,
+            &meetings_root,
+            peer_events.clone(),
+            lifecycle_events.clone(),
+        );
 
         Ok(Self {
             endpoint,
@@ -123,6 +143,7 @@ impl SyncEngine {
             meetings_root,
             relay_url: config.relay_url,
             peer_events,
+            lifecycle_events,
         })
     }
 
@@ -137,6 +158,7 @@ impl SyncEngine {
         peers: &PeerDirectory,
         meetings_root: &Path,
         peer_events: broadcast::Sender<EndpointId>,
+        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
     ) -> Router {
         let blobs_protocol = iroh_blobs::BlobsProtocol::new(blobs.inner(), None);
         Router::builder(endpoint.clone())
@@ -148,6 +170,7 @@ impl SyncEngine {
                     blobs.clone(),
                     endpoint.clone(),
                     peer_events,
+                    lifecycle_events,
                 ),
             )
             .accept(
@@ -175,8 +198,15 @@ impl SyncEngine {
             .await
             .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
-        let router =
-            Self::build_router(&endpoint, &blobs, &peers, &meetings_root, peer_events.clone());
+        let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
+        let router = Self::build_router(
+            &endpoint,
+            &blobs,
+            &peers,
+            &meetings_root,
+            peer_events.clone(),
+            lifecycle_events.clone(),
+        );
         Ok(Self {
             endpoint,
             router,
@@ -187,6 +217,7 @@ impl SyncEngine {
             // no relay URL; `push_all_to` is unused here.
             relay_url: String::new(),
             peer_events,
+            lifecycle_events,
         })
     }
 
@@ -274,25 +305,25 @@ impl SyncEngine {
         self.peer_events.subscribe()
     }
 
+    /// Subscribe to discovery lifecycle events: each `(MeetingId,
+    /// ProcessingLifecycle)` this device receives from a peer's discovery
+    /// exchange (inbound via the accept loop, or outbound via
+    /// [`Self::discover_with`]). The consumer — in a crate depending on both
+    /// `sync` and `persistence` (ipc-bridge / headless) — persists each via
+    /// `persistence::apply_processing_lifecycle`; `sync` has no `persistence`
+    /// edge, so it emits rather than writes. Bounded: a consumer that hits
+    /// [`broadcast::error::RecvError::Lagged`] recovers by re-running discovery.
+    pub fn subscribe_lifecycle_events(
+        &self,
+    ) -> broadcast::Receiver<(MeetingId, ProcessingLifecycle)> {
+        self.lifecycle_events.subscribe()
+    }
+
     /// The meeting ids this device holds on disk — the `{uuid}` folders directly
     /// under [`Self::meetings_root`] (the dot-prefixed `.blobs` store and any
     /// non-UUID entry are skipped).
     pub fn local_meetings(&self) -> Vec<MeetingId> {
-        let mut out = Vec::new();
-        let Ok(entries) = std::fs::read_dir(&self.meetings_root) else {
-            return out;
-        };
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                if let Ok(uuid) = uuid::Uuid::parse_str(name) {
-                    out.push(MeetingId(uuid));
-                }
-            }
-        }
-        out
+        discovery_proto::list_meeting_ids(&self.meetings_root)
     }
 
     /// Reconcile EVERY meeting this device holds with `peer`, addressed relay-only
@@ -357,6 +388,37 @@ impl SyncEngine {
         let result = notes_proto::initiate_notes_sync(&conn, &self.meetings_root, meeting_id).await;
         conn.close(0u32.into(), b"notes-sync-done");
         result
+    }
+
+    /// Run a discovery exchange with `peer`: dial it on the [`SYNC_ALPN`] and run
+    /// the initiator side ([`discovery_proto::initiate_discovery`]), learning the
+    /// peer's `(MeetingId, ProcessingLifecycle)` for every meeting it holds. Each
+    /// received state is emitted on the lifecycle-event surface
+    /// ([`Self::subscribe_lifecycle_events`]) for a consumer to persist; the
+    /// returned ids are the peer's meeting list (the meeting-list discovery — the
+    /// caller reconciles any it lacks via [`Self::sync_notes`] / [`Self::sync_media`]).
+    ///
+    /// TODO(lifecycle-wiring): §7 requires discovery to ride *alongside* a
+    /// meeting's notes/media sync session, so receiving a meeting always brings
+    /// its lifecycle in the same session rather than a skippable separate round.
+    /// This is the standalone transport; the orchestrator wiring that folds it
+    /// into the per-meeting session, and the ipc-bridge/headless subscriber that
+    /// persists the emitted `(MeetingId, ProcessingLifecycle)` via
+    /// `persistence::apply_processing_lifecycle`, are the follow-on steps —
+    /// `discover_with` / [`Self::subscribe_lifecycle_events`] have no non-test
+    /// callers until then.
+    pub async fn discover_with(&self, peer: impl Into<EndpointAddr>) -> Result<Vec<MeetingId>> {
+        let conn = self.connect(peer).await?;
+        let result = discovery_proto::initiate_discovery(&conn, &self.meetings_root).await;
+        conn.close(0u32.into(), b"discovery-done");
+        let theirs = result?;
+        let ids = theirs.iter().map(|e| e.meeting_id).collect();
+        for entry in theirs {
+            let _ = self
+                .lifecycle_events
+                .send((entry.meeting_id, entry.processing));
+        }
+        Ok(ids)
     }
 
     /// Reconcile one meeting's media (`audio.opus` + note assets) with `peer`:
@@ -471,6 +533,9 @@ struct AcceptHook {
     /// Fires the remote's id once it is authorised, so an always-on hub can push
     /// back (see [`SyncEngine::subscribe_peer_events`]).
     peer_events: broadcast::Sender<EndpointId>,
+    /// Fires each `(MeetingId, ProcessingLifecycle)` received on an inbound
+    /// discovery exchange (see [`SyncEngine::subscribe_lifecycle_events`]).
+    lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
 }
 
 impl AcceptHook {
@@ -480,6 +545,7 @@ impl AcceptHook {
         blobs: BlobStore,
         endpoint: Endpoint,
         peer_events: broadcast::Sender<EndpointId>,
+        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
     ) -> Self {
         Self {
             meetings_root,
@@ -487,6 +553,7 @@ impl AcceptHook {
             blobs,
             endpoint,
             peer_events,
+            lifecycle_events,
         }
     }
 }
@@ -555,6 +622,25 @@ impl AcceptHook {
                     &self.meetings_root,
                 )
                 .await
+            }
+            StreamKind::Discovery => {
+                let theirs = discovery_proto::respond_discovery(
+                    connection,
+                    &mut send,
+                    &mut recv,
+                    &self.meetings_root,
+                )
+                .await?;
+                // Emit each received state for a consumer to persist via
+                // `persistence::apply_processing_lifecycle`. Best-effort: `send`
+                // errors only when there is no receiver (the desktop with no
+                // subscriber), which is fine.
+                for entry in theirs {
+                    let _ = self
+                        .lifecycle_events
+                        .send((entry.meeting_id, entry.processing));
+                }
+                Ok(())
             }
         }
     }

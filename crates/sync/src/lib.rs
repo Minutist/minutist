@@ -28,6 +28,7 @@
 
 pub mod address_lookup;
 pub mod blobs;
+pub mod discovery_proto;
 pub mod endpoint;
 pub mod frame;
 pub mod identity;

@@ -185,6 +185,36 @@ pub async fn apply_processing_lifecycle(
     Ok(())
 }
 
+/// Apply a peer-advertised processing-lifecycle state to a meeting we hold, or
+/// skip it if that meeting is not present locally yet.
+///
+/// The lifecycle consumer (the `ipc-bridge` / `headless` subscriber to the sync
+/// engine's lifecycle-event stream) calls this for each `(MeetingId,
+/// ProcessingLifecycle)` a discovery exchange surfaces. Discovery advertises the
+/// PEER's meetings, which we may not have synced yet — for those, applying would
+/// be premature (the notes/media receive path seeds the folder, not the
+/// lifecycle stream), so this returns `Ok(false)` rather than erroring. For a
+/// meeting we do hold it delegates to [`apply_processing_lifecycle`] and returns
+/// `Ok(true)`.
+///
+/// Keeping this in `persistence` keeps the meeting-folder layout owned here: the
+/// subscriber never constructs `{meetings_root}/{uuid}` paths itself.
+pub async fn apply_synced_lifecycle_if_present(
+    meetings_root: &Path,
+    id: MeetingId,
+    processing: ProcessingLifecycle,
+) -> AppResult<bool> {
+    if !meetings_root
+        .join(id.0.to_string())
+        .join("metadata.json")
+        .exists()
+    {
+        return Ok(false);
+    }
+    apply_processing_lifecycle(meetings_root, id, processing).await?;
+    Ok(true)
+}
+
 /// Delete a meeting: remove the folder recursively, then remove the index row.
 ///
 /// An absent folder is treated as already-deleted (the index row is still
@@ -392,5 +422,41 @@ mod tests {
         .await
         .expect_err("missing meeting must error");
         assert!(matches!(err, minutist_common::AppError::InvalidInput { .. }));
+    }
+
+    /// `apply_synced_lifecycle_if_present` skips a meeting we don't hold
+    /// (`Ok(false)`, no error) and applies one we do (`Ok(true)`, metadata
+    /// updated) — the consumer-side gating for peer-advertised lifecycle.
+    #[tokio::test]
+    async fn test_apply_synced_lifecycle_if_present() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+
+        // A meeting not present locally is skipped, not an error.
+        let absent = MeetingId::new();
+        let applied = super::apply_synced_lifecycle_if_present(
+            root,
+            absent,
+            ProcessingLifecycle::PendingProcessing,
+        )
+        .await
+        .expect("skipping an unsynced meeting must not error");
+        assert!(!applied, "an unsynced meeting must be skipped");
+
+        // A meeting we hold is applied and its metadata.json updated.
+        let id = write_meta_with_no_names(root);
+        let folder = root.join(id.0.to_string());
+        let processed = ProcessingLifecycle::Processed {
+            processed_by: HostRef("endpoint-xyz".to_string()),
+            at: "2026-06-27T10:25:00Z".to_string(),
+        };
+        let applied = super::apply_synced_lifecycle_if_present(root, id, processed.clone())
+            .await
+            .expect("applying a present meeting must succeed");
+        assert!(applied, "a present meeting must be applied");
+        assert_eq!(
+            read_metadata(&folder).expect("read after apply").processing,
+            processed
+        );
     }
 }

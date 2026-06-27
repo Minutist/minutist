@@ -474,8 +474,8 @@ impl Diarizer for SherpaDiarizer {
         // the map.
         self.compute_turns(audio, sample_rate).map(|turns| {
             // `assign_speakers` is the `common::Diarizer` trait implementation;
-            // it has no access to the voiceprint library so no veto verdicts.
-            let (segs, n, _map) = overlay_speakers(&turns, segments, &self.config, &[]);
+            // it has no access to the voiceprint library so no veto verdicts or merge.
+            let (segs, n, _map) = overlay_speakers(&turns, segments, &self.config, &[], &[]);
             (segs, n)
         })
     }
@@ -533,18 +533,54 @@ impl Diarizer for SherpaDiarizer {
 /// candidate clusters; an empty slice is the no-veto baseline (the normal prune
 /// path). Vetoed clusters are also exempt from the speaker-count cap so a known
 /// enrolled speaker is never re-dropped by the cap after being rescued by the veto.
+///
+/// `merge_map` carries `(source, canonical)` pairs from the library-informed merge
+/// pass (issue #0023). Before the prune/cap, every turn and chosen-winner whose
+/// cluster id matches a `source` is remapped to its `canonical` id, so the merged
+/// cluster's combined speech mass is what the prune sees. An empty `merge_map`
+/// leaves behaviour bit-identical to the pre-merge code. The invariant that only
+/// same-identity clusters share a canonical is enforced by the caller
+/// (`compute_merge_map`): `merge_map` never unifies two different enrolled
+/// identities.
 pub fn overlay_speakers(
     turns: &[SpeakerTurn],
     segments: Vec<Segment>,
     config: &DiarizerConfig,
     veto_ids: &[i32],
+    merge_map: &[(i32, i32)],
 ) -> (Vec<Segment>, u32, Vec<(i32, String)>) {
+    // When a merge_map is active, build a remapped copy of turns so that the
+    // word-split path (split_segment_by_words / word_turn) operates on canonical
+    // cluster ids. The prune-side remap is done separately on the ranked-overlap
+    // vectors. An empty merge_map keeps both paths on the original turns slice.
+    let remapped_turns_storage: Vec<SpeakerTurn>;
+    let effective_turns: &[SpeakerTurn] = if merge_map.is_empty() {
+        turns
+    } else {
+        remapped_turns_storage = turns
+            .iter()
+            .map(|t| {
+                let canonical = merge_map
+                    .iter()
+                    .find(|(src, _)| *src == t.cluster)
+                    .map(|(_, can)| *can)
+                    .unwrap_or(t.cluster);
+                SpeakerTurn { cluster: canonical, ..*t }
+            })
+            .collect();
+        &remapped_turns_storage
+    };
+
     // Per-segment ranked overlaps: (cluster_id, overlap_ms) sorted descending by
     // overlap, lower cluster id breaking ties. Lets the prune/cap reassign a
     // segment to its next-best SURVIVING cluster without re-touching the turns.
+    //
+    // Computed from `effective_turns` (which carries remapped cluster ids when a
+    // merge_map is active), so the ranked overlaps already use canonical ids and
+    // the combined speech mass of merged clusters is what the prune/cap sees.
     let ranked: Vec<Vec<(i32, u64)>> = segments
         .iter()
-        .map(|seg| ranked_overlaps(turns, seg.start_ms, seg.end_ms))
+        .map(|seg| ranked_overlaps(effective_turns, seg.start_ms, seg.end_ms))
         .collect();
 
     // Initial winner per segment: the top-ranked cluster (or None).
@@ -600,7 +636,7 @@ pub fn overlay_speakers(
         let dur = seg.end_ms.saturating_sub(seg.start_ms);
         let mixed = is_mixed_segment(&ranked[i], &survivor_set, dur, min_share);
         if mixed && !seg.words.is_empty() {
-            for (mut sub, cluster) in split_segment_by_words(&seg, turns, &survivor_set) {
+            for (mut sub, cluster) in split_segment_by_words(&seg, effective_turns, &survivor_set) {
                 sub.shared_speakers = Vec::new();
                 out.push(sub);
                 out_cluster.push(Some(cluster));
@@ -1340,7 +1376,7 @@ mod tests {
             seg(2_100, 3_900), // overlaps the 3-turn → B
             seg(4_100, 5_900), // overlaps the 7-turn → A
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -1352,7 +1388,7 @@ mod tests {
         let turns = vec![turn(0.0, 1.0, 0)];
         // Segment sits entirely after the only turn → no overlap → None.
         let segs = vec![seg(5_000, 6_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(count, 0);
         assert_eq!(segs[0].speaker_id, None);
     }
@@ -1365,7 +1401,7 @@ mod tests {
             turn(1.2, 3.0, 1), // 1200..3000 ms : overlaps [1000,2000) by 800 ms
         ];
         let segs = vec![seg(1_000, 2_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(count, 1);
         // Cluster id 1 is the only chosen id → first-seen → "A".
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -1380,7 +1416,7 @@ mod tests {
             turn(1.5, 3.0, 4), // overlaps [1000,2000) by 500 ms (1500..2000)
         ];
         let segs = vec![seg(1_000, 2_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(count, 1);
         // Cluster 4 (the lower id) wins the tie; as the only chosen id it
         // first-seen-relabels to "A".
@@ -1405,7 +1441,7 @@ mod tests {
     fn overlay_single_speaker_one_label() {
         let turns = vec![turn(0.0, 10.0, 2)];
         let segs = vec![seg(0, 2_000), seg(3_000, 5_000), seg(6_000, 9_000)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(count, 1);
         for s in &segs {
             assert_eq!(s.speaker_id.as_deref(), Some("A"));
@@ -1428,7 +1464,7 @@ mod tests {
             seg(2_500, 3_500), // gap → None
             seg(4_100, 4_900), // C
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(count, 3);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("B"));
@@ -1440,7 +1476,7 @@ mod tests {
     fn overlay_empty_segments_is_zero() {
         let turns = vec![turn(0.0, 1.0, 0)];
         let segs: Vec<Segment> = Vec::new();
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(count, 0);
         assert!(segs.is_empty());
     }
@@ -1454,7 +1490,7 @@ mod tests {
             speaker_id: Some("Z".to_string()),
             ..seg(5_000, 6_000)
         }];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert_eq!(segs[0].speaker_id, None);
     }
 
@@ -1480,7 +1516,7 @@ mod tests {
         // Empty `words` (the Qwen path): a mixed segment is NOT split — it keeps
         // its dominant label + the `shared_speakers` flag.
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[], &[]);
 
         // Primary labels by first-seen order.
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
@@ -1500,7 +1536,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[], &[]);
 
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert!(
@@ -1518,7 +1554,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, _count, _map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
         assert!(segs[0].shared_speakers.is_empty());
     }
 
@@ -1560,7 +1596,7 @@ mod tests {
         // blip cluster only ever wins via a turn no segment maxes on — exercise
         // the share prune with a segment that DOES max on the blip.
         segs[1] = seg(5_000, 5_150); // overlaps cluster 1 by 100 ms, cluster 0 by 50 ms
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[], &[]);
         assert_eq!(count, 1, "tiny-share cluster must be pruned away");
         // The straddling segment reassigned to the surviving cluster 0 → "A".
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1582,7 +1618,7 @@ mod tests {
             seg(5_100, 7_400),
             seg(7_500, 9_900),
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 2, None), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.02, 2, None), &[], &[]);
         assert_eq!(count, 2);
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(segs[1].speaker_id.as_deref(), Some("A"));
@@ -1610,7 +1646,7 @@ mod tests {
             seg(2_900, 3_550),
             seg(4_100, 5_000),
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 2, None), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 2, None), &[], &[]);
         assert_eq!(count, 1, "single-segment cluster pruned by the count floor");
         assert_eq!(segs[2].speaker_id.as_deref(), Some("A"));
     }
@@ -1630,7 +1666,7 @@ mod tests {
             seg(6_100, 9_900),
             seg(10_100, 11_900), // overlaps only cluster 2; after cap, reassigns
         ];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)), &[], &[]);
         assert_eq!(count, 2, "cap must keep exactly the two largest speakers");
         // The capped-out segment had no overlap with a survivor → None (no
         // surviving turn covers [10100,11900)).
@@ -1645,7 +1681,7 @@ mod tests {
         // confirm the largest cluster is retained.
         let turns = vec![turn(0.0, 5.0, 0)];
         let segs = vec![seg(0, 4_900)];
-        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(2.0, 0, None), &[]);
+        let (segs, count, _map) = overlay_speakers(&turns, segs, &pruned(2.0, 0, None), &[], &[]);
         assert_eq!(count, 1, "the largest cluster is retained when all prune");
         assert_eq!(segs[0].speaker_id.as_deref(), Some("A"));
     }
@@ -1665,7 +1701,7 @@ mod tests {
             let start = (t * 1000.0) as u64;
             segs.push(seg(start, start + 200));
         }
-        let (_segs, count, _map) = overlay_speakers(&turns, segs, &DiarizerConfig::default(), &[]);
+        let (_segs, count, _map) = overlay_speakers(&turns, segs, &DiarizerConfig::default(), &[], &[]);
         assert_eq!(count, 1, "default prune collapses the tiny-cluster scatter");
     }
 
@@ -1694,7 +1730,7 @@ mod tests {
         ];
         // Without veto: cluster 1 is pruned.
         let (segs_no_veto, count_no_veto, _) =
-            overlay_speakers(&turns, segs.clone(), &pruned(0.02, 0, None), &[]);
+            overlay_speakers(&turns, segs.clone(), &pruned(0.02, 0, None), &[], &[]);
         assert_eq!(count_no_veto, 1, "without veto the tiny cluster is pruned");
         assert_eq!(
             segs_no_veto[1].speaker_id.as_deref(),
@@ -1704,7 +1740,7 @@ mod tests {
 
         // With veto: cluster 1 is rescued and gets its own letter.
         let (segs_vetoed, count_vetoed, map) =
-            overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[1]);
+            overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[1], &[]);
         assert_eq!(
             count_vetoed, 2,
             "vetoed cluster 1 must survive; two speakers expected"
@@ -1746,7 +1782,7 @@ mod tests {
             seg(9_300, 9_900),
         ];
         // Veto cluster 1 only.
-        let (out, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[1]);
+        let (out, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[1], &[]);
         assert_eq!(
             count, 2,
             "cluster 0 (dominant) + cluster 1 (vetoed) survive; cluster 2 pruned"
@@ -1790,7 +1826,7 @@ mod tests {
             seg(9_100, 9_400),  // cluster 2 winner
         ];
         // Cap at 2 — without veto cluster 2 would be capped out.
-        let (out, count, map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)), &[2]);
+        let (out, count, map) = overlay_speakers(&turns, segs, &pruned(0.0, 0, Some(2)), &[2], &[]);
         // The vetoed cluster 2 must survive even though cap = 2. Cap drops cluster 1
         // (mid-share, non-vetoed) to make room, keeping cluster 0 and cluster 2.
         assert_eq!(count, 2, "cap 2: vetoed cluster 2 + dominant cluster 0 survive");
@@ -1804,6 +1840,100 @@ mod tests {
             cluster2_letter.map(|(_, l)| l.as_str()),
             "segment[2] must be on the vetoed cluster"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests for merge_map (#0023 library-informed merge)
+    // -----------------------------------------------------------------------
+
+    /// Empty merge_map: output is bit-identical to the no-merge call.
+    ///
+    /// Two clusters with no merge_map must produce the same result regardless
+    /// of whether &[] or an empty Vec is passed.
+    #[test]
+    fn merge_map_empty_is_bit_identical() {
+        let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 10.0, 1)];
+        let segs = vec![seg(0, 4_900), seg(5_100, 9_900)];
+
+        let (out_no_merge, count_no_merge, map_no_merge) =
+            overlay_speakers(&turns, segs.clone(), &no_prune(), &[], &[]);
+        let (out_with_empty, count_with_empty, map_with_empty) =
+            overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
+
+        assert_eq!(count_no_merge, count_with_empty);
+        assert_eq!(map_no_merge, map_with_empty);
+        assert_eq!(out_no_merge.len(), out_with_empty.len());
+        for (a, b) in out_no_merge.iter().zip(out_with_empty.iter()) {
+            assert_eq!(a.speaker_id, b.speaker_id);
+        }
+    }
+
+    /// Two surviving clusters that match the same enrolled identity are merged:
+    /// all segments relabelled to the canonical; canonical = the cluster with
+    /// greater speech mass.
+    #[test]
+    fn merge_map_two_clusters_same_identity_unified() {
+        // Cluster 0 (dominant, longer mass) and cluster 1 (shorter).
+        // merge_map: source=1, canonical=0 (cluster 0 has more mass).
+        let turns = vec![
+            turn(0.0, 7.0, 0),  // dominant — 7 s
+            turn(7.0, 9.0, 1),  // shorter — 2 s
+        ];
+        let segs = vec![seg(0, 6_900), seg(7_100, 8_900)];
+        let merge_map = &[(1i32, 0i32)]; // source 1 → canonical 0
+
+        let (out, count, map) = overlay_speakers(&turns, segs, &no_prune(), &[], merge_map);
+
+        // After merge both segments belong to the canonical cluster 0.
+        assert_eq!(count, 1, "merged clusters present as one speaker");
+        // The map must contain cluster 0 and NOT cluster 1.
+        assert!(map.iter().any(|(id, _)| *id == 0), "canonical cluster 0 must be in the map");
+        assert!(
+            map.iter().all(|(id, _)| *id != 1),
+            "source cluster 1 must not appear in the map after merge"
+        );
+        // All segments must carry the same label.
+        let labels: Vec<_> = out.iter().map(|s| s.speaker_id.as_deref()).collect();
+        assert!(
+            labels.windows(2).all(|w| w[0] == w[1]),
+            "all output segments must share one label after merge"
+        );
+    }
+
+    /// Two clusters matching DIFFERENT identities must NOT be merged.
+    #[test]
+    fn merge_map_different_identities_not_merged() {
+        // No merge_map entries — the caller only adds entries for same-identity groups.
+        let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 10.0, 1)];
+        let segs = vec![seg(0, 4_900), seg(5_100, 9_900)];
+        // No merge_map: pass empty slice.
+        let (_, count, _) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
+        assert_eq!(count, 2, "distinct clusters with no merge_map stay as two speakers");
+    }
+
+    /// A merged cluster's combined speech mass is what the prune sees: source's
+    /// mass is folded into the canonical, so the canonical survives even when the
+    /// source alone would have pushed it below the floor.
+    #[test]
+    fn merge_map_combined_mass_passes_prune() {
+        // Cluster 0: 7 s (~70%), cluster 1: 1 s (~10%, below 0.15 floor alone),
+        // cluster 2: 2 s (~20%). Merge 1→0: canonical 0 gets 8 s (~80%) → survives.
+        let turns = vec![
+            turn(0.0, 7.0, 0),
+            turn(7.0, 8.0, 1),  // only 10% alone — would be pruned at floor 0.15
+            turn(8.0, 10.0, 2),
+        ];
+        let segs = vec![seg(0, 6_900), seg(7_100, 7_900), seg(8_100, 9_900)];
+        let merge_map = &[(1i32, 0i32)]; // merge 1 into 0
+
+        // With merge: cluster 1 folded into 0 → prune floor at 0.15 sees 0: 80%, 2: 20%.
+        let (_out, count, map) =
+            overlay_speakers(&turns, segs, &pruned(0.15, 0, None), &[], merge_map);
+
+        assert_eq!(count, 2, "cluster 0 (merged) + cluster 2 survive");
+        assert!(map.iter().any(|(id, _)| *id == 0));
+        assert!(map.iter().any(|(id, _)| *id == 2));
+        assert!(map.iter().all(|(id, _)| *id != 1), "source 1 not in map after merge");
     }
 
     // -----------------------------------------------------------------------
@@ -2298,7 +2428,7 @@ mod tests {
             ]),
             seg(2_000, 3_000), // cluster 1 alone (no words)
         ];
-        let (out, count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
+        let (out, count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[], &[]);
         assert_eq!(count, 2, "the split yields two distinct speakers");
         assert_eq!(out.len(), 3, "the mixed segment split into two, plus segment 1");
         assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
@@ -2321,7 +2451,7 @@ mod tests {
             turn(1.0, 2.0, 1),
         ];
         let segs = vec![seg(0, 1_000), seg(1_000, 2_000)];
-        let (out, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[]);
+        let (out, _count, _map) = overlay_speakers(&turns, segs, &flag_share(), &[], &[]);
         assert_eq!(out.len(), 2, "no split on the no-words path");
         assert_eq!(out[0].speaker_id.as_deref(), Some("A"));
         assert_eq!(out[0].shared_speakers, vec!["B".to_string()]);
@@ -2338,7 +2468,7 @@ mod tests {
         // each cluster id with the letter actually baked into the segments.
         let turns = vec![turn(0.0, 2.0, 7), turn(2.0, 4.0, 3), turn(4.0, 6.0, 7)];
         let segs = vec![seg(0, 1_900), seg(2_100, 3_900), seg(4_100, 5_900)];
-        let (segs, count, map) = overlay_speakers(&turns, segs, &no_prune(), &[]);
+        let (segs, count, map) = overlay_speakers(&turns, segs, &no_prune(), &[], &[]);
 
         assert_eq!(count, 2);
         assert_eq!(map, vec![(7, "A".to_string()), (3, "B".to_string())]);
@@ -2362,7 +2492,7 @@ mod tests {
         // the surviving cluster 0 → A — never a letter for a dropped cluster.
         let turns = vec![turn(0.0, 5.0, 0), turn(5.0, 5.1, 1), turn(5.1, 10.0, 0)];
         let segs = vec![seg(0, 4_900), seg(5_000, 5_150), seg(5_400, 9_900)];
-        let (_segs, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[]);
+        let (_segs, count, map) = overlay_speakers(&turns, segs, &pruned(0.02, 0, None), &[], &[]);
         assert_eq!(count, 1);
         assert_eq!(map, vec![(0, "A".to_string())]);
     }

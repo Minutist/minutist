@@ -1782,25 +1782,37 @@ OUTSIDE the diarizer (the diarizer must not read the store — no
 `diarizer → persistence` edge is created); the orchestrator computes a verdict
 list and passes it in as `veto_ids: &[i32]`.
 
+**WU9 (issue #0023) — library-informed merge.** Extends the same extractor pass
+to also detect when ≥2 diarizer clusters both match the same enrolled identity
+and unify them before the prune/cap. The merge is computed in `compute_prune_veto_verdicts`
+alongside the veto; a `merge_map: Vec<(i32, i32)>` (source → canonical pairs) is
+threaded through `diarize_split_merge` → `overlay_speakers`. An empty `merge_map`
+is bit-identical to the pre-WU9 call. Gated on `voiceprint_enrolment_enabled`.
+
 **Orchestrator flow (inside `run_diarization_blocking`):**
 
-1. Before the split-backend enters, `compute_prune_veto_verdicts` identifies
-   low-share candidate clusters from the raw `SpeakerTurn` tally — clusters
-   whose total attributed duration is below `DiarizerConfig::min_cluster_share`
-   of the total speech AND which contribute at least `PRUNE_VETO_MIN_WINDOWS`
-   (= 3) complete 1.5 s audio windows (the same noise guard as WU5's
-   `NOISE_GUARD_MIN_WINDOWS`). For each such candidate it extracts a centroid via
-   `VoiceprintExtractor::centroid` and runs `matcher::assign_identities` against
-   the gallery. Clusters where the accept-band verdict fires (`sim >= T_accept`)
-   are returned as `Vec<(i32, String)>` (cluster id, matched display name).
+1. Before the split-backend enters, `compute_prune_veto_verdicts` embeds every
+   cluster from the raw `SpeakerTurn` tally (not only low-share ones — the merge
+   pass needs centroids for all clusters). It runs `matcher::match_each_cluster`
+   (per-cluster independent argmax, collisions allowed) against the gallery.
+
+   - **Veto verdicts**: clusters that are low-share (would be pruned) AND have
+     an accept-band match are collected as `Vec<(i32, String)>` (cluster id,
+     display name).
+   - **Merge map**: clusters grouped by matched identity where the group has
+     ≥2 members. Canonical = the group member with the greatest turn-duration
+     speech mass (tie-break: lowest cluster id). Non-canonical members become
+     `(source, canonical)` pairs in `Vec<(i32, i32)>`.
+
+   Both outputs come from the same single extractor pass — no third pass is added.
 
 2. The `VoiceprintExtractor` is consumed (dropped) before `diarize_split_merge`
    starts the Qwen split backend. Peak VRAM never includes both.
 
-3. `diarize_split_merge` extracts `veto_ids` from the verdict list and passes
-   them into `diarizer::overlay_speakers`. After the merge pass it resolves
-   vetoed cluster ids back to their first-seen letters via the returned
-   cluster→letter map and assembles `veto_names: Vec<(String, String)>`
+3. `diarize_split_merge` extracts `veto_ids` from the verdict list, receives
+   `merge_map`, and passes both into `diarizer::overlay_speakers`. After the
+   overlay it resolves vetoed cluster ids back to their first-seen letters via
+   the returned cluster→letter map and assembles `veto_names: Vec<(String, String)>`
    (letter → matched display name).
 
 4. After `finalise_diarization` (which always clears `speaker_names`), the
@@ -1814,7 +1826,8 @@ and returns a `Vec<StoredVoiceprint>` (best-effort; empty on error). The
 `rediarize` public method accepts `voiceprint_store: Option<&persistence::VoiceprintStore>`,
 loads the gallery at the top of the call, and threads it down through the chain.
 Paths that have no access to the store (the `reprocess` path, stub/test paths)
-pass `None`; the prune-veto is then a no-op (empty veto_ids).
+pass `None`; the prune-veto and merge are then no-ops (empty veto_ids, empty
+merge_map).
 
 **Extractor instantiation.** `build_prune_veto_extractor` is a new async method
 on `Orchestrator` that opens a `VoiceprintExtractor` from the embedding model
@@ -1831,13 +1844,19 @@ entirely and passes `None` to `run_diarization_blocking`.
 A vetoed cluster that would otherwise survive (share above the floor) is unaffected —
 the veto only matters at the boundary.
 
+**Library-merge invariant (binding).** Groups in `merge_map` are keyed by
+`identity_id`, so only clusters matching the SAME enrolled identity ever share
+a canonical. Two clusters matched to different identities can never be merged.
+This is enforced by `compute_prune_veto_verdicts` and must not be bypassed.
+
 **`PRUNE_VETO_MIN_WINDOWS: u64 = 3` (diarizer constant — placeholder).** Matches
 `matcher::NOISE_GUARD_MIN_WINDOWS`. Calibrated in WU6 alongside the acceptance
 thresholds.
 
-**Enrolment-enabled gate (inherited from §4).** The prune-veto path is gated on
-`settings.voiceprint_enrolment_enabled` (default `false`). When OFF, `gallery`
-is never loaded and the extractor is never opened; `veto_ids` is always `&[]`.
+**Enrolment-enabled gate (inherited from §4).** Both the prune-veto and the
+library-informed merge are gated on `settings.voiceprint_enrolment_enabled`
+(default `false`). When OFF, `gallery` is never loaded and the extractor is
+never opened; `veto_ids` and `merge_map` are both always `&[]`.
 
 **WU8 — identity management (issue #0003 §2.9.4, §4).** Five new IPC commands
 and two new `VoiceprintStore` methods complete the management surface:

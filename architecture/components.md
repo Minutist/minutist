@@ -1315,35 +1315,65 @@ this slice is exempt from the share-floor prune AND from the `max_speakers` cap;
 the veto takes priority over both. When `veto_ids` is empty (the default) the
 behaviour is identical to the pre-WU7 code.
 
-Public-signature change:
+**WU9 — library-informed merge (#0023).** `overlay_speakers` accepts a fifth
+argument `merge_map: &[(i32, i32)]`. Each pair `(source, canonical)` remaps the
+source cluster to the canonical before the prune/cap, so the merged cluster's
+combined speech mass is what `surviving_clusters` sees. An empty `merge_map` is
+bit-identical to the pre-WU9 call. The remap is applied via a remapped copy of
+the turns (`effective_turns`), so both the ranked-overlap computation and the
+Parakeet word-split path (`split_segment_by_words` / `word_turn`) operate on
+canonical cluster ids. The orchestrator's `compute_prune_veto_verdicts` now
+embeds all clusters (not only low-share ones) and runs `matcher::match_each_cluster`
+(collisions allowed) to find groups of clusters that match the same enrolled
+identity. Groups with ≥2 members yield `merge_map` entries; the canonical is the
+member with the greatest turn-duration speech mass (tie-break: lowest cluster id).
+`veto_ids` and `merge_map` are derived from the same single extractor pass.
+
+Public-signature change (WU7 + WU9 combined):
 
 ```
 pub fn overlay_speakers(
     turns: &[SpeakerTurn],
     segments: Vec<Segment>,
     config: &DiarizerConfig,
-    veto_ids: &[i32],               // NEW — pass &[] for no veto
+    veto_ids: &[i32],               // WU7 — pass &[] for no veto
+    merge_map: &[(i32, i32)],       // WU8 — pass &[] for no merge
 ) -> (Vec<Segment>, u32, Vec<(i32, String)>)
 ```
 
-`surviving_clusters` (private) gains the same `veto_ids: &[i32]` parameter.
-`assign_speakers` (the one-shot `Diarizer` impl entry point) passes `&[]`
-internally — the veto is only exercised when the orchestrator calls
-`overlay_speakers` directly with a populated list.
+`surviving_clusters` (private) gains the same `veto_ids: &[i32]` parameter from WU7.
+`assign_speakers` (the one-shot `Diarizer` impl entry point) passes `&[]` for both
+— the veto and merge are only exercised when the orchestrator calls
+`overlay_speakers` directly with populated lists.
 
 New constant: `pub const PRUNE_VETO_MIN_WINDOWS: u64 = 3` — the minimum number
 of 1.5 s audio windows a low-share candidate cluster must contribute before the
 orchestrator will attempt to embed it and check it against the gallery. Mirrors
 `matcher::NOISE_GUARD_MIN_WINDOWS`. Value is a placeholder; WU6 calibrates.
 
-No new dependency-table edge: `overlay_speakers` and `surviving_clusters` are
-pure logic consuming only the types already in scope.
+New function in `orchestrator::matcher`: `pub fn match_each_cluster(queries:
+&[QueryCluster], gallery: &[StoredVoiceprint]) -> Vec<(String, Option<(VoiceprintIdentityId,
+f32)>)>` — per-cluster independent argmax, collisions allowed (unlike
+`assign_identities` which is injective). Used by `compute_prune_veto_verdicts`
+for the merge-group pass.
 
-Tests (model-free): `prune_veto_keeps_low_share_enrolled_cluster` (veto cluster
-survives the share-floor), `prune_veto_non_enrolled_cluster_still_pruned` (vetoed
-cluster kept; adjacent non-vetoed cluster still pruned), and
-`prune_veto_exempt_from_cap` (vetoed cluster survives even when cap would exclude
-it, displacing the non-vetoed lowest-share cluster instead).
+No new dependency-table edge: `overlay_speakers`, `surviving_clusters`, and
+`match_each_cluster` are pure logic consuming only types already in scope.
+
+Tests (model-free, diarizer):
+`prune_veto_keeps_low_share_enrolled_cluster` (veto cluster survives the share-floor),
+`prune_veto_non_enrolled_cluster_still_pruned` (vetoed cluster kept; adjacent non-vetoed
+cluster still pruned), `prune_veto_exempt_from_cap` (vetoed cluster survives even when
+cap would exclude it), `merge_map_empty_is_bit_identical` (empty merge_map is a no-op),
+`merge_map_two_clusters_same_identity_unified` (two clusters relabelled to canonical),
+`merge_map_different_identities_not_merged` (empty merge_map → two speakers stay
+separate), `merge_map_combined_mass_passes_prune` (merged mass counted together by prune).
+
+Tests (model-free, matcher): `match_each_cluster_two_clusters_same_identity`
+(collision allowed — both get Alice), `match_each_cluster_two_clusters_different_identities`
+(distinct matches, no collision), `match_each_cluster_unenrolled_stays_none` (no match
+below T_REJECT), `match_each_cluster_margin_too_small_drops_match` (margin guard applies
+per-cluster).
 
 ### `summariser`
 **Crate:** `crates/summariser`

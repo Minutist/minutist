@@ -132,6 +132,120 @@ pub struct QueryCluster {
 }
 
 // ---------------------------------------------------------------------------
+// Per-cluster match (collisions allowed) — merge-pass support
+// ---------------------------------------------------------------------------
+
+/// Per-cluster best-identity match, with collisions allowed.
+///
+/// Unlike [`assign_identities`] (which is a global injective assignment — no
+/// identity can be claimed by two clusters), this function returns the
+/// **independent argmax** for each query cluster: the identity with the highest
+/// cosine over its gallery centroids, accepted only when:
+///
+/// - `sim >= T_ACCEPT` (or `T_ACCEPT_NOISY` when `window_count <
+///   NOISE_GUARD_MIN_WINDOWS`), AND
+/// - the winning identity beats the runner-up identity for the same query by at
+///   least `MIN_MARGIN`.
+///
+/// Two clusters can independently match the **same** identity (a collision);
+/// that is exactly the signal the library-informed merge pass needs to detect
+/// two diarizer clusters that belong to one enrolled speaker.
+///
+/// Returns one entry per query cluster: `(query_label, Option<(identity_id,
+/// sim)>)`. An entry with `None` means no identity cleared the accept threshold
+/// + margin for that cluster.
+///
+/// Pure function; reuses the same threshold constants as `assign_identities`.
+/// No new dependency edge (already in the orchestrator).
+pub fn match_each_cluster(
+    queries: &[QueryCluster],
+    gallery: &[StoredVoiceprint],
+) -> Vec<(String, Option<(VoiceprintIdentityId, f32)>)> {
+    if queries.is_empty() || gallery.is_empty() {
+        return queries
+            .iter()
+            .map(|q| (q.label.clone(), None))
+            .collect();
+    }
+
+    // Group gallery centroids by identity (same as assign_identities).
+    let mut identity_centroids: HashMap<VoiceprintIdentityId, Vec<&[f32]>> = HashMap::new();
+    for entry in gallery {
+        identity_centroids
+            .entry(entry.identity_id)
+            .or_default()
+            .push(&entry.embedding);
+    }
+
+    let mut result: Vec<(String, Option<(VoiceprintIdentityId, f32)>)> =
+        Vec::with_capacity(queries.len());
+
+    for query in queries {
+        if query.centroid.is_empty() {
+            result.push((query.label.clone(), None));
+            continue;
+        }
+
+        // Score every identity independently for this query.
+        let mut scores: Vec<(VoiceprintIdentityId, f32)> = identity_centroids
+            .iter()
+            .filter_map(|(&id, centroids)| {
+                let best_sim = centroids
+                    .iter()
+                    .map(|c| {
+                        if c.is_empty() {
+                            -1.0f32
+                        } else {
+                            minutist_common::voiceprint_math::cosine_unit(&query.centroid, c)
+                        }
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max);
+                // Only keep candidates above the reject floor (T_REJECT).
+                if best_sim >= T_REJECT {
+                    Some((id, best_sim))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if scores.is_empty() {
+            result.push((query.label.clone(), None));
+            continue;
+        }
+
+        // Sort descending so [0] is the winner and [1] (if any) is the runner-up.
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let (winner_id, winner_sim) = scores[0];
+        let runner_up_sim = scores.get(1).map(|s| s.1).unwrap_or(0.0f32);
+        let margin = winner_sim - runner_up_sim.max(0.0);
+
+        if margin < MIN_MARGIN {
+            // Two identities score too similarly — cannot decide; skip.
+            result.push((query.label.clone(), None));
+            continue;
+        }
+
+        // Query-side noise guard.
+        let effective_accept = if query.window_count < NOISE_GUARD_MIN_WINDOWS {
+            T_ACCEPT_NOISY
+        } else {
+            T_ACCEPT
+        };
+
+        if winner_sim >= effective_accept {
+            result.push((query.label.clone(), Some((winner_id, winner_sim))));
+        } else {
+            // In the uncertain band — not an accept; skip for merge purposes.
+            result.push((query.label.clone(), None));
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Assignment
 // ---------------------------------------------------------------------------
 
@@ -543,5 +657,102 @@ mod tests {
         let queries = vec![qc("A", 0.0, 10)];
         let matches = assign_identities(&queries, &[]);
         assert!(matches.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // match_each_cluster — collision-allowed per-cluster matcher
+    // -----------------------------------------------------------------------
+
+    /// Two clusters both close to the same identity: both must return that
+    /// identity (collision allowed). This is the key difference from
+    /// `assign_identities`, which would give it to only the closer one.
+    #[test]
+    fn match_each_cluster_two_clusters_same_identity() {
+        use std::f32::consts::PI;
+        // Alice at 0°; A at 5°, B at 10° — both well above T_ACCEPT.
+        let queries = vec![
+            qc("A", 5.0_f32 * PI / 180.0, 10),
+            qc("B", 10.0_f32 * PI / 180.0, 10),
+        ];
+        let gallery = vec![gal_entry(id_alice(), cid(1), "Alice", 0.0)];
+
+        let results = match_each_cluster(&queries, &gallery);
+        assert_eq!(results.len(), 2);
+
+        for (label, matched) in &results {
+            let (id, _sim) = matched
+                .as_ref()
+                .unwrap_or_else(|| panic!("cluster {label} must match Alice"));
+            assert_eq!(
+                *id,
+                id_alice(),
+                "cluster {label} must match Alice (collision allowed)"
+            );
+        }
+    }
+
+    /// Two clusters matching DIFFERENT identities must NOT be merged — each
+    /// gets its own distinct identity.
+    #[test]
+    fn match_each_cluster_two_clusters_different_identities() {
+        use std::f32::consts::PI;
+        // Alice at 0°, Bob at 90°; A near Alice, B near Bob.
+        let queries = vec![
+            qc("A", 5.0_f32 * PI / 180.0, 10),
+            qc("B", 85.0_f32 * PI / 180.0, 10),
+        ];
+        let alice = gal_entry(id_alice(), cid(1), "Alice", 0.0);
+        let bob = gal_entry(id_bob(), cid(2), "Bob", PI / 2.0);
+        let gallery = vec![alice, bob];
+
+        let results = match_each_cluster(&queries, &gallery);
+        assert_eq!(results.len(), 2);
+
+        let a_match = results.iter().find(|(l, _)| l == "A").and_then(|(_, m)| m.as_ref());
+        let b_match = results.iter().find(|(l, _)| l == "B").and_then(|(_, m)| m.as_ref());
+
+        assert!(a_match.is_some(), "A must match some identity");
+        assert!(b_match.is_some(), "B must match some identity");
+        assert_ne!(
+            a_match.unwrap().0,
+            b_match.unwrap().0,
+            "A and B must match DIFFERENT identities"
+        );
+    }
+
+    /// A cluster that matches no identity stays None.
+    #[test]
+    fn match_each_cluster_unenrolled_stays_none() {
+        use std::f32::consts::PI;
+        // Alice at 0°; query at 90° — cosine = 0.0, below T_REJECT.
+        let queries = vec![qc("A", PI / 2.0, 10)];
+        let gallery = vec![gal_entry(id_alice(), cid(1), "Alice", 0.0)];
+
+        let results = match_each_cluster(&queries, &gallery);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].1.is_none(),
+            "cluster far from all gallery entries must return None"
+        );
+    }
+
+    /// Margin check applies per-cluster: two identities scoring too similarly
+    /// for one cluster means neither is returned for that cluster.
+    #[test]
+    fn match_each_cluster_margin_too_small_drops_match() {
+        use std::f32::consts::PI;
+        // Alice at 1°, Bob at 2°; query at 0° — margin between Alice and Bob
+        // is tiny (≈ cos(1°) - cos(2°) ≈ 0.0004), below MIN_MARGIN = 0.05.
+        let queries = vec![qc("A", 0.0, 10)];
+        let alice = gal_entry(id_alice(), cid(1), "Alice", 1.0_f32 * PI / 180.0);
+        let bob = gal_entry(id_bob(), cid(2), "Bob", 2.0_f32 * PI / 180.0);
+        let gallery = vec![alice, bob];
+
+        let results = match_each_cluster(&queries, &gallery);
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].1.is_none(),
+            "margin below MIN_MARGIN must produce no match for that cluster"
+        );
     }
 }

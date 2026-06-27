@@ -3398,19 +3398,22 @@ async fn run_diarization_blocking(
             } => (turns, config, backend),
         };
 
-        // §2.5 prune-veto: if the embedding model is available, run a second
-        // VoiceprintExtractor pass over each low-share candidate cluster's PCM
-        // to build a centroid and match against the gallery. Accept-band matches
-        // (with the query-side noise guard) produce veto verdicts for diarize_split_merge.
-        //
-        // "Low-share candidate" = a cluster that WOULD be pruned by the share or
-        // count floors if no veto were applied. This limits the extra embedding
-        // work to only the clusters at risk — never the dominant speakers.
-        let veto_verdicts: Vec<(i32, String)> = if let Some(extractor) = prune_veto_extractor {
-            compute_prune_veto_verdicts(&turns, &pcm, &config, &extractor, &gallery, meeting_id)
-        } else {
-            Vec::new()
-        };
+        // §2.5 prune-veto + #0023 library-informed merge: when the embedding model
+        // is available, run a single extractor pass over all clusters to build
+        // centroids and match against the gallery. The pass produces:
+        // - veto_verdicts: low-share clusters that match an enrolled identity (rescued
+        //   from the prune), passed to diarize_split_merge as veto_ids.
+        // - merge_map: (source→canonical) pairs for clusters that both match the same
+        //   enrolled identity; passed to overlay_speakers so the prune/cap sees the
+        //   combined speech mass.
+        let (veto_verdicts, merge_map): (Vec<(i32, String)>, Vec<(i32, i32)>) =
+            if let Some(extractor) = prune_veto_extractor {
+                compute_prune_veto_verdicts(
+                    &turns, &pcm, &config, &extractor, &gallery, meeting_id,
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
         // Drop the extractor before the split: its VRAM is freed before the Qwen
         // backend enters (§2.5 VRAM sequencing note above).
         // (prune_veto_extractor is moved into `extractor` above or already None)
@@ -3426,6 +3429,7 @@ async fn run_diarization_blocking(
             backend,
             &config,
             &veto_verdicts,
+            &merge_map,
             &event_tx,
             meeting_id,
         )
@@ -3528,6 +3532,10 @@ fn dominant_cluster(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> Option
 /// `speaker_names` after `finalise_diarization` clears the map.
 ///
 /// An empty `veto_verdicts` is the no-veto baseline (the prune runs normally).
+///
+/// `merge_map` is a slice of `(source, canonical)` pairs from the library-informed
+/// merge pass (#0023). An empty slice is the no-merge baseline (bit-identical to
+/// the pre-merge behaviour).
 fn diarize_split_merge(
     turns: &[SpeakerTurn],
     segments: Vec<Segment>,
@@ -3535,6 +3543,7 @@ fn diarize_split_merge(
     mut backend: Option<Box<dyn minutist_common::AsrBackend>>,
     config: &diarizer::DiarizerConfig,
     veto_verdicts: &[(i32, String)],
+    merge_map: &[(i32, i32)],
     event_tx: &broadcast::Sender<AppEvent>,
     meeting_id: MeetingId,
 ) -> AppResult<(Vec<Segment>, u32, Vec<(String, String)>)> {
@@ -3543,9 +3552,10 @@ fn diarize_split_merge(
     let veto_ids: Vec<i32> = veto_verdicts.iter().map(|(id, _)| *id).collect();
 
     // 1. Overlay labels + flag mixed Qwen segments; keep the cluster→letter map.
-    // Pass the veto ids so surviving_clusters rescues low-share enrolled speakers.
+    // Pass veto_ids (enrolled cluster rescue) and merge_map (same-identity cluster
+    // unification, #0023) — applied together in a single overlay pass.
     let (mut segments, _count, cluster_letters) =
-        diarizer::overlay_speakers(turns, segments, config, &veto_ids);
+        diarizer::overlay_speakers(turns, segments, config, &veto_ids, merge_map);
 
     // 2. Collapse fragments so a turn reads as one row (#0015 phase 1).
     diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);
@@ -3609,24 +3619,33 @@ fn diarize_split_merge(
     Ok((segments, count, veto_names))
 }
 
-/// §2.5 prune-veto second pass: determine which low-share candidate clusters match
-/// an enrolled voiceprint above the accept threshold.
+/// Second embedding pass: compute prune-veto verdicts AND the library-informed
+/// merge map in a single extractor pass.
 ///
-/// "Low-share candidate" = a cluster that WOULD be pruned by the share or count
-/// floor of `config` if no veto applied. The pass is limited to these candidates —
-/// never the dominant speakers — to keep the extra embedding work proportional.
+/// Embeds every cluster from `turns` (not only low-share candidates) so that
+/// `match_each_cluster` can detect when two clusters match the same enrolled
+/// identity. The single extractor pass is reused for both outputs:
 ///
-/// For each candidate cluster, gathers all turn windows whose pause-INCLUDING PCM
-/// range is non-empty (the turns are already on the pause-INCLUDING clock, so no
-/// clock mapper is needed here — we use the turns directly). Embeds + builds a
-/// centroid via `extractor.centroid`. Applies the query-side noise guard (§2.4):
-/// when `window_count < diarizer::PRUNE_VETO_MIN_WINDOWS`, the accept threshold
-/// is `matcher::T_ACCEPT_NOISY`; otherwise `matcher::T_ACCEPT`.
+/// - **Veto verdicts** `Vec<(i32, String)>`: clusters that ARE low-share (would
+///   be pruned) AND match an enrolled identity above the accept threshold. These
+///   are returned as `(cluster_id, display_name)` pairs and forwarded to
+///   `overlay_speakers` as `veto_ids`.
+/// - **Merge map** `Vec<(i32, i32)>`: `(source, canonical)` pairs from the
+///   library-informed merge pass (issue #0023). For each enrolled identity matched
+///   by ≥2 clusters, the group merges: canonical = the member with the greatest
+///   speech mass (tie-break: lowest cluster id). Non-canonical members become
+///   sources. The invariant that only same-identity clusters share a canonical is
+///   enforced here: groups are keyed by `identity_id`, so two different identities
+///   can never share a canonical.
 ///
-/// Runs `matcher::assign_identities` treating each candidate cluster as a query.
-/// Returns `(cluster_id, display_name)` pairs for accept-band matches only.
+/// `veto_ids` and `merge_map` are derived from the SAME per-cluster match results;
+/// no third extractor pass is added.
 ///
-/// Errors in individual cluster embeddings are logged + skipped (best-effort).
+/// When the prune is not active, no cluster is at risk of pruning — veto verdicts
+/// are skipped, but the merge pass still runs (a dominant cluster and another
+/// cluster can both match the same identity even without a prune floor).
+///
+/// Errors in individual cluster embeddings are logged and skipped (best-effort).
 fn compute_prune_veto_verdicts(
     turns: &[SpeakerTurn],
     pcm: &[f32],
@@ -3634,24 +3653,16 @@ fn compute_prune_veto_verdicts(
     extractor: &diarizer::VoiceprintExtractor,
     gallery: &[persistence::StoredVoiceprint],
     meeting_id: MeetingId,
-) -> Vec<(i32, String)> {
-    use crate::matcher::{assign_identities, MatchBand, QueryCluster, T_ACCEPT, T_ACCEPT_NOISY, NOISE_GUARD_MIN_WINDOWS};
+) -> (Vec<(i32, String)>, Vec<(i32, i32)>) {
+    use crate::matcher::{match_each_cluster, QueryCluster};
 
     if gallery.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
-    // Identify low-share candidate clusters: tally per-cluster turn duration from
-    // the raw turns, then apply the same share + count floors as surviving_clusters.
-    // A cluster is a candidate if it would fail the prune (below share OR below
-    // segment count) — we only run the extra embedding pass on those.
-    let prune_active = config.min_cluster_share > 0.0 || config.min_cluster_segments > 0;
-    if !prune_active {
-        // No prune is active; no cluster is at risk; skip the veto pass.
-        return Vec::new();
-    }
-
-    // Tally per-cluster total turn duration (pause-INCLUDING ms from the turns).
+    // Tally per-cluster total turn duration + turn count (pause-INCLUDING ms).
+    // All clusters are tallied — not only low-share ones — because the merge pass
+    // needs centroids for every cluster that might share an identity.
     let mut cluster_ids: Vec<i32> = Vec::new();
     let mut cluster_dur: Vec<u64> = Vec::new();
     let mut cluster_turn_count: Vec<usize> = Vec::new();
@@ -3671,50 +3682,48 @@ fn compute_prune_veto_verdicts(
     }
 
     if cluster_ids.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let total_dur: u64 = cluster_dur.iter().sum();
 
-    // Select low-share candidates (those that would be pruned).
-    let candidates: Vec<i32> = cluster_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &id)| {
-            let share = if total_dur > 0 {
-                cluster_dur[i] as f32 / total_dur as f32
-            } else {
-                0.0
-            };
-            let below_share = config.min_cluster_share > 0.0 && share < config.min_cluster_share;
-            let below_count = config.min_cluster_segments > 0
-                && cluster_turn_count[i] < config.min_cluster_segments;
-            if below_share || below_count {
-                Some(id)
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return Vec::new();
-    }
+    // Identify which clusters are low-share (would be pruned without a veto).
+    let prune_active = config.min_cluster_share > 0.0 || config.min_cluster_segments > 0;
+    let is_low_share: Vec<bool> = if prune_active {
+        cluster_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let share = if total_dur > 0 {
+                    cluster_dur[i] as f32 / total_dur as f32
+                } else {
+                    0.0
+                };
+                let below_share =
+                    config.min_cluster_share > 0.0 && share < config.min_cluster_share;
+                let below_count = config.min_cluster_segments > 0
+                    && cluster_turn_count[i] < config.min_cluster_segments;
+                below_share || below_count
+            })
+            .collect()
+    } else {
+        vec![false; cluster_ids.len()]
+    };
 
     tracing::debug!(
         target: "orchestrator",
         meeting_id = %meeting_id.0,
-        candidate_count = candidates.len(),
-        "prune-veto: running second embedding pass for low-share clusters"
+        total_clusters = cluster_ids.len(),
+        low_share_count = is_low_share.iter().filter(|&&b| b).count(),
+        "library-merge/prune-veto: running embedding pass for all clusters"
     );
 
-    // For each candidate cluster, gather all turn windows' PCM and build a centroid.
+    // Embed every cluster (not only low-share ones) in one extractor pass.
     // Turns are on the pause-INCLUDING clock; PCM is pause-INCLUDING — no clock mapper.
     const SR: u32 = 16_000;
     let mut queries: Vec<QueryCluster> = Vec::new();
 
-    for &cluster_id in &candidates {
-        // Collect all turn PCM windows for this cluster.
+    for &cluster_id in &cluster_ids {
         let windows: Vec<Vec<f32>> = turns
             .iter()
             .filter(|t| t.cluster == cluster_id)
@@ -3738,12 +3747,14 @@ fn compute_prune_veto_verdicts(
                 target: "orchestrator",
                 meeting_id = %meeting_id.0,
                 cluster_id,
-                "prune-veto: no usable PCM windows for candidate cluster; skipping"
+                "library-merge/prune-veto: no usable PCM windows for cluster; skipping"
             );
             continue;
         }
 
         let window_count = windows.len() as u64;
+        // The noise guard threshold (T_ACCEPT_NOISY vs T_ACCEPT) depends on
+        // window_count; it is applied inside match_each_cluster via the
         let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
 
         let centroid = match extractor.centroid(&window_refs, SR) {
@@ -3754,7 +3765,7 @@ fn compute_prune_veto_verdicts(
                     meeting_id = %meeting_id.0,
                     cluster_id,
                     error = %e,
-                    "prune-veto: centroid extraction failed; skipping"
+                    "library-merge/prune-veto: centroid extraction failed; skipping"
                 );
                 continue;
             }
@@ -3768,38 +3779,108 @@ fn compute_prune_veto_verdicts(
     }
 
     if queries.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
-    let assigned = assign_identities(&queries, gallery);
+    // Per-cluster best-identity match (collisions allowed) for the merge pass.
+    let per_cluster = match_each_cluster(&queries, gallery);
 
-    // Collect accept-band matches only; map the label (stringified cluster_id) back
-    // to i32. Apply the query-side noise guard (§2.4): the effective accept threshold
-    // is ALREADY applied inside assign_identities via the QueryCluster.window_count
-    // field (the matcher reads NOISE_GUARD_MIN_WINDOWS and T_ACCEPT_NOISY). Matches
-    // in the Uncertain band are NOT vetoed — they fall to the normal suggestion flow.
-    let _ = (T_ACCEPT, T_ACCEPT_NOISY, NOISE_GUARD_MIN_WINDOWS); // silence dead-code lint
-    let verdicts: Vec<(i32, String)> = assigned
-        .into_iter()
-        .filter(|m| m.band == MatchBand::Accept)
-        .filter_map(|m| {
-            m.query_label
-                .parse::<i32>()
-                .ok()
-                .map(|id| (id, m.display_name))
+    // -------------------------------------------------------------------
+    // Derive veto verdicts: low-share clusters with an accept-band match.
+    // -------------------------------------------------------------------
+    // `is_low_share` is indexed by cluster_ids; look up by cluster_id.
+    let veto_verdicts: Vec<(i32, String)> = per_cluster
+        .iter()
+        .filter_map(|(label, matched)| {
+            let (identity_id, _sim) = matched.as_ref()?;
+            let cluster_id: i32 = label.parse().ok()?;
+            // Only veto if this cluster is low-share (would be pruned).
+            let idx = cluster_ids.iter().position(|&id| id == cluster_id)?;
+            if !is_low_share[idx] {
+                return None;
+            }
+            // Resolve display name from gallery.
+            let display_name = gallery
+                .iter()
+                .find(|e| e.identity_id == *identity_id)
+                .map(|e| e.display_name.clone())?;
+            Some((cluster_id, display_name))
         })
         .collect();
 
-    if !verdicts.is_empty() {
+    if !veto_verdicts.is_empty() {
         tracing::info!(
             target: "orchestrator",
             meeting_id = %meeting_id.0,
-            vetoed_count = verdicts.len(),
+            vetoed_count = veto_verdicts.len(),
             "prune-veto: enrolled quiet speakers rescued from pruning"
         );
     }
 
-    verdicts
+    // -------------------------------------------------------------------
+    // Derive merge map: group clusters by matched identity; emit
+    // (source, canonical) pairs for non-canonical members of each group.
+    //
+    // Canonical = the group member with the greatest speech mass
+    // (turn-duration sum from cluster_dur); tie-break = lowest cluster id.
+    // Invariant: groups are keyed by identity_id, so only same-identity
+    // clusters are ever merged.
+    // -------------------------------------------------------------------
+    use minutist_common::VoiceprintIdentityId;
+    // Build identity → Vec<cluster_id> groups from accept-band matches.
+    let mut identity_groups: Vec<(VoiceprintIdentityId, Vec<i32>)> = Vec::new();
+    for (label, matched) in &per_cluster {
+        let Some((identity_id, _)) = matched else { continue };
+        let cluster_id: i32 = match label.parse() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        match identity_groups.iter_mut().find(|(id, _)| id == identity_id) {
+            Some((_, members)) => members.push(cluster_id),
+            None => identity_groups.push((*identity_id, vec![cluster_id])),
+        }
+    }
+
+    let mut merge_map: Vec<(i32, i32)> = Vec::new();
+    for (_identity_id, members) in &identity_groups {
+        if members.len() < 2 {
+            // Single cluster matched this identity — nothing to merge.
+            continue;
+        }
+        // Canonical = largest speech mass; tie-break = lowest cluster id.
+        let canonical = *members
+            .iter()
+            .max_by(|&&a, &&b| {
+                let dur_a = cluster_ids
+                    .iter()
+                    .position(|&id| id == a)
+                    .map(|i| cluster_dur[i])
+                    .unwrap_or(0);
+                let dur_b = cluster_ids
+                    .iter()
+                    .position(|&id| id == b)
+                    .map(|i| cluster_dur[i])
+                    .unwrap_or(0);
+                dur_a.cmp(&dur_b).then(b.cmp(&a)) // tie: lower id wins (b.cmp(&a) = a < b)
+            })
+            .expect("members is non-empty");
+        for &source in members {
+            if source != canonical {
+                merge_map.push((source, canonical));
+            }
+        }
+    }
+
+    if !merge_map.is_empty() {
+        tracing::info!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            merge_count = merge_map.len(),
+            "library-merge: merging same-identity diarizer clusters"
+        );
+    }
+
+    (veto_verdicts, merge_map)
 }
 
 /// Split one kept mixed Qwen segment into single-speaker sub-segments by

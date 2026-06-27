@@ -118,6 +118,19 @@ restated. Adding any other edge requires updating
   remains a `common`-only crate; no `diarizer` edge is permitted or needed
   (the pure maths live in `common`; the embedding extraction stays in
   `diarizer`; only the final `Vec<f32>` bytes cross into `persistence`).
+- **Processing-lifecycle + host-election types (WS4-B — issue 0016 / 0020).**
+  `ProcessingLifecycle`, `ProcessingClaim`, and `HostRef` are added to `common`
+  by the architecture-owner, alongside the `MeetingMeta.processing` field
+  (`#[serde(default)] = Local`, no migration). `HostRef(String)` is an opaque
+  device key — the seam that keeps `iroh` OUT of `common`: `sync` maps it
+  from/to `iroh::EndpointId` at the wire boundary, so **`common` gains no `iroh`
+  dependency**. The dependency table in `components.md` is **unchanged**: `sync`
+  and `persistence` already depend on `common` and gain no new edge. The
+  lifecycle's transport (a new bidirectional Discovery/lifecycle `StreamKind`
+  carrying `(MeetingId, ProcessingLifecycle)`, plus the receive path that writes
+  the propagated state into the local `metadata.json`) is `sync`'s domain
+  (systems-engineer), landed as separate `crates/sync` PRs gated on this one.
+  See `planning/DESIGN_processing-lifecycle.md` (the binding §7 decisions).
 
 ## Role definitions
 

@@ -206,7 +206,8 @@ used, not added here.
 `NoteBlock`, `MeetingState`,
 `InterAgentRequest`, `InterAgentReply`,
 `AttachmentId`, `ConversionState`, `AttachmentEntry`,
-`LiveDigestItem`, `LiveDigest`, `LiveAgentMode`),
+`LiveDigestItem`, `LiveDigest`, `LiveAgentMode`,
+`ProcessingLifecycle`, `ProcessingClaim`, `HostRef`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`, `DocVlm`), the shared `AppError` enum + `AppResult<T>` alias,
 `apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` — the
@@ -536,6 +537,49 @@ dependency-table edge**.
 The `cos > 0.999` centroid-aligns-with-sample-mean discipline from
 `diarizer::online::clusterer` is retargeted at this module via unit tests in
 `voiceprint_math::tests`.
+
+**Captured-but-unprocessed meeting lifecycle + processing-host election
+(WS4-B — issue 0016 / 0020).** `MeetingMeta` gains
+`processing: ProcessingLifecycle` (`#[serde(default)] = Local`, the established
+additive pattern — existing `metadata.json` reads as a locally-recorded-and-
+processed meeting, no migration). Three new architecture-owned types:
+
+- `ProcessingLifecycle` — an internally-tagged enum (`#[serde(tag = "state")]`,
+  mirroring `ModelStatusState`): `Local` (default) / `PendingProcessing` /
+  `Claimed { claim: ProcessingClaim }` / `Processed { processed_by: HostRef,
+  at }`. Derived and host-authoritative — the claiming host authors it,
+  consumers self-heal their copy from the propagated value, and it is NOT part
+  of the user-editable metadata that folds into the notes-CRDT.
+- `ProcessingClaim { host: HostRef, claimed_at, lease_expires_at }` — a durable,
+  syncable cross-device claim, distinct from `orchestrator`'s in-memory,
+  never-synced single-device offline slot (`claim_offline`). RFC 3339 UTC
+  strings; the timestamps drive lease/reap timing only, never the racing-claim
+  tiebreak (lowest `HostRef` wins — clock-independent; the rule lives in `sync`).
+- `HostRef(pub String)` — an opaque device key mirroring `ModelId`. This is the
+  load-bearing seam that keeps `iroh` OUT of `common`: `sync` maps it from/to
+  its `iroh::EndpointId` at the wire boundary. **`common` gains no `iroh` dep.**
+
+One shape serves two roles without naming a device type — a phone (0016) or a
+GPU-less desktop (0020) is the capture device that writes `PendingProcessing`;
+a desktop or the headless GPU hub is the processing host that claims, produces
+derived outputs, and is by construction the sole `Artifacts` sender (so no
+version field is needed on derived outputs).
+
+**Transport is NOT in `common`:** `metadata.json` does not sync today, so the
+lifecycle has no transport on its own. It rides a new bidirectional
+Discovery/lifecycle `StreamKind` in `sync` (carrying `(MeetingId,
+ProcessingLifecycle)` per meeting, also completing the deferred S5 meeting-list
+discovery) — NOT `metadata.json`-as-a-blob, NOT the `Artifacts` frame (which is
+processor→consumer derived outputs, and the claim must propagate *before*
+processing), NOT the notes-CRDT. That `StreamKind` and the receive path that
+writes the propagated `processing` into the local `metadata.json` are `sync`'s
+domain, landed as separate PRs gated on this one. Full design + the binding §7
+decisions: `planning/DESIGN_processing-lifecycle.md`.
+
+Adding these types is an architecture-owner change. The dependency table at the
+top of this file is **unchanged**: `sync` and `persistence` already depend on
+`common`, and `common` gains no new edge (the `HostRef(String)` seam is exactly
+why).
 
 **Stable surface — locked.** The trait signatures and event variants in
 this crate are the architectural contract that sub-agents implement

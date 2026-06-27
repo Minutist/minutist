@@ -468,6 +468,83 @@ pub struct ModelStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Processing lifecycle + host election
+// ---------------------------------------------------------------------------
+
+/// Opaque key naming the host (device) that holds a meeting's processing
+/// claim. An opaque string keeps `iroh` out of `common`: `sync` maps it
+/// from/to its `iroh::EndpointId` at the wire boundary. Mirrors [`ModelId`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[cfg_attr(feature = "specta", specta(transparent))]
+pub struct HostRef(pub String);
+
+/// A durable, syncable claim that one host owns a meeting's processing (ASR /
+/// diarization / summarisation) and is the authoritative producer of its
+/// derived outputs.
+///
+/// Distinct from the in-memory single-device offline slot in `orchestrator`
+/// (`claim_offline`), which guards one device against two concurrent offline
+/// ops and is never persisted or synced. This claim is persisted in
+/// `metadata.json` and propagated to peers, so it can act as a cross-device
+/// lock. Carried inside [`ProcessingLifecycle::Claimed`].
+///
+/// Timestamps are RFC 3339 UTC strings, matching `MeetingMeta::started_at`'s
+/// format (no `chrono` in `common`). They drive lease/reap timing only and are
+/// NOT used to resolve racing claims — cross-device clock skew makes them
+/// unreliable, so the tiebreak is the lowest `HostRef` (decided in `sync`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct ProcessingClaim {
+    /// The host that owns this claim.
+    pub host: HostRef,
+    /// When the claim was taken (RFC 3339 UTC).
+    pub claimed_at: String,
+    /// Past this instant (RFC 3339 UTC) with no transition to
+    /// [`ProcessingLifecycle::Processed`], any peer may reap the claim and
+    /// re-elect — recovering a crashed host that cannot release its own slot.
+    pub lease_expires_at: String,
+}
+
+/// Where a meeting sits in the capture → processing → processed pipeline,
+/// persisted on [`MeetingMeta`] (`metadata.json`) and propagated to peers.
+///
+/// `processing` is **derived and host-authoritative**: the host that holds the
+/// claim authors it; consumers never write it — they receive it over the
+/// lifecycle sync exchange and self-heal their local copy. It is NOT part of
+/// the user-editable metadata that folds into the notes-CRDT.
+///
+/// `#[serde(default)] = Local` so existing `metadata.json` written before this
+/// field existed reads as a locally-recorded-and-processed meeting (today's
+/// only path) — no migration. The same defaulted-field pattern `speaker_names`
+/// / `notes_format` use.
+///
+/// One shape serves two roles without naming a device type: a phone or a
+/// GPU-less desktop is the capture device (writes `PendingProcessing`); a
+/// desktop or the headless GPU hub is the processing host (claims → produces
+/// outputs). See `planning/DESIGN_processing-lifecycle.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum ProcessingLifecycle {
+    /// Recorded AND processed on this device — today's only path, and the
+    /// back-compat default for metadata written before the field existed.
+    #[default]
+    Local,
+    /// Captured on a device that does not process it locally, and offered for
+    /// an eligible host to adopt. The capture device sets this at finalise
+    /// instead of running the pipeline.
+    PendingProcessing,
+    /// A host has claimed the meeting and is producing its derived outputs.
+    /// Peers observing this neither claim nor process it.
+    Claimed { claim: ProcessingClaim },
+    /// Processing finished; the derived outputs are authoritative. `at` is the
+    /// RFC 3339 UTC completion time.
+    Processed { processed_by: HostRef, at: String },
+}
+
+// ---------------------------------------------------------------------------
 // Meeting metadata
 // ---------------------------------------------------------------------------
 
@@ -523,6 +600,15 @@ pub struct MeetingMeta {
     /// `notes_format` use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_id: Option<CollectionId>,
+    /// Where this meeting sits in the capture → processing → processed
+    /// pipeline. Host-authoritative and self-healing — a consumer never
+    /// authors it; the sync lifecycle exchange propagates the source host's
+    /// state. `#[serde(default)] = Local` so existing `metadata.json` (written
+    /// before the field existed) reads as a locally-processed meeting, the same
+    /// defaulted-field pattern `notes_format` uses. See
+    /// `planning/DESIGN_processing-lifecycle.md`.
+    #[serde(default)]
+    pub processing: ProcessingLifecycle,
     pub app_version: String,
 }
 
@@ -2249,6 +2335,7 @@ mod tests {
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
+            processing: Default::default(),
             collection_id: None,
             app_version: "0.0.0".to_string(),
         };
@@ -2258,6 +2345,62 @@ mod tests {
         assert_eq!(back.audio_format.sample_rate, 16_000);
         assert_eq!(back.audio_format.channels, 1);
         assert_eq!(back.audio_format.bitrate_kbps, Some(32));
+    }
+
+    #[test]
+    fn processing_lifecycle_defaults_to_local() {
+        assert_eq!(ProcessingLifecycle::default(), ProcessingLifecycle::Local);
+    }
+
+    #[test]
+    fn processing_lifecycle_serde_round_trips_each_variant() {
+        let claim = ProcessingClaim {
+            host: HostRef("endpoint-abc".to_string()),
+            claimed_at: "2026-06-27T10:00:00Z".to_string(),
+            lease_expires_at: "2026-06-27T10:30:00Z".to_string(),
+        };
+        for state in [
+            ProcessingLifecycle::Local,
+            ProcessingLifecycle::PendingProcessing,
+            ProcessingLifecycle::Claimed {
+                claim: claim.clone(),
+            },
+            ProcessingLifecycle::Processed {
+                processed_by: HostRef("endpoint-abc".to_string()),
+                at: "2026-06-27T10:30:00Z".to_string(),
+            },
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let back: ProcessingLifecycle = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, state);
+        }
+
+        // Internally tagged on `state`, snake_case — mirrors `ModelStatusState`.
+        let pending =
+            serde_json::to_string(&ProcessingLifecycle::PendingProcessing).unwrap();
+        assert_eq!(pending, r#"{"state":"pending_processing"}"#);
+    }
+
+    #[test]
+    fn meeting_meta_without_processing_field_reads_as_local() {
+        // A `metadata.json` written before the field existed must deserialise as
+        // a locally-processed meeting — the `#[serde(default)]` no-migration
+        // contract (DESIGN_processing-lifecycle.md §7 Q4).
+        let legacy = r#"{
+            "uuid": "00000000-0000-4000-8000-000000000000",
+            "title": "Legacy meeting",
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": null,
+            "duration_ms": 0,
+            "speaker_count": 0,
+            "audio_format": {"codec":"opus","sample_rate":16000,"channels":1,"bitrate_kbps":32},
+            "asr_model": null,
+            "llm_model": null,
+            "diarizer": null,
+            "app_version": "0.1.0"
+        }"#;
+        let meta: MeetingMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(meta.processing, ProcessingLifecycle::Local);
     }
 
     #[test]
@@ -2297,6 +2440,7 @@ mod tests {
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
+            processing: Default::default(),
             collection_id: None,
             app_version: "0.0.0".to_string(),
         };

@@ -640,6 +640,8 @@ impl Orchestrator {
             speaker_names: std::collections::BTreeMap::new(),
             notes_format: 0,
             collection_id: None,
+            // Recorded and processed on this device → the `Local` default.
+            processing: Default::default(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 

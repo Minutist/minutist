@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use minutist_common::{AppResult, CollectionId, MeetingId};
+use minutist_common::{AppResult, CollectionId, MeetingId, ProcessingLifecycle};
 
 use crate::error::Error;
 use crate::index::MeetingIndex;
@@ -132,6 +132,59 @@ pub async fn set_speaker_name(
     Ok(meta.speaker_names)
 }
 
+/// Apply a meeting's processing-lifecycle state to `metadata.json` (the
+/// authoritative copy): read, set `processing`, write back.
+///
+/// The persistence half of the lifecycle consumer. The state is
+/// host-authoritative and arrives over the sync lifecycle exchange; the
+/// subscriber that bridges that exchange to this call lives in a crate that
+/// depends on both `sync` and `persistence` (`ipc-bridge` / `headless`), since
+/// `sync` has no dependency edge to `persistence`. Any racing-claim conflict is
+/// resolved upstream in `sync` (lowest `HostRef` wins) before the winning state
+/// reaches here, so this writes what it is given — overwriting the inbound
+/// placeholder seeded by [`crate::MeetingFolder::ensure`], which starts at
+/// `Local` and never guesses `PendingProcessing`
+/// (`planning/DESIGN_processing-lifecycle.md` §7 Q4). It is also the local
+/// producer for a re-process request (`Processed`/`Local` → `PendingProcessing`).
+///
+/// `processing` is not mirrored in `index.db` (like `speaker_names`), so unlike
+/// [`rename_meeting`] there is no index row to reconcile.
+///
+/// `AppError::InvalidInput` (via `Error::MeetingNotFound`) if the folder has no
+/// `metadata.json`: the sync receive path seeds the placeholder before the
+/// lifecycle is applied, so a missing folder is an ordering error.
+pub async fn apply_processing_lifecycle(
+    meetings_root: &Path,
+    id: MeetingId,
+    processing: ProcessingLifecycle,
+) -> AppResult<()> {
+    let folder = meetings_root.join(id.0.to_string());
+    if !folder.join("metadata.json").exists() {
+        return Err(Error::MeetingNotFound(id).into());
+    }
+
+    let mut meta = reader::read_metadata_inner(&folder)?;
+    // A stable discriminant for diagnostics. The `HostRef` inside a claim is a
+    // device key (not user content) but is omitted to keep the log minimal.
+    let state = match &processing {
+        ProcessingLifecycle::Local => "local",
+        ProcessingLifecycle::PendingProcessing => "pending_processing",
+        ProcessingLifecycle::Claimed { .. } => "claimed",
+        ProcessingLifecycle::Processed { .. } => "processed",
+    };
+    meta.processing = processing;
+    crate::write_metadata(&folder, &meta)?;
+
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        state,
+        "processing lifecycle applied"
+    );
+
+    Ok(())
+}
+
 /// Delete a meeting: remove the folder recursively, then remove the index row.
 ///
 /// An absent folder is treated as already-deleted (the index row is still
@@ -187,7 +240,9 @@ fn list_entry_from(folder: &Path) -> Result<minutist_common::MeetingListEntry, E
 
 #[cfg(test)]
 mod tests {
-    use minutist_common::{AudioFormat, MeetingId, MeetingMeta};
+    use minutist_common::{
+        AudioFormat, HostRef, MeetingId, MeetingMeta, ProcessingClaim, ProcessingLifecycle,
+    };
     use tempfile::TempDir;
 
     use crate::folder::MeetingFolder;
@@ -271,6 +326,71 @@ mod tests {
         let err = super::set_speaker_name(tempdir.path(), missing, "A", "Alice")
             .await
             .expect_err("missing meeting must error");
+        assert!(matches!(err, minutist_common::AppError::InvalidInput { .. }));
+    }
+
+    /// `apply_processing_lifecycle` overwrites `metadata.json`'s `processing`
+    /// with the given host-authoritative state (seeded `Local` → `Claimed` →
+    /// `Processed`), persisting each.
+    #[tokio::test]
+    async fn test_apply_processing_lifecycle() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = write_meta_with_no_names(root);
+        let folder = root.join(id.0.to_string());
+
+        // The seeded placeholder is `Local`.
+        assert_eq!(
+            read_metadata(&folder).expect("read seed").processing,
+            ProcessingLifecycle::Local
+        );
+
+        // A host claims it.
+        let claim = ProcessingClaim {
+            host: HostRef("endpoint-xyz".to_string()),
+            claimed_at: "2026-06-27T10:00:00Z".to_string(),
+            lease_expires_at: "2026-06-27T10:30:00Z".to_string(),
+        };
+        super::apply_processing_lifecycle(
+            root,
+            id,
+            ProcessingLifecycle::Claimed {
+                claim: claim.clone(),
+            },
+        )
+        .await
+        .expect("apply claimed");
+        assert_eq!(
+            read_metadata(&folder).expect("read claimed").processing,
+            ProcessingLifecycle::Claimed { claim }
+        );
+
+        // Then it completes.
+        let processed = ProcessingLifecycle::Processed {
+            processed_by: HostRef("endpoint-xyz".to_string()),
+            at: "2026-06-27T10:25:00Z".to_string(),
+        };
+        super::apply_processing_lifecycle(root, id, processed.clone())
+            .await
+            .expect("apply processed");
+        assert_eq!(
+            read_metadata(&folder).expect("read processed").processing,
+            processed
+        );
+    }
+
+    /// `apply_processing_lifecycle` returns `MeetingNotFound` for a meeting with
+    /// no `metadata.json` (the receive path must seed the folder first).
+    #[tokio::test]
+    async fn test_apply_processing_lifecycle_missing_meeting() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let err = super::apply_processing_lifecycle(
+            tempdir.path(),
+            MeetingId::new(),
+            ProcessingLifecycle::PendingProcessing,
+        )
+        .await
+        .expect_err("missing meeting must error");
         assert!(matches!(err, minutist_common::AppError::InvalidInput { .. }));
     }
 }

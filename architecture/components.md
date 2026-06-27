@@ -1646,7 +1646,18 @@ on `common`.
   `set_speaker_name(root, id, label, name) -> AppResult<speaker_names map>`
   is the third op: a read-modify-write of `metadata.json`'s `speaker_names`
   (empty `name` clears the entry). It touches no index row (speaker names are
-  not indexed), so unlike rename there is nothing to reconcile. Privacy
+  not indexed), so unlike rename there is nothing to reconcile.
+  `apply_processing_lifecycle(root, id, processing) -> AppResult<()>` is the
+  fourth op: a read-modify-write of `metadata.json`'s `processing`
+  (`ProcessingLifecycle`) and the persistence half of the lifecycle consumer.
+  The host-authoritative state arrives over the sync lifecycle exchange; a
+  subscriber in a crate depending on both `sync` and `persistence` (`ipc-bridge`
+  / `headless`) calls this, since `sync` has no edge to `persistence`.
+  Racing-claim conflict is resolved upstream in `sync`, so this writes the given
+  state, overwriting the inbound `Local` placeholder (DESIGN_processing-lifecycle
+  §7 Q4). Like `set_speaker_name` it touches no index row (`processing` is not
+  indexed) and adds no cross-component dependency edge (stays inside
+  `persistence`; its workspace edges remain `common` + `notes-crdt`). Privacy
   invariant (#0014 audit): these ops log the meeting id (and the diarizer
   `label`), never the `new_title` or speaker `name` — both are user content that
   must not reach a log line (and thus the crash file / report excerpt, which

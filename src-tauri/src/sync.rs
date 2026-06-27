@@ -139,6 +139,9 @@ impl ConnectedSync {
             }
         };
 
+        // Clone the meetings root for the lifecycle subscriber before the config
+        // consumes it.
+        let subscriber_meetings_dir = meetings_dir.clone();
         let mut config = SyncConfig::new(meetings_dir);
         if let Some(token) = relay_token {
             config = config.with_relay_auth_token(token);
@@ -146,6 +149,14 @@ impl ConnectedSync {
 
         match SyncEngine::start(config, identity).await {
             Ok(engine) => {
+                // Persist the processing-lifecycle states the engine surfaces from
+                // discovery. The subscriber loop lives in `ipc-bridge` (which owns
+                // the `persistence` edge); here we only hand it the engine's
+                // receiver, so this module keeps no direct `persistence` use.
+                ipc_bridge::spawn_lifecycle_subscriber(
+                    engine.subscribe_lifecycle_events(),
+                    subscriber_meetings_dir,
+                );
                 let mut rt = self.runtime.lock().await;
                 rt.engine = Some(Arc::new(engine));
                 rt.status = SyncStatus::Idle;

@@ -377,6 +377,8 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
     let mut poll = tokio::time::interval(dur_or_env("MINUTIST_HUB_POLL_MS", PEER_POLL_INTERVAL));
     let debounce = dur_or_env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", PEER_PUSH_DEBOUNCE);
     let mut peer_events = engine.subscribe_peer_events();
+    let mut lifecycle_events = engine.subscribe_lifecycle_events();
+    let meetings_root = data_dir.join("meetings");
     let mut last_push: HashMap<_, Instant> = HashMap::new();
 
     // Pin the shutdown future ONCE so its signal handlers persist across loop
@@ -425,6 +427,28 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
                     }
                 }
             }
+            // Persist processing-lifecycle states the engine surfaces from
+            // discovery (the consumer side of the lifecycle exchange). The apply
+            // is raced against shutdown — matching the push arm — so a SIGTERM is
+            // honoured promptly even if a metadata write stalls; an interrupted
+            // apply is safe (write_metadata is atomic, and the state is
+            // re-advertised on the next discovery).
+            event = lifecycle_events.recv() => match event {
+                Ok((meeting_id, processing)) => {
+                    tokio::select! {
+                        _ = &mut shutdown => break 'serve,
+                        result = persistence::meeting_ops::apply_synced_lifecycle_if_present(&meetings_root, meeting_id, processing) => match result {
+                            Ok(true) => {}
+                            Ok(false) => tracing::debug!(target: "hub", meeting_id = %meeting_id.0, "synced lifecycle for a meeting not present locally; skipping (re-applied only on a later discovery)"),
+                            Err(e) => tracing::warn!(target: "hub", meeting_id = %meeting_id.0, error = %e, "failed to apply synced lifecycle"),
+                        },
+                    }
+                }
+                Err(RecvError::Lagged(dropped)) => {
+                    tracing::warn!(target: "hub", dropped, "lifecycle-event lag; dropped states recover only on a re-run discovery (no scheduled caller yet)");
+                }
+                Err(RecvError::Closed) => break 'serve,
+            },
         }
     }
 }

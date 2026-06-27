@@ -577,11 +577,22 @@ processing), NOT the notes-CRDT. `sync` *reads* a meeting's `processing` from it
 `metadata.json` (via `common::MeetingMeta` + `serde_json` — both already `sync`
 deps, so no new edge) to advertise, and **emits** each received `(MeetingId,
 ProcessingLifecycle)` on `SyncEngine::subscribe_lifecycle_events`; it never
-*writes* `metadata.json` (it has no `persistence` edge). The consumer that
-persists a received state via `persistence::apply_processing_lifecycle` lives in
-a crate depending on both `sync` and `persistence` (`ipc-bridge` / `headless`).
-`SyncEngine::discover_with` is the initiator surface. Full design + the binding §7
-decisions: `planning/DESIGN_processing-lifecycle.md`.
+*writes* `metadata.json` (it has no `persistence` edge). The consumer is
+**built**: each side persists a received state via
+`persistence::apply_synced_lifecycle_if_present` (which skips advertisements for
+meetings not held locally — the notes/media receive path seeds the folder, not
+this stream). The desktop loop is
+`ipc_bridge::lifecycle::run_lifecycle_subscriber` (app-main's `ConnectedSync`
+subscribes the engine and hands over the receiver — its item type is
+`common`-only, so `ipc-bridge` keeps no `sync` edge); the hub runs the
+equivalent arm in `headless`'s serve loop. `Lagged` is non-fatal (logged);
+dropped states recover only when discovery is next driven — there is no
+scheduled `discover_with` caller yet, so recovery relies on inbound
+peer-initiated discovery or a future scheduled caller, NOT an automatic re-run.
+A skipped event for a not-yet-synced meeting is likewise not replayed when the
+folder later arrives. These are tracked as known v1 limitations in
+`planning/DESIGN_processing-lifecycle.md`. `SyncEngine::discover_with` is the
+initiator surface. Full design + the binding §7 decisions: same doc.
 
 Adding these types is an architecture-owner change. The dependency table at the
 top of this file is **unchanged**: `sync` and `persistence` already depend on
@@ -1662,7 +1673,13 @@ on `common`.
   / `headless`) calls this, since `sync` has no edge to `persistence`.
   Racing-claim conflict is resolved upstream in `sync`, so this writes the given
   state, overwriting the inbound `Local` placeholder (DESIGN_processing-lifecycle
-  §7 Q4). Like `set_speaker_name` it touches no index row (`processing` is not
+  §7 Q4). Its consumer-side wrapper `apply_synced_lifecycle_if_present(root, id,
+  processing) -> AppResult<bool>` applies a peer-advertised state only when the
+  meeting is held locally (else `Ok(false)` — discovery advertises the peer's
+  meetings, and the notes/media receive path, not this stream, seeds a folder),
+  keeping the folder layout owned here; the `ipc-bridge` / `headless` lifecycle
+  subscribers call it per discovery event. Like `set_speaker_name` it touches no
+  index row (`processing` is not
   indexed) and adds no cross-component dependency edge (stays inside
   `persistence`; its workspace edges remain `common` + `notes-crdt`). Privacy
   invariant (#0014 audit): these ops log the meeting id (and the diarizer

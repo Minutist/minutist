@@ -126,6 +126,21 @@
           "sha256": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2"
         }
       ]
+    },
+    {
+      "id": "bge-m3-q8_0",
+      "kind": "embed",
+      "display_name": "BGE-M3 (Q8_0)",
+      "license": "mit",
+      "total_size_bytes": 634553760,
+      "files": [
+        {
+          "filename": "bge-m3-Q8_0.gguf",
+          "url": "https://huggingface.co/ggml-org/bge-m3/resolve/9eba04c5d75ba5a1595e45de734d36bef4e5cb98/bge-m3-Q8_0.gguf",
+          "size": 634553760,
+          "sha256": "aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173"
+        }
+      ]
     }
   ]
 }

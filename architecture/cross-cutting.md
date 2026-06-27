@@ -1172,6 +1172,12 @@ change.
 │   ├── notes.md                   markdown (derived, best-effort)
 │   ├── summary.md
 │   ├── metadata.json
+│   ├── meeting.db                 libsql; owned by `persistence`; per-meeting RAG
+│   │                              chunk/embedding cache (rag_chunk/rag_embedding +
+│   │                              rag_chunk_fts) — derived, rebuildable (re-chunk +
+│   │                              re-embed the attachments/transcript). Phase B
+│   │                              occupies it with RAG tables only; the wider
+│   │                              per-meeting consolidation is planning/DESIGN_meeting_db.md
 │   ├── assets/                 pasted/dropped note images (content-hash files)
 │   │   └── <sha256>.<ext>
 │   └── chat/{session_id}.json  chat sessions (Phase 9)

@@ -53,6 +53,7 @@
 
 pub mod assets;
 pub mod attachments;
+mod blob;
 pub mod chat;
 pub mod collections;
 pub mod error;
@@ -61,6 +62,7 @@ pub mod meeting_ops;
 pub mod metadata;
 pub mod migrations;
 pub mod opus_encoder;
+pub mod rag;
 pub mod reader;
 pub mod summary;
 pub mod transcript;
@@ -89,6 +91,7 @@ pub use chat::ChatStore;
 pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;
 pub use index::MeetingIndex;
+pub use rag::{NewChunk, RagStore, RetrievedChunk};
 // Moved to `notes-crdt`; re-exported at the historical `persistence::*` paths.
 pub use notes_crdt::{
     metadata_lock, note_blocks_from_json, write_metadata, MeetingFolder, NotesData, NotesStore,

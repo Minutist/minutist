@@ -47,6 +47,7 @@ use chrono::Utc;
 use libsql::{Builder, Connection, Database};
 use minutist_common::{AppResult, MeetingId, VoiceprintCentroidId, VoiceprintIdentityId};
 
+use crate::blob::{blob_to_f32_vec, f32_slice_to_blob};
 use crate::error::Error;
 use crate::voiceprints_migrations;
 
@@ -1334,28 +1335,6 @@ async fn recompute_centroid(
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Serialisation helpers
-// ---------------------------------------------------------------------------
-
-/// Serialise a `[f32]` slice to a little-endian byte blob for SQLite storage.
-fn f32_slice_to_blob(v: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(v.len() * 4);
-    for &x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
-    out
-}
-
-/// Deserialise a little-endian byte blob back to `Vec<f32>`.
-///
-/// Any trailing bytes that do not form a complete f32 are silently discarded.
-fn blob_to_f32_vec(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -2007,6 +2007,27 @@ inside `persistence`; its workspace edges remain `common` and `notes-crdt`).
   Phase 5's `summariser` produces the file; Phase 4 lands only the path helper
   and the I/O seam.
 
+**RAG store (`rag` module + per-meeting `meeting.db`) — RAG Phase B.** `RagStore`
+is the per-meeting retrieval cache in `{root}/{uuid}/meeting.db` (libsql; a
+**derived, rebuildable** cache — re-chunk + re-embed to reconstruct, never
+authoritative). Tables: `rag_chunk` (id, doc_type, source_id, chunk_text,
+byte_offset), `rag_embedding` (chunk_id, embedding BLOB, dim, model_id), and a
+self-content `rag_chunk_fts` FTS5 index. One db per meeting, so rows are not keyed
+by `meeting_id`.
+- `RagStore::open(db_path) -> AppResult<RagStore>` (creates the schema on open)
+- `has_source(source_id) -> AppResult<bool>` — lets the caller skip re-embedding a
+  content-addressed (unchanged) source
+- `index_source(source_id, doc_type, model_id, &[NewChunk]) -> AppResult<usize>` —
+  delete-then-insert, replacing a source's chunks in one transaction
+- `forget_source(source_id) -> AppResult<u64>`; meeting-wide deletion is the
+  folder delete (the db lives inside `{uuid}/`)
+- `retrieve_dense(query_embedding, k)` / `retrieve_lexical(query_text, k)` — the two
+  retrieval legs (brute-force cosine via `common::voiceprint_math`; FTS5 `bm25()`
+  over sanitised, quoted query tokens), fused by the caller (Reciprocal Rank
+  Fusion). Splitting the legs keeps `persistence` free of a `rag-retrieval` edge —
+  its workspace edges remain `common` + `notes-crdt`.
+The f32↔BLOB helpers are shared with `voiceprints` via the crate-private `blob` module.
+
 **Phase 6 surface growth — public atomic `write_metadata(meeting_dir,
 &MeetingMeta)`.** A public free function (now living in `notes-crdt`'s `metadata`
 module, re-exported at the `persistence` crate root) that **atomically** (tmp +

@@ -21,6 +21,7 @@ members = [
     "crates/sync-ffi",
     "crates/doc-convert",
     "crates/rag-retrieval",
+    "crates/embedder",
     "crates/ipc-bridge",
     "crates/headless",
     "crates/election",

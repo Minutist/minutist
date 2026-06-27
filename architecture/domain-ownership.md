@@ -25,7 +25,8 @@ role when work is parallel.
 | `notes-crdt` | data-engineer | `crates/notes-crdt/**` | Same | `common` |
 | `persistence` | data-engineer | `crates/persistence/**` | Same | `common`, `notes-crdt` |
 | `doc-convert` | data-engineer | `crates/doc-convert/**` | Same | `common` only — NO other workspace-component edge |
-| `rag-retrieval` | ml-runtime-engineer | `crates/rag-retrieval/**` | Same | `common` only (pure retrieval logic; the concrete embedder is injected by `ipc-bridge` via the `Embedder` seam) |
+| `rag-retrieval` | ml-runtime-engineer | `crates/rag-retrieval/**` | Same | `common` only (pure retrieval logic; the concrete embedder is the `embedder` crate, injected via the `Embedder` seam) |
+| `embedder` | ml-runtime-engineer | `crates/embedder/**` | Same | `common`, `llama-cpp-2` (a model-loading leaf — the embedding peer of `summariser`) |
 | `settings` | data-engineer | `crates/settings/**` | Same | `common` |
 | `orchestrator` | systems-engineer | `crates/orchestrator/**` | Same | `common` + all live-pipeline crates per table in `components.md` |
 | `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator` |

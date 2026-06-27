@@ -42,6 +42,7 @@ appears in:
 | `election` | WS4-B (producer-gate) | `common`, `persistence` |
 | `doc-convert` | Attachments WS | `common` |
 | `rag-retrieval` | RAG | `common` |
+| `embedder` | RAG | `common`, `llama-cpp-2` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※ |
 | `headless` (bin) | WS4-B | `common`, `persistence`, `sync`, `settings` ‖ |
@@ -3219,18 +3220,39 @@ transcripts are RETRIEVED, not pinned (`planning/RAG_RETRIEVAL_PLAN.md`). This i
   is the dot product).
 - `Embedder` — the seam, defined in `common` alongside `Summariser` / `DocVlm`
   (re-exported from `rag-retrieval` for convenience). The concrete BGE-M3 /
-  llama-backed impl lives in `ipc-bridge` (which owns the model substrate);
-  because the trait lives in `common` — which `ipc-bridge` already depends on —
-  that impl creates **no `ipc-bridge → rag-retrieval` edge**. Phase B adds
-  `ModelKind::Embed` + the BGE-M3 manifest entry, the concrete embedder, the
-  per-meeting libsql chunk/vector store (+ FTS5), and the `retrieve_chunks` tool
-  (and regenerates the TS bindings, since `ModelKind` crosses the IPC surface).
+  llama-backed impl is the **`embedder` crate** (a model-loading leaf — see its
+  section below), which `ipc-bridge` constructs and holds; `rag-retrieval` itself
+  stays pure (no `llama-cpp-2`). Phase B adds `ModelKind::Embed` + the BGE-M3
+  manifest entry, the `embedder` crate, the per-meeting libsql chunk/vector store
+  (+ FTS5), and the `retrieve_chunks` tool (and regenerates the TS bindings, since
+  `ModelKind` crosses the IPC surface).
 - `RagChunk` / `DocType` — the pre-persistence chunk value (attachment | transcript); `persistence` assigns the durable row + identity columns (Phase B).
 
 **Planned embedder (Phase B):** BGE-M3 Q8_0 (MIT, on-demand download via a
 `ModelKind::Embed` manifest entry) — selected by SP-LIVE E6 (80% recall@5 on
 real-prose paraphrased queries vs Qwen3-Embedding-0.6B's 40%; see
 `research/sp-live-e6-embed-2026-06-25.md`).
+
+### `embedder`
+**Crate:** `crates/embedder` (RAG)
+**Owns:** the concrete text-embedding model — `Bgem3Embedder`, the
+`common::Embedder` implementation backed by a held llama.cpp model (BGE-M3 by
+default: CLS-pooled, 1024-dim, **L2-normalised**). The embedding peer of
+`summariser` / `asr-runtime` / `diarizer`: a model-loading leaf that owns the
+`llama-cpp-2` FFI for embeddings, so `ipc-bridge` (a Tauri crate) carries no direct
+llama edge. Depends on `common` (`Embedder`, `AppError`, `shared_llama_backend`,
+`voiceprint_math::unit_normalise`) + `llama-cpp-2`. GPU features (`vulkan`/`cuda`/
+`metal`/`rocm`) forward to `llama-cpp-2`, enabled transitively by `ipc-bridge`.
+
+- `Bgem3Embedder::open(gguf_path, n_gpu_layers) -> AppResult<Self>` — load the GGUF
+  (`n_gpu_layers` follows `gpu_acceleration`, like `LlamaSummariser`).
+- `embed_batch(&[&str]) -> AppResult<Vec<Vec<f32>>>` — one fresh embeddings
+  `LlamaContext` per text (`encode` + CLS-pooled `embeddings_seq_ith(0)`, then
+  L2-normalise); `dim()` returns the model's `n_embd`. `Send + Sync` (holds only
+  the `unsafe impl Send + Sync` `LlamaModel` + `Copy` scalars; the `!Sync` context
+  is per-call, never stored). Reuses the process-wide `shared_llama_backend`.
+  Constructed + held by `ipc-bridge` (lazy `ensure_embedder`); consumed by the
+  attach/transcript write path and the `retrieve_chunks` tool.
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

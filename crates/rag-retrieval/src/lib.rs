@@ -17,7 +17,7 @@
 //! [`Embedder`] seam (defined in `common` alongside `Summariser`/`DocVlm`, and
 //! re-exported here). It depends ONLY on `common`; it does NOT load models or
 //! pull `llama-cpp-2`. The concrete llama-backed embedder (BGE-M3 by default) is
-//! provided by `ipc-bridge` against `common::Embedder`; per-meeting chunk/vector
+//! provided by the `embedder` crate against `common::Embedder`; per-meeting chunk/vector
 //! persistence (libsql + FTS5) and the `retrieve_chunks` tool live in
 //! `persistence` / `agent-tools` (later phases).
 

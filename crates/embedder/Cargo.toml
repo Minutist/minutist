@@ -1,0 +1,27 @@
+[package]
+name = "embedder"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Owner role: ml-runtime-engineer.
+# The text-embedding model crate: a `common::Embedder` implementation backed by a
+# held llama.cpp model (BGE-M3, CLS-pooled, 1024-dim, L2-normalised). Mirrors the
+# other model-loading leaf crates (`summariser`, `asr-runtime`, `diarizer`) — it
+# owns the `llama-cpp-2` FFI for embeddings so `ipc-bridge` (a Tauri crate) does
+# NOT carry a direct llama edge. Used by the RAG retrieval path (Phase B): chunks
+# are embedded at attach/transcript-finalise time and the query at ask time.
+
+[dependencies]
+minutist-common = { path = "../common", features = ["llama-backend"] }
+llama-cpp-2 = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+# GPU acceleration backends, OFF by default — forward to llama-cpp-2, mirroring
+# `summariser` / `asr-runtime`. `ipc-bridge` enables these transitively.
+vulkan = ["llama-cpp-2/vulkan"]
+metal = ["llama-cpp-2/metal"]
+cuda = ["llama-cpp-2/cuda"]
+rocm = ["llama-cpp-2/rocm"]

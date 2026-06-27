@@ -1929,8 +1929,9 @@ pub trait DocVlm: Send + Sync {
 
 /// Injected text-embedding seam used by `rag-retrieval` to turn chunk and query
 /// text into vectors for cosine ranking, without `rag-retrieval` ever loading a
-/// model. The concrete BGE-M3 / llama-backed implementation lives in `ipc-bridge`
-/// (which owns the model substrate); `rag-retrieval` depends only on this trait.
+/// model. The concrete BGE-M3 / llama-backed implementation lives in the
+/// `embedder` crate (the embedding peer of `summariser`); `rag-retrieval` and the
+/// other consumers depend only on this trait.
 /// Sits alongside [`Summariser`] / [`DocVlm`] as a model-backed inference seam.
 ///
 /// `Send + Sync`: implementations hold an `Arc`-wrapped model (safe with

@@ -15,8 +15,8 @@ authors.workspace = true
 # search. It depends ONLY on `common` (AppResult, the shared cosine math in
 # `voiceprint_math`, and the `Embedder` seam — which lives in `common` alongside
 # `Summariser`/`DocVlm`); it does NOT pull `llama-cpp-2`. The concrete llama-backed
-# embedder is provided by `ipc-bridge` (which owns the model substrate) against
-# `common::Embedder`.
+# embedder is provided by the `embedder` crate (a model-loading leaf, like
+# `summariser`) against `common::Embedder`.
 
 [dependencies]
 minutist-common = { path = "../common" }

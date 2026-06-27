@@ -87,6 +87,14 @@ pub enum StreamKind {
     Notes = 1,
     /// Media-manifest exchange ([`crate::media_proto`]).
     Media = 2,
+    /// Meeting-list + processing-lifecycle discovery
+    /// ([`crate::discovery_proto`]). Each side sends the
+    /// `(MeetingId, ProcessingLifecycle)` of every meeting it holds, so a peer
+    /// learns both which meetings exist and their host-authoritative processing
+    /// state. Appended as tag `3`: the tag is the wire contract, so new variants
+    /// must only ever be added at the end — an older peer rejects an unknown tag
+    /// via [`Self::from_tag`] rather than mis-dispatching.
+    Discovery = 3,
 }
 
 impl StreamKind {
@@ -96,6 +104,7 @@ impl StreamKind {
         match tag {
             1 => Ok(Self::Notes),
             2 => Ok(Self::Media),
+            3 => Ok(Self::Discovery),
             other => Err(Error::Protocol(format!("unknown sync stream kind {other}"))),
         }
     }
@@ -281,6 +290,19 @@ pub async fn respond_notes_sync(
 mod tests {
     use super::*;
     use yrs::updates::decoder::Decode;
+
+    #[test]
+    fn stream_kind_tags_are_the_wire_contract() {
+        // The tag byte IS the wire contract: 1/2/3 are fixed and append-only, so
+        // this test fails if a future change reorders or renumbers a variant.
+        assert_eq!(StreamKind::from_tag(1).unwrap(), StreamKind::Notes);
+        assert_eq!(StreamKind::from_tag(2).unwrap(), StreamKind::Media);
+        assert_eq!(StreamKind::from_tag(3).unwrap(), StreamKind::Discovery);
+        // An unknown tag (an old peer seeing a future variant, or garbage) is a
+        // protocol error — never a silent mis-dispatch.
+        assert!(matches!(StreamKind::from_tag(0), Err(Error::Protocol(_))));
+        assert!(matches!(StreamKind::from_tag(4), Err(Error::Protocol(_))));
+    }
 
     #[test]
     fn empty_state_has_empty_state_vector() {

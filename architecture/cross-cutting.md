@@ -1178,7 +1178,8 @@ change.
 └── models/                     owned by `model-registry` (and nobody else)
     ├── asr/{model-id}/...      downloaded GGUF + mmproj per manifest entry
     ├── llm/{model-id}/...
-    └── diarize/{model-id}/...
+    ├── diarize/{model-id}/...
+    └── embed/{model-id}/...    retrieval embedder GGUF (BGE-M3 — RAG Phase B)
 ```
 
 The model manifest is **not** written into the cache. It is bundled in the

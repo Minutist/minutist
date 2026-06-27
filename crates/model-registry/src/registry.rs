@@ -178,6 +178,7 @@ impl ModelRegistry {
             ModelKind::Asr => "asr",
             ModelKind::Llm => "llm",
             ModelKind::Diarize => "diarize",
+            ModelKind::Embed => "embed",
         };
         self.cache_root.join(kind_subdir).join(&entry.id.0)
     }

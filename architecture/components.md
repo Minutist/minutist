@@ -338,7 +338,9 @@ used, not added here.
 `LiveDigestItem`, `LiveDigest`, `LiveAgentMode`,
 `ProcessingLifecycle`, `ProcessingClaim`, `HostRef`),
 trait definitions (`AsrBackend`, `Diarizer`,
-`Summariser`, `DocVlm`, `Embedder`), the shared `AppError` enum + `AppResult<T>` alias,
+`Summariser`, `DocVlm`, `Embedder` — the last is **batch-first** (`embed_batch`
+primary; scalar `embed` default-delegates), and `ModelKind` carries an `Embed`
+variant for the retrieval embedder), the shared `AppError` enum + `AppResult<T>` alias,
 `apply_speaker_overlay(&mut [Segment], &BTreeMap<String, String>)` — the
 single canonical speaker-name overlay (raw diarizer label → display name),
 shared by the agent read tools and the summariser input path so a summary

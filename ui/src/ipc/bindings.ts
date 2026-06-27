@@ -1818,7 +1818,11 @@ export type ModelId = string
  * under `{app-data}/models/{kind}/` (see `architecture/cross-cutting.md`
  * "Filesystem layout").
  */
-export type ModelKind = "asr" | "llm" | "diarize"
+export type ModelKind = "asr" | "llm" | "diarize" | 
+/**
+ * Text-embedding model (e.g. BGE-M3) backing retrieval.
+ */
+"embed"
 export type ModelStatus = { id: ModelId; kind: ModelKind; display_name: string; status: ModelStatusState; 
 /**
  * SPDX licence identifier of the underlying weights, copied verbatim

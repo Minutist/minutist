@@ -396,6 +396,8 @@ pub enum ModelKind {
     Asr,
     Llm,
     Diarize,
+    /// Text-embedding model (e.g. BGE-M3) backing retrieval.
+    Embed,
 }
 
 /// Catalogue entry describing one model the app knows about.
@@ -1936,13 +1938,26 @@ pub trait DocVlm: Send + Sync {
 /// call (never stored), so the seam can be shared across the retrieval threads
 /// (`spawn_blocking`) that embed chunks at attach time and the query at ask time.
 pub trait Embedder: Send + Sync {
-    /// Embed `text` into a fixed-dimension, **L2-normalised** vector of length
-    /// [`Self::dim`].
+    /// Embed each input into a fixed-dimension, **L2-normalised** vector of length
+    /// [`Self::dim`] — one vector per input, in input order. This is the primary
+    /// method: callers embed a whole chunk set in one call so implementations can
+    /// amortise model setup. An empty `texts` slice returns an empty `Vec`.
     ///
     /// Implementations MUST return unit-length vectors so the retrieval cosine
     /// reduces to a dot product. Used at attach time to embed chunks and at query
     /// time to embed the question.
-    fn embed(&self, text: &str) -> AppResult<Vec<f32>>;
+    fn embed_batch(&self, texts: &[&str]) -> AppResult<Vec<Vec<f32>>>;
+
+    /// Embed a single `text`. Default-delegates to a one-element
+    /// [`Self::embed_batch`]; implementations need not override it.
+    fn embed(&self, text: &str) -> AppResult<Vec<f32>> {
+        self.embed_batch(std::slice::from_ref(&text))?
+            .pop()
+            .ok_or_else(|| AppError::Inference {
+                backend: "embedder".into(),
+                context: "embed_batch returned no vector for a single input".into(),
+            })
+    }
 
     /// The embedding dimensionality (e.g. 1024 for BGE-M3).
     fn dim(&self) -> usize;
@@ -2284,9 +2299,11 @@ mod tests {
         let asr = serde_json::to_string(&ModelKind::Asr).unwrap();
         let llm = serde_json::to_string(&ModelKind::Llm).unwrap();
         let diar = serde_json::to_string(&ModelKind::Diarize).unwrap();
+        let embed = serde_json::to_string(&ModelKind::Embed).unwrap();
         assert_eq!(asr, "\"asr\"");
         assert_eq!(llm, "\"llm\"");
         assert_eq!(diar, "\"diarize\"");
+        assert_eq!(embed, "\"embed\"");
     }
 
     #[test]

@@ -116,6 +116,7 @@ fn dummy_meta(id: MeetingId, duration_ms: u64) -> MeetingMeta {
         diarizer: None,
         speaker_names: std::collections::BTreeMap::new(),
         notes_format: 0,
+        processing: Default::default(),
         collection_id: None,
         app_version: "0.0.0-test".to_string(),
     }

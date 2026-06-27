@@ -98,6 +98,7 @@ async fn seed_meeting(
         diarizer: None,
         speaker_names,
         notes_format: 0,
+        processing: Default::default(),
         collection_id: None,
         app_version: "0.0.0".to_string(),
     };

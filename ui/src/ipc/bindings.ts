@@ -1593,6 +1593,12 @@ export type GpuAcceleration =
  */
 "off"
 /**
+ * Opaque key naming the host (device) that holds a meeting's processing
+ * claim. An opaque string keeps `iroh` out of `common`: `sync` maps it
+ * from/to its `iroh::EndpointId` at the wire boundary. Mirrors [`ModelId`].
+ */
+export type HostRef = string
+/**
  * Error type returned from every Tauri command in `ipc-bridge`.
  * 
  * Carries the same discriminants as `common::AppError` and serialises to the
@@ -1782,7 +1788,17 @@ notes_format?: number;
  * grows when set — the same defaulted-field pattern `speaker_names` /
  * `notes_format` use.
  */
-collection_id?: CollectionId | null; app_version: string }
+collection_id?: CollectionId | null; 
+/**
+ * Where this meeting sits in the capture → processing → processed
+ * pipeline. Host-authoritative and self-healing — a consumer never
+ * authors it; the sync lifecycle exchange propagates the source host's
+ * state. `#[serde(default)] = Local` so existing `metadata.json` (written
+ * before the field existed) reads as a locally-processed meeting, the same
+ * defaulted-field pattern `notes_format` uses. See
+ * `planning/DESIGN_processing-lifecycle.md`.
+ */
+processing?: ProcessingLifecycle; app_version: string }
 /**
  * The full restorable state of a meeting, assembled by `persistence` for
  * `open_meeting`: metadata, transcript segments, and the notes document
@@ -1895,6 +1911,78 @@ user_code: string;
  * provided it, else the bare verification URL.
  */
 verification_uri: string }
+/**
+ * A durable, syncable claim that one host owns a meeting's processing (ASR /
+ * diarization / summarisation) and is the authoritative producer of its
+ * derived outputs.
+ * 
+ * Distinct from the in-memory single-device offline slot in `orchestrator`
+ * (`claim_offline`), which guards one device against two concurrent offline
+ * ops and is never persisted or synced. This claim is persisted in
+ * `metadata.json` and propagated to peers, so it can act as a cross-device
+ * lock. Carried inside [`ProcessingLifecycle::Claimed`].
+ * 
+ * Timestamps are RFC 3339 UTC strings, matching `MeetingMeta::started_at`'s
+ * format (no `chrono` in `common`). They drive lease/reap timing only and are
+ * NOT used to resolve racing claims — cross-device clock skew makes them
+ * unreliable, so the tiebreak is the lowest `HostRef` (decided in `sync`).
+ */
+export type ProcessingClaim = { 
+/**
+ * The host that owns this claim.
+ */
+host: HostRef; 
+/**
+ * When the claim was taken (RFC 3339 UTC).
+ */
+claimed_at: string; 
+/**
+ * Past this instant (RFC 3339 UTC) with no transition to
+ * [`ProcessingLifecycle::Processed`], any peer may reap the claim and
+ * re-elect — recovering a crashed host that cannot release its own slot.
+ */
+lease_expires_at: string }
+/**
+ * Where a meeting sits in the capture → processing → processed pipeline,
+ * persisted on [`MeetingMeta`] (`metadata.json`) and propagated to peers.
+ * 
+ * `processing` is **derived and host-authoritative**: the host that holds the
+ * claim authors it; consumers never write it — they receive it over the
+ * lifecycle sync exchange and self-heal their local copy. It is NOT part of
+ * the user-editable metadata that folds into the notes-CRDT.
+ * 
+ * `#[serde(default)] = Local` so existing `metadata.json` written before this
+ * field existed reads as a locally-recorded-and-processed meeting (today's
+ * only path) — no migration. The same defaulted-field pattern `speaker_names`
+ * / `notes_format` use.
+ * 
+ * One shape serves two roles without naming a device type: a phone or a
+ * GPU-less desktop is the capture device (writes `PendingProcessing`); a
+ * desktop or the headless GPU hub is the processing host (claims → produces
+ * outputs). See `planning/DESIGN_processing-lifecycle.md`.
+ */
+export type ProcessingLifecycle = 
+/**
+ * Recorded AND processed on this device — today's only path, and the
+ * back-compat default for metadata written before the field existed.
+ */
+{ state: "local" } | 
+/**
+ * Captured on a device that does not process it locally, and offered for
+ * an eligible host to adopt. The capture device sets this at finalise
+ * instead of running the pipeline.
+ */
+{ state: "pending_processing" } | 
+/**
+ * A host has claimed the meeting and is producing its derived outputs.
+ * Peers observing this neither claim nor process it.
+ */
+{ state: "claimed"; claim: ProcessingClaim } | 
+/**
+ * Processing finished; the derived outputs are authoritative. `at` is the
+ * RFC 3339 UTC completion time.
+ */
+{ state: "processed"; processed_by: HostRef; at: string }
 /**
  * Top-level state of the recording pipeline. Emitted to the webview on
  * transitions via `AppEvent::StateChanged`.

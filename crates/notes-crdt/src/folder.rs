@@ -151,6 +151,13 @@ impl MeetingFolder {
                 speaker_names: std::collections::BTreeMap::new(),
                 notes_format: 0,
                 collection_id: None,
+                // Inbound placeholder defaults to `Local` (the ProcessingLifecycle
+                // default). We never guess `PendingProcessing` here: the lifecycle
+                // sync exchange overwrites this with the source host's
+                // authoritative state, and a `Processed` meeting synced for viewing
+                // must not look adoptable. See
+                // planning/DESIGN_processing-lifecycle.md §7 Q4.
+                processing: Default::default(),
                 app_version: String::new(),
             };
             crate::write_metadata(&path, &placeholder)?;

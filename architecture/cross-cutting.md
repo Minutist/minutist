@@ -1250,6 +1250,54 @@ hub neither serves the UI nor, in the sync-hub role, runs models. The
 single-writer rule applies per data root: the daemon must be the sole process
 over its root, and must never point at a desktop's `{app-data}`.
 
+### Per-meeting metadata.json write lock
+
+The single-writer rule above keeps two *processes* off one data root; a second,
+in-process lock serialises the in-process tasks that read-modify-write a meeting's
+`metadata.json` against each other. The guarded writers are the
+`persistence::meeting_ops` operations (`rename_meeting`, `set_meeting_collection`,
+`set_speaker_name`, `apply_processing_lifecycle`) and `MeetingFolder::ensure`'s
+placeholder seed; on a multi-threaded runtime the sync lifecycle-event subscriber
+can run one while a user command runs another. Without serialisation each does an
+independent read→mutate→write and the later write drops the field the earlier one
+set.
+
+A process-wide per-meeting `std::sync::Mutex` registry — `METADATA_LOCKS`, in the
+leaf `notes-crdt` crate — serialises them, mirroring the attachments
+`MANIFEST_LOCKS` (see "Per-meeting manifest write lock"):
+
+    static METADATA_LOCKS: OnceLock<Mutex<HashMap<MeetingId, Arc<Mutex<()>>>>>
+
+It lives in `notes-crdt` because that is the lowest crate both writers reach
+(`persistence` depends on `notes-crdt`, and `ensure` is defined there). It is a
+`std::sync::Mutex`, not a `tokio` one, because every guarded RMW is synchronous
+`std::fs` with no `.await` held across the guard — so it adds no `tokio`
+dependency to `notes-crdt`. Each writer takes `notes_crdt::metadata_lock(id)` for
+the check-then-RMW and drops the guard before any later `.await` (the `index.db`
+upsert in `rename_meeting` / `set_meeting_collection` runs after the guard is
+released; the index is a derived cache, reconciled by `rebuild_from_disk`).
+
+Coverage boundary: this registry serialises the `meeting_ops` RMWs, the lifecycle
+subscriber, and `ensure`'s seed — NOT every writer of `metadata.json`. Two writers
+are not yet on it:
+
+- The `orchestrator`'s post-processing RMWs — `finalise_diarization`, the
+  re-transcribe `speaker_count` update, and the voiceprint `speaker_names`
+  restores — read the whole `MeetingMeta` and write it back without taking this
+  lock, so a concurrent orchestrator pass can still revert the lifecycle
+  subscriber's `processing` (a silent lost-update — though not a torn file, since
+  writes are atomic tmp+fsync+rename). This is the headline residual: a local
+  diarize/reprocess pass racing a remote host's `Claimed`/`Processed` advert.
+- `agent-tools`' speaker-rename / meeting-rename tools RMW through their own
+  instance-scoped lock — a *separate* registry — so they do not serialise against
+  the writers above.
+
+Folding both onto `notes_crdt::metadata_lock` (ideally behind one guarded
+read-modify-write helper, so a caller cannot forget the lock) is a tracked
+cross-domain follow-up. `MeetingWriter::finalise` writes the initial
+`metadata.json` blind (not an RMW, no prior on-disk state) and is intentionally
+not gated.
+
 ## Voiceprint matching
 
 **Scope (issue #0003).** Cross-session speaker voiceprints: a speaker enrolled

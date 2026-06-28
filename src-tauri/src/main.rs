@@ -373,6 +373,7 @@ struct McpStartParams {
     event_tx: tokio::sync::broadcast::Sender<minutist_common::AppEvent>,
     settings: settings::SettingsHandle,
     summariser: Arc<tokio::sync::OnceCell<Arc<ipc_bridge::LlamaSummariser>>>,
+    embedder: Arc<tokio::sync::OnceCell<Arc<dyn minutist_common::Embedder>>>,
     chat_in_flight:
         Arc<std::sync::Mutex<std::collections::HashSet<minutist_common::ChatSessionId>>>,
     app_data_dir: std::path::PathBuf,
@@ -410,6 +411,7 @@ async fn do_start_mcp_server(params: McpStartParams) {
         event_tx: params.event_tx.clone(),
         settings: params.settings.clone(),
         summariser: params.summariser.clone(),
+        embedder: params.embedder.clone(),
     };
 
     // Ensure the held summariser is loaded before binding the port: a failure
@@ -856,28 +858,31 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // SAME Gemma-4 model once). Constructed here — before the worker — so
             // the conversion worker can carry a `GemmaVlm` backed by it.
             let summariser_cell = Arc::new(tokio::sync::OnceCell::new());
+            // The held BGE-M3 embedder cell (RAG), shared with `IpcState` below so
+            // the model loads once for both the write path and `retrieve_chunks`.
+            let embedder_cell = Arc::new(tokio::sync::OnceCell::new());
 
-            // The image-OCR backend for the conversion worker: a `GemmaVlm`
-            // wrapping the held summariser via a `ChatHandles`. Lazy — it loads
-            // the model + vision projector only when a direct image attachment
-            // actually reaches the VLM. The bounded single worker serialises
-            // OCR, so it never contends with itself on the GPU (it does share
-            // the device with summarise/ASR — compute serialises, acceptable
-            // for a background job).
+            // The conversion worker's handles: a `ChatHandles` carrying the held
+            // summariser (for the image-OCR `GemmaVlm`) AND the held embedder (for
+            // the RAG attach-index write path). Built once, shared between both.
+            // Lazy — neither model loads until first use.
+            let convert_handles = ipc_bridge::ChatHandles {
+                orchestrator: orchestrator.clone(),
+                index: index.clone(),
+                meetings_dir: notes_meetings_dir.clone(),
+                event_tx: ipc_event_tx.clone(),
+                settings: settings_handle.clone(),
+                summariser: summariser_cell.clone(),
+                embedder: embedder_cell.clone(),
+            };
             let attachment_vlm: Arc<dyn minutist_common::DocVlm> =
-                Arc::new(ipc_bridge::GemmaVlm::new(ipc_bridge::ChatHandles {
-                    orchestrator: orchestrator.clone(),
-                    index: index.clone(),
-                    meetings_dir: notes_meetings_dir.clone(),
-                    event_tx: ipc_event_tx.clone(),
-                    settings: settings_handle.clone(),
-                    summariser: summariser_cell.clone(),
-                }));
+                Arc::new(ipc_bridge::GemmaVlm::new(convert_handles.clone()));
             ipc_bridge::spawn_attachment_convert_worker(
                 attachment_convert_rx,
                 notes_meetings_dir.clone(),
                 ipc_event_tx.clone(),
                 Some(attachment_vlm),
+                Some(convert_handles),
             );
 
             // Converge-on-startup for attachment conversions: re-enqueue any row
@@ -1004,6 +1009,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 event_tx: ipc_event_tx.clone(),
                 attachment_convert_tx,
                 summariser: summariser_cell.clone(),
+                embedder: embedder_cell.clone(),
                 tool_registry,
                 chat_in_flight: chat_in_flight.clone(),
                 chat_cancel: chat_cancel.clone(),
@@ -1086,6 +1092,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 let watcher_event_tx = ipc_event_tx.clone();
                 let watcher_settings = settings_handle.clone();
                 let watcher_summariser = summariser_cell.clone();
+                let watcher_embedder = embedder_cell.clone();
                 let watcher_chat_in_flight = chat_in_flight.clone();
                 let watcher_app_data_dir = app_data_dir.clone();
                 let watcher_mcp_info = mcp_info.clone();
@@ -1130,6 +1137,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                             event_tx: watcher_event_tx.clone(),
                             settings: watcher_settings.clone(),
                             summariser: watcher_summariser.clone(),
+                            embedder: watcher_embedder.clone(),
                             chat_in_flight: watcher_chat_in_flight.clone(),
                             app_data_dir: watcher_app_data_dir.clone(),
                             mcp_info: watcher_mcp_info.clone(),
@@ -1172,6 +1180,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                                 event_tx: watcher_event_tx.clone(),
                                 settings: watcher_settings.clone(),
                                 summariser: watcher_summariser.clone(),
+                                embedder: watcher_embedder.clone(),
                                 chat_in_flight: watcher_chat_in_flight.clone(),
                                 app_data_dir: watcher_app_data_dir.clone(),
                                 mcp_info: watcher_mcp_info.clone(),

@@ -182,10 +182,11 @@ pub fn spawn_attachment_convert_worker(
     meetings_dir: PathBuf,
     event_tx: broadcast::Sender<AppEvent>,
     vlm: Option<Arc<dyn DocVlm>>,
+    rag_handles: Option<ChatHandles>,
 ) {
     tauri::async_runtime::spawn(async move {
         while let Some(job) = rx.recv().await {
-            run_convert_job(&meetings_dir, &event_tx, vlm.clone(), job).await;
+            run_convert_job(&meetings_dir, &event_tx, vlm.clone(), rag_handles.clone(), job).await;
         }
         tracing::info!(
             target: "ipc-bridge",
@@ -287,6 +288,7 @@ async fn run_convert_job(
     meetings_dir: &Path,
     event_tx: &broadcast::Sender<AppEvent>,
     vlm: Option<Arc<dyn DocVlm>>,
+    rag_handles: Option<ChatHandles>,
     job: ConvertJob,
 ) {
     let ConvertJob {
@@ -298,6 +300,8 @@ async fn run_convert_job(
 
     let meetings_dir_owned = meetings_dir.to_path_buf();
     let original_filename = format!("{hash}.{ext}");
+    // Keep the hash for the RAG index (the conversion closure below moves `hash`).
+    let hash_for_index = hash.clone();
     // The blocking task returns `true` when the manifest row was flipped to
     // Ready, `false` when the row was removed mid-conversion (so the just-written
     // `<hash>.md` was cleaned up and no `Ready` event should be emitted).
@@ -347,6 +351,11 @@ async fn run_convert_job(
                 attachment_id = %attachment_id.0,
                 "attachment converted to markdown"
             );
+            // RAG (best-effort): chunk + embed the converted markdown into
+            // meeting.db so it is retrievable. Skipped when no handles are wired.
+            if let Some(handles) = &rag_handles {
+                crate::rag_index::index_attachment(handles, meeting_id, &hash_for_index).await;
+            }
         }
         Ok(Ok(false)) => {
             // Row removed mid-conversion: the markdown was cleaned up above and
@@ -505,6 +514,7 @@ mod tests {
         run_convert_job(
             root,
             &event_tx,
+            None,
             None,
             ConvertJob {
                 meeting_id: id,
@@ -709,6 +719,7 @@ mod tests {
         run_convert_job(
             root,
             &event_tx,
+            None,
             None,
             ConvertJob {
                 meeting_id: id,

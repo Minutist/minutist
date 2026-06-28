@@ -43,7 +43,7 @@ appears in:
 | `doc-convert` | Attachments WS | `common` |
 | `rag-retrieval` | RAG | `common` |
 | `embedder` | RAG | `common`, `llama-cpp-2` |
-| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
+| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert`, `embedder`, `rag-retrieval` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※ |
 | `headless` (bin) | WS4-B | `common`, `persistence`, `sync`, `settings` ‖ |
 
@@ -3232,6 +3232,17 @@ transcripts are RETRIEVED, not pinned (`planning/RAG_RETRIEVAL_PLAN.md`). This i
 `ModelKind::Embed` manifest entry) — selected by SP-LIVE E6 (80% recall@5 on
 real-prose paraphrased queries vs Qwen3-Embedding-0.6B's 40%; see
 `research/sp-live-e6-embed-2026-06-25.md`).
+
+**Write path (Phase B — `ipc-bridge::rag_index`).** `ipc-bridge` drives the RAG
+write path through a best-effort `rag_index` module (the new `ipc-bridge →
+rag-retrieval` edge supplies `chunk_text`; `ipc-bridge → embedder` supplies the
+model): at attachment-convert time (`run_convert_job`, after the `Ready` flip) and
+at transcript-finalise time (an unconditional post-stop step, after any reprocess),
+it chunks the source, embeds the chunks via the held `Embedder` on `spawn_blocking`,
+and persists them into the meeting's `meeting.db` via `RagStore::index_source`.
+Failures log and are swallowed — RAG is a rebuildable cache and must never fail
+attachment conversion or the post-stop flow. Chat/live-agent *consumption* of the
+index (via `retrieve_chunks`) is a later phase.
 
 ### `embedder`
 **Crate:** `crates/embedder` (RAG)

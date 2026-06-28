@@ -85,6 +85,11 @@ pub(crate) fn apply_output_language(prompt: &str, output_language_setting: &str)
 /// summarise path.
 pub const DEFAULT_LLM_MODEL_ID: &str = "gemma-4-e4b-it-q4_k_m";
 
+/// The bundled retrieval embedder id (BGE-M3) — hand-matched to a `kind = embed`
+/// entry in `resources/models.json` (guarded by a test in `tests/`). Used by the
+/// RAG write path and the `retrieve_chunks` tool.
+pub const DEFAULT_EMBED_MODEL_ID: &str = "bge-m3-q8_0";
+
 /// Resolve the LLM model id used by [`summarise_meeting`]: the user-selected
 /// `settings.llm_model_id` if set, else the bundled default
 /// [`DEFAULT_LLM_MODEL_ID`].
@@ -330,7 +335,10 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
         state.orchestrator.diarization_enabled(),
         state.settings.current().auto_summarise_on_stop,
     );
-    if !passes.is_empty() {
+    // Always spawn the post-stop task: it runs the gated/ordered passes (a no-op
+    // when none apply) and then unconditionally indexes the final transcript into
+    // meeting.db for retrieval.
+    {
         let orchestrator = std::sync::Arc::clone(&state.orchestrator);
         let index = std::sync::Arc::clone(&state.index);
         let handles = state.chat_handles();
@@ -420,6 +428,19 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
                 }
             })
             .await;
+
+            // Always index the final transcript into meeting.db for retrieval
+            // (best-effort; runs after any reprocess so it indexes the repaired
+            // transcript). A failure leaves retrieval over this meeting incomplete,
+            // never the meeting itself.
+            if let Err(e) = crate::rag_index::index_transcript(&handles, meeting_id).await {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "post-stop transcript RAG-index failed (best-effort; rebuilt on next reprocess)"
+                );
+            }
         });
     }
 
@@ -2034,7 +2055,7 @@ pub(crate) fn open_summariser_in_dir(
 }
 
 /// Locate the single non-`mmproj` `.gguf` file in `model_dir`.
-fn find_gguf_weights(model_dir: &Path) -> Result<std::path::PathBuf, AppError> {
+pub(crate) fn find_gguf_weights(model_dir: &Path) -> Result<std::path::PathBuf, AppError> {
     let read_dir = std::fs::read_dir(model_dir).map_err(|e| AppError::ModelLoad {
         model_id: model_dir.display().to_string(),
         context: format!("cannot read model directory: {e}"),

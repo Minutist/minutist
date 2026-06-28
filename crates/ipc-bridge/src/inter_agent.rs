@@ -376,6 +376,7 @@ mod tests {
             event_tx,
             settings,
             summariser: summariser_cell,
+            embedder: Arc::new(tokio::sync::OnceCell::new()),
         };
         let chat_in_flight = Arc::new(Mutex::new(HashSet::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

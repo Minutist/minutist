@@ -146,6 +146,7 @@ pub mod inter_agent;
 pub mod lifecycle;
 pub mod live_agent;
 pub mod output_language;
+pub mod rag_index;
 pub mod sync;
 pub mod tunnel;
 
@@ -238,6 +239,10 @@ pub struct IpcState {
     /// handlers can drive without a `block_on`. See
     /// `architecture/cross-cutting.md` — "Agent chat loop".
     pub summariser: Arc<OnceCell<Arc<LlamaSummariser>>>,
+    /// The lazily-loaded held BGE-M3 embedder (RAG). The SAME `Arc<OnceCell>`
+    /// [`ChatHandles`] holds, so the model loads once and serves both the RAG
+    /// write path and the `retrieve_chunks` tool.
+    pub embedder: Arc<OnceCell<Arc<dyn minutist_common::Embedder>>>,
     /// The chat tool registry, built once (`ToolRegistry::v1(false)` — the
     /// inter-agent bridge tool is Phase 10). Shared by the chat driver, which
     /// reads `descriptors()` for the offered tools and `dispatch(...)` to run
@@ -360,6 +365,7 @@ impl IpcState {
             event_tx: self.event_tx.clone(),
             settings: self.settings.clone(),
             summariser: Arc::clone(&self.summariser),
+            embedder: Arc::clone(&self.embedder),
         }
     }
 

@@ -43,6 +43,23 @@ impl Summariser for StubSummariser {
     }
 }
 
+/// An `Embedder` stub returning a fixed unit vector per text, so `retrieve_chunks`
+/// is exercisable without a real GGUF. All vectors are identical, so the dense leg
+/// ranks every chunk equally and the lexical (FTS5) leg decides the ordering.
+struct StubEmbedder;
+
+impl minutist_common::Embedder for StubEmbedder {
+    fn embed_batch(&self, texts: &[&str]) -> AppResult<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+    }
+    fn dim(&self) -> usize {
+        4
+    }
+    fn model_id(&self) -> &str {
+        "stub-embed"
+    }
+}
+
 /// Build a `ToolContext` over a tempdir-backed meetings root + in-memory index +
 /// a test orchestrator. Returns the context plus the `TempDir` guard (kept alive
 /// by the caller) and the meetings root path.
@@ -383,6 +400,64 @@ async fn retrieve_chunks_without_embedder_errors_gracefully() {
         err,
         minutist_common::AppError::InvalidInput { .. }
     ));
+}
+
+#[tokio::test]
+async fn retrieve_chunks_returns_indexed_passages() {
+    let (tempdir, meetings_dir, _ctx) = make_ctx().await;
+    let id = MeetingId::new();
+    // Index two chunks into the meeting's meeting.db. model_id + dim must match the
+    // stub embedder so the dense leg's model/dim filter accepts them.
+    std::fs::create_dir_all(meetings_dir.join(id.0.to_string())).unwrap();
+    let store = persistence::RagStore::open(persistence::meeting_db_path(&meetings_dir, id))
+        .await
+        .unwrap();
+    let emb = vec![1.0f32, 0.0, 0.0, 0.0];
+    store
+        .index_source(
+            "transcript",
+            "transcript",
+            "stub-embed",
+            &[
+                persistence::NewChunk { text: "alpha apple discussion", byte_offset: 0, embedding: &emb },
+                persistence::NewChunk { text: "beta banana tangent", byte_offset: 30, embedding: &emb },
+            ],
+        )
+        .await
+        .unwrap();
+
+    // A ToolContext with the stub embedder, scoped to this meeting.
+    let index = Arc::new(MeetingIndex::open(":memory:").await.unwrap());
+    let orchestrator: Arc<Orchestrator> = Arc::new(test_orchestrator(meetings_dir.clone()));
+    let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
+    let embedder: Arc<dyn minutist_common::Embedder> = Arc::new(StubEmbedder);
+    let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
+    let ctx = ToolContext::new(
+        orchestrator,
+        index,
+        meetings_dir.clone(),
+        summariser,
+        Some(embedder),
+        event_tx,
+        Some(id),
+    );
+
+    let reg = ToolRegistry::v1(false);
+    let out = reg
+        .dispatch(&ctx, "retrieve_chunks", serde_json::json!({ "query": "alpha", "k": 5 }))
+        .await
+        .expect("retrieve_chunks");
+    let chunks = out.data["chunks"].as_array().expect("chunks array");
+    assert!(!chunks.is_empty(), "expected at least one retrieved passage");
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c["text"].as_str().unwrap_or("").contains("alpha")),
+        "the alpha chunk must be retrieved for query 'alpha'"
+    );
+    // Provenance: transcript chunks report source "transcript".
+    assert!(chunks.iter().all(|c| c["source"] == "transcript"));
+    drop(tempdir);
 }
 
 #[tokio::test]

@@ -111,6 +111,13 @@ const DEV_MODELS: ModelStatus[] = [
     status: { state: "available", local_dir: "/dev/models/diarize/3dspeaker" },
     license: "apache-2.0",
   },
+  {
+    id: "bge-m3-q8_0",
+    kind: "embed",
+    display_name: "BGE-M3 (Q8_0)",
+    status: { state: "available", local_dir: "/dev/models/embed/bge-m3" },
+    license: "mit",
+  },
 ];
 
 const DEV_SETTINGS: Settings = {

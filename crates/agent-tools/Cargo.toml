@@ -7,7 +7,8 @@ authors.workspace = true
 
 # Phase 9: the shared tool layer. One `Tool` trait + one `ToolRegistry`; the
 # single place a chat-agent / MCP tool is defined. Edges: common, persistence,
-# orchestrator (NO summariser edge — `resummarise` drives an
+# orchestrator, rag-retrieval (for `rrf_fuse` in `retrieve_chunks`)
+# (NO summariser edge — `resummarise` drives an
 # `Arc<dyn Summariser>` held in `ToolContext`; NO model-registry edge —
 # `relisten_section` resolves its ASR backend through
 # `Orchestrator::transcribe_pcm_window`).

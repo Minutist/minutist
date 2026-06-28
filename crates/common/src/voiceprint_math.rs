@@ -79,6 +79,17 @@ pub fn cosine_unit(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
 }
 
+/// Descending comparator for similarity scores that sinks non-finite values (a
+/// NaN/±inf from a degenerate vector) to the bottom, so a single bad score cannot
+/// make the sort non-transitive. Shared by `rag-retrieval`'s `rank_top_k` and the
+/// RAG dense-retrieval leg.
+pub fn cmp_desc_finite_first(a: f32, b: f32) -> std::cmp::Ordering {
+    let key = |s: f32| if s.is_finite() { s } else { f32::NEG_INFINITY };
+    key(b)
+        .partial_cmp(&key(a))
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
 /// Count-weighted mean of N established centroids, then L2-normalised.
 ///
 /// Each element of `centroids` is a `(vector, count)` pair where `count`

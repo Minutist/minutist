@@ -91,7 +91,7 @@ pub use chat::ChatStore;
 pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;
 pub use index::MeetingIndex;
-pub use rag::{NewChunk, RagStore, RetrievedChunk};
+pub use rag::{meeting_db_path, NewChunk, RagStore, RetrievedChunk};
 // Moved to `notes-crdt`; re-exported at the historical `persistence::*` paths.
 pub use notes_crdt::{
     metadata_lock, note_blocks_from_json, write_metadata, MeetingFolder, NotesData, NotesStore,

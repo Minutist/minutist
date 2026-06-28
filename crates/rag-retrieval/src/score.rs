@@ -25,11 +25,9 @@ pub fn rank_top_k(query: &[f32], items: &[(usize, Vec<f32>)], k: usize) -> Vec<(
             (*id, cosine_unit(query, v))
         })
         .collect();
-    // Sort descending. A non-finite score (e.g. from a degenerate embedding)
-    // would make `partial_cmp` non-transitive and scramble the whole ordering, so
-    // map it to the bottom before comparing.
-    let key = |s: f32| if s.is_finite() { s } else { f32::NEG_INFINITY };
-    scored.sort_by(|a, b| key(b.1).partial_cmp(&key(a.1)).unwrap_or(std::cmp::Ordering::Equal));
+    // Descending; non-finite scores sink to the bottom (shared comparator) so a
+    // degenerate embedding can't make the sort non-transitive.
+    scored.sort_by(|a, b| minutist_common::voiceprint_math::cmp_desc_finite_first(a.1, b.1));
     scored.truncate(k);
     scored
 }

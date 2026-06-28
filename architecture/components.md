@@ -2022,12 +2022,18 @@ by `meeting_id`.
   delete-then-insert, replacing a source's chunks in one transaction
 - `forget_source(source_id) -> AppResult<u64>`; meeting-wide deletion is the
   folder delete (the db lives inside `{uuid}/`)
-- `retrieve_dense(query_embedding, k)` / `retrieve_lexical(query_text, k)` — the two
-  retrieval legs (brute-force cosine via `common::voiceprint_math`; FTS5 `bm25()`
-  over sanitised, quoted query tokens), fused by the caller (Reciprocal Rank
-  Fusion). Splitting the legs keeps `persistence` free of a `rag-retrieval` edge —
-  its workspace edges remain `common` + `notes-crdt`.
-The f32↔BLOB helpers are shared with `voiceprints` via the crate-private `blob` module.
+- `retrieve_dense(query_embedding, model_id, k)` / `retrieve_lexical(query_text, k)`
+  — the two retrieval legs (brute-force cosine via `common::voiceprint_math`; FTS5
+  `bm25()` over sanitised, quoted query tokens), fused by the caller (Reciprocal
+  Rank Fusion). The dense leg scores ONLY vectors stored under `model_id` and of
+  matching dimension (`common::Embedder` now exposes `model_id()`); a foreign
+  vector is skipped, not truncate-scored, so a model swap degrades to "no
+  comparable vectors" instead of corrupting the ranking. Splitting the legs keeps
+  `persistence` free of a `rag-retrieval` edge — its workspace edges remain
+  `common` + `notes-crdt`.
+The f32↔BLOB helpers (and the descending finite-first sort comparator) are shared
+via `common`; `persistence::meeting_db_path` is the single owner of the `meeting.db`
+layout. `RagStore::open` sets a `busy_timeout` so overlapping indexers retry.
 
 **Phase 6 surface growth — public atomic `write_metadata(meeting_dir,
 &MeetingMeta)`.** A public free function (now living in `notes-crdt`'s `metadata`

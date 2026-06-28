@@ -33,10 +33,27 @@
 use std::path::Path;
 
 use libsql::{Builder, Connection, Database};
-use minutist_common::{voiceprint_math::cosine_unit, AppResult};
+use minutist_common::{
+    voiceprint_math::{cmp_desc_finite_first, cosine_unit},
+    AppResult,
+};
 
 use crate::blob::{blob_to_f32_vec, f32_slice_to_blob};
 use crate::error::Error;
+
+/// Path to a meeting's RAG cache db, `{meetings_dir}/{meeting_id}/meeting.db`.
+///
+/// The single owner of the `meeting.db` filename + per-meeting layout — the write
+/// path (`ipc-bridge::rag_index`) and the retrieval tool (`agent-tools`) both
+/// resolve the path through here rather than hand-joining the literal.
+pub fn meeting_db_path(
+    meetings_dir: &Path,
+    meeting_id: minutist_common::MeetingId,
+) -> std::path::PathBuf {
+    meetings_dir
+        .join(meeting_id.0.to_string())
+        .join("meeting.db")
+}
 
 /// One chunk to index: the pre-persistence value plus its (L2-normalised)
 /// embedding. The owning `source_id` / `doc_type` / `model_id` are passed once to
@@ -91,6 +108,11 @@ impl RagStore {
     async fn open_inner(db_path: impl AsRef<Path>) -> Result<Self, Error> {
         let db = Builder::new_local(db_path.as_ref()).build().await?;
         let conn = db.connect()?;
+        // A brief busy timeout so an overlapping writer (the attach-index and the
+        // post-stop transcript-index can race on one meeting.db) retries instead of
+        // failing its BEGIN IMMEDIATE with SQLITE_BUSY. `query` (not `execute`): the
+        // assignment form returns the new value as a row.
+        let _ = conn.query("PRAGMA busy_timeout = 5000", ()).await?;
         create_schema(&conn).await?;
         Ok(Self { db, conn })
     }
@@ -234,22 +256,29 @@ impl RagStore {
         Ok(deleted)
     }
 
-    /// Dense leg: rank every chunk by cosine similarity to `query_embedding`
-    /// (assumed L2-normalised, so cosine reduces to a dot product), returning the
-    /// top `k`. Brute-force over the meeting's vectors — a per-meeting corpus is a
-    /// few hundred chunks, so this is sub-millisecond. `k == 0` or an empty query
-    /// returns empty.
+    /// Dense leg: rank chunks by cosine similarity to `query_embedding` (assumed
+    /// L2-normalised, so cosine reduces to a dot product), returning the top `k`.
+    /// Scores ONLY against vectors stored under `model_id` and of the same
+    /// dimension — a vector from a different embedder (or dimension) is skipped
+    /// rather than scored on a truncated dot product, so a model swap degrades to
+    /// "no comparable vectors" instead of silently corrupting the ranking.
+    /// Brute-force over the meeting's vectors (a few hundred chunks, sub-ms).
+    /// `k == 0` or an empty query returns empty.
     pub async fn retrieve_dense(
         &self,
         query_embedding: &[f32],
+        model_id: &str,
         k: usize,
     ) -> AppResult<Vec<RetrievedChunk>> {
-        Ok(self.retrieve_dense_inner(query_embedding, k).await?)
+        Ok(self
+            .retrieve_dense_inner(query_embedding, model_id, k)
+            .await?)
     }
 
     async fn retrieve_dense_inner(
         &self,
         query_embedding: &[f32],
+        model_id: &str,
         k: usize,
     ) -> Result<Vec<RetrievedChunk>, Error> {
         if k == 0 || query_embedding.is_empty() {
@@ -259,14 +288,20 @@ impl RagStore {
             .conn
             .query(
                 "SELECT c.id, c.doc_type, c.source_id, c.chunk_text, c.byte_offset, e.embedding
-                 FROM rag_chunk c JOIN rag_embedding e ON e.chunk_id = c.id",
-                (),
+                 FROM rag_chunk c JOIN rag_embedding e ON e.chunk_id = c.id
+                 WHERE e.model_id = ?1",
+                libsql::params![model_id],
             )
             .await?;
         let mut scored: Vec<RetrievedChunk> = Vec::new();
         while let Some(row) = rows.next().await? {
             let blob: Vec<u8> = row.get(5)?;
             let v = blob_to_f32_vec(&blob);
+            // Defence in depth behind the model_id filter: never score against a
+            // foreign-dimension vector (cosine_unit would silently truncate it).
+            if v.len() != query_embedding.len() {
+                continue;
+            }
             let score = cosine_unit(query_embedding, &v);
             let byte_offset: i64 = row.get(4)?;
             scored.push(RetrievedChunk {
@@ -278,13 +313,9 @@ impl RagStore {
                 score,
             });
         }
-        // Descending; non-finite scores sink to the bottom (mirrors rank_top_k) so
-        // a degenerate embedding can't corrupt the ordering.
-        scored.sort_by(|a, b| {
-            let ka = if a.score.is_finite() { a.score } else { f32::NEG_INFINITY };
-            let kb = if b.score.is_finite() { b.score } else { f32::NEG_INFINITY };
-            kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Descending; non-finite scores sink to the bottom so a degenerate
+        // embedding can't corrupt the ordering (shared comparator).
+        scored.sort_by(|a, b| cmp_desc_finite_first(a.score, b.score));
         scored.truncate(k);
         Ok(scored)
     }
@@ -425,7 +456,7 @@ mod tests {
         .expect("index");
 
         let q = unit(vec![0.95, 0.05, 0.0]);
-        let hits = s.retrieve_dense(&q, 2).await.expect("dense");
+        let hits = s.retrieve_dense(&q, "bge-m3-q8_0", 2).await.expect("dense");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].text, "alpha", "nearest vector first");
         assert!(hits[0].score >= hits[1].score);
@@ -484,14 +515,14 @@ mod tests {
         )
         .await
         .expect("reindex");
-        let all = s.retrieve_dense(&e, 10).await.unwrap();
+        let all = s.retrieve_dense(&e, "m", 10).await.unwrap();
         assert_eq!(all.len(), 2, "re-index replaced the prior chunk set");
         assert!(all.iter().all(|c| c.text != "v1"));
 
         let removed = s.forget_source("att1").await.unwrap();
         assert_eq!(removed, 2);
         assert!(!s.has_source("att1").await.unwrap());
-        assert!(s.retrieve_dense(&e, 10).await.unwrap().is_empty());
+        assert!(s.retrieve_dense(&e, "m", 10).await.unwrap().is_empty());
         assert!(s.retrieve_lexical("v2a", 10).await.unwrap().is_empty());
     }
 }

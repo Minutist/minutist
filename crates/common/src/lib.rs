@@ -1962,6 +1962,11 @@ pub trait Embedder: Send + Sync {
 
     /// The embedding dimensionality (e.g. 1024 for BGE-M3).
     fn dim(&self) -> usize;
+
+    /// A stable identifier for the model producing these vectors (the manifest id,
+    /// e.g. `"bge-m3-q8_0"`). Persisted with each embedding and used at query time
+    /// so retrieval only scores a query against vectors from the same model.
+    fn model_id(&self) -> &str;
 }
 
 // ---------------------------------------------------------------------------

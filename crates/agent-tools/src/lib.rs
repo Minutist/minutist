@@ -35,7 +35,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use minutist_common::{
-    AppError, AppEvent, AppResult, InterAgentReply, InterAgentRequest, MeetingId, Summariser,
+    AppError, AppEvent, AppResult, Embedder, InterAgentReply, InterAgentRequest, MeetingId,
+    Summariser,
 };
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
@@ -144,6 +145,11 @@ pub struct ToolContext {
     /// one-shot summary path + the chat agent). Backs `resummarise`. Held as
     /// `Arc<dyn Summariser>` directly (SP0: the bundled impl is `Send + Sync`).
     pub summariser: Arc<dyn Summariser>,
+    /// The held BGE-M3 embedder (`Send + Sync`; loaded once, shared with the RAG
+    /// write path). Backs `retrieve_chunks` — embeds the query before ranking.
+    /// `None` when no embedder is wired (or its load failed); `retrieve_chunks`
+    /// then errors gracefully rather than the context build failing the chat turn.
+    pub embedder: Option<Arc<dyn Embedder>>,
     /// The shared `AppEvent` broadcast bus. Currently UNREAD by any tool — the
     /// offline write op (`reprocess`) emits
     /// `TranscriptReady`/`DiarizationComplete` via the orchestrator's own bus,
@@ -171,6 +177,7 @@ impl ToolContext {
         index: Arc<MeetingIndex>,
         meetings_dir: PathBuf,
         summariser: Arc<dyn Summariser>,
+        embedder: Option<Arc<dyn Embedder>>,
         event_tx: broadcast::Sender<AppEvent>,
         default_meeting: Option<MeetingId>,
     ) -> Self {
@@ -179,6 +186,7 @@ impl ToolContext {
             index,
             meetings_dir,
             summariser,
+            embedder,
             event_tx,
             default_meeting,
             inter_agent: None,
@@ -280,6 +288,7 @@ impl ToolRegistry {
             Arc::new(tools::GetMetadata),
             Arc::new(tools::GetRecordingState),
             Arc::new(tools::SearchWithinTranscript),
+            Arc::new(tools::RetrieveChunks),
             Arc::new(tools::RelistenSection),
             Arc::new(tools::Resummarise),
             Arc::new(tools::SpeakerTalkTime),

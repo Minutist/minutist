@@ -434,6 +434,11 @@ async fn do_start_mcp_server(params: McpStartParams) {
         }
     };
 
+    // Resolve the held embedder for retrieve_chunks (best-effort — retrieval is a
+    // bonus, so a load failure leaves the tool disabled rather than failing start).
+    // Done BEFORE `chat_handles` is moved into the inter-agent driver below.
+    let mcp_embedder = chat_handles.ensure_embedder().await.ok();
+
     // Create a fresh shutdown watch pair FIRST so the inter-agent driver and
     // the mcp-server accept loop share the same per-instance signal.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -456,6 +461,7 @@ async fn do_start_mcp_server(params: McpStartParams) {
             params.index.clone(),
             params.meetings_dir.clone(),
             summariser as Arc<dyn minutist_common::Summariser>,
+            mcp_embedder,
             params.event_tx.clone(),
             None, // MCP callers pass meeting_id explicitly
         )

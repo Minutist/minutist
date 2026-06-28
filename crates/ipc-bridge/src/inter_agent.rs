@@ -251,6 +251,7 @@ async fn run_one_turn(
         Arc::clone(&handles.index),
         handles.meetings_dir.clone(),
         summariser.clone() as Arc<dyn Summariser>,
+        handles.ensure_embedder().await.ok(),
         handles.event_tx.clone(),
         meeting_id,
     );

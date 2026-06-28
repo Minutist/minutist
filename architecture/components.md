@@ -33,7 +33,7 @@ appears in:
 | `model-registry` | 2 | `common`, `settings` |
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
-| `agent-tools` | 9 | `common`, `persistence`, `orchestrator` |
+| `agent-tools` | 9 | `common`, `persistence`, `orchestrator`, `rag-retrieval` |
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
@@ -2597,10 +2597,10 @@ inter-agent bridge SENDER (`mpsc::Sender<(InterAgentRequest, oneshot)>`, set via
 internal agent so it cannot message itself). The bridge uses only `common` types
 + tokio channels — no `chat-agent` edge.
 
-**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 22 base v1
+**`ToolRegistry::v1(include_inter_agent_bridge: bool)`** registers the 23 base v1
 tools in insertion order; `ipc-bridge` passes `false` (the internal agent must
 not message itself) and `app-main` passes `true` for the MCP registry instance,
-which APPENDS `send_to_internal_agent` (23 tools). `descriptors()` /
+which APPENDS `send_to_internal_agent` (24 tools). `descriptors()` /
 `mcp_tool_descriptors()` are pure name/description/schema projections (single
 source of truth); `mcp_tool_descriptors()` honours `expose_over_mcp()`.
 **`mcp_tool_descriptors_gated(allow_writes)`** (Phase 10) composes the
@@ -2615,6 +2615,9 @@ then `execute`.
 **v1 tools.** Read/compute: `list_meetings`, `search_meetings`, `get_meeting`,
 `get_transcript`, `get_transcript_slice`, `get_summary`, `get_notes`,
 `get_metadata`, `get_recording_state`, `search_within_transcript`,
+`retrieve_chunks` (hybrid dense + FTS5 retrieval over a meeting's attachments and
+transcript via `meeting.db`, fused by RRF; embeds the query through the held
+`Embedder`, errors gracefully when none is wired),
 `relisten_section`, `resummarise`, `speaker_talk_time`, `list_attachments`
 (returns manifest rows — id, filename, ext, conversion state, byte size, and
 `converted_md_filename` when Ready — for a meeting; backed by

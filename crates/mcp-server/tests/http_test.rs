@@ -68,6 +68,7 @@ async fn start_server_with_done(
             index,
             meetings_dir,
             summariser,
+            None, // no embedder (test)
             event_tx,
             None,
         )

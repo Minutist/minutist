@@ -352,6 +352,12 @@ impl IpcState {
         self.chat_handles().ensure_summariser().await
     }
 
+    /// Resolve the held BGE-M3 embedder (RAG), loading it once on first use.
+    /// Shares the same `Arc<OnceCell>` as the write path, so it loads once.
+    pub async fn ensure_embedder(&self) -> Result<Arc<dyn minutist_common::Embedder>, IpcError> {
+        self.chat_handles().ensure_embedder().await
+    }
+
     /// Bundle the chat-runtime handles (held model + persistence + settings +
     /// event bus) into a [`ChatHandles`]. Both the UI chat path (via
     /// [`Self::ensure_summariser`]) and the Phase-10 inter-agent driver use this

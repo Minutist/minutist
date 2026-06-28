@@ -29,7 +29,7 @@ role when work is parallel.
 | `embedder` | ml-runtime-engineer | `crates/embedder/**` | Same | `common`, `llama-cpp-2` (a model-loading leaf — the embedding peer of `summariser`) |
 | `settings` | data-engineer | `crates/settings/**` | Same | `common` |
 | `orchestrator` | systems-engineer | `crates/orchestrator/**` | Same | `common` + all live-pipeline crates per table in `components.md` |
-| `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator` |
+| `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `orchestrator`, `rag-retrieval` |
 | `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
 | `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |

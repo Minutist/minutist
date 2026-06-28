@@ -338,6 +338,7 @@ mod tests {
                     index,
                     meetings_dir,
                     summariser,
+                    None, // no embedder wired here (retrieve_chunks unused)
                     event_tx,
                     None,
                 )

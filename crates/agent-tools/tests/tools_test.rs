@@ -61,6 +61,7 @@ async fn make_ctx() -> (TempDir, std::path::PathBuf, ToolContext) {
         index,
         meetings_dir.clone(),
         summariser,
+        None, // no embedder (the retrieve_chunks test builds its own ctx)
         event_tx,
         None,
     );
@@ -166,6 +167,7 @@ async fn registry_v1_has_the_documented_tool_set() {
         "get_metadata",
         "get_recording_state",
         "search_within_transcript",
+        "retrieve_chunks",
         "relisten_section",
         "resummarise",
         "speaker_talk_time",
@@ -354,6 +356,27 @@ async fn dispatch_unknown_tool_is_invalid_input() {
     let reg = ToolRegistry::v1(false);
     let err = reg
         .dispatch(&ctx, "no_such_tool", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        minutist_common::AppError::InvalidInput { .. }
+    ));
+}
+
+#[tokio::test]
+async fn retrieve_chunks_without_embedder_errors_gracefully() {
+    // `make_ctx` wires no embedder (None); retrieve_chunks must surface a clean
+    // InvalidInput rather than panic — chat works without retrieval available.
+    let (_t, _root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = minutist_common::MeetingId::new();
+    let err = reg
+        .dispatch(
+            &ctx,
+            "retrieve_chunks",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "query": "anything" }),
+        )
         .await
         .unwrap_err();
     assert!(matches!(

@@ -26,7 +26,7 @@ mod score;
 
 pub use chunk::{chunk_text, Chunk};
 pub use minutist_common::Embedder;
-pub use score::{cosine_unit, rank_top_k, unit_normalise};
+pub use score::{cosine_unit, rank_top_k, rrf_fuse, unit_normalise};
 
 use serde::{Deserialize, Serialize};
 

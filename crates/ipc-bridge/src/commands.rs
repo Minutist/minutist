@@ -2260,11 +2260,15 @@ pub async fn send_chat_message(
 
     // Build the tool context for this session (default_meeting scopes meeting_id
     // omission for the internal UI).
+    // Resolve the held embedder best-effort: retrieval is a bonus tool, so a load
+    // failure must not fail the chat turn (retrieve_chunks errors instead).
+    let embedder = state.ensure_embedder().await.ok();
     let ctx = ToolContext::new(
         Arc::clone(&state.orchestrator),
         Arc::clone(&state.index),
         meetings_dir.clone(),
         summariser.clone() as Arc<dyn Summariser>,
+        embedder,
         state.event_tx.clone(),
         meeting_id,
     );

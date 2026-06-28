@@ -86,6 +86,7 @@ dependencies = [
  "model-registry",
  "orchestrator",
  "persistence",
+ "rag-retrieval",
  "serde",
  "serde_json",
  "settings",

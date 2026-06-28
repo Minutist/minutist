@@ -273,6 +273,99 @@ impl Tool for GetTranscriptSlice {
 }
 
 // ---------------------------------------------------------------------------
+// retrieve_chunks
+// ---------------------------------------------------------------------------
+
+/// Hybrid (dense + lexical) retrieval over a meeting's RAG index (`meeting.db`).
+pub struct RetrieveChunks;
+
+#[async_trait]
+impl Tool for RetrieveChunks {
+    fn name(&self) -> &'static str {
+        "retrieve_chunks"
+    }
+    fn title(&self) -> &'static str {
+        "Retrieve relevant passages"
+    }
+    fn description(&self) -> &'static str {
+        "Semantic + keyword retrieval over a meeting's attachments and transcript. \
+         Returns the passages most relevant to `query`, each with its text and source. \
+         Prefer this over reading whole attachments/transcripts when only the relevant \
+         parts are needed. Returns no chunks when the meeting has not been indexed yet."
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        schema_obj(
+            json!({
+                "meeting_id": { "type": "string", "description": "Meeting UUID" },
+                "query": { "type": "string", "description": "What to find relevant passages about" },
+                "k": { "type": "integer", "minimum": 1, "maximum": 16, "description": "Max passages to return (default 6)" },
+            }),
+            &["meeting_id", "query"],
+        )
+    }
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> AppResult<ToolOutput> {
+        let id = resolve_meeting(ctx, &args)?;
+        let query = require_str(&args, "query")?.to_string();
+        let k = args
+            .get("k")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(6)
+            .clamp(1, 16) as usize;
+
+        // Embed the query (synchronous FFI → off the async runtime). No embedder
+        // wired → retrieval is unavailable in this context (graceful, not a panic).
+        let embedder = ctx.embedder.clone().ok_or_else(|| AppError::InvalidInput {
+            context: "retrieve_chunks: no embedder is available in this context".into(),
+        })?;
+        let q = query.clone();
+        let qvec = spawn_blocking_io(move || embedder.embed(&q)).await?;
+
+        // Open the meeting's RAG cache (an absent/never-indexed meeting opens an
+        // empty db → both legs return nothing). Fetch a little extra per leg so
+        // the fusion has material from each.
+        let db = ctx.meeting_dir(id).join("meeting.db");
+        let store = persistence::RagStore::open(&db).await?;
+        let leg_k = k * 2;
+        let dense = store.retrieve_dense(&qvec, leg_k).await?;
+        let lexical = store.retrieve_lexical(&query, leg_k).await?;
+
+        // Fuse the two ranked lists by chunk id (RRF), then map back to records.
+        let dense_ids: Vec<&str> = dense.iter().map(|c| c.chunk_id.as_str()).collect();
+        let lexical_ids: Vec<&str> = lexical.iter().map(|c| c.chunk_id.as_str()).collect();
+        let fused = rag_retrieval::rrf_fuse(&[&dense_ids, &lexical_ids], k);
+        let by_id: std::collections::HashMap<&str, &persistence::RetrievedChunk> = dense
+            .iter()
+            .chain(lexical.iter())
+            .map(|c| (c.chunk_id.as_str(), c))
+            .collect();
+
+        let chunks: Vec<serde_json::Value> = fused
+            .iter()
+            .filter_map(|cid| by_id.get(cid).copied())
+            .map(|c| {
+                // Provenance: the literal "transcript", else the attachment source id.
+                let source = if c.doc_type == "transcript" {
+                    "transcript"
+                } else {
+                    c.source_id.as_str()
+                };
+                json!({
+                    "text": c.text,
+                    "source": source,
+                    "doc_type": c.doc_type,
+                    "byte_offset": c.byte_offset,
+                })
+            })
+            .collect();
+        let n = chunks.len();
+        Ok(ToolOutput::new(
+            json!({ "chunks": chunks }),
+            format!("{n} passage(s) for {query:?}"),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // get_summary
 // ---------------------------------------------------------------------------
 

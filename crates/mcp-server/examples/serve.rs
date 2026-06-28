@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             index,
             meetings_dir,
             summariser,
+            None, // no embedder (smoke example)
             event_tx,
             None,
         )

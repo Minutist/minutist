@@ -696,6 +696,18 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
         // an empty 404 (no detail leaks). See architecture/cross-cutting.md —
         // "Note image assets".
         .register_uri_scheme_protocol(ipc_bridge::MEETING_ASSET_SCHEME, serve_note_asset)
+        // Recording-audio re-listen protocol (`meetingrecording:`). Serves a WAV
+        // of a single transcript window's audio for the transcript "play segment"
+        // affordance (#0023). ASYNCHRONOUS: the decode + pause-aware window
+        // mapping run on the orchestrator's blocking pool, so unlike
+        // `meetingasset:` the handler answers via a `UriSchemeResponder` from a
+        // spawned task. Parse + orchestrator call live in
+        // `ipc_bridge::resolve_recording_slice` (which owns the `orchestrator`
+        // edge); any failure → an empty 404.
+        .register_asynchronous_uri_scheme_protocol(
+            ipc_bridge::MEETING_RECORDING_SCHEME,
+            serve_recording_slice,
+        )
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             // Mount events first so the event channel is ready before any
@@ -1470,6 +1482,58 @@ fn serve_note_asset(
                 .unwrap_or_else(|_| Response::new(Vec::new()))
         }
     }
+}
+
+/// Handle a `meetingrecording:` URI-scheme request: serve a WAV of one
+/// transcript window's audio for the in-app "play segment" affordance (#0023).
+///
+/// The request URI path is `/<meeting_id>/<start_ms>-<end_ms>` (as produced by
+/// `convertFileSrc(<meeting_id>/<start>-<end>, "meetingrecording")`).
+/// **Asynchronous** (unlike [`serve_note_asset`]): the decode + pause-aware
+/// window mapping run on the orchestrator's blocking pool, so this handler
+/// clones the `Arc<Orchestrator>` from the managed [`IpcState`], spawns a task
+/// that awaits `ipc_bridge::resolve_recording_slice` (which owns the
+/// `orchestrator` edge), and answers via the [`tauri::UriSchemeResponder`].
+/// Success → `200` `audio/wav`; ANY failure → an empty `404` so no detail leaks.
+fn serve_recording_slice(
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    request: tauri::http::Request<Vec<u8>>,
+    responder: tauri::UriSchemeResponder,
+) {
+    use tauri::http::{header, Response, StatusCode};
+
+    let orchestrator = {
+        let state = ctx.app_handle().state::<IpcState>();
+        Arc::clone(&state.orchestrator)
+    };
+    let path = request.uri().path().to_string();
+
+    tauri::async_runtime::spawn(async move {
+        let response = match ipc_bridge::resolve_recording_slice(&orchestrator, &path).await {
+            Ok(wav) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "audio/wav")
+                // No long cache: the WAV is cheap to regenerate (the orchestrator
+                // caches the decoded PCM), and a reprocess can rewrite the segment
+                // at the same `[start,end]` key, so a stale webview cache must not
+                // outlive it. A tiny max-age only dedupes a double-fire.
+                .header(header::CACHE_CONTROL, "private, max-age=2")
+                .body(wav)
+                .unwrap_or_else(|_| Response::new(Vec::new())),
+            Err(e) => {
+                tracing::debug!(
+                    target: "app-main",
+                    path = %path,
+                    "meetingrecording request rejected: {e}"
+                );
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Vec::new())
+                    .unwrap_or_else(|_| Response::new(Vec::new()))
+            }
+        };
+        responder.respond(response);
+    });
 }
 
 /// Fallback 32×32 RGBA tray icon — solid blue (#1E64B4).

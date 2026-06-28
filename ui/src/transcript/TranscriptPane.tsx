@@ -8,8 +8,17 @@ import { useTranslationsStore } from "../state/translations";
 import { OUTPUT_LANGUAGES } from "../shell/OutputLanguagePicker";
 import { writeSegmentDrag } from "../editor/transcript-dnd";
 import { speakerColorIndex } from "./speaker-color";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import type { MeetingId, Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
+
+/**
+ * Custom URI scheme for serving a transcript window's audio to the webview.
+ * Mirrors `ipc_bridge::MEETING_RECORDING_SCHEME`. Used with
+ * `convertFileSrc("<meeting_id>/<start_ms>-<end_ms>", MEETING_RECORDING_SCHEME)`
+ * so the rendered clip URL routes to `app-main`'s recording-audio handler.
+ */
+const MEETING_RECORDING_SCHEME = "meetingrecording";
 
 /**
  * Action toolbar at the top of the transcript pane (#67).
@@ -382,6 +391,36 @@ export function formatTimestamp(start_ms: number): string {
   return `${pad2(mm)}:${pad2(ss)}.${pad2(cs)}`;
 }
 
+/** Filled play triangle — the per-segment "play this segment's audio" glyph. */
+function PlayGlyph() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M4 3.2 13 8l-9 4.8z" fill="currentColor" />
+    </svg>
+  );
+}
+
+/** Filled stop square — shown while this segment's clip is playing. */
+function StopGlyph() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 16 16"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor" />
+    </svg>
+  );
+}
+
 /**
  * Read-only scrollable transcript view.
  *
@@ -432,6 +471,55 @@ export function TranscriptPane() {
   // display-only. This mirrors `active-transcript`'s saved-vs-live rule.
   const recordingKind = useRecordingStore((s) => s.state.kind);
   const speakerEditable = openMeetingId !== null && recordingKind === "idle";
+
+  // Per-segment audio re-listen (#0023 manual-labelling aid). A single shared,
+  // off-DOM <audio> plays the WAV the `meetingrecording:` protocol cuts for one
+  // transcript window; the clip is pre-sliced to [start_ms, end_ms) so it stops
+  // on its own (no seeking — see `Orchestrator::extract_segment_wav`).
+  // `playingIdx` is the row whose clip is currently playing (drives the glyph).
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Monotonic token of the latest play request; guards the play() promise's
+  // catch so a superseded click's AbortError cannot clear the glyph of the row
+  // that is now playing.
+  const playTokenRef = useRef(0);
+  const [playingIdx, setPlayingIdx] = useState<number | null>(null);
+
+  function playSegment(idx: number, seg: Segment) {
+    if (openMeetingId === null) return;
+    let audio = audioRef.current;
+    if (audio === null) {
+      audio = new Audio();
+      audio.addEventListener("ended", () => setPlayingIdx(null));
+      audio.addEventListener("error", () => setPlayingIdx(null));
+      audioRef.current = audio;
+    }
+    // Clicking the row that is already playing stops it (toggle).
+    if (playingIdx === idx) {
+      audio.pause();
+      setPlayingIdx(null);
+      return;
+    }
+    // Setting a new src aborts the prior load, rejecting its play() promise
+    // (AbortError); the token ensures only the latest click's catch clears state.
+    const token = ++playTokenRef.current;
+    audio.src = convertFileSrc(
+      `${openMeetingId}/${seg.start_ms}-${seg.end_ms}`,
+      MEETING_RECORDING_SCHEME,
+    );
+    setPlayingIdx(idx);
+    void audio.play().catch(() => {
+      if (playTokenRef.current === token) setPlayingIdx(null);
+    });
+  }
+
+  // Stop any clip when the open meeting changes or the pane unmounts, so a clip
+  // never outlives the meeting it belongs to.
+  useEffect(() => {
+    return () => {
+      audioRef.current?.pause();
+      setPlayingIdx(null);
+    };
+  }, [openMeetingId]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // Track whether the user has scrolled away from the bottom.
@@ -593,6 +681,37 @@ export function TranscriptPane() {
                       seg.text
                     )}
                   </span>
+                  {/*
+                    Per-segment audio re-listen (#0023): a quiet play/stop glyph
+                    at the row's right edge, revealed on row hover. Only on a
+                    saved, idle meeting (same gate as speaker rename — a finalised
+                    `audio.opus` must exist). `stopPropagation` so it does not
+                    also trigger the row's jump-to-paragraph click.
+                  */}
+                  {speakerEditable && (
+                    <button
+                      type="button"
+                      className={
+                        playingIdx === idx
+                          ? "transcript-pane__play transcript-pane__play--active"
+                          : "transcript-pane__play"
+                      }
+                      aria-label={
+                        playingIdx === idx
+                          ? "Stop playback"
+                          : "Play this segment’s audio"
+                      }
+                      title={
+                        playingIdx === idx ? "Stop" : "Play this segment’s audio"
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        playSegment(idx, seg);
+                      }}
+                    >
+                      {playingIdx === idx ? <StopGlyph /> : <PlayGlyph />}
+                    </button>
+                  )}
                 </li>
               );
             })}

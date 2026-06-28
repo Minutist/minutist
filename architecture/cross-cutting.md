@@ -1906,6 +1906,50 @@ The content-hash filename means identical pastes dedupe to one file.
   whole meeting folder, so `assets/` (and its images) are deleted with the
   meeting — no separate asset cleanup path is required.
 
+## Recording-audio re-listen serving (`meetingrecording:`)
+
+The transcript "play segment" affordance (#0023) plays the audio under a single
+transcript row. It does NOT expose `audio.opus` to the webview; instead the
+backend cuts a self-contained WAV of exactly the requested window and the webview
+plays that clip start-to-finish (no seeking).
+
+- **Why a pre-cut WAV, not browser seeking.** `Segment::start_ms`/`end_ms` are on
+  the pause-EXCLUDING transcript clock, while `audio.opus` is pause-INCLUDING
+  (TIMELINE-DRIFT #4), and the encoder writes Ogg granule positions in 16 kHz
+  units rather than the RFC 7845 48 kHz units (#0024). A browser `<audio>` seek
+  would therefore land in the wrong place. Cutting the slice server-side reuses
+  `orchestrator::runner::pcm_window_for_excluding_range` (the same pause-aware
+  mapping the re-listen / re-ASR paths use, including the clamp-across-a-pause
+  rule) and emits a WAV, so neither the two-clock drift nor any Ogg/granule quirk
+  reaches the playback path.
+
+- **Serving mechanism.** `app-main` registers an **asynchronous** URI-scheme
+  protocol via `register_asynchronous_uri_scheme_protocol("meetingrecording",
+  serve_recording_slice)` — async because the decode + mapping run on the
+  orchestrator's blocking pool (the synchronous `meetingasset:` handler shape
+  cannot await). The handler clones `Arc<Orchestrator>` from the managed
+  `IpcState`, spawns a task that awaits `ipc_bridge::resolve_recording_slice`
+  (which owns the `orchestrator` edge — `app-main` only shapes the response), and
+  answers via the `UriSchemeResponder`. Success → `200 audio/wav`; ANY
+  validation/decode failure → an empty **404** so no detail leaks.
+
+- **Request path + parsing.** The frontend builds the URL via
+  `convertFileSrc("<meeting_id>/<start_ms>-<end_ms>", "meetingrecording")`.
+  `resolve_recording_slice` parses the path into a `Uuid` + the `<start>-<end>`
+  window (rejecting non-UUID ids, nested paths, and non-integer bounds) and calls
+  `Orchestrator::extract_segment_wav`, which decodes `audio.opus`
+  (`persistence::read_audio_pcm`), maps the window, and returns the WAV.
+  `extract_segment_wav` is read-only (no inference, no transcript rewrite),
+  caps the requested span (so the pause-window clamp cannot amplify a crafted
+  oversized `end_ms` into a whole-region WAV), bounds concurrent whole-file
+  decodes, and caches the decoded PCM single-entry so rapid clicking through a
+  meeting's segments decodes `audio.opus` once. It refuses a meeting that is
+  still recording/finalising (its `audio.opus` is mid-write — the same W2 guard
+  as `transcribe_pcm_window`). The UI only shows the control on a saved, idle
+  meeting, so the protocol is hit only for finalised audio. A background
+  reprocess reports the recorder as idle, so the control is reachable then; that
+  is safe (reprocess never rewrites `audio.opus`).
+
 ## Attachments (Attachments WS)
 
 Meeting attachments extend the `persistence` component and the `ipc-bridge`

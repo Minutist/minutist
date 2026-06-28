@@ -1688,6 +1688,44 @@ pub(crate) fn pcm_window_for_excluding_range(
     None
 }
 
+/// Encode a 16 kHz mono f32 PCM slice as a self-contained little-endian PCM16
+/// WAV byte buffer (44-byte RIFF/WAVE header + samples). Backs
+/// [`crate::Orchestrator::extract_segment_wav`], which hands the webview a
+/// pre-cut, seek-free clip for the transcript "play segment" affordance:
+/// serving WAV (not the source Ogg/Opus) keeps the granule-position
+/// non-conformance (#0024) and all container quirks out of the playback path.
+pub(crate) fn pcm16_wav(samples: &[f32]) -> Vec<u8> {
+    // The caller (`extract_segment_wav`) caps the slice well under 4 GiB; assert
+    // it so the u32 RIFF / `data` length fields below cannot silently truncate.
+    debug_assert!(
+        samples
+            .len()
+            .checked_mul(2)
+            .is_some_and(|n| n <= u32::MAX as usize),
+        "pcm16_wav slice too large for a 32-bit WAV length field",
+    );
+    let sr = SAMPLE_RATE_HZ as u32;
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt-chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // channels = mono
+    out.extend_from_slice(&sr.to_le_bytes());
+    out.extend_from_slice(&(sr * 2).to_le_bytes()); // byte rate (mono, 16-bit)
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for &s in samples {
+        out.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    out
+}
+
 /// Inverse of [`pcm_window_for_excluding_range`]: map a pause-INCLUDING PCM
 /// sample index back to its position on the pause-EXCLUDING transcript clock,
 /// in milliseconds (#0015 phase 4).
@@ -3029,6 +3067,48 @@ mod tests {
     fn pcm_window_out_of_range_is_none() {
         let pcm = vec![0.5f32; ms_to_samples(1000)];
         assert!(pcm_window_for_excluding_range(&pcm, 5000, 6000).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // pcm16_wav (the transcript "play segment" clip encoder)
+    // -----------------------------------------------------------------------
+
+    /// The encoded buffer is a well-formed 16 kHz mono PCM16 WAV: a 44-byte
+    /// header carrying the canonical RIFF/WAVE fields, one little-endian i16 per
+    /// input sample, and a `data` length matching the sample count. Samples are
+    /// clamped to [-1, 1] before scaling, so an out-of-range f32 saturates rather
+    /// than wrapping.
+    #[test]
+    fn pcm16_wav_header_and_samples_are_canonical() {
+        // 0.0 → 0, 1.0 → 32767, -1.0 → -32767, and 2.0 clamps to 32767.
+        let samples = [0.0f32, 1.0, -1.0, 2.0];
+        let wav = pcm16_wav(&samples);
+
+        assert_eq!(wav.len(), 44 + samples.len() * 2, "44-byte header + 2 B/sample");
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(u32::from_le_bytes([wav[16], wav[17], wav[18], wav[19]]), 16); // PCM fmt size
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1); // PCM
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1); // mono
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            SAMPLE_RATE_HZ as u32,
+        );
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16); // bits/sample
+        assert_eq!(&wav[36..40], b"data");
+        let data_len = u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]);
+        assert_eq!(data_len as usize, samples.len() * 2);
+        assert_eq!(
+            u32::from_le_bytes([wav[4], wav[5], wav[6], wav[7]]),
+            36 + data_len,
+        );
+
+        let decoded: Vec<i16> = wav[44..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        assert_eq!(decoded, vec![0, 32767, -32767, 32767]);
     }
 
     /// Trailing/leading pause padding is excluded; a pause at the very start

@@ -184,6 +184,7 @@
 }
 
 .transcript-pane__row {
+  position: relative;
   display: grid;
   grid-template-columns: 4.5rem 1fr;
   gap: 0.85rem;
@@ -391,4 +392,46 @@
 .transcript-pane__vp-btn--accept {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* ── Per-segment audio re-listen (#0023) ──────────────────────────────────
+   A small play/stop glyph at the row's right edge, quiet by default and
+   revealed on row hover/focus-within (mirrors the meeting-list action reveal).
+   The clip is pre-cut server-side, so the control is a play/stop toggle — no
+   scrubber. Stays visible while its own clip plays (`--active`). */
+.transcript-pane__play {
+  position: absolute;
+  top: 0.15rem;
+  right: 0.2rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  padding: 0;
+  color: var(--stone);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.transcript-pane__row:hover .transcript-pane__play,
+.transcript-pane__row:focus-within .transcript-pane__play,
+.transcript-pane__play--active {
+  opacity: 1;
+}
+
+.transcript-pane__play:hover,
+.transcript-pane__play--active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .transcript-pane__play {
+    transition: none;
+  }
 }

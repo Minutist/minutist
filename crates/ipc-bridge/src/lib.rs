@@ -634,6 +634,103 @@ fn content_type_for(filename: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Recording-audio re-listen serving — the `meetingrecording:` URI scheme
+// ---------------------------------------------------------------------------
+
+/// The custom URI scheme used to serve decoded recording-audio slices to the
+/// webview for the transcript "play segment" affordance.
+///
+/// `app-main` registers an **asynchronous** protocol handler under this name
+/// (the decode + window mapping run on the orchestrator's blocking pool, so the
+/// handler cannot be the synchronous `meetingasset:` form). The frontend builds
+/// a URL via `convertFileSrc("<meeting_id>/<start_ms>-<end_ms>",
+/// MEETING_RECORDING_SCHEME)`; the handler returns a WAV of exactly that
+/// transcript window (see `Orchestrator::extract_segment_wav`).
+pub const MEETING_RECORDING_SCHEME: &str = "meetingrecording";
+
+/// Resolve a `meetingrecording:` request path to a 16 kHz mono PCM16 WAV of the
+/// requested transcript window.
+///
+/// The request path is `/<meeting_id>/<start_ms>-<end_ms>` (URL path component,
+/// as produced by `convertFileSrc(..., MEETING_RECORDING_SCHEME)`; a trailing
+/// `.wav` extension, if the frontend adds one, is ignored). This parses the id +
+/// window and delegates the decode + pause-aware window mapping + WAV encode to
+/// `Orchestrator::extract_segment_wav` (the orchestrator owns the audio-timeline
+/// domain). `start_ms`/`end_ms` are transcript-clock (pause-EXCLUDING) ms.
+///
+/// Lives here (not in `app-main`) so the `orchestrator` dependency edge stays
+/// inside `ipc-bridge`; `app-main`'s registered handler only shapes the HTTP
+/// response. Returns `AppError::InvalidInput` for a malformed path / id /
+/// window, and surfaces the orchestrator error (out-of-range window, decode
+/// failure) otherwise; the handler maps any error to a 404 so no detail leaks.
+pub async fn resolve_recording_slice(
+    orchestrator: &Orchestrator,
+    request_path: &str,
+) -> Result<Vec<u8>, minutist_common::AppError> {
+    let (meeting_id, start_ms, end_ms) = parse_recording_request(request_path)?;
+    orchestrator
+        .extract_segment_wav(meeting_id, start_ms, end_ms)
+        .await
+}
+
+/// Parse a `meetingrecording:` request path `/<meeting_id>/<start_ms>-<end_ms>`
+/// into `(MeetingId, start_ms, end_ms)`. A trailing `.<ext>` on the window is
+/// ignored. Pure (no I/O) so it is unit-testable without an `Orchestrator`;
+/// [`resolve_recording_slice`] wraps it.
+///
+/// Fails closed (`AppError::InvalidInput`) on any malformation: missing/extra
+/// path segments, a non-UUID id, a window that is not exactly `<int>-<int>`, or
+/// `end <= start`. (The orchestrator re-checks the span, but rejecting here keeps
+/// the parse total and self-contained.) `start_ms`/`end_ms` are transcript-clock
+/// (pause-EXCLUDING) milliseconds.
+fn parse_recording_request(
+    request_path: &str,
+) -> Result<(minutist_common::MeetingId, u64, u64), minutist_common::AppError> {
+    use minutist_common::{AppError, MeetingId};
+
+    let trimmed = request_path.trim_start_matches('/');
+    let mut parts = trimmed.splitn(2, '/');
+    let (id_str, window) = match (parts.next(), parts.next()) {
+        (Some(id), Some(w)) if !id.is_empty() && !w.is_empty() => (id, w),
+        _ => {
+            return Err(AppError::InvalidInput {
+                context: format!("malformed meetingrecording path: {request_path:?}"),
+            })
+        }
+    };
+    if window.contains('/') {
+        return Err(AppError::InvalidInput {
+            context: format!("meetingrecording path has nested segments: {request_path:?}"),
+        });
+    }
+
+    let uuid = uuid::Uuid::parse_str(id_str).map_err(|_| AppError::InvalidInput {
+        context: format!("meetingrecording path has a non-UUID meeting id: {id_str:?}"),
+    })?;
+
+    // window = "<start_ms>-<end_ms>" (ignore any trailing extension).
+    let window = window.split('.').next().unwrap_or(window);
+    let (start_str, end_str) = window.split_once('-').ok_or_else(|| AppError::InvalidInput {
+        context: format!("meetingrecording window is not '<start>-<end>': {window:?}"),
+    })?;
+    let start_ms: u64 = start_str.parse().map_err(|_| AppError::InvalidInput {
+        context: format!("meetingrecording start_ms is not an integer: {start_str:?}"),
+    })?;
+    let end_ms: u64 = end_str.parse().map_err(|_| AppError::InvalidInput {
+        context: format!("meetingrecording end_ms is not an integer: {end_str:?}"),
+    })?;
+    if end_ms <= start_ms {
+        return Err(AppError::InvalidInput {
+            context: format!(
+                "meetingrecording window end ({end_ms}) must exceed start ({start_ms})"
+            ),
+        });
+    }
+
+    Ok((MeetingId(uuid), start_ms, end_ms))
+}
+
+// ---------------------------------------------------------------------------
 // bindings_builder — shared builder for app-main and the export helper
 // ---------------------------------------------------------------------------
 
@@ -756,6 +853,54 @@ mod tests {
         let resolved = resolve_note_asset(root, &path).expect("resolve");
         assert_eq!(resolved.bytes, bytes);
         assert_eq!(resolved.content_type, "image/png");
+    }
+
+    // -----------------------------------------------------------------------
+    // Recording-slice request parsing (`meetingrecording:` scheme). Pure — no
+    // Orchestrator/Tauri runtime; drives `parse_recording_request` directly.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_recording_request_accepts_valid_window_and_ignores_extension() {
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let (id, start, end) =
+            parse_recording_request(&format!("/{uuid}/1000-2000")).expect("valid window");
+        assert_eq!(id.0, uuid::Uuid::nil());
+        assert_eq!((start, end), (1000, 2000));
+
+        // A trailing `.wav` (should the frontend ever append one) is ignored.
+        let (_, start, end) =
+            parse_recording_request(&format!("/{uuid}/1000-2000.wav")).expect("ext ignored");
+        assert_eq!((start, end), (1000, 2000));
+    }
+
+    #[test]
+    fn parse_recording_request_rejects_malformed_paths() {
+        use minutist_common::AppError;
+        let uuid = "00000000-0000-0000-0000-000000000000";
+        let bad = [
+            String::new(),                    // empty
+            "/".to_string(),                  // just the slash
+            format!("/{uuid}"),               // no window
+            format!("/{uuid}/"),              // empty window
+            format!("/{uuid}/-5"),            // empty start
+            format!("/{uuid}/5-"),            // empty end
+            format!("/{uuid}/100-50"),        // end < start
+            format!("/{uuid}/5-5"),           // end == start
+            format!("/{uuid}/5-10-20"),       // extra dash
+            format!("/{uuid}/a-b"),           // non-integer bounds
+            format!("/{uuid}/1000-2000/x"),   // nested segment
+            "/not-a-uuid/1-2".to_string(),    // non-UUID id
+        ];
+        for path in bad {
+            assert!(
+                matches!(
+                    parse_recording_request(&path),
+                    Err(AppError::InvalidInput { .. })
+                ),
+                "expected InvalidInput for {path:?}",
+            );
+        }
     }
 
     #[test]

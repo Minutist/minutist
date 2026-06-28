@@ -64,13 +64,23 @@ use state::{
     transition_finalising, transition_idle, transition_offline_claim, transition_offline_release,
     transition_pause, transition_resume, transition_start, transition_stop, InternalState,
 };
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 
 pub use error::Error;
 
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
+
+/// Maximum span of a single transcript "play segment" / re-listen clip
+/// (`extract_segment_wav`). A transcript segment is a VAD chunk — seconds — so
+/// this is generous; its purpose is to cap the WAV a `meetingrecording:` request
+/// can produce, so a crafted oversized `end_ms` cannot be amplified (via the
+/// pause-window clamp) into a whole-region decode/encode.
+const MAX_RELISTEN_CLIP_MS: u64 = 300_000;
+
+/// Concurrent whole-file decodes permitted on the re-listen cache-miss path.
+const RELISTEN_DECODE_CONCURRENCY: usize = 2;
 
 /// The recording orchestrator. `Send + Sync`; intended to live in `Arc<Orchestrator>`.
 pub struct Orchestrator {
@@ -99,6 +109,21 @@ pub struct Orchestrator {
     /// is a brief, non-awaiting take/insert.
     #[allow(clippy::type_complexity)]
     prewarmed_asr: Arc<StdMutex<Option<(AsrEngine, Box<dyn AsrBackend + Send>)>>>,
+    /// Single-entry decoded-PCM cache for the transcript "play segment" /
+    /// re-listen path ([`Self::extract_segment_wav`]). Holds the most-recently-
+    /// played meeting's pause-INCLUDING f32 PCM so rapid clicking through a
+    /// meeting's segments (the manual-labelling workflow, #0023) decodes
+    /// `audio.opus` once rather than once per click. Single-entry bounds it to one
+    /// meeting's PCM; `audio.opus` is never rewritten by reprocess, so an entry
+    /// stays valid for its meeting id (UUIDs are never reused). A
+    /// `std::sync::Mutex` because every access is a brief, non-awaiting
+    /// check/insert.
+    relisten_pcm_cache: StdMutex<Option<(MeetingId, Arc<Vec<f32>>)>>,
+    /// Caps concurrent whole-file decodes on the re-listen cache-miss path so a
+    /// flood of `meetingrecording:` requests for distinct meetings cannot pile up
+    /// unbounded full-file PCM allocations (defence-in-depth — the normal UI uses
+    /// a single shared `<audio>`).
+    relisten_decode_sem: Semaphore,
 }
 
 struct OrchestratorInner {
@@ -167,6 +192,8 @@ impl Orchestrator {
             event_tx,
             last_transcript_incomplete: Arc::new(AtomicBool::new(false)),
             prewarmed_asr: Arc::new(StdMutex::new(None)),
+            relisten_pcm_cache: StdMutex::new(None),
+            relisten_decode_sem: Semaphore::new(RELISTEN_DECODE_CONCURRENCY),
         }
     }
 
@@ -1715,6 +1742,130 @@ impl Orchestrator {
                 ),
             }),
         }
+    }
+
+    /// Extract the audio for a transcript window as a self-contained 16 kHz mono
+    /// PCM16 WAV, for the in-app transcript "play segment" affordance (re-listen
+    /// without re-ASR).
+    ///
+    /// Unlike [`Self::transcribe_pcm_window`] this runs **no inference**: it
+    /// decodes `audio.opus`, maps the pause-EXCLUDING `[start_ms, end_ms)`
+    /// transcript window onto the pause-INCLUDING PCM via
+    /// [`runner::pcm_window_for_excluding_range`] (same clamp-across-a-pause
+    /// rule), and returns a WAV of exactly that slice. Serving a pre-cut WAV lets
+    /// the webview play the clip start-to-finish with no seeking, so the Ogg
+    /// granule-position non-conformance (#0024) and container quirks never enter
+    /// the playback path.
+    ///
+    /// Read-only and cheap (decode-once, then cache). Rejects a window outside
+    /// the recording, a window longer than [`MAX_RELISTEN_CLIP_MS`] (so the
+    /// pause-window clamp can never amplify a crafted oversized `end_ms` into a
+    /// whole-region WAV), and — mirroring `transcribe_pcm_window`'s W2 guard — a
+    /// meeting that is still recording/finalising (its `audio.opus` is mid-write).
+    ///
+    /// **Reprocess concurrency.** A background re-transcribe/re-diarize reports
+    /// the recorder as `Idle` (it holds the separate offline claim), so this is
+    /// reachable during a reprocess. That is safe — it only reads `audio.opus`,
+    /// which reprocess never rewrites — but a `[start_ms, end_ms)` the caller
+    /// captured before the rewrite may cut a window stale relative to the new
+    /// `transcript.json`. The displayed transcript is likewise stale until the
+    /// reprocess completes, so the clip still matches what the user sees.
+    ///
+    /// # Errors
+    ///
+    /// - `AppError::InvalidInput` if `end_ms <= start_ms`, the window exceeds the
+    ///   clip cap, the meeting is still active, or the window falls outside the
+    ///   recording.
+    /// - The `persistence` decode error if `audio.opus` is missing/corrupt.
+    pub async fn extract_segment_wav(
+        &self,
+        meeting_id: MeetingId,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> AppResult<Vec<u8>> {
+        if end_ms <= start_ms {
+            return Err(AppError::InvalidInput {
+                context: format!(
+                    "segment window end_ms ({end_ms}) must exceed start_ms ({start_ms})"
+                ),
+            });
+        }
+        // Cap the REQUESTED span before any decode. The pause-window clamp only
+        // ever shrinks the mapped slice, so a bounded request → bounded output —
+        // this is what closes the amplification path (a crafted huge `end_ms`).
+        if end_ms - start_ms > MAX_RELISTEN_CLIP_MS {
+            return Err(AppError::InvalidInput {
+                context: format!(
+                    "segment window [{start_ms}, {end_ms}) ms exceeds the {MAX_RELISTEN_CLIP_MS} ms re-listen cap"
+                ),
+            });
+        }
+
+        // Re-listen is defined only over FINALISED audio (W2): reject the meeting
+        // currently being recorded/finalised — its `audio.opus` is still being
+        // appended, so a full-file decode can hit a truncated OGG page.
+        let active = match self.state().await {
+            RecordingState::Recording { meeting_id, .. }
+            | RecordingState::Paused { meeting_id, .. }
+            | RecordingState::Stopping { meeting_id }
+            | RecordingState::Finalising { meeting_id } => Some(meeting_id),
+            RecordingState::Idle => None,
+        };
+        if active == Some(meeting_id) {
+            return Err(AppError::InvalidInput {
+                context: "cannot play audio from a meeting that is still recording or finalising"
+                    .into(),
+            });
+        }
+
+        // Reuse the cached decode for this meeting (the rapid-click labelling
+        // path); else decode `audio.opus` once under the decode-concurrency
+        // semaphore and cache it (single-entry, so memory is bounded to one
+        // meeting's PCM). The lock is held only for the brief check/insert, never
+        // across the decode or `.await`.
+        let cached = {
+            let guard = self.relisten_pcm_cache.lock().unwrap();
+            guard
+                .as_ref()
+                .filter(|(id, _)| *id == meeting_id)
+                .map(|(_, pcm)| Arc::clone(pcm))
+        };
+        let pcm = match cached {
+            Some(pcm) => pcm,
+            None => {
+                let _permit = self.relisten_decode_sem.acquire().await.map_err(|e| {
+                    AppError::Internal {
+                        context: format!("relisten decode semaphore closed: {e}"),
+                    }
+                })?;
+                let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+                let decoded =
+                    tokio::task::spawn_blocking(move || persistence::read_audio_pcm(&meeting_dir))
+                        .await
+                        .map_err(|e| AppError::Internal {
+                            context: format!("extract_segment_wav decode join failed: {e}"),
+                        })??;
+                let pcm = Arc::new(decoded);
+                *self.relisten_pcm_cache.lock().unwrap() = Some((meeting_id, Arc::clone(&pcm)));
+                pcm
+            }
+        };
+
+        // Map the window + encode the WAV off the async threads (the pause scan
+        // is O(samples)). The mapped slice is ≤ the requested span, hence bounded.
+        tokio::task::spawn_blocking(move || -> AppResult<Vec<u8>> {
+            let range = runner::pcm_window_for_excluding_range(&pcm, start_ms, end_ms)
+                .ok_or_else(|| AppError::InvalidInput {
+                    context: format!(
+                        "segment window [{start_ms}, {end_ms}) ms is outside the recording"
+                    ),
+                })?;
+            Ok(runner::pcm16_wav(&pcm[range]))
+        })
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("extract_segment_wav encode join failed: {e}"),
+        })?
     }
 
     /// Re-run speaker diarization for a previously-recorded meeting offline

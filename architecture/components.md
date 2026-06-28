@@ -584,8 +584,8 @@ lifecycle". See also `architecture/cross-cutting.md` — "Operation progress".
 `common` build stays pure), `common` exposes
 `llama_backend::shared_llama_backend() -> AppResult<&'static LlamaBackend>` — the
 single process-wide backend. `LlamaBackend::init()` is global (once per
-process), and both `asr-runtime` and `summariser` load GGUF models in the same
-app process, so they MUST share one cell; each enables the feature and delegates
+process), and `asr-runtime`, `summariser`, and `embedder` load GGUF models in the
+same app process, so they MUST share one cell; each enables the feature and delegates
 to this function. (A private `OnceLock` per crate made whichever initialised
 second fail — the record-then-summarise bug fixed in the Phase-7 review pass.)
 This adds no workspace dependency edge; `llama-cpp-2` is an external FFI dep.

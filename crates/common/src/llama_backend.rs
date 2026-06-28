@@ -1,9 +1,10 @@
 //! The process-wide shared `LlamaBackend` singleton.
 //!
 //! `LlamaBackend::init()` is GLOBAL — llama.cpp permits it once per process;
-//! a second call returns an error. Both `asr-runtime` and `summariser` load
-//! GGUF models, and in the assembled app both run in the SAME process (record
-//! then summarise). If each crate owned its own `OnceLock<LlamaBackend>`, the
+//! a second call returns an error. `asr-runtime`, `summariser`, and `embedder`
+//! all load GGUF models, and in the assembled app they run in the SAME process
+//! (record, then summarise + embed for retrieval). If each crate owned its own
+//! `OnceLock<LlamaBackend>`, the
 //! second crate to initialise would hit the global already-init error while its
 //! own cell stayed empty, and fail — silently breaking record-then-summarise.
 //! They MUST funnel through this single cell.

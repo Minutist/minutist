@@ -15,9 +15,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The process-wide shared `LlamaBackend` (feature-gated; enabled by the two
-/// llama.cpp-using crates, `asr-runtime` + `summariser`, so they share one
-/// global backend init). See the module docs.
+/// The process-wide shared `LlamaBackend` (feature-gated; enabled by the
+/// llama.cpp-using crates — `asr-runtime`, `summariser`, `embedder` — so they
+/// share one global backend init). See the module docs.
 #[cfg(feature = "llama-backend")]
 pub mod llama_backend;
 

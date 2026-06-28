@@ -36,6 +36,9 @@ use minutist_common::{AppError, AppResult, Embedder};
 /// BGE-M3 text embedder backed by a held llama.cpp model.
 pub struct Bgem3Embedder {
     model: LlamaModel,
+    /// The manifest id this model was loaded under (e.g. `"bge-m3-q8_0"`), reported
+    /// via [`Embedder::model_id`] so retrieval scopes to vectors from the same model.
+    model_id: String,
     n_embd: usize,
     n_threads: i32,
     /// Hard cap on tokens fed to a single encode (BGE-M3's context is 8192). Real
@@ -46,26 +49,43 @@ pub struct Bgem3Embedder {
 impl Bgem3Embedder {
     /// Load the embedder GGUF at `gguf_path`.
     ///
-    /// `n_gpu_layers` follows the `gpu_acceleration` setting (`0` = CPU even in a
-    /// GPU build; `u32::MAX` = offload every layer), matching `LlamaSummariser`.
-    /// Returns [`AppError::ModelLoad`] if the file is absent or fails to load.
-    pub fn open(gguf_path: impl AsRef<Path>, n_gpu_layers: u32) -> AppResult<Self> {
+    /// `model_id` is the manifest id (e.g. `"bge-m3-q8_0"`) reported via
+    /// [`Embedder::model_id`] and persisted with each vector so retrieval only
+    /// scores against the same model. `n_gpu_layers` follows the `gpu_acceleration`
+    /// setting (`0` = CPU even in a GPU build; `u32::MAX` = offload every layer),
+    /// matching `LlamaSummariser`. Returns [`AppError::ModelLoad`] if the file is
+    /// absent, fails to load, or reports a non-positive embedding dimension.
+    pub fn open(
+        gguf_path: impl AsRef<Path>,
+        model_id: impl Into<String>,
+        n_gpu_layers: u32,
+    ) -> AppResult<Self> {
+        let model_id = model_id.into();
         let path = gguf_path.as_ref();
         let backend = shared_llama_backend()?;
         if !path.exists() {
             return Err(AppError::ModelLoad {
-                model_id: "bge-m3".into(),
+                model_id: model_id.clone(),
                 context: format!("embedder GGUF not found at {}", path.display()),
             });
         }
         let model_params = LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers);
         let model = LlamaModel::load_from_file(backend, path, &model_params).map_err(|e| {
             AppError::ModelLoad {
-                model_id: "bge-m3".into(),
+                model_id: model_id.clone(),
                 context: e.to_string(),
             }
         })?;
-        let n_embd = usize::try_from(model.n_embd()).unwrap_or(0);
+        // Fail loudly on a degenerate model rather than coercing to a 0-dim embedder
+        // that would silently produce empty vectors and disable retrieval.
+        let raw_n_embd = model.n_embd();
+        let n_embd = usize::try_from(raw_n_embd)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| AppError::ModelLoad {
+                model_id: model_id.clone(),
+                context: format!("model reports a non-positive embedding dimension: {raw_n_embd}"),
+            })?;
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get() as i32)
             .unwrap_or(4)
@@ -73,11 +93,13 @@ impl Bgem3Embedder {
         tracing::info!(
             target: "embedder",
             model = %path.display(),
+            model_id = %model_id,
             n_embd,
             "BGE-M3 embedder loaded"
         );
         Ok(Self {
             model,
+            model_id,
             n_embd,
             n_threads,
             max_tokens: 8192,
@@ -151,5 +173,9 @@ impl Embedder for Bgem3Embedder {
 
     fn dim(&self) -> usize {
         self.n_embd
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
     }
 }

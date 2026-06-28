@@ -358,6 +358,13 @@ impl IpcState {
         self.chat_handles().ensure_embedder().await
     }
 
+    /// The held embedder ONLY if already loaded (non-blocking peek; never loads or
+    /// downloads). The write path loads it; `ToolContext` build uses this so a chat
+    /// turn that never retrieves doesn't trigger a model download.
+    pub fn embedder_if_loaded(&self) -> Option<Arc<dyn minutist_common::Embedder>> {
+        self.embedder.get().cloned()
+    }
+
     /// Bundle the chat-runtime handles (held model + persistence + settings +
     /// event bus) into a [`ChatHandles`]. Both the UI chat path (via
     /// [`Self::ensure_summariser`]) and the Phase-10 inter-agent driver use this

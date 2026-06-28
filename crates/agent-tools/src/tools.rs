@@ -317,16 +317,19 @@ impl Tool for RetrieveChunks {
         let embedder = ctx.embedder.clone().ok_or_else(|| AppError::InvalidInput {
             context: "retrieve_chunks: no embedder is available in this context".into(),
         })?;
+        // Capture the model id before the embedder moves into spawn_blocking — the
+        // dense leg scores only against vectors from this same model.
+        let model_id = embedder.model_id().to_string();
         let q = query.clone();
         let qvec = spawn_blocking_io(move || embedder.embed(&q)).await?;
 
         // Open the meeting's RAG cache (an absent/never-indexed meeting opens an
         // empty db → both legs return nothing). Fetch a little extra per leg so
         // the fusion has material from each.
-        let db = ctx.meeting_dir(id).join("meeting.db");
-        let store = persistence::RagStore::open(&db).await?;
+        let store =
+            persistence::RagStore::open(persistence::meeting_db_path(&ctx.meetings_dir, id)).await?;
         let leg_k = k * 2;
-        let dense = store.retrieve_dense(&qvec, leg_k).await?;
+        let dense = store.retrieve_dense(&qvec, &model_id, leg_k).await?;
         let lexical = store.retrieve_lexical(&query, leg_k).await?;
 
         // Fuse the two ranked lists by chunk id (RRF), then map back to records.

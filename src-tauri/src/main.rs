@@ -434,10 +434,11 @@ async fn do_start_mcp_server(params: McpStartParams) {
         }
     };
 
-    // Resolve the held embedder for retrieve_chunks (best-effort — retrieval is a
-    // bonus, so a load failure leaves the tool disabled rather than failing start).
-    // Done BEFORE `chat_handles` is moved into the inter-agent driver below.
-    let mcp_embedder = chat_handles.ensure_embedder().await.ok();
+    // Peek the held embedder for retrieve_chunks WITHOUT loading it (the write path
+    // owns loading; the tool errors gracefully when absent), so enabling the MCP
+    // server never triggers a model download. Done BEFORE `chat_handles` moves into
+    // the inter-agent driver below.
+    let mcp_embedder = chat_handles.embedder_if_loaded();
 
     // Create a fresh shutdown watch pair FIRST so the inter-agent driver and
     // the mcp-server accept loop share the same per-instance signal.

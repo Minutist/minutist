@@ -101,7 +101,7 @@ impl ChatHandles {
                     settings.gpu_acceleration != minutist_common::GpuAcceleration::Off;
                 let n_gpu_layers = commands::resolve_summariser_gpu_layers(enabled);
                 let embedder = tokio::task::spawn_blocking(move || {
-                    Bgem3Embedder::open(&gguf, n_gpu_layers)
+                    Bgem3Embedder::open(&gguf, commands::DEFAULT_EMBED_MODEL_ID, n_gpu_layers)
                 })
                 .await
                 .map_err(|e| minutist_common::AppError::Internal {
@@ -116,6 +116,14 @@ impl ChatHandles {
             .await
             .map_err(IpcError::from)?;
         Ok(Arc::clone(handle))
+    }
+
+    /// The held embedder ONLY if it is already loaded — a non-blocking peek that
+    /// never triggers a download/load. Used at `ToolContext` build so a chat turn
+    /// that never retrieves doesn't pay the model-load cost (the write path owns
+    /// loading); `retrieve_chunks` errors gracefully when it is `None`.
+    pub fn embedder_if_loaded(&self) -> Option<Arc<dyn Embedder>> {
+        self.embedder.get().cloned()
     }
 
     /// Preload the held summariser at startup when the user has opted in

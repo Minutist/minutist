@@ -1467,6 +1467,18 @@ pub async fn reprocess(meeting_id: MeetingId, state: State<'_, IpcState>) -> Res
         }
     }
 
+    // Re-index the (now-repaired) transcript for retrieval so meeting.db doesn't
+    // hold stale chunks after a manual reprocess (best-effort; mirrors the
+    // post-stop transcript-index pass — the transcript is finalised here too).
+    if let Err(e) = crate::rag_index::index_transcript(&state.chat_handles(), meeting_id).await {
+        tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            error = %e,
+            "reprocess: transcript RAG re-index failed (best-effort)"
+        );
+    }
+
     Ok(())
 }
 
@@ -2279,9 +2291,10 @@ pub async fn send_chat_message(
 
     // Build the tool context for this session (default_meeting scopes meeting_id
     // omission for the internal UI).
-    // Resolve the held embedder best-effort: retrieval is a bonus tool, so a load
-    // failure must not fail the chat turn (retrieve_chunks errors instead).
-    let embedder = state.ensure_embedder().await.ok();
+    // Peek the held embedder WITHOUT loading it: retrieval is a bonus tool, so a
+    // chat turn that never calls retrieve_chunks must not pay the model-load /
+    // download cost (the write path loads it; the tool errors gracefully when None).
+    let embedder = state.embedder_if_loaded();
     let ctx = ToolContext::new(
         Arc::clone(&state.orchestrator),
         Arc::clone(&state.index),

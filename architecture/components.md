@@ -3245,10 +3245,13 @@ real-prose paraphrased queries vs Qwen3-Embedding-0.6B's 40%; see
 **Write path (Phase B — `ipc-bridge::rag_index`).** `ipc-bridge` drives the RAG
 write path through a best-effort `rag_index` module (the new `ipc-bridge →
 rag-retrieval` edge supplies `chunk_text`; `ipc-bridge → embedder` supplies the
-model): at attachment-convert time (`run_convert_job`, after the `Ready` flip) and
-at transcript-finalise time (an unconditional post-stop step, after any reprocess),
-it chunks the source, embeds the chunks via the held `Embedder` on `spawn_blocking`,
-and persists them into the meeting's `meeting.db` via `RagStore::index_source`.
+model): at attachment-convert time (`run_convert_job`, after the `Ready` flip;
+char-window chunks, skipped via `has_source` when the content hash is already
+indexed) and at every transcript-finalise point — the post-stop pass AND the
+standalone `reprocess` command — so the index never goes stale (transcript chunked
+per speaker turn (#0015), with `apply_speaker_overlay` applied first). It embeds the
+chunks via the held `Embedder` on `spawn_blocking` and persists them to the meeting's
+`meeting.db` via `RagStore::index_source` (recording the embedder's `model_id`).
 Failures log and are swallowed — RAG is a rebuildable cache and must never fail
 attachment conversion or the post-stop flow. Chat/live-agent *consumption* of the
 index (via `retrieve_chunks`) is a later phase. Delete coherence: removing an

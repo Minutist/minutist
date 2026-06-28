@@ -3245,7 +3245,10 @@ it chunks the source, embeds the chunks via the held `Embedder` on `spawn_blocki
 and persists them into the meeting's `meeting.db` via `RagStore::index_source`.
 Failures log and are swallowed — RAG is a rebuildable cache and must never fail
 attachment conversion or the post-stop flow. Chat/live-agent *consumption* of the
-index (via `retrieve_chunks`) is a later phase.
+index (via `retrieve_chunks`) is a later phase. Delete coherence: removing an
+attachment forgets its chunks once the content hash is orphaned (best-effort,
+`rag_index::forget_attachment`); deleting a meeting drops `meeting.db` with the
+meeting folder (`meeting_ops::delete_meeting`'s `remove_dir_all`).
 
 ### `embedder`
 **Crate:** `crates/embedder` (RAG)

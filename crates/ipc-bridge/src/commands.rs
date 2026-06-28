@@ -1077,14 +1077,33 @@ pub async fn remove_attachment(
     state: State<'_, IpcState>,
 ) -> Result<(), IpcError> {
     let meetings_dir = state.meetings_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        persistence::remove_manifest_entry(&meetings_dir, meeting_id, attachment_id)
+    let dir = meetings_dir.clone();
+    // Remove the manifest row and, in the same blocking task, decide whether the
+    // attachment's content hash is now orphaned — the same dedup test that gates
+    // the markdown unlink (no surviving row shares the hash).
+    let (removed, hash_orphaned) = tokio::task::spawn_blocking(move || {
+        let removed = persistence::remove_manifest_entry(&dir, meeting_id, attachment_id)?;
+        let orphaned = match &removed {
+            Some(entry) => !persistence::read_manifest(&dir, meeting_id)?
+                .iter()
+                .any(|e| e.hash == entry.hash),
+            None => false,
+        };
+        Ok::<_, AppError>((removed, orphaned))
     })
     .await
     .map_err(|e| AppError::Internal {
         context: format!("remove_attachment task join failed: {e}"),
     })?
     .map_err(IpcError::from)?;
+
+    // RAG (best-effort): once the source content is fully gone, drop its retrieval
+    // chunks so a removed attachment can no longer surface in retrieval.
+    if hash_orphaned {
+        if let Some(entry) = &removed {
+            crate::rag_index::forget_attachment(&meetings_dir, meeting_id, &entry.hash).await;
+        }
+    }
 
     let _ = state.event_tx.send(AppEvent::AttachmentRemoved {
         meeting_id,

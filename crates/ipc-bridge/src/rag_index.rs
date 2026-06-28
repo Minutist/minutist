@@ -100,6 +100,37 @@ pub async fn index_attachment(handles: &ChatHandles, meeting_id: MeetingId, hash
     }
 }
 
+/// Attachment-remove hook: forget a now-orphaned source's chunks from `meeting.db`.
+/// Best-effort — logs and returns on error. The caller is responsible for the
+/// dedup check (only call this once the content hash is no longer referenced by
+/// any surviving attachment). A meeting that was never indexed has no db → no-op.
+pub async fn forget_attachment(meetings_dir: &Path, meeting_id: MeetingId, source_id: &str) {
+    let db = meeting_db_path(meetings_dir, meeting_id);
+    if !db.exists() {
+        return;
+    }
+    let store = match persistence::RagStore::open(&db).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc-bridge",
+                meeting_id = %meeting_id.0,
+                error = %e,
+                "RAG forget: opening meeting.db failed (skipped)"
+            );
+            return;
+        }
+    };
+    if let Err(e) = store.forget_source(source_id).await {
+        tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            error = %e,
+            "RAG forget_source failed (best-effort)"
+        );
+    }
+}
+
 /// Post-stop hook: index the meeting transcript into `meeting.db`. Returns `Err`
 /// so the caller can log it alongside the other post-stop passes. Idempotent: the
 /// `"transcript"` source is replaced wholesale on each call (e.g. after reprocess).

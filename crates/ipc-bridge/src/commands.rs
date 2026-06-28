@@ -1078,18 +1078,11 @@ pub async fn remove_attachment(
 ) -> Result<(), IpcError> {
     let meetings_dir = state.meetings_dir.clone();
     let dir = meetings_dir.clone();
-    // Remove the manifest row and, in the same blocking task, decide whether the
-    // attachment's content hash is now orphaned — the same dedup test that gates
-    // the markdown unlink (no surviving row shares the hash).
-    let (removed, hash_orphaned) = tokio::task::spawn_blocking(move || {
-        let removed = persistence::remove_manifest_entry(&dir, meeting_id, attachment_id)?;
-        let orphaned = match &removed {
-            Some(entry) => !persistence::read_manifest(&dir, meeting_id)?
-                .iter()
-                .any(|e| e.hash == entry.hash),
-            None => false,
-        };
-        Ok::<_, AppError>((removed, orphaned))
+    // remove_manifest_entry returns the removed entry plus whether its content hash
+    // is now orphaned (computed under the manifest lock — the same decision that
+    // gates the markdown unlink).
+    let removed = tokio::task::spawn_blocking(move || {
+        persistence::remove_manifest_entry(&dir, meeting_id, attachment_id)
     })
     .await
     .map_err(|e| AppError::Internal {
@@ -1097,10 +1090,10 @@ pub async fn remove_attachment(
     })?
     .map_err(IpcError::from)?;
 
-    // RAG (best-effort): once the source content is fully gone, drop its retrieval
-    // chunks so a removed attachment can no longer surface in retrieval.
-    if hash_orphaned {
-        if let Some(entry) = &removed {
+    // RAG (best-effort): once the source content is fully gone (hash orphaned), drop
+    // its retrieval chunks so a removed attachment can no longer surface in retrieval.
+    if let Some((entry, orphaned)) = &removed {
+        if *orphaned {
             crate::rag_index::forget_attachment(&meetings_dir, meeting_id, &entry.hash).await;
         }
     }

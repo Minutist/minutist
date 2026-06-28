@@ -99,6 +99,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 summariser = component "summariser" "llama-cpp-2 (text) for summary generation. Implements Summariser. Owns the text-LLM model lifecycle; also exposes the optional external-LLM dispatcher." "Rust crate: crates/summariser"
 
+                embedder = component "embedder" "BGE-M3 text embedder: the common::Embedder impl over a held llama.cpp model (CLS-pooled, 1024-dim, L2-normalised). Model-loading leaf, the embedding peer of summariser/asr-runtime. (RAG Phase B)" "Rust crate: crates/embedder"
+
+                ragRetrieval = component "rag-retrieval" "Pure retrieval logic: char/turn chunking + cosine ranking + RRF fusion. Depends only on common; the concrete embedder is injected via the common::Embedder seam. (RAG Phase A/B)" "Rust crate: crates/rag-retrieval"
+
                 modelRegistry = component "model-registry" "Model download, hash verification, on-disk catalogue. Owns the model cache directory; everything that needs a model goes through it." "Rust crate: crates/model-registry"
 
                 notesCrdt = component "notes-crdt" "Leaf carrying the notes-CRDT primitives extracted from persistence: the Yjs (yrs) notes.ydoc + its JSON/markdown projections (NotesStore, ydoc), the MeetingFolder layout, and the metadata.json writer. No libsql/audiopus/ogg, so sync can transport the CRDT and cross-compile to mobile. persistence re-exports it at the historical paths." "Rust crate: crates/notes-crdt"
@@ -202,6 +206,8 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.notesCrdt    -> minutist.core.common "Uses interface types"
         minutist.core.sync         -> minutist.core.common "Uses interface types"
         minutist.core.election     -> minutist.core.common "Uses interface types"
+        minutist.core.embedder     -> minutist.core.common "Uses interface types (Embedder, voiceprint_math, shared_llama_backend)"
+        minutist.core.ragRetrieval -> minutist.core.common "Uses interface types (Embedder seam, voiceprint_math)"
 
         // Live pipeline. Orchestrator wires the dataflow.
         minutist.core.audioCapture -> microphone "Captures audio" "cpal"
@@ -221,6 +227,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         // FFI boundaries.
         minutist.core.asrRuntime  -> minutist.llamaNative "Inference" "llama-cpp-2 FFI"
         minutist.core.summariser  -> minutist.llamaNative "Inference" "llama-cpp-2 FFI"
+        minutist.core.embedder    -> minutist.llamaNative "Embedding inference" "llama-cpp-2 FFI"
         minutist.core.diarizer    -> minutist.sherpaNative "Inference" "sherpa-rs FFI"
 
         // Persistence.
@@ -246,6 +253,14 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         // model-registry edge — agent-tools has none).
         minutist.core.agentTools -> minutist.core.persistence "Reads meeting artefacts; writes via existing writers"
         minutist.core.agentTools -> minutist.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
+        minutist.core.agentTools -> minutist.core.ragRetrieval "rrf_fuse for the retrieve_chunks tool"
+
+        // RAG (Phase B). ipc-bridge drives the write path (chunk + embed + persist
+        // to the per-meeting meeting.db) and holds the embedder; agent-tools'
+        // retrieve_chunks queries it. embedder is the model-loading leaf;
+        // rag-retrieval is pure logic.
+        minutist.core.ipcBridge -> minutist.core.embedder "Constructs + holds the BGE-M3 embedder"
+        minutist.core.ipcBridge -> minutist.core.ragRetrieval "chunk_text for the RAG write path"
 
         // Chat agent (Phase 9). The stateless turn engine sits ABOVE both the
         // summariser substrate (borrows the loaded LlamaModel via the D5 seam)

@@ -429,7 +429,7 @@ pub fn remove_manifest_entry(
     root: &Path,
     meeting_id: MeetingId,
     id: AttachmentId,
-) -> AppResult<Option<AttachmentEntry>> {
+) -> AppResult<Option<(AttachmentEntry, bool)>> {
     let lock = manifest_lock(meeting_id);
     let _guard = lock.lock().expect("manifest lock poisoned");
 
@@ -442,13 +442,15 @@ pub fn remove_manifest_entry(
 
     write_manifest_unlocked(root, meeting_id, &entries)?;
 
-    // Dedup-safe unlink: only remove hash files if no surviving row shares the hash.
-    let hash_still_referenced = entries.iter().any(|e| e.hash == removed.hash);
-    if !hash_still_referenced {
+    // Dedup-safe: the hash is orphaned iff no surviving row shares it. Computed here
+    // under the manifest lock and returned so a caller (the RAG chunk-forget) keys
+    // off the SAME decision that gates the markdown unlink — no re-read, no race.
+    let hash_orphaned = !entries.iter().any(|e| e.hash == removed.hash);
+    if hash_orphaned {
         unlink_attachment_files(root, meeting_id, &removed.hash, &removed.ext);
     }
 
-    Ok(Some(removed))
+    Ok(Some((removed, hash_orphaned)))
 }
 
 /// Read the `(original_filename, markdown)` of every `Ready` attachment in

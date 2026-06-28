@@ -130,7 +130,14 @@ impl MeetingFolder {
             .map_err(Error::Io)
             .map_err(minutist_common::AppError::from)?;
 
+        // Serialise the check-then-seed against every other `metadata.json`
+        // writer for this meeting (the `persistence::meeting_ops` RMW ops): the
+        // placeholder seed must not clobber — or be clobbered by — a concurrent
+        // authoritative write. Held only across the synchronous check + write,
+        // never an `.await` (this fn is sync). See `crate::metadata_lock`.
         let metadata_path = path.join("metadata.json");
+        let seed_lock = crate::metadata_lock(meeting_id);
+        let _seed_guard = seed_lock.lock().expect("metadata lock poisoned");
         if !metadata_path.exists() {
             let placeholder = MeetingMeta {
                 uuid: meeting_id,

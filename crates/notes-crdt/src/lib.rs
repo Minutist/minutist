@@ -11,6 +11,9 @@
 //! - [`MeetingFolder`]: the on-disk `{root}/{uuid}/` layout and its path
 //!   helpers, including [`MeetingFolder::ensure`] (the sync-receiver seam).
 //! - [`write_metadata`]: the atomic `metadata.json` writer.
+//! - [`metadata_lock`]: the process-wide per-meeting lock that serialises every
+//!   `metadata.json` read-modify-write (shared by `persistence::meeting_ops` and
+//!   [`MeetingFolder::ensure`]).
 //!
 //! These were extracted from `persistence` so `sync` can transport / merge the
 //! notes CRDT without pulling in `persistence`'s C-heavy graph (libsql /
@@ -24,10 +27,12 @@
 pub mod error;
 pub mod folder;
 pub mod metadata;
+pub mod metadata_lock;
 pub mod notes;
 pub mod ydoc;
 
 pub use error::Error;
 pub use folder::MeetingFolder;
 pub use metadata::{write_metadata, write_metadata_atomic};
+pub use metadata_lock::metadata_lock;
 pub use notes::{note_blocks_from_json, NotesData, NotesStore};

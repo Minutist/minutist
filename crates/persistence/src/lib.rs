@@ -90,7 +90,9 @@ pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;
 pub use index::MeetingIndex;
 // Moved to `notes-crdt`; re-exported at the historical `persistence::*` paths.
-pub use notes_crdt::{note_blocks_from_json, write_metadata, MeetingFolder, NotesData, NotesStore};
+pub use notes_crdt::{
+    metadata_lock, note_blocks_from_json, write_metadata, MeetingFolder, NotesData, NotesStore,
+};
 pub use reader::{
     read_audio_pcm, read_meeting_state, read_metadata, read_note_blocks, read_transcript,
 };

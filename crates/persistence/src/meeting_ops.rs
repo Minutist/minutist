@@ -7,23 +7,95 @@
 //! match, so a crash between the two steps leaves the index stale-but-rebuildable
 //! ([`crate::MeetingIndex::rebuild_from_disk`] reconciles it).
 //!
-//! Every operation here that read-modify-writes `metadata.json` first takes the
+//! Every `metadata.json` read-modify-write goes through [`update_metadata`] (or
+//! its skip-if-absent sibling [`update_metadata_if_present`]), which takes the
 //! meeting's lock from `notes_crdt::metadata_lock` and holds it across the whole
-//! RMW (releasing it before any `index.db` `.await`). That serialises these
-//! operations against each other, against the sync lifecycle subscriber
-//! ([`apply_synced_lifecycle_if_present`]), and against `MeetingFolder::ensure`'s
-//! placeholder seed. It does NOT cover writers outside this set — notably the
-//! `orchestrator`'s post-processing RMWs, which can still revert `processing`;
-//! see the coverage boundary in `architecture/cross-cutting.md` — Filesystem
-//! layout, "Per-meeting metadata.json write lock".
+//! RMW (releasing it before any `index.db` `.await`). That serialises every
+//! writer of a meeting's `metadata.json` on one per-meeting lock — these
+//! operations, the sync lifecycle subscriber
+//! ([`apply_synced_lifecycle_if_present`]), `MeetingFolder::ensure`'s
+//! placeholder seed, the `orchestrator`'s post-processing writes, and the
+//! `agent-tools` tools — so a concurrent writer cannot interleave and revert a
+//! field (issue 0025). See `architecture/cross-cutting.md` — Filesystem layout,
+//! "Per-meeting metadata.json write lock".
 
 use std::path::Path;
 
-use minutist_common::{AppResult, CollectionId, MeetingId, ProcessingLifecycle};
+use minutist_common::{AppResult, CollectionId, MeetingId, MeetingMeta, ProcessingLifecycle};
 
 use crate::error::Error;
 use crate::index::MeetingIndex;
 use crate::reader;
+
+/// Guarded read-modify-write of a meeting's `metadata.json` — the single entry
+/// point every `metadata.json` writer uses (issue 0025).
+///
+/// Takes the per-meeting `notes_crdt::metadata_lock(id)`, confirms the meeting
+/// exists, reads the [`MeetingMeta`], applies `f`, and writes it back atomically
+/// — one lock acquisition spanning the existence check and the RMW, so no
+/// concurrent writer can interleave and revert a field. The closure returns
+/// whatever the caller needs from the mutated `meta` (e.g. `()`, or the updated
+/// `speaker_names`), computed under the guard.
+///
+/// Synchronous by design: the std-`Mutex` guard must never be held across an
+/// `.await`. Any async follow-up (e.g. an `index.db` upsert) runs after this
+/// returns and the guard drops.
+///
+/// `Error::MeetingNotFound` if the folder has no `metadata.json`. Use
+/// [`update_metadata_if_present`] for the consumer case that skips an absent
+/// meeting instead of erroring.
+pub fn update_metadata<F, R>(meetings_root: &Path, id: MeetingId, f: F) -> AppResult<R>
+where
+    F: FnOnce(&mut MeetingMeta) -> R,
+{
+    let folder = meetings_root.join(id.0.to_string());
+    let lock = notes_crdt::metadata_lock(id);
+    let _guard = lock.lock().expect("metadata lock poisoned");
+    if !folder.join("metadata.json").exists() {
+        return Err(Error::MeetingNotFound(id).into());
+    }
+    let mut meta = reader::read_metadata_inner(&folder)?;
+    let out = f(&mut meta);
+    crate::write_metadata(&folder, &meta)?;
+    Ok(out)
+}
+
+/// Like [`update_metadata`], but returns `Ok(None)` (skips) when the meeting is
+/// not present locally rather than erroring — the consumer-side contract for a
+/// peer-advertised state whose folder may not have synced in yet (the
+/// notes/media receive path seeds it). The presence check and the write are one
+/// atomic unit under the lock.
+pub fn update_metadata_if_present<F, R>(
+    meetings_root: &Path,
+    id: MeetingId,
+    f: F,
+) -> AppResult<Option<R>>
+where
+    F: FnOnce(&mut MeetingMeta) -> R,
+{
+    let folder = meetings_root.join(id.0.to_string());
+    let lock = notes_crdt::metadata_lock(id);
+    let _guard = lock.lock().expect("metadata lock poisoned");
+    if !folder.join("metadata.json").exists() {
+        return Ok(None);
+    }
+    let mut meta = reader::read_metadata_inner(&folder)?;
+    let out = f(&mut meta);
+    crate::write_metadata(&folder, &meta)?;
+    Ok(Some(out))
+}
+
+/// A stable, log-safe discriminant for a [`ProcessingLifecycle`] — the variant
+/// name only (the `HostRef` inside a claim is a device key, not user content,
+/// but is omitted to keep log lines minimal).
+fn lifecycle_state_label(processing: &ProcessingLifecycle) -> &'static str {
+    match processing {
+        ProcessingLifecycle::Local => "local",
+        ProcessingLifecycle::PendingProcessing => "pending_processing",
+        ProcessingLifecycle::Claimed { .. } => "claimed",
+        ProcessingLifecycle::Processed { .. } => "processed",
+    }
+}
 
 /// Rename a meeting: update `metadata.json`'s `title` in place, then refresh
 /// the index row.
@@ -37,25 +109,15 @@ pub async fn rename_meeting(
     id: MeetingId,
     new_title: &str,
 ) -> AppResult<()> {
-    let folder = meetings_root.join(id.0.to_string());
-
-    // Hold the per-meeting metadata lock across the existence check and the RMW
-    // (read → set title → atomic tmp+rename write), then release it BEFORE the
-    // `.await` on the index upsert: the guard is a std Mutex and must not cross
-    // an await, and the index is a derived cache reconciled by
-    // `rebuild_from_disk`. The folder is authoritative; the index follows.
-    {
-        let lock = notes_crdt::metadata_lock(id);
-        let _guard = lock.lock().expect("metadata lock poisoned");
-        if !folder.join("metadata.json").exists() {
-            return Err(Error::MeetingNotFound(id).into());
-        }
-        let mut meta = reader::read_metadata_inner(&folder)?;
+    // RMW `metadata.json` under the per-meeting lock; it is released before the
+    // async index upsert (the index is a derived cache reconciled by
+    // `rebuild_from_disk` — the folder is authoritative).
+    update_metadata(meetings_root, id, |meta| {
         meta.title = new_title.to_string();
-        crate::write_metadata(&folder, &meta)?;
-    }
+    })?;
 
     // Refresh the index row to match the renamed meeting.
+    let folder = meetings_root.join(id.0.to_string());
     let entry = list_entry_from(&folder)?;
     index.upsert(&entry).await?;
 
@@ -86,22 +148,14 @@ pub async fn set_meeting_collection(
     id: MeetingId,
     collection_id: Option<CollectionId>,
 ) -> AppResult<()> {
-    let folder = meetings_root.join(id.0.to_string());
-
-    // Lock for the check + RMW; release before the index upsert `.await`
+    // RMW under the per-meeting lock; released before the index upsert `.await`
     // (see `rename_meeting`).
-    {
-        let lock = notes_crdt::metadata_lock(id);
-        let _guard = lock.lock().expect("metadata lock poisoned");
-        if !folder.join("metadata.json").exists() {
-            return Err(Error::MeetingNotFound(id).into());
-        }
-        let mut meta = reader::read_metadata_inner(&folder)?;
+    update_metadata(meetings_root, id, |meta| {
         meta.collection_id = collection_id;
-        crate::write_metadata(&folder, &meta)?;
-    }
+    })?;
 
     // Refresh the index row so the derived `collection_id` mirror matches.
+    let folder = meetings_root.join(id.0.to_string());
     let entry = list_entry_from(&folder)?;
     index.upsert(&entry).await?;
 
@@ -129,24 +183,16 @@ pub async fn set_speaker_name(
     label: &str,
     name: &str,
 ) -> AppResult<std::collections::BTreeMap<String, String>> {
-    let folder = meetings_root.join(id.0.to_string());
-
-    // No `.await` in this fn, so the metadata-lock guard is simply held across
-    // the whole check + RMW and dropped at return. Serialises against the
-    // lifecycle subscriber and the other `meeting_ops` writers for this meeting.
-    let lock = notes_crdt::metadata_lock(id);
-    let _guard = lock.lock().expect("metadata lock poisoned");
-    if !folder.join("metadata.json").exists() {
-        return Err(Error::MeetingNotFound(id).into());
-    }
-
-    let mut meta = reader::read_metadata_inner(&folder)?;
-    if name.is_empty() {
-        meta.speaker_names.remove(label);
-    } else {
-        meta.speaker_names.insert(label.to_string(), name.to_string());
-    }
-    crate::write_metadata(&folder, &meta)?;
+    // RMW under the per-meeting lock; the closure returns the updated map (built
+    // under the guard) so the caller reflects ground truth without a second read.
+    let speaker_names = update_metadata(meetings_root, id, |meta| {
+        if name.is_empty() {
+            meta.speaker_names.remove(label);
+        } else {
+            meta.speaker_names.insert(label.to_string(), name.to_string());
+        }
+        meta.speaker_names.clone()
+    })?;
 
     tracing::info!(
         target: "persistence",
@@ -155,45 +201,7 @@ pub async fn set_speaker_name(
         "speaker name set"
     );
 
-    Ok(meta.speaker_names)
-}
-
-/// Read `metadata.json`, set `processing`, write it back atomically, and log.
-///
-/// The synchronous read-modify-write the per-meeting metadata lock serialises,
-/// shared by [`apply_processing_lifecycle`] and
-/// [`apply_synced_lifecycle_if_present`]. The caller MUST hold
-/// `notes_crdt::metadata_lock(id)` for the whole call (using one shared sync
-/// helper instead of one public fn delegating to the other also avoids the
-/// std-`Mutex` re-entrant-lock deadlock that delegation would cause), and MUST
-/// have confirmed the meeting's `metadata.json` exists under that same guard (an
-/// absent file is mapped to the caller's own result — `MeetingNotFound` for a
-/// direct apply, `Ok(false)` for the skip-if-absent synced path).
-fn write_processing_locked(
-    folder: &Path,
-    id: MeetingId,
-    processing: ProcessingLifecycle,
-) -> AppResult<()> {
-    let mut meta = reader::read_metadata_inner(folder)?;
-    // A stable discriminant for diagnostics. The `HostRef` inside a claim is a
-    // device key (not user content) but is omitted to keep the log minimal.
-    let state = match &processing {
-        ProcessingLifecycle::Local => "local",
-        ProcessingLifecycle::PendingProcessing => "pending_processing",
-        ProcessingLifecycle::Claimed { .. } => "claimed",
-        ProcessingLifecycle::Processed { .. } => "processed",
-    };
-    meta.processing = processing;
-    crate::write_metadata(folder, &meta)?;
-
-    tracing::info!(
-        target: "persistence",
-        meeting_id = %id.0,
-        state,
-        "processing lifecycle applied"
-    );
-
-    Ok(())
+    Ok(speaker_names)
 }
 
 /// Apply a meeting's processing-lifecycle state to `metadata.json` (the
@@ -223,17 +231,17 @@ pub async fn apply_processing_lifecycle(
     id: MeetingId,
     processing: ProcessingLifecycle,
 ) -> AppResult<()> {
-    let folder = meetings_root.join(id.0.to_string());
-
-    // Hold the per-meeting metadata lock across the existence check and the RMW
-    // so a concurrent writer (a user command, or `ensure`'s seed) cannot
-    // interleave. No `.await` is held under the guard.
-    let lock = notes_crdt::metadata_lock(id);
-    let _guard = lock.lock().expect("metadata lock poisoned");
-    if !folder.join("metadata.json").exists() {
-        return Err(Error::MeetingNotFound(id).into());
-    }
-    write_processing_locked(&folder, id, processing)
+    // RMW `processing` under the per-meeting lock (the helper holds it across
+    // the existence check + write so a concurrent writer cannot interleave).
+    let state = lifecycle_state_label(&processing);
+    update_metadata(meetings_root, id, |meta| meta.processing = processing)?;
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        state,
+        "processing lifecycle applied"
+    );
+    Ok(())
 }
 
 /// Apply a peer-advertised processing-lifecycle state to a meeting we hold, or
@@ -257,18 +265,22 @@ pub async fn apply_synced_lifecycle_if_present(
     id: MeetingId,
     processing: ProcessingLifecycle,
 ) -> AppResult<bool> {
-    let folder = meetings_root.join(id.0.to_string());
-
-    // One lock acquisition covers both the presence check and the write, so a
-    // meeting that appears (or disappears) concurrently is handled atomically.
-    // No `.await` is held under the guard.
-    let lock = notes_crdt::metadata_lock(id);
-    let _guard = lock.lock().expect("metadata lock poisoned");
-    if !folder.join("metadata.json").exists() {
-        return Ok(false);
+    // One lock acquisition covers the presence check + write (skip-if-absent),
+    // so a meeting appearing or disappearing concurrently is handled atomically.
+    let state = lifecycle_state_label(&processing);
+    let applied = update_metadata_if_present(meetings_root, id, |meta| {
+        meta.processing = processing;
+    })?
+    .is_some();
+    if applied {
+        tracing::info!(
+            target: "persistence",
+            meeting_id = %id.0,
+            state,
+            "processing lifecycle applied"
+        );
     }
-    write_processing_locked(&folder, id, processing)?;
-    Ok(true)
+    Ok(applied)
 }
 
 /// Delete a meeting: remove the folder recursively, then remove the index row.

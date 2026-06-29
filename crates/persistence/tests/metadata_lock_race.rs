@@ -12,16 +12,20 @@
 //! threads. Distinct meetings use distinct locks and never serialise against
 //! each other; only the two writers within one meeting contend.
 //!
-//! Scope: this covers the `persistence::meeting_ops` + lifecycle-subscriber path
-//! the lock guards. It does NOT cover the `orchestrator`'s unguarded
-//! `metadata.json` RMW sites (a tracked cross-domain follow-up), which can still
-//! revert `processing` — see the coverage boundary in
-//! `architecture/cross-cutting.md` ("Per-meeting metadata.json write lock").
+//! Scope: covers every `metadata.json` writer now on the shared per-meeting lock
+//! (issue 0025) — the `persistence::meeting_ops` fns, the sync lifecycle
+//! subscriber, AND the `orchestrator`'s post-processing RMWs (routed through
+//! `meeting_ops::update_metadata`). The second test below races an
+//! orchestrator-style blind RMW against a lifecycle write to prove it; see the
+//! coverage note in `architecture/cross-cutting.md` ("Per-meeting metadata.json
+//! write lock").
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use minutist_common::{AudioFormat, HostRef, MeetingId, MeetingMeta, ProcessingLifecycle};
+use minutist_common::{
+    AudioFormat, HostRef, MeetingId, MeetingMeta, ProcessingClaim, ProcessingLifecycle,
+};
 use persistence::{read_metadata, write_metadata, MeetingFolder};
 use tempfile::TempDir;
 
@@ -108,6 +112,72 @@ async fn concurrent_metadata_rmw_keeps_both_fields() {
         assert!(
             matches!(meta.processing, ProcessingLifecycle::Processed { .. }),
             "meeting {}: processing lost — a concurrent speaker-name write clobbered it (got {:?})",
+            id.0,
+            meta.processing
+        );
+    }
+}
+
+/// Issue 0025: the orchestrator's post-processing `metadata.json` RMWs now go
+/// through `meeting_ops::update_metadata`, taking the SAME per-meeting lock as
+/// the sync lifecycle subscriber. This races a `finalise_diarization`-style
+/// blind RMW (set `speaker_count`) against the subscriber's `Claimed` write —
+/// the headline "a remote GPU node's Claimed lands while the local diarize chain
+/// runs" scenario, which reverted `processing` to `Local` before the
+/// orchestrator was on the lock. With the shared lock, BOTH fields survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orchestrator_rmw_and_lifecycle_keep_both_fields() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+
+    const MEETINGS: usize = 64;
+    const SPEAKER_COUNT: u32 = 7;
+    let ids: Vec<MeetingId> = (0..MEETINGS).map(|_| seed_meeting(&root)).collect();
+
+    let claimed = ProcessingLifecycle::Claimed {
+        claim: ProcessingClaim {
+            host: HostRef("gpu-node".to_string()),
+            claimed_at: "2026-06-28T10:00:00Z".to_string(),
+            lease_expires_at: "2026-06-28T10:30:00Z".to_string(),
+        },
+    };
+
+    let mut handles = Vec::with_capacity(MEETINGS * 2);
+    for &id in &ids {
+        // Writer 1: a `finalise_diarization`-style blind RMW via the guarded
+        // helper (sync; the std lock is held only within this synchronous call).
+        let r = root.clone();
+        handles.push(tokio::spawn(async move {
+            persistence::meeting_ops::update_metadata(&r, id, |m| {
+                m.speaker_count = SPEAKER_COUNT;
+            })
+            .expect("update_metadata speaker_count");
+        }));
+
+        // Writer 2: the sync lifecycle subscriber's `Claimed` write.
+        let r = root.clone();
+        let claimed = claimed.clone();
+        handles.push(tokio::spawn(async move {
+            persistence::meeting_ops::apply_processing_lifecycle(&r, id, claimed)
+                .await
+                .expect("apply_processing_lifecycle");
+        }));
+    }
+    for h in handles {
+        h.await.expect("writer task panicked");
+    }
+
+    for &id in &ids {
+        let folder = root.join(id.0.to_string());
+        let meta = read_metadata(&folder).expect("read metadata");
+        assert_eq!(
+            meta.speaker_count, SPEAKER_COUNT,
+            "meeting {}: speaker_count lost — a concurrent lifecycle write clobbered the orchestrator RMW",
+            id.0
+        );
+        assert!(
+            matches!(meta.processing, ProcessingLifecycle::Claimed { .. }),
+            "meeting {}: processing lost — a concurrent orchestrator RMW clobbered Claimed (got {:?})",
             id.0,
             meta.processing
         );

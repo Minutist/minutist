@@ -1543,10 +1543,15 @@ impl Orchestrator {
         // transcript (may differ from before if ASR boundary changes moved some
         // segments off their prior speaker).
         let meeting_dir_for_meta = meeting_dir.to_path_buf();
+        let root = self.persistence_root.clone();
         let entry: MeetingListEntry = tokio::task::spawn_blocking(move || -> AppResult<MeetingListEntry> {
-            let mut meta = persistence::read_metadata(&meeting_dir_for_meta)?;
-            meta.speaker_count = speaker_count;
-            persistence::write_metadata(&meeting_dir_for_meta, &meta)?;
+            // Guarded RMW of `speaker_count` (issue 0025): the per-meeting metadata
+            // lock serialises this against the sync lifecycle subscriber so neither
+            // reverts the other's field. Returns the post-write meta for the entry.
+            let meta = persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
+                meta.speaker_count = speaker_count;
+                meta.clone()
+            })?;
             let transcript = persistence::read_transcript(&meeting_dir_for_meta)?;
             Ok(MeetingListEntry {
                 id: meta.uuid,
@@ -2143,14 +2148,15 @@ impl Orchestrator {
         // finalise_diarization's clear, the same pattern as apply_voiceprint_matches.
         // The offline claim is still held throughout, so no concurrent op races this.
         if !veto_names.is_empty() {
-            let meeting_dir_veto = meeting_dir.clone();
+            let root = self.persistence_root.clone();
             let veto_names_copy = veto_names.clone();
             let write_result = tokio::task::spawn_blocking(move || -> AppResult<()> {
-                let mut meta = persistence::read_metadata(&meeting_dir_veto)?;
-                for (letter, name) in &veto_names_copy {
-                    meta.speaker_names.insert(letter.clone(), name.clone());
-                }
-                persistence::write_metadata(&meeting_dir_veto, &meta)
+                // Guarded RMW (issue 0025): serialises with the lifecycle subscriber.
+                persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
+                    for (letter, name) in &veto_names_copy {
+                        meta.speaker_names.insert(letter.clone(), name.clone());
+                    }
+                })
             })
             .await;
             match write_result {
@@ -2246,20 +2252,24 @@ impl Orchestrator {
         let meeting_dir_for_write = meeting_dir.to_path_buf();
         let segments_for_write = segments.to_vec();
         let descriptor = diarizer_descriptor();
+        let root = self.persistence_root.clone();
         tokio::task::spawn_blocking(move || -> AppResult<()> {
             persistence::write_transcript(&meeting_dir_for_write, &segments_for_write)?;
-            let mut meta = persistence::read_metadata(&meeting_dir_for_write)?;
-            meta.speaker_count = speaker_count;
-            meta.diarizer = Some(descriptor);
-            // Phase 9 (§4.4): a (re-)diarization pass can re-letter speakers, so
-            // any user-set `speaker_names` keyed on the OLD letters is now
-            // potentially wrong. Clear it in this same metadata write (no second
-            // write) so the map can never silently mis-label a re-lettered
-            // speaker. The chat tool's description states this; an MCP client
-            // cannot re-map the way the UI could, so clearing is the only safe
-            // cross-consumer behaviour. See `cross-cutting.md` "Agent chat loop".
-            meta.speaker_names.clear();
-            persistence::write_metadata(&meeting_dir_for_write, &meta)
+            // Guarded RMW (issue 0025): the per-meeting metadata lock serialises
+            // this against the sync lifecycle subscriber, so a concurrent
+            // `Claimed`/`Processed` write cannot be reverted (and vice versa).
+            persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
+                meta.speaker_count = speaker_count;
+                meta.diarizer = Some(descriptor);
+                // Phase 9 (§4.4): a (re-)diarization pass can re-letter speakers, so
+                // any user-set `speaker_names` keyed on the OLD letters is now
+                // potentially wrong. Clear it in this same metadata write (no second
+                // write) so the map can never silently mis-label a re-lettered
+                // speaker. The chat tool's description states this; an MCP client
+                // cannot re-map the way the UI could, so clearing is the only safe
+                // cross-consumer behaviour. See `cross-cutting.md` "Agent chat loop".
+                meta.speaker_names.clear();
+            })
         })
         .await
         .map_err(|e| AppError::Internal {
@@ -2328,15 +2338,16 @@ impl Orchestrator {
 
         // Update speaker_names: restore accepted matches on top of the cleared map.
         if !matched_names.is_empty() {
-            let meeting_dir_w = meeting_dir.clone();
+            let root = self.persistence_root.clone();
             let names_copy = matched_names.clone();
             tokio::task::spawn_blocking(move || -> AppResult<()> {
-                let mut meta = persistence::read_metadata(&meeting_dir_w)?;
+                // Guarded RMW (issue 0025): serialises with the lifecycle subscriber.
                 // speaker_names was cleared by finalise_diarization; restore accepted ones.
-                for (label, name) in &names_copy {
-                    meta.speaker_names.insert(label.clone(), name.clone());
-                }
-                persistence::write_metadata(&meeting_dir_w, &meta)
+                persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
+                    for (label, name) in &names_copy {
+                        meta.speaker_names.insert(label.clone(), name.clone());
+                    }
+                })
             })
             .await
             .map_err(|e| AppError::Internal {
@@ -2696,15 +2707,16 @@ impl Orchestrator {
         }
 
         // Write the restored names back into metadata.json (on top of the cleared map).
-        let meeting_dir_w = meeting_dir.to_path_buf();
+        let root = self.persistence_root.clone();
         let names_copy = restored.clone();
         let write_result = tokio::task::spawn_blocking(move || -> AppResult<()> {
-            let mut meta = persistence::read_metadata(&meeting_dir_w)?;
+            // Guarded RMW (issue 0025): serialises with the lifecycle subscriber.
             // speaker_names was cleared by finalise_diarization; restore matched ones.
-            for (label, name) in &names_copy {
-                meta.speaker_names.insert(label.clone(), name.clone());
-            }
-            persistence::write_metadata(&meeting_dir_w, &meta)
+            persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
+                for (label, name) in &names_copy {
+                    meta.speaker_names.insert(label.clone(), name.clone());
+                }
+            })
         })
         .await;
 

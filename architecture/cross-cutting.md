@@ -1254,13 +1254,19 @@ over its root, and must never point at a desktop's `{app-data}`.
 
 The single-writer rule above keeps two *processes* off one data root; a second,
 in-process lock serialises the in-process tasks that read-modify-write a meeting's
-`metadata.json` against each other. The guarded writers are the
-`persistence::meeting_ops` operations (`rename_meeting`, `set_meeting_collection`,
-`set_speaker_name`, `apply_processing_lifecycle`) and `MeetingFolder::ensure`'s
-placeholder seed; on a multi-threaded runtime the sync lifecycle-event subscriber
-can run one while a user command runs another. Without serialisation each does an
-independent read→mutate→write and the later write drops the field the earlier one
-set.
+`metadata.json` against each other. Every such RMW goes through one guarded helper
+— `persistence::meeting_ops::update_metadata(root, id, |meta| {…})` (and its
+skip-if-absent sibling `update_metadata_if_present`) — which takes the lock,
+reads, applies the closure, and writes atomically, so a caller cannot forget the
+lock. The writers routed through it: the `meeting_ops` operations
+(`rename_meeting`, `set_meeting_collection`, `set_speaker_name`,
+`apply_processing_lifecycle`), `MeetingFolder::ensure`'s placeholder seed, the
+sync lifecycle-event subscriber, the `orchestrator`'s post-processing RMWs
+(`finalise_diarization`, the re-transcribe `speaker_count` update, the voiceprint
+`speaker_names` restores), and `agent-tools`' write tools. On a multi-threaded
+runtime any of these can run while another runs; without serialisation each does
+an independent read→mutate→write and the later write drops the field the earlier
+one set.
 
 A process-wide per-meeting `std::sync::Mutex` registry — `METADATA_LOCKS`, in the
 leaf `notes-crdt` crate — serialises them, mirroring the attachments
@@ -1277,26 +1283,17 @@ the check-then-RMW and drops the guard before any later `.await` (the `index.db`
 upsert in `rename_meeting` / `set_meeting_collection` runs after the guard is
 released; the index is a derived cache, reconciled by `rebuild_from_disk`).
 
-Coverage boundary: this registry serialises the `meeting_ops` RMWs, the lifecycle
-subscriber, and `ensure`'s seed — NOT every writer of `metadata.json`. Two writers
-are not yet on it:
-
-- The `orchestrator`'s post-processing RMWs — `finalise_diarization`, the
-  re-transcribe `speaker_count` update, and the voiceprint `speaker_names`
-  restores — read the whole `MeetingMeta` and write it back without taking this
-  lock, so a concurrent orchestrator pass can still revert the lifecycle
-  subscriber's `processing` (a silent lost-update — though not a torn file, since
-  writes are atomic tmp+fsync+rename). This is the headline residual: a local
-  diarize/reprocess pass racing a remote host's `Claimed`/`Processed` advert.
-- `agent-tools`' speaker-rename / meeting-rename tools RMW through their own
-  instance-scoped lock — a *separate* registry — so they do not serialise against
-  the writers above.
-
-Folding both onto `notes_crdt::metadata_lock` (ideally behind one guarded
-read-modify-write helper, so a caller cannot forget the lock) is a tracked
-cross-domain follow-up. `MeetingWriter::finalise` writes the initial
-`metadata.json` blind (not an RMW, no prior on-disk state) and is intentionally
-not gated.
+Coverage (issue 0025, closed): every `metadata.json` RMW listed above is on this
+single registry via `update_metadata`, so the headline lost-update — a local
+diarize/reprocess pass racing a remote host's `Claimed`/`Processed` advert and
+reverting `processing` — can no longer occur. `agent-tools` no longer keeps its
+own instance-scoped lock registry; its write tools route through
+`persistence::meeting_ops`, sharing the one lock. The cross-domain edits to
+`orchestrator` and `agent-tools` were made under the agreed proposal in
+`planning/issues/0025-metadata-lock-orchestrator-followup.md`.
+`MeetingWriter::finalise` writes the initial `metadata.json` blind (not an RMW, no
+prior on-disk state) and is intentionally not gated. The race is
+regression-tested in `crates/persistence/tests/metadata_lock_race.rs`.
 
 ## Voiceprint matching
 

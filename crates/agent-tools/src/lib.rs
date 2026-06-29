@@ -29,7 +29,7 @@
 //! *bodies* still push CPU/fs/inference work onto `tokio::task::spawn_blocking`
 //! — the trait being async does not relax the cross-cutting rule.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,7 +39,7 @@ use minutist_common::{
 };
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 mod tools;
 
@@ -156,12 +156,6 @@ pub struct ToolContext {
     /// explicitly. A tool resolves the effective meeting via
     /// [`ToolContext::resolve_meeting`].
     pub default_meeting: Option<MeetingId>,
-    /// Per-meeting metadata write serialization (§4.2). The two tool-layer
-    /// writers that bypass the orchestrator's offline claim
-    /// (`set_speaker_name`, `rename_meeting`) take the same per-meeting async
-    /// mutex for their read-modify-write of `metadata.json`, so two concurrent
-    /// metadata writes cannot drop a write (last-writer-wins).
-    metadata_locks: Arc<Mutex<HashMap<MeetingId, Arc<Mutex<()>>>>>,
     /// The inter-agent bridge sender (Phase 10), present ONLY for the MCP
     /// registry instance (`v1(true)`). `send_to_internal_agent` reads it here;
     /// `None` for the internal chat agent's context (it must not message
@@ -171,7 +165,7 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
-    /// Construct a context. `metadata_locks` is initialised empty.
+    /// Construct a context.
     pub fn new(
         orchestrator: Arc<Orchestrator>,
         index: Arc<MeetingIndex>,
@@ -187,7 +181,6 @@ impl ToolContext {
             summariser,
             event_tx,
             default_meeting,
-            metadata_locks: Arc::new(Mutex::new(HashMap::new())),
             inter_agent: None,
         }
     }
@@ -210,14 +203,6 @@ impl ToolContext {
     /// The `{meetings_dir}/{meeting_id}/` folder path for `id`.
     pub(crate) fn meeting_dir(&self, id: MeetingId) -> PathBuf {
         self.meetings_dir.join(id.0.to_string())
-    }
-
-    /// Resolve a per-meeting metadata mutex for `id`, creating it on first use.
-    /// The returned guard must be held across the whole read-modify-write of
-    /// `metadata.json` (§4.2 class 2/3).
-    pub(crate) async fn metadata_lock(&self, id: MeetingId) -> Arc<Mutex<()>> {
-        let mut map = self.metadata_locks.lock().await;
-        Arc::clone(map.entry(id).or_insert_with(|| Arc::new(Mutex::new(()))))
     }
 }
 

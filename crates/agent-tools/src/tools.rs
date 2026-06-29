@@ -649,21 +649,15 @@ impl Tool for SetSpeakerName {
         let speaker_id = require_bounded_str(&args, "speaker_id")?.to_string();
         let name = require_bounded_str(&args, "name")?.to_string();
 
-        // Hold the per-meeting metadata mutex across the whole read-modify-write
-        // so a concurrent set_speaker_name / rename_meeting cannot drop a write
-        // (§4.2 class 2). The lock guards the *section*, not the disk file.
-        let lock = ctx.metadata_lock(id).await;
-        let _guard = lock.lock().await;
-
-        let dir = ctx.meeting_dir(id);
-        let speaker_names: BTreeMap<String, String> =
-            spawn_blocking_io(move || -> AppResult<BTreeMap<String, String>> {
-                let mut meta = persistence::read_metadata(&dir)?;
-                meta.speaker_names.insert(speaker_id, name);
-                persistence::write_metadata(&dir, &meta)?;
-                Ok(meta.speaker_names)
-            })
-            .await?;
+        // Route through persistence: `meeting_ops::set_speaker_name` performs the
+        // read-modify-write under the shared per-meeting `notes_crdt::metadata_lock`
+        // (issue 0025), so it serialises with every other metadata.json writer —
+        // the other tools, the UI commands, the orchestrator, and the sync
+        // lifecycle subscriber — on ONE lock. It returns the updated map so the
+        // tool reflects ground truth without re-reading.
+        let speaker_names =
+            persistence::meeting_ops::set_speaker_name(&ctx.meetings_dir, id, &speaker_id, &name)
+                .await?;
 
         let data = json!({ "speaker_names": speaker_names });
         Ok(ToolOutput::new(data, "speaker name set"))
@@ -708,13 +702,10 @@ impl Tool for RenameMeeting {
         // Cap the title at dispatch (S4): a meeting title is a short label.
         let title = require_bounded_str(&args, "title")?.to_string();
 
-        // rename_meeting also touches metadata.json (title) + upserts the index,
-        // so it takes the SAME per-meeting metadata mutex as set_speaker_name (a
-        // rename racing a set_speaker_name would otherwise lose a write — §4.2
-        // class 3).
-        let lock = ctx.metadata_lock(id).await;
-        let _guard = lock.lock().await;
-
+        // `meeting_ops::rename_meeting` performs the metadata.json RMW under the
+        // shared per-meeting `notes_crdt::metadata_lock` (issue 0025), so it
+        // serialises with every other metadata.json writer on ONE lock — no
+        // separate agent-tools mutex is needed.
         persistence::meeting_ops::rename_meeting(&ctx.meetings_dir, &ctx.index, id, &title).await?;
         Ok(ToolOutput::new(
             json!({ "ok": true }),

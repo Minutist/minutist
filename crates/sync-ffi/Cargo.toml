@@ -1,0 +1,53 @@
+[package]
+name = "sync-ffi"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Android FFI wrapper over the `sync` crate's `SyncEngine` (WS4-B, phone
+# companion / issue 0016). UniFFI exposes the transport subset to Kotlin; the
+# `.so` is cross-compiled to aarch64-linux-android in the minutist-mobile repo's
+# `docker/android-build` image (NDK r27 + cargo-ndk + the pinned 1.91 toolchain)
+# and bundled by gradle. It depends ONLY on `sync` (the engine it wraps) and
+# `common` (the wire types it maps at the boundary) — it takes NO `iroh`
+# dependency of its own: peers are addressed by passing hex id strings to
+# `SyncEngine`'s string-keyed `*_to_peer` methods, which relay-address them
+# internally. NOT linked by any desktop binary; `app-main` / `ipc-bridge` have
+# no edge on it.
+#
+# Option A (issue 0016): wrap OUR `SyncEngine`, not upstream `iroh-ffi`. That
+# subsumes the media-blob path — `sync_media` / `import_media` already
+# encapsulate `iroh-blobs`, so it never reaches the boundary; no separate
+# iroh-blobs FFI is needed.
+
+[lib]
+# cdylib: the aarch64 `.so` gradle bundles. lib: lets the workspace build/test
+# the crate on the host (the wrap compiles natively even though the binding
+# artifacts are generated out-of-tree for Android).
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+# Library-mode UniFFI binding generator: `uniffi-bindgen generate --library
+# <the .so> --language kotlin`. Run in the mobile build to emit Kotlin bindings.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+# The crate this wraps. Its public `SyncEngine` is the entire FFI surface.
+sync = { path = "../sync" }
+# The wire types `SyncEngine` surfaces (`MeetingId`, `ProcessingLifecycle`),
+# mapped to FFI-facing strings/records at the boundary.
+minutist-common = { path = "../common" }
+# UniFFI binding generation. `cli` provides `uniffi_bindgen_main` for the
+# library-mode bindgen binary above.
+uniffi = { version = "0.31", features = ["cli"] }
+# The wrapper owns a multi-thread runtime: `SyncEngine` holds none (its accept
+# loop was spawned under an ambient runtime), and the phone has no Tauri/ambient
+# tokio. Sync FFI methods `block_on` it; event subscriptions drain on dedicated
+# OS threads (off the runtime — see the C1 note in lib.rs).
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Parse meeting-id strings off the boundary back into `MeetingId(Uuid)`.
+uuid = { workspace = true }

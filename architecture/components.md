@@ -38,6 +38,7 @@ appears in:
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
 | `sync` | WS4-B | `common`, `notes-crdt` |
+| `sync-ffi` | WS4-B (phone) | `common`, `sync` ¶ |
 | `doc-convert` | Attachments WS | `common` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
@@ -100,6 +101,29 @@ crate-add. The post-launch GPU node adds `orchestrator` + the ML-runtime crates
 (`asr-runtime` / `asr-parakeet` / `diarizer` / `summariser` / `model-registry`)
 as a SEPARATE table-update commit at that time. See `cross-cutting.md` —
 "Headless server daemon".
+
+¶ `sync-ffi` is the Android FFI wrapper over `sync` (phone companion, issue
+0016). It UniFFI-exposes `sync::SyncEngine`'s transport surface to Kotlin and is
+cross-compiled to `aarch64-linux-android` (a `.so` + generated bindings) in the
+minutist-mobile repo's `docker/android-build` image (NDK r27 + cargo-ndk + the
+pinned 1.91 toolchain), bundled by gradle. It is **mobile-only**: NOT linked by
+`app-main` or `headless`, and `ipc-bridge` has no edge on it. Membership is
+**unconditional** (compiled by `cargo build --workspace`), like `sync` /
+`tunnel-client`; no desktop artefact links it. It takes no workspace edge beyond
+`common` (the wire types it maps at the boundary — `MeetingId`,
+`ProcessingLifecycle`) and `sync` (the engine it wraps); the phone data layer
+adds `notes-crdt` in a later step (a table-update commit at that time). It takes
+**no `iroh` dependency of its own** — peers are addressed by passing hex id
+strings to `SyncEngine`'s string-keyed `*_to_peer` methods, which relay-address
+them internally (like `push_all_to`), so no `iroh` type crosses the UniFFI
+boundary and there is no version-lockstep to hand-maintain. Third-party:
+`uniffi` (binding generation). Because Option A wraps OUR `SyncEngine` (not
+upstream `iroh-ffi`), `iroh-blobs` stays encapsulated behind `sync_media` /
+`import_media` and needs no separate FFI surface. The wrapper owns its tokio
+runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS
+threads so a re-entrant foreign callback never `block_on`s from within the
+runtime. No `tauri::*` / `ipc-bridge` imports. See `cross-cutting.md` — "Build
+variants".
 
 **WS4-B S5 phase 3 (UI):** `ui/src/state/sync-status.ts` and
 `ui/src/shell/SyncSettingsPane.tsx` are purely internal to the webview layer; they

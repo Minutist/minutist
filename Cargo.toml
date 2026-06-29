@@ -18,6 +18,7 @@ members = [
     "crates/mcp-server",
     "crates/tunnel-client",
     "crates/sync",
+    "crates/sync-ffi",
     "crates/doc-convert",
     "crates/ipc-bridge",
     "crates/headless",

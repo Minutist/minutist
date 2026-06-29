@@ -477,47 +477,82 @@ export function TranscriptPane() {
   // transcript window; the clip is pre-sliced to [start_ms, end_ms) so it stops
   // on its own (no seeking — see `Orchestrator::extract_segment_wav`).
   // `playingIdx` is the row whose clip is currently playing (drives the glyph).
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  // Monotonic token of the latest play request; guards the play() promise's
-  // catch so a superseded click's AbortError cannot clear the glyph of the row
-  // that is now playing.
+  // Play via Web Audio (fetch the pre-cut WAV, decode it fully, play from a
+  // buffer) rather than an <audio> element streaming the custom protocol — the
+  // latter underran/glitched in WebView2 (slow + periodic ticking). Fully
+  // buffering the short clip removes streaming underruns, and decodeAudioData
+  // honours the WAV's 16 kHz rate.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
+  // Monotonic token of the latest play request; guards the async fetch/decode
+  // so a superseded click can't start or clear the wrong row.
   const playTokenRef = useRef(0);
   const [playingIdx, setPlayingIdx] = useState<number | null>(null);
 
-  function playSegment(idx: number, seg: Segment) {
-    if (openMeetingId === null) return;
-    let audio = audioRef.current;
-    if (audio === null) {
-      audio = new Audio();
-      audio.addEventListener("ended", () => setPlayingIdx(null));
-      audio.addEventListener("error", () => setPlayingIdx(null));
-      audioRef.current = audio;
+  function stopCurrentClip() {
+    const src = sourceRef.current;
+    if (src !== null) {
+      src.onended = null;
+      try {
+        src.stop();
+      } catch {
+        // already stopped/ended — nothing to do
+      }
+      sourceRef.current = null;
     }
+  }
+
+  async function playSegment(idx: number, seg: Segment) {
+    if (openMeetingId === null) return;
     // Clicking the row that is already playing stops it (toggle).
     if (playingIdx === idx) {
-      audio.pause();
+      stopCurrentClip();
       setPlayingIdx(null);
       return;
     }
-    // Setting a new src aborts the prior load, rejecting its play() promise
-    // (AbortError); the token ensures only the latest click's catch clears state.
+    stopCurrentClip();
     const token = ++playTokenRef.current;
-    audio.src = convertFileSrc(
-      `${openMeetingId}/${seg.start_ms}-${seg.end_ms}`,
-      MEETING_RECORDING_SCHEME,
-    );
     setPlayingIdx(idx);
-    void audio.play().catch(() => {
+    try {
+      if (audioCtxRef.current === null) {
+        audioCtxRef.current = new AudioContext();
+      }
+      const ctx = audioCtxRef.current;
+      if (ctx.state === "suspended") await ctx.resume();
+      const url = convertFileSrc(
+        `${openMeetingId}/${seg.start_ms}-${seg.end_ms}`,
+        MEETING_RECORDING_SCHEME,
+      );
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`recording slice HTTP ${resp.status}`);
+      const bytes = await resp.arrayBuffer();
+      if (playTokenRef.current !== token) return; // superseded mid-fetch
+      const buffer = await ctx.decodeAudioData(bytes);
+      if (playTokenRef.current !== token) return; // superseded mid-decode
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.onended = () => {
+        if (playTokenRef.current === token) {
+          setPlayingIdx(null);
+          sourceRef.current = null;
+        }
+      };
+      source.start();
+      sourceRef.current = source;
+    } catch {
       if (playTokenRef.current === token) setPlayingIdx(null);
-    });
+    }
   }
 
-  // Stop any clip when the open meeting changes or the pane unmounts, so a clip
-  // never outlives the meeting it belongs to.
+  // Stop playback + release the audio context when the open meeting changes or
+  // the pane unmounts, so a clip never outlives the meeting it belongs to.
   useEffect(() => {
     return () => {
-      audioRef.current?.pause();
+      stopCurrentClip();
       setPlayingIdx(null);
+      void audioCtxRef.current?.close();
+      audioCtxRef.current = null;
     };
   }, [openMeetingId]);
 
@@ -706,7 +741,7 @@ export function TranscriptPane() {
                       }
                       onClick={(e) => {
                         e.stopPropagation();
-                        playSegment(idx, seg);
+                        void playSegment(idx, seg);
                       }}
                     >
                       {playingIdx === idx ? <StopGlyph /> : <PlayGlyph />}

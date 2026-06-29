@@ -1494,34 +1494,45 @@ fn serve_note_asset(
 /// clones the `Arc<Orchestrator>` from the managed [`IpcState`], spawns a task
 /// that awaits `ipc_bridge::resolve_recording_slice` (which owns the
 /// `orchestrator` edge), and answers via the [`tauri::UriSchemeResponder`].
-/// Success → `200` `audio/wav`; ANY failure → an empty `404` so no detail leaks.
+///
+/// **Range-aware.** WebView2's `<audio>` media loader issues a `Range` request
+/// and needs `Accept-Ranges` + `Content-Length` (and a `206` for a ranged
+/// request) before it will play — a bare `200` without a length is rejected.
+/// So this serves `206 Partial Content` for a `Range` header and `200` with
+/// `Accept-Ranges: bytes` + `Content-Length` otherwise. ANY failure → an empty
+/// `404` so no detail leaks.
 fn serve_recording_slice(
     ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
     request: tauri::http::Request<Vec<u8>>,
     responder: tauri::UriSchemeResponder,
 ) {
-    use tauri::http::{header, Response, StatusCode};
+    use tauri::http::{Response, StatusCode};
 
     let orchestrator = {
         let state = ctx.app_handle().state::<IpcState>();
         Arc::clone(&state.orchestrator)
     };
     let path = request.uri().path().to_string();
+    let range = request
+        .headers()
+        .get(tauri::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     tauri::async_runtime::spawn(async move {
         let response = match ipc_bridge::resolve_recording_slice(&orchestrator, &path).await {
-            Ok(wav) => Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "audio/wav")
-                // No long cache: the WAV is cheap to regenerate (the orchestrator
-                // caches the decoded PCM), and a reprocess can rewrite the segment
-                // at the same `[start,end]` key, so a stale webview cache must not
-                // outlive it. A tiny max-age only dedupes a double-fire.
-                .header(header::CACHE_CONTROL, "private, max-age=2")
-                .body(wav)
-                .unwrap_or_else(|_| Response::new(Vec::new())),
+            Ok(wav) => {
+                tracing::info!(
+                    target: "app-main",
+                    path = %path,
+                    bytes = wav.len(),
+                    range = ?range,
+                    "meetingrecording served"
+                );
+                audio_wav_response(wav, range.as_deref())
+            }
             Err(e) => {
-                tracing::debug!(
+                tracing::info!(
                     target: "app-main",
                     path = %path,
                     "meetingrecording request rejected: {e}"
@@ -1534,6 +1545,70 @@ fn serve_recording_slice(
         };
         responder.respond(response);
     });
+}
+
+/// Build the HTTP response for a recording-slice WAV, honouring a byte `Range`.
+///
+/// Media elements over a custom URI scheme need range support: a `Range` header
+/// gets `206 Partial Content` with `Content-Range`; everything advertises
+/// `Accept-Ranges: bytes` + `Content-Length` (without which WebView2 will not
+/// play the clip). A short `max-age` only dedupes a double-fire — the WAV is
+/// cheap to regenerate and a reprocess can rewrite the same `[start,end]` key,
+/// so a stale webview cache must not outlive it.
+fn audio_wav_response(wav: Vec<u8>, range: Option<&str>) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::{header, Response, StatusCode};
+
+    let total = wav.len();
+    let ranged = range
+        .and_then(parse_byte_range)
+        .map(|(start, end)| (start, end.unwrap_or(total.saturating_sub(1))))
+        .filter(|&(start, end)| total > 0 && start <= end && start < total)
+        .map(|(start, end)| (start, end.min(total.saturating_sub(1))));
+
+    match ranged {
+        Some((start, end)) => {
+            let body = wav[start..=end].to_vec();
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, "audio/wav")
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+                .header(header::CONTENT_LENGTH, body.len().to_string())
+                // The webview fetches this clip cross-origin (custom scheme vs the
+                // app origin); allow it so Web Audio playback can read the bytes.
+                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                .header(header::CACHE_CONTROL, "private, max-age=2")
+                .body(body)
+                .unwrap_or_else(|_| Response::new(Vec::new()))
+        }
+        None => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "audio/wav")
+            .header(header::ACCEPT_RANGES, "bytes")
+            .header(header::CONTENT_LENGTH, total.to_string())
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .header(header::CACHE_CONTROL, "private, max-age=2")
+            .body(wav)
+            .unwrap_or_else(|_| Response::new(Vec::new())),
+    }
+}
+
+/// Parse the first byte range from a `Range: bytes=START-[END]` header into
+/// `(start, Some(end)|None)`. Returns `None` for anything not of that shape
+/// (incl. suffix ranges like `bytes=-500`), which the caller treats as "serve
+/// the whole body".
+fn parse_byte_range(header_value: &str) -> Option<(usize, Option<usize>)> {
+    let spec = header_value.trim().strip_prefix("bytes=")?;
+    let first = spec.split(',').next()?;
+    let (start, end) = first.split_once('-')?;
+    let start: usize = start.trim().parse().ok()?;
+    let end = end.trim();
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(end.parse::<usize>().ok()?)
+    };
+    Some((start, end))
 }
 
 /// Fallback 32×32 RGBA tray icon — solid blue (#1E64B4).

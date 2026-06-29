@@ -82,6 +82,18 @@ const MAX_RELISTEN_CLIP_MS: u64 = 300_000;
 /// Concurrent whole-file decodes permitted on the re-listen cache-miss path.
 const RELISTEN_DECODE_CONCURRENCY: usize = 2;
 
+/// Depth of the resampled-sample channel passed to [`AudioManager::start`]. Deep
+/// (≈ several seconds of batches) on purpose: the consumer stalls during the
+/// model-load burst at record start, and a shallow channel would back-pressure
+/// the capture forwarder into drop-flooding (truncating the recording). Deep
+/// buffering rides the stall — the backlog drains once models load, losing no
+/// audio. Partner of `audio-capture`'s `RAW_RING_CAPACITY` (the raw-frame ring).
+const CAPTURE_SAMPLE_CHANNEL_DEPTH: usize = 512;
+
+/// Depth of the level-meter channel passed to [`AudioManager::start`]; small —
+/// meter updates are advisory and only the newest value matters.
+const CAPTURE_METER_CHANNEL_DEPTH: usize = 64;
+
 /// The recording orchestrator. `Send + Sync`; intended to live in `Arc<Orchestrator>`.
 pub struct Orchestrator {
     settings: SettingsHandle,
@@ -111,14 +123,18 @@ pub struct Orchestrator {
     prewarmed_asr: Arc<StdMutex<Option<(AsrEngine, Box<dyn AsrBackend + Send>)>>>,
     /// Single-entry decoded-PCM cache for the transcript "play segment" /
     /// re-listen path ([`Self::extract_segment_wav`]). Holds the most-recently-
-    /// played meeting's pause-INCLUDING f32 PCM so rapid clicking through a
-    /// meeting's segments (the manual-labelling workflow, #0023) decodes
-    /// `audio.opus` once rather than once per click. Single-entry bounds it to one
+    /// played meeting's pause-INCLUDING f32 PCM **plus its pause-excluding
+    /// kept-region table**, so rapid clicking through a meeting's segments (the
+    /// manual-labelling workflow, #0023) decodes `audio.opus` AND runs the
+    /// O(samples) pause scan once rather than once per click — each clip request
+    /// then does only the cheap region→slice math. Single-entry bounds it to one
     /// meeting's PCM; `audio.opus` is never rewritten by reprocess, so an entry
     /// stays valid for its meeting id (UUIDs are never reused). A
     /// `std::sync::Mutex` because every access is a brief, non-awaiting
     /// check/insert.
-    relisten_pcm_cache: StdMutex<Option<(MeetingId, Arc<Vec<f32>>)>>,
+    #[allow(clippy::type_complexity)]
+    relisten_pcm_cache:
+        StdMutex<Option<(MeetingId, Arc<Vec<f32>>, Arc<Vec<runner::KeptRegion>>)>>,
     /// Caps concurrent whole-file decodes on the re-listen cache-miss path so a
     /// flood of `meetingrecording:` requests for distinct meetings cannot pile up
     /// unbounded full-file PCM allocations (defence-in-depth — the normal UI uses
@@ -401,7 +417,11 @@ impl Orchestrator {
         // otherwise. On non-Windows / loopback-open failure the capture layer
         // falls back to mic-only (logged) rather than failing the recording.
         let capture_system_audio = self.settings.current().capture_system_audio;
-        let streams = match capture.start(32, 64, capture_system_audio) {
+        let streams = match capture.start(
+            CAPTURE_SAMPLE_CHANNEL_DEPTH,
+            CAPTURE_METER_CHANNEL_DEPTH,
+            capture_system_audio,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 guard.state = InternalState::Idle;
@@ -1818,20 +1838,21 @@ impl Orchestrator {
             });
         }
 
-        // Reuse the cached decode for this meeting (the rapid-click labelling
-        // path); else decode `audio.opus` once under the decode-concurrency
-        // semaphore and cache it (single-entry, so memory is bounded to one
-        // meeting's PCM). The lock is held only for the brief check/insert, never
-        // across the decode or `.await`.
+        // Reuse the cached decode + pause-region table for this meeting (the
+        // rapid-click labelling path); else decode `audio.opus` once under the
+        // decode-concurrency semaphore, run the O(samples) pause scan once, and
+        // cache both (single-entry, so memory is bounded to one meeting's PCM).
+        // The lock is held only for the brief check/insert, never across the
+        // decode or `.await`.
         let cached = {
             let guard = self.relisten_pcm_cache.lock().unwrap();
             guard
                 .as_ref()
-                .filter(|(id, _)| *id == meeting_id)
-                .map(|(_, pcm)| Arc::clone(pcm))
+                .filter(|(id, _, _)| *id == meeting_id)
+                .map(|(_, pcm, regions)| (Arc::clone(pcm), Arc::clone(regions)))
         };
-        let pcm = match cached {
-            Some(pcm) => pcm,
+        let (pcm, regions) = match cached {
+            Some(hit) => hit,
             None => {
                 let _permit = self.relisten_decode_sem.acquire().await.map_err(|e| {
                     AppError::Internal {
@@ -1839,22 +1860,32 @@ impl Orchestrator {
                     }
                 })?;
                 let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
-                let decoded =
-                    tokio::task::spawn_blocking(move || persistence::read_audio_pcm(&meeting_dir))
-                        .await
-                        .map_err(|e| AppError::Internal {
-                            context: format!("extract_segment_wav decode join failed: {e}"),
-                        })??;
-                let pcm = Arc::new(decoded);
-                *self.relisten_pcm_cache.lock().unwrap() = Some((meeting_id, Arc::clone(&pcm)));
-                pcm
+                // Decode + the O(samples) pause scan together off the async
+                // threads; both are cached so subsequent clips skip them.
+                let (pcm, regions) = tokio::task::spawn_blocking(move || {
+                    persistence::read_audio_pcm(&meeting_dir)
+                        .map(|pcm| {
+                            let regions = runner::pause_excluding_segments(&pcm);
+                            (pcm, regions)
+                        })
+                })
+                .await
+                .map_err(|e| AppError::Internal {
+                    context: format!("extract_segment_wav decode join failed: {e}"),
+                })??;
+                let pcm = Arc::new(pcm);
+                let regions = Arc::new(regions);
+                *self.relisten_pcm_cache.lock().unwrap() =
+                    Some((meeting_id, Arc::clone(&pcm), Arc::clone(&regions)));
+                (pcm, regions)
             }
         };
 
-        // Map the window + encode the WAV off the async threads (the pause scan
-        // is O(samples)). The mapped slice is ≤ the requested span, hence bounded.
+        // Map the window + encode the WAV off the async threads. The per-request
+        // region→slice math is cheap; the O(samples) pause scan was done at decode
+        // time (and cached). The mapped slice is ≤ the requested span, hence bounded.
         tokio::task::spawn_blocking(move || -> AppResult<Vec<u8>> {
-            let range = runner::pcm_window_for_excluding_range(&pcm, start_ms, end_ms)
+            let range = runner::excluding_range_to_pcm_slice(&regions, start_ms, end_ms)
                 .ok_or_else(|| AppError::InvalidInput {
                     context: format!(
                         "segment window [{start_ms}, {end_ms}) ms is outside the recording"

@@ -1550,7 +1550,7 @@ pub(crate) fn find_file_in_dir(
 /// the original (pause-INCLUDING) `pcm`; `excl_start_ms` is the region's start
 /// on the pause-excluding timeline (the cumulative duration of all kept audio
 /// before it).
-struct KeptRegion {
+pub(crate) struct KeptRegion {
     src_start: usize,
     src_end: usize,
     excl_start_ms: u64,
@@ -1579,7 +1579,7 @@ const PAUSE_MIN_MS: u64 = 4000;
 /// pause-EXCLUDING clock, which advances only over kept audio. Short quiet gaps
 /// (below the threshold) are NOT split out — they remain part of a kept region,
 /// matching the live capture clock which counts them.
-fn pause_excluding_segments(pcm: &[f32]) -> Vec<KeptRegion> {
+pub(crate) fn pause_excluding_segments(pcm: &[f32]) -> Vec<KeptRegion> {
     let pause_min_samples = (PAUSE_MIN_MS as usize * SAMPLE_RATE_HZ as usize) / 1000;
 
     let mut regions: Vec<KeptRegion> = Vec::new();
@@ -1659,9 +1659,20 @@ pub(crate) fn pcm_window_for_excluding_range(
     start_ms: u64,
     end_ms: u64,
 ) -> Option<std::ops::Range<usize>> {
-    let regions = pause_excluding_segments(pcm);
+    excluding_range_to_pcm_slice(&pause_excluding_segments(pcm), start_ms, end_ms)
+}
 
-    for region in &regions {
+/// The per-request half of [`pcm_window_for_excluding_range`]: map the
+/// pause-EXCLUDING window onto a PCM slice given an already-computed kept-region
+/// table. Split out so the re-listen path can compute the O(samples)
+/// [`pause_excluding_segments`] scan once per meeting (cached alongside the
+/// decoded PCM) and run only this cheap region math per clip request.
+pub(crate) fn excluding_range_to_pcm_slice(
+    regions: &[KeptRegion],
+    start_ms: u64,
+    end_ms: u64,
+) -> Option<std::ops::Range<usize>> {
+    for region in regions {
         let region_kept_samples = region.src_end - region.src_start;
         let region_excl_len_ms =
             (region_kept_samples as u64 * 1000) / SAMPLE_RATE_HZ;

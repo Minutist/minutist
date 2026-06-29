@@ -688,7 +688,13 @@ fn parse_recording_request(
 ) -> Result<(minutist_common::MeetingId, u64, u64), minutist_common::AppError> {
     use minutist_common::{AppError, MeetingId};
 
-    let trimmed = request_path.trim_start_matches('/');
+    // The async URI-scheme handler receives the raw, still-percent-encoded path:
+    // `convertFileSrc` runs `encodeURIComponent` over the whole "<id>/<window>"
+    // string, so the separating '/' arrives as "%2F" (one path segment). Decode
+    // before splitting. Decoding a path with no escapes is a no-op, so this is
+    // also correct if a caller ever passes an already-decoded path.
+    let decoded = percent_decode_path(request_path);
+    let trimmed = decoded.trim_start_matches('/');
     let mut parts = trimmed.splitn(2, '/');
     let (id_str, window) = match (parts.next(), parts.next()) {
         (Some(id), Some(w)) if !id.is_empty() && !w.is_empty() => (id, w),
@@ -728,6 +734,39 @@ fn parse_recording_request(
     }
 
     Ok((MeetingId(uuid), start_ms, end_ms))
+}
+
+/// Minimal percent-decoder for a URI path: turn `%XX` byte escapes back into
+/// their bytes (lossy UTF-8), pass everything else through. Sufficient for the
+/// `meetingrecording:` path (a UUID + `<start>-<end>` window, where the only
+/// escape `convertFileSrc` introduces is `%2F` for the separating slash); kept
+/// dependency-free. An incomplete trailing escape is treated literally.
+fn percent_decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Hex digit (`0-9A-Fa-f`) to its 0–15 value, or `None`.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +910,13 @@ mod tests {
         // A trailing `.wav` (should the frontend ever append one) is ignored.
         let (_, start, end) =
             parse_recording_request(&format!("/{uuid}/1000-2000.wav")).expect("ext ignored");
+        assert_eq!((start, end), (1000, 2000));
+
+        // convertFileSrc percent-encodes the separating slash as %2F — the path
+        // arrives as one segment and must be decoded before splitting.
+        let (id, start, end) =
+            parse_recording_request(&format!("/{uuid}%2F1000-2000")).expect("encoded slash");
+        assert_eq!(id.0, uuid::Uuid::nil());
         assert_eq!((start, end), (1000, 2000));
     }
 

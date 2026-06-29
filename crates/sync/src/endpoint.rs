@@ -370,6 +370,42 @@ impl SyncEngine {
         Ok(reconciled)
     }
 
+    /// Resolve a hex endpoint-id string to a relay-routed [`EndpointAddr`] (id +
+    /// the configured relay) — the addressing form [`Self::push_all_to`] uses.
+    /// The string-keyed `*_to_peer` / `*_with_peer` methods below take this so an
+    /// FFI / non-`iroh` caller (the phone wrapper) can address a paired peer
+    /// without constructing `iroh` types.
+    fn peer_relay_addr(&self, peer_id: &str) -> Result<EndpointAddr> {
+        let id: EndpointId = peer_id
+            .parse()
+            .map_err(|e| Error::Protocol(format!("parsing peer id {peer_id:?}: {e}")))?;
+        let relay: RelayUrl = self.relay_url.parse().map_err(|e| {
+            Error::Endpoint(format!(
+                "peer dial needs a relay url, got {:?}: {e}",
+                self.relay_url
+            ))
+        })?;
+        Ok(EndpointAddr::new(id).with_relay_url(relay))
+    }
+
+    /// [`Self::sync_notes`] addressing the peer by its hex endpoint-id string
+    /// (relay-routed). The peer must already be paired ([`Self::add_peer_from_ticket`]).
+    pub async fn sync_notes_to_peer(&self, peer_id: &str, meeting_id: MeetingId) -> Result<()> {
+        self.sync_notes(self.peer_relay_addr(peer_id)?, meeting_id)
+            .await
+    }
+
+    /// [`Self::sync_media`] addressing the peer by its hex endpoint-id string.
+    pub async fn sync_media_to_peer(&self, peer_id: &str, meeting_id: MeetingId) -> Result<()> {
+        self.sync_media(self.peer_relay_addr(peer_id)?, meeting_id)
+            .await
+    }
+
+    /// [`Self::discover_with`] addressing the peer by its hex endpoint-id string.
+    pub async fn discover_with_peer(&self, peer_id: &str) -> Result<Vec<MeetingId>> {
+        self.discover_with(self.peer_relay_addr(peer_id)?).await
+    }
+
     /// Dial a peer on the [`SYNC_ALPN`]. The peer must already be resolvable —
     /// either injected via [`Self::add_peer`] or passed as a full
     /// [`EndpointAddr`] carrying its relay/direct addresses.

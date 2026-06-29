@@ -12,13 +12,15 @@
 //! threads. Distinct meetings use distinct locks and never serialise against
 //! each other; only the two writers within one meeting contend.
 //!
-//! Scope: covers every `metadata.json` writer now on the shared per-meeting lock
-//! (issue 0025) — the `persistence::meeting_ops` fns, the sync lifecycle
-//! subscriber, AND the `orchestrator`'s post-processing RMWs (routed through
-//! `meeting_ops::update_metadata`). The second test below races an
-//! orchestrator-style blind RMW against a lifecycle write to prove it; see the
-//! coverage note in `architecture/cross-cutting.md` ("Per-meeting metadata.json
-//! write lock").
+//! Scope: every `metadata.json` writer now routes through the shared per-meeting
+//! lock (issue 0025) — the `persistence::meeting_ops` fns (incl. the
+//! `update_metadata` primitive the `orchestrator`'s post-processing RMWs and the
+//! agent-tools tools call), `read_meeting_state`'s notes-format flip, and the
+//! sync lifecycle subscriber. These tests race the `update_metadata` PRIMITIVE
+//! against a lifecycle write to prove the lock serialises any two writers of one
+//! meeting; that each caller actually routes through it is verified by
+//! compilation + review, not here. See `architecture/cross-cutting.md`
+//! ("Per-meeting metadata.json write lock").
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -118,15 +120,18 @@ async fn concurrent_metadata_rmw_keeps_both_fields() {
     }
 }
 
-/// Issue 0025: the orchestrator's post-processing `metadata.json` RMWs now go
-/// through `meeting_ops::update_metadata`, taking the SAME per-meeting lock as
-/// the sync lifecycle subscriber. This races a `finalise_diarization`-style
-/// blind RMW (set `speaker_count`) against the subscriber's `Claimed` write —
-/// the headline "a remote GPU node's Claimed lands while the local diarize chain
-/// runs" scenario, which reverted `processing` to `Local` before the
-/// orchestrator was on the lock. With the shared lock, BOTH fields survive.
+/// Issue 0025: every blind full-struct RMW (the orchestrator's post-processing
+/// writes, `read_meeting_state`'s notes-format flip) now goes through
+/// `meeting_ops::update_metadata`, taking the SAME per-meeting lock as the sync
+/// lifecycle subscriber. This races that primitive — a `finalise_diarization`-style
+/// `speaker_count` RMW — against the subscriber's `Claimed` write: the headline
+/// "a remote host's Claimed lands while the local diarize chain runs" scenario
+/// that reverted `processing` to `Local` when those writers were off the lock.
+/// With the shared lock BOTH fields survive. (This exercises the shared
+/// primitive; that each call site routes through it is verified by compilation +
+/// review, not here.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn orchestrator_rmw_and_lifecycle_keep_both_fields() {
+async fn guarded_rmw_and_lifecycle_keep_both_fields() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().to_path_buf();
 

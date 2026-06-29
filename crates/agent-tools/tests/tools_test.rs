@@ -935,6 +935,57 @@ async fn set_speaker_name_round_trips_through_metadata() {
     assert_eq!(tr.data.as_array().unwrap()[0]["speaker_id"], "Alice");
 }
 
+/// Locks the MCP-boundary contract (issue 0025): routing `set_speaker_name`
+/// onto `persistence::meeting_ops::set_speaker_name` means `name:""` CLEARS the
+/// label (the canonical/UI behaviour) rather than inserting an empty-string name.
+#[tokio::test]
+async fn set_speaker_name_empty_name_clears_label() {
+    let (_t, root, ctx) = make_ctx().await;
+    let reg = ToolRegistry::v1(false);
+    let id = seed_meeting(
+        &root,
+        &ctx.index,
+        "M",
+        vec![seg(0, 1000, "x", Some("A"))],
+        BTreeMap::new(),
+    )
+    .await;
+
+    // Set a name, then clear it with an empty name.
+    reg.dispatch(
+        &ctx,
+        "set_speaker_name",
+        serde_json::json!({ "meeting_id": id.0.to_string(), "speaker_id": "A", "name": "Alice" }),
+    )
+    .await
+    .unwrap();
+
+    let out = reg
+        .dispatch(
+            &ctx,
+            "set_speaker_name",
+            serde_json::json!({ "meeting_id": id.0.to_string(), "speaker_id": "A", "name": "" }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out.data["speaker_names"].get("A").is_none(),
+        "empty name must clear the label, got {:?}",
+        out.data["speaker_names"]
+    );
+
+    // Cleared on disk too.
+    let meta = reg
+        .dispatch(
+            &ctx,
+            "get_metadata",
+            serde_json::json!({ "meeting_id": id.0.to_string() }),
+        )
+        .await
+        .unwrap();
+    assert!(meta.data["speaker_names"].get("A").is_none());
+}
+
 #[tokio::test]
 async fn concurrent_set_speaker_name_does_not_drop_a_write() {
     let (_t, root, ctx) = make_ctx().await;

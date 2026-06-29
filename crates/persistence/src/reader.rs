@@ -133,8 +133,17 @@ pub fn read_meeting_state(meeting_dir: &Path) -> AppResult<MeetingState> {
     // written (e.g. by a prior save) while notes_format still read 0.
     let seeded = NotesStore::seed_ydoc_if_needed(root, meta.uuid)?;
     if (seeded || meeting_dir.join("notes.ydoc").exists()) && meta.notes_format == 0 {
-        meta.notes_format = 1;
-        crate::write_metadata(meeting_dir, &meta)?;
+        // Route the flip through the guarded primitive so it takes the
+        // per-meeting metadata lock (issue 0025). This is a full-struct RMW, and
+        // it fires on exactly the synced meetings that receive `Claimed` /
+        // `Processed` over the lifecycle stream — so an unguarded write here
+        // would read `processing` before a concurrent lifecycle write and then
+        // revert it. `update_metadata` re-reads under the lock, so the returned
+        // `meta` reflects any such concurrent write rather than clobbering it.
+        meta = crate::meeting_ops::update_metadata(root, meta.uuid, |m| {
+            m.notes_format = 1;
+            m.clone()
+        })?;
     }
 
     let notes = NotesStore::load(root, meta.uuid)?.map(|data| {

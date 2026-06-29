@@ -932,8 +932,8 @@ pub struct LiveDigest {
     pub decisions: Vec<LiveDigestItem>,
     /// Questions posed during the meeting that have not yet received an answer.
     pub open_asks: Vec<LiveDigestItem>,
-    /// Questions answered from pinned attachment context (documents, slides,
-    /// etc. attached before the meeting started).
+    /// Questions answered from attached-document context (documents, slides, etc.),
+    /// retrieved into the live agent's context.
     pub attachment_answers: Vec<LiveDigestItem>,
     /// Terms, acronyms, or references mentioned but not explained in the
     /// transcript (potential knowledge gaps surfaced for the attendee).

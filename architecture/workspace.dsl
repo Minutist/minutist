@@ -255,12 +255,13 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.agentTools -> minutist.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
         minutist.core.agentTools -> minutist.core.ragRetrieval "rrf_fuse for the retrieve_chunks tool"
 
-        // RAG (Phase B). ipc-bridge drives the write path (chunk + embed + persist
+        // RAG (Phase B/D). ipc-bridge drives the write path (chunk + embed + persist
         // to the per-meeting meeting.db) and holds the embedder; agent-tools'
-        // retrieve_chunks queries it. embedder is the model-loading leaf;
-        // rag-retrieval is pure logic.
+        // retrieve_chunks queries it, and the live-agent worker both retrieves and
+        // incrementally indexes transcript per refresh (Phase D). embedder is the
+        // model-loading leaf; rag-retrieval is pure logic.
         minutist.core.ipcBridge -> minutist.core.embedder "Constructs + holds the BGE-M3 embedder"
-        minutist.core.ipcBridge -> minutist.core.ragRetrieval "chunk_text for the RAG write path"
+        minutist.core.ipcBridge -> minutist.core.ragRetrieval "chunk_text (write path) + rrf_fuse (live-agent retrieval)"
 
         // Chat agent (Phase 9). The stateless turn engine sits ABOVE both the
         // summariser substrate (borrows the loaded LlamaModel via the D5 seam)

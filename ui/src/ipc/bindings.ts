@@ -1672,8 +1672,8 @@ decisions: LiveDigestItem[];
  */
 open_asks: LiveDigestItem[]; 
 /**
- * Questions answered from pinned attachment context (documents, slides,
- * etc. attached before the meeting started).
+ * Questions answered from attached-document context (documents, slides, etc.),
+ * retrieved into the live agent's context.
  */
 attachment_answers: LiveDigestItem[]; 
 /**
@@ -2364,12 +2364,20 @@ live_agent_digest_attachment_answers?: boolean;
  */
 live_agent_digest_unresolved_references?: boolean; 
 /**
- * Maximum total characters of attachment markdown fed into the live
- * agent's pinned prefix. ~80 000 chars ≈ 20 k tokens, safely within the
- * held `LlamaContext`'s n_ctx = 32 768. An older store deserialises to
- * 80 000.
+ * Upper bound (characters) on the attachment / earlier-transcript context the
+ * live agent retrieves into its tail per refresh. A backstop —
+ * `live_agent_retrieval_k` is the dominant knob (each chunk is ~1 KB). Within
+ * the held `LlamaContext`'s n_ctx = 32 768. An older store deserialises to 80 000.
+ * (`serde(alias)` keeps the pre-rename `live_agent_attachment_budget_chars` key
+ * readable from existing on-disk settings.)
  */
-live_agent_attachment_budget_chars?: number; 
+live_agent_retrieval_budget_chars?: number; 
+/**
+ * Top-k attachment / earlier-transcript chunks the live agent retrieves and
+ * injects into its tail per refresh (the discrete-GPU tier; an integrated GPU
+ * is scaled down). `0` disables retrieval. An older store deserialises to 8.
+ */
+live_agent_retrieval_k?: number; 
 /**
  * The system prompt passed to the live agent on every refresh. Instructs
  * the model to UPDATE the standing digest rather than regenerate it,

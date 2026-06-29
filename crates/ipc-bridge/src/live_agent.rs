@@ -25,12 +25,18 @@
 //! a separate mutex: the driver only fires a new request after receiving the
 //! previous result.
 //!
-//! # Pin-at-start
+//! # Prefix and retrieval
 //!
-//! The attachment prefix is built once (`build_prefix`) at session spawn and
-//! included in every `TailRequest`. The worker's `LiveSession` calls
-//! `seed_prefix` once (idempotent); subsequent calls are no-ops. The ~40 s
-//! prefill runs at session start, never mid-recording.
+//! The prefix (`build_prefix`) is just the system prompt + digest-category
+//! instructions — small, prefilled once at session spawn (`seed_prefix` is
+//! idempotent; subsequent calls are no-ops). Attachment and earlier-transcript
+//! context is NOT pinned: each refresh retrieves the few chunks relevant to what
+//! is being discussed (dense + lexical over the meeting's `meeting.db`, fused by
+//! RRF) and injects them into the bounded tail. A tier-scaled `k` keeps the
+//! per-refresh prefill small on an integrated GPU and generous on a discrete one.
+//! The held embedder loads in the background at worker start; until it is ready
+//! (or while `meeting.db` is empty) the agent degrades to transcript-only with no
+//! injected context.
 //!
 //! # Standing-list update discipline
 //!
@@ -57,13 +63,16 @@
 //! This is the v1 policy: no re-seed mid-recording (re-seeding costs another
 //! ~40 s prefill and would starve ASR inference).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use chat_agent::{CancelFlag, LiveSession, LlamaLiveBackend, LlamaLiveConfig, SamplerConfig};
-use minutist_common::{AppEvent, LiveDigest, LiveDigestItem, MeetingId};
+use minutist_common::{AppEvent, Embedder, LiveDigest, LiveDigestItem, MeetingId};
 use orchestrator::Orchestrator;
+use persistence::{meeting_db_path, RagStore, RetrievedChunk};
+use rag_retrieval::rrf_fuse;
 use settings::SettingsHandle;
 use summariser::LlamaSummariser;
 use tokio::sync::{broadcast, mpsc, watch, OnceCell};
@@ -88,6 +97,7 @@ pub(crate) struct TailRequest {
     cancel: CancelFlag,
 }
 
+#[derive(Debug)]
 pub(crate) enum RefreshResult {
     Ok(String),
     Err(String),
@@ -110,6 +120,10 @@ pub struct LiveAgentHandles {
     /// summarise paths). The worker thread calls `ensure_summariser` on this
     /// to obtain the `Arc<LlamaSummariser>` it borrows `&LlamaModel` from.
     pub summariser: Arc<OnceCell<Arc<LlamaSummariser>>>,
+    /// The lazily-loaded held BGE-M3 embedder (the SAME `Arc<OnceCell>` the chat
+    /// and RAG write paths share). The worker loads it in the background at start
+    /// and peeks it each refresh to embed the retrieval query; `None` until ready.
+    pub embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
 }
 
 /// Spawn the live-agent auto-driver task for an active recording.
@@ -131,6 +145,7 @@ pub fn spawn_live_agent(
         event_tx,
         settings,
         summariser,
+        embedder,
     } = handles;
 
     let (req_tx, req_rx) = mpsc::channel::<TailRequest>(WORKER_CHANNEL_DEPTH);
@@ -157,6 +172,7 @@ pub fn spawn_live_agent(
                 req_rx,
                 res_tx,
                 summariser,
+                embedder,
                 worker_orchestrator,
                 worker_settings,
                 worker_meetings_dir,
@@ -479,6 +495,7 @@ fn run_worker_thread(
     req_rx: mpsc::Receiver<TailRequest>,
     res_tx: mpsc::Sender<RefreshResult>,
     summariser_cell: Arc<OnceCell<Arc<LlamaSummariser>>>,
+    embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
     orchestrator: Arc<Orchestrator>,
     settings: SettingsHandle,
     meetings_dir: PathBuf,
@@ -526,16 +543,40 @@ fn run_worker_thread(
         }
     };
 
-    // M4: build the attachment prefix on the worker thread (off the async
-    // runtime). build_prefix calls persistence::read_attachments_markdown_parts
-    // which does synchronous filesystem I/O — it must not run on a Tauri async
-    // task thread.
-    let prefix = build_prefix(&meetings_dir, meeting_id, &settings.current());
+    // Load the held embedder in the BACKGROUND now that the summariser is in.
+    // It populates the shared cell (the same `Arc<OnceCell>` the chat / RAG write
+    // paths use), so the retrieval loop peeks it each refresh. Progress is
+    // cooperative: the spawned task advances only at the worker loop's `.await`
+    // points — the model open itself runs on a `spawn_blocking` thread so it does
+    // proceed in parallel, but on a busy meeting "ready" can lag the first refresh.
+    // The GPU offload races the summariser warm-up with no VRAM admission control;
+    // an allocation failure is caught and retrieval is disabled for the session.
+    // All best-effort — on any failure the agent runs without injected context.
+    {
+        let bg_cell = embedder_cell.clone();
+        let bg_orchestrator = orchestrator.clone();
+        let bg_settings = settings.clone();
+        rt.spawn(async move {
+            if let Err(e) = ensure_embedder_in_worker(&bg_cell, &bg_orchestrator, &bg_settings).await
+            {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    error = %e,
+                    "live-agent: background embedder load failed (retrieval disabled this session)"
+                );
+            }
+        });
+    }
+
+    // The prefix is just the system prompt + digest categories now — attachment
+    // and earlier-transcript context is retrieved into the tail each refresh, not
+    // pinned here. Cheap, no filesystem I/O.
+    let prefix = build_prefix(&settings.current());
     tracing::debug!(
         target: "ipc-bridge",
         meeting_id = %meeting_id.0,
         prefix_chars = prefix.len(),
-        "live-agent: attachment prefix built on worker thread"
+        "live-agent: prefix built on worker thread"
     );
 
     // Construct the LlamaLiveBackend on this thread. LlamaLiveBackend<'m>
@@ -588,7 +629,43 @@ fn run_worker_thread(
         }
     }
 
-    rt.block_on(run_worker_loop(meeting_id, req_rx, res_tx, &mut session));
+    // Open the per-meeting RAG cache (created if absent — an empty cache until
+    // attachments / transcript are indexed). On failure, retrieval is disabled
+    // for the session (the agent still produces digests, just without injected
+    // context). The tier-scaled `k` is fixed for the session: the GPU tier does
+    // not change mid-meeting.
+    let s = settings.current();
+    let is_integrated = minutist_common::probe_primary_gpu()
+        .map(|p| p.is_integrated)
+        // No probe → assume the tight (integrated) tier so an unknown GPU never
+        // gets the generous per-refresh prefill budget.
+        .unwrap_or(true);
+    let retrieval = match rt.block_on(RagStore::open(meeting_db_path(&meetings_dir, meeting_id))) {
+        Ok(store) => Some(LiveRetrieval {
+            embedder_cell,
+            store,
+            meetings_dir,
+            k: tier_scaled_k(s.live_agent_retrieval_k, is_integrated),
+            char_budget: s.live_agent_retrieval_budget_chars,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc-bridge",
+                meeting_id = %meeting_id.0,
+                error = %e,
+                "live-agent: opening meeting.db failed; retrieval disabled this session"
+            );
+            None
+        }
+    };
+
+    rt.block_on(run_worker_loop(
+        meeting_id,
+        req_rx,
+        res_tx,
+        &mut session,
+        retrieval.as_ref(),
+    ));
 
     tracing::info!(
         target: "ipc-bridge",
@@ -632,14 +709,62 @@ async fn ensure_summariser_in_worker(
     Ok(Arc::clone(handle))
 }
 
+/// Load the held embedder using the shared `OnceCell`, mirroring
+/// [`crate::chat_runtime::ChatHandles::ensure_embedder`]. Run in the background at
+/// worker start so the load — and any first-use BGE-M3 download — stays off the
+/// digest critical path. Populates the cell the retrieval loop peeks.
+async fn ensure_embedder_in_worker(
+    cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
+    orchestrator: &Arc<Orchestrator>,
+    settings: &SettingsHandle,
+) -> Result<Arc<dyn Embedder>, minutist_common::AppError> {
+    let handle = cell
+        .get_or_try_init(|| async {
+            let s = settings.current();
+            let model_id = minutist_common::ModelId::from(crate::commands::DEFAULT_EMBED_MODEL_ID);
+            let model_dir = orchestrator.ensure_model_path(&model_id).await?;
+            let gguf = crate::commands::find_gguf_weights(&model_dir)?;
+            // The embedder is small (~600 MB); offload it whenever GPU acceleration
+            // is enabled (Off forces CPU). It is not in the summariser-first VRAM plan.
+            let enabled = s.gpu_acceleration != minutist_common::GpuAcceleration::Off;
+            let n_gpu_layers = crate::commands::resolve_summariser_gpu_layers(enabled);
+            let embedder = tokio::task::spawn_blocking(move || {
+                embedder::Bgem3Embedder::open(
+                    &gguf,
+                    crate::commands::DEFAULT_EMBED_MODEL_ID,
+                    n_gpu_layers,
+                )
+            })
+            .await
+            .map_err(|e| minutist_common::AppError::Internal {
+                context: format!("live-agent embedder load task join failed: {e}"),
+            })??;
+            tracing::info!(
+                target: "ipc-bridge",
+                "live-agent: held BGE-M3 embedder loaded (background)"
+            );
+            Ok::<_, minutist_common::AppError>(Arc::new(embedder) as Arc<dyn Embedder>)
+        })
+        .await?;
+    Ok(Arc::clone(handle))
+}
+
 async fn run_worker_loop(
     meeting_id: MeetingId,
     mut req_rx: mpsc::Receiver<TailRequest>,
     res_tx: mpsc::Sender<RefreshResult>,
     session: &mut LiveSession<LlamaLiveBackend<'_>>,
+    retrieval: Option<&LiveRetrieval>,
 ) {
     while let Some(req) = req_rx.recv().await {
-        let result = process_request(meeting_id, session, req);
+        // Retrieve attachment / earlier-transcript context relevant to this
+        // refresh window and inject it into the tail. `None` until the embedder
+        // has loaded or while the cache is empty (the agent still digests).
+        let injected = match retrieval {
+            Some(rc) => build_retrieval_block(rc, &req.tail).await,
+            None => None,
+        };
+        let result = process_request(meeting_id, session, req, injected.as_deref());
         // Both CapacityExhausted and Err are terminal: the held context is
         // untrustworthy after either condition. Stop after sending.
         let is_terminal = matches!(
@@ -663,6 +788,36 @@ async fn run_worker_loop(
             );
             return;
         }
+
+        // After emitting the digest, incrementally index newly-sealed transcript
+        // turns so later refreshes can retrieve earlier discussion. Best-effort and
+        // off the digest's critical path (the result is already sent).
+        if let Some(rc) = retrieval {
+            if let Some(embedder) = rc.embedder_cell.get().cloned() {
+                match crate::rag_index::index_transcript_incremental(
+                    &rc.store,
+                    &rc.meetings_dir,
+                    meeting_id,
+                    &embedder,
+                )
+                .await
+                {
+                    Ok(n) if n > 0 => tracing::debug!(
+                        target: "ipc-bridge",
+                        meeting_id = %meeting_id.0,
+                        chunks = n,
+                        "live-agent: incrementally indexed transcript turns"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        target: "ipc-bridge",
+                        meeting_id = %meeting_id.0,
+                        error = %e,
+                        "live-agent: incremental transcript index failed (best-effort)"
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -670,12 +825,12 @@ fn process_request(
     meeting_id: MeetingId,
     session: &mut LiveSession<LlamaLiveBackend<'_>>,
     req: TailRequest,
+    retrieved: Option<&str>,
 ) -> RefreshResult {
-    // The prefix is already seeded at session start (run_worker_thread). This
-    // call is a no-op (seed_prefix_typed returns Ok(0) on subsequent calls) but
-    // is kept as a safety net with a live cancel flag so any hypothetical double-
-    // call during an unusual race is harmless.
-    let effective_tail = build_effective_tail(&req.tail, req.prior_digest_json.as_deref());
+    // The prefix was seeded once at session start; this call only appends the
+    // effective tail (retrieved context + prior digest + new segments).
+    let effective_tail =
+        build_effective_tail(&req.tail, req.prior_digest_json.as_deref(), retrieved);
 
     let mut generated = String::new();
     // refresh_typed returns the typed chat_agent::Error so ContextOverflow
@@ -709,18 +864,12 @@ fn process_request(
 // Prefix and tail construction
 // ---------------------------------------------------------------------------
 
-/// Build the one-time prefix: system prompt + digest-category instructions +
-/// attachment markdown (budgeted to `live_agent_attachment_budget_chars`).
+/// Build the one-time prefix: system prompt + digest-category instructions.
 ///
-/// The budget is measured in **characters** (Unicode scalar values, matching
-/// the field name `live_agent_attachment_budget_chars`). String slicing uses
-/// `floor_char_boundary` to guarantee the truncation point never falls inside
-/// a multi-byte UTF-8 sequence.
-pub(crate) fn build_prefix(
-    meetings_dir: &std::path::Path,
-    meeting_id: MeetingId,
-    s: &settings::Settings,
-) -> String {
+/// Attachment / earlier-transcript context is no longer pinned here — it is
+/// retrieved into the tail each refresh (see [`build_retrieval_block`]), keeping
+/// the once-prefilled prefix small on every GPU tier.
+pub(crate) fn build_prefix(s: &settings::Settings) -> String {
     let mut prefix = String::new();
 
     prefix.push_str(&s.live_agent_system_prompt);
@@ -737,7 +886,7 @@ pub(crate) fn build_prefix(
         prefix.push_str("- open_asks: questions posed but not yet answered\n");
     }
     if s.live_agent_digest_attachment_answers {
-        prefix.push_str("- attachment_answers: questions answered from pinned documents\n");
+        prefix.push_str("- attachment_answers: questions answered from retrieved documents\n");
     }
     if s.live_agent_digest_unresolved_references {
         prefix.push_str("- unresolved_references: terms or acronyms not explained\n");
@@ -747,53 +896,187 @@ pub(crate) fn build_prefix(
          Return ONLY a JSON object matching the LiveDigest schema.\n\n",
     );
 
-    match persistence::read_attachments_markdown_parts(meetings_dir, meeting_id) {
-        Ok(parts) => {
-            // Budget is in characters; measure accordingly.
-            let budget_chars = s.live_agent_attachment_budget_chars;
-            let mut total_chars = 0usize;
-            for (filename, content) in parts {
-                let remaining_chars = budget_chars.saturating_sub(total_chars);
-                if remaining_chars == 0 {
-                    break;
-                }
-                // Truncate on a char boundary so we never split a multi-byte
-                // sequence (content.len() is bytes; we compare char count).
-                let content_chars = content.chars().count();
-                let trimmed = if content_chars > remaining_chars {
-                    // Find the byte index of the remaining_chars-th character.
-                    let byte_end = content
-                        .char_indices()
-                        .nth(remaining_chars)
-                        .map(|(i, _)| i)
-                        .unwrap_or(content.len());
-                    &content[..byte_end]
-                } else {
-                    content.as_str()
-                };
-                prefix.push_str(&format!("## Attachment: {filename}\n\n"));
-                prefix.push_str(trimmed);
-                prefix.push_str("\n\n");
-                // Count chars actually added (trimmed is a &str).
-                total_chars += trimmed.chars().count();
-            }
+    prefix
+}
+
+// ---------------------------------------------------------------------------
+// Retrieval (RAG) — per-refresh context injection
+// ---------------------------------------------------------------------------
+
+/// Cap the retrieval query to the most recent slice of the discussion — it is the
+/// "what's being talked about now" focus; older context is what we retrieve.
+const QUERY_CHAR_CAP: usize = 2000;
+
+/// Per-session RAG context held by the worker: drives both retrieval (each refresh
+/// embeds the recent window + reads the cache) and incremental transcript indexing
+/// (sealed turns appended as the meeting runs). The shared embedder cell is peeked —
+/// `None` until the background load completes.
+///
+/// `store` is a single libsql connection used for BOTH the per-refresh reads and the
+/// incremental-index write; this is sound ONLY because the worker is a single-in-flight
+/// current-thread loop (the read and the append never overlap). Moving the incremental
+/// index off the loop (e.g. `tokio::spawn`) would need its own connection.
+struct LiveRetrieval {
+    embedder_cell: Arc<OnceCell<Arc<dyn Embedder>>>,
+    store: RagStore,
+    /// Meeting folder root — the incremental indexer reads `transcript.json` under it.
+    meetings_dir: PathBuf,
+    /// Top-k chunks fused across the dense + lexical legs (tier-scaled).
+    k: usize,
+    /// Upper bound on injected-context characters. A backstop — `k` is the
+    /// dominant knob, since each chunk is ~1 KB.
+    char_budget: usize,
+}
+
+/// Scale the configured retrieval `k` to the GPU tier. An integrated GPU pays a
+/// quadratic per-refresh prefill, so it gets roughly half the chunks (floored so
+/// retrieval never collapses to a single hit); a discrete GPU uses the full `k`.
+/// `k == 0` disables retrieval on both tiers.
+fn tier_scaled_k(base_k: usize, is_integrated: bool) -> usize {
+    if base_k == 0 {
+        return 0;
+    }
+    if is_integrated {
+        (base_k / 2).max(3).min(base_k)
+    } else {
+        base_k
+    }
+}
+
+/// The last `n` characters of `s` (char-boundary safe), or all of `s` when shorter.
+/// `n == 0` yields `""`.
+fn tail_chars(s: &str, n: usize) -> &str {
+    if n == 0 {
+        return "";
+    }
+    let count = s.chars().count();
+    if count <= n {
+        return s;
+    }
+    let start = s
+        .char_indices()
+        .nth(count - n)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    &s[start..]
+}
+
+/// A human-readable heading for a retrieved chunk, by document type. (The
+/// attachment `source_id` is a content hash, not a filename, so the heading is
+/// generic until a hash→filename lookup is wired in.)
+fn retrieval_source_label(c: &RetrievedChunk) -> &'static str {
+    match c.doc_type.as_str() {
+        "attachment" => "From an attached document",
+        "transcript" => "Earlier in the meeting",
+        _ => "Relevant context",
+    }
+}
+
+/// Retrieve the chunks relevant to the recent discussion and format them as a
+/// tail-injected context block, or `None` when retrieval is unavailable / empty.
+///
+/// Query = the recent transcript window (`recent`, this refresh's new segments),
+/// capped to the last [`QUERY_CHAR_CAP`] characters. The dense (cosine) and
+/// lexical (FTS5) legs are fused by RRF. No dedup against the live window is
+/// needed: `recent` is reset each refresh, and the incremental indexer only seals
+/// turns that have already scrolled out of the window, so an indexed transcript
+/// chunk can never duplicate what is in the current window. Survivors are packed
+/// up to `char_budget`.
+async fn build_retrieval_block(rc: &LiveRetrieval, recent: &str) -> Option<String> {
+    // Peek the shared cell — `None` until the background load completes.
+    let embedder = rc.embedder_cell.get().cloned()?;
+    if rc.k == 0 {
+        return None;
+    }
+    let query = tail_chars(recent, QUERY_CHAR_CAP);
+    if query.trim().is_empty() {
+        return None;
+    }
+    // Embed the query OFF the runtime thread (sync FFI ~180 ms) so the background
+    // embedder load and the worker channels keep progressing during it.
+    let q = query.to_string();
+    let emb = embedder.clone();
+    let qvec = match tokio::task::spawn_blocking(move || emb.embed(&q)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "ipc-bridge",
+                error = %e,
+                "live-agent: query embed failed; skipping context injection"
+            );
+            return None;
         }
         Err(e) => {
             tracing::warn!(
                 target: "ipc-bridge",
-                meeting_id = %meeting_id.0,
-                "live-agent: could not read attachments: {e}"
+                error = %e,
+                "live-agent: query embed task join failed; skipping context injection"
             );
+            return None;
         }
+    };
+    let model_id = embedder.model_id();
+    // A cache-read failure disables injection for this refresh only (best-effort).
+    let dense = rc
+        .store
+        .retrieve_dense(&qvec, model_id, rc.k)
+        .await
+        .unwrap_or_default();
+    let lexical = rc
+        .store
+        .retrieve_lexical(query, rc.k)
+        .await
+        .unwrap_or_default();
+    if dense.is_empty() && lexical.is_empty() {
+        return None;
     }
 
-    prefix
+    // Fuse by chunk_id (RRF ignores the per-leg score scales), then map the fused
+    // ids back to their chunk. Both legs return the same chunk fields, so either
+    // copy works.
+    let mut by_id: HashMap<String, RetrievedChunk> = HashMap::new();
+    for c in dense.iter().chain(lexical.iter()) {
+        by_id.entry(c.chunk_id.clone()).or_insert_with(|| c.clone());
+    }
+    let dense_ids: Vec<String> = dense.iter().map(|c| c.chunk_id.clone()).collect();
+    let lexical_ids: Vec<String> = lexical.iter().map(|c| c.chunk_id.clone()).collect();
+    let fused = rrf_fuse(&[&dense_ids, &lexical_ids], rc.k);
+
+    let mut block = String::new();
+    let mut used = 0usize;
+    for id in fused {
+        let Some(chunk) = by_id.get(&id) else {
+            continue;
+        };
+        if used + chunk.text.len() > rc.char_budget {
+            break;
+        }
+        let label = retrieval_source_label(chunk);
+        block.push_str(&format!("## {label}\n{}\n\n", chunk.text.trim()));
+        used += chunk.text.len();
+    }
+    if block.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Relevant context (attachments + earlier transcript):\n\n{block}"
+        ))
+    }
 }
 
-/// Build the effective tail appended on each refresh: the prior digest JSON
-/// (if any) for standing-list updates, then the new transcript segments.
-fn build_effective_tail(new_segments: &str, prior_digest_json: Option<&str>) -> String {
+/// Build the effective tail appended on each refresh: the retrieved context
+/// block (if any), then the prior digest JSON (if any) for standing-list
+/// updates, then the new transcript segments.
+fn build_effective_tail(
+    new_segments: &str,
+    prior_digest_json: Option<&str>,
+    retrieved: Option<&str>,
+) -> String {
     let mut tail = String::new();
+    if let Some(ctx) = retrieved {
+        tail.push_str(ctx);
+        tail.push('\n');
+    }
     if let Some(prior) = prior_digest_json {
         tail.push_str("Current digest state:\n");
         tail.push_str(prior);
@@ -1056,12 +1339,13 @@ pub(crate) mod test_support {
     /// The session must already be seeded (the caller mirrors the worker-thread
     /// startup by calling `session.seed_prefix_typed` before the first request,
     /// matching the real flow in `run_worker_thread`).
-    pub(crate) fn process_stub_request(
+    pub(crate) fn process_stub_request<B: LiveSessionBackend>(
         _meeting_id: MeetingId,
-        session: &mut LiveSession<WorkerBackend>,
+        session: &mut LiveSession<B>,
         req: TailRequest,
     ) -> RefreshResult {
-        let effective_tail = build_effective_tail(&req.tail, req.prior_digest_json.as_deref());
+        let effective_tail =
+            build_effective_tail(&req.tail, req.prior_digest_json.as_deref(), None);
         let mut generated = String::new();
         match session.refresh_typed(&effective_tail, &req.sampler, &req.cancel, &mut |piece| {
             generated.push_str(piece)
@@ -1088,7 +1372,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{process_stub_request, OverflowBackend, WorkerBackend};
+    use super::test_support::{process_stub_request, WorkerBackend};
     use super::*;
     use chat_agent::LiveSession;
     use minutist_common::{LiveDigest, LiveDigestItem, MeetingId};
@@ -1258,16 +1542,18 @@ mod tests {
 
     #[test]
     fn category_toggles_off_omit_from_prefix() {
-        let mut s = settings::Settings::default();
-        // Use a neutral system prompt that contains none of the category names.
-        s.live_agent_system_prompt = "You are a meeting assistant.".to_string();
-        s.live_agent_digest_action_items = false;
-        s.live_agent_digest_decisions = false;
-        s.live_agent_digest_open_asks = false;
-        s.live_agent_digest_attachment_answers = false;
-        s.live_agent_digest_unresolved_references = false;
+        // Neutral system prompt that contains none of the category names.
+        let s = settings::Settings {
+            live_agent_system_prompt: "You are a meeting assistant.".to_string(),
+            live_agent_digest_action_items: false,
+            live_agent_digest_decisions: false,
+            live_agent_digest_open_asks: false,
+            live_agent_digest_attachment_answers: false,
+            live_agent_digest_unresolved_references: false,
+            ..Default::default()
+        };
 
-        let prefix = build_prefix(std::path::Path::new("/nonexistent"), new_mid(), &s);
+        let prefix = build_prefix(&s);
         // With all toggles off, the category listing must not appear.
         assert!(!prefix.contains("action_items"));
         assert!(!prefix.contains("decisions"));
@@ -1278,61 +1564,22 @@ mod tests {
 
     #[test]
     fn category_toggles_on_appear_in_prefix() {
-        let mut s = settings::Settings::default();
-        s.live_agent_system_prompt = "You are a meeting assistant.".to_string();
-        s.live_agent_digest_action_items = true;
-        s.live_agent_digest_decisions = true;
-        s.live_agent_digest_open_asks = true;
-        s.live_agent_digest_attachment_answers = true;
-        s.live_agent_digest_unresolved_references = true;
+        let s = settings::Settings {
+            live_agent_system_prompt: "You are a meeting assistant.".to_string(),
+            live_agent_digest_action_items: true,
+            live_agent_digest_decisions: true,
+            live_agent_digest_open_asks: true,
+            live_agent_digest_attachment_answers: true,
+            live_agent_digest_unresolved_references: true,
+            ..Default::default()
+        };
 
-        let prefix = build_prefix(std::path::Path::new("/nonexistent"), new_mid(), &s);
+        let prefix = build_prefix(&s);
         assert!(prefix.contains("action_items"));
         assert!(prefix.contains("decisions"));
         assert!(prefix.contains("open_asks"));
         assert!(prefix.contains("attachment_answers"));
         assert!(prefix.contains("unresolved_references"));
-    }
-
-    // -----------------------------------------------------------------------
-    // UTF-8 safe truncation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn build_prefix_truncates_multibyte_attachment_safely() {
-        // Construct a settings with a tiny attachment budget (10 chars) and a
-        // system prompt that doesn't mention any category name.
-        let mut s = settings::Settings::default();
-        s.live_agent_system_prompt = "sys".to_string();
-        s.live_agent_attachment_budget_chars = 10;
-        // Turn off all categories to keep the prefix small and predictable.
-        s.live_agent_digest_action_items = false;
-        s.live_agent_digest_decisions = false;
-        s.live_agent_digest_open_asks = false;
-        s.live_agent_digest_attachment_answers = false;
-        s.live_agent_digest_unresolved_references = false;
-
-        // No real attachment dir — the read will fail gracefully; we test the
-        // truncation logic via the char-boundary invariant in isolation.
-        // Use a string of multi-byte characters to confirm no panic.
-        let content = "α β γ δ ε ζ η θ ι κ"; // each Greek letter is 2 bytes
-        let budget = 10usize;
-        let content_chars = content.chars().count();
-        // Manually replicate the truncation logic from build_prefix.
-        let truncated = if content_chars > budget {
-            let byte_end = content
-                .char_indices()
-                .nth(budget)
-                .map(|(i, _)| i)
-                .unwrap_or(content.len());
-            &content[..byte_end]
-        } else {
-            content
-        };
-        // Must not panic; char count must be exactly budget.
-        assert_eq!(truncated.chars().count(), budget);
-        // Must be valid UTF-8 (the slice boundary is on a char boundary).
-        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -1526,24 +1773,254 @@ mod tests {
         // manually confirm the RefreshResult mapping is correct by inspecting
         // the match arm in process_stub_request's own use of refresh_typed.
         //
-        // A direct smoke-test: create an OverflowBackend LiveSession, seed it,
-        // then call refresh_typed and confirm ContextOverflow is returned as a
-        // typed variant (not swallowed into AppError::InvalidInput).
+        // Drive the overflow through the SAME path the worker uses
+        // (process_request → refresh_typed): a ContextOverflow must MAP to
+        // RefreshResult::CapacityExhausted, not be swallowed into RefreshResult::Err.
         let mut session2 = LiveSession::new(OverflowBackend);
         session2
             .seed_prefix_typed("sys", &CancelFlag::new())
             .expect("seed");
-        match session2.refresh_typed(
-            "t",
-            &SamplerConfig::deterministic(),
-            &CancelFlag::new(),
-            &mut |_| {},
-        ) {
-            Err(chat_agent::Error::ContextOverflow(_)) => {
-                // Correct — typed variant preserved; the live_agent driver can
-                // match on this to set capacity_exhausted.
+        let req = TailRequest {
+            tail: "t".to_string(),
+            prior_digest_json: None,
+            sampler: SamplerConfig::deterministic(),
+            cancel: CancelFlag::new(),
+        };
+        match process_stub_request(new_mid(), &mut session2, req) {
+            RefreshResult::CapacityExhausted(_) => {
+                // Correct — classified as capacity, not a transient Err.
             }
-            other => panic!("expected Error::ContextOverflow, got {other:?}"),
+            other => panic!("ContextOverflow must map to CapacityExhausted, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Retrieval (RAG) — tier scaling, query window, and injection
+    // -----------------------------------------------------------------------
+
+    /// A deterministic embedder for retrieval tests: every input maps to the same
+    /// unit vector, so dense ranking is driven entirely by the stored chunk vectors.
+    struct StubEmbedder;
+
+    impl Embedder for StubEmbedder {
+        fn embed_batch(&self, texts: &[&str]) -> minutist_common::AppResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0]).collect())
+        }
+        fn dim(&self) -> usize {
+            3
+        }
+        fn model_id(&self) -> &str {
+            "stub-embed"
+        }
+    }
+
+    /// A pre-populated embedder cell (the background load is simulated as already done).
+    fn stub_cell() -> Arc<OnceCell<Arc<dyn Embedder>>> {
+        let cell: Arc<OnceCell<Arc<dyn Embedder>>> = Arc::new(OnceCell::new());
+        cell.set(Arc::new(StubEmbedder) as Arc<dyn Embedder>).ok();
+        cell
+    }
+
+    #[test]
+    fn tier_scaled_k_halves_on_integrated_full_on_discrete() {
+        assert_eq!(tier_scaled_k(8, false), 8, "discrete uses the full k");
+        assert_eq!(tier_scaled_k(8, true), 4, "integrated halves k");
+        // The .max(3) floor RAISES a sub-3 half...
+        assert_eq!(tier_scaled_k(5, true), 3, "5/2=2 floored up to 3");
+        assert_eq!(tier_scaled_k(4, true), 3, "4/2=2 floored up to 3");
+        assert_eq!(tier_scaled_k(3, true), 3, "floor=cap corner");
+        // ...but the .min(base_k) clamp keeps it from exceeding a small configured k.
+        assert_eq!(tier_scaled_k(2, true), 2, "floor clamped down to base_k=2");
+        assert_eq!(tier_scaled_k(1, true), 1, "floor clamped down to base_k=1");
+        assert_eq!(tier_scaled_k(0, true), 0, "k=0 disables retrieval on both tiers");
+        assert_eq!(tier_scaled_k(0, false), 0);
+    }
+
+    #[test]
+    fn tail_chars_keeps_the_last_n_on_char_boundaries() {
+        assert_eq!(tail_chars("hello", 2), "lo");
+        assert_eq!(tail_chars("hello", 5), "hello", "n == count returns all");
+        assert_eq!(tail_chars("hi", 5), "hi", "shorter than n returns all");
+        assert_eq!(tail_chars("hello", 0), "", "n == 0 yields empty");
+        assert_eq!(tail_chars("", 5), "", "empty input");
+        // Multi-byte: each Greek letter is 2 bytes; the slice must land on a boundary.
+        assert_eq!(tail_chars("αβγ", 2), "βγ");
+    }
+
+    #[tokio::test]
+    async fn retrieval_block_injects_relevant_chunk() {
+        let store = persistence::RagStore::open(":memory:").await.expect("open");
+        let near = vec![1.0, 0.0, 0.0];
+        let far = vec![0.0, 1.0, 0.0];
+        store
+            .index_source(
+                "att1",
+                "attachment",
+                "stub-embed",
+                &[
+                    persistence::NewChunk {
+                        text: "the budget owner is Priya",
+                        byte_offset: 0,
+                        embedding: &near,
+                    },
+                    persistence::NewChunk {
+                        text: "unrelated coffee notes",
+                        byte_offset: 40,
+                        embedding: &far,
+                    },
+                ],
+            )
+            .await
+            .expect("index");
+
+        let rc = LiveRetrieval {
+            embedder_cell: stub_cell(),
+            store,
+            meetings_dir: std::path::PathBuf::new(),
+            k: 4,
+            char_budget: 10_000,
+        };
+        let block = build_retrieval_block(&rc, "who owns the budget")
+            .await
+            .expect("a relevant chunk is injected");
+        assert!(block.contains("the budget owner is Priya"), "block: {block}");
+        assert!(
+            block.contains("From an attached document"),
+            "attachment heading present"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_block_none_without_embedder() {
+        let store = persistence::RagStore::open(":memory:").await.expect("open");
+        // Embedder cell empty (background load not yet complete): no injection.
+        let rc = LiveRetrieval {
+            embedder_cell: Arc::new(OnceCell::new()),
+            store,
+            meetings_dir: std::path::PathBuf::new(),
+            k: 4,
+            char_budget: 10_000,
+        };
+        assert!(build_retrieval_block(&rc, "anything").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retrieval_block_k_zero_disables_retrieval() {
+        let store = persistence::RagStore::open(":memory:").await.expect("open");
+        let e = vec![1.0, 0.0, 0.0];
+        store
+            .index_source(
+                "att1",
+                "attachment",
+                "stub-embed",
+                &[persistence::NewChunk {
+                    text: "indexed text",
+                    byte_offset: 0,
+                    embedding: &e,
+                }],
+            )
+            .await
+            .expect("index");
+        let rc = LiveRetrieval {
+            embedder_cell: stub_cell(),
+            store,
+            meetings_dir: std::path::PathBuf::new(),
+            k: 0,
+            char_budget: 10_000,
+        };
+        assert!(build_retrieval_block(&rc, "indexed text").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retrieval_block_fuses_both_legs_and_labels_by_doc_type() {
+        let store = persistence::RagStore::open(":memory:").await.expect("open");
+        // X (attachment): near the query vector but shares no query token → found by
+        // the DENSE leg only. Y (transcript): far vector but contains the query token
+        // → found by the LEXICAL leg only. The stub embeds the query to [1,0,0].
+        store
+            .index_source(
+                "att1",
+                "attachment",
+                "stub-embed",
+                &[persistence::NewChunk {
+                    text: "quarterly planning notes",
+                    byte_offset: 0,
+                    embedding: &[1.0, 0.0, 0.0],
+                }],
+            )
+            .await
+            .expect("index attachment");
+        store
+            .append_source_chunks(
+                "transcript_live",
+                "transcript",
+                "stub-embed",
+                &[persistence::NewChunk {
+                    text: "the budget is approved",
+                    byte_offset: 0,
+                    embedding: &[0.0, 1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("index transcript");
+        let rc = LiveRetrieval {
+            embedder_cell: stub_cell(),
+            store,
+            meetings_dir: std::path::PathBuf::new(),
+            k: 4,
+            char_budget: 10_000,
+        };
+        let block = build_retrieval_block(&rc, "budget")
+            .await
+            .expect("both legs contribute");
+        // Both chunks injected, each with its doc-type heading.
+        assert!(block.contains("quarterly planning notes"), "dense-only hit present");
+        assert!(block.contains("the budget is approved"), "lexical-only hit present");
+        assert!(block.contains("From an attached document"));
+        assert!(block.contains("Earlier in the meeting"));
+        // Y is found by BOTH legs, so RRF ranks it above the dense-only X.
+        let y = block.find("the budget is approved").unwrap();
+        let x = block.find("quarterly planning notes").unwrap();
+        assert!(y < x, "the both-legs hit outranks the single-leg hit");
+    }
+
+    #[tokio::test]
+    async fn retrieval_block_respects_char_budget() {
+        let store = persistence::RagStore::open(":memory:").await.expect("open");
+        let e = vec![1.0, 0.0, 0.0];
+        store
+            .index_source(
+                "att1",
+                "attachment",
+                "stub-embed",
+                &[
+                    persistence::NewChunk {
+                        text: "AAAAAAAAAA",
+                        byte_offset: 0,
+                        embedding: &e,
+                    },
+                    persistence::NewChunk {
+                        text: "BBBBBBBBBB",
+                        byte_offset: 20,
+                        embedding: &e,
+                    },
+                ],
+            )
+            .await
+            .expect("index");
+        // Budget fits only one ~10-char chunk body (the second would push past 12).
+        let rc = LiveRetrieval {
+            embedder_cell: stub_cell(),
+            store,
+            meetings_dir: std::path::PathBuf::new(),
+            k: 4,
+            char_budget: 12,
+        };
+        let block = build_retrieval_block(&rc, "query")
+            .await
+            .expect("one chunk fits");
+        let a = block.contains("AAAAAAAAAA");
+        let b = block.contains("BBBBBBBBBB");
+        assert!(a ^ b, "exactly one chunk fits the 12-char budget; block: {block}");
     }
 }

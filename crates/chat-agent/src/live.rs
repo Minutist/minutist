@@ -2,18 +2,20 @@
 //!
 //! The Phase-9 chat loop allocates a **fresh** [`LlamaContext`] per turn (clean
 //! KV cache). The live in-meeting agent is an explicit departure from that
-//! pattern (SP-LIVE E2): the attachment prefix is prefilled **once** at
-//! recording start (~40 s for a moderately sized slide deck) and the context is
-//! then extended with each digest refresh by appending only the incremental
-//! transcript tail. A fresh-per-turn approach would re-pay the ~40 s prefill
-//! cost on every cadence tick, making live operation unusable.
+//! pattern (SP-LIVE E2): the prefix is prefilled **once** at recording start and
+//! the context is then extended with each digest refresh by appending only the
+//! incremental tail. A fresh-per-turn approach would re-pay the prefill cost on
+//! every cadence tick, making live operation unusable. This engine is
+//! prefix-agnostic — `ipc-bridge` decides the prefix content; as of Phase D it is a
+//! small system-prompt + digest-categories prefix, with attachment / transcript
+//! context retrieved into the tail instead of pinned here.
 //!
 //! # Design
 //!
 //! The testable seam is [`LiveSessionBackend`]:
 //!
 //! - [`LiveSessionBackend::prefill_prefix`] — tokenise + chunked-prefill the
-//!   pinned system + attachments text ONCE, retaining the KV state.
+//!   prefix text ONCE, retaining the KV state.
 //! - [`LiveSessionBackend::refresh`] — append the incremental tail tokens and
 //!   decode the digest answer from the retained KV; does NOT re-prefill.
 //!
@@ -131,7 +133,7 @@ impl<B: LiveSessionBackend> LiveSession<B> {
         }
     }
 
-    /// Prefill the system + attachments prefix into the held KV cache.
+    /// Prefill the prefix text into the held KV cache.
     ///
     /// Idempotent: the second and subsequent calls are no-ops (the prefix is
     /// already in the KV cache; re-prefilling would corrupt the position state).

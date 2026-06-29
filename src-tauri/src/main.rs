@@ -1265,6 +1265,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 let la_event_tx = ipc_event_tx.clone();
                 let la_settings = settings_handle.clone();
                 let la_summariser = summariser_cell.clone();
+                let la_embedder = embedder_cell.clone();
                 tauri::async_runtime::spawn(async move {
                     let mut events = la_orchestrator.subscribe_events();
                     // Shutdown sender for the currently active session (if any).
@@ -1309,6 +1310,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                                                 event_tx: la_event_tx.clone(),
                                                 settings: la_settings.clone(),
                                                 summariser: la_summariser.clone(),
+                                                embedder: la_embedder.clone(),
                                             },
                                             meeting_id,
                                             shutdown_rx,

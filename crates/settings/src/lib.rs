@@ -223,12 +223,21 @@ const fn default_digest_toggle_true() -> bool {
     true
 }
 
-/// Default live-agent attachment budget in chars (~80 000 chars ≈ 20 k tokens
-/// at the average E5 tokenisation ratio). Caps the total markdown fed from
-/// pinned attachments so the held `LlamaContext` (n_ctx = 32 768) is not
-/// exhausted by the prefix alone. An older store deserialises to this value.
-const fn default_live_agent_attachment_budget_chars() -> usize {
+/// Default live-agent injected-context char backstop (~80 000 chars). Caps the
+/// total attachment / earlier-transcript text retrieved into the tail each refresh
+/// so the held `LlamaContext` (n_ctx = 32 768) is not exhausted;
+/// `live_agent_retrieval_k` is the dominant knob. An older store deserialises to
+/// this value.
+const fn default_live_agent_retrieval_budget_chars() -> usize {
     80_000
+}
+
+/// Default top-k chunks the live agent retrieves and injects per refresh (the
+/// discrete-GPU tier; an integrated GPU is scaled down — see `tier_scaled_k` in
+/// the live-agent worker). Each chunk is ~1 KB, so 8 stays well within the held
+/// `LlamaContext`. `0` disables retrieval. An older store deserialises to 8.
+const fn default_live_agent_retrieval_k() -> usize {
+    8
 }
 
 /// Default live-agent system prompt: a digest-maintenance instruction that
@@ -653,12 +662,23 @@ pub struct Settings {
     #[serde(default = "default_digest_toggle_true")]
     pub live_agent_digest_unresolved_references: bool,
 
-    /// Maximum total characters of attachment markdown fed into the live
-    /// agent's pinned prefix. ~80 000 chars ≈ 20 k tokens, safely within the
-    /// held `LlamaContext`'s n_ctx = 32 768. An older store deserialises to
-    /// 80 000.
-    #[serde(default = "default_live_agent_attachment_budget_chars")]
-    pub live_agent_attachment_budget_chars: usize,
+    /// Upper bound (characters) on the attachment / earlier-transcript context the
+    /// live agent retrieves into its tail per refresh. A backstop —
+    /// `live_agent_retrieval_k` is the dominant knob (each chunk is ~1 KB). Within
+    /// the held `LlamaContext`'s n_ctx = 32 768. An older store deserialises to 80 000.
+    /// (`serde(alias)` keeps the pre-rename `live_agent_attachment_budget_chars` key
+    /// readable from existing on-disk settings.)
+    #[serde(
+        default = "default_live_agent_retrieval_budget_chars",
+        alias = "live_agent_attachment_budget_chars"
+    )]
+    pub live_agent_retrieval_budget_chars: usize,
+
+    /// Top-k attachment / earlier-transcript chunks the live agent retrieves and
+    /// injects into its tail per refresh (the discrete-GPU tier; an integrated GPU
+    /// is scaled down). `0` disables retrieval. An older store deserialises to 8.
+    #[serde(default = "default_live_agent_retrieval_k")]
+    pub live_agent_retrieval_k: usize,
 
     /// The system prompt passed to the live agent on every refresh. Instructs
     /// the model to UPDATE the standing digest rather than regenerate it,
@@ -721,7 +741,8 @@ impl Default for Settings {
             live_agent_digest_open_asks: default_digest_toggle_true(),
             live_agent_digest_attachment_answers: default_digest_toggle_true(),
             live_agent_digest_unresolved_references: default_digest_toggle_true(),
-            live_agent_attachment_budget_chars: default_live_agent_attachment_budget_chars(),
+            live_agent_retrieval_budget_chars: default_live_agent_retrieval_budget_chars(),
+            live_agent_retrieval_k: default_live_agent_retrieval_k(),
             live_agent_system_prompt: default_live_agent_system_prompt(),
             voiceprint_enrolment_enabled: false,
         }
@@ -784,7 +805,8 @@ mod tests {
             live_agent_digest_open_asks: true,
             live_agent_digest_attachment_answers: false,
             live_agent_digest_unresolved_references: true,
-            live_agent_attachment_budget_chars: 40_000,
+            live_agent_retrieval_budget_chars: 40_000,
+            live_agent_retrieval_k: 6,
             live_agent_system_prompt: "Custom live prompt.".to_string(),
             voiceprint_enrolment_enabled: true,
         };
@@ -798,7 +820,7 @@ mod tests {
         assert_eq!(restored.live_agent_min_segments, 5);
         assert_eq!(restored.live_agent_min_seconds, 30);
         assert!(!restored.live_agent_digest_decisions);
-        assert_eq!(restored.live_agent_attachment_budget_chars, 40_000);
+        assert_eq!(restored.live_agent_retrieval_budget_chars, 40_000);
         assert_eq!(restored.live_agent_system_prompt, "Custom live prompt.");
         assert!(restored.voiceprint_enrolment_enabled);
         assert_eq!(original, restored);
@@ -1716,11 +1738,23 @@ mod tests {
     }
 
     #[test]
-    fn live_agent_attachment_budget_defaults_to_eighty_thousand() {
+    fn live_agent_retrieval_budget_defaults_to_eighty_thousand() {
         assert_eq!(
-            Settings::default().live_agent_attachment_budget_chars,
+            Settings::default().live_agent_retrieval_budget_chars,
             80_000,
-            "live_agent_attachment_budget_chars must default to 80_000"
+            "live_agent_retrieval_budget_chars must default to 80_000"
+        );
+    }
+
+    #[test]
+    fn live_agent_retrieval_budget_reads_legacy_attachment_key() {
+        // Back-compat: a store written before the rename used the
+        // `live_agent_attachment_budget_chars` key; the serde alias must still read it.
+        let json = r#"{"live_agent_attachment_budget_chars": 12345}"#;
+        let s: Settings = serde_json::from_str(json).expect("deserialise legacy key");
+        assert_eq!(
+            s.live_agent_retrieval_budget_chars, 12345,
+            "serde alias reads the pre-rename key"
         );
     }
 
@@ -1749,7 +1783,7 @@ mod tests {
             live_agent_digest_open_asks: true,
             live_agent_digest_attachment_answers: false,
             live_agent_digest_unresolved_references: true,
-            live_agent_attachment_budget_chars: 50_000,
+            live_agent_retrieval_budget_chars: 50_000,
             live_agent_system_prompt: "Custom prompt.".to_string(),
             ..Settings::default()
         };
@@ -1760,7 +1794,7 @@ mod tests {
         assert_eq!(restored.live_agent_min_seconds, 60);
         assert!(!restored.live_agent_digest_decisions);
         assert!(!restored.live_agent_digest_attachment_answers);
-        assert_eq!(restored.live_agent_attachment_budget_chars, 50_000);
+        assert_eq!(restored.live_agent_retrieval_budget_chars, 50_000);
         assert_eq!(restored.live_agent_system_prompt, "Custom prompt.");
         assert_eq!(original, restored);
     }
@@ -1818,8 +1852,8 @@ mod tests {
             "missing live_agent_digest_unresolved_references must deserialise to true"
         );
         assert_eq!(
-            restored.live_agent_attachment_budget_chars, 80_000,
-            "missing live_agent_attachment_budget_chars must deserialise to 80_000"
+            restored.live_agent_retrieval_budget_chars, 80_000,
+            "missing live_agent_retrieval_budget_chars must deserialise to 80_000"
         );
         assert_eq!(
             restored.live_agent_system_prompt,

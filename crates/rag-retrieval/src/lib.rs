@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocType {
-    /// A pinned attachment (doc-convert markdown).
+    /// An attachment (doc-convert markdown).
     Attachment,
     /// The meeting transcript.
     Transcript,

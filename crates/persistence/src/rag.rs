@@ -160,35 +160,8 @@ impl RagStore {
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
         let result = async {
             self.delete_source_rows(source_id).await?;
-            for c in chunks {
-                let id = uuid::Uuid::new_v4().to_string();
-                self.conn
-                    .execute(
-                        "INSERT INTO rag_chunk (id, doc_type, source_id, chunk_text, byte_offset)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        libsql::params![id.clone(), doc_type, source_id, c.text, c.byte_offset as i64],
-                    )
-                    .await?;
-                self.conn
-                    .execute(
-                        "INSERT INTO rag_chunk_fts (chunk_text, chunk_id) VALUES (?1, ?2)",
-                        libsql::params![c.text, id.clone()],
-                    )
-                    .await?;
-                self.conn
-                    .execute(
-                        "INSERT INTO rag_embedding (chunk_id, embedding, dim, model_id)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        libsql::params![
-                            id,
-                            f32_slice_to_blob(c.embedding),
-                            c.embedding.len() as i64,
-                            model_id
-                        ],
-                    )
-                    .await?;
-            }
-            Ok::<usize, Error>(chunks.len())
+            self.insert_chunk_rows(source_id, doc_type, model_id, chunks)
+                .await
         }
         .await;
         match result {
@@ -203,6 +176,115 @@ impl RagStore {
                 Err(e)
             }
         }
+    }
+
+    /// Append `chunks` to `source_id` WITHOUT deleting existing chunks, in one
+    /// transaction. Unlike [`Self::index_source`] (delete-then-insert), this grows a
+    /// source incrementally — used by the live-agent incremental transcript indexer,
+    /// which appends only the turns that have newly sealed (see
+    /// [`Self::max_byte_offset`]). The caller is responsible for not re-appending
+    /// already-indexed chunks. Returns the number of chunks inserted.
+    pub async fn append_source_chunks(
+        &self,
+        source_id: &str,
+        doc_type: &str,
+        model_id: &str,
+        chunks: &[NewChunk<'_>],
+    ) -> AppResult<usize> {
+        Ok(self
+            .append_source_chunks_inner(source_id, doc_type, model_id, chunks)
+            .await?)
+    }
+
+    async fn append_source_chunks_inner(
+        &self,
+        source_id: &str,
+        doc_type: &str,
+        model_id: &str,
+        chunks: &[NewChunk<'_>],
+    ) -> Result<usize, Error> {
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+        let result = self
+            .insert_chunk_rows(source_id, doc_type, model_id, chunks)
+            .await;
+        match result {
+            Ok(n) => {
+                self.conn.execute("COMMIT", ()).await?;
+                Ok(n)
+            }
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                    tracing::warn!(target: "persistence", error = %rb, "RAG append rollback failed");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The highest `byte_offset` indexed for `source_id`, or `None` when the source
+    /// has no chunks. The live-agent incremental indexer uses this as the watermark:
+    /// a turn-packed chunk with a strictly greater offset has not been indexed yet.
+    pub async fn max_byte_offset(&self, source_id: &str) -> AppResult<Option<u64>> {
+        Ok(self.max_byte_offset_inner(source_id).await?)
+    }
+
+    async fn max_byte_offset_inner(&self, source_id: &str) -> Result<Option<u64>, Error> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT MAX(byte_offset) FROM rag_chunk WHERE source_id = ?1",
+                libsql::params![source_id],
+            )
+            .await?;
+        match rows.next().await? {
+            // MAX over no rows yields a single NULL row → `Option<i64>` is `None`.
+            Some(row) => Ok(row.get::<Option<i64>>(0)?.map(|v| v as u64)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert the chunk / FTS / embedding rows for `chunks`. The caller owns the
+    /// surrounding transaction, so [`Self::index_source`] can delete-first while
+    /// [`Self::append_source_chunks`] inserts-only.
+    async fn insert_chunk_rows(
+        &self,
+        source_id: &str,
+        doc_type: &str,
+        model_id: &str,
+        chunks: &[NewChunk<'_>],
+    ) -> Result<usize, Error> {
+        for c in chunks {
+            let id = uuid::Uuid::new_v4().to_string();
+            self.conn
+                .execute(
+                    "INSERT INTO rag_chunk (id, doc_type, source_id, chunk_text, byte_offset)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    libsql::params![id.clone(), doc_type, source_id, c.text, c.byte_offset as i64],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "INSERT INTO rag_chunk_fts (chunk_text, chunk_id) VALUES (?1, ?2)",
+                    libsql::params![c.text, id.clone()],
+                )
+                .await?;
+            self.conn
+                .execute(
+                    "INSERT INTO rag_embedding (chunk_id, embedding, dim, model_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    libsql::params![
+                        id,
+                        f32_slice_to_blob(c.embedding),
+                        c.embedding.len() as i64,
+                        model_id
+                    ],
+                )
+                .await?;
+        }
+        Ok(chunks.len())
     }
 
     /// Remove every chunk (and its embedding + FTS row) for `source_id`. Returns
@@ -524,5 +606,51 @@ mod tests {
         assert!(!s.has_source("att1").await.unwrap());
         assert!(s.retrieve_dense(&e, "m", 10).await.unwrap().is_empty());
         assert!(s.retrieve_lexical("v2a", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_grows_source_and_tracks_watermark() {
+        let s = store().await;
+        let e = unit(vec![1.0, 0.0]);
+        assert_eq!(
+            s.max_byte_offset("transcript").await.unwrap(),
+            None,
+            "empty source has no watermark"
+        );
+
+        s.append_source_chunks(
+            "transcript",
+            "transcript",
+            "m",
+            &[
+                NewChunk { text: "first turn", byte_offset: 0, embedding: &e },
+                NewChunk { text: "second turn", byte_offset: 50, embedding: &e },
+            ],
+        )
+        .await
+        .expect("append 1");
+        assert_eq!(s.max_byte_offset("transcript").await.unwrap(), Some(50));
+
+        // A second append GROWS the source (does not replace, unlike index_source).
+        s.append_source_chunks(
+            "transcript",
+            "transcript",
+            "m",
+            &[NewChunk { text: "third turn", byte_offset: 120, embedding: &e }],
+        )
+        .await
+        .expect("append 2");
+        assert_eq!(s.max_byte_offset("transcript").await.unwrap(), Some(120));
+        let all = s.retrieve_dense(&e, "m", 10).await.unwrap();
+        assert_eq!(all.len(), 3, "append accumulates across calls");
+
+        // An empty append is a no-op and leaves the watermark unchanged.
+        assert_eq!(
+            s.append_source_chunks("transcript", "transcript", "m", &[])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(s.max_byte_offset("transcript").await.unwrap(), Some(120));
     }
 }

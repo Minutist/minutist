@@ -8,8 +8,9 @@
 //! runs on `spawn_blocking`; persistence is async libsql.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use minutist_common::{apply_speaker_overlay, AppError, AppResult, MeetingId, Segment};
+use minutist_common::{apply_speaker_overlay, AppError, AppResult, Embedder, MeetingId, Segment};
 use persistence::meeting_db_path;
 
 use crate::chat_runtime::ChatHandles;
@@ -18,6 +19,12 @@ use crate::chat_runtime::ChatHandles;
 /// Used for attachment markdown; the transcript is chunked by speaker turn instead.
 const CHUNK_CHARS: usize = 1024;
 const CHUNK_OVERLAP: usize = 200;
+
+/// `source_id` for transcript chunks appended incrementally DURING a live recording.
+/// Kept distinct from the canonical `"transcript"` source the post-stop pass writes,
+/// so the live append and the post-stop delete-then-insert never collide on a shared
+/// key. The post-stop [`index_transcript`] forgets it once the full set is written.
+const TRANSCRIPT_LIVE_SOURCE: &str = "transcript_live";
 
 /// Embed `chunks` (`(text, byte_offset)` pairs) and replace `source_id`'s chunks in
 /// the meeting's `meeting.db`.
@@ -172,6 +179,22 @@ pub async fn index_transcript(handles: &ChatHandles, meeting_id: MeetingId) -> A
     }
     let chunks = chunk_transcript_turns(&segments, CHUNK_CHARS);
     let n = index_chunks(handles, meeting_id, "transcript", "transcript", chunks, false).await?;
+    // Drop the transient live-append chunks now the canonical "transcript" set is
+    // written. Done AFTER the full index so a live append that landed during it is
+    // also cleared; the rare append that lands after this forget self-heals on the
+    // next reprocess (best-effort, like the rest of the RAG write path).
+    if let Ok(store) =
+        persistence::RagStore::open(meeting_db_path(&handles.meetings_dir, meeting_id)).await
+    {
+        if let Err(e) = store.forget_source(TRANSCRIPT_LIVE_SOURCE).await {
+            tracing::warn!(
+                target: "ipc-bridge",
+                meeting_id = %meeting_id.0,
+                error = %e,
+                "RAG: clearing transient live transcript chunks failed (best-effort)"
+            );
+        }
+    }
     tracing::info!(
         target: "ipc-bridge",
         meeting_id = %meeting_id.0,
@@ -179,6 +202,88 @@ pub async fn index_transcript(handles: &ChatHandles, meeting_id: MeetingId) -> A
         "indexed transcript for retrieval"
     );
     Ok(())
+}
+
+/// Live-recording incremental transcript indexer: append the turns that have newly
+/// **sealed** (scrolled out of the live window) into `store`, embedding only those.
+///
+/// Re-chunks the on-disk transcript each call (cheap string work), drops the trailing
+/// partial chunk (still inside the live window — re-chunked next call), and appends
+/// only chunks whose `byte_offset` is beyond the indexed watermark
+/// ([`persistence::RagStore::max_byte_offset`]). Greedy turn-packing makes every
+/// earlier chunk prefix-stable, so the watermark cleanly separates new from indexed —
+/// already-indexed turns are never re-embedded.
+///
+/// Writes to a distinct [`TRANSCRIPT_LIVE_SOURCE`] (not the canonical `"transcript"`),
+/// so it never collides with the post-stop full re-index; that pass forgets the live
+/// source once the canonical set is written, making these chunks transient. Raw
+/// diarizer labels are kept (NO `apply_speaker_overlay`): the overlay is a no-op
+/// during a live recording anyway, and skipping it keeps `byte_offset`
+/// overlay-invariant — applying a different-length display name to an already-sealed
+/// turn would otherwise shift offsets and silently desync the watermark. A torn read
+/// of the in-place-rewritten `transcript.json` mid-flush yields a parse `Err` the
+/// caller swallows and retries next refresh (benign). Returns the number of chunks
+/// appended. The caller (live-agent worker) supplies the open `store` + the
+/// already-resolved `embedder`.
+pub async fn index_transcript_incremental(
+    store: &persistence::RagStore,
+    meetings_dir: &Path,
+    meeting_id: MeetingId,
+    embedder: &Arc<dyn Embedder>,
+) -> AppResult<usize> {
+    let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
+    let segments = persistence::read_transcript(&meeting_dir)?;
+    if segments.is_empty() {
+        return Ok(0);
+    }
+    let mut chunks = chunk_transcript_turns(&segments, CHUNK_CHARS);
+    // Drop the trailing partial chunk — more turns will extend it, and it is still
+    // inside the live window. Everything before it is sealed + prefix-stable.
+    chunks.pop();
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    let watermark = store.max_byte_offset(TRANSCRIPT_LIVE_SOURCE).await?;
+    let fresh: Vec<(String, u64)> = chunks
+        .into_iter()
+        .filter(|(_, off)| watermark.is_none_or(|w| *off > w))
+        .collect();
+    if fresh.is_empty() {
+        return Ok(0);
+    }
+    let model_id = embedder.model_id().to_string();
+    let owned: Vec<String> = fresh.iter().map(|(t, _)| t.clone()).collect();
+    let emb = embedder.clone();
+    let embeddings = tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        emb.embed_batch(&refs)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("incremental embed task join failed: {e}"),
+    })??;
+    if embeddings.len() != fresh.len() {
+        return Err(AppError::Inference {
+            backend: "embedder".into(),
+            context: format!(
+                "embedder returned {} vectors for {} chunks",
+                embeddings.len(),
+                fresh.len()
+            ),
+        });
+    }
+    let to_append: Vec<persistence::NewChunk> = fresh
+        .iter()
+        .zip(&embeddings)
+        .map(|((text, byte_offset), embedding)| persistence::NewChunk {
+            text,
+            byte_offset: *byte_offset,
+            embedding,
+        })
+        .collect();
+    store
+        .append_source_chunks(TRANSCRIPT_LIVE_SOURCE, "transcript", &model_id, &to_append)
+        .await
 }
 
 /// Chunk the transcript by speaker turn (issue #0015): pack consecutive turns
@@ -256,5 +361,143 @@ mod tests {
     #[test]
     fn turn_chunking_empty_is_empty() {
         assert!(chunk_transcript_turns(&[], 1024).is_empty());
+    }
+
+    /// Deterministic embedder for the incremental-index test (ranking is irrelevant
+    /// here; we assert append counts + the watermark).
+    struct StubEmbedder;
+
+    impl Embedder for StubEmbedder {
+        fn embed_batch(&self, texts: &[&str]) -> AppResult<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn model_id(&self) -> &str {
+            "stub-embed"
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_index_appends_only_newly_sealed_turns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mid = MeetingId::new();
+        let meeting_dir = tmp.path().join(mid.0.to_string());
+        std::fs::create_dir_all(&meeting_dir).expect("mkdir");
+        let store = persistence::RagStore::open(":memory:").await.expect("open");
+        let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder);
+
+        // Each turn longer than CHUNK_CHARS, so every turn is its own chunk and the
+        // most recent turn is always the unsealed trailing partial.
+        let long = "x".repeat(CHUNK_CHARS + 100);
+        let turns = |n: usize| -> Vec<Segment> {
+            (0..n)
+                .map(|i| seg(Some("A"), &format!("{i} {long}")))
+                .collect()
+        };
+
+        // 3 turns → chunks [t0, t1, t2]; t2 is the trailing partial → 2 sealed.
+        persistence::write_transcript(&meeting_dir, &turns(3)).expect("write 3");
+        let n = index_transcript_incremental(&store, tmp.path(), mid, &embedder)
+            .await
+            .expect("inc 1");
+        assert_eq!(n, 2, "two sealed turns indexed; the third is the trailing partial");
+
+        // A 4th turn seals t2 → only t2 is beyond the watermark → 1 appended.
+        persistence::write_transcript(&meeting_dir, &turns(4)).expect("write 4");
+        let n = index_transcript_incremental(&store, tmp.path(), mid, &embedder)
+            .await
+            .expect("inc 2");
+        assert_eq!(n, 1, "only the newly-sealed turn is appended (no re-embed)");
+
+        // No new turns → nothing sealed beyond the watermark.
+        let n = index_transcript_incremental(&store, tmp.path(), mid, &embedder)
+            .await
+            .expect("inc 3");
+        assert_eq!(n, 0, "idempotent when nothing new has sealed");
+
+        // Exactly the three sealed turns are persisted (the trailing t3 is not).
+        let all = store
+            .retrieve_dense(&[1.0, 0.0, 0.0, 0.0], "stub-embed", 100)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "only sealed turns are persisted");
+    }
+
+    /// Records the batch size of each `embed_batch` call, so a test can prove the
+    /// incremental indexer embeds ONLY newly-sealed chunks (never re-embeds).
+    struct CountingEmbedder {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl Embedder for CountingEmbedder {
+        fn embed_batch(&self, texts: &[&str]) -> AppResult<Vec<Vec<f32>>> {
+            self.calls.lock().unwrap().push(texts.len());
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn model_id(&self) -> &str {
+            "stub-embed"
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_index_packs_turns_and_never_re_embeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mid = MeetingId::new();
+        let meeting_dir = tmp.path().join(mid.0.to_string());
+        std::fs::create_dir_all(&meeting_dir).expect("mkdir");
+        let store = persistence::RagStore::open(":memory:").await.expect("open");
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let embedder: Arc<dyn Embedder> = Arc::new(CountingEmbedder {
+            calls: calls.clone(),
+        });
+
+        // ~400-char turns → two pack into one ~801-char chunk (< CHUNK_CHARS=1024); a
+        // third would overflow and flush. So packing genuinely packs (unlike the
+        // one-turn-per-chunk case above), exercising the prefix-stability assumption.
+        let turns = |n: usize| -> Vec<Segment> {
+            (0..n)
+                .map(|i| seg(Some("S"), &format!("turn {i} {}", "y".repeat(390))))
+                .collect()
+        };
+
+        // 5 turns → [c0=(t0,t1), c1=(t2,t3), c2=(t4 trailing)] → pop → 2 sealed.
+        persistence::write_transcript(&meeting_dir, &turns(5)).expect("write 5");
+        assert_eq!(
+            index_transcript_incremental(&store, tmp.path(), mid, &embedder)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![2],
+            "first call embeds the two sealed packed chunks"
+        );
+
+        // 7 turns → c2=(t4,t5) now sealed; t6 trailing. Only c2 is beyond the watermark.
+        persistence::write_transcript(&meeting_dir, &turns(7)).expect("write 7");
+        assert_eq!(
+            index_transcript_incremental(&store, tmp.path(), mid, &embedder)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![2, 1],
+            "second call embeds ONLY the newly-sealed chunk — c0/c1 are not re-embedded \
+             (proves prefix-stable packing + the watermark)"
+        );
+
+        let all = store
+            .retrieve_dense(&[1.0, 0.0, 0.0, 0.0], "stub-embed", 100)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "three sealed packed chunks, no duplicates");
     }
 }

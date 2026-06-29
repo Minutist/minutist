@@ -2020,6 +2020,12 @@ by `meeting_id`.
   content-addressed (unchanged) source
 - `index_source(source_id, doc_type, model_id, &[NewChunk]) -> AppResult<usize>` —
   delete-then-insert, replacing a source's chunks in one transaction
+- `append_source_chunks(source_id, doc_type, model_id, &[NewChunk]) -> AppResult<usize>`
+  + `max_byte_offset(source_id) -> AppResult<Option<u64>>` — INSERT-only growth and
+  the indexed watermark, used by the live-agent incremental transcript indexer to
+  append only the turns that have newly sealed (never re-embedding indexed turns).
+  The post-stop `index_source` pass later replaces the source wholesale, so these
+  live chunks are transient.
 - `forget_source(source_id) -> AppResult<u64>`; meeting-wide deletion is the
   folder delete (the db lives inside `{uuid}/`)
 - `retrieve_dense(query_embedding, model_id, k)` / `retrieve_lexical(query_text, k)`
@@ -2752,16 +2758,18 @@ when a single turn is genuinely too large (the driver rejects it as
 
 **Live-session engine (`live.rs` — SP-LIVE E2, S2a).** An explicit departure
 from the stateless-fresh-context turn engine above. The live in-meeting agent
-requires holding one `LlamaContext` for an entire recording session so the
-attachment prefix is prefilled once rather than re-paid on each cadence tick
-(~40 s vs ~4.5 s warm decode — see `cross-cutting.md` "Live in-meeting agent").
-The surface is:
+requires holding one `LlamaContext` for an entire recording session so the prefix
+is prefilled once rather than re-paid on each cadence tick (see `cross-cutting.md`
+"Live in-meeting agent"). The engine is prefix-agnostic — it prefills whatever text
+the caller hands it; `ipc-bridge::build_prefix` supplies a small system-prompt +
+digest-categories prefix (attachment / earlier-transcript context is retrieved into
+the per-refresh tail instead, Phase D). The surface is:
 
 - `LiveSessionBackend` trait — the testable seam, mirroring `TurnBackend`.
   Two operations: `prefill_prefix(text) -> Result<usize, Error>` (chunked-prefill
-  the pinned system + attachments text ONCE, retaining KV state) and
+  the prefix text ONCE, retaining KV state) and
   `refresh(tail, cfg, cancel, token_cb) -> Result<RawTurn, Error>` (append the
-  incremental transcript tail to the held KV cache and decode the digest answer
+  incremental tail to the held KV cache and decode the digest answer
   WITHOUT re-prefilling the prefix).
 
 - `LlamaLiveBackend<'m>` — the real impl. Borrows `&LlamaModel` from the same
@@ -3002,7 +3010,8 @@ deserialises to the defaults below:
 | `live_agent_digest_open_asks` | `bool` | `true` | Include open / unanswered asks in the digest panel. |
 | `live_agent_digest_attachment_answers` | `bool` | `true` | Include attachment-sourced answers in the digest panel. |
 | `live_agent_digest_unresolved_references` | `bool` | `true` | Include unresolved references in the digest panel. |
-| `live_agent_attachment_budget_chars` | `usize` | `80_000` | Max chars of attachment markdown in the pinned prefix (~20 k tokens; fits within n_ctx = 32 768). |
+| `live_agent_retrieval_budget_chars` | `usize` | `80_000` | Char backstop on the attachment / earlier-transcript context retrieved into the live agent's tail per refresh (`live_agent_retrieval_k` is the dominant knob). `serde(alias)` reads the pre-rename `live_agent_attachment_budget_chars` key. |
+| `live_agent_retrieval_k` | `usize` | `8` | Top-k chunks retrieved + injected per refresh (the discrete-GPU tier; an integrated GPU is scaled down by `tier_scaled_k`). `0` disables retrieval. |
 | `live_agent_system_prompt` | `String` | (built-in) | System prompt emphasising UPDATE-the-standing-list-don't-regenerate, per §3 of the SP-LIVE spec. |
 
 `LiveAgentMode` is a `common` type (serde `rename_all = "snake_case"`; `Default = Auto`;
@@ -3249,12 +3258,18 @@ model): at attachment-convert time (`run_convert_job`, after the `Ready` flip;
 char-window chunks, skipped via `has_source` when the content hash is already
 indexed) and at every transcript-finalise point — the post-stop pass AND the
 standalone `reprocess` command — so the index never goes stale (transcript chunked
-per speaker turn (#0015), with `apply_speaker_overlay` applied first). It embeds the
+per speaker turn (#0015), with `apply_speaker_overlay` applied first). During a live
+recording the live-agent worker also runs an append-only incremental pass each
+refresh (`index_transcript_incremental`), so earlier turns become retrievable before
+stop. It embeds the
 chunks via the held `Embedder` on `spawn_blocking` and persists them to the meeting's
 `meeting.db` via `RagStore::index_source` (recording the embedder's `model_id`).
 Failures log and are swallowed — RAG is a rebuildable cache and must never fail
-attachment conversion or the post-stop flow. Chat/live-agent *consumption* of the
-index (via `retrieve_chunks`) is a later phase. Delete coherence: removing an
+attachment conversion or the post-stop flow. The index is *consumed* two ways: the
+chat agent's `retrieve_chunks` tool, and the live agent's per-refresh retrieval
+(`ipc-bridge::live_agent`, Phase D) — which embeds the recent transcript window and
+reads the meeting's `RagStore` directly to inject relevant context into each digest.
+Delete coherence: removing an
 attachment forgets its chunks once the content hash is orphaned (best-effort,
 `rag_index::forget_attachment`); deleting a meeting drops `meeting.db` with the
 meeting folder (`meeting_ops::delete_meeting`'s `remove_dir_all`).
@@ -3872,8 +3887,10 @@ no-attachment path. `summarise_meeting_inner` (the `#[cfg(test)]` stub path) pas
 `spawn_live_agent(handles, meeting_id, gpu_probe, shutdown)` wires the held-context
 digest-refresh loop for one active recording session. No new command or new
 dependency edge — it uses the existing `ipc-bridge → chat-agent` (for `LiveSession`
-/ `LiveSessionBackend` / `SamplerConfig` / `CancelFlag`) and `ipc-bridge →
-persistence` (for `read_attachments_markdown_parts`) edges already in the table.
+/ `LiveSessionBackend` / `SamplerConfig` / `CancelFlag`), `ipc-bridge → persistence`
+(for the per-meeting `RagStore`), `ipc-bridge → rag-retrieval` (for `rrf_fuse`), and
+`ipc-bridge → embedder` / `common::Embedder` (for the held embedder) edges already in
+the table.
 
 The driver has two halves:
 - **Async driver task** (`tauri::async_runtime::spawn`): subscribes to the
@@ -3894,17 +3911,25 @@ driver emits one `LiveDigestError` ("context window filled") and sets a permanen
 `capacity_exhausted` flag — no further refresh dispatches for the session.
 Re-seeding mid-recording is not attempted (prohibitive prefill cost).
 
-The prefix (system prompt + category-toggle instructions + attachment markdown, budgeted
-to `settings.live_agent_attachment_budget_chars`) is built once at session spawn and
-seeded into the `LlamaContext` at worker startup — BEFORE the cadence loop — so the
-~40 s prefill runs at meeting start, not mid-recording (the binding SP-LIVE
-pin-at-start decision). The seed honours the worker `CancelFlag`, so a Start-then-Stop
-during the prefill aborts promptly. Subsequent `seed_prefix`
-calls are no-ops (`LiveSession` enforces this). Each subsequent request appends the
-new transcript tail (plus the prior digest JSON for standing-list update) and decodes
-a fresh `LiveDigest`. Results are parsed by `parse_digest`, which preserves `resolved
-= true` flags from prior items (model forgetfulness guard), and emitted as
-`AppEvent::LiveDigestUpdated` / `AppEvent::LiveDigestError`.
+The prefix (system prompt + category-toggle instructions only) is built once at session
+spawn and seeded into the `LlamaContext` at worker startup — BEFORE the cadence loop.
+It does NOT pin attachment markdown: attachment and earlier-transcript context is
+retrieved into the tail each refresh (the Phase-D unified-budget decision), so the
+once-prefilled prefix stays small on every GPU tier. The seed honours the worker
+`CancelFlag`, so a Start-then-Stop during the prefill aborts promptly. Subsequent
+`seed_prefix` calls are no-ops (`LiveSession` enforces this).
+
+Each refresh, BEFORE decoding, the worker embeds the recent transcript window (peeking
+the held embedder — loaded in the background at worker start; `None` until ready, so
+the agent degrades to no injected context) and runs the dense + lexical legs over the
+meeting's `RagStore`, fused by `rrf_fuse`. The top-`k` fused chunks (tier-scaled —
+`tier_scaled_k` halves `k` on an integrated GPU, full `k` on a discrete one) are packed
+into a "Relevant context" block, capped by `live_agent_retrieval_budget_chars`, and
+injected ahead of the prior digest JSON + new transcript tail (transcript chunks already
+inside the live window are dropped). The request then decodes a fresh `LiveDigest`,
+parsed by `parse_digest` (which preserves `resolved = true` flags from prior items —
+model forgetfulness guard) and emitted as `AppEvent::LiveDigestUpdated` /
+`AppEvent::LiveDigestError`.
 
 The `app-main` watcher task subscribes to `StateChanged`, calls `spawn_live_agent`
 on `Recording` (only when `live_agent_should_run(settings.live_agent_enabled,

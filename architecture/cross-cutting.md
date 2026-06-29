@@ -814,18 +814,19 @@ constraints are binding on them):
 The live in-meeting agent (Phase 9 / WU2b) runs a digest-refresh loop during
 an active recording, driven by incoming `TranscriptSegment` events and gated by
 the `live_agent_min_segments` / `live_agent_min_seconds` cadence settings.
-Meeting attachments are pinned in the `LlamaContext` prefix once at recording
-start. Cross-cutting rules:
+Attachment and earlier-transcript context is RETRIEVED into the per-refresh tail
+(not pinned in the prefix); the prefix is just the system prompt + digest
+categories. Cross-cutting rules:
 
 - **HELD context, not fresh per turn.** The Phase-9 chat loop ("Agent chat
   loop" above) allocates a **fresh** `LlamaContext` per assistant turn. The live
   agent holds **one** `LlamaContext` for the entire live session on a dedicated
-  single-owned thread (SP-LIVE E2). The attachment prefix is prefilled ONCE at
-  recording start (~40 s for a moderately sized slide deck) and the context is
-  extended with each digest refresh by appending only the incremental transcript
-  tail. The fresh-per-turn pattern would re-pay the ~40 s prefill cost on every
-  cadence tick, making live operation unusable. `LlamaContext` is `!Send`; the
-  dedicated thread owns it exclusively.
+  single-owned thread (SP-LIVE E2). The small prefix (system prompt + digest
+  categories) is prefilled ONCE at recording start, and the context is extended
+  with each digest refresh by appending the retrieved context block + the
+  incremental transcript tail. The fresh-per-turn pattern would re-pay the prefill
+  cost on every cadence tick, making live operation unusable. `LlamaContext` is
+  `!Send`; the dedicated thread owns it exclusively.
 
   *Implementation (S2a — `chat-agent::live`).* The held-context loop is
   implemented in `crates/chat-agent/src/live.rs` as `LiveSessionBackend` (the
@@ -849,13 +850,18 @@ start. Cross-cutting rules:
     (`#[cfg(test)]`) exercises the driver protocol without a model.
   - Two bounded `tokio::sync::mpsc` channels (depth 1 each) between the driver
     and worker, enforcing single-in-flight without a separate mutex.
-  - The prefix is built on the worker thread (`build_prefix`) at session start,
-    then seeded via `seed_prefix_typed` BEFORE the request loop (pin-at-start).
-    `build_prefix` calls `persistence::read_attachments_markdown_parts`
-    (synchronous filesystem I/O) and must not run on the async driver task.
+  - The small prefix (system prompt + digest categories) is built on the worker
+    thread (`build_prefix`) at session start, then seeded via `seed_prefix_typed`
+    BEFORE the request loop. The worker also opens the per-meeting `RagStore`,
+    background-loads the held embedder (the load + any first-use download stays off
+    the digest critical path), and on each refresh embeds the recent window, runs
+    the dense + lexical legs fused by `rrf_fuse`, and injects the top-`k`
+    (tier-scaled) chunks into the tail. After emitting each digest it incrementally
+    indexes newly-sealed transcript turns into the `RagStore`
+    (`rag_index::index_transcript_incremental`, watermark-based, best-effort).
   - A `startup_cancel: CancelFlag` is created in `spawn_live_agent`, cloned for
     the driver task, and passed to the worker. The driver raises it on any
-    shutdown path so a Stop during the ~40 s prefix seed aborts promptly and
+    shutdown path so a Stop during the prefix seed aborts promptly and
     unblocks the driver's join on the worker thread.
   - The worker thread `JoinHandle` is retained by the async driver task and
     joined after the driver loop exits, ensuring the worker is reaped rather
@@ -875,8 +881,8 @@ start. Cross-cutting rules:
   `Error::ContextOverflow` the driver emits ONE `LiveDigestError` event
   (user-visible "context window filled") and sets a permanent
   `capacity_exhausted` flag that stops all further refresh dispatches for the
-  session. Re-seeding mid-recording is NOT attempted (it costs another ~40 s
-  prefill, starving ASR). The prior digest items are preserved in the event
+  session. Re-seeding mid-recording is NOT attempted (it would re-prefill from
+  scratch, starving ASR). The prior digest items are preserved in the event
   store. Recovery is the next recording session (fresh context).
   The driver calls `LiveSession::seed_prefix_typed` and `LiveSession::refresh_typed`
   (returning `Result<_, chat_agent::Error>`) rather than the `AppResult` wrappers,
@@ -884,8 +890,8 @@ start. Cross-cutting rules:
   impl maps `ContextOverflow` to `AppError::InvalidInput`, erasing the variant —
   string-matching over `AppError::Display` would be fragile and is not used.
 
-  *KV retention policy.* The held context accumulates **prefix + transcript tail
-  only**. Generated digest-answer tokens are decoded ephemerally into the KV and
+  *KV retention policy.* The held context accumulates **prefix + the per-refresh
+  tail (retrieved context + transcript) only**. Generated digest-answer tokens are decoded ephemerally into the KV and
   then pruned via `clear_kv_cache_seq` after every refresh (on completion and
   on cancel). This keeps capacity growth proportional to the transcript and
   prevents cancelled partial answers from poisoning subsequent refreshes.
@@ -895,7 +901,7 @@ start. Cross-cutting rules:
 
   *Cancellability.* `prefill_prefix` and the tail-prefill loop in `refresh` both
   accept a `&CancelFlag` and check it between decoded chunks. A raised flag during
-  the ~40 s prefix prefill prunes any partially-decoded KV range and returns
+  the prefix prefill prunes any partially-decoded KV range and returns
   `Error::Inference("cancelled")` so the driver can tear down promptly. Both
   the tail-prefill loop (inside `refresh`) and the generation loop already checked
   the flag; the prefix prefill was the missing path.
@@ -924,10 +930,14 @@ start. Cross-cutting rules:
   attachment_answers, unresolved_references) apply the base standing-list rule
   (resolved-flag-only carry-forward from matched items).
 
-- **Pin-at-start constraint.** The ~40 s one-time attachment prefill MUST NOT run
-  mid-recording (it would starve ASR inference and block the recording UI). The
-  prefix is built on the worker thread at session spawn, before the first cadence
-  fire. Subsequent `seed_prefix` calls on the same `LiveSession` are no-ops.
+- **Small-prefix + retrieve-into-tail constraint (Phase D).** Attachment markdown
+  is NOT pinned in the prefix — pinning a large set costs a one-time prefill (~40 s,
+  minutes on an integrated GPU) that would starve ASR and stall the recording UI.
+  Instead the prefix is just the system prompt + categories (sub-second prefill,
+  once at session spawn), and relevant attachment / earlier-transcript context is
+  retrieved into the bounded tail each refresh. A tier-scaled `k` (halved on an
+  integrated GPU) keeps the per-refresh prefill small. Subsequent `seed_prefix`
+  calls on the same `LiveSession` are no-ops.
 
 - **ASR(CPU) vs LLM(GPU): no contention (SP-LIVE E1 GO).** ASR (`asr-runtime` /
   `asr-parakeet`) runs on CPU via `sherpa-onnx` or llama.cpp CPU layers. The live

@@ -16,6 +16,10 @@ mod manager;
 mod meter;
 mod mixer;
 mod resample;
+/// Windows-only: mic capture via WASAPI communications mode (OS voice DSP →
+/// processed mono), preferred over the cpal raw path on Windows.
+#[cfg(windows)]
+mod wasapi_comms;
 
 #[cfg(any(test, feature = "test-source"))]
 pub mod test_source;

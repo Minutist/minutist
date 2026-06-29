@@ -778,13 +778,23 @@ internal sample rate (**16 kHz mono — mandated; this matches mtmd's
 encoder input rate per Spike 1's Q-P0-1**, so downstream consumers do
 not resample).
 
-**Back-pressure policy:** the cpal-callback→forwarder channel is a bounded
-(8-frame) `Mutex<VecDeque>` + `Condvar` ring. The cpal real-time callback
-produces via `try_lock` only (never blocks the RT thread); on overflow it pops
-the OLDEST frame and pushes the newest, so drop-oldest is genuinely honoured
-(an earlier `sync_channel` design held the lock for the whole session and
-silently degraded to drop-newest). Meter window is 512 samples (~32 ms at
-16 kHz, ~30 Hz emission rate).
+**Back-pressure policy:** the capture→forwarder channel is a bounded
+(`RAW_RING_CAPACITY` ≈ 10 s of buffers) `Mutex<VecDeque>` + `Condvar` ring. The
+producer pushes via `try_lock` only (never blocks the RT callback); on overflow
+it pops the OLDEST frame and pushes the newest, so drop-oldest is genuinely
+honoured. The ring (and the `samples` tokio channel, likewise deep) are sized to
+ride the model-load burst at record start — a small ring/channel back-pressured
+into a drop-flood that truncated recordings. Meter window is 512 samples
+(~32 ms at 16 kHz, ~30 Hz emission rate).
+
+**Windows mic capture (platform path).** On Windows the mic is captured via
+WASAPI **communications mode** (`wasapi` crate — a `cfg(windows)` dependency of
+this crate): the stream is tagged `AudioCategory_Communications`, so the
+OS/driver voice pipeline (array beamforming + AEC + noise suppression) delivers
+a processed **mono** stream, autoconverted to 16 kHz — the app never beamforms
+or averages the raw mic array itself. Falls back to the cpal raw path if the
+comms path fails to initialise, and on non-Windows. See
+`planning/research/windows-mic-array-capture-2026-06.md`.
 
 **Device identity:** `AudioDevice.id` is an opaque `String` of the form
 `"{enumeration-index}\u{1f}{name}"` (ASCII unit separator, which a device name

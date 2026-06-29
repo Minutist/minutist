@@ -69,6 +69,15 @@ struct ChannelInner {
     closed: bool,
 }
 
+/// Capacity of a per-source raw-frame ring (cpal callback → resample forwarder),
+/// counted in cpal callback buffers. Sized to ride a multi-second stall of the
+/// forwarder/consumer — chiefly the model-load burst at record start, which
+/// otherwise CPU-starves the forwarder, overflows a small ring, and drop-floods
+/// (and truncates) the recording. At ~10 ms cpal buffers this is ~10 s of
+/// headroom; the forwarder drains the backlog once models finish loading, so no
+/// audio is lost — only briefly delayed. (Was 8 ≈ 80 ms, far too small.)
+pub(crate) const RAW_RING_CAPACITY: usize = 1024;
+
 /// A bounded SPSC channel that, on overflow, evicts the OLDEST queued frame so
 /// the newest data is always retained — the true drop-oldest contract.
 ///
@@ -202,10 +211,38 @@ struct StreamHandle(cpal::Stream);
 #[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for StreamHandle {}
 
-/// Live capture resources for one cpal source (mic OR loopback): the stream,
+/// How a source is captured: a cpal stream, or (the Windows mic path) a WASAPI
+/// communications-mode capture thread that exits when the shared `stopped` flag
+/// is set.
+enum CaptureBackend {
+    Cpal(StreamHandle),
+    /// Constructed only under `cfg(windows)`; `allow(dead_code)` keeps
+    /// non-Windows builds warning-clean.
+    #[allow(dead_code)]
+    WasapiComms(std::thread::JoinHandle<()>),
+}
+
+impl CaptureBackend {
+    /// Pause or resume the underlying device. A cpal stream pauses/plays the
+    /// hardware; the WASAPI comms thread keeps running and honours the source
+    /// `paused` flag instead (dropping frames while paused), so this is a no-op
+    /// for it.
+    fn set_device_paused(&self, paused: bool) -> AppResult<()> {
+        if let CaptureBackend::Cpal(s) = self {
+            if paused {
+                s.0.pause().map_err(Error::from)?;
+            } else {
+                s.0.play().map_err(Error::from)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Live capture resources for one source (mic OR loopback): the capture backend,
 /// its pause flag, and the cpal→forwarder channel closed on stop.
 struct SourceHandles {
-    stream: StreamHandle,
+    backend: CaptureBackend,
     paused: Arc<AtomicBool>,
     raw_ch: Arc<DropOldestChannel>,
 }
@@ -285,39 +322,70 @@ impl AudioCaptureManager {
             context: "no device; call open() first".into(),
         })?;
 
-        let config = device::preferred_config(cpal_device)?;
-        let in_rate = config.sample_rate().0;
-        let channels = config.channels() as usize;
         let device_name = cpal_device
             .name()
             .unwrap_or_else(|_| "<unknown>".to_string());
 
-        tracing::info!(
-            target = "audio-capture",
-            device = %device_name,
-            sample_rate = in_rate,
-            channels,
-            format = ?config.sample_format(),
-            capture_system_audio,
-            "starting capture stream"
-        );
-
         // The forwarder/mixer task(s) share one stop flag.
         let stopped = Arc::new(AtomicBool::new(false));
 
-        // --- Build the microphone cpal stream + its raw ring channel ---
-        let mic_raw_ch = Arc::new(DropOldestChannel::new(8));
+        // The mic source's raw ring + pause flag (shared by whichever backend).
+        let mic_raw_ch = Arc::new(DropOldestChannel::new(RAW_RING_CAPACITY));
         let mic_paused = Arc::new(AtomicBool::new(false));
-        let mic_stream = build_input_stream(
-            cpal_device,
-            &config,
-            channels,
-            in_rate,
+
+        // Mic capture backend: prefer the WASAPI communications path on Windows —
+        // it returns the OS-processed (beamformed + AEC + noise-suppressed) MONO
+        // stream at 16 kHz, so the forwarder resampler is a pass-through and we
+        // never average a raw mic array ourselves. Falls back to cpal raw capture
+        // off-Windows or if the comms path can't initialise. (v1 captures the
+        // default communications device; honouring an explicit non-default mic
+        // selection on this path is a follow-up.)
+        #[cfg(windows)]
+        let wasapi_mic = crate::wasapi_comms::try_start(
             Arc::clone(&mic_paused),
+            Arc::clone(&stopped),
             Arc::clone(&mic_raw_ch),
-        )?;
-        mic_stream.play().map_err(Error::from)?;
-        let mic_stream = StreamHandle(mic_stream);
+        );
+        #[cfg(not(windows))]
+        let wasapi_mic: Option<(std::thread::JoinHandle<()>, u32)> = None;
+
+        let (mic_backend, in_rate) = match wasapi_mic {
+            Some((handle, rate)) => {
+                tracing::info!(
+                    target = "audio-capture",
+                    device = %device_name,
+                    sample_rate = rate,
+                    channels = 1usize,
+                    capture_system_audio,
+                    "starting mic capture (WASAPI communications mode: OS beamforming/AEC/NS → mono)"
+                );
+                (CaptureBackend::WasapiComms(handle), rate)
+            }
+            None => {
+                let config = device::preferred_config(cpal_device)?;
+                let in_rate = config.sample_rate().0;
+                let channels = config.channels() as usize;
+                tracing::info!(
+                    target = "audio-capture",
+                    device = %device_name,
+                    sample_rate = in_rate,
+                    channels,
+                    format = ?config.sample_format(),
+                    capture_system_audio,
+                    "starting mic capture (cpal raw)"
+                );
+                let mic_stream = build_input_stream(
+                    cpal_device,
+                    &config,
+                    channels,
+                    in_rate,
+                    Arc::clone(&mic_paused),
+                    Arc::clone(&mic_raw_ch),
+                )?;
+                mic_stream.play().map_err(Error::from)?;
+                (CaptureBackend::Cpal(StreamHandle(mic_stream)), in_rate)
+            }
+        };
 
         // --- Try to open the loopback source when requested ---
         // A failure (unsupported platform, no render device) degrades to
@@ -377,7 +445,7 @@ impl AudioCaptureManager {
                 spawn_mixer(mic_batch_rx, sys_batch_rx, sample_tx, meter_tx);
 
                 self.loopback = Some(SourceHandles {
-                    stream: lb_stream,
+                    backend: CaptureBackend::Cpal(lb_stream),
                     paused: lb.paused,
                     raw_ch: lb.raw_ch,
                 });
@@ -395,7 +463,7 @@ impl AudioCaptureManager {
         }
 
         self.mic = Some(SourceHandles {
-            stream: mic_stream,
+            backend: mic_backend,
             paused: mic_paused,
             raw_ch: mic_raw_ch,
         });
@@ -422,7 +490,7 @@ impl AudioCaptureManager {
 
         for src in [self.mic.as_ref(), self.loopback.as_ref()].into_iter().flatten() {
             src.paused.store(true, Ordering::Relaxed);
-            src.stream.0.pause().map_err(Error::from)?;
+            src.backend.set_device_paused(true)?;
         }
         self.state = StreamState::Paused;
         tracing::info!(target = "audio-capture", "capture paused");
@@ -443,7 +511,7 @@ impl AudioCaptureManager {
 
         for src in [self.mic.as_ref(), self.loopback.as_ref()].into_iter().flatten() {
             src.paused.store(false, Ordering::Relaxed);
-            src.stream.0.play().map_err(Error::from)?;
+            src.backend.set_device_paused(false)?;
         }
         self.state = StreamState::Running;
         tracing::info!(target = "audio-capture", "capture resumed");

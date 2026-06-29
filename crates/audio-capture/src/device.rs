@@ -168,9 +168,18 @@ pub(crate) fn describe_device(device_id: Option<&str>) -> Result<AudioDevice, Er
 /// Choose the best `SupportedStreamConfig` for an input device.
 ///
 /// Strategy: use the device's default sample rate (avoids forcing hardware
-/// into a non-native rate which can fail on Bluetooth / ALSA) and prefer
-/// F32 > I16 > I32 > others at that rate. Falls back to the device default
-/// if no supported config matches the default rate.
+/// into a non-native rate which can fail on Bluetooth / ALSA), then prefer the
+/// FEWEST channels (mono) and, as a tie-break, F32 > I16 > I32 > others.
+///
+/// Preferring mono is deliberate: a multi-mic array (e.g. a laptop's 4-channel
+/// "Microphone Array") should be downmixed by the platform's WASAPI/driver path,
+/// which beamforms the elements correctly. Capturing the raw multi-channel format
+/// and averaging it ourselves comb-filters the phase-offset elements into
+/// muffled, low-level audio. When the device exposes a mono config we take it so
+/// the platform does the downmix; otherwise we fall back to multi-channel (still
+/// averaged in the capture callback) — and the fuller fix (the Windows
+/// communications endpoint with its echo-cancelling voice DSP) is platform code
+/// beyond cpal.
 pub(crate) fn preferred_config(
     device: &cpal::Device,
 ) -> Result<cpal::SupportedStreamConfig, Error> {
@@ -195,12 +204,17 @@ pub(crate) fn preferred_config(
         _ => 1,
     };
 
+    // Rank a candidate (lower is better): fewest channels first (mono → let the
+    // platform downmix the array, not our naive average), then best format.
+    let rank = |r: &cpal::SupportedStreamConfigRange| {
+        (r.channels(), std::cmp::Reverse(score(r.sample_format())))
+    };
     let mut best: Option<cpal::SupportedStreamConfigRange> = None;
     for range in supported {
         if range.min_sample_rate() <= target_rate && range.max_sample_rate() >= target_rate {
             let better = match &best {
                 None => true,
-                Some(cur) => score(range.sample_format()) > score(cur.sample_format()),
+                Some(cur) => rank(&range) < rank(cur),
             };
             if better {
                 best = Some(range);

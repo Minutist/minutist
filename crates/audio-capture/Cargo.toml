@@ -14,6 +14,13 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 
+# Windows-only: WASAPI communications-mode mic capture (OS beamforming / AEC /
+# noise-suppression → processed mono), so we never average a raw mic array.
+# See architecture/components.md (audio-capture) + the research artefact
+# planning/research/windows-mic-array-capture-2026-06.md.
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.23"
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 

@@ -87,7 +87,7 @@ pub(crate) fn open_loopback() -> Result<LoopbackSource, Error> {
         "opening render endpoint in loopback mode"
     );
 
-    let raw_ch = Arc::new(DropOldestChannel::new(8));
+    let raw_ch = Arc::new(DropOldestChannel::new(crate::manager::RAW_RING_CAPACITY));
     let paused = Arc::new(AtomicBool::new(false));
 
     // Reuse the mic path's stream builder: on a render device cpal's

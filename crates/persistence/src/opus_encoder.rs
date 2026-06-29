@@ -40,6 +40,16 @@ use crate::error::{Error, Result};
 pub const FRAME_SAMPLES: usize = 320;
 /// Sample rate mandated by the architecture (16 kHz mono).
 pub const SAMPLE_RATE: u32 = 16_000;
+/// Granule-position increment per 20 ms frame, in the Opus container's mandated
+/// **48 kHz** units (RFC 7845 §4 — Ogg/Opus granule positions are always at
+/// 48 kHz regardless of the decode rate). 320 samples @16 kHz = 960 @48 kHz.
+///
+/// Writing the raw 16 kHz frame count here was the #0024 non-conformance: every
+/// conformant reader (VLC, WMP, libsndfile) computes duration = granule/48000
+/// and so saw 1/3 the real length, stopping playback early and rejecting the
+/// file as malformed. Our own decoder counts packets/samples and ignores the
+/// granule, so this only affects external interpretation.
+const GRANULE_PER_FRAME: u64 = FRAME_SAMPLES as u64 * 48_000 / SAMPLE_RATE as u64;
 /// Target bitrate in bps (32 kbps).
 const BITRATE_BPS: i32 = 32_000;
 /// Maximum encoded packet size in bytes (generous upper bound for 32 kbps).
@@ -59,7 +69,8 @@ pub struct OggOpusEncoder<W: Write> {
     writer: PacketWriter<'static, W>,
     /// Ogg logical bitstream serial number.
     serial: u32,
-    /// Current granule position (cumulative decoded samples written).
+    /// Current granule position — cumulative samples at the Opus container's
+    /// 48 kHz rate (RFC 7845), advancing by [`GRANULE_PER_FRAME`] per frame.
     granule: u64,
     /// Samples accumulated but not yet forming a complete frame.
     pending: Vec<f32>,
@@ -305,7 +316,7 @@ impl<W: Write> OggOpusEncoder<W> {
         let n = self.encoder.encode_float(frame, &mut buf)?;
         buf.truncate(n);
 
-        self.granule += FRAME_SAMPLES as u64;
+        self.granule += GRANULE_PER_FRAME;
 
         self.writer
             .write_packet(
@@ -327,7 +338,7 @@ impl<W: Write> OggOpusEncoder<W> {
         let n = self.encoder.encode_float(&frame, &mut buf)?;
         buf.truncate(n);
 
-        self.granule += FRAME_SAMPLES as u64;
+        self.granule += GRANULE_PER_FRAME;
 
         self.writer
             .write_packet(

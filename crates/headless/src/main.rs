@@ -45,11 +45,11 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use iroh_tickets::endpoint::EndpointTicket;
-use minutist_common::{AppError, AppResult, MeetingId};
+use minutist_common::{AppError, AppResult, MeetingId, ProcessingLifecycle};
 use serde::Serialize;
 use sha2::Digest;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
-use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::broadcast::{self, error::RecvError};
 
 /// Default shutdown drain window; override `MINUTIST_HUB_SHUTDOWN_GRACE_MS`.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -62,6 +62,12 @@ const PEER_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// reconnecting peer is not re-pushed every time); override
 /// `MINUTIST_HUB_PUSH_DEBOUNCE_MS`.
 const PEER_PUSH_DEBOUNCE: Duration = Duration::from_secs(15);
+
+/// Default interval for the recovery discovery sweep — a periodic re-discovery of
+/// every known peer so a lifecycle state a consumer dropped (`Lagged`) or skipped
+/// (advertised before the meeting's folder had synced in) is eventually
+/// re-applied; override `MINUTIST_HUB_DISCOVERY_MS`.
+const DISCOVERY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// A timing default overridable via an env var (milliseconds), so a test mode can
 /// collapse the hub's timers to sub-second without touching production defaults.
@@ -367,19 +373,38 @@ async fn start_engine(
     Ok(SyncEngine::start(config, identity).await?)
 }
 
-/// Serve until `SIGTERM` / `SIGINT`. Two background behaviours run off one select
-/// loop: the peers file is re-read on a fixed interval (so `add-peer` is honoured
-/// without a restart, and the interval's immediate first tick performs the initial
-/// load), and on each "peer arrived" event the hub reciprocally pushes every
-/// meeting it holds to that peer (debounced per peer) — so a device that
-/// reconnects both deposits and collects, converging through the hub.
+/// Serve until `SIGTERM` / `SIGINT`. The peers file is re-read on a fixed interval
+/// (so `add-peer` is honoured without a restart, and the interval's immediate
+/// first tick performs the initial load); on each "peer arrived" event the hub
+/// reciprocally pushes every meeting it holds to that peer (debounced per peer) —
+/// so a device that reconnects both deposits and collects, converging through the
+/// hub — and that push rides a lifecycle discovery in the same flow (§7); and a
+/// periodic discovery sweep re-advertises so a lifecycle state a consumer dropped
+/// or skipped is re-applied (the recovery driver).
+///
+/// The lifecycle-event CONSUMER runs in a dedicated spawned task
+/// ([`apply_lifecycle_events`]), NOT in this select loop: the loop awaits the
+/// emitters (`discover_all` and the `push_all_to` ride-along both emit into the
+/// same broadcast), so draining in the same loop would let a sweep larger than the
+/// channel cap self-lag while the loop is parked on the sweep producing it — a
+/// separate drain keeps up concurrently.
 async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut HashSet<String>) {
     let mut poll = tokio::time::interval(dur_or_env("MINUTIST_HUB_POLL_MS", PEER_POLL_INTERVAL));
     let debounce = dur_or_env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", PEER_PUSH_DEBOUNCE);
+    let mut discovery_poll =
+        tokio::time::interval(dur_or_env("MINUTIST_HUB_DISCOVERY_MS", DISCOVERY_INTERVAL));
     let mut peer_events = engine.subscribe_peer_events();
-    let mut lifecycle_events = engine.subscribe_lifecycle_events();
     let meetings_root = data_dir.join("meetings");
     let mut last_push: HashMap<_, Instant> = HashMap::new();
+
+    // Drain discovery lifecycle events in a DEDICATED task so the consumer keeps up
+    // while this loop is parked awaiting an emitter (discover_all / the push_all_to
+    // ride-along emit into the same broadcast). The engine's sender outlives this
+    // fn, so the task is aborted on shutdown rather than seeing `Closed` on its own.
+    let lifecycle_task = tokio::spawn(apply_lifecycle_events(
+        engine.subscribe_lifecycle_events(),
+        meetings_root,
+    ));
 
     // Pin the shutdown future ONCE so its signal handlers persist across loop
     // iterations — recreating them each pass could drop a signal that arrives in
@@ -391,6 +416,19 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
         tokio::select! {
             _ = &mut shutdown => break 'serve,
             _ = poll.tick() => reload_peers(engine, data_dir, seen),
+            _ = discovery_poll.tick() => {
+                // Recovery sweep: re-discover every known peer so a lifecycle state
+                // a consumer dropped (Lagged) or skipped (a meeting not present when
+                // it was advertised) is re-applied. Raced against shutdown, like the
+                // push arm. (The first, immediate tick is a no-op before peers load.)
+                tokio::select! {
+                    _ = &mut shutdown => break 'serve,
+                    result = engine.discover_all() => match result {
+                        Ok(n) => tracing::debug!(target: "hub", peers = n, "periodic discovery swept peers"),
+                        Err(e) => tracing::warn!(target: "hub", error = %e, "periodic discovery failed"),
+                    },
+                }
+            }
             arrived = peer_events.recv() => {
                 // Map the event to the peers to reconcile. A normal event names one
                 // peer. `Lagged` means arrivals were dropped under load (e.g. while a
@@ -427,28 +465,45 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
                     }
                 }
             }
-            // Persist processing-lifecycle states the engine surfaces from
-            // discovery (the consumer side of the lifecycle exchange). The apply
-            // is raced against shutdown — matching the push arm — so a SIGTERM is
-            // honoured promptly even if a metadata write stalls; an interrupted
-            // apply is safe (write_metadata is atomic, and the state is
-            // re-advertised on the next discovery).
-            event = lifecycle_events.recv() => match event {
-                Ok((meeting_id, processing)) => {
-                    tokio::select! {
-                        _ = &mut shutdown => break 'serve,
-                        result = persistence::meeting_ops::apply_synced_lifecycle_if_present(&meetings_root, meeting_id, processing) => match result {
-                            Ok(true) => {}
-                            Ok(false) => tracing::debug!(target: "hub", meeting_id = %meeting_id.0, "synced lifecycle for a meeting not present locally; skipping (re-applied only on a later discovery)"),
-                            Err(e) => tracing::warn!(target: "hub", meeting_id = %meeting_id.0, error = %e, "failed to apply synced lifecycle"),
-                        },
-                    }
+        }
+    }
+
+    // The engine's lifecycle sender outlives this fn (shutdown is graceful, not a
+    // drop), so the drain task won't observe `Closed` on its own — abort it.
+    lifecycle_task.abort();
+}
+
+/// Drain the engine's discovery lifecycle events and persist each, until the
+/// broadcast closes. Runs as a DEDICATED task (spawned by [`serve_until_shutdown`])
+/// so it drains CONCURRENTLY with the serve loop's discovery/push awaits — which
+/// emit into this same broadcast — instead of self-lagging when a re-discovery
+/// sweep emits more than the channel cap while the loop is parked on it. Mirrors
+/// `ipc_bridge::lifecycle::run_lifecycle_subscriber` (the hub cannot link
+/// `ipc-bridge`). `Lagged` is logged; the periodic `discover_all` sweep
+/// re-advertises and this drain re-applies — no self-triggered re-discovery.
+async fn apply_lifecycle_events(
+    mut lifecycle_events: broadcast::Receiver<(MeetingId, ProcessingLifecycle)>,
+    meetings_root: PathBuf,
+) {
+    loop {
+        match lifecycle_events.recv().await {
+            Ok((meeting_id, processing)) => {
+                match persistence::meeting_ops::apply_synced_lifecycle_if_present(
+                    &meetings_root,
+                    meeting_id,
+                    processing,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::debug!(target: "hub", meeting_id = %meeting_id.0, "synced lifecycle for a meeting not present locally; skipping (re-applied on a later discovery)"),
+                    Err(e) => tracing::warn!(target: "hub", meeting_id = %meeting_id.0, error = %e, "failed to apply synced lifecycle"),
                 }
-                Err(RecvError::Lagged(dropped)) => {
-                    tracing::warn!(target: "hub", dropped, "lifecycle-event lag; dropped states recover only on a re-run discovery (no scheduled caller yet)");
-                }
-                Err(RecvError::Closed) => break 'serve,
-            },
+            }
+            Err(RecvError::Lagged(dropped)) => {
+                tracing::warn!(target: "hub", dropped, "lifecycle-event lag; states recover on the periodic discovery sweep");
+            }
+            Err(RecvError::Closed) => break,
         }
     }
 }

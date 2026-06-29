@@ -8,9 +8,9 @@
 //! taking a dependency on the `sync` crate. That keeps the trait-seam invariant
 //! that holds `sync` a near-leaf (see [`crate::sync`]).
 //!
-//! The hub (`headless`) runs the equivalent loop inline in its serve loop; it
-//! depends on both `sync` and `persistence` directly and does not link
-//! `ipc-bridge`.
+//! The hub (`headless`) runs the equivalent loop in a dedicated task beside its
+//! serve loop; it depends on both `sync` and `persistence` directly and does not
+//! link `ipc-bridge`.
 
 use std::path::PathBuf;
 
@@ -24,20 +24,17 @@ use tokio::sync::broadcast;
 ///
 /// Runs until the broadcast sender is dropped (engine shutdown → `Closed`).
 ///
-/// Recovery semantics (v1 — see the known limitations in
-/// `planning/DESIGN_processing-lifecycle.md`):
-/// - `Lagged` is non-fatal and logged. A dropped event is recovered only when
-///   discovery is next driven and re-advertises the authoritative state. Today
-///   `discover_with` has NO scheduled caller, so recovery relies on a peer
-///   initiating discovery against us (inbound) or a future scheduled caller —
-///   there is no automatic re-run here. TODO(recovery): on `Lagged`, trigger a
-///   re-discovery once a discovery driver exists.
+/// Recovery semantics (see `planning/DESIGN_processing-lifecycle.md` §8):
+/// - `Lagged` is non-fatal and logged. This subscriber does not re-trigger
+///   discovery itself (it holds no engine handle). On the desktop, recovery rides
+///   the next `sync_now`, which runs `discover_with` per peer (the §7
+///   ride-alongside) and re-advertises the authoritative state. (The hub
+///   additionally runs a periodic `discover_all` sweep; the desktop has no such
+///   sweep — a dedicated desktop recovery driver is a later concern.)
 /// - An event for a meeting not present locally is skipped (the notes/media
-///   receive path, not this stream, seeds a meeting's folder). A skipped event
-///   is NOT replayed when that folder later syncs in: the meeting's lifecycle
-///   stays at its local default until a subsequent discovery re-advertises it.
-///   TODO(recovery): re-apply on folder arrival, or couple discovery to
-///   notes/media sync completion.
+///   receive path, not this stream, seeds a meeting's folder). It is re-applied
+///   once the folder has synced in and discovery next runs (the ride-along on the
+///   next `sync_now`).
 pub async fn run_lifecycle_subscriber(
     mut rx: broadcast::Receiver<(MeetingId, ProcessingLifecycle)>,
     meetings_dir: PathBuf,
@@ -71,7 +68,7 @@ pub async fn run_lifecycle_subscriber(
                 tracing::warn!(
                     target: "ipc-bridge",
                     dropped,
-                    "lifecycle-event subscriber lagged; dropped states recover only on a re-run discovery (no scheduled caller yet)"
+                    "lifecycle-event subscriber lagged; dropped states recover on the next sync_now ride-along discovery"
                 );
             }
             Err(broadcast::error::RecvError::Closed) => {

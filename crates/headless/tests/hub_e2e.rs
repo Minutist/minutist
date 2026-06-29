@@ -21,7 +21,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use iroh::{EndpointAddr, RelayUrl};
-use minutist_common::MeetingId;
+use minutist_common::{HostRef, MeetingId, ProcessingLifecycle};
 use persistence::NotesStore;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use uuid::Uuid;
@@ -56,9 +56,11 @@ fn spawn_hub(
         ])
         .env("MINUTIST_SYNC_TOKEN", token)
         .env("RUST_LOG", "hub=info,iroh=error,iroh_relay=error")
-        // Collapse the hub's timers so reconnect/push scenarios run sub-second.
+        // Collapse the hub's timers so reconnect/push/discovery scenarios run
+        // sub-second.
         .env("MINUTIST_HUB_POLL_MS", "200")
         .env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", "200")
+        .env("MINUTIST_HUB_DISCOVERY_MS", "500")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -361,4 +363,106 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     engine_b.shutdown().await.expect("shutdown b");
     let _ = hub.kill().await;
     eprintln!("hub_e2e push: PASS — hub pushed A's meeting to B on arrival");
+}
+
+/// Discovery-scheduling: a peer's processing-lifecycle state reaches the hub's
+/// `metadata.json` via the hub's discovery — the §7 ride-along on the peer-arrival
+/// push and the periodic recovery sweep (both collapsed sub-second by `spawn_hub`).
+/// A flags a meeting `Processed` and pushes only its NOTES to the hub; the
+/// `Processed` state has no transport of its own, so the hub recording it proves
+/// discovery carried it.
+#[tokio::test]
+async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
+    let token = match std::env::var("MINUTIST_SYNC_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!("SKIP hub_e2e lifecycle: set MINUTIST_SYNC_TOKEN to run");
+            return;
+        }
+    };
+    let relay_url = std::env::var("MINUTIST_SYNC_RELAY")
+        .unwrap_or_else(|_| SyncConfig::DEFAULT_RELAY_URL.into());
+
+    let hub_dir = tempfile::TempDir::new().expect("hub tempdir");
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+
+    let hub_id = DeviceIdentity::load_or_generate(hub_dir.path())
+        .expect("hub identity")
+        .endpoint_id();
+
+    let cfg = |dir: &std::path::Path| SyncConfig {
+        relay_url: relay_url.clone(),
+        relay_auth_token: Some(token.clone()),
+        meetings_root: dir.to_path_buf(),
+    };
+    let engine_a = SyncEngine::start(
+        cfg(dir_a.path()),
+        DeviceIdentity::load_or_generate(dir_a.path()).expect("id a"),
+    )
+    .await
+    .expect("engine A");
+
+    std::fs::write(
+        hub_dir.path().join("peers"),
+        format!("{}\n", engine_a.my_ticket()),
+    )
+    .expect("write hub peers");
+
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, &token);
+    tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("hub did not become ready within 20s")
+        .expect("hub ready signal dropped");
+
+    let relay: RelayUrl = relay_url.parse().expect("relay url");
+    let hub_addr = EndpointAddr::new(hub_id).with_relay_url(relay);
+    engine_a.add_peer(hub_addr.clone());
+
+    // A seeds a meeting, flags it Processed, and pushes its NOTES to the hub (which
+    // seeds the meeting folder on the hub). The Processed state has no transport of
+    // its own — it reaches the hub only through discovery.
+    let meeting = MeetingId(Uuid::new_v4());
+    let jx = serde_json::json!({"type":"doc","content":[{"type":"paragraph",
+        "content":[{"type":"text","text":"processed by A"}]}]});
+    persistence::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting");
+    NotesStore::save(dir_a.path(), meeting, &jx, "processed by A").expect("seed A");
+    let processed = ProcessingLifecycle::Processed {
+        processed_by: HostRef("endpoint-a".into()),
+        at: "2026-06-29T10:00:00Z".into(),
+    };
+    persistence::meeting_ops::apply_processing_lifecycle(dir_a.path(), meeting, processed.clone())
+        .await
+        .expect("flag A meeting processed");
+    sync_with_retry(&engine_a, &hub_addr, meeting, "A->hub notes").await;
+
+    // The hub must end up recording Processed for the meeting — applied from A's
+    // discovery (the ride-along on A's arrival and/or the periodic sweep).
+    let hub_meeting_dir = hub_dir.path().join("meetings").join(meeting.0.to_string());
+    let got = wait_for_processing(&hub_meeting_dir, &processed, Duration::from_secs(45)).await;
+    assert!(
+        got,
+        "the hub must record the peer's Processed lifecycle via discovery"
+    );
+
+    engine_a.shutdown().await.expect("shutdown a");
+    let _ = hub.kill().await;
+    eprintln!("hub_e2e lifecycle: PASS — A's Processed state reached the hub via discovery");
+}
+
+/// Poll until `dir`'s `metadata.json` records `expected` processing, or `deadline`.
+async fn wait_for_processing(
+    dir: &std::path::Path,
+    expected: &ProcessingLifecycle,
+    deadline: Duration,
+) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if let Ok(meta) = persistence::read_metadata(dir) {
+            if &meta.processing == expected {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
 }

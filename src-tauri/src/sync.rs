@@ -282,6 +282,15 @@ impl SyncControl for ConnectedSync {
                 label: "Syncing media…".to_string(),
                 fraction: Some(done as f32 / total as f32),
             });
+
+            // §7 ride-alongside: exchange lifecycle with this peer in the same
+            // session, so the meeting just synced carries its processing state
+            // (and we learn the peer's for the meetings we hold). Best-effort and
+            // NOT a progress step — a discovery failure does not fail the sync; the
+            // lifecycle re-advertises on the next sync.
+            if let Err(e) = engine.discover_with(peer).await {
+                tracing::warn!(target: "app-main", peer = %peer, error = %e, "ride-along discovery failed");
+            }
         }
 
         self.set_status(SyncStatus::Idle).await;

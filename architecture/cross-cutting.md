@@ -2231,7 +2231,8 @@ to it as follows:
   `minutist-hub ready` log marker once bound (a harness waits on it instead of
   sleeping). The timing constants are env-overridable in milliseconds
   (`MINUTIST_HUB_POLL_MS` / `MINUTIST_HUB_PUSH_DEBOUNCE_MS` /
-  `MINUTIST_HUB_SHUTDOWN_GRACE_MS`) for a sub-second test mode, and
+  `MINUTIST_HUB_DISCOVERY_MS` / `MINUTIST_HUB_SHUTDOWN_GRACE_MS`) for a sub-second
+  test mode, and
   `MINUTIST_HUB_LOG_JSON=1` switches tracing to a structured JSON formatter for
   field-level event assertions. Production defaults are unchanged.
 - **Convergence (push-on-reconnect).** `SyncEngine` fires a bounded "peer arrived"
@@ -2247,6 +2248,23 @@ to it as follows:
   `Lagged` peer-event (arrivals dropped under load) is recovered by reconciling
   EVERY known peer, so no arrival is permanently missed. The desktop does not
   subscribe to peer events.
+- **Lifecycle discovery scheduling (§7 / recovery).** The processing-lifecycle
+  exchange (`StreamKind::Discovery`, carrying `(MeetingId, ProcessingLifecycle)`)
+  rides the sync flow rather than a separate skippable round: `push_all_to` runs a
+  `discover_with` for the peer (a separate dial, last) after reconciling its
+  notes/media (the desktop's `sync_now` does the same per peer), so a meeting's
+  lifecycle follows the meeting it was pushed in. The hub additionally runs a
+  periodic recovery sweep — `SyncEngine::discover_all` (re-discovers every known
+  peer, relay-addressed, on the `MINUTIST_HUB_DISCOVERY_MS` interval, raced against
+  shutdown) — so a lifecycle state a consumer dropped (broadcast overflow) or
+  skipped (advertised before the meeting's folder had synced in) is re-applied on
+  the next sweep. The hub's lifecycle CONSUMER runs in a dedicated task beside the
+  serve loop (not inline), draining concurrently with the discovery/push awaits
+  that emit into the same broadcast — draining in the serve loop would let a sweep
+  larger than the channel cap self-lag while the loop is parked on the sweep
+  producing it. The desktop has the ride-alongside but no periodic sweep (it
+  recovers on its next `sync_now`); a dedicated desktop recovery driver is a later
+  concern.
 - **Single-writer per data root.** The daemon owns an entirely separate data root
   from any desktop (`settings.store`, `logs/`, `index.db`, `meetings/{uuid}/`
   under it; the device key at the root). Two processes must never share one root

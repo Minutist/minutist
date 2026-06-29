@@ -1260,10 +1260,13 @@ skip-if-absent sibling `update_metadata_if_present`) — which takes the lock,
 reads, applies the closure, and writes atomically, so a caller cannot forget the
 lock. The writers routed through it: the `meeting_ops` operations
 (`rename_meeting`, `set_meeting_collection`, `set_speaker_name`,
-`apply_processing_lifecycle`), `MeetingFolder::ensure`'s placeholder seed, the
-sync lifecycle-event subscriber, the `orchestrator`'s post-processing RMWs
-(`finalise_diarization`, the re-transcribe `speaker_count` update, the voiceprint
-`speaker_names` restores), and `agent-tools`' write tools. On a multi-threaded
+`apply_processing_lifecycle`), `MeetingFolder::ensure`'s placeholder seed,
+`read_meeting_state`'s lazy notes-format flip (the one-time `notes.ydoc`
+migration on first open — it fires on exactly the synced meetings receiving
+`Claimed`/`Processed`, so it must be guarded), the sync lifecycle-event
+subscriber, the `orchestrator`'s post-processing RMWs (`finalise_diarization`,
+the re-transcribe `speaker_count` update, the voiceprint `speaker_names`
+restores), and `agent-tools`' write tools. On a multi-threaded
 runtime any of these can run while another runs; without serialisation each does
 an independent read→mutate→write and the later write drops the field the earlier
 one set.

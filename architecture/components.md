@@ -1685,7 +1685,16 @@ on `common`.
   invariant (#0014 audit): these ops log the meeting id (and the diarizer
   `label`), never the `new_title` or speaker `name` — both are user content that
   must not reach a log line (and thus the crash file / report excerpt, which
-  capture info+ log lines).
+  capture info+ log lines). All of these RMWs go through the guarded primitive
+  `update_metadata(root, id, |meta| {…}) -> AppResult<R>` (and
+  `update_metadata_if_present -> AppResult<Option<R>>`): it takes the per-meeting
+  `notes_crdt::metadata_lock`, reads, applies the closure, and writes atomically,
+  so a caller cannot forget the lock. It is the single guarded `metadata.json`
+  RMW entry point — the `orchestrator`'s post-processing writes and `agent-tools`'
+  write tools route through it / the `meeting_ops` fns too (issue 0025), so every
+  in-process writer of a meeting's `metadata.json` serialises on ONE lock;
+  `agent-tools` no longer keeps its own per-meeting mutex. See
+  `cross-cutting.md` — "Per-meeting metadata.json write lock".
 - **Collections store (`collections` module + `collections.json`).** A user-facing
 "folder" grouping meetings — distinct from [`MeetingFolder`] (a single meeting's
 directory). `CollectionStore` is the authoritative reader/writer for the flat

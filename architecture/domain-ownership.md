@@ -131,6 +131,15 @@ restated. Adding any other edge requires updating
   the propagated state into the local `metadata.json`) is `sync`'s domain
   (systems-engineer), landed as separate `crates/sync` PRs gated on this one.
   See `planning/DESIGN_processing-lifecycle.md` (the binding §7 decisions).
+- **Per-meeting `metadata.json` write lock — orchestrator + agent-tools
+  follow-up (issue 0025).** A guarded RMW helper
+  `persistence::meeting_ops::update_metadata` puts every `metadata.json`
+  read-modify-write on one per-meeting lock. Routing the `orchestrator`'s five
+  post-processing RMW sites and `agent-tools`' write tools onto it (and deleting
+  `agent-tools`' own lock registry) are cross-domain edits into systems-engineer
+  crates; `planning/issues/0025-metadata-lock-orchestrator-followup.md` is the
+  agreed proposal authorising them. The dependency table is **unchanged**:
+  `orchestrator` and `agent-tools` already depend on `persistence`.
 
 ## Role definitions
 

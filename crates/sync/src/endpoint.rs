@@ -355,6 +355,18 @@ impl SyncEngine {
             }
             reconciled += 1;
         }
+
+        // §7 ride-alongside: after reconciling notes+media, exchange lifecycle
+        // with the peer in the same flow (a separate dial, run LAST), so a
+        // meeting's processing state follows the meeting it was just pushed in.
+        // This is ordering, not atomicity: a device that goes offline between the
+        // notes push and this dial has not pushed its lifecycle — the periodic
+        // recovery sweep (`discover_all`) backstops that window. Best-effort: a
+        // discovery failure does not fail the push (the meetings are reconciled;
+        // the lifecycle re-advertises on the next discovery).
+        if let Err(e) = self.discover_with(addr.clone()).await {
+            tracing::warn!(target: "sync", peer = %peer, error = %e, "ride-along discovery failed");
+        }
         Ok(reconciled)
     }
 
@@ -394,19 +406,18 @@ impl SyncEngine {
     /// the initiator side ([`discovery_proto::initiate_discovery`]), learning the
     /// peer's `(MeetingId, ProcessingLifecycle)` for every meeting it holds. Each
     /// received state is emitted on the lifecycle-event surface
-    /// ([`Self::subscribe_lifecycle_events`]) for a consumer to persist; the
-    /// returned ids are the peer's meeting list (the meeting-list discovery — the
-    /// caller reconciles any it lacks via [`Self::sync_notes`] / [`Self::sync_media`]).
+    /// ([`Self::subscribe_lifecycle_events`]) for the ipc-bridge / headless
+    /// subscriber to persist via `persistence::apply_synced_lifecycle_if_present`;
+    /// the returned ids are the peer's meeting list (the meeting-list discovery —
+    /// the caller reconciles any it lacks via [`Self::sync_notes`] /
+    /// [`Self::sync_media`]).
     ///
-    /// TODO(lifecycle-wiring): §7 requires discovery to ride *alongside* a
-    /// meeting's notes/media sync session, so receiving a meeting always brings
-    /// its lifecycle in the same session rather than a skippable separate round.
-    /// This is the standalone transport; the orchestrator wiring that folds it
-    /// into the per-meeting session, and the ipc-bridge/headless subscriber that
-    /// persists the emitted `(MeetingId, ProcessingLifecycle)` via
-    /// `persistence::apply_processing_lifecycle`, are the follow-on steps —
-    /// `discover_with` / [`Self::subscribe_lifecycle_events`] have no non-test
-    /// callers until then.
+    /// Per §7 (`planning/DESIGN_processing-lifecycle.md`) discovery rides
+    /// alongside a full sync: [`Self::push_all_to`] (the hub) and the desktop's
+    /// `sync_now` call this after reconciling a peer's notes/media, so a meeting's
+    /// lifecycle travels in the session it is pushed in rather than a skippable
+    /// separate round. [`Self::discover_all`] drives it as a standalone recovery
+    /// sweep (the hub's periodic re-discovery).
     pub async fn discover_with(&self, peer: impl Into<EndpointAddr>) -> Result<Vec<MeetingId>> {
         let conn = self.connect(peer).await?;
         let result = discovery_proto::initiate_discovery(&conn, &self.meetings_root).await;
@@ -419,6 +430,39 @@ impl SyncEngine {
                 .send((entry.meeting_id, entry.processing));
         }
         Ok(ids)
+    }
+
+    /// Run a discovery exchange with EVERY known peer, relay-addressed (id + the
+    /// configured relay) — the hub's recovery sweep. Mirrors [`Self::push_all_to`]'s
+    /// addressing (a hub reaches its peers through the relay). A per-peer failure is
+    /// logged and skipped; returns how many peers were discovered without error.
+    ///
+    /// This is the scheduled (periodic) re-advertisement that re-applies a
+    /// lifecycle state a consumer dropped (broadcast
+    /// [`broadcast::error::RecvError::Lagged`], recovered on the next sweep) or
+    /// skipped (an advertisement for a meeting not present locally when it fired).
+    /// Each received state is emitted on [`Self::subscribe_lifecycle_events`], the
+    /// same as [`Self::discover_with`].
+    pub async fn discover_all(&self) -> Result<usize> {
+        let relay: RelayUrl = self.relay_url.parse().map_err(|e| {
+            Error::Endpoint(format!(
+                "discover_all needs a relay url, got {:?}: {e}",
+                self.relay_url
+            ))
+        })?;
+        let peers = self.peer_ids();
+        tracing::debug!(target: "sync", count = peers.len(), "sweeping peers for discovery");
+        let mut discovered = 0usize;
+        for peer in peers {
+            let addr = EndpointAddr::new(peer).with_relay_url(relay.clone());
+            match self.discover_with(addr).await {
+                Ok(_) => discovered += 1,
+                Err(e) => {
+                    tracing::warn!(target: "sync", peer = %peer, error = %e, "recovery discovery failed")
+                }
+            }
+        }
+        Ok(discovered)
     }
 
     /// Reconcile one meeting's media (`audio.opus` + note assets) with `peer`:

@@ -49,7 +49,7 @@ pub async fn run_lifecycle_subscriber(
                 )
                 .await
                 {
-                    // Applied; `apply_processing_lifecycle` logs the transition.
+                    // Applied; `apply_synced_lifecycle_if_present` logs the merged state.
                     Ok(true) => {}
                     Ok(false) => tracing::debug!(
                         target: "ipc-bridge",

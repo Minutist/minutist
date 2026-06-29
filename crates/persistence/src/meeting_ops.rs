@@ -208,17 +208,13 @@ pub async fn set_speaker_name(
 /// authoritative copy) under the per-meeting metadata lock: read, set
 /// `processing`, write back.
 ///
-/// The persistence half of the lifecycle consumer. The state is
-/// host-authoritative and arrives over the sync lifecycle exchange; the
-/// subscriber that bridges that exchange to this call lives in a crate that
-/// depends on both `sync` and `persistence` (`ipc-bridge` / `headless`), since
-/// `sync` has no dependency edge to `persistence`. Any racing-claim conflict is
-/// resolved upstream in `sync` (lowest `HostRef` wins) before the winning state
-/// reaches here, so this writes what it is given — overwriting the inbound
-/// placeholder seeded by [`crate::MeetingFolder::ensure`], which starts at
-/// `Local` and never guesses `PendingProcessing`
-/// (`planning/DESIGN_processing-lifecycle.md` §7 Q4). It is also the local
-/// producer for a re-process request (`Processed`/`Local` → `PendingProcessing`).
+/// This is the LOCAL authoritative write: a host setting its OWN state
+/// unconditionally — the placeholder-seed overwrite, or (with the producer-gate)
+/// a host's own claim / lease renewal / `Processed`-on-completion. Inbound
+/// PEER-advertised states do NOT come through here; they go through
+/// [`apply_synced_lifecycle_if_present`], which merges by precedence
+/// ([`notes_crdt::merge_processing`]) so a peer's state can never walk the local
+/// one backwards.
 ///
 /// `processing` is not mirrored in `index.db` (like `speaker_names`), so unlike
 /// [`rename_meeting`] there is no index row to reconcile.
@@ -253,9 +249,11 @@ pub async fn apply_processing_lifecycle(
 /// PEER's meetings, which we may not have synced yet — for those, applying would
 /// be premature (the notes/media receive path seeds the folder, not the
 /// lifecycle stream), so this returns `Ok(false)` rather than erroring. For a
-/// meeting we do hold it applies the state through the same per-meeting metadata
-/// lock and write path as [`apply_processing_lifecycle`] — so the skip-or-apply
-/// decision and the write are atomic against a concurrent writer — and returns
+/// meeting we do hold, the peer-advertised state is MERGED into the local one by
+/// precedence ([`notes_crdt::merge_processing`]) inside one guarded RMW — so a
+/// stale advertisement (an in-flight `PendingProcessing` after a host has
+/// `Claimed`/`Processed` the meeting, or a discovery sweep replaying an old view)
+/// can never walk the local state backwards under last-writer-wins — and returns
 /// `Ok(true)`.
 ///
 /// Keeping this in `persistence` keeps the meeting-folder layout owned here: the
@@ -265,22 +263,27 @@ pub async fn apply_synced_lifecycle_if_present(
     id: MeetingId,
     processing: ProcessingLifecycle,
 ) -> AppResult<bool> {
-    // One lock acquisition covers the presence check + write (skip-if-absent),
-    // so a meeting appearing or disappearing concurrently is handled atomically.
-    let state = lifecycle_state_label(&processing);
-    let applied = update_metadata_if_present(meetings_root, id, |meta| {
-        meta.processing = processing;
-    })?
-    .is_some();
-    if applied {
-        tracing::info!(
-            target: "persistence",
-            meeting_id = %id.0,
-            state,
-            "processing lifecycle applied"
-        );
+    // One lock acquisition covers the presence check + merge-write
+    // (skip-if-absent), so a meeting appearing or disappearing concurrently is
+    // handled atomically. The inbound state is MERGED by precedence, not written
+    // verbatim, so it cannot regress the local state under last-writer-wins. The
+    // closure returns the merged winner's label for an accurate log line.
+    let merged = update_metadata_if_present(meetings_root, id, |meta| {
+        meta.processing = notes_crdt::merge_processing(&meta.processing, processing);
+        lifecycle_state_label(&meta.processing)
+    })?;
+    match merged {
+        Some(state) => {
+            tracing::info!(
+                target: "persistence",
+                meeting_id = %id.0,
+                state,
+                "synced processing lifecycle merged"
+            );
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    Ok(applied)
 }
 
 /// Delete a meeting: remove the folder recursively, then remove the index row.
@@ -525,6 +528,59 @@ mod tests {
         assert_eq!(
             read_metadata(&folder).expect("read after apply").processing,
             processed
+        );
+    }
+
+    /// The precedence merge: a stale inbound `PendingProcessing` must NOT regress
+    /// a meeting the local host has already driven to `Processed`; a `Local`
+    /// meeting still advances on an inbound `PendingProcessing`.
+    #[tokio::test]
+    async fn apply_synced_merges_by_precedence_no_regression() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+
+        // A meeting the local host drove to Processed (local authoritative write).
+        let id = write_meta_with_no_names(root);
+        let folder = root.join(id.0.to_string());
+        let processed = ProcessingLifecycle::Processed {
+            processed_by: HostRef("endpoint-self".to_string()),
+            at: "2026-06-30T10:00:00Z".to_string(),
+        };
+        super::apply_processing_lifecycle(root, id, processed.clone())
+            .await
+            .expect("set processed");
+
+        // A stale peer advertisement (PendingProcessing) merges but must NOT
+        // regress the local Processed.
+        let applied = super::apply_synced_lifecycle_if_present(
+            root,
+            id,
+            ProcessingLifecycle::PendingProcessing,
+        )
+        .await
+        .expect("present meeting merges");
+        assert!(applied, "a present meeting merges (Ok(true))");
+        assert_eq!(
+            read_metadata(&folder).expect("read after merge").processing,
+            processed,
+            "a stale PendingProcessing must not regress a local Processed"
+        );
+
+        // A Local meeting still advances on an inbound PendingProcessing.
+        let other = write_meta_with_no_names(root);
+        super::apply_synced_lifecycle_if_present(
+            root,
+            other,
+            ProcessingLifecycle::PendingProcessing,
+        )
+        .await
+        .expect("advance local");
+        assert_eq!(
+            read_metadata(&root.join(other.0.to_string()))
+                .expect("read other")
+                .processing,
+            ProcessingLifecycle::PendingProcessing,
+            "Local must advance to PendingProcessing"
         );
     }
 }

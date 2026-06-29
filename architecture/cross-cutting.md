@@ -1298,6 +1298,25 @@ own instance-scoped lock registry; its write tools route through
 prior on-disk state) and is intentionally not gated. The race is
 regression-tested in `crates/persistence/tests/metadata_lock_race.rs`.
 
+**Inbound lifecycle precedence (not last-writer-wins).** The lock serialises
+writers but does not order them by *meaning*: a perfectly-serialised inbound apply
+of a peer's stale `processing` would still overwrite a more-advanced local state.
+So `apply_synced_lifecycle_if_present` (the consumer of peer-advertised lifecycle)
+does not write the inbound state verbatim — it MERGES it into the current one by
+precedence via `notes_crdt::merge_processing`: `Processed` > `Claimed` >
+`PendingProcessing` > `Local`, with the two host-stamped states (`Claimed`,
+`Processed`) tie-broken on the lowest `HostRef` — deterministic and
+clock-independent per §7 decision 2 (a same-host `Claimed` re-advert keeps the
+later lease). A stale advertisement (an in-flight `PendingProcessing` after a host has
+`Claimed`/`Processed` the meeting, or a discovery sweep replaying an old view) can
+therefore never walk the local state backwards. `merge_processing` lives in the
+`notes-crdt` leaf so the desktop, the headless hub, and the mobile sync FFI share
+one rule. A LOCAL authoritative write (`apply_processing_lifecycle` — a host
+setting its OWN claim/renewal/`Processed`) is unconditional and does not merge.
+(Deferred: a deliberate `Processed → PendingProcessing` reprocess request is a
+backwards move precedence rejects; it needs a monotonic epoch, which lands with
+that feature.)
+
 ## Voiceprint matching
 
 **Scope (issue #0003).** Cross-session speaker voiceprints: a speaker enrolled

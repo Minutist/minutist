@@ -43,8 +43,8 @@ pub use error::Error;
 pub use folder::MeetingFolder;
 pub use lifecycle::merge_processing;
 pub use metadata::{
-    read_metadata, update_metadata, update_metadata_if_present, write_metadata,
-    write_metadata_atomic,
+    read_metadata, update_metadata, update_metadata_if, update_metadata_if_present, write_metadata,
+    write_metadata_atomic, MetaUpdate,
 };
 pub use metadata_lock::metadata_lock;
 pub use notes::{note_blocks_from_json, NotesData, NotesStore};

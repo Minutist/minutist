@@ -162,3 +162,141 @@ where
     write_metadata(&folder, &meta)?;
     Ok(Some(out))
 }
+
+/// The outcome of a conditional guarded RMW ([`update_metadata_if`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum MetaUpdate<R> {
+    /// The closure committed: it returned `Some(R)` against the current on-disk
+    /// state, and the mutated `metadata.json` was written.
+    Applied(R),
+    /// The closure returned `None`: the current state did not satisfy the
+    /// predicate, so nothing was written (any speculative mutation is discarded).
+    SkippedPredicate,
+    /// The meeting folder has no `metadata.json` (not present locally); the
+    /// closure never ran.
+    SkippedAbsent,
+}
+
+/// Conditional guarded read-modify-write: like [`update_metadata`], but the
+/// closure decides — under the per-meeting lock, against the CURRENT on-disk state
+/// — whether to commit. `f` returns `Some(R)` to write the mutation it made (→
+/// [`MetaUpdate::Applied`]) or `None` to leave `metadata.json` untouched (→
+/// [`MetaUpdate::SkippedPredicate`], discarding any mutation it speculatively made);
+/// an absent meeting yields [`MetaUpdate::SkippedAbsent`] without running `f`.
+///
+/// The predicate test and the mutation happen in ONE closure under ONE lock
+/// acquisition, so there is no read-then-write window a concurrent writer could
+/// slip through — the apply-iff-the-current-state-still-qualifies semantics the
+/// producer-gate's claim / re-assert / renew / reap each need (e.g. "set
+/// `Claimed{self}` only if currently `PendingProcessing` or an expired `Claimed`").
+///
+/// A caller that must OBSERVE the current state on the skip path (e.g. to make a
+/// lease-aware reap decision when the predicate fails) captures it inside `f`
+/// before returning `None`: `f` is handed `&mut MeetingMeta`, so it sees the fresh
+/// on-disk state regardless of which branch it takes.
+///
+/// Synchronous by design (the std-`Mutex` guard is never held across an `.await`),
+/// co-located with [`update_metadata`] and [`metadata_lock`](crate::metadata_lock)
+/// in this leaf so `persistence` and the `election` crate share one implementation.
+pub fn update_metadata_if<F, R>(
+    meetings_root: &Path,
+    id: MeetingId,
+    f: F,
+) -> AppResult<MetaUpdate<R>>
+where
+    F: FnOnce(&mut MeetingMeta) -> Option<R>,
+{
+    let folder = meetings_root.join(id.0.to_string());
+    let lock = crate::metadata_lock(id);
+    let _guard = lock.lock().expect("metadata lock poisoned");
+    if !folder.join("metadata.json").exists() {
+        return Ok(MetaUpdate::SkippedAbsent);
+    }
+    let mut meta = read_metadata(&folder)?;
+    match f(&mut meta) {
+        Some(out) => {
+            write_metadata(&folder, &meta)?;
+            Ok(MetaUpdate::Applied(out))
+        }
+        None => Ok(MetaUpdate::SkippedPredicate),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minutist_common::ProcessingLifecycle;
+
+    fn meeting_dir(root: &Path, id: MeetingId) -> std::path::PathBuf {
+        root.join(id.0.to_string())
+    }
+
+    #[test]
+    fn update_metadata_if_applies_when_predicate_commits() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let id = MeetingId::new();
+        crate::MeetingFolder::ensure(tmp.path(), id).expect("ensure"); // seeds Local
+
+        let out = update_metadata_if(tmp.path(), id, |m| {
+            if matches!(m.processing, ProcessingLifecycle::Local) {
+                m.processing = ProcessingLifecycle::PendingProcessing;
+                Some("claimed")
+            } else {
+                None
+            }
+        })
+        .expect("rmw");
+
+        assert_eq!(out, MetaUpdate::Applied("claimed"));
+        assert_eq!(
+            read_metadata(&meeting_dir(tmp.path(), id))
+                .expect("read")
+                .processing,
+            ProcessingLifecycle::PendingProcessing
+        );
+    }
+
+    #[test]
+    fn update_metadata_if_skips_predicate_observes_state_and_discards_mutation() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let id = MeetingId::new();
+        crate::MeetingFolder::ensure(tmp.path(), id).expect("ensure");
+        update_metadata(tmp.path(), id, |m| {
+            m.processing = ProcessingLifecycle::PendingProcessing;
+        })
+        .expect("seed pending");
+
+        let mut observed = None;
+        let out: MetaUpdate<()> = update_metadata_if(tmp.path(), id, |m| {
+            observed = Some(m.processing.clone());
+            m.title = "speculative".to_string(); // mutate...
+            // Predicate fails (only claim if Local; it is Pending) → skip.
+            if matches!(m.processing, ProcessingLifecycle::Local) {
+                Some(())
+            } else {
+                None // ...the mutation above is discarded
+            }
+        })
+        .expect("rmw");
+
+        assert_eq!(out, MetaUpdate::SkippedPredicate);
+        // The closure saw the fresh on-disk state on the skip path.
+        assert_eq!(observed, Some(ProcessingLifecycle::PendingProcessing));
+        // Nothing was written: the speculative title mutation was discarded and the
+        // processing state is unchanged.
+        let meta = read_metadata(&meeting_dir(tmp.path(), id)).expect("read");
+        assert_eq!(meta.title, "", "a None return must discard the mutation");
+        assert_eq!(meta.processing, ProcessingLifecycle::PendingProcessing);
+    }
+
+    #[test]
+    fn update_metadata_if_skips_absent_meeting_without_running_closure() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let id = MeetingId::new(); // no folder seeded
+        let out: MetaUpdate<()> = update_metadata_if(tmp.path(), id, |_| {
+            panic!("closure must not run for an absent meeting");
+        })
+        .expect("rmw");
+        assert_eq!(out, MetaUpdate::SkippedAbsent);
+    }
+}

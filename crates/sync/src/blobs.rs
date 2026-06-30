@@ -37,8 +37,9 @@
 //! out-of-band over the notes channel ([`crate::media_proto`]); there is no blob
 //! discovery — the peer's [`EndpointId`] plus the hash is all the downloader needs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, FixedOffset};
 use iroh::{Endpoint, EndpointId};
@@ -199,21 +200,37 @@ impl BlobStore {
     ///
     /// - if the per-meeting authority record holds an entry whose hash equals the
     ///   on-disk file's hash, that recorded `(produced_by, produced_at)` is used —
-    ///   the device faithfully relays the authority that arrived WITH the bytes;
+    ///   the device faithfully relays the authority that arrived WITH the bytes,
+    ///   and a present `producer_authority` is IGNORED (a received record always
+    ///   wins, so a consumer's own stale `Processed` cannot re-stamp bytes it did
+    ///   not produce);
     /// - otherwise the bytes were not received over sync (a relay always records on
     ///   receive — see [`record_artifact_authority`]), so THIS device produced
     ///   them: `producer_authority` (the local `Processed { processed_by, at }`
     ///   read from `metadata.json`) supplies the stamp, recorded so a later relay
-    ///   is faithful. This fallback is byte-coherent only because, in the
-    ///   single-producer-per-meeting topology this cut targets, a producer's own
-    ///   `metadata.json` `Processed` matches the bytes it wrote (the producer-gate
-    ///   that would otherwise admit a second producer is unbuilt — DESIGN §7).
+    ///   is faithful.
+    ///
+    /// The producer fallback is byte-coherent only under the single-producer-
+    /// per-meeting topology this cut targets: a producer's own `metadata.json`
+    /// `Processed` matches the bytes it wrote. It rests on the record-on-receive
+    /// invariant — which holds because every sync receive records authority under
+    /// the per-meeting lock (so a consumer's bytes always carry a matching record
+    /// and never reach the fallback). The fully-robust guard (mint only when the
+    /// local `Processed.processed_by` is THIS device's own host) needs the
+    /// producer-gate's `processed_by` convention, which is unbuilt (DESIGN §7) —
+    /// no production path flips a meeting to `Processed` yet, so the fallback is
+    /// exercised only by tests and the future producer-gate.
     ///
     /// An artifact present on disk for which neither path establishes authority
     /// (bytes exist, no matching record, the meeting is not locally `Processed`) is
     /// NOT advertised — the device will not stamp bytes it cannot date. A meeting
     /// with no artifact files yields an empty manifest (a zero-segment or
     /// not-yet-summarised `Processed` meeting has nothing to send — not an error).
+    ///
+    /// The two awaited blob imports run first; the authority read-modify-write then
+    /// runs under the per-meeting artifact-authority lock (off the await points), so
+    /// two concurrent exchanges for the same meeting cannot lose each other's record
+    /// — see [`with_artifact_authority`].
     pub async fn import_artifacts(
         &self,
         meetings_root: &Path,
@@ -221,10 +238,10 @@ impl BlobStore {
         producer_authority: Option<(HostRef, String)>,
     ) -> Result<ArtifactManifest> {
         let folder = meetings_root.join(meeting_id.0.to_string());
-        let mut authority = load_artifact_authority(meetings_root, meeting_id);
-        let mut dirty = false;
-        let mut entries = Vec::new();
 
+        // Phase 1 (awaited): import each present artifact into the blob store and
+        // pin its tag, collecting the (rel, hash) pairs. No authority decision yet.
+        let mut imported: Vec<(&'static str, Hash)> = Vec::new();
         for rel in ARTIFACT_RELS {
             let path = folder.join(rel);
             if !path.is_file() {
@@ -232,38 +249,45 @@ impl BlobStore {
             }
             let hash = self.import_path(&path).await?;
             self.tag(&artifact_tag(meeting_id, rel), hash).await?;
-
-            let (produced_by, produced_at) = match authority.recorded_for(rel, hash) {
-                Some(rec) => (rec.produced_by.clone(), rec.produced_at.clone()),
-                None => match &producer_authority {
-                    Some((by, at)) => {
-                        authority.record(rel, hash, by.clone(), at.clone());
-                        dirty = true;
-                        (by.clone(), at.clone())
-                    }
-                    None => {
-                        tracing::debug!(
-                            target: "sync",
-                            meeting_id = %meeting_id.0,
-                            rel,
-                            "artifact present but no provable authority (not synced-in, not locally Processed); not advertising"
-                        );
-                        continue;
-                    }
-                },
-            };
-
-            entries.push(ArtifactEntry {
-                rel_path: rel.to_string(),
-                hash,
-                produced_by,
-                produced_at,
-            });
+            imported.push((rel, hash));
         }
 
-        if dirty {
-            save_artifact_authority(meetings_root, meeting_id, &authority)?;
-        }
+        // Phase 2 (synchronous, under the per-meeting lock): resolve each imported
+        // artifact's authority against the stored record, falling back to the
+        // producer authority, and persist any newly-minted records atomically.
+        let entries = with_artifact_authority(meetings_root, meeting_id, |authority| {
+            let mut dirty = false;
+            let mut entries = Vec::new();
+            for &(rel, hash) in &imported {
+                let (produced_by, produced_at) = match authority.recorded_for(rel, hash) {
+                    Some(rec) => (rec.produced_by.clone(), rec.produced_at.clone()),
+                    None => match &producer_authority {
+                        Some((by, at)) => {
+                            authority.record(rel, hash, by.clone(), at.clone());
+                            dirty = true;
+                            (by.clone(), at.clone())
+                        }
+                        None => {
+                            tracing::debug!(
+                                target: "sync",
+                                meeting_id = %meeting_id.0,
+                                rel,
+                                "artifact present but no provable authority (not synced-in, not locally Processed); not advertising"
+                            );
+                            continue;
+                        }
+                    },
+                };
+                entries.push(ArtifactEntry {
+                    rel_path: rel.to_string(),
+                    hash,
+                    produced_by,
+                    produced_at,
+                });
+            }
+            (dirty, entries)
+        })?;
+
         Ok(ArtifactManifest { entries })
     }
 
@@ -272,10 +296,12 @@ impl BlobStore {
     /// pinning it with the per-meeting artifact tag.
     ///
     /// `rel` is re-validated against the artifact allow-list (defence in depth — the
-    /// manifest was validated whole). The export goes to a sibling `{rel}.tmp` then
-    /// atomically renames over the target, so a concurrent reader of
-    /// `transcript.json` (read far more often than `audio.opus`) never observes a
-    /// partial file. The caller ensures the meeting folder via
+    /// manifest was validated whole). The export goes to a sibling `{rel}.tmp` which
+    /// is fsynced then atomically renamed over the target (the durable tmp+fsync+
+    /// rename the rest of the codebase uses for `transcript.json` / `summary.md`), so
+    /// a concurrent reader of `transcript.json` (read far more often than
+    /// `audio.opus`) never observes a partial file and a crash cannot commit a
+    /// truncated one. The caller ensures the meeting folder via
     /// `notes_crdt::MeetingFolder::ensure` and records the received authority (it
     /// holds the peer entry's `produced_by`/`produced_at`); this writes only the
     /// artifact file.
@@ -310,7 +336,15 @@ impl BlobStore {
             .export(hash, &tmp)
             .await
             .map_err(|e| Error::Protocol(format!("exporting artifact {hash} to {tmp:?}: {e}")))?;
+        // fsync the exported tmp so the rename below cannot commit a name that
+        // points at not-yet-durable bytes (matches persistence's atomic writers).
+        std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Error::Protocol(format!("fsyncing artifact tmp {tmp:?}: {e}")))?;
         std::fs::rename(&tmp, &target).map_err(|e| {
+            // Leave no tmp residue on a failed rename (the next download overwrites
+            // it regardless, but a directory-scanning slice should not see it).
+            let _ = std::fs::remove_file(&tmp);
             Error::Protocol(format!("atomically renaming {tmp:?} -> {target:?}: {e}"))
         })?;
         self.tag(&artifact_tag(meeting_id, rel), hash).await?;
@@ -538,15 +572,25 @@ pub struct ArtifactEntry {
 impl ArtifactEntry {
     /// Whether `self` should overwrite `other` for the same `rel_path`: strictly
     /// newer by `produced_at` (parsed to an instant), ties broken by the LOWEST
-    /// `produced_by` HostRef. Clock-independent on the tiebreak and matching the
-    /// lifecycle merge's two-`Processed` rule (`notes_crdt::merge_processing`), so
-    /// the lifecycle edge and the on-disk bytes name one authoritative host. NEVER
-    /// `>=` (a same-`produced_at`, different-content pair must not pull on both
-    /// sides — DESIGN §2 C2) and NEVER a raw-string compare (mixed fractional
-    /// precision / offset sorts wrong). A malformed timestamp on EITHER side is
-    /// treated as not-superseding, so a parse glitch can only keep local bytes,
-    /// never clobber them. Callers short-circuit equal hashes (identical bytes
-    /// never need pulling) before consulting this.
+    /// `produced_by` HostRef. NEVER `>=` (a same-`produced_at`, different-content
+    /// pair must not pull on both sides — DESIGN §2 C2) and NEVER a raw-string
+    /// compare (mixed fractional precision / offset sorts wrong). A malformed
+    /// timestamp on EITHER side is treated as not-superseding, so a parse glitch
+    /// can only keep local bytes, never clobber them. Callers short-circuit equal
+    /// hashes (identical bytes never need pulling) before consulting this.
+    ///
+    /// This is the BYTES order: newest `produced_at` wins, so a reprocess by ANY
+    /// host (even a higher HostRef) supersedes an older copy. It shares only the
+    /// lowest-`HostRef` TIEBREAK with `notes_crdt::merge_processing`'s two-`Processed`
+    /// rule — NOT the whole order: that merge is clock-INDEPENDENT (lowest HostRef
+    /// regardless of timestamp, §7 D2, so the lifecycle state converges without
+    /// trusting clocks), whereas this is clock-dependent by design (newest bytes
+    /// win). Under a single producer per meeting the two never disagree (one host
+    /// stamps both the lifecycle and the bytes); only a cross-host reprocess —
+    /// which the unbuilt producer-gate gates against — could make `metadata.json`'s
+    /// `processed_by` name a different host than the on-disk `produced_by`. The
+    /// pull is byte-authoritative and never consults `metadata.json`, so that
+    /// divergence can never cause a clobber here.
     pub(crate) fn supersedes(&self, other: &ArtifactEntry) -> bool {
         match (
             parse_produced_at(&self.produced_at),
@@ -632,7 +676,9 @@ const ARTIFACT_AUTHORITY_SUBDIR: &str = "artifacts";
 /// `{meetings_root}/.blobs/artifacts/{meeting_id}.json`, written whenever an
 /// artifact's bytes are written (received over sync, or first advertised by the
 /// producer), so a device re-advertises the authority that arrived WITH the bytes
-/// rather than one re-derived from `metadata.json` (DESIGN §2 C1).
+/// rather than one re-derived from `metadata.json` (DESIGN §2 C1). Every
+/// read-modify-write goes through [`with_artifact_authority`] under the per-meeting
+/// lock, so concurrent exchanges for one meeting cannot lose each other's record.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct ArtifactAuthority {
     /// `rel_path` -> the authority recorded for the bytes last written at that path.
@@ -721,11 +767,59 @@ fn save_artifact_authority(
         .map_err(|e| Error::Protocol(format!("atomically renaming {tmp:?} -> {path:?}: {e}")))
 }
 
+/// Process-wide registry of per-meeting artifact-authority-store mutexes — the
+/// `.blobs/artifacts/{id}.json` analogue of `notes_crdt::metadata_lock`'s
+/// `metadata.json` registry. A separate registry (not a reuse of the metadata
+/// lock) so an artifact exchange and a `metadata.json` RMW for the same meeting do
+/// not needlessly serialise against each other.
+///
+/// Each `MeetingId` gets its own `Mutex<()>`; the map grows by one tiny entry per
+/// meeting touched and is never reclaimed (the same bounded-by-meeting-count growth
+/// the metadata-lock registry accepts).
+static ARTIFACT_AUTHORITY_LOCKS: OnceLock<Mutex<HashMap<MeetingId, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+/// Return (or lazily create) the per-meeting artifact-authority-store lock.
+fn artifact_authority_lock(meeting_id: MeetingId) -> Arc<Mutex<()>> {
+    ARTIFACT_AUTHORITY_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("ARTIFACT_AUTHORITY_LOCKS registry poisoned")
+        .entry(meeting_id)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// Run a read-modify-write on a meeting's artifact-authority record under the
+/// per-meeting lock, so two concurrent artifact exchanges for the same meeting (two
+/// inbound pulls on a hub, or an inbound pull racing an outbound push) cannot lose
+/// each other's authority update via a stale load. `f` receives the loaded record
+/// and returns `(dirty, value)`; the record is saved (atomically) iff `dirty`.
+///
+/// The lock is a [`std::sync::Mutex`] held only across the synchronous load →
+/// mutate → save — never across an `.await` (the awaited blob download/import
+/// happens before this is called), so it adds no async-runtime entanglement.
+fn with_artifact_authority<R>(
+    meetings_root: &Path,
+    meeting_id: MeetingId,
+    f: impl FnOnce(&mut ArtifactAuthority) -> (bool, R),
+) -> Result<R> {
+    let lock = artifact_authority_lock(meeting_id);
+    let _guard = lock.lock().expect("artifact-authority lock poisoned");
+    let mut authority = load_artifact_authority(meetings_root, meeting_id);
+    let (dirty, value) = f(&mut authority);
+    if dirty {
+        save_artifact_authority(meetings_root, meeting_id, &authority)?;
+    }
+    Ok(value)
+}
+
 /// Record the authority for an artifact's received bytes — called after
 /// [`BlobStore::download_artifact`] with the peer entry's `produced_by` /
 /// `produced_at`, so a future [`BlobStore::import_artifacts`] on this device
 /// faithfully re-advertises the authority that arrived with the bytes rather than
-/// re-deriving it from `metadata.json`.
+/// re-deriving it from `metadata.json`. The read-modify-write runs under the
+/// per-meeting lock ([`with_artifact_authority`]).
 pub(crate) fn record_artifact_authority(
     meetings_root: &Path,
     meeting_id: MeetingId,
@@ -734,9 +828,10 @@ pub(crate) fn record_artifact_authority(
     produced_by: HostRef,
     produced_at: String,
 ) -> Result<()> {
-    let mut authority = load_artifact_authority(meetings_root, meeting_id);
-    authority.record(rel, hash, produced_by, produced_at);
-    save_artifact_authority(meetings_root, meeting_id, &authority)
+    with_artifact_authority(meetings_root, meeting_id, |authority| {
+        authority.record(rel, hash, produced_by, produced_at);
+        (true, ())
+    })
 }
 
 #[cfg(test)]
@@ -982,5 +1077,47 @@ mod tests {
             changed.entries.is_empty(),
             "changed bytes with no provable authority must not be advertised"
         );
+    }
+
+    /// A faithful authority record (the state a device is in after RECEIVING bytes)
+    /// overrides a present `producer_authority`. This is the W-2 guard: a consumer
+    /// whose `metadata.json` advanced to `Processed` via discovery must NOT re-stamp
+    /// the bytes it received from its own (stale, not byte-coherent) `Processed` —
+    /// the recorded authority that arrived WITH the bytes wins.
+    #[tokio::test]
+    async fn recorded_authority_overrides_producer_authority() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = BlobStore::open(root).await.expect("open store");
+        let id = MeetingId::new();
+        let folder = root.join(id.0.to_string());
+        std::fs::create_dir_all(&folder).expect("mk folder");
+        std::fs::write(folder.join("transcript.json"), b"[]").expect("write transcript");
+
+        // First import records (host-a, T1) for the on-disk bytes (producer
+        // fallback) — standing in for the authority a receive would have recorded.
+        store
+            .import_artifacts(
+                root,
+                id,
+                Some((HostRef("host-a".to_string()), "2026-06-30T10:00:00Z".to_string())),
+            )
+            .await
+            .expect("seed record");
+
+        // A later import offering a DIFFERENT producer_authority (host-b, T2) — e.g.
+        // a device whose metadata.json advanced via discovery — must NOT re-stamp:
+        // the recorded (host-a, T1) wins because it matches the on-disk bytes.
+        let m = store
+            .import_artifacts(
+                root,
+                id,
+                Some((HostRef("host-b".to_string()), "2026-06-30T11:00:00Z".to_string())),
+            )
+            .await
+            .expect("reimport");
+        assert_eq!(m.entries.len(), 1);
+        assert_eq!(m.entries[0].produced_by, HostRef("host-a".to_string()));
+        assert_eq!(m.entries[0].produced_at, "2026-06-30T10:00:00Z");
     }
 }

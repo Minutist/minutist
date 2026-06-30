@@ -961,6 +961,13 @@ model, and token→word/segment timestamp aggregation.
 per-word `start_ms`/`end_ms` populated** — the token-level timestamps the mtmd
 path cannot produce.
 
+**Output guard.** A chunk whose decode is a degenerate repetition runaway — one
+word exceeding 50% of the output, or (over ≥ 8 words) a distinct-word ratio
+below 0.35 — yields **no** segment. Discontinuous/starved audio (a dropped-frame
+burst) drives the transducer to loop a word or clause; dropping the window keeps
+the hallucinated loop out of the transcript, summary, and RAG index. This is the
+Parakeet counterpart to the `asr-runtime` plausibility check.
+
 **Why a separate crate.** Keeps the single-domain rule: `asr-runtime` is the
 llama-cpp-2/Qwen domain; `asr-parakeet` is the sherpa-onnx/Parakeet domain.
 sherpa-onnx already enters the workspace via `diarizer`; this is its second

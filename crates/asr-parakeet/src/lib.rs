@@ -31,6 +31,21 @@ const FEATURE_DIM: i32 = 80;
 /// Manifest id, used only in error context.
 const MODEL_ID: &str = "parakeet-tdt-0.6b-v3-int8";
 
+/// Minimum word count before the single-word-runaway branch of
+/// [`is_degenerate_repetition`] fires — short utterances ("yeah yeah yeah") are
+/// legitimate even when one word dominates.
+const REPEAT_MIN_WORDS: usize = 5;
+/// Single-word runaway: one word accounting for more than this fraction of a
+/// string of at least `REPEAT_MIN_WORDS` words is degenerate.
+const SINGLE_WORD_DOMINANCE: f32 = 0.5;
+/// Minimum word count before the repeated-phrase branch fires; a healthy clause
+/// is rarely this long with so few distinct words.
+const PHRASE_MIN_WORDS: usize = 8;
+/// Repeated-phrase runaway: a distinct-word-to-total ratio below this (over at
+/// least `PHRASE_MIN_WORDS` words) means a whole clause is looping even though
+/// no single word dominates.
+const PHRASE_DISTINCT_RATIO: f32 = 0.35;
+
 /// Construction inputs for [`ParakeetBackend`].
 #[derive(Debug, Clone)]
 pub struct ParakeetConfig {
@@ -211,6 +226,19 @@ impl minutist_common::AsrBackend for ParakeetBackend {
         if text.is_empty() {
             return Ok(vec![]);
         }
+        // Drop a runaway-repetition chunk rather than pour a hallucinated loop
+        // into the transcript: starved/discontinuous audio (e.g. a dropped-frame
+        // burst) makes the decoder repeat a word or clause indefinitely.
+        if is_degenerate_repetition(&text) {
+            tracing::warn!(
+                target = "asr-parakeet",
+                start_ms = chunk.start_ms,
+                end_ms = chunk.end_ms,
+                text_chars = text.chars().count(),
+                "dropping degenerate (repetition-runaway) ASR output — likely starved/discontinuous audio"
+            );
+            return Ok(vec![]);
+        }
         let words = aggregate_words(&tokens, &timestamps, chunk.start_ms, chunk.end_ms);
 
         // Log the length, never the text: transcript content must not enter the
@@ -237,6 +265,50 @@ impl minutist_common::AsrBackend for ParakeetBackend {
             shared_speakers: Vec::new(),
         }])
     }
+}
+
+/// Detect degenerate ASR output — model runaway that emits the same word or
+/// phrase repeatedly. Returns `true` when the chunk should be dropped rather
+/// than poured into the transcript (and thence the summary and RAG index).
+///
+/// Two failure modes, both seen when the audio feed is discontinuous (dropped
+/// frames starve the decoder): a single word looping ("the the the …") and a
+/// whole clause looping ("scope of work is significant. scope of work is
+/// significant. …"). The first is caught by single-word dominance; the second
+/// by a low ratio of distinct words to total — which a single healthy sentence
+/// never trips. Words are lower-cased and stripped of surrounding punctuation
+/// so "word," and "word" count as one token.
+fn is_degenerate_repetition(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    let total = words.len();
+    if total < REPEAT_MIN_WORDS {
+        return false;
+    }
+
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for w in &words {
+        *counts.entry(w.as_str()).or_insert(0) += 1;
+    }
+
+    // Single-word runaway.
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    if (max_count as f32) / (total as f32) > SINGLE_WORD_DOMINANCE {
+        return true;
+    }
+
+    // Repeated-phrase runaway: few distinct words relative to the total.
+    if total >= PHRASE_MIN_WORDS && (counts.len() as f32) / (total as f32) < PHRASE_DISTINCT_RATIO {
+        return true;
+    }
+
+    false
 }
 
 unsafe fn cptr_to_string(p: *const std::os::raw::c_char) -> String {
@@ -330,5 +402,41 @@ mod tests {
     #[test]
     fn empty_tokens_yield_no_words() {
         assert!(aggregate_words(&[], &[], 0, 1_000).is_empty());
+    }
+
+    #[test]
+    fn degenerate_rejects_single_word_runaway() {
+        // The classic decoder loop: one word emitted over and over.
+        assert!(is_degenerate_repetition(&"the ".repeat(10)));
+        // Punctuation- and case-insensitive: "X. x. X." is still one word.
+        assert!(is_degenerate_repetition("Yeah. yeah. YEAH. yeah. yeah. yeah."));
+    }
+
+    #[test]
+    fn degenerate_rejects_repeated_phrase_runaway() {
+        // A whole clause looping — no single word exceeds 50%, but the distinct
+        // ratio is far below threshold (5 distinct words across 25).
+        assert!(is_degenerate_repetition(
+            &"scope of work is significant. ".repeat(5)
+        ));
+    }
+
+    #[test]
+    fn degenerate_accepts_healthy_speech() {
+        // A normal varied sentence is not degenerate.
+        assert!(!is_degenerate_repetition(
+            "we should confirm the staging budget before the load test runs next week"
+        ));
+        // Legitimate incidental repetition ("the" twice) stays under threshold.
+        assert!(!is_degenerate_repetition(
+            "the cat sat on the mat while we talked"
+        ));
+    }
+
+    #[test]
+    fn degenerate_ignores_short_utterances() {
+        // Below REPEAT_MIN_WORDS: short confirmations are never degenerate even
+        // when one word dominates.
+        assert!(!is_degenerate_repetition("okay okay sure"));
     }
 }

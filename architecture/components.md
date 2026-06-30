@@ -38,7 +38,7 @@ appears in:
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
 | `sync` | WS4-B | `common`, `notes-crdt` |
-| `sync-ffi` | WS4-B (phone) | `common`, `sync` ¶ |
+| `sync-ffi` | WS4-B (phone) | `common`, `sync`, `notes-crdt` ¶ |
 | `doc-convert` | Attachments WS | `common` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
@@ -111,13 +111,18 @@ pinned 1.91 toolchain), bundled by gradle. It is **mobile-only**: NOT linked by
 **unconditional** (compiled by `cargo build --workspace`), like `sync` /
 `tunnel-client`; no desktop artefact links it. It takes no workspace edge beyond
 `common` (the wire types it maps at the boundary — `MeetingId`,
-`ProcessingLifecycle`) and `sync` (the engine it wraps); the phone data layer
-adds `notes-crdt` in a later step (a table-update commit at that time). It takes
+`ProcessingLifecycle`, `MeetingMeta`, `Segment`), `sync` (the engine it wraps),
+and `notes-crdt` (the C-free leaf the phone data layer rides — `MeetingFolder`,
+`NotesStore`, and the lifted `read_metadata` / `write_metadata` /
+`update_metadata_if_present` + `merge_processing` — so save / list / get +
+lifecycle-apply stay off `persistence`'s C-heavy graph). It takes
 **no `iroh` dependency of its own** — peers are addressed by passing hex id
 strings to `SyncEngine`'s string-keyed `*_to_peer` methods, which relay-address
 them internally (like `push_all_to`), so no `iroh` type crosses the UniFFI
 boundary and there is no version-lockstep to hand-maintain. Third-party:
-`uniffi` (binding generation). Because Option A wraps OUR `SyncEngine` (not
+`uniffi` (binding generation) and `chrono` (epoch-ms ↔ RFC 3339 for the meeting
+timestamps the phone model carries as numbers; same workspace pin as
+`notes-crdt`, no new transitive crate). Because Option A wraps OUR `SyncEngine` (not
 upstream `iroh-ffi`), `iroh-blobs` stays encapsulated behind `sync_media` /
 `import_media` and needs no separate FFI surface. The wrapper owns its tokio
 runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS

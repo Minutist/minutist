@@ -36,9 +36,15 @@ path = "src/bin/uniffi-bindgen.rs"
 [dependencies]
 # The crate this wraps. Its public `SyncEngine` is the entire FFI surface.
 sync = { path = "../sync" }
-# The wire types `SyncEngine` surfaces (`MeetingId`, `ProcessingLifecycle`),
-# mapped to FFI-facing strings/records at the boundary.
+# The wire types `SyncEngine` surfaces (`MeetingId`, `ProcessingLifecycle`,
+# `MeetingMeta`, `Segment`, `AudioFormat`), mapped to FFI-facing records at the
+# boundary.
 minutist-common = { path = "../common" }
+# The C-free leaf the phone data layer rides: `MeetingFolder::ensure`,
+# `NotesStore`, and the lifted `read_metadata` / `write_metadata` /
+# `update_metadata_if_present` + `merge_processing` — so save / list / get +
+# lifecycle-apply stay off `persistence`'s C-heavy graph (issue 0016).
+notes-crdt = { path = "../notes-crdt" }
 # UniFFI binding generation. `cli` provides `uniffi_bindgen_main` for the
 # library-mode bindgen binary above.
 uniffi = { version = "0.31", features = ["cli"] }
@@ -51,3 +57,13 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 # Parse meeting-id strings off the boundary back into `MeetingId(Uuid)`.
 uuid = { workspace = true }
+# Epoch-ms <-> RFC3339 for the meeting timestamps: the phone model carries them
+# as numbers, `metadata.json` stores ISO strings. Same workspace pin as
+# notes-crdt — no new transitive crate.
+chrono = { workspace = true }
+# Build the captured note's ProseMirror doc + parse `transcript.json` off disk.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# Tempdir meetings-root for the data-layer projection / save tests.
+tempfile = "3"

@@ -31,7 +31,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use minutist_common::{MeetingId, ProcessingLifecycle};
+use minutist_common::{AppError, AudioFormat, MeetingId, MeetingMeta, ProcessingLifecycle, Segment};
+use notes_crdt::{MeetingFolder, NotesStore};
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -60,6 +61,10 @@ pub enum SyncFfiError {
     /// A filesystem / runtime io operation failed.
     #[error("io: {msg}")]
     Io { msg: String },
+    /// A meeting-folder read/write (the phone data layer) failed — metadata /
+    /// transcript / notes serialisation or storage.
+    #[error("data: {msg}")]
+    Data { msg: String },
     /// An argument off the boundary did not parse (e.g. a meeting-id string).
     #[error("invalid argument: {msg}")]
     InvalidArg { msg: String },
@@ -76,6 +81,27 @@ impl From<sync::Error> for SyncFfiError {
             sync::Error::Identity(msg) => SyncFfiError::Identity { msg },
             sync::Error::Io(e) => SyncFfiError::Io { msg: e.to_string() },
         }
+    }
+}
+
+impl From<AppError> for SyncFfiError {
+    /// The notes-crdt data-layer helpers (`MeetingFolder` / `NotesStore` /
+    /// `read_metadata` / `update_metadata_if_present`) surface
+    /// [`minutist_common::AppError`]. An io failure keeps the retryable `Io`
+    /// category; everything else (serialisation, invalid state) is `Data`.
+    fn from(e: AppError) -> Self {
+        match e {
+            AppError::Io { context } => SyncFfiError::Io { msg: context },
+            other => SyncFfiError::Data {
+                msg: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<notes_crdt::Error> for SyncFfiError {
+    fn from(e: notes_crdt::Error) -> Self {
+        SyncFfiError::from(AppError::from(e))
     }
 }
 
@@ -116,6 +142,66 @@ impl From<ProcessingLifecycle> for FfiLifecycle {
     }
 }
 
+/// One transcript segment in the phone's view of a synced meeting. Mirrors the
+/// mobile `TranscriptSegment`: `speaker_index` is 1-based into
+/// [`FfiMeeting::Synced`]'s `speakers` palette (`0` when the segment carries no
+/// diarised speaker).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSegment {
+    pub speaker_index: u32,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+/// The capture-lifecycle sub-state of a [`FfiMeeting::Captured`] meeting — the two
+/// states the phone holds before results arrive (mirrors the mobile model's
+/// `processing: 'pending' | 'claimed'`).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiCaptureState {
+    /// Offered for a host to adopt (`PendingProcessing`).
+    Pending,
+    /// A host is producing the derived outputs (`Claimed`).
+    Claimed,
+}
+
+/// The phone's view of a meeting — the two mutually-exclusive states the mobile
+/// `Meeting` union carries. Projected from the meeting folder by
+/// [`project_meeting`]: a meeting awaiting results (`PendingProcessing` /
+/// `Claimed`) is [`Self::Captured`]; one whose outputs exist (`Processed`, or the
+/// desktop-only `Local`) is [`Self::Synced`].
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiMeeting {
+    /// Recorded here (or on a delegating device), awaiting processing.
+    Captured {
+        id: String,
+        title: String,
+        started_at_ms: i64,
+        duration_ms: i64,
+        /// `audio.opus` is present in the folder.
+        has_audio: bool,
+        /// `notes.ydoc` is present in the folder.
+        has_notes: bool,
+        processing: FfiCaptureState,
+        /// The `HostRef` string a host stamped when `Claimed` (resolution to a
+        /// friendly name is the caller's — see the mobile `claimedBy` doc).
+        claimed_by: Option<String>,
+    },
+    /// Processed and synced back: derived outputs are present and read-only here.
+    Synced {
+        id: String,
+        title: String,
+        started_at_ms: i64,
+        transcript: Vec<FfiSegment>,
+        summary: Option<String>,
+        /// Display labels indexed from 1 (`speakers[i-1]` for `speaker_index = i`).
+        speakers: Vec<String>,
+        /// The authoritative `notes.ydoc` as Yjs v1 update bytes (opaque — render
+        /// via a Yjs doc), or `None` when the meeting has no notes.
+        notes: Option<Vec<u8>>,
+    },
+}
+
 /// Foreign-implemented sink for discovery lifecycle events. The wrapper drains
 /// [`SyncEngine::subscribe_lifecycle_events`] and invokes this for each
 /// `(meeting, lifecycle)`. On [`Self::on_lagged`] the consumer recovers by
@@ -149,6 +235,11 @@ pub struct FfiSyncEngine {
     /// concurrently on the multi-thread runtime.
     inner: Mutex<Option<Arc<SyncEngine>>>,
     rt: Arc<Runtime>,
+    /// The per-meeting `{uuid}` folder root, kept for the data-layer methods
+    /// (save / list / get) and the inbound lifecycle-apply — they read and write
+    /// `metadata.json` directly via the C-free notes-crdt primitives, independent
+    /// of the engine's transport.
+    meetings_root: PathBuf,
 }
 
 #[uniffi::export]
@@ -176,16 +267,18 @@ impl FfiSyncEngine {
             })?;
 
         let identity = DeviceIdentity::load_or_generate(Path::new(&app_data_dir))?;
+        let meetings_root = PathBuf::from(meetings_root);
         let config = SyncConfig {
             relay_url,
             relay_auth_token,
-            meetings_root: PathBuf::from(meetings_root),
+            meetings_root: meetings_root.clone(),
         };
         let engine = rt.block_on(SyncEngine::start(config, identity))?;
 
         Ok(Arc::new(Self {
             inner: Mutex::new(Some(Arc::new(engine))),
             rt: Arc::new(rt),
+            meetings_root,
         }))
     }
 
@@ -227,6 +320,48 @@ impl FfiSyncEngine {
             .collect())
     }
 
+    /// Persist a freshly-recorded meeting as captured-unprocessed and return its
+    /// new id (a hyphenated UUID string). Writes `metadata.json` (as
+    /// `PendingProcessing`), optionally copies `audio_src_path` to the folder's
+    /// `audio.opus` (the Kotlin layer pre-materialises the Opus file), and — when
+    /// `notes_text` is non-empty — seeds `notes.ydoc` from it. `started_at_ms` is
+    /// Unix epoch milliseconds. Does not require a started engine — purely local.
+    pub fn save_captured(
+        &self,
+        title: String,
+        started_at_ms: i64,
+        duration_ms: i64,
+        audio_src_path: Option<String>,
+        notes_text: String,
+    ) -> Result<String, SyncFfiError> {
+        save_captured_to(
+            &self.meetings_root,
+            &title,
+            started_at_ms,
+            duration_ms,
+            audio_src_path.as_deref(),
+            &notes_text,
+        )
+    }
+
+    /// Every meeting this device holds, projected to the phone model, newest
+    /// first (by start time). A folder that fails to read is skipped, not fatal.
+    pub fn list_meetings(&self) -> Result<Vec<FfiMeeting>, SyncFfiError> {
+        let mut meetings: Vec<FfiMeeting> = notes_crdt::folder::list_meeting_ids(&self.meetings_root)
+            .into_iter()
+            .filter_map(|id| project_meeting(&self.meetings_root, id))
+            .collect();
+        meetings.sort_by_key(|m| std::cmp::Reverse(started_at_ms_of(m)));
+        Ok(meetings)
+    }
+
+    /// Project a single meeting by id, or `None` if its folder is absent /
+    /// unreadable.
+    pub fn get_meeting(&self, meeting_id: String) -> Result<Option<FfiMeeting>, SyncFfiError> {
+        let id = parse_meeting(&meeting_id)?;
+        Ok(project_meeting(&self.meetings_root, id))
+    }
+
     /// Reconcile one meeting's notes with a paired peer (blocking).
     pub fn sync_notes(&self, peer_id: String, meeting_id: String) -> Result<(), SyncFfiError> {
         let engine = self.engine()?;
@@ -262,9 +397,19 @@ impl FfiSyncEngine {
         listener: Box<dyn LifecycleListener>,
     ) -> Result<(), SyncFfiError> {
         let rx = self.engine()?.subscribe_lifecycle_events();
+        let meetings_root = self.meetings_root.clone();
         spawn_drain(rx, move |item| match item {
             Drained::Event((meeting, lifecycle)) => {
-                listener.on_lifecycle(meeting.0.to_string(), lifecycle.into())
+                let id_str = meeting.0.to_string();
+                // Persist the inbound state to our local metadata.json FIRST,
+                // then notify the UI to re-snapshot — mirroring the desktop's
+                // apply_synced_lifecycle_if_present, persistence-free on the lifted
+                // notes-crdt primitives (merge by precedence so a stale advert
+                // cannot regress local state; a meeting we don't hold yet is
+                // skipped). The drain runs on a dedicated OS thread, so this sync
+                // RMW is fine.
+                apply_inbound_lifecycle(&meetings_root, meeting, lifecycle.clone());
+                listener.on_lifecycle(id_str, lifecycle.into());
             }
             Drained::Lagged => listener.on_lagged(),
         });
@@ -342,6 +487,252 @@ where
     });
 }
 
+// ---------------------------------------------------------------------------
+// Phone data layer (persistence-free): save / project / lifecycle-apply over the
+// meeting folder, on the C-free notes-crdt primitives. Factored as free fns so
+// they are testable against a tempdir root without a started `FfiSyncEngine`.
+// ---------------------------------------------------------------------------
+
+/// The `started_at_ms` of either [`FfiMeeting`] variant (for list ordering).
+fn started_at_ms_of(m: &FfiMeeting) -> i64 {
+    match m {
+        FfiMeeting::Captured { started_at_ms, .. } | FfiMeeting::Synced { started_at_ms, .. } => {
+            *started_at_ms
+        }
+    }
+}
+
+/// Unix epoch milliseconds → an RFC 3339 UTC string (the form `metadata.json`
+/// stores). Falls back to the epoch on an out-of-range input rather than failing.
+fn ms_to_rfc3339(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .unwrap_or_default()
+        .to_rfc3339()
+}
+
+/// An RFC 3339 timestamp → Unix epoch milliseconds, or `0` if it does not parse
+/// (a meeting with an unreadable timestamp still lists, sorted oldest).
+fn rfc3339_to_ms(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// Write a captured-unprocessed meeting (the [`FfiSyncEngine::save_captured`] body,
+/// factored out for direct testing). Returns the new meeting id string.
+fn save_captured_to(
+    meetings_root: &Path,
+    title: &str,
+    started_at_ms: i64,
+    duration_ms: i64,
+    audio_src_path: Option<&str>,
+    notes_text: &str,
+) -> Result<String, SyncFfiError> {
+    let id = MeetingId::new();
+    let folder = MeetingFolder::ensure(meetings_root, id)?;
+
+    // All-or-nothing: roll back the freshly-created folder if any write below
+    // fails, so a partial save can't leave a useless audio-less / metadata-only
+    // PendingProcessing meeting on disk. The caller retries (the platform audio
+    // temp persists upstream); the meeting id is fresh, so the folder is ours to
+    // remove.
+    let write = (|| -> Result<(), SyncFfiError> {
+        let meta = MeetingMeta {
+            uuid: id,
+            title: title.to_string(),
+            started_at: ms_to_rfc3339(started_at_ms),
+            ended_at: None,
+            duration_ms: duration_ms.max(0) as u64,
+            speaker_count: 0,
+            // The phone records AAC and transcodes to 16 kHz mono Ogg-Opus before
+            // saving, matching the desktop's `audio.opus` ingest invariant.
+            audio_format: AudioFormat {
+                codec: "opus".to_string(),
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate_kbps: None,
+            },
+            asr_model: None,
+            llm_model: None,
+            diarizer: None,
+            speaker_names: std::collections::BTreeMap::new(),
+            notes_format: 1,
+            processing: ProcessingLifecycle::PendingProcessing,
+            collection_id: None,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        notes_crdt::write_metadata(&folder, &meta)?;
+
+        if let Some(src) = audio_src_path {
+            std::fs::copy(src, folder.join("audio.opus")).map_err(|e| SyncFfiError::Io {
+                msg: format!("copying captured audio: {e}"),
+            })?;
+        }
+
+        if !notes_text.is_empty() {
+            // A minimal ProseMirror doc wrapping the raw note text; `NotesStore::save`
+            // builds the authoritative `notes.ydoc` + derived projections from it.
+            let doc = serde_json::json!({
+                "type": "doc",
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{ "type": "text", "text": notes_text }],
+                }],
+            });
+            NotesStore::save(meetings_root, id, &doc, notes_text)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write {
+        let _ = std::fs::remove_dir_all(&folder);
+        return Err(e);
+    }
+
+    tracing::info!(target: "sync-ffi", meeting_id = %id.0, "captured meeting saved");
+    Ok(id.0.to_string())
+}
+
+/// Read `transcript.json` (a `Vec<Segment>`), empty when absent or unreadable. A
+/// present-but-corrupt file is logged (the meeting still projects, transcript-less)
+/// rather than silently dropped; an absent file is the legitimate no-transcript
+/// case and stays quiet.
+fn read_transcript(folder: &Path) -> Vec<Segment> {
+    match std::fs::read(folder.join("transcript.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "sync-ffi",
+                folder = %folder.display(),
+                error = %e,
+                "corrupt transcript.json; projecting the meeting transcript-less"
+            );
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Project diarised segments into the phone's `(segments, speakers)` shape:
+/// `speaker_id` labels (e.g. "A", "B") become 1-based indices in first-appearance
+/// order, and `speakers[i-1]` is the user-set name (`speaker_names`) or a
+/// `"Speaker {i}"` fallback. A segment with no `speaker_id` gets index `0`.
+///
+/// The 1-based renumber is **deliberate**: the mobile model indexes speakers from
+/// 1 to align with the `--speaker-N` CSS palette tokens (see the `speakers` /
+/// `speakerIndex` docs in minutist-mobile `types.ts`), so the phone shows
+/// "Speaker 1" where the desktop shows the bare diarizer letter ("Speaker B").
+/// NAMED speakers match cross-device via the `speaker_names` overlay; only the
+/// UNNAMED fallback label differs cosmetically. Exact unnamed-label parity is a
+/// UI follow-up (it would also need the palette-keying schemes aligned).
+fn project_speakers(
+    transcript: &[Segment],
+    speaker_names: &std::collections::BTreeMap<String, String>,
+) -> (Vec<FfiSegment>, Vec<String>) {
+    let mut labels: Vec<String> = Vec::new();
+    let mut segments = Vec::with_capacity(transcript.len());
+    for seg in transcript {
+        let speaker_index = match &seg.speaker_id {
+            Some(label) => {
+                let pos = labels.iter().position(|l| l == label).unwrap_or_else(|| {
+                    labels.push(label.clone());
+                    labels.len() - 1
+                });
+                (pos + 1) as u32
+            }
+            None => 0,
+        };
+        segments.push(FfiSegment {
+            speaker_index,
+            start_ms: seg.start_ms as i64,
+            end_ms: seg.end_ms as i64,
+            text: seg.text.clone(),
+        });
+    }
+    let speakers = labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            speaker_names
+                .get(label)
+                .cloned()
+                .unwrap_or_else(|| format!("Speaker {}", i + 1))
+        })
+        .collect();
+    (segments, speakers)
+}
+
+/// Project a meeting folder into the phone's [`FfiMeeting`] model, or `None` when
+/// the folder has no `metadata.json` or it cannot be read (so one bad folder does
+/// not break a listing). Persistence-free: plain reads of `metadata.json` /
+/// `transcript.json` / `summary.md` + the notes ydoc.
+fn project_meeting(meetings_root: &Path, id: MeetingId) -> Option<FfiMeeting> {
+    let folder = meetings_root.join(id.0.to_string());
+    if !folder.join("metadata.json").exists() {
+        return None;
+    }
+    let meta = match notes_crdt::read_metadata(&folder) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(target: "sync-ffi", meeting_id = %id.0, error = %e, "skipping unreadable meeting");
+            return None;
+        }
+    };
+    let started_at_ms = rfc3339_to_ms(&meta.started_at);
+    let id_str = id.0.to_string();
+
+    match meta.processing {
+        // Awaiting results → the captured-unprocessed view.
+        ProcessingLifecycle::PendingProcessing | ProcessingLifecycle::Claimed { .. } => {
+            let (processing, claimed_by) = match &meta.processing {
+                ProcessingLifecycle::Claimed { claim } => {
+                    (FfiCaptureState::Claimed, Some(claim.host.0.clone()))
+                }
+                _ => (FfiCaptureState::Pending, None),
+            };
+            Some(FfiMeeting::Captured {
+                id: id_str,
+                title: meta.title,
+                started_at_ms,
+                duration_ms: meta.duration_ms as i64,
+                has_audio: folder.join("audio.opus").exists(),
+                has_notes: folder.join("notes.ydoc").exists(),
+                processing,
+                claimed_by,
+            })
+        }
+        // Processed (synced back) or the desktop-only Local: outputs exist.
+        _ => {
+            let transcript = read_transcript(&folder);
+            let (segments, speakers) = project_speakers(&transcript, &meta.speaker_names);
+            let summary = std::fs::read_to_string(folder.join("summary.md")).ok();
+            let notes = NotesStore::read_ydoc_state(meetings_root, id).ok().flatten();
+            Some(FfiMeeting::Synced {
+                id: id_str,
+                title: meta.title,
+                started_at_ms,
+                transcript: segments,
+                summary,
+                speakers,
+                notes,
+            })
+        }
+    }
+}
+
+/// Apply a peer-advertised lifecycle to our local `metadata.json` by precedence
+/// merge, skipping a meeting we do not hold yet — the phone-side equivalent of
+/// `persistence::apply_synced_lifecycle_if_present`, on the lifted notes-crdt
+/// primitives. Best-effort: a write failure is logged, not surfaced (the next
+/// discovery sweep re-applies).
+fn apply_inbound_lifecycle(meetings_root: &Path, id: MeetingId, incoming: ProcessingLifecycle) {
+    let result = notes_crdt::update_metadata_if_present(meetings_root, id, |meta| {
+        meta.processing = notes_crdt::merge_processing(&meta.processing, incoming);
+    });
+    if let Err(e) = result {
+        tracing::warn!(target: "sync-ffi", meeting_id = %id.0, error = %e, "applying synced lifecycle failed");
+    }
+}
+
 /// Parse a hyphenated UUID string off the boundary into a [`MeetingId`].
 fn parse_meeting(s: &str) -> Result<MeetingId, SyncFfiError> {
     Uuid::parse_str(s)
@@ -356,6 +747,7 @@ mod tests {
     use super::*;
     use minutist_common::{HostRef, ProcessingClaim};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tempfile::TempDir;
 
     #[test]
     fn lifecycle_maps_every_variant_carrying_fields() {
@@ -445,5 +837,224 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("drain callback did not complete a re-entrant block_on off-runtime");
+    }
+
+    /// A diarised segment for the projection tests.
+    fn seg(label: Option<&str>, start: u64, text: &str) -> Segment {
+        Segment {
+            start_ms: start,
+            end_ms: start + 500,
+            text: text.into(),
+            speaker_id: label.map(String::from),
+            confidence: None,
+            words: vec![],
+            shared_speakers: vec![],
+        }
+    }
+
+    /// Write a `Processed` meeting (metadata + optional transcript/summary) for the
+    /// Synced-projection tests — no engine, no ML.
+    fn write_processed_meeting(
+        root: &std::path::Path,
+        segments: &[Segment],
+        speaker_names: &[(&str, &str)],
+        summary: Option<&str>,
+    ) -> MeetingId {
+        let id = MeetingId::new();
+        let folder = MeetingFolder::ensure(root, id).expect("ensure");
+        let names = speaker_names
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let meta = MeetingMeta {
+            uuid: id,
+            title: "Synced one".into(),
+            started_at: "2026-06-30T09:00:00+00:00".into(),
+            ended_at: None,
+            duration_ms: 1000,
+            speaker_count: 2,
+            audio_format: AudioFormat {
+                codec: "opus".into(),
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate_kbps: None,
+            },
+            asr_model: None,
+            llm_model: None,
+            diarizer: None,
+            speaker_names: names,
+            notes_format: 1,
+            processing: ProcessingLifecycle::Processed {
+                processed_by: HostRef("host-x".into()),
+                at: "2026-06-30T09:30:00+00:00".into(),
+            },
+            collection_id: None,
+            app_version: "0.0.0".into(),
+        };
+        notes_crdt::write_metadata(&folder, &meta).expect("write meta");
+        if !segments.is_empty() {
+            std::fs::write(
+                folder.join("transcript.json"),
+                serde_json::to_vec(segments).expect("ser segs"),
+            )
+            .expect("write transcript");
+        }
+        if let Some(s) = summary {
+            std::fs::write(folder.join("summary.md"), s).expect("write summary");
+        }
+        id
+    }
+
+    /// `save_captured` writes a PendingProcessing meeting that projects as
+    /// `Captured{Pending}`, with `has_notes`/`has_audio` reflecting the folder.
+    #[test]
+    fn save_captured_projects_as_pending() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let id_str =
+            save_captured_to(root, "My meeting", 1_700_000_000_000, 5_000, None, "hello notes")
+                .expect("save");
+        let id = MeetingId(Uuid::parse_str(&id_str).unwrap());
+        match project_meeting(root, id).expect("present") {
+            FfiMeeting::Captured {
+                title,
+                processing,
+                has_notes,
+                has_audio,
+                duration_ms,
+                claimed_by,
+                ..
+            } => {
+                assert_eq!(title, "My meeting");
+                assert!(matches!(processing, FfiCaptureState::Pending));
+                assert!(has_notes, "notes.ydoc seeded from the note text");
+                assert!(!has_audio, "no audio path was passed");
+                assert_eq!(duration_ms, 5_000);
+                assert!(claimed_by.is_none());
+            }
+            other => panic!("expected Captured, got {other:?}"),
+        }
+    }
+
+    /// A `Processed` meeting with a transcript + summary projects as `Synced`, with
+    /// `speaker_id` labels mapped to a 1-based palette (named where set, else
+    /// `"Speaker N"`) and a no-speaker segment indexed `0`.
+    #[test]
+    fn processed_meeting_projects_as_synced_with_speaker_palette() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let segs = vec![
+            seg(Some("A"), 0, "hi"),
+            seg(Some("B"), 500, "hello"),
+            seg(Some("A"), 1000, "bye"),
+            seg(None, 1500, "[noise]"),
+        ];
+        let id = write_processed_meeting(root, &segs, &[("A", "Alice")], Some("# Summary"));
+        match project_meeting(root, id).expect("present") {
+            FfiMeeting::Synced {
+                transcript,
+                summary,
+                speakers,
+                ..
+            } => {
+                // A → 1 (named "Alice"), B → 2 (fallback "Speaker 2").
+                assert_eq!(speakers, vec!["Alice".to_string(), "Speaker 2".to_string()]);
+                assert_eq!(
+                    transcript.iter().map(|s| s.speaker_index).collect::<Vec<_>>(),
+                    vec![1, 2, 1, 0],
+                );
+                assert_eq!(transcript[0].text, "hi");
+                assert_eq!(summary.as_deref(), Some("# Summary"));
+            }
+            other => panic!("expected Synced, got {other:?}"),
+        }
+    }
+
+    /// `list_meeting_ids` skips `.blobs`, and projecting + sorting newest-first
+    /// orders by start time.
+    #[test]
+    fn list_skips_blobs_and_sorts_newest_first() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".blobs")).unwrap();
+        save_captured_to(root, "older", 1_000, 10, None, "").unwrap();
+        save_captured_to(root, "newer", 2_000, 10, None, "").unwrap();
+
+        let ids = notes_crdt::folder::list_meeting_ids(root);
+        assert_eq!(ids.len(), 2, ".blobs must be skipped");
+
+        let mut metas: Vec<FfiMeeting> = ids
+            .into_iter()
+            .filter_map(|id| project_meeting(root, id))
+            .collect();
+        metas.sort_by_key(|m| std::cmp::Reverse(started_at_ms_of(m)));
+        assert_eq!(started_at_ms_of(&metas[0]), 2_000);
+        assert_eq!(started_at_ms_of(&metas[1]), 1_000);
+    }
+
+    /// Inbound lifecycle merges into the local metadata by precedence: a host's
+    /// `Claimed` is applied (projects as `Captured{Claimed, claimed_by}`), and a
+    /// subsequent stale `PendingProcessing` does NOT regress it.
+    #[test]
+    fn inbound_lifecycle_merges_by_precedence() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let id = MeetingId(
+            Uuid::parse_str(&save_captured_to(root, "m", 1_000, 10, None, "").unwrap()).unwrap(),
+        );
+
+        apply_inbound_lifecycle(
+            root,
+            id,
+            ProcessingLifecycle::Claimed {
+                claim: ProcessingClaim {
+                    host: HostRef("host-gpu".into()),
+                    claimed_at: "2026-06-30T00:00:00Z".into(),
+                    lease_expires_at: "2026-06-30T01:00:00Z".into(),
+                },
+            },
+        );
+        match project_meeting(root, id).expect("present") {
+            FfiMeeting::Captured {
+                processing,
+                claimed_by,
+                ..
+            } => {
+                assert!(matches!(processing, FfiCaptureState::Claimed));
+                assert_eq!(claimed_by.as_deref(), Some("host-gpu"));
+            }
+            other => panic!("expected Captured/Claimed, got {other:?}"),
+        }
+
+        // A stale PendingProcessing must not walk Claimed backwards.
+        apply_inbound_lifecycle(root, id, ProcessingLifecycle::PendingProcessing);
+        assert!(matches!(
+            project_meeting(root, id).unwrap(),
+            FfiMeeting::Captured {
+                processing: FfiCaptureState::Claimed,
+                ..
+            }
+        ));
+    }
+
+    /// `save_captured` is all-or-nothing: a failed audio copy rolls back the
+    /// freshly-created folder, leaving no orphan meeting (I2).
+    #[test]
+    fn save_captured_rolls_back_on_failed_audio_copy() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let result = save_captured_to(
+            root,
+            "m",
+            1_000,
+            10,
+            Some("/nonexistent/path/audio.opus"),
+            "notes",
+        );
+        assert!(result.is_err(), "a missing audio source must fail the save");
+        assert!(
+            notes_crdt::folder::list_meeting_ids(root).is_empty(),
+            "a failed save must leave no orphan meeting folder"
+        );
     }
 }

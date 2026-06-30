@@ -37,7 +37,6 @@ use std::path::Path;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use minutist_common::{MeetingId, MeetingMeta, ProcessingLifecycle};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::frame::{read_frame, write_frame};
 use crate::notes_proto::StreamKind;
@@ -53,27 +52,13 @@ pub struct DiscoveryEntry {
     pub processing: ProcessingLifecycle,
 }
 
-/// Enumerate the meeting ids this device holds on disk — the `{uuid}` folders
-/// directly under `root` (the dot-prefixed `.blobs` store and any non-UUID entry
-/// are skipped). Shared by
+/// Enumerate the meeting ids this device holds on disk — delegates to the canonical
+/// [`notes_crdt::folder::list_meeting_ids`] (the scan lives beside the meeting-folder
+/// layout it reads). Used by
 /// [`SyncEngine::local_meetings`](crate::SyncEngine::local_meetings) and the
 /// discovery exchange.
 pub(crate) fn list_meeting_ids(root: &Path) -> Vec<MeetingId> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        if let Some(name) = entry.file_name().to_str() {
-            if let Ok(uuid) = Uuid::parse_str(name) {
-                out.push(MeetingId(uuid));
-            }
-        }
-    }
-    out
+    notes_crdt::folder::list_meeting_ids(root)
 }
 
 /// Read a meeting's `processing` from its `metadata.json`, defaulting to
@@ -214,17 +199,9 @@ mod tests {
         assert!(matches!(decode(b"not json"), Err(Error::Protocol(_))));
     }
 
-    #[test]
-    fn list_meeting_ids_finds_uuid_dirs_and_skips_others() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path();
-        let a = MeetingId::new();
-        std::fs::create_dir(root.join(a.0.to_string())).expect("mk a");
-        std::fs::create_dir(root.join(".blobs")).expect("mk .blobs");
-        std::fs::create_dir(root.join("not-a-uuid")).expect("mk other");
-        let found = list_meeting_ids(root);
-        assert_eq!(found, vec![a]);
-    }
+    // The UUID-dir scan itself is tested canonically in `notes_crdt::folder`
+    // (`list_meeting_ids_finds_uuid_dirs_and_skips_others`); this module only
+    // delegates to it.
 
     #[test]
     fn read_local_processing_defaults_to_local_when_metadata_absent() {

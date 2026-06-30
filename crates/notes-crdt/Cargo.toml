@@ -27,6 +27,10 @@ tracing = { workspace = true }
 # from it. Same workspace pin as `persistence` / `sync` so the on-the-wire
 # encoding agrees across the three crates.
 yrs = { workspace = true }
+# uuid: parse a meeting-folder directory name back into a `MeetingId` for the
+# canonical `folder::list_meeting_ids` scan (the meeting-folder layout this crate
+# owns). Same workspace pin as `sync` / the rest of the workspace.
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

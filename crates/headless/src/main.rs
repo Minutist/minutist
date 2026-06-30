@@ -287,7 +287,7 @@ fn print_status(data_dir: &Path, relay_url: String) -> AppResult<()> {
         .collect();
 
     let meetings_root = data_dir.join("meetings");
-    let mut meetings: Vec<MeetingStatus> = list_meeting_ids(&meetings_root)
+    let mut meetings: Vec<MeetingStatus> = persistence::folder::list_meeting_ids(&meetings_root)
         .into_iter()
         .map(|id| {
             let digest = meeting_digest(&meetings_root, id);
@@ -311,26 +311,6 @@ fn print_status(data_dir: &Path, relay_url: String) -> AppResult<()> {
     })?;
     println!("{json}");
     Ok(())
-}
-
-/// The meeting ids on disk — `{uuid}` folders directly under `meetings_root` (the
-/// dot-prefixed `.blobs` store and any non-UUID entry are skipped).
-fn list_meeting_ids(meetings_root: &Path) -> Vec<MeetingId> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(meetings_root) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        if let Some(name) = entry.file_name().to_str() {
-            if let Ok(uuid) = uuid::Uuid::parse_str(name) {
-                out.push(MeetingId(uuid));
-            }
-        }
-    }
-    out
 }
 
 /// sha256 (hex) of a meeting's `notes.ydoc` PROJECTED to canonical JSON — stable
@@ -672,7 +652,7 @@ mod tests {
     fn status_helpers_list_and_digest_meetings() {
         let base = tempfile::tempdir().expect("tempdir");
         let root = base.path();
-        assert!(list_meeting_ids(root).is_empty());
+        assert!(persistence::folder::list_meeting_ids(root).is_empty());
 
         // A meeting with notes: listed, with a deterministic digest.
         let m = MeetingId(uuid::Uuid::new_v4());
@@ -684,7 +664,7 @@ mod tests {
         });
         persistence::NotesStore::save(root, m, &json, "status helper test").expect("save notes");
 
-        assert_eq!(list_meeting_ids(root), vec![m]);
+        assert_eq!(persistence::folder::list_meeting_ids(root), vec![m]);
         let d1 = meeting_digest(root, m).expect("digest present");
         let d2 = meeting_digest(root, m).expect("digest present again");
         assert_eq!(d1, d2, "digest is deterministic for unchanged content");

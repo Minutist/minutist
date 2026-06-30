@@ -1389,8 +1389,16 @@ drifts when the upstream repo is re-uploaded and silently breaks hash verificati
 authoritative `notes.ydoc` blob + its lossless ProseMirror-JSON conversion and
 the lib0 v1/v2 encoding hops), `NotesStore` (read/write `notes.ydoc` + derive
 `notes.json` / `notes.md`, plus `note_blocks_from_json`), the `MeetingFolder`
-on-disk layout (`{root}/{uuid}/`, including `ensure`), and the public
-`metadata.json` writer (`write_metadata` + the shared `write_metadata_atomic`).
+on-disk layout (`{root}/{uuid}/`, including `ensure` and the canonical
+`folder::list_meeting_ids` scan), and the public `metadata.json` writer
+(`write_metadata` + the shared `write_metadata_atomic`).
+
+`folder::list_meeting_ids(root)` is the ONE enumeration of "which meetings this
+device holds" — the `{uuid}` directories under the meetings root (`.blobs` and
+non-UUID entries skipped). It lives here, beside the folder layout it scans;
+`sync`'s discovery exchange and the `headless` hub delegate to it (the latter via
+the `persistence::folder` re-export), and the producer-gate election loop reads it,
+so there is no per-consumer copy to drift.
 
 A **leaf** (depends only on `common`). Third-party deps: `yrs` (the Yjs CRDT
 port, workspace-pinned), `chrono`, `serde` / `serde_json`, `thiserror`,

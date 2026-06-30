@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use minutist_common::{AppResult, AudioFormat, MeetingId, MeetingMeta};
+use uuid::Uuid;
 
 use crate::error::Error;
 
@@ -224,6 +225,35 @@ fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// The meeting ids on disk — the `{uuid}` directories directly under `root`.
+///
+/// The dot-prefixed blob-store dir (`.blobs`) and any non-UUID entry are skipped:
+/// a meeting UUID's string form never begins with a dot, so the UUID parse rejects
+/// them. Non-directory entries and an unreadable `root` yield no ids.
+///
+/// This is the CANONICAL scan. It lives here, beside the meeting-folder layout it
+/// enumerates, so the "which meetings does this device hold" question has one
+/// implementation: `sync`'s discovery exchange, the `headless` hub, and the
+/// producer-gate election loop all reach it (directly or via the `persistence`
+/// re-export) rather than each keeping its own copy.
+pub fn list_meeting_ids(root: &Path) -> Vec<MeetingId> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            if let Ok(uuid) = Uuid::parse_str(name) {
+                out.push(MeetingId(uuid));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +314,24 @@ mod tests {
             "create must reject an existing folder"
         );
         MeetingFolder::ensure(dir.path(), id).expect("ensure on an existing folder");
+    }
+
+    #[test]
+    fn list_meeting_ids_finds_uuid_dirs_and_skips_others() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let a = MeetingId::new();
+        std::fs::create_dir(root.join(a.0.to_string())).expect("mk uuid dir");
+        std::fs::create_dir(root.join(".blobs")).expect("mk .blobs");
+        std::fs::create_dir(root.join("not-a-uuid")).expect("mk non-uuid dir");
+        std::fs::write(root.join("loose-file"), b"x").expect("mk loose file");
+        assert_eq!(list_meeting_ids(root), vec![a]);
+    }
+
+    #[test]
+    fn list_meeting_ids_empty_for_absent_or_empty_root() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        assert!(list_meeting_ids(tmp.path()).is_empty());
+        assert!(list_meeting_ids(&tmp.path().join("does-not-exist")).is_empty());
     }
 }

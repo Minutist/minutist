@@ -107,12 +107,16 @@ fn producer_authority(root: &Path, meeting_id: MeetingId) -> Option<(HostRef, St
 /// each to its per-meeting path and recording the authority that arrived with the
 /// bytes.
 ///
-/// For each peer entry: take it if we hold no provable local copy of that artifact
-/// (we advertised none); skip it if the bytes are byte-identical (same hash); and
-/// otherwise take it only when it strictly supersedes ours
+/// For each peer entry: if we advertise a provable copy, take the peer's only when
+/// its bytes differ AND it strictly supersedes ours
 /// ([`crate::blobs::ArtifactEntry::supersedes`] — strict `>` on `produced_at`, ties
-/// to the lowest `produced_by` HostRef). `peer_manifest` has been validated before
-/// this runs.
+/// to the lowest `produced_by` HostRef). If we advertise NO provable copy, pull only
+/// when we genuinely lack the file on disk: a file present but unstampable (bytes
+/// produced before a `Processed` flip, or a lost/corrupt authority record) is NOT
+/// overwritten with a peer copy we cannot prove is newer — that would silently lose
+/// possibly-newer local bytes. The local file is kept (stuck until its authority is
+/// re-established) and the situation logged. `peer_manifest` has been validated
+/// before this runs.
 async fn pull_superseding(
     store: &BlobStore,
     endpoint: &Endpoint,
@@ -124,12 +128,28 @@ async fn pull_superseding(
 ) -> Result<()> {
     for entry in &peer_manifest.entries {
         let should_pull = match local_manifest.entry(&entry.rel_path) {
-            // We advertise no provable copy of this artifact → take the peer's.
-            None => true,
-            // Byte-identical → nothing to do.
-            Some(ours) if ours.hash == entry.hash => false,
-            // Differing bytes → take the peer's only if it strictly supersedes ours.
-            Some(ours) => entry.supersedes(ours),
+            // We advertise a provable copy: take the peer's only if its bytes differ
+            // AND it strictly supersedes ours (byte-identical → nothing to do).
+            Some(ours) => ours.hash != entry.hash && entry.supersedes(ours),
+            // We advertise no provable copy. Pull ONLY if we genuinely lack the file
+            // on disk; if a file IS present but we could not stamp it, refuse to
+            // overwrite it with a copy we cannot prove is newer (silent-loss guard).
+            None => {
+                let local_path = meetings_root
+                    .join(meeting_id.0.to_string())
+                    .join(&entry.rel_path);
+                if local_path.exists() {
+                    tracing::warn!(
+                        target: "sync",
+                        meeting_id = %meeting_id.0,
+                        rel = %entry.rel_path,
+                        "peer offers an artifact we hold on disk but cannot stamp (no provable authority); keeping local bytes, not overwriting"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
         };
         if !should_pull {
             continue;

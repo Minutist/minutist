@@ -296,11 +296,12 @@ impl BlobStore {
     /// pinning it with the per-meeting artifact tag.
     ///
     /// `rel` is re-validated against the artifact allow-list (defence in depth — the
-    /// manifest was validated whole). The export goes to a sibling `{rel}.tmp` which
-    /// is fsynced then atomically renamed over the target (the durable tmp+fsync+
-    /// rename the rest of the codebase uses for `transcript.json` / `summary.md`), so
-    /// a concurrent reader of `transcript.json` (read far more often than
-    /// `audio.opus`) never observes a partial file and a crash cannot commit a
+    /// manifest was validated whole). The export goes to a hash-suffixed sibling
+    /// `{rel}.{hash}.tmp` (so concurrent pulls of the same rel at different hashes do
+    /// not share a tmp) which is fsynced then atomically renamed over the target (the
+    /// durable tmp+fsync+rename the rest of the codebase uses for `transcript.json` /
+    /// `summary.md`), so a concurrent reader of `transcript.json` (read far more often
+    /// than `audio.opus`) never observes a partial file and a crash cannot commit a
     /// truncated one. The caller ensures the meeting folder via
     /// `notes_crdt::MeetingFolder::ensure` and records the received authority (it
     /// holds the peer entry's `produced_by`/`produced_at`); this writes only the
@@ -327,10 +328,13 @@ impl BlobStore {
             })?;
 
         let target = meetings_root.join(meeting_id.0.to_string()).join(rel);
-        let tmp = target.with_extension(format!(
-            "{}.tmp",
-            target.extension().and_then(|e| e.to_str()).unwrap_or("")
-        ));
+        // Include the content hash in the tmp name so two concurrent pulls of the
+        // same (meeting, rel) at DIFFERENT hashes never share a tmp and tear each
+        // other's export; same-hash concurrent pulls write byte-identical content to
+        // one name, which is harmless. (`import_artifacts` only ever reads the fixed
+        // ARTIFACT_RELS names, so a stale `.tmp` left by a crash is ignored.)
+        let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let tmp = target.with_extension(format!("{ext}.{hash}.tmp"));
         self.store
             .blobs()
             .export(hash, &tmp)
@@ -726,8 +730,11 @@ fn artifact_authority_path(meetings_root: &Path, meeting_id: MeetingId) -> PathB
 }
 
 /// Load a meeting's artifact-authority record, defaulting to empty when absent or
-/// unreadable. A corrupt record is logged and treated as empty: the worst case is
-/// re-establishing authority from the producer fallback, never a clobber.
+/// unreadable. A corrupt record is logged and treated as empty. The worst case is
+/// that the artifact is not advertised this round (no provable authority); the pull
+/// guard then KEEPS the still-present local bytes rather than overwriting them with
+/// a peer copy it cannot prove is newer (see `artifacts_proto::pull_superseding`),
+/// so a lost record degrades to fetch-pending, never a clobber.
 fn load_artifact_authority(meetings_root: &Path, meeting_id: MeetingId) -> ArtifactAuthority {
     let path = artifact_authority_path(meetings_root, meeting_id);
     match std::fs::read(&path) {

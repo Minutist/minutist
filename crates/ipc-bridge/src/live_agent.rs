@@ -2781,9 +2781,10 @@ mod tests {
     }
 
     #[test]
-    fn live_agent_should_run_auto_integrated_gpu_accel_on_returns_true() {
-        // AMD Radeon 890M (integrated, Vulkan on) is the validated SP-LIVE
-        // hardware — Auto must resolve true when gpu_acceleration is active.
+    fn live_agent_should_run_auto_integrated_gpu_returns_false() {
+        // AMD Radeon 890M (integrated, shared memory): Auto must NOT co-schedule
+        // the held LLM context with the GPU ASR path — they share one memory pool
+        // and exhausting it aborts the process. `On` is the explicit opt-in.
         use minutist_common::{live_agent_should_run, GpuAcceleration, GpuProbe, LiveAgentMode};
         let probe = GpuProbe {
             total_bytes: 16 * 1024 * 1024 * 1024,
@@ -2791,8 +2792,13 @@ mod tests {
             is_integrated: true,
             name: "AMD Radeon 890M".to_string(),
         };
-        assert!(live_agent_should_run(
+        assert!(!live_agent_should_run(
             LiveAgentMode::Auto,
+            Some(&probe),
+            GpuAcceleration::Auto
+        ));
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
             Some(&probe),
             GpuAcceleration::Auto
         ));

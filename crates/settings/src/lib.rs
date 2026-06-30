@@ -192,11 +192,14 @@ fn default_chat_system_prompt() -> String {
         .to_string()
 }
 
-/// Default live-agent enabled mode: `Auto` (run iff the startup GPU probe
-/// finds a capable discrete GPU). An older store written before this field
-/// existed deserialises to `Auto` via `#[serde(default)]`.
+/// Default live-agent enabled mode: `Off`. The in-meeting co-pilot is opt-in
+/// until validated on real hardware; `Auto` would silently run an LLM during
+/// every accelerated recording (and `Auto` itself never enables on a
+/// shared-memory integrated GPU — see [`minutist_common::live_agent_should_run`]).
+/// A store written before this field existed deserialises to `Off` via
+/// `#[serde(default)]`.
 const fn default_live_agent_enabled() -> LiveAgentMode {
-    LiveAgentMode::Auto
+    LiveAgentMode::Off
 }
 
 /// Default live-agent cadence: minimum transcript segments before a refresh.
@@ -1748,11 +1751,11 @@ mod tests {
     use minutist_common::{live_agent_should_run, GpuAcceleration, GpuProbe, LiveAgentMode};
 
     #[test]
-    fn live_agent_enabled_defaults_to_auto() {
+    fn live_agent_enabled_defaults_to_off() {
         assert_eq!(
             Settings::default().live_agent_enabled,
-            LiveAgentMode::Auto,
-            "live_agent_enabled must default to Auto (GPU-capability-gated)"
+            LiveAgentMode::Off,
+            "live_agent_enabled must default to Off (the co-pilot is opt-in)"
         );
     }
 
@@ -1867,8 +1870,8 @@ mod tests {
         let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
         assert_eq!(
             restored.live_agent_enabled,
-            LiveAgentMode::Auto,
-            "missing live_agent_enabled must deserialise to Auto"
+            LiveAgentMode::Off,
+            "missing live_agent_enabled must deserialise to Off (the safe default)"
         );
         assert_eq!(
             restored.live_agent_min_segments, 8,
@@ -1978,8 +1981,9 @@ mod tests {
     }
 
     #[test]
-    fn live_agent_should_run_auto_gpu_accel_on_is_true() {
-        // Both discrete and integrated GPUs with acceleration active pass Auto.
+    fn live_agent_should_run_auto_discrete_on_integrated_off() {
+        // A discrete GPU with acceleration active passes Auto; a shared-memory
+        // integrated GPU does NOT (the held context would contend with GPU ASR).
         assert!(
             live_agent_should_run(
                 LiveAgentMode::Auto,
@@ -1989,12 +1993,12 @@ mod tests {
             "Auto with discrete GPU and accel on must be true"
         );
         assert!(
-            live_agent_should_run(
+            !live_agent_should_run(
                 LiveAgentMode::Auto,
                 Some(&integrated_probe()),
                 GpuAcceleration::Auto
             ),
-            "Auto with integrated GPU and accel on must be true (SP-LIVE E1)"
+            "Auto with integrated GPU must be false (shared-memory contention)"
         );
     }
 

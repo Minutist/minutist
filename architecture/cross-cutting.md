@@ -1090,16 +1090,19 @@ categories. Cross-cutting rules:
   a foreground chat/summarise decode holds the model) if field testing reveals
   throughput degradation.
 
-- **`LiveAgentMode::Auto` = GPU-acceleration-active gated.**
-  `settings.live_agent_enabled` defaults to `Auto`.
+- **`LiveAgentMode::Auto` = discrete-GPU-only; default `Off`.**
+  `settings.live_agent_enabled` defaults to `Off` — the in-meeting co-pilot is
+  opt-in until validated on real hardware.
   `live_agent_should_run(mode, probe, gpu_acceleration)` in `common` resolves it:
-  `Auto` is `true` when the probe is `Some` AND `gpu_acceleration != Off`. This is a
-  **GPU-acceleration-active proxy** — the LLM runs on the GPU rather than contending
-  with the CPU-bound ASR path. It does NOT inspect `probe.is_integrated` (the AMD
-  Radeon 890M, an integrated GPU running Vulkan, is the validated SP-LIVE E1 hardware
-  and must resolve `true`). It does NOT consult `resolve_gpu_plan`'s VRAM-budget
-  thresholds. `Off` disables unconditionally; `On` enables unconditionally.
-  WU2b should refine this to a VRAM-headroom check once the live-context cost is measured.
+  `Auto` is `true` only when a **discrete** GPU is present (`probe.is_some()` AND
+  `!probe.is_integrated`) AND `gpu_acceleration != Off`, where the held 32 768-token
+  `LlamaContext` runs in dedicated VRAM clear of the GPU-accelerated ASR/diarization
+  path. On a **shared-memory integrated GPU** (e.g. the AMD Radeon 890M) the held
+  context and the ASR path draw from ONE memory pool; co-scheduling them exhausts it
+  and a native allocation failure aborts the process — so `Auto` resolves `false`
+  there. `Off` disables unconditionally; `On` is the explicit opt-in that accepts the
+  integrated-GPU contention. It does NOT consult `resolve_gpu_plan`'s VRAM-budget
+  thresholds; WU2b could refine the discrete-GPU case to a free-VRAM headroom check.
 
 - **KV quantisation: OFF.** q8_0 KV quantisation costs ~15 % decode throughput for
   memory savings the 36 GB test GPU does not need. Not applied to the live agent

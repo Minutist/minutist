@@ -274,9 +274,9 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             </select>
             <p className="settings-drawer__hint">
               Maintains a running digest of the meeting with the chat model during
-              recording. Auto (the default) runs it when GPU acceleration is active
-              — on any GPU, integrated or discrete. On always runs it, even on a
-              CPU-only host (slower refreshes). Off never runs it.
+              recording. Off by default. Auto runs it only on a discrete GPU; On
+              forces it on any GPU (on a shared-memory integrated GPU it competes
+              with transcription for memory, so leave it Off there).
             </p>
           </div>
           <label

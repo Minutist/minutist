@@ -965,16 +965,18 @@ pub struct LiveDigest {
 
 /// Whether the live in-meeting agent runs during an active recording.
 ///
-/// `Auto` (the default) enables when GPU acceleration is ACTIVE: a usable GPU
-/// is present (probe is `Some`) AND `gpu_acceleration != Off`. This ensures the
-/// live agent's `LlamaContext` (n_ctx = 32 768) runs on the GPU and does not
-/// contend with the CPU-bound ASR path. On the AMD Radeon 890M (integrated,
-/// Vulkan on) with `gpu_acceleration = Auto`, this resolves `true` — the
-/// validated SP-LIVE hardware.
+/// `Auto` enables only on a **discrete** GPU with acceleration active, where the
+/// live agent's `LlamaContext` (n_ctx = 32 768) runs in dedicated VRAM and does
+/// not contend with the GPU-accelerated ASR/diarization path. On a shared-memory
+/// integrated GPU the held context and the ASR path draw from one memory pool, so
+/// Auto resolves `false` (co-scheduling them there exhausts memory and a native
+/// allocation failure aborts the process). `On` is the explicit opt-in for that
+/// contention; `Off` disables the agent everywhere. The default is `Off` — the
+/// feature is opt-in until validated on real hardware.
 ///
 /// This is **distinct from** [`GpuAcceleration`], which governs model-layer
-/// placement (GPU vs CPU). `LiveAgentMode::Auto` means "run iff a GPU is active";
-/// `GpuAcceleration::Auto` means "offload layers iff they fit in the VRAM budget".
+/// placement (GPU vs CPU). `LiveAgentMode::Auto` means "run iff a discrete GPU is
+/// active"; `GpuAcceleration::Auto` means "offload layers iff they fit the budget".
 ///
 /// Serialises as snake_case (`"auto"` / `"on"` / `"off"`) to match the
 /// established `GpuAcceleration` pattern and the TypeScript binding shape.
@@ -982,18 +984,18 @@ pub struct LiveDigest {
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum LiveAgentMode {
-    /// Enable the live agent when GPU acceleration is active: a usable GPU is
-    /// present (`probe.is_some()`) AND `gpu_acceleration != Off`. This is the
-    /// recommended default: users with a GPU (integrated or discrete) running
-    /// with acceleration on get the feature automatically; users on CPU-only
-    /// builds or with acceleration forced off are not affected.
-    #[default]
+    /// Enable the live agent only on a DISCRETE GPU with acceleration active
+    /// (`probe.is_some() && !probe.is_integrated && gpu_acceleration != Off`),
+    /// where the held context runs in dedicated VRAM clear of the ASR path. On an
+    /// integrated (shared-memory) GPU or CPU-only host this resolves `false`.
     Auto,
-    /// Always enable the live agent regardless of GPU capability. Use when the
-    /// user explicitly wants the feature even on a slow host (slower refreshes
-    /// are acceptable trade-off).
+    /// Always enable the live agent regardless of GPU capability. The explicit
+    /// opt-in for an integrated GPU or a slow host, accepting the memory
+    /// contention / slower refreshes.
     On,
-    /// Permanently disable the live agent regardless of GPU capability.
+    /// Permanently disable the live agent regardless of GPU capability. The
+    /// default until the feature is validated on real hardware.
+    #[default]
     Off,
 }
 
@@ -1004,14 +1006,18 @@ pub enum LiveAgentMode {
 ///
 /// - `Off` → always `false`.
 /// - `On` → always `true` (user override; no capability check).
-/// - `Auto` → `true` iff `probe` is `Some` AND `gpu_acceleration != Off`.
-///   This is a **GPU-acceleration-active proxy**: a usable GPU exists and the
-///   user has not forced CPU mode. The live agent's `LlamaContext` then runs on
-///   the GPU, off the CPU-bound ASR path.
-///   Does NOT inspect `probe.is_integrated` — the AMD 890M (integrated, Vulkan
-///   on) is the validated SP-LIVE hardware and must resolve `true`.
-///   Does NOT invoke `resolve_gpu_plan` or inspect VRAM bytes. WU2b should
-///   refine this to a VRAM-headroom check once the held-context cost is measured.
+/// - `Auto` → `true` iff a **discrete** GPU is present (`probe` is `Some` AND
+///   `!probe.is_integrated`) AND `gpu_acceleration != Off`. On a discrete GPU
+///   the live agent's `LlamaContext` (n_ctx = 32 768) runs in dedicated VRAM, so
+///   it does not contend with the GPU-accelerated ASR/diarization path. On a
+///   **shared-memory integrated GPU** the held context and the ASR path draw
+///   from the SAME memory pool; co-scheduling them exhausts it and an inference
+///   allocation throws (a native `bad_alloc` that aborts the process — observed
+///   on the AMD 890M). Auto therefore resolves `false` on an integrated GPU;
+///   `On` remains the explicit opt-in for users who accept that contention.
+///   Does NOT invoke `resolve_gpu_plan` or inspect VRAM bytes — a free-VRAM
+///   headroom refinement (WU2b) could later let Auto enable on a discrete GPU
+///   only when the held context provably fits alongside the ASR footprint.
 pub fn live_agent_should_run(
     mode: LiveAgentMode,
     probe: Option<&GpuProbe>,
@@ -1020,7 +1026,9 @@ pub fn live_agent_should_run(
     match mode {
         LiveAgentMode::Off => false,
         LiveAgentMode::On => true,
-        LiveAgentMode::Auto => probe.is_some() && gpu_acceleration != GpuAcceleration::Off,
+        LiveAgentMode::Auto => {
+            probe.is_some_and(|p| !p.is_integrated) && gpu_acceleration != GpuAcceleration::Off
+        }
     }
 }
 
@@ -2893,19 +2901,25 @@ mod tests {
     }
 
     #[test]
-    fn live_agent_auto_integrated_gpu_accel_on_returns_true() {
-        // Integrated GPU with acceleration active (e.g. AMD Radeon 890M, Vulkan
-        // on) → Auto enables. The is_integrated flag is NOT a gate; the GPU-
-        // acceleration-active proxy is the correct discriminator (SP-LIVE E1).
-        assert!(live_agent_should_run(
+    fn live_agent_auto_integrated_gpu_returns_false() {
+        // Integrated GPU (e.g. AMD Radeon 890M): the held 32K context and the GPU
+        // ASR path share one memory pool, so Auto must NOT co-schedule them —
+        // doing so exhausts memory and a native allocation failure aborts the app.
+        assert!(!live_agent_should_run(
             LiveAgentMode::Auto,
             Some(&make_gpu_probe(16, true)),
             GpuAcceleration::Auto
         ));
-        assert!(live_agent_should_run(
+        assert!(!live_agent_should_run(
             LiveAgentMode::Auto,
             Some(&make_gpu_probe(16, true)),
             GpuAcceleration::On
+        ));
+        // `On` is the explicit opt-in: it runs on an integrated GPU regardless.
+        assert!(live_agent_should_run(
+            LiveAgentMode::On,
+            Some(&make_gpu_probe(16, true)),
+            GpuAcceleration::Auto
         ));
     }
 
@@ -2925,8 +2939,8 @@ mod tests {
     }
 
     #[test]
-    fn live_agent_mode_default_is_auto() {
-        assert_eq!(LiveAgentMode::default(), LiveAgentMode::Auto);
+    fn live_agent_mode_default_is_off() {
+        assert_eq!(LiveAgentMode::default(), LiveAgentMode::Off);
     }
 
     #[test]

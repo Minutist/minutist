@@ -124,11 +124,11 @@ export type RecordingStore = {
    */
   setGpuAcceleration: (mode: GpuAcceleration) => Promise<void>;
   /**
-   * Set the live co-pilot mode ("auto" by default), persisting via
+   * Set the live co-pilot mode ("off" by default), persisting via
    * `commands.updateSettings` — the same round-trip-through-settings pattern as
-   * `setGpuAcceleration`. `Off` never runs the in-meeting agent; `Auto` (the
-   * default) runs it when GPU acceleration is active — any GPU, integrated or
-   * discrete; `On` always runs it, even on a CPU-only host (the explicit opt-in).
+   * `setGpuAcceleration`. `Off` never runs the in-meeting agent; `Auto` runs it
+   * only on a discrete GPU (where it does not contend with the GPU ASR path);
+   * `On` is the explicit opt-in on any GPU, including an integrated one.
    */
   setLiveAgentMode: (mode: LiveAgentMode) => Promise<void>;
   /**

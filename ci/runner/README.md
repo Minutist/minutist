@@ -15,6 +15,18 @@ gh api -X POST repos/Minutist/minutist/actions/runners/registration-token \
 docker compose up -d --build
 ```
 
+### Additional hosts (more capacity / faster)
+
+The state path defaults to `/mnt/bulk/srv/github-runner`. On a host with fast
+LOCAL storage, set `RUNNER_STATE_BASE` in `.env` to a local-SSD path (the
+runner's cargo `target/` + `_work` dominate build time, so local disk beats a
+NAS mount), give the runner a distinct `RUNNER_NAME`, `mkdir -p
+$RUNNER_STATE_BASE/{state,toolcache}` owned by uid 1000, and `docker compose up
+-d --build github-runner` (a single replica per extra host is usually enough).
+Run compose from this dir so `.env` is auto-loaded for `${RUNNER_STATE_BASE}`
+interpolation. The workflows target the generic `[self-hosted, linux, x64]`
+labels, so any such runner picks up the Linux legs — no workflow change.
+
 Registration persists in the state volume — `RUNNER_TOKEN` is consumed once
 and may be removed from `.env` afterwards. Verify with:
 

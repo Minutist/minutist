@@ -91,6 +91,11 @@ fn encode_manifest(manifest: &ArtifactManifest) -> Result<Vec<u8>> {
 /// the derived state). Used only as the byte-coherent fallback when the
 /// authority store holds no record for the on-disk bytes — see
 /// [`BlobStore::import_artifacts`].
+///
+/// The underlying `metadata.json` read is intentionally lock-free: its failure
+/// mode is conservative — a torn/absent/corrupt read yields `Local` → `None` →
+/// the artifact simply is not advertised this round (fetch-pending, self-heals on
+/// the next sync), never a clobber — so it does not need the metadata lock.
 fn producer_authority(root: &Path, meeting_id: MeetingId) -> Option<(HostRef, String)> {
     match discovery_proto::read_local_processing(root, meeting_id) {
         ProcessingLifecycle::Processed { processed_by, at } => Some((processed_by, at)),
@@ -158,7 +163,10 @@ async fn pull_superseding(
         // the per-device `translations.json`; reconcile (clear/regenerate) the
         // stale translations and emit a reload signal so an open UI re-reads. Both
         // land with the consumer read-sync slice; `sync` has no UI/persistence edge
-        // to drive them here.
+        // to drive them here. This is a content-correctness gap (a stale translation
+        // would key to the wrong segments), NOT polish — it is a RELEASE GATE: the
+        // consumer read-sync slice must land before artifact sync + translations are
+        // both enabled in a shipping build.
     }
     Ok(())
 }

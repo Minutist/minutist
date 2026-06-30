@@ -179,12 +179,20 @@ I lack by hash" is the whole rule, whereas a derived artifact is MUTABLE (a meet
 can be reprocessed). So each manifest entry carries the authority that produced those
 exact bytes (`produced_by` host + `produced_at`); the receiver pulls a peer entry
 only when it STRICTLY supersedes its own (strict `>` on `produced_at`, ties to the
-lowest `produced_by` HostRef — clock-independent, matching the
-`notes_crdt::merge_processing` two-`Processed` tiebreak so the lifecycle edge and the
-on-disk bytes name one authoritative host). That authority is stamped WITH the bytes
-and never re-derived from `metadata.json` (whose `Processed` stamp propagates over
-Discovery independently of the bytes; deriving from it would let a stale relay copy
-clobber a newer producer copy). The per-(meeting, rel-path) authority is persisted at
+lowest `produced_by` HostRef). This is the BYTES order — newest `produced_at` wins,
+so a reprocess by any host supersedes an older copy — and it shares only the
+lowest-`HostRef` TIEBREAK with `notes_crdt::merge_processing`'s two-`Processed` rule,
+not the whole order: that lifecycle merge is clock-INDEPENDENT (lowest HostRef
+regardless of timestamp, §7 D2). Under a single producer per meeting the two never
+disagree; only a cross-host reprocess — which the unbuilt producer-gate gates against
+— could make `metadata.json`'s `processed_by` name a different host than the on-disk
+`produced_by`, and the pull is byte-authoritative and never consults `metadata.json`,
+so that divergence cannot clobber. That authority is stamped WITH the bytes and never
+re-derived from `metadata.json` (whose `Processed` stamp propagates over Discovery
+independently of the bytes; deriving from it would let a stale relay copy clobber a
+newer producer copy). The per-(meeting, rel-path) authority RMW runs under a
+per-meeting lock (the `.blobs/artifacts` analogue of the metadata lock), so
+concurrent exchanges for one meeting cannot lose each other's record. The per-(meeting, rel-path) authority is persisted at
 `{meetings_root}/.blobs/artifacts/{id}.json` (sync-owned, beside the blob store),
 written whenever an artifact's bytes are written, so a device re-advertises the
 authority that arrived WITH the bytes. An `is_artifact_rel` allow-list

@@ -7,7 +7,6 @@ import { useMeetingsStore } from "../state/meetings";
 import { useReportProblemStore } from "../state/report-problem";
 import { useSyncStatusStore } from "../state/sync-status";
 import { MeetingControls } from "./MeetingControls";
-import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
 import { RecordingStatus } from "./RecordingStatus";
 import { MeetingMasthead } from "./MeetingMasthead";
@@ -266,9 +265,8 @@ export function MainWindow() {
             the former re-transcribe + re-diarize actions into one).
           */}
           <MeetingControls />
-          <div className="main-window__meter" aria-label="Audio level">
-            <AudioMeter />
-          </div>
+          {/* Audio level meter moved to the TOP of the transcript pane (see
+              `TranscriptPane`), where it sits above the live transcript. */}
           {/*
             Pane-visibility toggle (FR-21/FR-30): a segmented control that shows
             or hides each column. A pressed segment = the pane is visible. The

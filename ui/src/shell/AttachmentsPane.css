@@ -223,6 +223,7 @@
 }
 
 .attachments-pane__row-main {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 0.7rem;
@@ -284,17 +285,35 @@
 }
 
 .attachments-pane__row-actions {
-  flex: 0 0 auto;
+  /* Lifted OUT of the row's flex flow (was flex: 0 0 auto, which reserved the
+     buttons' full width even while hidden and cramped the filename). Now the
+     name owns the full row width; the actions overlay the right edge only on
+     hover/focus, over a scrim that fades a long name out cleanly beneath them. */
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
   display: flex;
+  align-items: center;
   gap: 0.3rem;
+  padding-left: 2rem;
+  background: linear-gradient(
+    to right,
+    transparent 0,
+    var(--sheet-quiet) 1.75rem
+  );
   opacity: 0;
-  transition: opacity 120ms ease;
+  transform: translateX(0.5rem);
+  pointer-events: none;
+  transition: opacity 130ms ease, transform 130ms ease;
 }
 
 /* Reveal actions on hover/focus-within; keep them reachable for keyboard. */
 .attachments-pane__row:hover .attachments-pane__row-actions,
 .attachments-pane__row:focus-within .attachments-pane__row-actions {
   opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
 }
 
 .attachments-pane__row-btn {

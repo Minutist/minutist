@@ -240,10 +240,6 @@
 
 /* --- Audio meter (slim) ------------------------------------------------- */
 
-.main-window__meter {
-  width: 96px;
-}
-
 .audio-meter {
   position: relative;
   height: 6px;

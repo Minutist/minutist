@@ -11,6 +11,7 @@ import { speakerColorIndex } from "./speaker-color";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { MeetingId, Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
+import { AudioMeter } from "../shell/AudioMeter";
 
 /**
  * Custom URI scheme for serving a transcript window's audio to the webview.
@@ -470,6 +471,10 @@ export function TranscriptPane() {
   // (re-lettered on stop) and there is no metadata to write, so the chips are
   // display-only. This mirrors `active-transcript`'s saved-vs-live rule.
   const recordingKind = useRecordingStore((s) => s.state.kind);
+  // The live audio meter belongs at the top of this pane (above the live
+  // transcript) and is only meaningful while capture is running — show it for
+  // recording/paused, hide it for a finished (idle) meeting where peak is 0.
+  const isLive = recordingKind === "recording" || recordingKind === "paused";
   const speakerEditable = openMeetingId !== null && recordingKind === "idle";
 
   // Per-segment audio re-listen (#0023 manual-labelling aid). A single shared,
@@ -579,6 +584,11 @@ export function TranscriptPane() {
 
   return (
     <div className="transcript-pane">
+      {isLive && (
+        <div className="transcript-pane__meter" aria-label="Audio level">
+          <AudioMeter />
+        </div>
+      )}
       <TranscriptToolbar />
       <VoiceprintSuggestionBanner />
       <div

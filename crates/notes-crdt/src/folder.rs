@@ -227,17 +227,7 @@ fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minutist_common::MeetingMeta;
-
-    /// Read `metadata.json` from a meeting folder directly via `serde_json`.
-    ///
-    /// `notes-crdt` has no `reader` module (that stays in `persistence`, behind
-    /// the Opus decoder), so these tests parse the seeded `metadata.json` file
-    /// from disk rather than reaching for `persistence::read_metadata`.
-    fn read_metadata(meeting_dir: &std::path::Path) -> MeetingMeta {
-        let bytes = std::fs::read(meeting_dir.join("metadata.json")).expect("read metadata.json");
-        serde_json::from_slice(&bytes).expect("parse metadata.json")
-    }
+    use crate::read_metadata;
 
     #[test]
     fn ensure_creates_folder_and_seeds_metadata() {
@@ -251,7 +241,7 @@ mod tests {
             "a placeholder metadata.json must be seeded"
         );
 
-        let meta = read_metadata(&path);
+        let meta = read_metadata(&path).expect("read seeded metadata");
         assert_eq!(meta.uuid, id);
         assert!(
             meta.title.is_empty(),
@@ -267,14 +257,14 @@ mod tests {
         // First call seeds the placeholder; overwrite it with a real title to
         // stand in for the authoritative metadata having synced across.
         let path = MeetingFolder::ensure(dir.path(), id).expect("first ensure");
-        let mut meta = read_metadata(&path);
+        let mut meta = read_metadata(&path).expect("read seeded metadata");
         meta.title = "Real meeting".to_string();
         crate::write_metadata(&path, &meta).expect("overwrite metadata");
 
         // A second ensure (a re-sync of the same meeting) must not clobber it.
         let path2 = MeetingFolder::ensure(dir.path(), id).expect("second ensure");
         assert_eq!(path, path2);
-        let reloaded = read_metadata(&path2);
+        let reloaded = read_metadata(&path2).expect("read metadata after re-ensure");
         assert_eq!(
             reloaded.title, "Real meeting",
             "ensure must leave an existing metadata.json untouched"

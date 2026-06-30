@@ -1,5 +1,12 @@
-//! `metadata.json` write helpers.
+//! `metadata.json` read / write / guarded-RMW helpers.
 //!
+//! - [`read_metadata`] deserialises `metadata.json` into a [`MeetingMeta`].
+//! - [`update_metadata`] / [`update_metadata_if_present`] are the **guarded
+//!   read-modify-write** entry points (issue 0025): they take the per-meeting
+//!   [`metadata_lock`](crate::metadata_lock) across read→mutate→write so no two
+//!   writers interleave. Living here (the leaf, beside the lock + the writer)
+//!   lets `persistence` and the mobile `sync-ffi` path share one implementation;
+//!   `persistence::meeting_ops` re-exports them at their historical paths.
 //! - [`write_metadata`] is the **public** atomic writer keyed on the meeting
 //!   **directory** (`{root}/{uuid}/`). It is the seam the orchestrator uses to
 //!   update `metadata.json`'s `{ speaker_count, diarizer }` after the Phase-6
@@ -15,7 +22,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use minutist_common::{AppResult, MeetingMeta};
+use minutist_common::{AppResult, MeetingId, MeetingMeta};
 
 use crate::error::{Error, Result};
 
@@ -77,4 +84,81 @@ pub fn write_metadata_atomic(path: &Path, meta: &MeetingMeta) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Read and deserialise `metadata.json` from a meeting folder (`{root}/{uuid}/`).
+///
+/// A blocking `std::fs` read + `serde_json` parse. Lives in this leaf crate so
+/// the guarded read-modify-write [`update_metadata`] — and any non-`persistence`
+/// caller (the mobile `sync-ffi` path) — can read `metadata.json` without the
+/// C-heavy `persistence` graph. `persistence::read_metadata` re-exports it (in
+/// its own error namespace).
+pub fn read_metadata(meeting_dir: &Path) -> Result<MeetingMeta> {
+    let bytes = std::fs::read(meeting_dir.join("metadata.json"))?;
+    let meta: MeetingMeta = serde_json::from_slice(&bytes)?;
+    Ok(meta)
+}
+
+/// Guarded read-modify-write of a meeting's `metadata.json` — the single entry
+/// point every `metadata.json` writer uses (issue 0025).
+///
+/// Takes the per-meeting [`metadata_lock`](crate::metadata_lock), confirms the
+/// meeting exists, reads the [`MeetingMeta`], applies `f`, and writes it back
+/// atomically — one lock acquisition spanning the existence check and the RMW, so
+/// no concurrent writer can interleave and revert a field. The closure returns
+/// whatever the caller needs from the mutated `meta` (e.g. `()`, or the updated
+/// `speaker_names`), computed under the guard.
+///
+/// Synchronous by design: the std-`Mutex` guard must never be held across an
+/// `.await`. Any async follow-up (e.g. an `index.db` upsert) runs after this
+/// returns and the guard drops.
+///
+/// `AppError::InvalidInput` (via [`Error::MeetingNotFound`]) if the folder has no
+/// `metadata.json`. Use [`update_metadata_if_present`] for the consumer case that
+/// skips an absent meeting instead of erroring.
+///
+/// Lives in this leaf crate — co-located with [`metadata_lock`](crate::metadata_lock)
+/// and [`write_metadata`] — so `persistence` AND the mobile `sync-ffi` path share
+/// ONE guarded-RMW implementation rather than each re-deriving the lock discipline
+/// (the de-duplication issue 0025 established). `persistence::meeting_ops`
+/// re-exports it at its historical path, so its callers are unchanged.
+pub fn update_metadata<F, R>(meetings_root: &Path, id: MeetingId, f: F) -> AppResult<R>
+where
+    F: FnOnce(&mut MeetingMeta) -> R,
+{
+    let folder = meetings_root.join(id.0.to_string());
+    let lock = crate::metadata_lock(id);
+    let _guard = lock.lock().expect("metadata lock poisoned");
+    if !folder.join("metadata.json").exists() {
+        return Err(Error::MeetingNotFound(id).into());
+    }
+    let mut meta = read_metadata(&folder)?;
+    let out = f(&mut meta);
+    write_metadata(&folder, &meta)?;
+    Ok(out)
+}
+
+/// Like [`update_metadata`], but returns `Ok(None)` (skips) when the meeting is
+/// not present locally rather than erroring — the consumer-side contract for a
+/// peer-advertised state whose folder may not have synced in yet (the
+/// notes/media receive path seeds it). The presence check and the write are one
+/// atomic unit under the lock.
+pub fn update_metadata_if_present<F, R>(
+    meetings_root: &Path,
+    id: MeetingId,
+    f: F,
+) -> AppResult<Option<R>>
+where
+    F: FnOnce(&mut MeetingMeta) -> R,
+{
+    let folder = meetings_root.join(id.0.to_string());
+    let lock = crate::metadata_lock(id);
+    let _guard = lock.lock().expect("metadata lock poisoned");
+    if !folder.join("metadata.json").exists() {
+        return Ok(None);
+    }
+    let mut meta = read_metadata(&folder)?;
+    let out = f(&mut meta);
+    write_metadata(&folder, &meta)?;
+    Ok(Some(out))
 }

@@ -210,9 +210,11 @@ the feature in S5. It depends only on `common` (shared types) and `notes-crdt`
 role. It does NOT depend on `persistence`: the notes-CRDT primitives were
 extracted into the leaf `notes-crdt` crate so `sync`'s lib stays off the C-heavy
 graph and cross-compiles to mobile. The meeting-media path (`audio.opus` +
-`assets/*`) is written by `sync` itself under the meetings root after
-`MeetingFolder::ensure`; `persistence::assets` (which stays in `persistence`)
-is reached only as a DEV-dependency by `sync`'s integration tests.
+`assets/*`) and the derived-artifact path (`transcript.json` + `summary.md`, plus
+the sync-owned authority store under `.blobs/artifacts/`) are written by `sync`
+itself under the meetings root after `MeetingFolder::ensure`; `persistence::assets`
+(which stays in `persistence`) is reached only as a DEV-dependency by `sync`'s
+integration tests.
 
 `headless` (WS4-B) is systems-engineer for the same reason as `sync` /
 `tunnel-client` / `mcp-server`: it is connective tissue, not a domain. It is the

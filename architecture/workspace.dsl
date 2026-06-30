@@ -168,7 +168,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core -> updateServer "Polls + applies signed updates"
         minutist.core -> externalLlm "Optional summary dispatch" "HTTP"
         mcpClient -> minutist.core "tools/list + tools/call (bearer + Host/Origin)" "Streamable HTTP / loopback"
-        minutist.core -> minutist.headlessHub "Reconciles notes + media over iroh QUIC (mutual device sync)"
+        minutist.core -> minutist.headlessHub "Reconciles notes + media + derived artifacts over iroh QUIC (mutual device sync)"
         minutist.core -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
         minutist.headlessHub -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
 

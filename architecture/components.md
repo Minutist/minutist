@@ -171,6 +171,29 @@ on GC state. `sync` reads/writes only `audio.opus` and `assets/*` under the
 meetings root — it does not touch metadata/transcript/notes projections in the
 media path.
 
+The derived-artifact protocol (`artifacts_proto`, `StreamKind::Artifacts` tag `4`)
+mirrors the media exchange but for a meeting's DERIVED outputs — `transcript.json`
+and `summary.md`, the processor→consumer files processing produces. It differs in
+one load-bearing way: media blobs are immutable and content-addressed, so "pull what
+I lack by hash" is the whole rule, whereas a derived artifact is MUTABLE (a meeting
+can be reprocessed). So each manifest entry carries the authority that produced those
+exact bytes (`produced_by` host + `produced_at`); the receiver pulls a peer entry
+only when it STRICTLY supersedes its own (strict `>` on `produced_at`, ties to the
+lowest `produced_by` HostRef — clock-independent, matching the
+`notes_crdt::merge_processing` two-`Processed` tiebreak so the lifecycle edge and the
+on-disk bytes name one authoritative host). That authority is stamped WITH the bytes
+and never re-derived from `metadata.json` (whose `Processed` stamp propagates over
+Discovery independently of the bytes; deriving from it would let a stale relay copy
+clobber a newer producer copy). The per-(meeting, rel-path) authority is persisted at
+`{meetings_root}/.blobs/artifacts/{id}.json` (sync-owned, beside the blob store),
+written whenever an artifact's bytes are written, so a device re-advertises the
+authority that arrived WITH the bytes. An `is_artifact_rel` allow-list
+(`transcript.json` + `summary.md`) is kept DISJOINT from the media path-safety
+allow-list so a derived file can never ride the media union path. `sync` writes only
+`transcript.json` + `summary.md` (atomically, tmp+rename) under the meetings root in
+this path; the `translations.json` reconcile + UI reload signal a received transcript
+implies are the consumer read-sync slice (see `planning/DESIGN_artifacts.md` §4).
+
 The `tunnel-client` row's "May depend on" is empty by design: the crate takes
 **no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)
 and re-implements the relay's postcard wire frames locally rather than sharing a
@@ -585,9 +608,12 @@ processed meeting, no migration). Three new architecture-owned types:
 
 One shape serves two roles without naming a device type — a phone (0016) or a
 GPU-less desktop (0020) is the capture device that writes `PendingProcessing`;
-a desktop or the headless GPU hub is the processing host that claims, produces
-derived outputs, and is by construction the sole `Artifacts` sender (so no
-version field is needed on derived outputs).
+a desktop or the headless GPU hub is the processing host that claims and produces
+derived outputs. A single host produces a meeting's derived outputs, but the
+`Artifacts` manifest still stamps each entry with the producing host + production
+time (`produced_by` / `produced_at`) bound to the bytes, so a relay or hub
+forwarding those bytes multi-hop can never let a stale copy supersede a newer one
+(see the `sync` `artifacts_proto` description).
 
 **Transport is NOT in `common`:** `metadata.json` does not sync today, so the
 lifecycle has no transport on its own. It rides the bidirectional

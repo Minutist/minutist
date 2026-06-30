@@ -70,11 +70,13 @@ use crate::{Error, Result};
 
 /// ALPN for the sync-update protocol. Bumping the suffix is a wire break.
 ///
-/// Both the notes reconciliation and the media-manifest exchange
-/// ([`crate::media_proto`]) multiplex onto this one ALPN: the initiator writes a
-/// one-byte [`StreamKind`] tag as the first byte of each bidirectional stream, and
-/// the accept hook dispatches on it. Keeping a single ALPN means one paired-peer
-/// authorisation point (the notes-ALPN accept hook) covers both protocols.
+/// Every sync exchange multiplexes onto this one ALPN — notes reconciliation,
+/// the media-manifest exchange ([`crate::media_proto`]), discovery
+/// ([`crate::discovery_proto`]), and the derived-artifact exchange
+/// ([`crate::artifacts_proto`]): the initiator writes a one-byte [`StreamKind`]
+/// tag as the first byte of each bidirectional stream, and the accept hook
+/// dispatches on it. Keeping a single ALPN means one paired-peer authorisation
+/// point (the notes-ALPN accept hook) covers all of them.
 pub const SYNC_ALPN: &[u8] = b"minutist/sync/notes/1";
 
 /// The first byte of a sync bidirectional stream, selecting the protocol that
@@ -95,6 +97,14 @@ pub enum StreamKind {
     /// must only ever be added at the end — an older peer rejects an unknown tag
     /// via [`Self::from_tag`] rather than mis-dispatching.
     Discovery = 3,
+    /// Derived-artifact exchange ([`crate::artifacts_proto`]): the
+    /// processor→consumer sync of a meeting's `transcript.json` + `summary.md`
+    /// (the outputs processing produces). Mirrors [`Self::Media`] — a manifest of
+    /// `(relative-path, hash, produced_by, produced_at)` entries, then a
+    /// content-addressed blob pull over the blobs ALPN — but the authority is
+    /// stamped per entry, bound to the bytes, so a stale relay copy can never
+    /// clobber a newer producer copy. Appended as tag `4` (append-only).
+    Artifacts = 4,
 }
 
 impl StreamKind {
@@ -105,6 +115,7 @@ impl StreamKind {
             1 => Ok(Self::Notes),
             2 => Ok(Self::Media),
             3 => Ok(Self::Discovery),
+            4 => Ok(Self::Artifacts),
             other => Err(Error::Protocol(format!("unknown sync stream kind {other}"))),
         }
     }
@@ -293,15 +304,16 @@ mod tests {
 
     #[test]
     fn stream_kind_tags_are_the_wire_contract() {
-        // The tag byte IS the wire contract: 1/2/3 are fixed and append-only, so
+        // The tag byte IS the wire contract: 1/2/3/4 are fixed and append-only, so
         // this test fails if a future change reorders or renumbers a variant.
         assert_eq!(StreamKind::from_tag(1).unwrap(), StreamKind::Notes);
         assert_eq!(StreamKind::from_tag(2).unwrap(), StreamKind::Media);
         assert_eq!(StreamKind::from_tag(3).unwrap(), StreamKind::Discovery);
+        assert_eq!(StreamKind::from_tag(4).unwrap(), StreamKind::Artifacts);
         // An unknown tag (an old peer seeing a future variant, or garbage) is a
         // protocol error — never a silent mis-dispatch.
         assert!(matches!(StreamKind::from_tag(0), Err(Error::Protocol(_))));
-        assert!(matches!(StreamKind::from_tag(4), Err(Error::Protocol(_))));
+        assert!(matches!(StreamKind::from_tag(5), Err(Error::Protocol(_))));
     }
 
     #[test]

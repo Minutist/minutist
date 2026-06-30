@@ -8723,6 +8723,7 @@ dependencies = [
 name = "sync"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "iroh",
  "iroh-blobs",
  "iroh-tickets",

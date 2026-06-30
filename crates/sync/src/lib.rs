@@ -27,6 +27,7 @@
 //! [iroh]: https://docs.rs/iroh/1.0.0/iroh/
 
 pub mod address_lookup;
+pub mod artifacts_proto;
 pub mod blobs;
 pub mod discovery_proto;
 pub mod endpoint;

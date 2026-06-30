@@ -61,6 +61,12 @@ iroh-blobs = { version = "=0.103.0", features = ["fs-store"] }
 yrs = { workspace = true }
 # UUID — decode the fixed 16-byte meeting id off the wire back into a `MeetingId`.
 uuid = { workspace = true }
+# chrono — parse the RFC 3339 `produced_at` authority on artifact-manifest entries
+# to an instant for the strict-`>` supersede rule (`artifacts_proto` /
+# `blobs::ArtifactEntry`). A raw-string timestamp compare sorts mixed fractional
+# precision / offsets wrong, so a real parse is required. Same workspace pin
+# `notes-crdt` already uses for the lifecycle merge, so the two agree.
+chrono = { workspace = true }
 
 [features]
 # Exposes the relay-less direct-connection path (`SyncEngine::start_direct` +

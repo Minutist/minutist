@@ -19,7 +19,7 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# tracing: the moved bodies log meeting ids (never content) under the
+# tracing: `write_metadata` logs the meeting id (never content) under the
 # `target: "persistence"` stream, matching the rest of the meeting-storage surface.
 tracing = { workspace = true }
 # yrs: the Yjs CRDT port. Stores the authoritative per-meeting notes document as

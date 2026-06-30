@@ -113,9 +113,10 @@ pub fn read_metadata(meeting_dir: &Path) -> Result<MeetingMeta> {
 /// `.await`. Any async follow-up (e.g. an `index.db` upsert) runs after this
 /// returns and the guard drops.
 ///
-/// `AppError::InvalidInput` (via [`Error::MeetingNotFound`]) if the folder has no
-/// `metadata.json`. Use [`update_metadata_if_present`] for the consumer case that
-/// skips an absent meeting instead of erroring.
+/// A missing `metadata.json` yields [`Error::MeetingNotFound`], surfaced as
+/// `AppError::InvalidInput` at the [`AppResult`] boundary. Use
+/// [`update_metadata_if_present`] for the consumer case that skips an absent
+/// meeting instead of erroring.
 ///
 /// Lives in this leaf crate — co-located with [`metadata_lock`](crate::metadata_lock)
 /// and [`write_metadata`] — so `persistence` AND the mobile `sync-ffi` path share

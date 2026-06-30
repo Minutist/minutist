@@ -1,0 +1,32 @@
+[package]
+name = "election"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# Leaf crate: the host-election state machine for capture-but-unprocessed meetings
+# (the producer-gate). An eligible host claims a `PendingProcessing` meeting (or
+# reaps a `Claimed` whose lease expired), holds a renewable lease, runs the
+# pipeline via the `ElectionDriver` trait, and writes `Processed` — all propagated
+# over the existing Discovery exchange (no new wire message). The two collaborators
+# the loop must not depend on directly — the `SyncEngine` advertise and the
+# `Orchestrator` reprocess — sit behind `ElectionDriver`, so the ONE state machine
+# is reused by both eligible host types (desktop-with-GPU + the future GPU node)
+# and is unit-testable with a mock driver. Deps: `common` (lifecycle types),
+# `persistence` (the guarded metadata RMW + the meeting-id scan, both re-exported
+# from the `notes-crdt` leaf), `chrono` (lease timing), `async-trait` (the driver
+# trait), `tokio` (the loop + lease renewal), `tracing`. NOT `sync` / `orchestrator`
+# / `tauri` / `iroh`. See `planning/DESIGN_producer-gate.md`.
+
+[dependencies]
+minutist-common = { path = "../common" }
+persistence = { path = "../persistence" }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

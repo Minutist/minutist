@@ -39,6 +39,7 @@ appears in:
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
 | `sync` | WS4-B | `common`, `notes-crdt` |
 | `sync-ffi` | WS4-B (phone) | `common`, `sync`, `notes-crdt` ¶ |
+| `election` | WS4-B (producer-gate) | `common`, `persistence` |
 | `doc-convert` | Attachments WS | `common` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
@@ -1428,6 +1429,38 @@ The behaviour of the moved code is documented in the `persistence` "CRDT notes
 storage" / "Note image assets" sections below — they describe the same `ydoc` /
 `NotesStore` / `MeetingFolder` surface regardless of which crate now hosts the
 bodies. See `planning/DESIGN_notes-crdt.md`.
+
+### `election`
+**Crate:** `crates/election`
+**Owns:** the host-election state machine for capture-but-unprocessed meetings —
+the producer side of the processing lifecycle (`planning/DESIGN_producer-gate.md`).
+`run_election_loop(config, driver, meetings_root, capability)` polls the meetings on
+disk and, for each claimable one (`PendingProcessing`, or a `Claimed` whose lease
+has expired), claims it via the conditional guarded RMW (`update_metadata_if`), runs
+the pipeline, and writes `Processed` — propagating each state change over the
+existing Discovery exchange via the driver's `advertise()`. No new wire message.
+
+A **leaf** (`common` + `persistence` only). The two collaborators it must not depend
+on directly — the `sync` `SyncEngine` (advertise) and the `orchestrator` (reprocess)
+— sit behind the `ElectionDriver` trait, so this crate carries no `sync` /
+`orchestrator` / `tauri` / `iroh` edge, the ONE state machine is reused by both
+eligible host types (desktop-with-GPU + the future headless GPU node), and the
+contention paths are unit-testable with a mock driver. It reaches
+`folder::list_meeting_ids` and the guarded `update_metadata_if` through the
+`persistence` re-exports (no `notes-crdt` edge). The `Capability` is PASSED IN by the
+binding crate (app-main / headless), so this leaf does not link the GPU probe.
+
+**Correctness core** (pure, exhaustively tested): a meeting is claimable iff
+`PendingProcessing` or a `Claimed` past its lease; a claim is *superseded* (stop
+renewing) only by a `Processed`-by-other or a LIVE lower-`HostRef` `Claimed` — an
+EXPIRED lower-`HostRef` claim is a stale replay (re-injected by `merge_processing`'s
+clock-independent lowest-`HostRef` resolution from a peer sweep) and is reapable
+regardless of `HostRef`, so the renewal re-asserts over it rather than self-aborting
+(`DESIGN_producer-gate.md` §10, review CRITICAL-1). Two eligible hosts may briefly do
+duplicate-but-idempotent work; the authoritative winner falls out of convergence
+(`merge_processing` + the Artifacts authority rule), not a settle timer — so the loop
+never cancels an in-flight `process()`. The desktop `DesktopElectionDriver` (app-main,
+`connected`-gated) and the future headless GPU-node driver implement the trait.
 
 ### `persistence`
 **Crate:** `crates/persistence`

@@ -2363,6 +2363,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
+name = "election"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "minutist-common",
+ "persistence",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "embed-resource"
 version = "3.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

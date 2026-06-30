@@ -37,7 +37,7 @@ use crate::reader;
 /// implementation. Re-exported here at their historical `persistence::meeting_ops`
 /// path so every caller — the ops below, the orchestrator's post-processing
 /// writes, `reader::read_meeting_state`, and `agent-tools` — is unchanged.
-pub use notes_crdt::{update_metadata, update_metadata_if_present};
+pub use notes_crdt::{update_metadata, update_metadata_if, update_metadata_if_present, MetaUpdate};
 
 /// A stable, log-safe discriminant for a [`ProcessingLifecycle`] — the variant
 /// name only (the `HostRef` inside a claim is a device key, not user content,

@@ -38,9 +38,10 @@
 //!
 //! Runner → ASR worker: `Arc<Mutex<VecDeque<FlushPayload>>>` (capacity 4) + `Arc<Notify>`.
 //! On backpressure the runner drops the OLDEST queued flush (the entry at the
-//! front of the deque), enqueues the newest at the back, and emits
-//! `AppEvent::ErrorOccurred`. Audio is always preserved in `audio.opus`; only
-//! live transcript is lost.
+//! front of the deque) and enqueues the newest at the back. This is self-healing
+//! and log-only (a WARN, not a UI error): audio is always preserved in
+//! `audio.opus`, and the dropped flush's transcript is restored by the
+//! post-stop re-transcribe the `incomplete` flag triggers.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -669,7 +670,6 @@ fn run_drain_loop(
                         &flush_queue,
                         &mut writer_cmd_rx,
                         writer,
-                        &event_tx,
                         meeting_id,
                         online_diarizer.as_ref(),
                     );
@@ -732,7 +732,6 @@ fn run_drain_loop(
                         &flush_queue,
                         &mut writer_cmd_rx,
                         writer,
-                        &event_tx,
                         meeting_id,
                         online_diarizer.as_ref(),
                     );
@@ -805,7 +804,7 @@ fn run_drain_loop(
                         speaker_ids,
                         meeting_id,
                     };
-                    dispatch_flush(&flush_queue, payload, &event_tx);
+                    dispatch_flush(&flush_queue, payload);
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -825,7 +824,7 @@ fn run_drain_loop(
                         speaker_ids,
                         meeting_id,
                     };
-                    dispatch_flush(&flush_queue, payload, &event_tx);
+                    dispatch_flush(&flush_queue, payload);
                 } else {
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -869,7 +868,7 @@ fn run_drain_loop(
                             speaker_ids,
                             meeting_id,
                         };
-                        dispatch_flush(&flush_queue, payload, &event_tx);
+                        dispatch_flush(&flush_queue, payload);
                     }
                     // Wait for the ASR worker to process any remaining flushes.
                     wait_for_asr_worker_drain(
@@ -904,36 +903,25 @@ fn run_drain_loop(
 ///
 /// If the queue is already at capacity (`FLUSH_CHANNEL_CAP`), the **oldest**
 /// pending flush (the entry at the front of the deque) is removed and
-/// discarded, then the new payload is pushed to the back. An
-/// `AppEvent::ErrorOccurred` is emitted so the UI can surface the warning.
+/// discarded, then the new payload is pushed to the back.
 ///
-/// Audio is always preserved in `audio.opus`; only the live transcript is
-/// lost for the dropped flush.
-fn dispatch_flush(
-    flush_queue: &FlushQueue,
-    payload: FlushPayload,
-    event_tx: &broadcast::Sender<AppEvent>,
-) {
-    dispatch_flush_inner(flush_queue, payload, event_tx);
+/// This is self-healing and log-only — NOT surfaced to the UI as an error (it
+/// can fire repeatedly under sustained load, e.g. CPU-only ASR). Audio is always
+/// preserved in `audio.opus`; the dropped flush's transcript is restored by the
+/// post-stop re-transcribe that the `incomplete` flag triggers.
+fn dispatch_flush(flush_queue: &FlushQueue, payload: FlushPayload) {
+    dispatch_flush_inner(flush_queue, payload);
 }
 
 /// Public wrapper for `dispatch_flush` used by tests.
 ///
 /// Only available under the `test-source` feature (or in `#[cfg(test)]`).
 #[cfg(any(test, feature = "test-source"))]
-pub(crate) fn dispatch_flush_pub(
-    flush_queue: &FlushQueue,
-    payload: FlushPayload,
-    event_tx: &broadcast::Sender<AppEvent>,
-) {
-    dispatch_flush_inner(flush_queue, payload, event_tx);
+pub(crate) fn dispatch_flush_pub(flush_queue: &FlushQueue, payload: FlushPayload) {
+    dispatch_flush_inner(flush_queue, payload);
 }
 
-fn dispatch_flush_inner(
-    flush_queue: &FlushQueue,
-    payload: FlushPayload,
-    event_tx: &broadcast::Sender<AppEvent>,
-) {
+fn dispatch_flush_inner(flush_queue: &FlushQueue, payload: FlushPayload) {
     let mut deque = flush_queue
         .deque
         .lock()
@@ -946,16 +934,15 @@ fn dispatch_flush_inner(
         // re-transcribe of the complete audio after stop (the dropped flush's
         // audio survives in audio.opus; only its transcript was lost).
         flush_queue.incomplete.store(true, Ordering::Release);
+        // Self-healing backpressure: the audio survives in `audio.opus` and the
+        // `incomplete` flag above triggers a full re-transcribe after stop, so
+        // this is a log-only WARN — NOT surfaced to the UI as an error (it can
+        // fire repeatedly under sustained load, e.g. CPU-only ASR).
         tracing::warn!(
             target: "orchestrator",
             "ASR flush queue full (backpressure); dropping oldest pending flush \
-             (audio.opus unaffected)"
+             (audio.opus unaffected; restored by the post-stop re-transcribe)"
         );
-        let _ = event_tx.send(AppEvent::ErrorOccurred {
-            error: AppError::Internal {
-                context: "ASR flush queue full; oldest pending flush dropped (audio.opus unaffected)".into(),
-            },
-        });
     }
 
     deque.push_back(payload);
@@ -1468,7 +1455,6 @@ fn finalise_on_stop(
     flush_queue: &FlushQueue,
     writer_cmd_rx: &mut mpsc::Receiver<WriterCommand>,
     mut writer: MeetingWriter,
-    event_tx: &broadcast::Sender<AppEvent>,
     meeting_id: MeetingId,
     online_diarizer: Option<&Arc<OnlineDiarizer>>,
 ) {
@@ -1503,7 +1489,7 @@ fn finalise_on_stop(
             speaker_ids,
             meeting_id,
         };
-        dispatch_flush(flush_queue, payload, event_tx);
+        dispatch_flush(flush_queue, payload);
     }
 
     // Wait for the ASR worker to process any remaining flushes so that
@@ -2850,8 +2836,6 @@ mod tests {
     #[test]
     fn dispatch_flush_drops_oldest_when_queue_full() {
         use minutist_common::MeetingId;
-        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<AppEvent>(16);
-
         let flush_queue = FlushQueue::new();
         let meeting_id = MeetingId::new();
 
@@ -2864,7 +2848,7 @@ mod tests {
                 speaker_ids: vec![None],
                 meeting_id,
             };
-            dispatch_flush(&flush_queue, payload, &event_tx);
+            dispatch_flush(&flush_queue, payload);
         }
 
         // No drop yet → the live transcript is still complete.
@@ -2881,7 +2865,7 @@ mod tests {
             speaker_ids: vec![None],
             meeting_id,
         };
-        dispatch_flush(&flush_queue, newest_payload, &event_tx);
+        dispatch_flush(&flush_queue, newest_payload);
 
         // Drain the queue and collect start_ms values.
         let deque = flush_queue.deque.lock().unwrap();

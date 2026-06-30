@@ -149,14 +149,17 @@ const _: fn() = || {
 
 /// Drive ≥5 rapid flushes into the cap-4 ASR flush queue and verify:
 ///   (a) The OLDEST flush is the one dropped (not the newest).
-///   (b) `AppEvent::ErrorOccurred` is emitted at least once.
+///   (b) The drop is SILENT — no `AppEvent::ErrorOccurred` is emitted. The drop
+///       is self-healing (audio is preserved; the `incomplete` flag, asserted in
+///       the runner unit test, triggers a post-stop re-transcribe), so surfacing
+///       it as a user error would spam under sustained load (e.g. CPU-only ASR).
 ///   (c) The orchestrator survives — no panic and `stop()` returns `Ok`.
 ///
 /// This test uses `FlushBackpressureHarness` to inject flushes directly into
 /// the flush queue without needing a real VAD model, exercising the drop-oldest
 /// logic in `dispatch_flush` (runner.rs) directly.
 #[tokio::test]
-async fn asr_flush_queue_drops_oldest_and_emits_error_occurred() {
+async fn asr_flush_queue_drops_oldest_silently() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let harness = FlushBackpressureHarness::new();
@@ -192,11 +195,11 @@ async fn asr_flush_queue_drops_oldest_and_emits_error_occurred() {
         "newest flush (start_ms=5000) must be retained; queued: {starts:?}"
     );
 
-    // Collect all events emitted during the dispatches.
+    // The backpressure drop must NOT surface as an error event.
     let mut error_occurred_count = 0u32;
     loop {
         match event_rx.try_recv() {
-            Ok(AppEvent::ErrorOccurred { error: AppError::Internal { .. } }) => {
+            Ok(AppEvent::ErrorOccurred { .. }) => {
                 error_occurred_count += 1;
             }
             Ok(_) => {}
@@ -205,9 +208,9 @@ async fn asr_flush_queue_drops_oldest_and_emits_error_occurred() {
         }
     }
 
-    assert!(
-        error_occurred_count >= 2,
-        "expected ≥2 ErrorOccurred events (one per overflow); got {error_occurred_count}"
+    assert_eq!(
+        error_occurred_count, 0,
+        "the backpressure drop is self-healing and must emit NO ErrorOccurred; got {error_occurred_count}"
     );
 
     // Verify the orchestrator itself is also resilient with slow backend and

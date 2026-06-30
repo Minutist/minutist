@@ -84,8 +84,8 @@ impl FlushBackpressureHarness {
 
     /// Dispatch one flush payload to the queue.
     ///
-    /// If the queue is full, drops the oldest and emits `ErrorOccurred` on the
-    /// shared event bus.
+    /// If the queue is full, drops the oldest pending flush and flags the
+    /// transcript incomplete (log-only WARN; the drop is not surfaced as an event).
     pub fn dispatch(&self, start_ms: u64) {
         let payload = FlushPayload {
             samples: vec![0.0f32; 480],
@@ -93,7 +93,7 @@ impl FlushBackpressureHarness {
             speaker_ids: vec![None],
             meeting_id: self.meeting_id,
         };
-        dispatch_flush_pub(&self.flush_queue, payload, &self.event_tx);
+        dispatch_flush_pub(&self.flush_queue, payload);
     }
 
     /// Return the current queue length.

@@ -1649,37 +1649,39 @@ export type IpcError = { code: "io"; context: string } | { code: "model_load"; m
 /**
  * Whether the live in-meeting agent runs during an active recording.
  * 
- * `Auto` (the default) enables when GPU acceleration is ACTIVE: a usable GPU
- * is present (probe is `Some`) AND `gpu_acceleration != Off`. This ensures the
- * live agent's `LlamaContext` (n_ctx = 32 768) runs on the GPU and does not
- * contend with the CPU-bound ASR path. On the AMD Radeon 890M (integrated,
- * Vulkan on) with `gpu_acceleration = Auto`, this resolves `true` — the
- * validated SP-LIVE hardware.
+ * `Auto` enables only on a **discrete** GPU with acceleration active, where the
+ * live agent's `LlamaContext` (n_ctx = 32 768) runs in dedicated VRAM and does
+ * not contend with the GPU-accelerated ASR/diarization path. On a shared-memory
+ * integrated GPU the held context and the ASR path draw from one memory pool, so
+ * Auto resolves `false` (co-scheduling them there exhausts memory and a native
+ * allocation failure aborts the process). `On` is the explicit opt-in for that
+ * contention; `Off` disables the agent everywhere. The default is `Off` — the
+ * feature is opt-in until validated on real hardware.
  * 
  * This is **distinct from** [`GpuAcceleration`], which governs model-layer
- * placement (GPU vs CPU). `LiveAgentMode::Auto` means "run iff a GPU is active";
- * `GpuAcceleration::Auto` means "offload layers iff they fit in the VRAM budget".
+ * placement (GPU vs CPU). `LiveAgentMode::Auto` means "run iff a discrete GPU is
+ * active"; `GpuAcceleration::Auto` means "offload layers iff they fit the budget".
  * 
  * Serialises as snake_case (`"auto"` / `"on"` / `"off"`) to match the
  * established `GpuAcceleration` pattern and the TypeScript binding shape.
  */
 export type LiveAgentMode = 
 /**
- * Enable the live agent when GPU acceleration is active: a usable GPU is
- * present (`probe.is_some()`) AND `gpu_acceleration != Off`. This is the
- * recommended default: users with a GPU (integrated or discrete) running
- * with acceleration on get the feature automatically; users on CPU-only
- * builds or with acceleration forced off are not affected.
+ * Enable the live agent only on a DISCRETE GPU with acceleration active
+ * (`probe.is_some() && !probe.is_integrated && gpu_acceleration != Off`),
+ * where the held context runs in dedicated VRAM clear of the ASR path. On an
+ * integrated (shared-memory) GPU or CPU-only host this resolves `false`.
  */
 "auto" | 
 /**
- * Always enable the live agent regardless of GPU capability. Use when the
- * user explicitly wants the feature even on a slow host (slower refreshes
- * are acceptable trade-off).
+ * Always enable the live agent regardless of GPU capability. The explicit
+ * opt-in for an integrated GPU or a slow host, accepting the memory
+ * contention / slower refreshes.
  */
 "on" | 
 /**
- * Permanently disable the live agent regardless of GPU capability.
+ * Permanently disable the live agent regardless of GPU capability. The
+ * default until the feature is validated on real hardware.
  */
 "off"
 /**

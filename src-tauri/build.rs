@@ -25,9 +25,14 @@ fn git_sha() -> String {
 
 fn main() {
     println!("cargo:rustc-env=MINUTIST_GIT_SHA={}", git_sha());
-    // Re-run when the env override changes or HEAD moves (best-effort: the path
-    // is absent on the Windows mirror, where the env override drives this).
+    // Re-run when the env override changes or HEAD moves. Watch `logs/HEAD` (the
+    // reflog), which is appended on every commit/checkout/reset — unlike `HEAD`,
+    // whose symbolic-ref content is invariant across same-branch commits. Both
+    // paths are absent on the Windows mirror (which excludes .git), where the
+    // env override drives this instead. (rerun-if-changed on a missing path is a
+    // harmless no-op.)
     println!("cargo:rerun-if-env-changed=MINUTIST_GIT_SHA");
+    println!("cargo:rerun-if-changed=../.git/logs/HEAD");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     tauri_build::build()
 }

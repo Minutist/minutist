@@ -1392,6 +1392,20 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // Build the tray icon.
             build_tray(app)?;
 
+            // Stamp the build into the title bar so a user (or a bug report) can
+            // identify exactly which build is running. The git SHA is embedded by
+            // build.rs; it reads "unknown" only when neither the env override nor
+            // a local `.git` was available, in which case show the version alone.
+            if let Some(window) = app.get_webview_window("main") {
+                let sha = env!("MINUTIST_GIT_SHA");
+                let title = if sha == "unknown" {
+                    format!("Minutist {}", env!("CARGO_PKG_VERSION"))
+                } else {
+                    format!("Minutist {} ({sha})", env!("CARGO_PKG_VERSION"))
+                };
+                let _ = window.set_title(&title);
+            }
+
             // The main window is created hidden (tauri.conf.json `visible:
             // false`) to avoid a white flash: the OS would otherwise paint an
             // empty frame before the webview renders. Reveal it a short moment

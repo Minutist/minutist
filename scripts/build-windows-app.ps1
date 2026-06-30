@@ -40,7 +40,11 @@ param(
     # live-test BuildDir keeps the shared 'C:\mt'; any other worktree gets its own
     # short cache so concurrent multi-worktree builds cannot poison each other's
     # crate rlibs. Override explicitly to pin a specific cache.
-    [string]$TargetDir = ''
+    [string]$TargetDir = '',
+    # Short git SHA of the source, captured in WSL (the mirror excludes .git, so
+    # build.rs cannot derive it here). Embedded into the build for the title bar
+    # and diagnostic reports. Empty → build.rs records "unknown".
+    [string]$GitSha    = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,6 +118,12 @@ if (-not $TargetDir) {
 }
 $env:CARGO_TARGET_DIR = $TargetDir
 Write-Host "==> CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR (short path; avoids rc.exe MAX_PATH in nested CMake)"
+
+# Pass the WSL-captured git SHA to build.rs (the mirror excludes .git).
+if ($GitSha) {
+    $env:MINUTIST_GIT_SHA = $GitSha
+    Write-Host "==> MINUTIST_GIT_SHA=$GitSha"
+}
 
 Set-Location $build
 

@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tools"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "audio-capture",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "asr-parakeet"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "minutist-common",
  "sherpa-rs",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "asr-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "encoding_rs",
  "hound",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "audio-capture"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cpal",
  "minutist-common",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "chat-agent"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "agent-tools",
  "encoding_rs",
@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "diarizer"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hound",
  "minutist-common",
@@ -2195,7 +2195,7 @@ dependencies = [
 
 [[package]]
 name = "doc-convert"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "calamine",
  "csv",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "headless"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "iroh",
@@ -3999,7 +3999,7 @@ dependencies = [
 
 [[package]]
 name = "ipc-bridge"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "agent-tools",
  "async-trait",
@@ -4976,7 +4976,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "agent-tools",
  "bytes",
@@ -5060,7 +5060,7 @@ dependencies = [
 
 [[package]]
 name = "minutist"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "agent-tools",
  "async-trait",
@@ -5095,7 +5095,7 @@ dependencies = [
 
 [[package]]
 name = "minutist-common"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "llama-cpp-2",
  "serde",
@@ -5118,7 +5118,7 @@ dependencies = [
 
 [[package]]
 name = "model-registry"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "minutist-common",
@@ -5540,7 +5540,7 @@ dependencies = [
 
 [[package]]
 name = "notes-crdt"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "minutist-common",
@@ -6085,7 +6085,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchestrator"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "asr-parakeet",
  "asr-runtime",
@@ -6380,7 +6380,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "persistence"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "audiopus",
  "chrono",
@@ -8114,7 +8114,7 @@ dependencies = [
 
 [[package]]
 name = "settings"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "minutist-common",
  "serde",
@@ -8473,7 +8473,7 @@ dependencies = [
 
 [[package]]
 name = "spike-asr"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -8488,7 +8488,7 @@ dependencies = [
 
 [[package]]
 name = "spike-diarize"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -8503,7 +8503,7 @@ dependencies = [
 
 [[package]]
 name = "spike-doc-vlm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -8523,7 +8523,7 @@ dependencies = [
 
 [[package]]
 name = "spike-llm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -8538,7 +8538,7 @@ dependencies = [
 
 [[package]]
 name = "spike-vad-loop"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -8693,7 +8693,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "summariser"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "encoding_rs",
  "llama-cpp-2",
@@ -8759,7 +8759,7 @@ dependencies = [
 
 [[package]]
 name = "sync"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -9879,7 +9879,7 @@ dependencies = [
 
 [[package]]
 name = "tunnel-client"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "futures-util",
  "postcard",
@@ -10292,7 +10292,7 @@ dependencies = [
 
 [[package]]
 name = "vad-chunker"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "hound",
  "minutist-common",

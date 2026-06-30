@@ -119,14 +119,17 @@ WIN_SRC_UNC   ?= $(shell wslpath -w "$(CURDIR)" 2>/dev/null || echo '\\wsl.local
 WIN_BUILD_DIR ?= C:\Users\anl\meeting-app
 WIN_TARGET_DIR ?=
 WIN_SCRIPT    ?= $(WIN_SRC_UNC)\scripts\build-windows-app.ps1
+# Captured in WSL (the Windows mirror excludes .git); passed to build.rs so the
+# title bar / diagnostic reports identify the exact commit.
+GIT_SHA       := $(shell git -C "$(CURDIR)" rev-parse --short HEAD 2>/dev/null || echo unknown)
 WIN_RUN       := powershell.exe -NoProfile -ExecutionPolicy Bypass \
                  -File '$(WIN_SCRIPT)' -WslSrc '$(WIN_SRC_UNC)' -BuildDir '$(WIN_BUILD_DIR)' -TargetDir '$(WIN_TARGET_DIR)'
 
 windows-build: ## Build the portable Windows CPU app (WSL -> Windows MSVC)
-	$(WIN_RUN)
+	$(WIN_RUN) -GitSha '$(GIT_SHA)'
 
 windows-build-vulkan: ## Build the portable Windows Vulkan app (WSL -> Windows MSVC)
-	$(WIN_RUN) -Features vulkan
+	$(WIN_RUN) -Features vulkan -GitSha '$(GIT_SHA)'
 
 # --- Free-tier (no MCP server) local builds --------------------------------
 # The free artifact is --no-default-features + an explicit GPU backend.

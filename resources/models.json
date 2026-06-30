@@ -136,9 +136,9 @@
       "files": [
         {
           "filename": "bge-m3-Q8_0.gguf",
-          "url": "https://huggingface.co/ggml-org/bge-m3/resolve/9eba04c5d75ba5a1595e45de734d36bef4e5cb98/bge-m3-Q8_0.gguf",
+          "url": "https://huggingface.co/gpustack/bge-m3-GGUF/resolve/2d48f1737679ad900d5c26c5aad5410e9c70fdca/bge-m3-Q8_0.gguf",
           "size": 634553760,
-          "sha256": "aa473d51f451a22f0fcf39ba3330c14bed38a385712b1113440f69df4047a173"
+          "sha256": "950f4a8e5e19477a6d3c26d2f162233c20002c601f75e4b002e3239997821167"
         }
       ]
     }

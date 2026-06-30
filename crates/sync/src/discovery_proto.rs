@@ -81,8 +81,9 @@ pub(crate) fn list_meeting_ids(root: &Path) -> Vec<MeetingId> {
 /// same conservative default the inbound placeholder uses (§7 Q4: a meeting we
 /// cannot classify is treated as local, never guessed adoptable). `sync` reads
 /// `metadata.json` only to learn the local state to advertise; the authoritative
-/// writer is `persistence`.
-fn read_local_processing(root: &Path, id: MeetingId) -> ProcessingLifecycle {
+/// writer is `persistence`. Shared with [`crate::artifacts_proto`], which maps a
+/// local `Processed` to the producer authority it stamps on its artifact manifest.
+pub(crate) fn read_local_processing(root: &Path, id: MeetingId) -> ProcessingLifecycle {
     let path = root.join(id.0.to_string()).join("metadata.json");
     match std::fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<MeetingMeta>(&bytes) {

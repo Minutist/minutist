@@ -29,7 +29,8 @@
 //!   so it must NEVER be registered unguarded.
 //!
 //! [`SyncEngine::connect`] dials a peer; [`SyncEngine::sync_notes`] /
-//! [`SyncEngine::sync_media`] dial and run the initiator side for one meeting.
+//! [`SyncEngine::sync_media`] / [`SyncEngine::sync_artifacts`] dial and run the
+//! initiator side for one meeting.
 
 use std::path::{Path, PathBuf};
 
@@ -47,7 +48,7 @@ use crate::address_lookup::PeerDirectory;
 use crate::blobs::BlobStore;
 use crate::identity::DeviceIdentity;
 use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
-use crate::{discovery_proto, media_proto, Error, Result, SyncConfig};
+use crate::{artifacts_proto, discovery_proto, media_proto, Error, Result, SyncConfig};
 
 /// Owns the iroh endpoint, the out-of-band peer directory, the content-addressed
 /// blob store, and the router that accepts inbound sync connections for one
@@ -329,10 +330,10 @@ impl SyncEngine {
     /// Reconcile EVERY meeting this device holds with `peer`, addressed relay-only
     /// (id + the configured relay). This is the hub's reciprocal push: on a peer
     /// arriving it pushes all it holds, so a device that reconnects to deposit one
-    /// meeting also collects every other meeting the hub has accumulated. Notes and
-    /// media are reconciled per meeting; a per-meeting failure is logged and
-    /// skipped so one bad meeting does not abort the rest. Returns how many
-    /// meetings reconciled without error.
+    /// meeting also collects every other meeting the hub has accumulated. Notes,
+    /// media, and derived artifacts are reconciled per meeting; a per-meeting
+    /// failure is logged and skipped so one bad meeting does not abort the rest.
+    /// Returns how many meetings reconciled without error.
     pub async fn push_all_to(&self, peer: EndpointId) -> Result<usize> {
         let relay: RelayUrl = self.relay_url.parse().map_err(|e| {
             Error::Endpoint(format!(
@@ -351,6 +352,14 @@ impl SyncEngine {
             }
             if let Err(e) = self.sync_media(addr.clone(), meeting).await {
                 tracing::warn!(target: "sync", peer = %peer, meeting = %meeting.0, error = %e, "push media failed");
+                continue;
+            }
+            // Derived artifacts ride per meeting, AFTER notes+media and BEFORE the
+            // final ride-along discovery, so a peer that learns `Processed` via the
+            // discovery exchange below has already had the transcript/summary pulled
+            // (DESIGN §5 ordering invariant).
+            if let Err(e) = self.sync_artifacts(addr.clone(), meeting).await {
+                tracing::warn!(target: "sync", peer = %peer, meeting = %meeting.0, error = %e, "push artifacts failed");
                 continue;
             }
             reconciled += 1;
@@ -398,6 +407,12 @@ impl SyncEngine {
     /// [`Self::sync_media`] addressing the peer by its hex endpoint-id string.
     pub async fn sync_media_to_peer(&self, peer_id: &str, meeting_id: MeetingId) -> Result<()> {
         self.sync_media(self.peer_relay_addr(peer_id)?, meeting_id)
+            .await
+    }
+
+    /// [`Self::sync_artifacts`] addressing the peer by its hex endpoint-id string.
+    pub async fn sync_artifacts_to_peer(&self, peer_id: &str, meeting_id: MeetingId) -> Result<()> {
+        self.sync_artifacts(self.peer_relay_addr(peer_id)?, meeting_id)
             .await
     }
 
@@ -534,6 +549,41 @@ impl SyncEngine {
         result
     }
 
+    /// Reconcile one meeting's derived artifacts (`transcript.json` + `summary.md`)
+    /// with `peer`: dial it on the [`SYNC_ALPN`] and run the initiator side of the
+    /// artifact-manifest protocol ([`artifacts_proto::initiate_artifacts_sync`])
+    /// against this device's [`Self::meetings_root`]. Each side imports its own
+    /// artifacts into the blob store (stamping each entry with the authority for
+    /// those exact bytes), exchanges a manifest, and pulls every entry that
+    /// strictly supersedes its local copy over the blobs ALPN — exporting it
+    /// atomically to the per-meeting path. On return both sides hold the
+    /// authoritative copy of each artifact (a stale copy never overwrites a newer
+    /// one — `planning/DESIGN_artifacts.md` §2).
+    ///
+    /// The remote [`EndpointId`] is taken from the dialled connection so the
+    /// downloader dials the same peer back for blobs. Like [`Self::sync_media`],
+    /// this is on-demand per-meeting reconciliation: one call, one meeting, a fresh
+    /// connection per call.
+    pub async fn sync_artifacts(
+        &self,
+        peer: impl Into<EndpointAddr>,
+        meeting_id: MeetingId,
+    ) -> Result<()> {
+        let conn = self.connect(peer).await?;
+        let peer_id = conn.remote_id();
+        let result = artifacts_proto::initiate_artifacts_sync(
+            &conn,
+            &self.blobs,
+            &self.endpoint,
+            peer_id,
+            &self.meetings_root,
+            meeting_id,
+        )
+        .await;
+        conn.close(0u32.into(), b"artifacts-sync-done");
+        result
+    }
+
     /// Import a meeting's media into this device's blob store and return its
     /// [`crate::blobs::Manifest`]. Test-only seam used to stage blobs and to read
     /// a known hash for the blobs-ALPN authorisation test, without going through a
@@ -592,12 +642,14 @@ impl SyncEngine {
 /// ticket.
 ///
 /// Once authorised it accepts the bidirectional stream the initiator opened, reads
-/// the leading one-byte [`StreamKind`] tag, and runs the matching responder:
-/// notes-sync ([`notes_proto::respond_notes_sync`]) or media-manifest
-/// ([`media_proto::respond_media_sync`]) against the device's
-/// [`SyncEngine::meetings_root`]. The media responder also needs the blob store
-/// and the endpoint (to pull blobs back from the initiator), so the hook carries
-/// clones of both (the router spawns a fresh task per connection). A failed
+/// the leading one-byte [`StreamKind`] tag, and runs the matching responder —
+/// notes ([`notes_proto::respond_notes_sync`]), media
+/// ([`media_proto::respond_media_sync`]), discovery
+/// ([`discovery_proto::respond_discovery`]), or derived artifacts
+/// ([`artifacts_proto::respond_artifacts_sync`]) — against the device's
+/// [`SyncEngine::meetings_root`]. The media and artifacts responders also need the
+/// blob store and the endpoint (to pull blobs back from the initiator), so the hook
+/// carries clones of both (the router spawns a fresh task per connection). A failed
 /// exchange is converted to an [`AcceptError`]; it does not bring the router down.
 #[derive(Debug, Clone)]
 struct AcceptHook {
@@ -721,6 +773,18 @@ impl AcceptHook {
                         .send((entry.meeting_id, entry.processing));
                 }
                 Ok(())
+            }
+            StreamKind::Artifacts => {
+                artifacts_proto::respond_artifacts_sync(
+                    connection,
+                    &mut send,
+                    &mut recv,
+                    &self.blobs,
+                    &self.endpoint,
+                    peer,
+                    &self.meetings_root,
+                )
+                .await
             }
         }
     }

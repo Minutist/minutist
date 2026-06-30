@@ -20,11 +20,11 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      RUNNER_STATE_DIR: /mnt/bulk/srv/github-runner/state
+      RUNNER_STATE_DIR: ${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/state
       RUNNER_TOOL_CACHE: /opt/hostedtoolcache
     volumes:
-      - /mnt/bulk/srv/github-runner/state:/mnt/bulk/srv/github-runner/state
-      - /mnt/bulk/srv/github-runner/toolcache:/opt/hostedtoolcache
+      - ${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/state:${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/state
+      - ${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/toolcache:/opt/hostedtoolcache
       - /var/run/docker.sock:/var/run/docker.sock
 
   # Second replica: two sessions push concurrently and a single runner
@@ -43,9 +43,9 @@ services:
     restart: unless-stopped
     env_file: .env2
     environment:
-      RUNNER_STATE_DIR: /mnt/bulk/srv/github-runner/state2
+      RUNNER_STATE_DIR: ${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/state2
       RUNNER_TOOL_CACHE: /opt/hostedtoolcache
     volumes:
-      - /mnt/bulk/srv/github-runner/state2:/mnt/bulk/srv/github-runner/state2
-      - /mnt/bulk/srv/github-runner/toolcache:/opt/hostedtoolcache
+      - ${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/state2:${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/state2
+      - ${RUNNER_STATE_BASE:-/mnt/bulk/srv/github-runner}/toolcache:/opt/hostedtoolcache
       - /var/run/docker.sock:/var/run/docker.sock

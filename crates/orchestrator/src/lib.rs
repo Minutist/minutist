@@ -18,9 +18,10 @@
 //! - A separate `spawn_blocking` ASR worker drains flush payloads from the
 //!   runner via a shared bounded queue (`Arc<Mutex<VecDeque>>` + `Notify`,
 //!   capacity 4) with drop-oldest backpressure: on overflow the runner pops
-//!   the OLDEST pending flush and emits `AppEvent::ErrorOccurred` (audio is
-//!   preserved in `audio.opus`; only the live transcript for the dropped
-//!   flush is lost). See `runner.rs`.
+//!   the OLDEST pending flush (a self-healing, log-only WARN — not a UI error).
+//!   Audio is preserved in `audio.opus`, and the `incomplete` flag drives a
+//!   post-stop re-transcribe that restores the dropped flush's transcript. See
+//!   `runner.rs`.
 //! - Events are broadcast via `tokio::sync::broadcast::channel(256)`.
 //!   Slow subscribers drop old events (broadcast semantics); a `tracing::warn!`
 //!   fires when a subscriber reports lag.

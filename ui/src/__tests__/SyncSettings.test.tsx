@@ -119,8 +119,10 @@ describe("SyncSettingsPane", () => {
     await waitFor(() =>
       expect(syncAddPeer).toHaveBeenCalledWith("some-peer-ticket"),
     );
-    // Field clears after a successful add.
-    expect(input.value).toBe("");
+    // Field clears after the add RESOLVES — an async state update that lands after
+    // the call is made, so wait for it rather than asserting synchronously (the
+    // issue-0026 flake: the bare assertion raced the resolve+clear).
+    await waitFor(() => expect(input.value).toBe(""));
   });
 
   it("add-peer button is disabled when the field is empty", async () => {

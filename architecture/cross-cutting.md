@@ -822,11 +822,15 @@ categories. Cross-cutting rules:
   loop" above) allocates a **fresh** `LlamaContext` per assistant turn. The live
   agent holds **one** `LlamaContext` for the entire live session on a dedicated
   single-owned thread (SP-LIVE E2). The small prefix (system prompt + digest
-  categories) is prefilled ONCE at recording start, and the context is extended
-  with each digest refresh by appending the retrieved context block + the
-  incremental transcript tail. The fresh-per-turn pattern would re-pay the prefill
-  cost on every cadence tick, making live operation unusable. `LlamaContext` is
-  `!Send`; the dedicated thread owns it exclusively.
+  categories) is prefilled ONCE at recording start as the OPEN USER TURN of a Gemma
+  chat-template prompt (#0022 — the instruct model needs the turn framing to reply
+  with JSON, not continue the transcript). Each refresh then **prunes the KV back to
+  the prefix** and decodes a fresh, BOUNDED tail on top (retrieved context + running
+  digest + recent transcript window + the chat-template suffix that closes the user
+  turn), so the held context never grows beyond `prefix + tail + generation` and
+  cannot overflow on a long meeting. The fresh-per-turn pattern would re-pay the
+  prefill cost on every cadence tick, making live operation unusable. `LlamaContext`
+  is `!Send`; the dedicated thread owns it exclusively.
 
   *Implementation (S2a — `chat-agent::live`).* The held-context loop is
   implemented in `crates/chat-agent/src/live.rs` as `LiveSessionBackend` (the
@@ -877,27 +881,29 @@ categories. Cross-cutting rules:
   result. A single error path covers both cases, consistent with the teardown
   on decode failure (M3).
 
-  *Context overflow policy (v1).* When `LlamaLiveBackend::refresh` returns
-  `Error::ContextOverflow` the driver emits ONE `LiveDigestError` event
-  (user-visible "context window filled") and sets a permanent
-  `capacity_exhausted` flag that stops all further refresh dispatches for the
-  session. Re-seeding mid-recording is NOT attempted (it would re-prefill from
-  scratch, starving ASR). The prior digest items are preserved in the event
-  store. Recovery is the next recording session (fresh context).
+  *Context overflow policy (#0022).* The prune-to-prefix bounded context means the
+  held context cannot grow without bound, so `Error::ContextOverflow` from
+  `LlamaLiveBackend::refresh` is now a rare backstop (a single tail larger than the
+  remaining window) rather than the expected long-meeting outcome. On it the driver
+  emits ONE `LiveDigestError` event and sets a terminal `capacity_exhausted` flag
+  that stops all further refresh dispatches for the session. Re-seeding mid-recording
+  is NOT attempted (it would re-prefill from scratch, starving ASR). The prior digest
+  items are preserved in the event store; recovery is the next recording session.
   The driver calls `LiveSession::seed_prefix_typed` and `LiveSession::refresh_typed`
   (returning `Result<_, chat_agent::Error>`) rather than the `AppResult` wrappers,
   so `ContextOverflow` can be matched structurally. The `From<Error> for AppError`
   impl maps `ContextOverflow` to `AppError::InvalidInput`, erasing the variant —
   string-matching over `AppError::Display` would be fragile and is not used.
 
-  *KV retention policy.* The held context accumulates **prefix + the per-refresh
-  tail (retrieved context + transcript) only**. Generated digest-answer tokens are decoded ephemerally into the KV and
-  then pruned via `clear_kv_cache_seq` after every refresh (on completion and
-  on cancel). This keeps capacity growth proportional to the transcript and
-  prevents cancelled partial answers from poisoning subsequent refreshes.
-  `clear_kv_cache_seq` returns `Result<bool, KvCacheConversionError>`; a `false` or
-  `Err` means the KV state is unrecoverable — the backend returns `Err` and the
-  driver tears down the session.
+  *KV retention policy (#0022).* The held context retains **only the pinned prefix**
+  (recorded as `prefix_len` at seed time). Each `refresh` prunes the KV back to
+  `prefix_len` via `clear_kv_cache_seq` FIRST — dropping the previous refresh's tail
+  AND its generated answer in one operation — then decodes this refresh's bounded
+  tail on top. Capacity therefore stays bounded by `prefix_len + tail + generation`,
+  not by meeting length, and a cancelled partial answer cannot poison the next
+  refresh. `clear_kv_cache_seq` returns `Result<bool, KvCacheConversionError>`; a
+  `false` or `Err` means the KV state is unrecoverable — the backend returns `Err`
+  and the driver tears down the session.
 
   *Cancellability.* `prefill_prefix` and the tail-prefill loop in `refresh` both
   accept a `&CancelFlag` and check it between decoded chunks. A raised flag during

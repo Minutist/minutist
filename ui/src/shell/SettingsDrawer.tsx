@@ -20,11 +20,12 @@ import type { ReactNode } from "react";
 import { useRecordingStore } from "../state/recording";
 import { readDiarizationEnabled } from "../state/diarization-settings";
 import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
+import { readLiveAgentMode } from "../state/live-agent-settings";
 import { readPreloadSummariser } from "../state/preload-summariser-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
 import { readNotesPaperRules } from "../state/notes-paper-settings";
 import { readTheme } from "../state/onboarding-settings";
-import type { GpuAcceleration, Theme } from "../ipc/bindings";
+import type { GpuAcceleration, LiveAgentMode, Theme } from "../ipc/bindings";
 import { DevicePicker } from "./DevicePicker";
 import { LanguagePicker } from "./LanguagePicker";
 import { OutputLanguagePicker } from "./OutputLanguagePicker";
@@ -113,6 +114,7 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
     (s) => s.setDiarizationEnabled,
   );
   const setGpuAcceleration = useRecordingStore((s) => s.setGpuAcceleration);
+  const setLiveAgentMode = useRecordingStore((s) => s.setLiveAgentMode);
   const setPreloadSummariser = useRecordingStore(
     (s) => s.setPreloadSummariser,
   );
@@ -124,6 +126,7 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
 
   const diarizationEnabled = readDiarizationEnabled(settings);
   const gpuAcceleration = readGpuAcceleration(settings);
+  const liveAgentMode = readLiveAgentMode(settings);
   const preloadSummariser = readPreloadSummariser(settings);
   const captureSystemAudio = readCaptureSystemAudio(settings);
   const theme = readTheme(settings);
@@ -253,6 +256,27 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             <p className="settings-drawer__hint">
               Auto detects your GPU memory and runs models on GPU when they fit,
               otherwise CPU.
+            </p>
+          </div>
+          <div className="settings-drawer__field">
+            <label htmlFor="settings-live-agent">Live co-pilot</label>
+            <select
+              id="settings-live-agent"
+              value={liveAgentMode}
+              disabled={settings === null}
+              onChange={(e) =>
+                void setLiveAgentMode(e.target.value as LiveAgentMode)
+              }
+            >
+              <option value="off">Off</option>
+              <option value="auto">Auto</option>
+              <option value="on">On</option>
+            </select>
+            <p className="settings-drawer__hint">
+              Maintains a running digest of the meeting with the chat model during
+              recording. Auto (the default) runs it when GPU acceleration is active
+              — on any GPU, integrated or discrete. On always runs it, even on a
+              CPU-only host (slower refreshes). Off never runs it.
             </p>
           </div>
           <label

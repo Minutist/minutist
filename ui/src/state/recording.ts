@@ -11,6 +11,7 @@ import type {
   RecordingState,
   AudioDevice,
   GpuAcceleration,
+  LiveAgentMode,
   Settings,
   Segment,
 } from "../ipc/bindings";
@@ -18,6 +19,7 @@ import type { AppEvent } from "../ipc/app-event";
 import { useModelsStore } from "./models";
 import { withDiarizationEnabled } from "./diarization-settings";
 import { withGpuAcceleration } from "./gpu-acceleration-settings";
+import { withLiveAgentMode } from "./live-agent-settings";
 import { withPreloadSummariser } from "./preload-summariser-settings";
 import { withCaptureSystemAudio } from "./system-audio-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
@@ -121,6 +123,14 @@ export type RecordingStore = {
    * GPU/CPU. GPU offload only ever happens in a GPU-feature build.
    */
   setGpuAcceleration: (mode: GpuAcceleration) => Promise<void>;
+  /**
+   * Set the live co-pilot mode ("auto" by default), persisting via
+   * `commands.updateSettings` — the same round-trip-through-settings pattern as
+   * `setGpuAcceleration`. `Off` never runs the in-meeting agent; `Auto` (the
+   * default) runs it when GPU acceleration is active — any GPU, integrated or
+   * discrete; `On` always runs it, even on a CPU-only host (the explicit opt-in).
+   */
+  setLiveAgentMode: (mode: LiveAgentMode) => Promise<void>;
   /**
    * Toggle preloading the summary/chat LLM at startup (on by default),
    * persisting via `commands.updateSettings` — the same round-trip-through-
@@ -398,6 +408,23 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
       return;
     }
     const next = withGpuAcceleration(current, mode);
+    try {
+      const result = await commands.updateSettings(next);
+      unwrap(result);
+      set({ settings: next, lastError: null });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  setLiveAgentMode: async (mode) => {
+    // Persist via `update_settings`, the same round-trip pattern as
+    // `setGpuAcceleration`.
+    const current = get().settings;
+    if (current === null) {
+      return;
+    }
+    const next = withLiveAgentMode(current, mode);
     try {
       const result = await commands.updateSettings(next);
       unwrap(result);

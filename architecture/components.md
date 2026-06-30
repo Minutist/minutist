@@ -2762,8 +2762,11 @@ requires holding one `LlamaContext` for an entire recording session so the prefi
 is prefilled once rather than re-paid on each cadence tick (see `cross-cutting.md`
 "Live in-meeting agent"). The engine is prefix-agnostic — it prefills whatever text
 the caller hands it; `ipc-bridge::build_prefix` supplies a small system-prompt +
-digest-categories prefix (attachment / earlier-transcript context is retrieved into
-the per-refresh tail instead, Phase D). The surface is:
+digest-categories prefix as the OPEN user turn of a Gemma chat-template prompt
+(`LIVE_TURN_PREFIX`), and each refresh's tail closes it (`LIVE_TURN_SUFFIX`) so the
+instruct model replies with the JSON digest instead of continuing the transcript
+(#0022). Attachment / earlier-transcript context is retrieved into the per-refresh
+tail (Phase D), not pinned. The surface is:
 
 - `LiveSessionBackend` trait — the testable seam, mirroring `TurnBackend`.
   Two operations: `prefill_prefix(text) -> Result<usize, Error>` (chunked-prefill
@@ -2774,15 +2777,17 @@ the per-refresh tail instead, Phase D). The surface is:
 
 - `LlamaLiveBackend<'m>` — the real impl. Borrows `&LlamaModel` from the same
   `LlamaSummariser` substrate (`ipc-bridge` lends it), builds one `LlamaContext`
-  at construction (n_ctx = 32 768, KV-quant OFF per SP-LIVE E3), tracks `n_past`,
-  and extends it on each `refresh` call rather than destroying or re-prefilling.
-  Internally tracks `prior_gen_pruned` (set when a refresh prunes its generated
-  tokens via `clear_kv_cache_seq`) and `last_kv_token` (the last token written to
-  the retained KV). An empty-tail `refresh` following a prune re-decodes
-  `last_kv_token` with logits enabled before sampling — this repopulates the
-  logit buffer from the still-valid KV state, avoiding incoherent output on the
-  stale slot left by the prune. These are private implementation fields; the
-  public API surface is unchanged.
+  at construction (n_ctx = 32 768, KV-quant OFF per SP-LIVE E3), and tracks
+  `n_past` + `prefix_len`. **Prune-to-prefix bounded context (#0022):** each
+  `refresh` first prunes the KV back to `prefix_len` (`clear_kv_cache_seq`),
+  dropping the previous refresh's tail AND its generated answer, then decodes the
+  fresh tail on top — so the held context never grows beyond `prefix_len + tail +
+  generation` and cannot overflow on a long meeting (the failure mode the
+  cumulative-append design hit on its first live test). `prefill_prefix` caps the
+  prefix at `n_ctx / 2` so the per-refresh tail always has headroom. The tail is
+  always non-empty (it carries the chat-template suffix), so there is no empty-tail
+  logit-coherence hazard. `prefix_len` is a private field; the public API surface
+  is unchanged.
   `LlamaContext` is `!Send`; `LlamaLiveBackend` is therefore also `!Send`. The
   S2b driver in `ipc-bridge` owns the dedicated thread and calls these methods
   only from there — this crate never asserts `Send` on it.
@@ -3906,18 +3911,23 @@ The driver has two halves:
   Communication uses two bounded `tokio::sync::mpsc` channels (depth 1) so
   in-flight is enforced without a separate mutex.
 
-**Context overflow policy (v1).** On `Error::ContextOverflow` from `refresh`, the
-driver emits one `LiveDigestError` ("context window filled") and sets a permanent
-`capacity_exhausted` flag — no further refresh dispatches for the session.
-Re-seeding mid-recording is not attempted (prohibitive prefill cost).
+**Context overflow policy (#0022).** The prune-to-prefix bounded context (above) means
+the held context cannot grow without bound, so `Error::ContextOverflow` from `refresh`
+is now a rare backstop (e.g. a single tail larger than the remaining window) rather than
+the expected long-meeting outcome. On it the driver emits one `LiveDigestError` and sets
+a terminal flag — no further refresh dispatches for the session. Re-seeding mid-recording
+is not attempted (prohibitive prefill cost).
 
 The prefix (system prompt + category-toggle instructions only) is built once at session
-spawn and seeded into the `LlamaContext` at worker startup — BEFORE the cadence loop.
-It does NOT pin attachment markdown: attachment and earlier-transcript context is
-retrieved into the tail each refresh (the Phase-D unified-budget decision), so the
-once-prefilled prefix stays small on every GPU tier. The seed honours the worker
-`CancelFlag`, so a Start-then-Stop during the prefill aborts promptly. Subsequent
-`seed_prefix` calls are no-ops (`LiveSession` enforces this).
+spawn and seeded into the `LlamaContext` at worker startup — BEFORE the cadence loop. It
+is the OPEN user turn of the chat-template prompt (`LIVE_TURN_PREFIX`) and does NOT pin
+attachment markdown: attachment and earlier-transcript context is retrieved into the tail
+each refresh (the Phase-D unified-budget decision), so the once-prefilled prefix stays
+small on every GPU tier. The seed honours the worker `CancelFlag`, so a Start-then-Stop
+during the prefill aborts promptly. Subsequent `seed_prefix` calls are no-ops
+(`LiveSession` enforces this). The driver emits an initial empty `LiveDigest` at start
+(#0022 D4) so the UI reveals the digest pane immediately; a worker that fails to start
+surfaces a terminal `LiveDigestError` rather than leaving the pane silent.
 
 Each refresh, BEFORE decoding, the worker embeds the recent transcript window (peeking
 the held embedder — loaded in the background at worker start; `None` until ready, so
@@ -3925,10 +3935,13 @@ the agent degrades to no injected context) and runs the dense + lexical legs ove
 meeting's `RagStore`, fused by `rrf_fuse`. The top-`k` fused chunks (tier-scaled —
 `tier_scaled_k` halves `k` on an integrated GPU, full `k` on a discrete one) are packed
 into a "Relevant context" block, capped by `live_agent_retrieval_budget_chars`, and
-injected ahead of the prior digest JSON + new transcript tail (transcript chunks already
-inside the live window are dropped). The request then decodes a fresh `LiveDigest`,
-parsed by `parse_digest` (which preserves `resolved = true` flags from prior items —
-model forgetfulness guard) and emitted as `AppEvent::LiveDigestUpdated` /
+injected ahead of the running digest + the bounded recent transcript window
+(`LIVE_WINDOW_BUDGET_CHARS`). The retrieved block, the digest, and the window are all
+untrusted, so each is `sanitise_untrusted`d (neutralising embedded Gemma control tokens)
+before the special-token tokeniser sees it, and the tail ends with `LIVE_TURN_SUFFIX`
+closing the user turn. The request then decodes a fresh `LiveDigest`, parsed by
+`parse_digest` (which preserves `resolved = true` flags from prior items — model
+forgetfulness guard) and emitted as `AppEvent::LiveDigestUpdated` /
 `AppEvent::LiveDigestError`.
 
 The `app-main` watcher task subscribes to `StateChanged`, calls `spawn_live_agent`

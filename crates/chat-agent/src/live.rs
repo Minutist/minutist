@@ -3,21 +3,45 @@
 //! The Phase-9 chat loop allocates a **fresh** [`LlamaContext`] per turn (clean
 //! KV cache). The live in-meeting agent is an explicit departure from that
 //! pattern (SP-LIVE E2): the prefix is prefilled **once** at recording start and
-//! the context is then extended with each digest refresh by appending only the
-//! incremental tail. A fresh-per-turn approach would re-pay the prefill cost on
-//! every cadence tick, making live operation unusable. This engine is
-//! prefix-agnostic — `ipc-bridge` decides the prefix content; as of Phase D it is a
-//! small system-prompt + digest-categories prefix, with attachment / transcript
-//! context retrieved into the tail instead of pinned here.
+//! that prefix KV is reused across every digest refresh. A fresh-per-turn
+//! approach would re-pay the prefill cost on every cadence tick, making live
+//! operation unusable.
+//!
+//! This crate is prefix-AGNOSTIC — it does the KV mechanics, never templating.
+//! The driver (`ipc-bridge::live_agent`) supplies the prefix text and the
+//! per-refresh tail already wrapped in chat-template markers. Under the current
+//! driver the prefix is the **open user turn** of a chat-template prompt
+//! (`<bos><start_of_turn>user\n{system + digest categories}`) — small and cheap;
+//! attachment and earlier-transcript context is RETRIEVED into the per-refresh
+//! tail (RAG), not pinned in the prefix. Each refresh **prunes the KV back to the
+//! prefix** and decodes a fresh, BOUNDED tail on top — the retrieved context +
+//! the running digest + a recent transcript window + the template suffix that
+//! closes the user turn and opens the model turn. The held context therefore
+//! never grows beyond `prefix + tail + generation`: it cannot overflow on a long
+//! meeting (the failure mode the cumulative-append design hit on its first live
+//! test — see planning issue 0022). The running digest (re-fed each refresh) plus
+//! the RAG retrieval layer are the durable memory; verbatim transcript that
+//! scrolls out of the window is dropped from the prompt but stays retrievable.
+//!
+//! Caveat (Gemma SWA): the shipped model uses interleaved sliding-window
+//! attention, so on the local-attention layers a far-back token stops being
+//! attendable once generation runs many positions past it — only the
+//! global-attention layers keep full visibility. With the small Phase-D prefix
+//! this is a non-issue for the prefix itself; it bounds how far back in the
+//! per-refresh tail the local layers attend, which is why the tail window is kept
+//! small and the relevant context is retrieved fresh each refresh rather than
+//! relied on from deep in the KV.
 //!
 //! # Design
 //!
 //! The testable seam is [`LiveSessionBackend`]:
 //!
 //! - [`LiveSessionBackend::prefill_prefix`] — tokenise + chunked-prefill the
-//!   prefix text ONCE, retaining the KV state.
-//! - [`LiveSessionBackend::refresh`] — append the incremental tail tokens and
-//!   decode the digest answer from the retained KV; does NOT re-prefill.
+//!   pinned (open user turn) prefix ONCE, retaining the KV state and recording
+//!   its length.
+//! - [`LiveSessionBackend::refresh`] — prune the KV back to the prefix, append
+//!   the fresh bounded tail, and decode the digest answer; does NOT re-prefill
+//!   the prefix.
 //!
 //! [`LlamaLiveBackend`] is the real impl. It owns one `LlamaContext` for the
 //! session lifetime (n_ctx from config, default 32 768; KV-quant OFF per
@@ -72,22 +96,18 @@ pub trait LiveSessionBackend {
     /// Returns the number of tokens prefilled (useful for capacity checks).
     fn prefill_prefix(&mut self, prefix_text: &str, cancel: &CancelFlag) -> Result<usize, Error>;
 
-    /// Append `tail_text` tokens to the held KV cache and decode the digest
-    /// answer from the retained context.
+    /// Prune the KV cache back to the pinned prefix, append `tail_text` on top,
+    /// and decode the digest answer.
     ///
-    /// The backend MUST NOT re-prefill the prefix. Only the tail tokens since
-    /// the last call (or since prefill, on the first refresh) are new.
+    /// The backend MUST NOT re-prefill the prefix — the prefix KV is reused. The
+    /// `tail_text` is the WHOLE volatile portion of the prompt for this refresh
+    /// (running digest + recent transcript window + the template suffix that
+    /// closes the user turn and opens the model turn); it replaces, rather than
+    /// extends, the previous refresh's tail.
     ///
-    /// **Precondition (logits invariant):** the most recent `decode` call into
-    /// this context must have produced logits at the last KV position. The
-    /// first refresh always satisfies this (prefill sets logits at the final
-    /// prefix token). A subsequent refresh with an empty tail, however, arrives
-    /// after the prior refresh pruned its generated tokens from the KV cache —
-    /// leaving the logit buffer referencing a now-removed KV slot. The real
-    /// backend enforces this invariant internally (re-decoding the last
-    /// retained token when `tail_text` is empty and a prior generation was
-    /// pruned); callers that bypass the real backend via a stub must honour
-    /// it in the same way if they test the empty-tail-after-refresh path.
+    /// `tail_text` is always non-empty (it carries the template suffix at
+    /// minimum), so the tail decode repopulates logits at its final token and
+    /// there is no empty-tail logit-coherence hazard.
     ///
     /// - `cfg` — sampler knobs for this decode pass.
     /// - `cancel` — checked between tokens; a raised flag causes
@@ -116,8 +136,10 @@ pub trait LiveSessionBackend {
 /// The invariant this type enforces:
 /// - `seed_prefix` calls `backend.prefill_prefix` on the first call and is a
 ///   no-op on subsequent calls (the prefix is already in the KV cache).
-/// - `refresh(new_tail)` calls `backend.refresh` with only the text appended
-///   since the last `refresh` (or since `seed_prefix` if this is the first).
+/// - `refresh(tail)` calls `backend.refresh` with the whole volatile portion of
+///   this refresh's prompt (running digest + recent transcript window +
+///   template suffix). The backend prunes the prior tail and decodes this one
+///   on top of the reused prefix KV.
 pub struct LiveSession<B: LiveSessionBackend> {
     backend: B,
     prefix_seeded: bool,
@@ -133,15 +155,16 @@ impl<B: LiveSessionBackend> LiveSession<B> {
         }
     }
 
-    /// Prefill the prefix text into the held KV cache.
+    /// Prefill the prefix (the open user turn: system + digest categories) into
+    /// the held KV cache.
     ///
     /// Idempotent: the second and subsequent calls are no-ops (the prefix is
     /// already in the KV cache; re-prefilling would corrupt the position state).
     /// Returns `Ok(0)` on a no-op call.
     ///
-    /// `cancel` is forwarded to the backend; a raised flag during the ~40 s
-    /// prefill returns an `Inference` error and the partially-decoded KV state
-    /// is discarded by the backend before returning.
+    /// `cancel` is forwarded to the backend; a raised flag during the prefill
+    /// returns an `Inference` error and the partially-decoded KV state is
+    /// discarded by the backend before returning.
     ///
     /// Returns the typed [`Error`] so callers that need to distinguish
     /// [`Error::ContextOverflow`] from other failures can do so without
@@ -165,8 +188,8 @@ impl<B: LiveSessionBackend> LiveSession<B> {
             .map_err(Into::into)
     }
 
-    /// Append the incremental transcript tail and decode a digest text from the
-    /// retained KV state.
+    /// Prune the KV back to the prefix, decode the fresh tail (running digest +
+    /// recent window + template suffix) on top, and return the generated text.
     ///
     /// - Returns `Ok(String)` with the generated text (the `RawTurn::text`).
     /// - A raised `cancel` flag produces an `Ok(String)` with the partial text
@@ -218,9 +241,10 @@ impl<B: LiveSessionBackend> LiveSession<B> {
 ///
 /// Lifecycle:
 /// 1. [`LiveSessionBackend::prefill_prefix`] — tokenise + chunked-prefill the
-///    prefix, advance `n_past`.
-/// 2. [`LiveSessionBackend::refresh`] — tokenise the tail, prefill the tail
-///    tokens from `n_past`, decode the answer, advance `n_past`.
+///    prefix, advance `n_past`, record `prefix_len`.
+/// 2. [`LiveSessionBackend::refresh`] — prune the KV back to `prefix_len`,
+///    tokenise + prefill the fresh tail, decode the answer. `n_past` returns to
+///    `prefix_len` at the start of the next refresh, so it stays bounded.
 ///
 /// **`!Send`**: `LlamaContext` is `!Send`. The S2b driver owns the thread.
 pub struct LlamaLiveBackend<'m> {
@@ -228,18 +252,12 @@ pub struct LlamaLiveBackend<'m> {
     config: LlamaLiveConfig,
     ctx: llama_cpp_2::context::LlamaContext<'m>,
     n_past: i32,
-    /// True once a refresh has completed and pruned its generated tokens from
-    /// the KV cache. After pruning, the last-logits slot references a position
-    /// that no longer holds a freshly decoded token, so sampling against
-    /// `ctx`'s stale logit buffer is undefined. An empty-tail refresh that
-    /// follows a pruned prior refresh must re-decode the last retained token
-    /// before sampling — see the empty-tail guard in `refresh`.
-    prior_gen_pruned: bool,
-    /// The last token id written to the held KV cache (the final token of the
-    /// last tail prefill, or the final prefix token if no tail has been
-    /// prefilled yet). Used by the empty-tail logit-repopulate path in
-    /// `refresh` to re-decode the retained KV slot with logits enabled.
-    last_kv_token: Option<llama_cpp_2::token::LlamaToken>,
+    /// KV positions `0..prefix_len` hold the pinned prefix (the open user turn:
+    /// system + digest-category instructions). Recorded by `prefill_prefix` and
+    /// never re-decoded. Every `refresh` prunes the KV cache back to exactly this
+    /// length before appending its tail, so the prefill is paid once and the held
+    /// context never grows beyond `prefix_len + tail + generation`.
+    prefix_len: i32,
 }
 
 /// Runtime knobs for the held live-session context. Mirrors
@@ -319,8 +337,7 @@ impl<'m> LlamaLiveBackend<'m> {
             config,
             ctx,
             n_past: 0,
-            prior_gen_pruned: false,
-            last_kv_token: None,
+            prefix_len: 0,
         })
     }
 }
@@ -330,7 +347,7 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
         use llama_cpp_2::llama_batch::LlamaBatch;
         use llama_cpp_2::model::AddBos;
 
-        let tokens = self
+        let mut tokens = self
             .model
             .str_to_token(prefix_text, AddBos::Never)
             .map_err(|e| Error::Inference(format!("tokenize prefix: {e}")))?;
@@ -339,17 +356,26 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
             return Ok(0);
         }
 
-        // The prefix itself must fit in n_ctx (at least one token of headroom
-        // for the first generation). The per-refresh budget guard in `refresh`
-        // enforces the actual remaining capacity against cfg.max_tokens at call
-        // time — that is where the correct per-call generation cap is known.
-        if tokens.len() >= self.config.n_ctx as usize {
-            return Err(Error::ContextOverflow(format!(
-                "prefix is {} tokens which fills the entire context window ({}); \
-                 no headroom for transcript or generation",
-                tokens.len(),
-                self.config.n_ctx,
-            )));
+        // D3 (issue 0022): cap the pinned prefix at half of n_ctx so the other
+        // half is always available for the per-refresh tail (retrieved context +
+        // running digest + recent transcript window) plus generation. Under the
+        // current driver the prefix is small (system prompt + category list + JSON
+        // contract), so this is a defensive guard — not normally hit — against a
+        // pathologically large system prompt. The instruction text sits at the
+        // FRONT of the prefix, so truncating the token tail drops trailing prefix
+        // content first and preserves the instructions: a soft degradation,
+        // whereas starving the per-refresh window is not.
+        let max_prefix_tokens = (self.config.n_ctx as usize) / 2;
+        if tokens.len() > max_prefix_tokens {
+            tracing::warn!(
+                target: "chat-agent",
+                prefix_tokens = tokens.len(),
+                max_prefix_tokens,
+                n_ctx = self.config.n_ctx,
+                "live prefix exceeds half of n_ctx; truncating it to preserve \
+                 per-refresh window headroom"
+            );
+            tokens.truncate(max_prefix_tokens);
         }
 
         let plan = summariser::plan_prefill(tokens.len(), self.config.n_batch);
@@ -359,8 +385,8 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
         let n_past_before = self.n_past;
 
         for chunk in &plan.chunks {
-            // M5: honour cancel between chunks so a Stop during the ~40 s
-            // prefill does not leave a GPU-bound zombie.
+            // M5: honour cancel between chunks so a Stop during prefill does not
+            // leave a GPU-bound zombie.
             if cancel.is_cancelled() {
                 // Prune any chunks already written to the KV cache.
                 let _ = self
@@ -389,8 +415,9 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
 
         let n_prefilled = tokens.len();
         self.n_past += n_prefilled as i32;
-        // Record the last prefix token for the empty-tail logit-repopulate path.
-        self.last_kv_token = tokens.last().copied();
+        // The pinned prefix occupies KV positions 0..n_past. Record this length:
+        // every refresh prunes back to it before appending its tail.
+        self.prefix_len = self.n_past;
 
         tracing::debug!(
             target: "chat-agent",
@@ -414,147 +441,118 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
         use llama_cpp_2::model::AddBos;
         use llama_cpp_2::sampling::LlamaSampler;
 
-        // --- Budget guard: ensure tail + generation fit in the remaining window ---
+        // --- Prune the KV cache back to the pinned prefix ---
         //
-        // The held context grows monotonically (prefix + accumulated transcript).
-        // Check that appending the new tail tokens plus generating up to
-        // cfg.max_tokens tokens would not overflow n_ctx. This mirrors the check
-        // in LlamaTurnBackend (llama.rs line 270), but against the REMAINING
-        // capacity rather than the full window. The check uses cfg.max_tokens
-        // because that is the actual cap on the generation loop below.
-        let tail_tokens = if !tail_text.is_empty() {
-            self.model
-                .str_to_token(tail_text, AddBos::Never)
-                .map_err(|e| Error::Inference(format!("tokenize tail: {e}")))?
-        } else {
-            Vec::new()
-        };
+        // The held context retains ONLY the pinned prefix (the open user turn:
+        // system + digest-category instructions). Each refresh re-decodes a fresh,
+        // BOUNDED tail (the retrieved context + the running digest + the recent
+        // transcript window + the chat-template suffix that closes the user turn
+        // and opens the model turn) on top of the reused prefix KV, then
+        // generates. Pruning to `prefix_len` here drops the previous refresh's
+        // tail AND its generated answer in one operation, so `n_past` never grows
+        // beyond `prefix_len + tail + generation`. The prefix prefill is therefore
+        // paid exactly once, at seed time.
+        if self.prefix_len <= 0 {
+            return Err(Error::Inference(
+                "refresh called before the prefix was seeded".to_string(),
+            ));
+        }
+        if self.n_past > self.prefix_len {
+            match self
+                .ctx
+                .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
+            {
+                Ok(true) => self.n_past = self.prefix_len,
+                Ok(false) | Err(_) => {
+                    return Err(Error::Inference(
+                        "clear_kv_cache_seq failed pruning to prefix; \
+                         context state is inconsistent"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
 
+        // --- Tokenise the tail ---
+        //
+        // The driver always supplies a non-empty tail: at minimum it carries the
+        // chat-template suffix (`<end_of_turn>\n<start_of_turn>model\n`), so the
+        // tail decode below always repopulates logits at its final token. That
+        // removes the empty-tail logit-coherence hazard the cumulative-append
+        // design had to guard against.
+        let tail_tokens = self
+            .model
+            .str_to_token(tail_text, AddBos::Never)
+            .map_err(|e| Error::Inference(format!("tokenize tail: {e}")))?;
+        if tail_tokens.is_empty() {
+            return Err(Error::Inference(
+                "live refresh tail tokenised to zero tokens".to_string(),
+            ));
+        }
+
+        // --- Budget guard: prefix + tail + generation must fit n_ctx ---
+        //
+        // With a bounded transcript window and a token-budgeted prefix this
+        // never fires in practice; it is a backstop against a misconfigured
+        // window or prefix budget. It reserves cfg.max_tokens for the generation
+        // loop, mirroring the check in LlamaTurnBackend.
         let required = (self.n_past as usize)
             .saturating_add(tail_tokens.len())
             .saturating_add(cfg.max_tokens);
         if required > self.config.n_ctx as usize {
             return Err(Error::ContextOverflow(format!(
-                "live session context exhausted: n_past={}, tail={} tokens, \
-                 max_tokens={} but n_ctx={}; session must be re-seeded",
-                self.n_past,
+                "live refresh would exceed context: prefix={}, tail={} tokens, \
+                 max_tokens={} but n_ctx={}",
+                self.prefix_len,
                 tail_tokens.len(),
                 cfg.max_tokens,
                 self.config.n_ctx,
             )));
         }
 
-        // --- Append tail tokens to the held KV ---
-        // M1: capture n_past before the tail loop. A mid-loop decode failure
-        // prunes the partially-appended range so the KV state is consistent on
-        // return. n_past is only advanced AFTER the entire tail completes.
-        if !tail_tokens.is_empty() {
-            let plan = summariser::plan_prefill(tail_tokens.len(), self.config.n_batch);
-            let mut batch = LlamaBatch::new(self.config.n_batch as usize, 1);
-            let n_past_before_tail = self.n_past;
-
-            for chunk in &plan.chunks {
-                // M5: honour cancel during the tail-prefill loop too, so a
-                // mid-recording Stop doesn't block on a large tail decode.
-                if cancel.is_cancelled() {
-                    let _ =
-                        self.ctx
-                            .clear_kv_cache_seq(Some(0), Some(n_past_before_tail as u32), None);
-                    return Err(Error::Inference("tail prefill cancelled".to_string()));
-                }
-                batch.clear();
-                for offset in 0..chunk.len {
-                    let global = chunk.start + offset;
-                    let pos = self.n_past + global as i32;
-                    let logits = chunk.logits_at_last && offset == chunk.len - 1;
-                    batch
-                        .add(tail_tokens[global], pos, &[0], logits)
-                        .map_err(|e| Error::Inference(format!("batch.add (tail prefill): {e}")))?;
-                }
-                if let Err(e) = self.ctx.decode(&mut batch) {
-                    // M1: prune the partial tail range so the KV state is
-                    // consistent. n_past is NOT advanced; the context stays at
-                    // the pre-tail position. The driver tears down the session
-                    // on this Err (the held-context invariant is broken).
-                    let _ =
-                        self.ctx
-                            .clear_kv_cache_seq(Some(0), Some(n_past_before_tail as u32), None);
-                    return Err(Error::Inference(format!("decode (tail prefill): {e}")));
-                }
+        // --- Append the tail on top of the pinned prefix ---
+        // M1: a mid-loop decode failure prunes back to prefix_len so the KV
+        // state stays consistent. n_past advances only after the whole tail
+        // decodes.
+        let plan = summariser::plan_prefill(tail_tokens.len(), self.config.n_batch);
+        let mut batch = LlamaBatch::new(self.config.n_batch as usize, 1);
+        for chunk in &plan.chunks {
+            // M5: honour cancel during the tail-prefill loop so a mid-recording
+            // Stop doesn't block on a large tail decode.
+            if cancel.is_cancelled() {
+                let _ = self
+                    .ctx
+                    .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None);
+                self.n_past = self.prefix_len;
+                return Err(Error::Inference("tail prefill cancelled".to_string()));
             }
-
-            self.n_past += tail_tokens.len() as i32;
-            // Record the last tail token for the empty-tail logit-repopulate path.
-            self.last_kv_token = tail_tokens.last().copied();
-            // The tail-prefill decode repopulates logits; any prior prune is
-            // superseded.
-            self.prior_gen_pruned = false;
-        }
-
-        // Record n_past after the tail append. Generated answer tokens are
-        // decoded into the KV cache during the loop below, but are PRUNED back
-        // to this position after every refresh (both on success and on cancel).
-        //
-        // KV retention policy: the held context accumulates prefix + transcript
-        // tail only. Each refresh's generated answer is decoded ephemerally —
-        // it guides sampling but is not retained across refreshes. This keeps
-        // capacity growth proportional to the transcript (not doubled by answer
-        // accumulation) and eliminates cancelled-generation pollution (an
-        // abandoned partial answer is never left in the KV).
-        //
-        // Trade-off vs retaining answers: the model cannot see its prior digest
-        // text as context. Standing-list continuity (the 'update, don't
-        // regenerate' behaviour) is therefore achieved by re-deriving from the
-        // full transcript tail each refresh, not by the model reading its prior
-        // output. This is the safer choice for v1: it avoids capacity blowup
-        // and the coherence hazard of a partial abandoned answer in context.
-        let n_past_after_tail = self.n_past;
-
-        // --- Logits coherence guard (empty-tail after prune) ---
-        //
-        // When a prior refresh decoded generation tokens and then pruned them via
-        // clear_kv_cache_seq, the context's last-logits slot references the last
-        // GENERATED token position, which no longer exists in the KV cache. A
-        // subsequent sampler.sample call against those stale logits produces
-        // incoherent output.
-        //
-        // The first refresh is always safe: plan_prefill sets logits_at_last on
-        // the final prefix chunk, so the prefix decode leaves valid logits.
-        //
-        // A second+ refresh with a non-empty tail is also safe: the tail-prefill
-        // decode repopulates logits at the last tail token before sampling.
-        //
-        // The hazardous path is: prior refresh pruned + this refresh has an empty
-        // tail. Fix: re-decode the last retained token (stored in `last_kv_token`)
-        // with logits enabled. The KV entry for that position is still valid; the
-        // re-decode simply refreshes the logit buffer from the retained state.
-        if tail_tokens.is_empty() && self.prior_gen_pruned {
-            use llama_cpp_2::llama_batch::LlamaBatch;
-            let last_pos = self.n_past - 1;
-            if last_pos < 0 {
-                return Err(Error::Inference(
-                    "empty tail on empty context — seed_prefix must be called first".to_string(),
-                ));
+            batch.clear();
+            for offset in 0..chunk.len {
+                let global = chunk.start + offset;
+                let pos = self.n_past + global as i32;
+                let logits = chunk.logits_at_last && offset == chunk.len - 1;
+                batch
+                    .add(tail_tokens[global], pos, &[0], logits)
+                    .map_err(|e| Error::Inference(format!("batch.add (tail prefill): {e}")))?;
             }
-            let last_token = self.last_kv_token.ok_or_else(|| {
-                Error::Inference(
-                    "empty-tail refresh after prune but last_kv_token not set — \
-                     this is a bug in LlamaLiveBackend"
-                        .to_string(),
-                )
-            })?;
-            let mut repopulate_batch = LlamaBatch::new(1, 1);
-            repopulate_batch
-                .add(last_token, last_pos, &[0], true)
-                .map_err(|e| Error::Inference(format!("batch.add (logit repopulate): {e}")))?;
-            self.ctx
-                .decode(&mut repopulate_batch)
-                .map_err(|e| Error::Inference(format!("decode (logit repopulate): {e}")))?;
-            // Logits are now valid; clear the flag.
-            self.prior_gen_pruned = false;
+            if let Err(e) = self.ctx.decode(&mut batch) {
+                let _ = self
+                    .ctx
+                    .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None);
+                self.n_past = self.prefix_len;
+                return Err(Error::Inference(format!("decode (tail prefill): {e}")));
+            }
         }
+        self.n_past += tail_tokens.len() as i32;
 
-        // --- Decode the digest answer from the retained KV state ---
+        // --- Decode the digest answer from the reused-prefix + fresh-tail state ---
+        //
+        // The generated answer tokens are decoded into the KV cache during the
+        // loop below and left there; the NEXT refresh's prune-to-prefix removes
+        // them along with this tail. They are never sampled against again (the
+        // next refresh re-decodes a fresh non-empty tail, repopulating logits,
+        // before it samples), so no separate generation-prune or logit-coherence
+        // guard is required.
         let mut sampler = if cfg.is_greedy() {
             LlamaSampler::chain_simple([LlamaSampler::greedy()])
         } else {
@@ -606,39 +604,15 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
                 .map_err(|e| Error::Inference(format!("decode (gen): {e}")))?;
         }
 
-        // Prune the generated answer tokens from the KV cache (see policy above).
-        // n_past is reset to the post-tail position so the next refresh appends
-        // its own tail onto the transcript-only KV state.
-        //
-        // M2: match the clear_kv_cache_seq return. A false/Err means the KV
-        // cache is in an unknown state; n_past must NOT be reset (that would
-        // desync it from the actual KV), so we return Err to let the driver
-        // tear down the session.
-        if self.n_past > n_past_after_tail {
-            match self
-                .ctx
-                .clear_kv_cache_seq(Some(0), Some(n_past_after_tail as u32), None)
-            {
-                Ok(true) => {
-                    self.n_past = n_past_after_tail;
-                    // Mark that a generation was pruned. The next empty-tail
-                    // refresh must re-decode the last retained token to
-                    // repopulate logits.
-                    self.prior_gen_pruned = true;
-                }
-                Ok(false) | Err(_) => {
-                    return Err(Error::Inference(
-                        "clear_kv_cache_seq failed after generation prune; \
-                         context state is inconsistent"
-                            .to_string(),
-                    ));
-                }
-            }
-        }
+        // The generated answer tokens remain in the KV cache (positions
+        // prefix_len + tail_len .. n_past). They are removed by the NEXT
+        // refresh's prune-to-prefix, never sampled against again.
 
         tracing::debug!(
             target: "chat-agent",
             n_past = self.n_past,
+            prefix_len = self.prefix_len,
+            tail_tokens = tail_tokens.len(),
             text_chars = text.len(),
             cancelled,
             "live session digest refresh complete"
@@ -701,6 +675,10 @@ mod tests {
         refresh_calls: Arc<Mutex<Vec<String>>>,
         /// Fake token counter (one byte = one token).
         n_past: usize,
+        /// Length of the pinned prefix, recorded at `prefill_prefix`. Each
+        /// `refresh` prunes `n_past` back to this before appending its tail,
+        /// mirroring the real backend's prune-to-prefix discipline.
+        prefix_len: usize,
         /// Simulated context window size for overflow tests. `None` = unlimited.
         n_ctx: Option<usize>,
     }
@@ -712,6 +690,7 @@ mod tests {
                 prefill_calls: Arc::new(Mutex::new(Vec::new())),
                 refresh_calls: Arc::new(Mutex::new(Vec::new())),
                 n_past: 0,
+                prefix_len: 0,
                 n_ctx: None,
             }
         }
@@ -749,6 +728,9 @@ mod tests {
                 .push(prefix_text.to_string());
             let n = prefix_text.len(); // fake: one byte = one token
             self.n_past += n;
+            // The prefix occupies positions 0..n_past; record its length so
+            // refresh can prune back to it (mirrors the real backend).
+            self.prefix_len = self.n_past;
             Ok(n)
         }
 
@@ -765,6 +747,11 @@ mod tests {
                 .push(tail_text.to_string());
 
             let tail_len = tail_text.len();
+
+            // Prune back to the pinned prefix before appending this tail
+            // (mirrors the real backend's prune-to-prefix discipline). n_past
+            // therefore tracks prefix_len + current tail, never cumulative.
+            self.n_past = self.prefix_len;
 
             // Budget guard matching LlamaLiveBackend behaviour.
             if let Some(n_ctx) = self.n_ctx {
@@ -827,7 +814,7 @@ mod tests {
 
         // First seed: should call prefill_prefix once.
         session
-            .seed_prefix("system + attachments prefix text", &CancelFlag::new())
+            .seed_prefix("system + categories prefix text", &CancelFlag::new())
             .unwrap();
         assert_eq!(
             session.backend.prefill_call_count(),
@@ -837,7 +824,7 @@ mod tests {
 
         // Second seed: no-op; prefill_prefix must NOT be called again.
         session
-            .seed_prefix("system + attachments prefix text", &CancelFlag::new())
+            .seed_prefix("system + categories prefix text", &CancelFlag::new())
             .unwrap();
         assert_eq!(
             session.backend.prefill_call_count(),
@@ -1174,16 +1161,57 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Empty-tail refresh after a normal refresh
+    // n_past stays bounded across many refreshes (the issue-0022 regression)
     // -----------------------------------------------------------------------
     //
-    // Verifies the `LiveSessionBackend::refresh` logits-invariant contract:
-    // after a normal refresh (which prunes generated tokens), a subsequent
-    // refresh with an empty tail must succeed and must record only the empty
-    // tail — NOT re-send the prefix or the previous tail. The stub has no
-    // real logit buffer, so this test exercises the `LiveSession` routing
-    // discipline rather than the real-backend re-decode path (which is
-    // covered by the gated `#[ignore]` test below).
+    // The cumulative-append design grew n_past every refresh until it overflowed
+    // n_ctx mid-meeting. The prune-to-prefix design must keep n_past at
+    // prefix_len + current_tail regardless of how many refreshes have run.
+
+    #[test]
+    fn n_past_stays_bounded_across_many_refreshes() {
+        let n = 50usize;
+        let results: Vec<RawTurn> = (0..n)
+            .map(|i| RawTurn {
+                text: format!("answer {i} with some generated tokens"),
+                ..Default::default()
+            })
+            .collect();
+        let stub = StubLiveBackend::new(results);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("prefix-of-12b", &CancelFlag::new()).unwrap();
+        let prefix_len = session.backend.n_past();
+
+        // Every refresh uses a same-length tail. n_past after each must equal
+        // prefix_len + tail_len — never cumulative.
+        let tail = "this is one refresh tail";
+        for _ in 0..n {
+            session
+                .refresh(
+                    tail,
+                    &SamplerConfig::deterministic(),
+                    &CancelFlag::new(),
+                    &mut |_| {},
+                )
+                .unwrap();
+            assert_eq!(
+                session.backend.n_past(),
+                prefix_len + tail.len(),
+                "n_past must stay bounded (prefix + current tail), not grow per refresh"
+            );
+        }
+        // The expensive prefix prefill happened exactly once.
+        assert_eq!(session.backend.prefill_call_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty-tail refresh routing (LiveSession layer)
+    // -----------------------------------------------------------------------
+    //
+    // The production driver never sends an empty tail (the tail always carries
+    // the chat-template suffix), but the `LiveSession` layer itself imposes no
+    // such constraint. This asserts it routes the caller's exact tail through —
+    // the prefix is prefilled once and earlier tails are not re-sent.
 
     #[test]
     fn empty_tail_after_refresh_is_routed_correctly() {

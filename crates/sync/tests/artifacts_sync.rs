@@ -192,6 +192,52 @@ async fn reprocess_newer_copy_supersedes_and_stale_does_not_clobber() {
 }
 
 #[tokio::test]
+async fn peer_copy_does_not_overwrite_unprovable_local_bytes() {
+    // Silent-loss guard: B holds NEWER transcript bytes it cannot stamp (present on
+    // disk, but the meeting is not locally Processed and there is no authority
+    // record — e.g. produced before a Processed flip, or a lost authority store), so
+    // B advertises nothing for it. A offers an OLDER, validly-stamped copy. The pull
+    // must NOT treat "B advertises none" as "B lacks it" and overwrite B's newer
+    // bytes — B keeps its local file.
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+
+    let meeting = MeetingId::new();
+    // A: an older, stamped transcript.
+    let a_bytes = br#"[{"v":"a-older"}]"#.to_vec();
+    seed_processed(root_a, meeting, &a_bytes, b"# A", "host-a", "2026-06-30T10:00:00Z").await;
+    // B: a newer transcript on disk, but NOT Processed and with no authority record
+    // (ensure seeds metadata as Local). B will not advertise it.
+    let b_bytes = br#"[{"v":"b-newer-unprovable"}]"#.to_vec();
+    MeetingFolder::ensure(root_b, meeting).expect("ensure folder b");
+    std::fs::write(
+        root_b.join(meeting.0.to_string()).join("transcript.json"),
+        &b_bytes,
+    )
+    .expect("write b transcript");
+
+    let (a, b) = paired_engines(root_a, root_b).await;
+
+    a.sync_artifacts(direct_addr(&b), meeting)
+        .await
+        .expect("reconcile a -> b");
+
+    // B's unprovable local bytes are intact — NOT clobbered by A's older copy.
+    assert_eq!(
+        read_artifact(root_b, meeting, "transcript.json"),
+        b_bytes,
+        "B's newer unstampable local bytes must not be overwritten by an older peer copy"
+    );
+    // A keeps its own copy (B advertised nothing for A to pull).
+    assert_eq!(read_artifact(root_a, meeting, "transcript.json"), a_bytes);
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+#[tokio::test]
 async fn sync_is_noop_when_both_already_hold_the_artifacts() {
     // Both devices already hold byte-identical artifacts for the same meeting. A
     // full reconciliation converges cleanly (a no-op): every entry is byte-identical

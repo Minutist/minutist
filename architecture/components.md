@@ -195,7 +195,11 @@ per-meeting lock (the `.blobs/artifacts` analogue of the metadata lock), so
 concurrent exchanges for one meeting cannot lose each other's record. The per-(meeting, rel-path) authority is persisted at
 `{meetings_root}/.blobs/artifacts/{id}.json` (sync-owned, beside the blob store),
 written whenever an artifact's bytes are written, so a device re-advertises the
-authority that arrived WITH the bytes. An `is_artifact_rel` allow-list
+authority that arrived WITH the bytes. The pull never overwrites an on-disk artifact
+it cannot prove is superseded: a peer copy of a rel the device does not advertise is
+taken only when that file is genuinely ABSENT locally — a file present but unstampable
+(no provable authority) is kept, not clobbered by a copy that may be older. An
+`is_artifact_rel` allow-list
 (`transcript.json` + `summary.md`) is kept DISJOINT from the media path-safety
 allow-list so a derived file can never ride the media union path. `sync` writes only
 `transcript.json` + `summary.md` (atomically, tmp+rename) under the meetings root in

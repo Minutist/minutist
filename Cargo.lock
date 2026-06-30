@@ -8746,8 +8746,12 @@ dependencies = [
 name = "sync-ffi"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "minutist-common",
+ "notes-crdt",
+ "serde_json",
  "sync",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

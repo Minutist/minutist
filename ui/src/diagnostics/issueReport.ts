@@ -85,7 +85,7 @@ export function buildClipboardReport(report: DiagnosticReport): string {
 
 const TRUNCATION_NOTE =
   "\n\n[diagnostic report truncated for the URL — the full report was copied " +
-  "to your clipboard; paste it above]";
+  "to your clipboard; paste it into this Diagnostic report field, replacing this note]";
 
 function composeUrl(params: URLSearchParams): string {
   return `https://github.com/${ISSUE_REPO}/issues/new?${params.toString()}`;

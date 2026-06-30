@@ -52,7 +52,7 @@ export const useReportProblemStore = create<ReportProblemStore>((set, get) => ({
       set({
         reporting: false,
         status: outcome.copiedToClipboard
-          ? "Opened your browser. The report was large, so the full report was copied to your clipboard — paste it into the issue."
+          ? "Opened your browser. The report was large, so the full report was copied to your clipboard — paste it into the “Diagnostic report” field at the bottom of the issue."
           : "Opened your browser with the report pre-filled.",
       });
     } catch (err) {

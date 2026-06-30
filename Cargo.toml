@@ -22,6 +22,7 @@ members = [
     "crates/doc-convert",
     "crates/ipc-bridge",
     "crates/headless",
+    "crates/election",
     "src-tauri",
     "spikes/asr",
     "spikes/llm",

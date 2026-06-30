@@ -33,6 +33,7 @@ role when work is parallel.
 | `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |
 | `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `notes-crdt` |
 | `sync-ffi` | systems-engineer | `crates/sync-ffi/**` | This file too if changing the FFI wrapper contract. | `common`, `sync` (mobile-only UniFFI wrapper — see the `¶` footnote in `components.md`) |
+| `election` | systems-engineer | `crates/election/**` | This file too if changing the `ElectionDriver` trait contract. | `common`, `persistence` (the producer-gate host-election leaf — drives `sync` / `orchestrator` only behind the `ElectionDriver` trait, so it takes no edge to either) |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
 | `headless` (bin) | systems-engineer | `crates/headless/**` | Same | `common`, `persistence`, `sync`, `settings` |

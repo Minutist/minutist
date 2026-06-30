@@ -1456,7 +1456,11 @@ renewing) only by a `Processed`-by-other or a LIVE lower-`HostRef` `Claimed` —
 EXPIRED lower-`HostRef` claim is a stale replay (re-injected by `merge_processing`'s
 clock-independent lowest-`HostRef` resolution from a peer sweep) and is reapable
 regardless of `HostRef`, so the renewal re-asserts over it rather than self-aborting
-(`DESIGN_producer-gate.md` §10, review CRITICAL-1). Two eligible hosts may briefly do
+(`DESIGN_producer-gate.md` §10, review CRITICAL-1). The renewal step re-stamps the
+lease atomically under the per-meeting lock — refreshing our own claim (preserving
+its original `claimed_at`), reaping a stale expired claim, or taking over a
+higher-`HostRef` live claim we win the tiebreak over — and stops only when genuinely
+superseded; it never regresses a `Local`/`Processed`. Two eligible hosts may briefly do
 duplicate-but-idempotent work; the authoritative winner falls out of convergence
 (`merge_processing` + the Artifacts authority rule), not a settle timer — so the loop
 never cancels an in-flight `process()`. The desktop `DesktopElectionDriver` (app-main,

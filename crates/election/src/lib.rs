@@ -218,7 +218,8 @@ pub async fn run_election_loop(
     let host = driver.host_ref();
     tracing::info!(target: "election", host = %host.0, "election loop started");
     loop {
-        tokio::time::sleep(config.poll).await;
+        // Scan THEN sleep, so a freshly-eligible host claims an already-pending
+        // meeting on startup rather than waiting a full poll interval first.
         let now = Utc::now();
         let candidates: Vec<MeetingId> = persistence::folder::list_meeting_ids(&meetings_root)
             .into_iter()
@@ -230,6 +231,7 @@ pub async fn run_election_loop(
                 tracing::warn!(target: "election", meeting_id = %id.0, error = %e, "election attempt failed");
             }
         }
+        tokio::time::sleep(config.poll).await;
     }
 }
 
@@ -247,9 +249,10 @@ async fn try_elect_and_process(
     id: MeetingId,
     config: &ElectionConfig,
 ) -> AppResult<()> {
-    let claim = build_claim(host, Utc::now(), config.lease);
+    let now = Utc::now();
+    let claim = build_claim(host, now, config.lease);
     let applied = update_metadata_if(meetings_root, id, |m| {
-        if claimable(&m.processing, Utc::now()) {
+        if claimable(&m.processing, now) {
             m.processing = ProcessingLifecycle::Claimed {
                 claim: claim.clone(),
             };
@@ -307,9 +310,7 @@ async fn try_elect_and_process(
 }
 
 /// Re-stamp the lease on the `renew` cadence while we hold the claim, stopping when
-/// signalled (process finished) or when genuinely superseded. Re-asserts the claim
-/// if a stale expired-claim replay clobbered it (the lease-aware reap), but yields
-/// to a live lower-`HostRef` claim or a `Processed`-by-other.
+/// signalled (process finished) or when genuinely superseded.
 async fn renewal_loop(
     meetings_root: PathBuf,
     id: MeetingId,
@@ -322,27 +323,89 @@ async fn renewal_loop(
             _ = tokio::time::sleep(config.renew) => {}
             _ = stop.notified() => return,
         }
-        let now = Utc::now();
-        if let Some(state) = read_processing(&meetings_root, id) {
-            if superseded(&state, &host, now) {
-                tracing::info!(target: "election", meeting_id = %id.0, "claim superseded by a live winner; stopping renewal");
-                return;
-            }
+        if matches!(
+            renewal_step(&meetings_root, id, &host, Utc::now(), config.lease),
+            RenewOutcome::Stop
+        ) {
+            return;
         }
-        let claim = build_claim(&host, now, config.lease);
-        let renewed = update_metadata_if(&meetings_root, id, |m| {
-            let mine = matches!(&m.processing, ProcessingLifecycle::Claimed { claim } if claim.host == host);
-            if mine || claimable(&m.processing, now) {
-                m.processing = ProcessingLifecycle::Claimed {
-                    claim: claim.clone(),
-                };
-                Some(())
-            } else {
-                None
+    }
+}
+
+/// Whether the renewal loop should keep renewing or stop.
+#[derive(Debug, PartialEq, Eq)]
+enum RenewOutcome {
+    /// Lease refreshed (or a transient write error); keep renewing.
+    Continue,
+    /// Genuinely superseded (a live lower-`HostRef` claim or a `Processed`-by-other)
+    /// or the meeting is gone; stop renewing.
+    Stop,
+}
+
+/// One renewal tick, performed atomically under the per-meeting lock: read the
+/// current state, and
+/// - if GENUINELY superseded ([`superseded`] — a `Processed`-by-other or a LIVE
+///   lower-`HostRef` claim), do not write and return [`RenewOutcome::Stop`];
+/// - otherwise re-assert our claim with a fresh lease — covering our own claim (the
+///   lease refresh, PRESERVING the original `claimed_at`), a reapable expired/stale
+///   claim (the lease-aware reap of a replay that `merge_processing` may have put on
+///   our disk), a higher-`HostRef` LIVE claim we win the tiebreak over, and a
+///   `PendingProcessing` offer. A `Local` / `Processed` state is never regressed
+///   (it should not arise mid-process; if it does, we leave it and keep ticking).
+///
+/// The decision and the write are ONE closure under ONE lock acquisition (no
+/// read-then-write window); the supersession observation rides back out via the
+/// closure-captured flag — the observed-state-on-skip contract
+/// [`notes_crdt::update_metadata_if`] exists for.
+fn renewal_step(
+    meetings_root: &Path,
+    id: MeetingId,
+    host: &HostRef,
+    now: DateTime<Utc>,
+    lease: Duration,
+) -> RenewOutcome {
+    let mut lost = false;
+    let lease = chrono::Duration::from_std(lease).unwrap_or_else(|_| chrono::Duration::minutes(30));
+    let result = update_metadata_if(meetings_root, id, |m| {
+        if superseded(&m.processing, host, now) {
+            lost = true;
+            return None;
+        }
+        // Re-assert only over a Claimed (mine / reapable / higher-live — the
+        // superseding cases already returned above) or a Pending offer; never
+        // regress a Local / Processed.
+        let reassert = matches!(
+            m.processing,
+            ProcessingLifecycle::Claimed { .. } | ProcessingLifecycle::PendingProcessing
+        );
+        if !reassert {
+            return None;
+        }
+        let claimed_at = match &m.processing {
+            ProcessingLifecycle::Claimed { claim } if claim.host == *host => {
+                claim.claimed_at.clone()
             }
-        });
-        if let Err(e) = renewed {
+            _ => now.to_rfc3339(),
+        };
+        m.processing = ProcessingLifecycle::Claimed {
+            claim: ProcessingClaim {
+                host: host.clone(),
+                claimed_at,
+                lease_expires_at: (now + lease).to_rfc3339(),
+            },
+        };
+        Some(())
+    });
+    match result {
+        // The meeting's folder is gone — nothing left to renew.
+        Ok(MetaUpdate::SkippedAbsent) => RenewOutcome::Stop,
+        // Skipped because superseded (stop) or because the state was non-reassertable
+        // Local/Processed (harmless; keep ticking until process() signals stop).
+        Ok(MetaUpdate::SkippedPredicate) if lost => RenewOutcome::Stop,
+        Ok(_) => RenewOutcome::Continue,
+        Err(e) => {
             tracing::warn!(target: "election", meeting_id = %id.0, error = %e, "lease renewal write failed");
+            RenewOutcome::Continue
         }
     }
 }
@@ -609,5 +672,127 @@ mod tests {
             Some(ProcessingLifecycle::Processed { at, .. }) => at,
             other => panic!("expected Processed, got {other:?}"),
         }
+    }
+
+    fn read_claim(root: &Path, id: MeetingId) -> ProcessingClaim {
+        match read_processing(root, id) {
+            Some(ProcessingLifecycle::Claimed { claim }) => claim,
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+    }
+
+    fn claimed_state(h: &str, claimed_at: &str, lease_expires_at: &str) -> ProcessingLifecycle {
+        ProcessingLifecycle::Claimed {
+            claim: ProcessingClaim {
+                host: host(h),
+                claimed_at: claimed_at.to_string(),
+                lease_expires_at: lease_expires_at.to_string(),
+            },
+        }
+    }
+
+    // ----- renewal_step (the loop core — review W1) -----
+
+    #[tokio::test]
+    async fn renewal_step_refreshes_my_lease_preserving_claimed_at() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let id = MeetingId::new();
+        let now = Utc::now();
+        let old_lease = (now + chrono::Duration::minutes(1)).to_rfc3339();
+        seed(root, id, claimed_state("m", "2026-07-01T09:00:00Z", &old_lease)).await;
+
+        let out = renewal_step(root, id, &host("m"), now, Duration::from_secs(1800));
+
+        assert_eq!(out, RenewOutcome::Continue);
+        let claim = read_claim(root, id);
+        assert_eq!(claim.host, host("m"));
+        // W3: the original claim instant is preserved across a renew.
+        assert_eq!(claim.claimed_at, "2026-07-01T09:00:00Z");
+        // The lease was extended (new expiry is later than the old one-minute one).
+        assert!(
+            DateTime::parse_from_rfc3339(&claim.lease_expires_at).unwrap()
+                > DateTime::parse_from_rfc3339(&old_lease).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn renewal_step_reaps_a_stale_expired_lower_replay() {
+        // The CRITICAL-1 case IN the loop: merge_processing may have clobbered our
+        // disk with a dead lower-HostRef holder's EXPIRED claim (replayed off a hub
+        // sweep). The renew must reap it back to us, not abort.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let id = MeetingId::new();
+        let now = Utc::now();
+        let expired = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        seed(root, id, claimed_state("a", "2026-07-01T09:00:00Z", &expired)).await;
+
+        let out = renewal_step(root, id, &host("m"), now, Duration::from_secs(1800));
+
+        assert_eq!(out, RenewOutcome::Continue);
+        assert_eq!(read_claim(root, id).host, host("m"), "expired lower replay must be reaped");
+    }
+
+    #[tokio::test]
+    async fn renewal_step_yields_to_a_live_lower_winner() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let id = MeetingId::new();
+        let now = Utc::now();
+        let live = (now + chrono::Duration::minutes(20)).to_rfc3339();
+        seed(root, id, claimed_state("a", "2026-07-01T09:00:00Z", &live)).await;
+
+        let out = renewal_step(root, id, &host("m"), now, Duration::from_secs(1800));
+
+        assert_eq!(out, RenewOutcome::Stop, "a live lower-HostRef claim supersedes us");
+        assert_eq!(read_claim(root, id).host, host("a"), "the live winner is left intact");
+    }
+
+    #[tokio::test]
+    async fn renewal_step_reasserts_over_a_live_higher_claim() {
+        // W2: a higher-HostRef live foreign claim on our own disk (a stale-merge
+        // artefact — we win the tiebreak) must be re-asserted, not left to lapse.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let id = MeetingId::new();
+        let now = Utc::now();
+        let live = (now + chrono::Duration::minutes(20)).to_rfc3339();
+        seed(root, id, claimed_state("z", "2026-07-01T09:00:00Z", &live)).await;
+
+        let out = renewal_step(root, id, &host("m"), now, Duration::from_secs(1800));
+
+        assert_eq!(out, RenewOutcome::Continue);
+        assert_eq!(read_claim(root, id).host, host("m"), "we win over a higher-HostRef live claim");
+    }
+
+    #[tokio::test]
+    async fn renewal_step_stops_on_processed_by_other_and_absent() {
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let now = Utc::now();
+
+        let processed = MeetingId::new();
+        seed(
+            root,
+            processed,
+            ProcessingLifecycle::Processed { processed_by: host("a"), at: "2026-07-01T10:00:00Z".into() },
+        )
+        .await;
+        assert_eq!(
+            renewal_step(root, processed, &host("m"), now, Duration::from_secs(1800)),
+            RenewOutcome::Stop
+        );
+        // Unchanged — we never regress a Processed.
+        assert!(matches!(
+            read_processing(root, processed),
+            Some(ProcessingLifecycle::Processed { processed_by, .. }) if processed_by == host("a")
+        ));
+
+        // An absent meeting (folder gone) stops the renewer.
+        assert_eq!(
+            renewal_step(root, MeetingId::new(), &host("m"), now, Duration::from_secs(1800)),
+            RenewOutcome::Stop
+        );
     }
 }

@@ -56,12 +56,12 @@ pub fn read_metadata(meeting_dir: &Path) -> AppResult<MeetingMeta> {
 }
 
 /// `read_metadata` in this crate's own error namespace, for the index /
-/// meeting-ops callers that already work in `crate::Error`.
+/// meeting-ops callers that already work in `crate::Error`. Delegates to the
+/// lifted [`notes_crdt::read_metadata`] (the deserialise now lives in the leaf so
+/// the guarded RMW and the mobile path share it), mapping its error into
+/// `crate::Error` via the existing `From<notes_crdt::Error>`.
 pub(crate) fn read_metadata_inner(meeting_dir: &Path) -> Result<MeetingMeta, Error> {
-    let path = meeting_dir.join("metadata.json");
-    let bytes = std::fs::read(&path).map_err(Error::Io)?;
-    let meta: MeetingMeta = serde_json::from_slice(&bytes).map_err(Error::Serialise)?;
-    Ok(meta)
+    Ok(notes_crdt::read_metadata(meeting_dir)?)
 }
 
 /// Read and deserialise `transcript.json` from a meeting folder.

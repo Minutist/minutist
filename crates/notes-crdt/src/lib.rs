@@ -10,7 +10,11 @@
 //!   [`note_blocks_from_json`] (the summariser's note-paragraph projection).
 //! - [`MeetingFolder`]: the on-disk `{root}/{uuid}/` layout and its path
 //!   helpers, including [`MeetingFolder::ensure`] (the sync-receiver seam).
-//! - [`write_metadata`]: the atomic `metadata.json` writer.
+//! - [`read_metadata`] / [`write_metadata`]: the `metadata.json` reader and the
+//!   atomic writer.
+//! - [`update_metadata`] / [`update_metadata_if_present`]: the guarded
+//!   read-modify-write of `metadata.json` (issue 0025) — read→mutate→write under
+//!   [`metadata_lock`], the single entry point every writer uses.
 //! - [`metadata_lock`]: the process-wide per-meeting lock that serialises every
 //!   `metadata.json` read-modify-write (shared by `persistence::meeting_ops` and
 //!   [`MeetingFolder::ensure`]).
@@ -38,6 +42,9 @@ pub mod ydoc;
 pub use error::Error;
 pub use folder::MeetingFolder;
 pub use lifecycle::merge_processing;
-pub use metadata::{write_metadata, write_metadata_atomic};
+pub use metadata::{
+    read_metadata, update_metadata, update_metadata_if_present, write_metadata,
+    write_metadata_atomic,
+};
 pub use metadata_lock::metadata_lock;
 pub use notes::{note_blocks_from_json, NotesData, NotesStore};

@@ -1255,10 +1255,12 @@ over its root, and must never point at a desktop's `{app-data}`.
 The single-writer rule above keeps two *processes* off one data root; a second,
 in-process lock serialises the in-process tasks that read-modify-write a meeting's
 `metadata.json` against each other. Every such RMW goes through one guarded helper
-— `persistence::meeting_ops::update_metadata(root, id, |meta| {…})` (and its
-skip-if-absent sibling `update_metadata_if_present`) — which takes the lock,
-reads, applies the closure, and writes atomically, so a caller cannot forget the
-lock. The writers routed through it: the `meeting_ops` operations
+— `notes_crdt::update_metadata(root, id, |meta| {…})` (and its skip-if-absent
+sibling `update_metadata_if_present`), re-exported at the historical
+`persistence::meeting_ops` path so existing callers are unchanged — which takes
+the lock, reads (via `notes_crdt::read_metadata`), applies the closure, and writes
+atomically, so a caller cannot forget the lock. The writers routed through it: the
+`meeting_ops` operations
 (`rename_meeting`, `set_meeting_collection`, `set_speaker_name`,
 `apply_processing_lifecycle`), `MeetingFolder::ensure`'s placeholder seed,
 `read_meeting_state`'s lazy notes-format flip (the one-time `notes.ydoc`
@@ -1278,10 +1280,15 @@ leaf `notes-crdt` crate — serialises them, mirroring the attachments
     static METADATA_LOCKS: OnceLock<Mutex<HashMap<MeetingId, Arc<Mutex<()>>>>>
 
 It lives in `notes-crdt` because that is the lowest crate both writers reach
-(`persistence` depends on `notes-crdt`, and `ensure` is defined there). It is a
-`std::sync::Mutex`, not a `tokio` one, because every guarded RMW is synchronous
-`std::fs` with no `.await` held across the guard — so it adds no `tokio`
-dependency to `notes-crdt`. Each writer takes `notes_crdt::metadata_lock(id)` for
+(`persistence` depends on `notes-crdt`, and `ensure` is defined there). The
+guarded helpers themselves — `update_metadata` / `update_metadata_if_present` and
+the `read_metadata` they read through — are co-located there beside the lock and
+`write_metadata`, so the C-free leaf owns the whole guarded-RMW primitive and the
+mobile `sync-ffi` path (persistence-free by design) shares the ONE implementation
+rather than re-deriving the lock discipline; `persistence` re-exports them at
+their historical paths. It is a `std::sync::Mutex`, not a `tokio` one, because
+every guarded RMW is synchronous `std::fs` with no `.await` held across the guard
+— so it adds no `tokio` dependency to `notes-crdt`. Each writer takes `notes_crdt::metadata_lock(id)` for
 the check-then-RMW and drops the guard before any later `.await` (the `index.db`
 upsert in `rename_meeting` / `set_meeting_collection` runs after the guard is
 released; the index is a derived cache, reconciled by `rebuild_from_disk`).

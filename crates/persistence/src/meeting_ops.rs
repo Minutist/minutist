@@ -7,10 +7,12 @@
 //! match, so a crash between the two steps leaves the index stale-but-rebuildable
 //! ([`crate::MeetingIndex::rebuild_from_disk`] reconciles it).
 //!
-//! Every `metadata.json` read-modify-write goes through [`update_metadata`] (or
-//! its skip-if-absent sibling [`update_metadata_if_present`]), which takes the
-//! meeting's lock from `notes_crdt::metadata_lock` and holds it across the whole
-//! RMW (releasing it before any `index.db` `.await`). That serialises every
+//! Every `metadata.json` read-modify-write goes through [`update_metadata`] /
+//! [`update_metadata_if_present`] (re-exported from the `notes_crdt` leaf, where
+//! they live beside the lock + writer so the mobile `sync-ffi` path shares one
+//! implementation), which takes the meeting's lock from `notes_crdt::metadata_lock`
+//! and holds it across the whole RMW (releasing it before any `index.db`
+//! `.await`). That serialises every
 //! writer of a meeting's `metadata.json` on one per-meeting lock — these
 //! operations, the sync lifecycle subscriber
 //! ([`apply_synced_lifecycle_if_present`]), `MeetingFolder::ensure`'s
@@ -21,69 +23,21 @@
 
 use std::path::Path;
 
-use minutist_common::{AppResult, CollectionId, MeetingId, MeetingMeta, ProcessingLifecycle};
+use minutist_common::{AppResult, CollectionId, MeetingId, ProcessingLifecycle};
 
 use crate::error::Error;
 use crate::index::MeetingIndex;
 use crate::reader;
 
-/// Guarded read-modify-write of a meeting's `metadata.json` — the single entry
-/// point every `metadata.json` writer uses (issue 0025).
+/// The guarded `metadata.json` read-modify-write entry points (issue 0025).
 ///
-/// Takes the per-meeting `notes_crdt::metadata_lock(id)`, confirms the meeting
-/// exists, reads the [`MeetingMeta`], applies `f`, and writes it back atomically
-/// — one lock acquisition spanning the existence check and the RMW, so no
-/// concurrent writer can interleave and revert a field. The closure returns
-/// whatever the caller needs from the mutated `meta` (e.g. `()`, or the updated
-/// `speaker_names`), computed under the guard.
-///
-/// Synchronous by design: the std-`Mutex` guard must never be held across an
-/// `.await`. Any async follow-up (e.g. an `index.db` upsert) runs after this
-/// returns and the guard drops.
-///
-/// `Error::MeetingNotFound` if the folder has no `metadata.json`. Use
-/// [`update_metadata_if_present`] for the consumer case that skips an absent
-/// meeting instead of erroring.
-pub fn update_metadata<F, R>(meetings_root: &Path, id: MeetingId, f: F) -> AppResult<R>
-where
-    F: FnOnce(&mut MeetingMeta) -> R,
-{
-    let folder = meetings_root.join(id.0.to_string());
-    let lock = notes_crdt::metadata_lock(id);
-    let _guard = lock.lock().expect("metadata lock poisoned");
-    if !folder.join("metadata.json").exists() {
-        return Err(Error::MeetingNotFound(id).into());
-    }
-    let mut meta = reader::read_metadata_inner(&folder)?;
-    let out = f(&mut meta);
-    crate::write_metadata(&folder, &meta)?;
-    Ok(out)
-}
-
-/// Like [`update_metadata`], but returns `Ok(None)` (skips) when the meeting is
-/// not present locally rather than erroring — the consumer-side contract for a
-/// peer-advertised state whose folder may not have synced in yet (the
-/// notes/media receive path seeds it). The presence check and the write are one
-/// atomic unit under the lock.
-pub fn update_metadata_if_present<F, R>(
-    meetings_root: &Path,
-    id: MeetingId,
-    f: F,
-) -> AppResult<Option<R>>
-where
-    F: FnOnce(&mut MeetingMeta) -> R,
-{
-    let folder = meetings_root.join(id.0.to_string());
-    let lock = notes_crdt::metadata_lock(id);
-    let _guard = lock.lock().expect("metadata lock poisoned");
-    if !folder.join("metadata.json").exists() {
-        return Ok(None);
-    }
-    let mut meta = reader::read_metadata_inner(&folder)?;
-    let out = f(&mut meta);
-    crate::write_metadata(&folder, &meta)?;
-    Ok(Some(out))
-}
+/// Re-exported from the `notes_crdt` leaf, where they live beside
+/// [`notes_crdt::metadata_lock`] and [`notes_crdt::write_metadata`] so
+/// `persistence` AND the mobile `sync-ffi` path share ONE guarded-RMW
+/// implementation. Re-exported here at their historical `persistence::meeting_ops`
+/// path so every caller — the ops below, the orchestrator's post-processing
+/// writes, `reader::read_meeting_state`, and `agent-tools` — is unchanged.
+pub use notes_crdt::{update_metadata, update_metadata_if_present};
 
 /// A stable, log-safe discriminant for a [`ProcessingLifecycle`] — the variant
 /// name only (the `HostRef` inside a claim is a device key, not user content,

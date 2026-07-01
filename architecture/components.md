@@ -42,7 +42,7 @@ appears in:
 | `election` | WS4-B (producer-gate) | `common`, `persistence` |
 | `doc-convert` | Attachments WS | `common` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§ |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※ |
 | `headless` (bin) | WS4-B | `common`, `persistence`, `sync`, `settings` ‖ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
@@ -79,6 +79,21 @@ that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
 `connected` Cargo feature exactly like the `mcp-server` / `tunnel-client` edges;
 the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
 — "Build variants".
+
+※ `election` is an **optional** edge of `app-main`, gated by the same `connected`
+Cargo feature as `mcp-server` / `tunnel-client` / `sync` (it is part of the
+connected-tier surface — the free build runs no election loop and never delegates
+or claims processing). The edge is live as of WS4-B producer-gate S4: the
+`DesktopElectionDriver` in `src-tauri/src/sync.rs` (co-located with the connected
+`SyncControl`) implements `election::ElectionDriver`, adapting the leaf's `advertise`
+to the `SyncEngine` discovery exchange and its `process` to `orchestrator::reprocess`;
+`app-main` spawns `election::run_election_loop` once the sync engine is bound, passing
+the `Capability` it derives from `common::probe_primary_gpu` (an eligible host claims
+and processes; a GPU-less one parks sync-only). The election leaf itself takes no
+`sync` / `orchestrator` / `tauri` edge — those collaborators sit behind the trait — so
+this is the single point that binds them together, exactly as `app-main` injects the
+connected `SyncControl`. The free artifact omits it. See `cross-cutting.md` — "Build
+variants".
 
 ‖ `headless` (bin) is a SECOND workspace binary beside `app-main` — the
 user-installed headless server daemon (`minutist-hub`): an always-on sync hub

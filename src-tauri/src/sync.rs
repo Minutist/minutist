@@ -42,8 +42,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ipc_bridge::{IpcError, SyncControl};
-use minutist_common::{AppEvent, MeetingId, SyncStatus};
+use election::{Capability, ElectionConfig, ElectionDriver};
+use ipc_bridge::{IpcError, MeetingIndex, SyncControl};
+use minutist_common::{AppEvent, AppResult, HostRef, MeetingId, SyncStatus};
+use orchestrator::Orchestrator;
 use settings::SettingsHandle;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use tokio::sync::broadcast;
@@ -67,10 +69,22 @@ struct Runtime {
     status: SyncStatus,
 }
 
+/// The collaborators the producer-gate election loop needs, passed in from
+/// `app-main` (which links `sync` + `orchestrator` + `election` together). Held so
+/// [`ConnectedSync::start_engine`] can spawn the loop once the engine binds. `None`
+/// disables the gate (the connected E2E tests build the sync control without it).
+pub struct ElectionDeps {
+    pub orchestrator: Arc<Orchestrator>,
+    pub index: Arc<MeetingIndex>,
+}
+
 /// The connected `SyncControl` implementation.
 pub struct ConnectedSync {
     event_tx: broadcast::Sender<AppEvent>,
     runtime: Arc<Mutex<Runtime>>,
+    /// When set (production), the engine-bind path spawns the producer-gate election
+    /// loop with a [`DesktopElectionDriver`] over these + the bound engine.
+    election: Option<ElectionDeps>,
 }
 
 impl ConnectedSync {
@@ -88,6 +102,7 @@ impl ConnectedSync {
         event_tx: broadcast::Sender<AppEvent>,
         app_data_base: PathBuf,
         meetings_dir: PathBuf,
+        election: Option<ElectionDeps>,
     ) -> Arc<Self> {
         let enabled = settings.current().connector_enabled;
         let initial_status = if enabled {
@@ -101,6 +116,7 @@ impl ConnectedSync {
                 engine: None,
                 status: initial_status,
             })),
+            election,
         });
 
         if enabled {
@@ -139,9 +155,10 @@ impl ConnectedSync {
             }
         };
 
-        // Clone the meetings root for the lifecycle subscriber before the config
-        // consumes it.
+        // Clone the meetings root for the lifecycle subscriber + the election loop
+        // before the config consumes it.
         let subscriber_meetings_dir = meetings_dir.clone();
+        let election_meetings_dir = meetings_dir.clone();
         let mut config = SyncConfig::new(meetings_dir);
         if let Some(token) = relay_token {
             config = config.with_relay_auth_token(token);
@@ -149,6 +166,7 @@ impl ConnectedSync {
 
         match SyncEngine::start(config, identity).await {
             Ok(engine) => {
+                let engine = Arc::new(engine);
                 // Persist the processing-lifecycle states the engine surfaces from
                 // discovery. The subscriber loop lives in `ipc-bridge` (which owns
                 // the `persistence` edge); here we only hand it the engine's
@@ -157,8 +175,40 @@ impl ConnectedSync {
                     engine.subscribe_lifecycle_events(),
                     subscriber_meetings_dir,
                 );
+
+                // Producer-gate election loop (S4): claim + process the
+                // `PendingProcessing` meetings a capture device offered, then push
+                // the derived artifacts back. Spawned only when the deps were
+                // injected (production; the connected E2E tests pass `None`). It
+                // self-gates on GPU capability — a CPU-only host parks and never
+                // claims — so spawning it unconditionally here is safe.
+                if let Some(deps) = &self.election {
+                    let driver: Arc<dyn ElectionDriver> = Arc::new(DesktopElectionDriver {
+                        engine: Arc::clone(&engine),
+                        orchestrator: Arc::clone(&deps.orchestrator),
+                        index: Arc::clone(&deps.index),
+                        host: HostRef(engine.endpoint_id().to_string()),
+                    });
+                    tauri::async_runtime::spawn(async move {
+                        // Probe the GPU capability ONCE, off the async executor (the
+                        // probe self-inits the ggml backend and can block).
+                        let capability = tokio::task::spawn_blocking(|| {
+                            capability_from_gpu(minutist_common::probe_primary_gpu().is_some())
+                        })
+                        .await
+                        .unwrap_or(Capability::ParkSyncOnly);
+                        election::run_election_loop(
+                            ElectionConfig::from_env(),
+                            driver,
+                            election_meetings_dir,
+                            capability,
+                        )
+                        .await;
+                    });
+                }
+
                 let mut rt = self.runtime.lock().await;
-                rt.engine = Some(Arc::new(engine));
+                rt.engine = Some(engine);
                 rt.status = SyncStatus::Idle;
                 tracing::info!(target: "app-main", "sync engine started");
             }
@@ -323,6 +373,68 @@ fn resolve_relay_token(_settings: &SettingsHandle) -> Option<String> {
     }
 }
 
+/// The desktop's [`ElectionDriver`] (producer-gate S4): drives the election loop's
+/// two collaborators — the bound [`SyncEngine`] (advertise lifecycle state over
+/// discovery; push derived artifacts to peers) and the [`Orchestrator`] (run the
+/// offline reprocess pipeline). This is the only place that links `election` +
+/// `sync` + `orchestrator`, which is why the loop abstracts them behind the trait.
+struct DesktopElectionDriver {
+    engine: Arc<SyncEngine>,
+    orchestrator: Arc<Orchestrator>,
+    index: Arc<MeetingIndex>,
+    /// This host's identity (the endpoint id) — the lowest-`HostRef` tiebreak key.
+    host: HostRef,
+}
+
+#[async_trait]
+impl ElectionDriver for DesktopElectionDriver {
+    fn host_ref(&self) -> HostRef {
+        self.host.clone()
+    }
+
+    async fn advertise(&self) {
+        // Propagate our lifecycle state (the fresh Claimed / Processed) to every
+        // paired peer over the discovery exchange. Best-effort: on failure the
+        // state re-advertises on the next loop tick / sync.
+        if let Err(e) = self.engine.discover_all().await {
+            tracing::warn!(target: "app-main", error = %e, "election: advertise (discover_all) failed");
+        }
+    }
+
+    async fn process(&self, meeting_id: MeetingId) -> AppResult<()> {
+        // The offline pipeline (re-transcribe + diarize) over the synced-in
+        // `audio.opus`, rewriting `transcript.json` / `summary.md`. `reprocess`
+        // takes one offline claim for the whole pass.
+        self.orchestrator.reprocess(&self.index, meeting_id).await
+    }
+
+    async fn push_artifacts(&self, meeting_id: MeetingId) {
+        // Push the derived artifacts to every peer BEFORE the loop advertises
+        // `Processed`, so a consumer never learns `Processed` without the outputs
+        // being retrievable (DESIGN_producer-gate.md §6.7). Best-effort per peer.
+        for peer in self.engine.peer_ids() {
+            if let Err(e) = self
+                .engine
+                .sync_artifacts_to_peer(&peer.to_string(), meeting_id)
+                .await
+            {
+                tracing::warn!(target: "app-main", peer = %peer, error = %e, "election: pushing artifacts to a peer failed");
+            }
+        }
+    }
+}
+
+/// Map a GPU-presence probe to the election [`Capability`]. Pure, so the self-gating
+/// decision — an eligible host claims + processes; a GPU-less one parks sync-only and
+/// never claims — is unit-testable without touching the ggml backend the probe inits.
+fn capability_from_gpu(has_gpu: bool) -> Capability {
+    if has_gpu {
+        Capability::Eligible
+    } else {
+        Capability::ParkSyncOnly
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! End-to-end coverage of the connected-tier `SyncControl` glue
@@ -383,6 +495,20 @@ mod tests {
         }
     }
 
+    /// The election capability self-gate (S4): a GPU maps to `Eligible` (claims +
+    /// processes); no GPU maps to `ParkSyncOnly` (never claims). Not network-gated.
+    #[test]
+    fn capability_maps_gpu_presence() {
+        assert!(matches!(
+            super::capability_from_gpu(true),
+            Capability::Eligible
+        ));
+        assert!(matches!(
+            super::capability_from_gpu(false),
+            Capability::ParkSyncOnly
+        ));
+    }
+
     /// A handle to a built `ConnectedSync` plus its event receiver and the temp
     /// dirs that must outlive it (dropping a `TempDir` deletes its contents).
     struct Device {
@@ -438,6 +564,10 @@ mod tests {
             event_tx,
             app_data.path().to_path_buf(),
             meetings.path().to_path_buf(),
+            // No election deps in the relay E2E test — it exercises the SyncControl
+            // surface, not the producer-gate loop (which the crates/election tests
+            // cover).
+            None,
         );
 
         let deadline = tokio::time::Instant::now() + BIND_TIMEOUT;

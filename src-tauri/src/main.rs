@@ -973,6 +973,13 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 ipc_event_tx.clone(),
                 app_data_dir.clone(),
                 notes_meetings_dir.clone(),
+                // Producer-gate S4: hand the election loop its collaborators so it
+                // can claim + reprocess PendingProcessing meetings once the engine
+                // binds. It self-gates on GPU capability (a CPU-only host parks).
+                Some(sync::ElectionDeps {
+                    orchestrator: orchestrator.clone(),
+                    index: index.clone(),
+                }),
             );
             #[cfg(not(feature = "connected"))]
             let sync_control: Arc<dyn ipc_bridge::SyncControl> = ipc_bridge::disabled_sync();

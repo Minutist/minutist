@@ -255,6 +255,47 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
         }
     }
 
+    // Producer-gate S2 — capture-only delegation. When this device delegates
+    // processing (a GPU-less / capture-only desktop), OFFER the meeting for an
+    // eligible host to process rather than running the pipeline locally: mark it
+    // `PendingProcessing` synchronously (before returning, so the next discovery
+    // exchange advertises the offer) and skip the local post-stop passes. Default
+    // OFF, gated by the `MINUTIST_DELEGATE_PROCESSING` env knob (a user-facing
+    // Settings toggle + UI is the productisation follow-up). Only meaningful
+    // alongside an eligible host running the election loop (S4) — on a lone device
+    // the meeting simply waits as `PendingProcessing` until a host appears; the
+    // audio is safely on disk regardless.
+    if should_delegate_processing() {
+        match persistence::meeting_ops::apply_processing_lifecycle(
+            &state.meetings_dir,
+            meta.uuid,
+            minutist_common::ProcessingLifecycle::PendingProcessing,
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    target: "ipc-bridge",
+                    meeting_id = %meta.uuid.0,
+                    "capture-only: offered the meeting for host processing (PendingProcessing); skipping local passes"
+                );
+                return Ok(meta);
+            }
+            // The mark failed, so the meeting is still `Local` — a state no election
+            // host will ever claim (`election::claimable` is false for `Local`).
+            // Returning here would strand it with no transcript repair / diarize /
+            // summary and no automatic recovery, so fall THROUGH to the local
+            // post-stop passes: a failed delegation degrades to processing here,
+            // exactly as if delegation were off.
+            Err(e) => tracing::warn!(
+                target: "ipc-bridge",
+                meeting_id = %meta.uuid.0,
+                error = %e,
+                "delegation mark failed; falling back to local post-stop passes"
+            ),
+        }
+    }
+
     // Decoupled background post-processing: the meeting is already indexed and
     // visible, so any heavy passes run OFF the stop path (a slow/hung pass can
     // never wedge stop or hide the meeting). Up to two passes run, in order, in
@@ -420,6 +461,27 @@ fn post_stop_passes(
         passes.push(PostStopPass::Summarise);
     }
     passes
+}
+
+/// Whether this device delegates processing to an eligible host (producer-gate S2)
+/// instead of running the pipeline locally, from the `MINUTIST_DELEGATE_PROCESSING`
+/// env knob. Default OFF. Read per `stop_recording` call (not cached at startup) so
+/// an operator can toggle delegation without a restart — deliberately asymmetric
+/// with S4's GPU `Capability`, which is probed once at sync-bind. (A user-facing
+/// Settings toggle + UI is the productisation follow-up; the env knob is the v1
+/// mechanism.)
+fn should_delegate_processing() -> bool {
+    is_delegate_value(std::env::var("MINUTIST_DELEGATE_PROCESSING").ok().as_deref())
+}
+
+/// Pure truthiness for the delegate knob — separated from the env read so the
+/// gating is unit-testable without mutating the process environment. Trimmed and
+/// case-insensitive; accepts `1` / `true` / `yes` / `on`.
+fn is_delegate_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Run the planned post-stop `passes` in order, invoking `run_pass` for each.
@@ -4205,6 +4267,24 @@ mod tests {
             !post_stop_passes(true, true, false).contains(&PostStopPass::Summarise),
             "auto-summarise off must omit the summarise pass"
         );
+    }
+
+    /// Producer-gate S2 — the delegate knob is truthy only for the documented
+    /// affirmative spellings; anything else (including a missing var) stays local.
+    #[test]
+    fn delegate_value_parses_truthy() {
+        assert!(is_delegate_value(Some("1")));
+        assert!(is_delegate_value(Some("true")));
+        assert!(is_delegate_value(Some("yes")));
+        assert!(is_delegate_value(Some("on")));
+        // Case-insensitive and trimmed.
+        assert!(is_delegate_value(Some("TRUE")));
+        assert!(is_delegate_value(Some("On")));
+        assert!(is_delegate_value(Some("  true  ")));
+        assert!(!is_delegate_value(Some("0")));
+        assert!(!is_delegate_value(Some("false")));
+        assert!(!is_delegate_value(Some("")));
+        assert!(!is_delegate_value(None));
     }
 
     /// An empty plan invokes `run_pass` zero times (no background work).

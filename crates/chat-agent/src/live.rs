@@ -138,6 +138,60 @@ pub trait LiveSessionBackend {
 }
 
 // ---------------------------------------------------------------------------
+// ConversationalTurn — stub-testable keep-alive turn trait (U2)
+// ---------------------------------------------------------------------------
+
+/// A stub-testable seam for the U2 keep-alive conversational turn.
+///
+/// The real backend ([`LlamaLiveBackend`]) uses a held [`ChatTemplateResult`]
+/// (rendered once via [`Self::init_tool_machinery`]) and delegates each turn to
+/// [`LlamaLiveBackend::append_turn`]. A test stub ([`StubLiveBackend`]) can
+/// implement this trait without an FFI model by fabricating [`RawTurn`]s from
+/// a queue (including optional tool calls), so the IPC tool-dispatch loop is
+/// unit-testable without a loaded GGUF.
+///
+/// The `init_tool_machinery` method has a no-op default implementation so stub
+/// backends only need to override `converse`.
+pub trait ConversationalTurn {
+    /// Render the tool grammar and oaicompat parser once for the session.
+    ///
+    /// Call at worker start (after `seed_prefix`) with the offered tool set.
+    /// Pass `None` for v1 (retrieval is auto-injected; the tool-dispatch loop
+    /// is built but dormant with no tools offered).
+    ///
+    /// The default implementation is a no-op — stubs that do not need real
+    /// tool machinery may leave it unoverridden.
+    fn init_tool_machinery(&mut self, _tools_json: Option<&str>) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Append one conversational turn to the held context and decode the reply.
+    ///
+    /// Both human messages and transcript windows are `"user"` role to the
+    /// model. The caller frames the content with any retrieval block and
+    /// turn-type instructions BEFORE calling `converse`.
+    ///
+    /// - `role` — the OpenAI role string (`"user"` or `"tool"`).
+    /// - `content` — the full text of this turn's input.
+    /// - `cfg` — sampler knobs for this decode pass.
+    /// - `cancel` — checked between tokens; a raised flag returns a
+    ///   [`RawTurn`] with `cancelled: true` and the partial text.
+    /// - `token_cb` — called per user-visible content piece (tool-call JSON is
+    ///   suppressed by the oaicompat streaming parser and never forwarded).
+    ///
+    /// Returns `Err` if `init_tool_machinery` has not been called yet, or if
+    /// the underlying decode fails.
+    fn converse(
+        &mut self,
+        role: &str,
+        content: &str,
+        cfg: &SamplerConfig,
+        cancel: &CancelFlag,
+        token_cb: &mut dyn FnMut(&str),
+    ) -> Result<RawTurn, Error>;
+}
+
+// ---------------------------------------------------------------------------
 // LiveSession driver
 // ---------------------------------------------------------------------------
 
@@ -240,6 +294,86 @@ impl<B: LiveSessionBackend> LiveSession<B> {
     ) -> AppResult<String> {
         self.refresh_typed(tail_text, cfg, cancel, token_cb)
             .map_err(Into::into)
+    }
+}
+
+impl<B: LiveSessionBackend + ConversationalTurn> LiveSession<B> {
+    /// Render the tool machinery for the session. Delegates to
+    /// [`ConversationalTurn::init_tool_machinery`] on the backend.
+    ///
+    /// Call once after [`Self::seed_prefix`] succeeds, before any
+    /// [`Self::converse`] calls.
+    pub fn init_tool_machinery(&mut self, tools_json: Option<&str>) -> Result<(), Error> {
+        self.backend.init_tool_machinery(tools_json)
+    }
+
+    /// Append a conversational turn to the held context and decode the reply,
+    /// returning the typed [`Error`] so callers can distinguish
+    /// [`Error::ContextOverflow`] from [`Error::MalformedOutput`] /
+    /// [`Error::Template`] without relying on the lossy `AppError` boundary.
+    ///
+    /// Requires the prefix to have been seeded (via [`Self::seed_prefix`] or
+    /// [`Self::seed_prefix_typed`]); returns [`Error::Inference`] otherwise —
+    /// mirrors the guard on [`Self::refresh_typed`].
+    ///
+    /// On success returns the full [`RawTurn`] (text + any tool calls +
+    /// `cancelled` flag).
+    pub fn converse_typed(
+        &mut self,
+        role: &str,
+        content: &str,
+        cfg: &SamplerConfig,
+        cancel: &CancelFlag,
+        token_cb: &mut dyn FnMut(&str),
+    ) -> Result<RawTurn, Error> {
+        if !self.prefix_seeded {
+            return Err(Error::Inference(
+                "live session converse called before seed_prefix".to_string(),
+            ));
+        }
+        self.backend.converse(role, content, cfg, cancel, token_cb)
+    }
+
+    /// Append a conversational turn to the held context and decode the reply.
+    ///
+    /// Requires the prefix to have been seeded (via [`Self::seed_prefix`] or
+    /// [`Self::seed_prefix_typed`]); returns [`Error::Inference`] otherwise —
+    /// mirrors the guard on [`Self::refresh_typed`].
+    ///
+    /// On success returns the full [`RawTurn`] (text + any tool calls +
+    /// `cancelled` flag). Converts to [`AppResult`] for callers that do not
+    /// need to distinguish overflow from other failures. For callers that do,
+    /// use [`Self::converse_typed`] instead.
+    pub fn converse(
+        &mut self,
+        role: &str,
+        content: &str,
+        cfg: &SamplerConfig,
+        cancel: &CancelFlag,
+        token_cb: &mut dyn FnMut(&str),
+    ) -> AppResult<RawTurn> {
+        self.converse_typed(role, content, cfg, cancel, token_cb)
+            .map_err(Into::into)
+    }
+}
+
+/// Passthrough accessors from [`LiveSession`] to the [`LlamaLiveBackend`] state
+/// queries. These are used by the IPC worker for capacity checks and framing.
+impl<'m> LiveSession<LlamaLiveBackend<'m>> {
+    /// Number of tokens currently resident in the held KV cache.
+    pub fn n_past(&self) -> i32 {
+        self.backend.n_past()
+    }
+
+    /// Remaining context capacity in tokens, reserving `cfg_max_tokens` for the
+    /// next generation pass.
+    pub fn remaining_capacity(&self, cfg_max_tokens: usize) -> usize {
+        self.backend.remaining_capacity(cfg_max_tokens)
+    }
+
+    /// Turn framing markers derived from this model's vocabulary.
+    pub fn turn_markers(&self) -> &TurnMarkers {
+        self.backend.turn_markers()
     }
 }
 
@@ -370,6 +504,14 @@ pub struct LlamaLiveBackend<'m> {
     /// Empty until the first successful `prefill_prefix`; replaced on any
     /// subsequent call.
     prefix_tokens: Vec<llama_cpp_2::token::LlamaToken>,
+    /// Once-rendered tool grammar + oaicompat parser for the U2 keep-alive loop.
+    ///
+    /// Set by `init_tool_machinery` at session start and held for the session.
+    /// Each `converse` call takes this out of the `Option`, passes a reference
+    /// to `append_turn`, then restores it — avoiding a second `&mut self`
+    /// conflict. `None` until `init_tool_machinery` is called; `converse` errors
+    /// immediately if it remains absent.
+    rendered: Option<llama_cpp_2::model::ChatTemplateResult>,
     /// Test-only flag: when `true`, `refresh` uses path A (checkpoint restore)
     /// regardless of the `USE_KV_CHECKPOINT` compile-time constant. This lets
     /// integration tests exercise path A without promoting the constant.
@@ -467,6 +609,7 @@ impl<'m> LlamaLiveBackend<'m> {
             prefix_hash: 0,
             snapshot: None,
             prefix_tokens: Vec::new(),
+            rendered: None,
             #[cfg(test)]
             force_kv_checkpoint: false,
         })
@@ -1261,6 +1404,62 @@ impl<'m> LlamaLiveBackend<'m> {
 }
 
 // ---------------------------------------------------------------------------
+// ConversationalTurn impl for LlamaLiveBackend (U2 keep-alive loop)
+// ---------------------------------------------------------------------------
+
+impl<'m> ConversationalTurn for LlamaLiveBackend<'m> {
+    /// Render the tool grammar + oaicompat parser once and hold it for the
+    /// session. Pass `None` for v1 (retrieval is auto-injected; no tools
+    /// offered yet). A minimal well-formed messages array is used to satisfy
+    /// the renderer; only the grammar/parser fields from the result are kept.
+    fn init_tool_machinery(&mut self, tools_json: Option<&str>) -> Result<(), Error> {
+        // A minimal ONE-element user message is required: Gemma's chat template
+        // errors (ffi error -3) on an empty message array. Only the
+        // grammar/parser fields of the result are kept — the message content is
+        // irrelevant and discarded.
+        let result = crate::llama::render_tool_machinery_for_model(
+            self.model,
+            r#"[{"role":"user","content":""}]"#,
+            tools_json,
+        )?;
+        self.rendered = Some(result);
+        tracing::debug!(
+            target: "chat-agent",
+            has_tools = tools_json.is_some(),
+            "LlamaLiveBackend: tool machinery rendered for session"
+        );
+        Ok(())
+    }
+
+    /// Append one conversational turn to the held context.
+    ///
+    /// Delegates to [`LlamaLiveBackend::append_turn`] using the
+    /// once-rendered [`ChatTemplateResult`] held in `self.rendered`.
+    ///
+    /// Borrow workaround: `append_turn` takes `&mut self` AND a
+    /// `&ChatTemplateResult`. Both borrows of `self` cannot coexist, so the
+    /// result is moved out of `self.rendered` with `take()`, passed by
+    /// reference, then restored before returning — on both the `Ok` and `Err`
+    /// paths.
+    fn converse(
+        &mut self,
+        role: &str,
+        content: &str,
+        cfg: &SamplerConfig,
+        cancel: &CancelFlag,
+        token_cb: &mut dyn FnMut(&str),
+    ) -> Result<RawTurn, Error> {
+        let rendered = self.rendered.take().ok_or_else(|| {
+            Error::Inference("converse called before init_tool_machinery".to_string())
+        })?;
+        let result = self.append_turn(role, content, &rendered, cfg, cancel, token_cb);
+        // Restore on both Ok and Err paths so subsequent turns can proceed.
+        self.rendered = Some(rendered);
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for append_turn (oaicompat streaming / final parse)
 // ---------------------------------------------------------------------------
 
@@ -1344,9 +1543,10 @@ mod tests {
     // Stub backend for unit tests (no model, no FFI)
     // -----------------------------------------------------------------------
 
-    /// A scriptable stub that records every `prefill_prefix` and `refresh` call
-    /// so the `LiveSession` discipline (prefix exactly once, only-tail-per-
-    /// refresh) can be asserted without a model.
+    /// A scriptable stub that records every `prefill_prefix`, `refresh`, and
+    /// `converse` call so the `LiveSession` discipline (prefix exactly once,
+    /// only-tail-per-refresh) can be asserted without a model, and so the IPC
+    /// tool-dispatch loop can be unit-tested with fabricated tool calls.
     ///
     /// Tracks a fake `n_past` (one byte = one token) and a configurable
     /// `n_ctx` capacity so capacity-overflow tests can drive the stub to the
@@ -1354,10 +1554,15 @@ mod tests {
     struct StubLiveBackend {
         /// Responses to return for successive `refresh` calls (popped in order).
         refresh_results: Vec<RawTurn>,
+        /// Responses to return for successive `converse` calls (popped in order).
+        /// Supports fabricated `tool_calls` so the tool-dispatch loop is testable.
+        converse_results: Vec<RawTurn>,
         /// All `prefix_text` values passed to `prefill_prefix`.
         prefill_calls: Arc<Mutex<Vec<String>>>,
         /// All `tail_text` values passed to `refresh`.
         refresh_calls: Arc<Mutex<Vec<String>>>,
+        /// All `(role, content)` pairs passed to `converse`.
+        converse_calls: Arc<Mutex<Vec<(String, String)>>>,
         /// Fake token counter (one byte = one token).
         n_past: usize,
         /// Length of the pinned prefix, recorded at `prefill_prefix`. Each
@@ -1366,22 +1571,32 @@ mod tests {
         prefix_len: usize,
         /// Simulated context window size for overflow tests. `None` = unlimited.
         n_ctx: Option<usize>,
+        /// Whether `init_tool_machinery` has been called.
+        tool_machinery_initialised: bool,
     }
 
     impl StubLiveBackend {
         fn new(refresh_results: Vec<RawTurn>) -> Self {
             Self {
                 refresh_results,
+                converse_results: Vec::new(),
                 prefill_calls: Arc::new(Mutex::new(Vec::new())),
                 refresh_calls: Arc::new(Mutex::new(Vec::new())),
+                converse_calls: Arc::new(Mutex::new(Vec::new())),
                 n_past: 0,
                 prefix_len: 0,
                 n_ctx: None,
+                tool_machinery_initialised: false,
             }
         }
 
         fn with_n_ctx(mut self, n_ctx: usize) -> Self {
             self.n_ctx = Some(n_ctx);
+            self
+        }
+
+        fn with_converse_results(mut self, results: Vec<RawTurn>) -> Self {
+            self.converse_results = results;
             self
         }
 
@@ -1391,6 +1606,10 @@ mod tests {
 
         fn refresh_tails(&self) -> Vec<String> {
             self.refresh_calls.lock().unwrap().clone()
+        }
+
+        fn converse_call_roles_contents(&self) -> Vec<(String, String)> {
+            self.converse_calls.lock().unwrap().clone()
         }
 
         fn n_past(&self) -> usize {
@@ -1474,6 +1693,50 @@ mod tests {
             }
             // Confirm n_past was not advanced by generation.
             debug_assert_eq!(self.n_past, n_past_after_tail);
+            Ok(raw)
+        }
+    }
+
+    impl ConversationalTurn for StubLiveBackend {
+        fn init_tool_machinery(&mut self, _tools_json: Option<&str>) -> Result<(), Error> {
+            self.tool_machinery_initialised = true;
+            Ok(())
+        }
+
+        /// Fabricate a [`RawTurn`] from the `converse_results` queue.
+        ///
+        /// Records the `(role, content)` pair, streams content pieces through
+        /// `token_cb` (space-split, mirroring the refresh stub), and advances
+        /// `n_past` by `content.len()` (one byte = one token). Supports
+        /// fabricated `tool_calls` so the IPC tool-dispatch loop can be
+        /// unit-tested without a model.
+        fn converse(
+            &mut self,
+            role: &str,
+            content: &str,
+            _cfg: &SamplerConfig,
+            cancel: &CancelFlag,
+            token_cb: &mut dyn FnMut(&str),
+        ) -> Result<RawTurn, Error> {
+            self.converse_calls
+                .lock()
+                .unwrap()
+                .push((role.to_string(), content.to_string()));
+
+            // Advance n_past monotonically (keep-alive: context grows per turn).
+            self.n_past += content.len();
+
+            let raw = self.converse_results.pop().unwrap_or_default();
+            if cancel.is_cancelled() {
+                return Ok(RawTurn {
+                    text: raw.text,
+                    tool_calls: Vec::new(),
+                    cancelled: true,
+                });
+            }
+            for word in raw.text.split_inclusive(' ') {
+                token_cb(word);
+            }
             Ok(raw)
         }
     }
@@ -1947,6 +2210,121 @@ mod tests {
         );
         // The prefix was still prefilled exactly once.
         assert_eq!(session.backend.prefill_call_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConversationalTurn (U2) — stub-driven unit tests (no model)
+    // -----------------------------------------------------------------------
+
+    /// `LiveSession::converse` must error before the prefix is seeded.
+    #[test]
+    fn converse_before_seed_prefix_returns_error() {
+        let stub = StubLiveBackend::new(vec![]);
+        let mut session = LiveSession::new(stub);
+
+        let err = session
+            .converse(
+                "user",
+                "hello",
+                &SamplerConfig::deterministic(),
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(err, minutist_common::AppError::Inference { .. }),
+            "converse before seed_prefix must be Inference error, got {err:?}"
+        );
+    }
+
+    /// `LiveSession::converse` succeeds after seed and returns the fabricated turn.
+    #[test]
+    fn converse_after_seed_prefix_succeeds() {
+        let expected = RawTurn {
+            text: "I understand.".into(),
+            tool_calls: Vec::new(),
+            cancelled: false,
+        };
+        let stub = StubLiveBackend::new(vec![])
+            .with_converse_results(vec![expected.clone()]);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("prefix", &CancelFlag::new()).unwrap();
+        session.init_tool_machinery(None).unwrap();
+
+        let mut streamed = String::new();
+        let raw = session
+            .converse(
+                "user",
+                "hello",
+                &SamplerConfig::deterministic(),
+                &CancelFlag::new(),
+                &mut |piece| streamed.push_str(piece),
+            )
+            .unwrap();
+
+        assert_eq!(raw.text, "I understand.");
+        assert!(raw.tool_calls.is_empty());
+        assert!(!raw.cancelled);
+        assert_eq!(streamed, "I understand.", "content streams through callback");
+    }
+
+    /// A fabricated tool call round-trips through `converse` so the IPC
+    /// tool-dispatch loop is testable without a model.
+    #[test]
+    fn converse_fabricated_tool_call_round_trips() {
+        let tool_turn = RawTurn {
+            text: String::new(),
+            tool_calls: vec![crate::types::ToolCall {
+                id: "call_0".into(),
+                name: "get_transcript".into(),
+                arguments_json: r#"{"meeting_id":"m1"}"#.into(),
+            }],
+            cancelled: false,
+        };
+        let stub = StubLiveBackend::new(vec![])
+            .with_converse_results(vec![tool_turn]);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("sys", &CancelFlag::new()).unwrap();
+        session.init_tool_machinery(None).unwrap();
+
+        let raw = session
+            .converse(
+                "user",
+                "What was said?",
+                &SamplerConfig::deterministic(),
+                &CancelFlag::new(),
+                &mut |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(raw.tool_calls.len(), 1);
+        assert_eq!(raw.tool_calls[0].name, "get_transcript");
+        assert_eq!(raw.tool_calls[0].arguments_json, r#"{"meeting_id":"m1"}"#);
+        assert!(!raw.cancelled);
+    }
+
+    /// `init_tool_machinery` records the call and `converse` records (role, content).
+    #[test]
+    fn converse_records_role_and_content() {
+        let stub = StubLiveBackend::new(vec![])
+            .with_converse_results(vec![RawTurn::default(), RawTurn::default()]);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("sys", &CancelFlag::new()).unwrap();
+        session.init_tool_machinery(None).unwrap();
+        assert!(session.backend.tool_machinery_initialised);
+
+        session
+            .converse("user", "hello", &SamplerConfig::deterministic(), &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+        session
+            .converse("tool", r#"{"result":"ok"}"#, &SamplerConfig::deterministic(), &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+
+        let calls = session.backend.converse_call_roles_contents();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], ("user".to_string(), "hello".to_string()));
+        assert_eq!(calls[1], ("tool".to_string(), r#"{"result":"ok"}"#.to_string()));
     }
 
     // -----------------------------------------------------------------------

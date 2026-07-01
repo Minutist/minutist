@@ -1373,6 +1373,22 @@ pub enum AppEvent {
         /// A concise human-readable description of what went wrong.
         message: String,
     },
+    /// The live co-pilot produced a visible conversational turn for an active
+    /// meeting. Emitted on every non-suppressed `WorkerResult::Message` from the
+    /// merged-input keep-alive loop (U2 — transcript NOOP → suppressed, never
+    /// emitted; user-chat turns always emit). `role` distinguishes the author:
+    /// `Assistant` for model replies, `Digest` for auto-injected transcript
+    /// turns, `User` for user-typed messages echoed back. `turn_id` is the
+    /// per-session monotonic counter carried on the matching persisted
+    /// [`ChatMessage`] so the webview can correlate streamed events with stored
+    /// turns. The digest pane (superseded in U4) should not be updated from this
+    /// event — route it to the unified co-pilot chat view instead.
+    LiveCopilotMessage {
+        meeting_id: MeetingId,
+        turn_id: u64,
+        role: ChatRole,
+        content: String,
+    },
 
     // --- MCP server (Phase 10) -------------------------------------------
     /// The in-process MCP server bound its loopback Streamable HTTP listener.
@@ -2980,6 +2996,50 @@ mod tests {
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"kind\":\"live_digest_error\""));
         assert!(json.contains("context overflow"));
+    }
+
+    #[test]
+    fn app_event_live_copilot_message_round_trips() {
+        // Confirm the tag and all fields serialise and deserialise correctly.
+        let mid = MeetingId::new();
+        for (role, role_str) in [
+            (ChatRole::Assistant, "assistant"),
+            (ChatRole::User, "user"),
+            (ChatRole::Digest, "digest"),
+        ] {
+            let e = AppEvent::LiveCopilotMessage {
+                meeting_id: mid,
+                turn_id: 7,
+                role,
+                content: "test content".to_string(),
+            };
+            let json = serde_json::to_string(&e).unwrap();
+            assert!(
+                json.contains("\"kind\":\"live_copilot_message\""),
+                "missing kind tag for {role_str}: {json}"
+            );
+            assert!(
+                json.contains(&format!("\"role\":\"{role_str}\"")),
+                "wrong role for {role_str}: {json}"
+            );
+            assert!(json.contains("\"turn_id\":7"), "turn_id wrong: {json}");
+            // Round-trip.
+            let back: AppEvent = serde_json::from_str(&json).unwrap();
+            if let AppEvent::LiveCopilotMessage {
+                meeting_id,
+                turn_id,
+                role: back_role,
+                content,
+            } = back
+            {
+                assert_eq!(meeting_id, mid);
+                assert_eq!(turn_id, 7);
+                assert_eq!(back_role, role);
+                assert_eq!(content, "test content");
+            } else {
+                panic!("deserialised to wrong variant for {role_str}");
+            }
+        }
     }
 
     #[test]

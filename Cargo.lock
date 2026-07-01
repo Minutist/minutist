@@ -4007,6 +4007,7 @@ dependencies = [
  "chrono",
  "doc-convert",
  "embedder",
+ "llama-cpp-2",
  "minutist-common",
  "model-registry",
  "orchestrator",

@@ -44,6 +44,7 @@ uuid = { workspace = true }  # for MeetingIdType's From impl
 sys-locale = { workspace = true }
 
 [dev-dependencies]
+llama-cpp-2 = { workspace = true }
 specta-typescript = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { workspace = true }

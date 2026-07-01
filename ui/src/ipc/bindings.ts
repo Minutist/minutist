@@ -1231,6 +1231,19 @@ export type AppEvent =
  */
 { kind: "live_digest_error"; meeting_id: MeetingId; message: string } | 
 /**
+ * The live co-pilot produced a visible conversational turn for an active
+ * meeting. Emitted on every non-suppressed `WorkerResult::Message` from the
+ * merged-input keep-alive loop (U2 — transcript NOOP → suppressed, never
+ * emitted; user-chat turns always emit). `role` distinguishes the author:
+ * `Assistant` for model replies, `Digest` for auto-injected transcript
+ * turns, `User` for user-typed messages echoed back. `turn_id` is the
+ * per-session monotonic counter carried on the matching persisted
+ * [`ChatMessage`] so the webview can correlate streamed events with stored
+ * turns. The digest pane (superseded in U4) should not be updated from this
+ * event — route it to the unified co-pilot chat view instead.
+ */
+{ kind: "live_copilot_message"; meeting_id: MeetingId; turn_id: number; role: ChatRole; content: string } | 
+/**
  * The in-process MCP server bound its loopback Streamable HTTP listener.
  * `app-main` emits this after `mcp_server::serve` returns the bound addr so
  * the Settings → MCP pane can show the live endpoint URL. The bearer token

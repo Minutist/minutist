@@ -852,16 +852,28 @@ categories. Cross-cutting rules:
     session on the same stack frame (reverse-declaration drop order guarantees
     the Arc outlives the borrow). The test-only stub `WorkerBackend`
     (`#[cfg(test)]`) exercises the driver protocol without a model.
-  - Two bounded `tokio::sync::mpsc` channels (depth 1 each) between the driver
-    and worker, enforcing single-in-flight without a separate mutex.
-  - The small prefix (system prompt + digest categories) is built on the worker
-    thread (`build_prefix`) at session start, then seeded via `seed_prefix_typed`
-    BEFORE the request loop. The worker also opens the per-meeting `RagStore`,
-    background-loads the held embedder (the load + any first-use download stays off
-    the digest critical path), and on each refresh embeds the recent window, runs
-    the dense + lexical legs fused by `rrf_fuse`, and injects the top-`k`
-    (tier-scaled) chunks into the tail. After emitting each digest it incrementally
-    indexes newly-sealed transcript turns into the `RagStore`
+  - **Three bounded `tokio::sync::mpsc` channels** (depth 1 each): a HIGH-priority
+    user-chat lane (`user_req_tx/rx`), a LOW-priority transcript lane
+    (`transcript_req_tx/rx`), and a raw `String` lane (`user_msg_tx/rx`) through
+    which the `LiveCopilotHandle` in the registry delivers user-typed messages to
+    the driver. The driver wraps each raw `String` into a `CopilotTurnRequest`
+    before forwarding on the HIGH lane. The worker's `tokio::select! { biased; }`
+    loop drains the HIGH user lane first, then the LOW transcript lane, so a
+    user message always preempts a pending transcript refresh.
+  - **Registry (`Arc<Mutex<HashMap<MeetingId, LiveCopilotHandle>>>`).**
+    `spawn_live_agent` accepts this registry as a fourth argument. It inserts a
+    `LiveCopilotHandle { user_tx }` keyed by `MeetingId` before spawning, and
+    removes it when the driver exits. The registry is stored on `IpcState`
+    (`live_copilot_handles`) and is the routing point for user messages directed
+    at the live session. The `send_chat_message` chat-command redirect (checking
+    the registry and bypassing the fresh-context path) is DEFERRED.
+  - The system prompt is built on the worker thread (`build_prefix`) at session
+    start and seeded via `seed_prefix_typed` BEFORE the request loop. The worker
+    also opens the per-meeting `RagStore`, background-loads the held embedder (the
+    load + any first-use download stays off the critical path), and on each refresh
+    embeds the recent window, runs the dense + lexical legs fused by `rrf_fuse`,
+    and injects the top-`k` (tier-scaled) chunks into the tail. After emitting each
+    digest it incrementally indexes newly-sealed transcript turns into the `RagStore`
     (`rag_index::index_transcript_incremental`, watermark-based, best-effort).
   - A `startup_cancel: CancelFlag` is created in `spawn_live_agent`, cloned for
     the driver task, and passed to the worker. The driver raises it on any
@@ -874,36 +886,30 @@ categories. Cross-cutting rules:
   `spawn_live_agent` on `Recording`; it raises the returned `watch::Sender`
   on `Idle` / `Stopping` / `Finalising` to tear down the driver.
 
-  *Error handling policy.* Both `RefreshResult::Err` (decode error, M1/M2
-  triggered) and `RefreshResult::CapacityExhausted` are terminal: the driver
-  sets a `terminal` flag on receipt, emits one `LiveDigestError` event, and
-  dispatches no further refreshes. The worker also stops after a terminal
-  result. A single error path covers both cases, consistent with the teardown
-  on decode failure (M3).
+  *Error handling policy.* Both `WorkerResult::Err` (decode error) and
+  `WorkerResult::CapacityExhausted` are terminal: the driver sets a `terminal`
+  flag on receipt, emits one `LiveDigestError` event, and dispatches no further
+  turns. The worker also stops after a terminal result.
 
-  *Context overflow policy (#0022).* The prune-to-prefix bounded context means the
-  held context cannot grow without bound, so `Error::ContextOverflow` from
-  `LlamaLiveBackend::refresh` is now a rare backstop (a single tail larger than the
-  remaining window) rather than the expected long-meeting outcome. On it the driver
-  emits ONE `LiveDigestError` event and sets a terminal `capacity_exhausted` flag
-  that stops all further refresh dispatches for the session. Re-seeding mid-recording
-  is NOT attempted (it would re-prefill from scratch, starving ASR). The prior digest
-  items are preserved in the event store; recovery is the next recording session.
-  The driver calls `LiveSession::seed_prefix_typed` and `LiveSession::refresh_typed`
-  (returning `Result<_, chat_agent::Error>`) rather than the `AppResult` wrappers,
-  so `ContextOverflow` can be matched structurally. The `From<Error> for AppError`
-  impl maps `ContextOverflow` to `AppError::InvalidInput`, erasing the variant —
-  string-matching over `AppError::Display` would be fragile and is not used.
+  *Context overflow policy.* The grow-in-place context can reach `n_ctx` on a
+  long meeting. `Error::ContextOverflow` from `LlamaLiveBackend::append_turn`
+  (surfaced by `LiveSession::converse_typed`) maps to
+  `WorkerResult::CapacityExhausted` and is terminal. The driver emits ONE
+  `LiveDigestError` and sets a `terminal` flag that stops all further turn
+  dispatches for the session. Re-seeding mid-recording is NOT attempted (it
+  would re-prefill from scratch, starving ASR). `classify_converse_error`
+  classifies on the TYPED `chat_agent::Error` (not on `AppError::InvalidInput`,
+  which conflates `ContextOverflow`, `MalformedOutput`, and `Template`) so only
+  genuine overflow maps to `CapacityExhausted`; a transient parse glitch
+  (`MalformedOutput`) maps to `WorkerResult::Err` with an accurate label.
 
-  *KV retention policy (#0022).* The held context retains **only the pinned prefix**
-  (recorded as `prefix_len` at seed time). Each `refresh` prunes the KV back to
-  `prefix_len` via `clear_kv_cache_seq` FIRST — dropping the previous refresh's tail
-  AND its generated answer in one operation — then decodes this refresh's bounded
-  tail on top. Capacity therefore stays bounded by `prefix_len + tail + generation`,
-  not by meeting length, and a cancelled partial answer cannot poison the next
-  refresh. `clear_kv_cache_seq` returns `Result<bool, KvCacheConversionError>`; a
-  `false` or `Err` means the KV state is unrecoverable — the backend returns `Err`
-  and the driver tears down the session.
+  *KV growth policy.* The context GROWS across turns — no per-turn prune.
+  `LlamaLiveBackend::append_turn` advances `n_past` monotonically. The
+  `clear_kv_cache_seq` / snapshot-restore mechanism is used only by
+  `LiveSessionBackend::refresh` (the post-meeting path); it is NOT on the
+  live path. `clear_kv_cache_seq` returns `Result<bool, KvCacheConversionError>`
+  on the `refresh` path; an unrecoverable return means the backend returns `Err`
+  there.
 
   *Cancellability.* `prefill_prefix` and the tail-prefill loop in `refresh` both
   accept a `&CancelFlag` and check it between decoded chunks. A raised flag during
@@ -923,18 +929,19 @@ categories. Cross-cutting rules:
   min_seconds`, and `!in_flight`. The AND gate (not OR) prevents premature
   refreshes during sparse meetings with few utterances.
 
-- **Standing-list update discipline.** Each refresh prompt includes the prior
-  digest (JSON-serialised) so the model UPDATEs existing items (flips `resolved`,
-  adds new items) rather than regenerating from scratch. `parse_digest` carries
-  forward `resolved = true` from prior items matching by text (case-insensitive)
-  even if the model emits `resolved: false` for them (model forgetfulness guard).
-  For `open_asks` specifically, the driver accumulates items across refreshes:
-  prior unresolved asks not mentioned by the model are carried forward (the model
-  may omit them to save tokens), while items the model marks `resolved: true` are
-  promoted to resolved and retained. This implements the "tracker maintained across
-  refreshes" contract from SP-LIVE. Other categories (action_items, decisions,
-  attachment_answers, unresolved_references) apply the base standing-list rule
-  (resolved-flag-only carry-forward from matched items).
+- **Keep-alive append-turn model (U2).** The live cadence drives
+  `LiveSession::converse` (backed by `LlamaLiveBackend::append_turn`) for BOTH
+  transcript and user-chat turns — no prune-to-prefix on the live path.
+  The context GROWS across turns; `prefix_len` marks the seeded system prompt and
+  the KV is never pruned back to it during the session. The two turn kinds differ
+  only in framing and response policy: `TurnKind::Transcript` wraps the retrieved
+  context block + NOOP-sentinel instruction and is stored with `ChatRole::Digest`;
+  `TurnKind::UserChat` delivers the user's literal message and is stored with
+  `ChatRole::User`. Both are served by `process_request`, which persists the clean
+  (unframed) input text to the live `ChatSession` and passes the framed model
+  prompt to `converse_typed`. The `LiveSession::refresh_typed` / prune-to-prefix
+  path is **not used on the live path** and remains available only for the
+  post-meeting `LiveSessionBackend::refresh` contract.
 
 - **Small-prefix + retrieve-into-tail constraint (Phase D).** Attachment markdown
   is NOT pinned in the prefix — pinning a large set costs a one-time prefill (~40 s,
@@ -981,16 +988,18 @@ categories. Cross-cutting rules:
   memory savings the 36 GB test GPU does not need. Not applied to the live agent
   context. n_ctx = 32 768.
 
-- **Digest panel is PASSIVE.** The live agent never writes to the transcript,
-  notes, or metadata. It is a read/compute-only agent in v1. The digest panel
-  receives `AppEvent::LiveDigestUpdated` events and updates passively; it does NOT
-  interrupt the user or modify any meeting document.
+- **Co-pilot panel is PASSIVE.** The live agent never writes to the transcript,
+  notes, or metadata. It is a read/compute-only agent in v1. The co-pilot chat
+  panel receives `AppEvent::LiveCopilotMessage` events and renders them passively;
+  it does NOT interrupt the user or modify any meeting document.
 
-- **Events ride the existing bus.** `LiveDigestUpdated` and `LiveDigestError` ride
-  the existing `AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
-  registration — no new event registration. Both are lossy-broadcast-safe
-  (`LiveDigestUpdated` carries the full replacement digest; a lagged subscriber
-  recovers on the next refresh).
+- **Events ride the existing bus.** `LiveCopilotMessage` and `LiveDigestError`
+  ride the existing `AppEventPayload` newtype + the single
+  `collect_events![AppEventPayload]` registration — no second registration.
+  Both are lossy-broadcast-safe (`LiveCopilotMessage` carries the full turn
+  content; a lagged subscriber is notified on next arrival).
+  `LiveDigestUpdated` is **not emitted on the live path** (the digest-JSON
+  contract is retired for live sessions).
 
 ## MCP transport (Phase 10)
 

@@ -170,7 +170,7 @@ pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
 pub use inter_agent::spawn_inter_agent_driver;
 pub use lifecycle::spawn_lifecycle_subscriber;
-pub use live_agent::{spawn_live_agent, LiveAgentHandles};
+pub use live_agent::{spawn_live_agent, LiveAgentHandles, LiveCopilotHandle};
 /// Re-exports so `app-main` can name these types without direct deps on
 /// `persistence` and `summariser`; both already appear in the public API
 /// (`open_meeting_index` returns `Arc<MeetingIndex>`; `IpcState::summariser`
@@ -326,6 +326,26 @@ pub struct IpcState {
     ///
     /// No new dependency edge: `ipc-bridge` already depends on `persistence`.
     pub voiceprints: Arc<Option<persistence::VoiceprintStore>>,
+    /// Per-meeting live co-pilot handles (U2 B5).
+    ///
+    /// `spawn_live_agent` inserts a [`LiveCopilotHandle`] keyed by `MeetingId`
+    /// when a recording starts and removes it when the agent exits. The
+    /// `send_chat_message` command checks this registry to determine whether the
+    /// target meeting is currently live and, if so, should route the user message
+    /// to the live co-pilot rather than spinning up a fresh `LlamaTurnBackend`
+    /// context.
+    ///
+    /// DEFERRED: the `send_chat_message` redirect to the live co-pilot is the
+    /// remaining wiring step; the registry and the user lane are built and
+    /// functional. See `live_agent.rs` — "Registry and chat routing".
+    ///
+    /// A `std::sync::Mutex<HashMap>` (not async): every access is a brief
+    /// non-awaiting insert / lookup / remove, mirroring `chat_in_flight`.
+    pub live_copilot_handles: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<minutist_common::MeetingId, LiveCopilotHandle>,
+        >,
+    >,
 }
 
 /// The live MCP endpoint surfaced to the Settings → MCP pane via

@@ -54,6 +54,48 @@ use crate::error::Error;
 use crate::live::LlamaLiveBackend;
 use crate::types::{CancelFlag, SamplerConfig, ToolCall};
 
+/// Render the tool grammar + oaicompat parser for `model` without constructing
+/// a full [`LlamaTurnBackend`].
+///
+/// Returns a [`ChatTemplateResult`] whose `.grammar`, `.grammar_triggers`,
+/// `.grammar_lazy`, `.chat_format`, `streaming_state_oaicompat()`, and
+/// `parse_response_oaicompat()` depend only on `tools_json` and the model
+/// template — NOT on `messages_json`. Pass a minimal well-formed messages array
+/// (e.g. `"[]"`) for `messages_json`; its rendered `.prompt` is discarded.
+///
+/// Used by [`LlamaLiveBackend::init_tool_machinery`] to render once per session
+/// without holding a full backend reference.
+pub(crate) fn render_tool_machinery_for_model(
+    model: &LlamaModel,
+    messages_json: &str,
+    tools_json: Option<&str>,
+) -> Result<ChatTemplateResult, Error> {
+    let template = model
+        .chat_template(None::<&str>)
+        .map_err(|e| Error::Template(format!("read GGUF chat template: {e}")))?;
+
+    let params = OpenAIChatTemplateParams {
+        messages_json,
+        tools_json,
+        tool_choice: None,
+        json_schema: None,
+        grammar: None,
+        reasoning_format: None,
+        chat_template_kwargs: None,
+        add_generation_prompt: true,
+        use_jinja: true,
+        parallel_tool_calls: false,
+        enable_thinking: false,
+        add_bos: false,
+        add_eos: false,
+        parse_tool_calls: tools_json.is_some(),
+    };
+
+    model
+        .apply_chat_template_oaicompat(&template, &params)
+        .map_err(|e| Error::Template(format!("oaicompat render: {e}")))
+}
+
 /// Runtime knobs for the real turn backend. Mirrors the relevant
 /// `summariser::SummariserConfig` fields so the chat context is sized like the
 /// summary context.

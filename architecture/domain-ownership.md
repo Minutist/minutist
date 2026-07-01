@@ -123,6 +123,20 @@ restated. Adding any other edge requires updating
   delegates to `append_turn` via `last_message_role_content` extraction; the
   restore-per-turn model is replaced. No new crate or workspace dependency edge
   is added.
+  **U2 scheduler + registry (B2/B5 — `ipc-bridge`, systems-engineer).**
+  `spawn_live_agent` grows a fourth `registry` parameter
+  (`Arc<Mutex<HashMap<MeetingId, LiveCopilotHandle>>>`). The driver inserts a
+  `LiveCopilotHandle { user_tx }` on start and removes it on exit. The worker
+  now runs a two-lane biased select: HIGH-priority user-chat requests are always
+  drained before LOW-priority transcript requests, so a user message preempts a
+  pending cadence refresh. Three depth-1 channels replace the prior single
+  channel: `user_req`, `transcript_req`, and `user_msg` (raw Strings from the
+  handle). The registry is stored on `IpcState::live_copilot_handles`; the
+  `send_chat_message` redirect that checks it is DEFERRED. The `ConversationalTurn`
+  trait bound is added to `run_worker_loop`'s `B` parameter to allow both the
+  transcript-refresh (`LiveSession::refresh_typed`) and the append-turn
+  (`ConversationalTurn::append_turn`) paths from one loop. No new dependency
+  edge is added (the `ipc-bridge → chat-agent` edge pre-exists).
 - **Voiceprint identity types + maths (issue #0003 WU0 — one-way door).**
   `VoiceprintIdentityId` and `VoiceprintCentroidId` are UUID newtypes added to
   `common` by the architecture-owner. Adding them is a **one-way-door** per

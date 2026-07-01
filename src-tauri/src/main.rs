@@ -1006,6 +1006,19 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             #[cfg(not(feature = "connected"))]
             let sync_control: Arc<dyn ipc_bridge::SyncControl> = ipc_bridge::disabled_sync();
 
+            // Shared registry of active live-copilot handles, keyed by MeetingId.
+            // Populated by `spawn_live_agent` when a recording starts and cleared
+            // on driver exit. The registry is owned by `IpcState` and cloned into
+            // the live-agent watcher task below.
+            let live_copilot_handles: Arc<
+                std::sync::Mutex<
+                    std::collections::HashMap<
+                        minutist_common::MeetingId,
+                        ipc_bridge::LiveCopilotHandle,
+                    >,
+                >,
+            > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
             // Register the IPC state so command handlers can access it.
             app.manage(IpcState {
                 orchestrator: orchestrator.clone(),
@@ -1030,6 +1043,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 app_version: app_handle.package_info().version.to_string(),
                 platform: platform_string(),
                 voiceprints,
+                live_copilot_handles: Arc::clone(&live_copilot_handles),
             });
 
             // Log the GPU probe + the resolved default plan at startup so the
@@ -1266,6 +1280,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 let la_settings = settings_handle.clone();
                 let la_summariser = summariser_cell.clone();
                 let la_embedder = embedder_cell.clone();
+                let la_live_copilot_handles = Arc::clone(&live_copilot_handles);
                 tauri::async_runtime::spawn(async move {
                     let mut events = la_orchestrator.subscribe_events();
                     // Shutdown sender for the currently active session (if any).
@@ -1314,6 +1329,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                                             },
                                             meeting_id,
                                             shutdown_rx,
+                                            Arc::clone(&la_live_copilot_handles),
                                         );
                                         live_agent_shutdown = Some((shutdown_tx, meeting_id));
 

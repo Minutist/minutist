@@ -7,11 +7,25 @@
 //! approach would re-pay the prefill cost on every cadence tick, making live
 //! operation unusable.
 //!
+//! ## U2 keep-alive append-turn
+//!
+//! The interactive co-pilot path (U2) extends the same held context for a
+//! conversational loop — NOT the prune-to-prefix-per-turn model tried in A2.
+//! Tool machinery (grammar, streaming parser, chat format) is rendered ONCE by
+//! `LlamaTurnBackend::render_tool_machinery`; the resulting `ChatTemplateResult`
+//! is held for the session and passed by reference to each
+//! `LlamaLiveBackend::append_turn` call. Each turn appends ONLY its framing +
+//! content tokens on top of the growing KV; the generated reply is left in the
+//! KV (it becomes context for the next turn). BOS is emitted only in the initial
+//! prefix seed (`prefill_prefix`'s `AddBos::Never` together with the caller
+//! supplying `<bos>` in the prefix text — not re-emitted here).
+//!
 //! This crate is prefix-AGNOSTIC — it does the KV mechanics, never templating.
 //! The driver (`ipc-bridge::live_agent`) supplies the prefix text and the
-//! per-refresh tail already wrapped in chat-template markers. Under the current
-//! driver the prefix is the **open user turn** of a chat-template prompt
-//! (`<bos><start_of_turn>user\n{system + digest categories}`) — small and cheap;
+//! per-refresh tail already wrapped in chat-template markers (probed from the
+//! model vocabulary via `detect_turn_markers`). Under the current driver the
+//! prefix is the **open user turn** of a chat-template prompt
+//! (`<bos>{turn_open}user\n{system + digest categories}`) — small and cheap;
 //! attachment and earlier-transcript context is RETRIEVED into the per-refresh
 //! tail (RAG), not pinned in the prefix. Each refresh **prunes the KV back to the
 //! prefix** and decodes a fresh, BOUNDED tail on top — the retrieved context +
@@ -249,11 +263,79 @@ impl<B: LiveSessionBackend> LiveSession<B> {
 ///    therefore stays bounded at `prefix_len + tail + generation`.
 ///
 /// **`!Send`**: `LlamaContext` is `!Send`. The S2b driver owns the thread.
+/// Chat-turn framing markers for a specific model, derived by probing the
+/// model vocabulary at construction time.
+///
+/// Each string is guaranteed to tokenise to exactly one control token with
+/// `str_to_token(..., AddBos::Never)`, i.e. the model recognises it as a
+/// true turn boundary, not as plain BPE fragments.
+///
+/// Known variants:
+/// - Gemma 4: `<|turn>` / `<turn|>` (tokens 105 / 106).
+/// - Gemma 2/3: `<start_of_turn>` / `<end_of_turn>`.
+#[derive(Debug, Clone)]
+pub struct TurnMarkers {
+    /// String that opens a turn for a given role, e.g. `<|turn>` or `<start_of_turn>`.
+    pub turn_open: String,
+    /// String that closes a turn, e.g. `<turn|>` or `<end_of_turn>`.
+    pub turn_close: String,
+}
+
+/// Probe the model vocabulary to find the actual single-token turn markers.
+///
+/// Tests each candidate pair (open, close) in priority order. Returns the
+/// first pair where both strings tokenise (with `parse_special = true`) to
+/// exactly one token. Falls back to the Gemma 2/3 strings if no candidate
+/// produces single tokens — those strings may still work as multi-token
+/// BPE sequences on older models.
+pub fn detect_turn_markers(model: &llama_cpp_2::model::LlamaModel) -> TurnMarkers {
+    use llama_cpp_2::model::AddBos;
+
+    // Candidates in priority order: Gemma 4 first (single control tokens),
+    // then Gemma 2/3.
+    let candidates: &[(&str, &str)] = &[
+        ("<|turn>", "<turn|>"),
+        ("<start_of_turn>", "<end_of_turn>"),
+    ];
+
+    for &(open, close) in candidates {
+        let open_tokens = model.str_to_token(open, AddBos::Never).unwrap_or_default();
+        let close_tokens = model.str_to_token(close, AddBos::Never).unwrap_or_default();
+        // `turn_close` MUST tokenise to a single token that is the model's EOG
+        // token: `append_turn` prepends `turn_close` to close the prior model
+        // turn (the generation loop breaks on the EOG token WITHOUT decoding it,
+        // so the close marker is not KV-resident and must be re-supplied). If the
+        // chosen close were not the EOG the model actually emits, the framing and
+        // the KV would desync. Both supported families satisfy this (Gemma 4
+        // `<turn|>` and Gemma 2/3 `<end_of_turn>` are EOG); require it explicitly
+        // so a future model cannot pick a non-EOG close marker.
+        if open_tokens.len() == 1
+            && close_tokens.len() == 1
+            && model.is_eog_token(close_tokens[0])
+        {
+            return TurnMarkers {
+                turn_open: open.to_string(),
+                turn_close: close.to_string(),
+            };
+        }
+    }
+
+    // Fallback: Gemma 2/3 strings as plain text (no single-token match found).
+    TurnMarkers {
+        turn_open: "<start_of_turn>".to_string(),
+        turn_close: "<end_of_turn>".to_string(),
+    }
+}
+
 pub struct LlamaLiveBackend<'m> {
     model: &'m llama_cpp_2::model::LlamaModel,
     config: LlamaLiveConfig,
     ctx: llama_cpp_2::context::LlamaContext<'m>,
     n_past: i32,
+    /// Turn framing markers derived from the model vocabulary at construction.
+    /// Used by `append_turn` to build chat-template framing without hardcoding
+    /// model-specific control tokens.
+    markers: TurnMarkers,
     /// KV positions `0..prefix_len` hold the pinned prefix (the open user turn:
     /// system + digest-category instructions). Recorded by `prefill_prefix` and
     /// never re-decoded. Every `refresh` restores the KV checkpoint back to
@@ -280,6 +362,14 @@ pub struct LlamaLiveBackend<'m> {
     /// the active code path until the round-trip test (see
     /// `tests::kv_checkpoint_round_trip_smoke`) is confirmed green.
     snapshot: Option<Vec<u8>>,
+    /// The token sequence decoded into KV positions `0..prefix_len`.
+    ///
+    /// Stored by `prefill_prefix` so callers on the persistent path
+    /// (`run_on_persistent_ctx`) can verify that the leading tokens of a
+    /// freshly-rendered prompt match the KV-resident prefix before reusing it.
+    /// Empty until the first successful `prefill_prefix`; replaced on any
+    /// subsequent call.
+    prefix_tokens: Vec<llama_cpp_2::token::LlamaToken>,
     /// Test-only flag: when `true`, `refresh` uses path A (checkpoint restore)
     /// regardless of the `USE_KV_CHECKPOINT` compile-time constant. This lets
     /// integration tests exercise path A without promoting the constant.
@@ -359,14 +449,24 @@ impl<'m> LlamaLiveBackend<'m> {
             .new_context(backend, ctx_params)
             .map_err(|e| Error::Inference(format!("LlamaContext init: {e}")))?;
 
+        let markers = detect_turn_markers(model);
+        tracing::debug!(
+            target: "chat-agent",
+            turn_open = %markers.turn_open,
+            turn_close = %markers.turn_close,
+            "LlamaLiveBackend: detected turn markers from model vocab"
+        );
+
         Ok(Self {
             model,
             config,
             ctx,
             n_past: 0,
+            markers,
             prefix_len: 0,
             prefix_hash: 0,
             snapshot: None,
+            prefix_tokens: Vec::new(),
             #[cfg(test)]
             force_kv_checkpoint: false,
         })
@@ -485,6 +585,10 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
 
         let n_prefilled = tokens.len();
         self.n_past += n_prefilled as i32;
+        // Record the decoded token sequence so the persistent turn path
+        // (`run_on_persistent_ctx`) can verify prefix alignment before reusing the
+        // KV cache.
+        self.prefix_tokens = tokens;
         // The pinned prefix occupies KV positions 0..n_past. Record this length:
         // every refresh prunes back to it before appending its tail.
         self.prefix_len = self.n_past;
@@ -816,6 +920,15 @@ impl<'m> LlamaLiveBackend<'m> {
         self.n_past
     }
 
+    /// Turn framing markers derived from this model's vocabulary.
+    ///
+    /// Callers that build prefix/tail strings outside this crate (e.g.
+    /// `ipc-bridge::live_agent`) must use these markers — never hardcoded
+    /// Gemma-2/3 literals — so the framing matches what `append_turn` writes.
+    pub fn turn_markers(&self) -> &TurnMarkers {
+        &self.markers
+    }
+
     /// Remaining context capacity in tokens, reserving `cfg_max_tokens` for
     /// generation on the next refresh.
     ///
@@ -837,6 +950,384 @@ impl<'m> LlamaLiveBackend<'m> {
     pub fn snapshot_size(&self) -> Option<usize> {
         self.snapshot.as_ref().map(|b| b.len())
     }
+
+    // -----------------------------------------------------------------------
+    // U2 keep-alive append-turn
+    // -----------------------------------------------------------------------
+
+    /// Append one conversational turn to the live held context WITHOUT pruning
+    /// or restoring the KV cache. The context grows turn-by-turn; prior turns
+    /// remain KV-resident and attend all subsequent ones (multi-turn coherence).
+    ///
+    /// # Framing
+    ///
+    /// Each turn is framed using the model-detected turn markers from
+    /// `self.markers` (set at construction by `detect_turn_markers`). On Gemma 4
+    /// these are `<|turn>` / `<turn|>`; on Gemma 2/3 they are
+    /// `<start_of_turn>` / `<end_of_turn>`. Both tokenise to single control
+    /// tokens in their respective vocabularies.
+    ///
+    /// - If a prior model-generated turn exists in the KV (`n_past > prefix_len`):
+    ///   the generation loop breaks on EOG without writing the close marker, so
+    ///   this call prepends it before the new turn's opening marker.
+    /// - New turn framing (always): `{open}{role}\n{content}{close}\n{open}model\n`
+    ///
+    /// BOS is NOT emitted here. It is already present in the prefix seed text
+    /// (the caller supplied `<bos>` in `prefill_prefix`). Re-emitting BOS
+    /// mid-conversation would corrupt the positional encoding.
+    ///
+    /// # Tool machinery reuse
+    ///
+    /// `rendered` is a `ChatTemplateResult` produced ONCE by
+    /// `LlamaTurnBackend::render_tool_machinery` and held for the session.
+    /// Its `.grammar`, `.grammar_triggers`, `.grammar_lazy`, `.chat_format`,
+    /// `streaming_state_oaicompat()`, and `parse_response_oaicompat()` are all
+    /// derived from the tool definitions + model template — NOT from the message
+    /// history — so they are correctly reused across turns.
+    ///
+    /// # Context growth
+    ///
+    /// The generated reply tokens are left in the KV (positions
+    /// `n_past_after_framing .. n_past_after_generation`). The conversation
+    /// context grows monotonically. The caller is responsible for tracking total
+    /// token use (via `n_past()`) and stopping before `n_ctx` is exhausted.
+    ///
+    /// # Cancellation
+    ///
+    /// A raised `cancel` flag during framing prefill returns
+    /// `RawTurn { cancelled: true, text: "", … }` with the KV pruned back to the
+    /// pre-framing depth (`self.n_past` is unchanged). A raised flag during
+    /// generation returns a cancelled turn with the partial text and leaves the KV
+    /// at the last successfully decoded generation position.
+    pub fn append_turn(
+        &mut self,
+        role: &str,
+        content: &str,
+        rendered: &llama_cpp_2::model::ChatTemplateResult,
+        cfg: &crate::types::SamplerConfig,
+        cancel: &crate::types::CancelFlag,
+        token_cb: &mut dyn FnMut(&str),
+    ) -> Result<crate::backend::RawTurn, Error> {
+        use encoding_rs::UTF_8;
+        use llama_cpp_2::llama_batch::LlamaBatch;
+        use llama_cpp_2::model::AddBos;
+
+        if self.prefix_len <= 0 {
+            return Err(Error::Inference(
+                "append_turn called before the prefix was seeded".to_string(),
+            ));
+        }
+
+        // Build the framing string using the model-detected turn markers.
+        // When a prior model turn exists in the KV, prepend the close marker it
+        // left un-decoded (the EOG token breaks the generation loop before the
+        // close marker is written).
+        let open = &self.markers.turn_open;
+        let close = &self.markers.turn_close;
+        let framing = if self.n_past > self.prefix_len {
+            format!("{close}\n{open}{role}\n{content}{close}\n{open}model\n")
+        } else {
+            format!("{open}{role}\n{content}{close}\n{open}model\n")
+        };
+
+        // Tokenise the framing with AddBos::Never — BOS is already present in
+        // the KV from the prefix seed and must not be repeated.
+        let framing_tokens = self
+            .model
+            .str_to_token(&framing, AddBos::Never)
+            .map_err(|e| Error::Inference(format!("tokenize framing (append_turn): {e}")))?;
+
+        if framing_tokens.is_empty() {
+            return Err(Error::Inference(
+                "append_turn framing tokenised to zero tokens".to_string(),
+            ));
+        }
+
+        // Budget guard: framing + generation must fit the remaining context.
+        let n_ctx = self.config.n_ctx as usize;
+        let required = (self.n_past as usize)
+            .saturating_add(framing_tokens.len())
+            .saturating_add(cfg.max_tokens);
+        if required > n_ctx {
+            return Err(Error::ContextOverflow(format!(
+                "append_turn would exceed context: \
+                 n_past={}, framing={} tokens, max_tokens={} but n_ctx={}",
+                self.n_past,
+                framing_tokens.len(),
+                cfg.max_tokens,
+                n_ctx,
+            )));
+        }
+
+        // Chunked prefill of the framing. n_past advances only after a
+        // successful full decode so partial-framing tokens in the KV do not
+        // corrupt the position counter on a decode error.
+        let plan = summariser::plan_prefill(framing_tokens.len(), self.config.n_batch);
+        let mut batch = LlamaBatch::new(self.config.n_batch as usize, 1);
+        for chunk in &plan.chunks {
+            if cancel.is_cancelled() {
+                // Prune any partially-decoded framing back to the pre-framing
+                // depth so the KV remains coherent for future calls.  n_past was
+                // not yet advanced, so it still marks the correct boundary.
+                let _ = self
+                    .ctx
+                    .clear_kv_cache_seq(Some(0), Some(self.n_past as u32), None);
+                return Ok(crate::backend::RawTurn {
+                    text: String::new(),
+                    tool_calls: Vec::new(),
+                    cancelled: true,
+                });
+            }
+            batch.clear();
+            for offset in 0..chunk.len {
+                let global = chunk.start + offset;
+                let pos = self.n_past + global as i32;
+                let logits = chunk.logits_at_last && offset == chunk.len - 1;
+                batch
+                    .add(framing_tokens[global], pos, &[0], logits)
+                    .map_err(|e| {
+                        Error::Inference(format!("batch.add (append_turn framing): {e}"))
+                    })?;
+            }
+            if let Err(e) = self.ctx.decode(&mut batch) {
+                let _ = self
+                    .ctx
+                    .clear_kv_cache_seq(Some(0), Some(self.n_past as u32), None);
+                return Err(Error::Inference(format!(
+                    "decode (append_turn framing): {e}"
+                )));
+            }
+        }
+        self.n_past += framing_tokens.len() as i32;
+
+        // --- Generation with streaming oaicompat parse ---
+        //
+        // Reuse the once-rendered tool machinery: grammar (from `rendered`),
+        // streaming parser, and final parse. The grammar/parser are derived from
+        // the tool definitions + model template, not from the message history, so
+        // they are valid for every turn in this session.
+        let mut sampler = {
+            // Build the sampler chain using the reused rendered result.
+            use llama_cpp_2::sampling::LlamaSampler;
+            let grammar = if cfg.grammar_backstop {
+                self.build_lazy_grammar(rendered)?
+            } else {
+                None
+            };
+            if cfg.is_greedy() {
+                let mut chain = Vec::new();
+                if let Some(g) = grammar {
+                    chain.push(g);
+                }
+                chain.push(LlamaSampler::greedy());
+                LlamaSampler::chain_simple(chain)
+            } else {
+                let mut chain = Vec::new();
+                if let Some(g) = grammar {
+                    chain.push(g);
+                }
+                chain.push(LlamaSampler::penalties(64, 1.1, 0.0, 0.0));
+                chain.push(LlamaSampler::top_k(64));
+                chain.push(LlamaSampler::top_p(cfg.top_p, 1));
+                chain.push(LlamaSampler::min_p(0.05, 1));
+                chain.push(LlamaSampler::temp(cfg.temperature));
+                chain.push(LlamaSampler::dist(cfg.seed));
+                LlamaSampler::chain_simple(chain)
+            }
+        };
+
+        let mut parser = rendered
+            .streaming_state_oaicompat()
+            .map_err(|e| Error::Template(format!("init oaicompat parser (append_turn): {e}")))?;
+        let mut decoder = UTF_8.new_decoder();
+        let mut raw_text = String::new();
+
+        let mut batch = LlamaBatch::new(1, 1);
+        for _ in 0..cfg.max_tokens {
+            if cancel.is_cancelled() {
+                return Ok(crate::backend::RawTurn {
+                    text: raw_text,
+                    tool_calls: Vec::new(),
+                    cancelled: true,
+                });
+            }
+
+            let token = sampler.sample(&self.ctx, -1);
+            sampler.accept(token);
+            if self.model.is_eog_token(token) {
+                // EOG: the model closed its turn (Gemma emits the EOG token at
+                // the end of `<end_of_turn>`). The `<end_of_turn>\n` string is
+                // NOT written into the KV here; the NEXT append_turn call will
+                // prepend it before the following turn's framing.
+                break;
+            }
+            let piece = self
+                .model
+                .token_to_piece(token, &mut decoder, true, None)
+                .map_err(|e| Error::Inference(format!("token_to_piece (append_turn): {e}")))?;
+            raw_text.push_str(&piece);
+
+            // Stream only user-visible content deltas (tool-call JSON is
+            // separated by the oaicompat streaming parser and never forwarded).
+            if let Ok(deltas) = parser.update(&piece, true) {
+                for delta in deltas {
+                    if let Some(content_piece) = content_delta_from_oaicompat(&delta) {
+                        if !content_piece.is_empty() {
+                            token_cb(&content_piece);
+                        }
+                    }
+                }
+            }
+
+            // Decode the generated token to advance the KV and populate logits
+            // for the next sampling step. The reply stays resident in the KV.
+            batch.clear();
+            batch
+                .add(token, self.n_past, &[0], true)
+                .map_err(|e| Error::Inference(format!("batch.add (append_turn gen): {e}")))?;
+            // Advance n_past only AFTER a successful decode, so the invariant
+            // "n_past == tokens actually resident in KV" holds even on the error
+            // path (a decode failure returns Err without counting an undecoded
+            // token).
+            self.ctx
+                .decode(&mut batch)
+                .map_err(|e| Error::Inference(format!("decode (append_turn gen): {e}")))?;
+            self.n_past += 1;
+        }
+
+        // Strip any stray trailing close-marker from the generated text. The
+        // generation loop stops on EOG (which IS the close token on Gemma 4),
+        // so the close marker should never appear in raw_text. But if the model
+        // emits a close-marker piece as non-EOG text (e.g. on Gemma 2/3 where
+        // `<end_of_turn>` can surface as BPE fragments before the EOG), remove
+        // it before the parse so it is never returned as user-visible content.
+        let close = &self.markers.turn_close;
+        let raw_text = if raw_text.ends_with(close.as_str()) {
+            raw_text[..raw_text.len() - close.len()].trim_end().to_string()
+        } else {
+            raw_text
+        };
+
+        // --- Authoritative final parse ---
+        let final_json = rendered
+            .parse_response_oaicompat(&raw_text, false)
+            .map_err(|e| Error::MalformedOutput(format!("final oaicompat parse (append_turn): {e}")))?;
+
+        let (text, tool_calls) = parse_oaicompat_message(&final_json);
+        Ok(crate::backend::RawTurn {
+            text,
+            tool_calls,
+            cancelled: false,
+        })
+    }
+
+    /// Build the grammar sampler from a reused `ChatTemplateResult`.
+    ///
+    /// Only the non-lazy (always-on) grammar path is used. The lazy
+    /// word/token-trigger path is skipped: the llama.cpp grammar state machine
+    /// can assert (`!stacks.empty()`) when a control-token close marker (e.g.
+    /// `<tool_call|>`) whose vocabulary piece doesn't match its GBNF literal is
+    /// accepted after the grammar triggers, causing an unrecoverable SIGABRT
+    /// through the FFI boundary. The oaicompat streaming parser handles
+    /// tool-call extraction independently, so the grammar backstop is only
+    /// applied when the template requests forced (non-lazy) grammar mode.
+    fn build_lazy_grammar(
+        &self,
+        rendered: &llama_cpp_2::model::ChatTemplateResult,
+    ) -> Result<Option<llama_cpp_2::sampling::LlamaSampler>, Error> {
+        use llama_cpp_2::sampling::LlamaSampler;
+
+        let Some(grammar) = rendered.grammar.as_deref() else {
+            return Ok(None);
+        };
+        if grammar.trim().is_empty() {
+            return Ok(None);
+        }
+
+        // Lazy grammar with word/token triggers is skipped (see doc comment).
+        if rendered.grammar_lazy {
+            let has_triggers = rendered.grammar_triggers.iter().any(|t| {
+                !t.value.is_empty() || t.token.is_some()
+            });
+            if has_triggers {
+                return Ok(None);
+            }
+        }
+
+        let sampler = LlamaSampler::grammar(self.model, grammar, "root")
+            .map_err(|e| Error::Grammar(format!("template grammar (append_turn): {e}")))?;
+        Ok(Some(sampler))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for append_turn (oaicompat streaming / final parse)
+// ---------------------------------------------------------------------------
+
+/// Extract the `content` string from an OpenAI streaming-delta JSON, if any.
+///
+/// Mirrors the identical helper in `llama.rs` — duplicated here so `append_turn`
+/// (on `LlamaLiveBackend`) can filter tool-call deltas without a cross-module
+/// call into `llama.rs` private scope.
+fn content_delta_from_oaicompat(delta_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(delta_json).ok()?;
+    if let Some(c) = v
+        .pointer("/choices/0/delta/content")
+        .and_then(|c| c.as_str())
+    {
+        return Some(c.to_string());
+    }
+    v.get("content")
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+}
+
+/// Map the authoritative final OpenAI message JSON into `(text, tool_calls)`.
+///
+/// Mirrors `parse_final_message` in `llama.rs` — same shape, same logic,
+/// duplicated here for the same reason as `content_delta_from_oaicompat`.
+fn parse_oaicompat_message(final_json: &str) -> (String, Vec<crate::types::ToolCall>) {
+    use serde_json::Value;
+
+    let Ok(v) = serde_json::from_str::<Value>(final_json) else {
+        return (String::new(), Vec::new());
+    };
+    let msg = v
+        .pointer("/choices/0/message")
+        .filter(|m| m.is_object())
+        .unwrap_or(&v);
+
+    let text = msg
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let mut tool_calls = Vec::new();
+    if let Some(calls) = msg.get("tool_calls").and_then(|c| c.as_array()) {
+        for (i, call) in calls.iter().enumerate() {
+            let func = call.get("function").unwrap_or(call);
+            let Some(name) = func.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let arguments_json = match func.get("arguments") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => "{}".to_string(),
+            };
+            let id = call
+                .get("id")
+                .and_then(|i| i.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{i}"));
+            tool_calls.push(crate::types::ToolCall {
+                id,
+                name: name.to_string(),
+                arguments_json,
+            });
+        }
+    }
+    (text, tool_calls)
 }
 
 // ---------------------------------------------------------------------------

@@ -2834,6 +2834,26 @@ tail (Phase D), not pinned. The surface is:
   has headroom. The tail is always non-empty (it carries the chat-template
   suffix), so there is no empty-tail logit-coherence hazard. `prefix_len` is a
   private field; the public API surface is otherwise unchanged.
+  **U2 keep-alive append-turn (`live.rs`):** `LlamaLiveBackend` gains
+  `append_turn(role, content, &ChatTemplateResult, cfg, cancel, token_cb) -> RawTurn`.
+  Each call appends ONLY the turn framing + content tokens on top of the
+  growing KV WITHOUT pruning or restoring (the context grows monotonically).
+  Framing: if `n_past > prefix_len` (prior turns exist), prepend
+  `"{turn_close}\n"` (the close the EOG-breaking gen loop never wrote), then
+  `"{turn_open}{role}\n{content}{turn_close}\n{turn_open}model\n"`.
+  `turn_open` and `turn_close` are the model-detected markers from
+  `detect_turn_markers` (e.g. `<start_of_turn>`/`<end_of_turn>` for Gemma 2/3,
+  `<|turn>`/`<turn|>` for Gemma 4); framing is model-agnostic at runtime.
+  All tokens are tokenised with `AddBos::Never`; BOS is present only in the
+  initial prefix seed. The `ChatTemplateResult` argument is the once-rendered
+  tool machinery (grammar, streaming parser, chat format) from
+  `LlamaTurnBackend::render_tool_machinery` — NOT re-rendered per turn. The
+  generated reply is left resident in the KV, becoming context for the next
+  turn. `build_lazy_grammar` (private) builds the GBNF sampler from the reused
+  `ChatTemplateResult` when `cfg.grammar_backstop` is set. Two module-private
+  helpers (`content_delta_from_oaicompat`, `parse_oaicompat_message`) mirror
+  the corresponding helpers in `llama.rs` so `append_turn` can filter streaming
+  deltas and parse the final message without a cross-module call.
   `LlamaContext` is `!Send`; `LlamaLiveBackend` is therefore also `!Send`. The
   S2b driver in `ipc-bridge` owns the dedicated thread and calls these methods
   only from there — this crate never asserts `Send` on it.
@@ -2845,9 +2865,20 @@ tail (Phase D), not pinned. The surface is:
   so unit tests drive the full loop with a `StubLiveBackend` (no FFI, no model)
   asserting prefix-once and tail-only discipline.
 
-**No new dependency edge.** `llama-cpp-2` is already a hard dep (used by
-`LlamaTurnBackend`); `summariser::plan_prefill` is already reused for chunked
-prefill in `llama.rs`. No new crate or workspace edge is introduced by `live.rs`.
+**U2 once-rendered tool machinery (`llama.rs`).** `LlamaTurnBackend` gains
+`render_tool_machinery(messages_json, tools_json) -> ChatTemplateResult` — a
+public wrapper around the private `render` call. The returned `ChatTemplateResult`
+carries the grammar, streaming parser, chat format, and `parse_response_oaicompat`
+derived from the tool definitions + model template; its `.prompt` is discarded.
+Hold it for the session and pass it by reference to each `append_turn` call.
+`run_on_persistent_ctx` is retained as a thin bridge: it calls `render` to get
+the tool machinery for the current call, extracts the last message's role + content
+via `last_message_role_content`, and delegates to `live_backend.append_turn`.
+The fresh-context `TurnBackend::run` path is unchanged.
+
+**No new dependency edge.** `llama-cpp-2` is already a hard dep; `summariser::plan_prefill`
+is already reused. No new crate or workspace edge is introduced by the U2
+append-turn primitive.
 
 ### `mcp-server`
 **Crate:** `crates/mcp-server` (Phase 10)

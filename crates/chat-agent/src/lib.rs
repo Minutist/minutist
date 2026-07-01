@@ -53,7 +53,10 @@ mod window;
 
 pub use backend::{messages_json, tools_json, RawTurn, TurnBackend};
 pub use error::Error;
-pub use live::{LiveSession, LiveSessionBackend, LlamaLiveBackend, LlamaLiveConfig};
+pub use live::{
+    detect_turn_markers, LiveSession, LiveSessionBackend, LlamaLiveBackend, LlamaLiveConfig,
+    TurnMarkers,
+};
 pub use llama::{LlamaTurnBackend, LlamaTurnConfig};
 pub use types::{CancelFlag, ChatMessage, Role, SamplerConfig, ToolCall, TurnOutcome};
 pub use window::{fits_budget, trim_to_budget, TrimOutcome, HARD_FLOOR_REJECT};

@@ -107,10 +107,22 @@ restated. Adding any other edge requires updating
   `state_seq_get_data_ext` into a private `snapshot: Option<Vec<u8>>`. Each
   `refresh` can restore from this snapshot via `state_seq_set_data_ext` instead
   of `clear_kv_cache_seq`. Promotion from opt-in (`USE_KV_CHECKPOINT = false`)
-  to active requires the `kv_checkpoint_round_trip_smoke` test to pass. A
+  to active requires BOTH gated real-model tests to pass —
+  `kv_checkpoint_round_trip_smoke` and `kv_checkpoint_refresh_path_a_smoke`
+  (matching `components.md` and the `USE_KV_CHECKPOINT` const doc). A
   `snapshot_size()` accessor exposes the snapshot byte count for driver logging.
   Neither the mechanism nor the accessor adds a new dependency edge beyond what
   is already in the table.
+  **U2 keep-alive append-turn:** `LlamaLiveBackend` (in `live.rs`,
+  ml-runtime-engineer) gains `append_turn(role, content, &ChatTemplateResult,
+  cfg, cancel, token_cb) -> RawTurn` — the keep-alive conversational primitive
+  that appends framing tokens to the growing KV without pruning or restoring.
+  `LlamaTurnBackend` (in `llama.rs`, same domain) gains `render_tool_machinery`
+  (public) to render the tool-aware `ChatTemplateResult` once per session for
+  reuse across turns. `run_on_persistent_ctx` (existing public method) now
+  delegates to `append_turn` via `last_message_role_content` extraction; the
+  restore-per-turn model is replaced. No new crate or workspace dependency edge
+  is added.
 - **Voiceprint identity types + maths (issue #0003 WU0 — one-way door).**
   `VoiceprintIdentityId` and `VoiceprintCentroidId` are UUID newtypes added to
   `common` by the architecture-owner. Adding them is a **one-way-door** per

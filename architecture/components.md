@@ -2802,11 +2802,15 @@ the caller hands it. Attachment / earlier-transcript context is retrieved into
 per-turn content by `ipc-bridge` (Phase D), not pinned to the prefix. The surface is:
 
 - `LiveSessionBackend` trait — the testable seam, mirroring `TurnBackend`.
-  Two operations: `prefill_prefix(text) -> Result<usize, Error>` (chunked-prefill
-  the prefix text ONCE, retaining KV state) and
-  `refresh(tail, cfg, cancel, token_cb) -> Result<RawTurn, Error>` (prune-to-prefix
-  and decode a fresh tail — used on the post-meeting `LiveSession::refresh` path only,
-  not by the live keep-alive loop).
+  Operations: `prefill_prefix(text) -> Result<usize, Error>` (chunked-prefill the
+  prefix text ONCE, retaining KV state); `refresh(tail, cfg, cancel, token_cb) ->
+  Result<RawTurn, Error>` (prune-to-prefix and decode a fresh tail — post-meeting
+  `LiveSession::refresh` path only, not the live keep-alive loop);
+  `reset_to_prefix() -> Result<(), Error>` (eviction primitive — prune the KV to
+  `prefix_len` without appending any tail; `n_past <= prefix_len` is a no-op);
+  `has_room_for(estimated_tokens, max_gen) -> bool` (capacity check:
+  `n_past + estimated + max_gen <= n_ctx`; always `true` for the unbounded stub);
+  `n_past() -> i32` (current KV depth, used by the eviction path for tracing).
 
 - `LlamaLiveBackend<'m>` — the real impl. Borrows `&LlamaModel` from the same
   `LlamaSummariser` substrate (`ipc-bridge` lends it), builds one `LlamaContext`

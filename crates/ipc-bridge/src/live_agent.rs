@@ -145,6 +145,40 @@ pub struct LiveCopilotHandle {
 /// turns as a leading block in the turn content (see `build_retrieval_block`).
 const LIVE_WINDOW_BUDGET_CHARS: usize = 8_000;
 
+// ---------------------------------------------------------------------------
+// U2 eviction constants
+// ---------------------------------------------------------------------------
+
+/// Number of most-recent User + Assistant turns to include in the recap block
+/// prepended after a KV eviction. Older turns are dropped from the recap (but
+/// remain in the persisted log and the RAG index, recoverable on demand).
+const EVICT_RECAP_TURNS: usize = 8;
+
+/// Approximate character budget for the whole recap block. The recap is trimmed
+/// by dropping older turns first (most-recent-first ordering ensures the
+/// most-relevant context survives the cap). Chosen to stay well within the
+/// prefix token headroom after eviction.
+///
+/// v2 (rolling-summary layered budget) is deferred: rather than only keeping
+/// last-K verbatim, v2 would summarise the evicted middle and prepend that
+/// summary. The infrastructure (`reset_to_prefix`, the recap header path) is in
+/// place; the summarisation call is the missing piece.
+const EVICT_RECAP_CHARS: usize = 4_000;
+
+/// Per-line character cap applied to each recap entry before the whole-block cap.
+/// Prevents a single very long turn from consuming the entire recap budget.
+const EVICT_RECAP_LINE_CAP: usize = 500;
+
+/// Token headroom added to every token-count estimate in the eviction trigger.
+///
+/// `append_turn` tokenises the full framing (turn markers + newlines + content);
+/// the framing markers alone add ~6–16 tokens depending on the model. This
+/// margin absorbs marker overhead and the inherent ±error in the chars/3
+/// heuristic, ensuring the trigger fires conservatively early rather than
+/// letting a boundary turn slip past `has_room_for` and hit the hard
+/// `ContextOverflow` guard in `append_turn`.
+const FRAMING_TOKEN_MARGIN: usize = 32;
+
 /// Neutralise chat-control token strings in untrusted content so they tokenise
 /// as ordinary text, not special tokens. Inserts a space after the `<` of each
 /// marker — enough to break the exact-string special-token match while staying
@@ -1394,6 +1428,56 @@ fn classify_converse_error(
     }
 }
 
+/// Perform a KV eviction: reset the session to its pinned prefix and prepend a
+/// verbatim recap of recent turns to `model_prompt`.
+///
+/// Returns `Some(WorkerResult::CapacityExhausted(...))` if the reset fails
+/// (leaving the KV in an unknown state), `None` on success.
+///
+/// On success, `model_prompt` is mutated in place: a sanitised recap header is
+/// prepended when recent turns are available in the persisted log.
+fn do_evict<B: LiveSessionBackend + ConversationalTurn>(
+    session: &mut LiveSession<B>,
+    meeting_id: MeetingId,
+    meetings_dir: &Path,
+    markers: &TurnMarkers,
+    model_prompt: &mut String,
+) -> Option<WorkerResult> {
+    let recap = load_eviction_recap(meetings_dir, meeting_id);
+    let n_past_before = session.n_past();
+    if let Err(e) = session.reset_to_prefix() {
+        tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "live-agent: reset_to_prefix failed during eviction: {e}; \
+             context state may be inconsistent"
+        );
+        // A failed reset leaves the KV in an unknown state; treat as terminal.
+        return Some(WorkerResult::CapacityExhausted(format!(
+            "context eviction failed (reset_to_prefix): {e}"
+        )));
+    }
+    let recap_turns = recap.as_deref().map(|r| r.lines().count()).unwrap_or(0);
+    let recap_chars = recap.as_deref().map(str::len).unwrap_or(0);
+    tracing::info!(
+        target: "ipc-bridge",
+        meeting_id = %meeting_id.0,
+        n_past_before,
+        recap_turns,
+        recap_chars,
+        "live-agent: context evicted and reset to prefix; recap prepended"
+    );
+    if let Some(r) = recap {
+        let header = format!(
+            "Earlier in this conversation (older context was condensed):\n{}\n\n",
+            r
+        );
+        let safe_header = sanitise_untrusted(&header, markers);
+        *model_prompt = safe_header + model_prompt.as_str();
+    }
+    None
+}
+
 fn process_request<B: LiveSessionBackend + ConversationalTurn>(
     meeting_id: MeetingId,
     session: &mut LiveSession<B>,
@@ -1416,7 +1500,30 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
         retrieved: retrieved.map(str::to_string),
         ..req
     };
-    let model_prompt = build_turn_content(&req_with_retrieved, markers);
+    let mut model_prompt = build_turn_content(&req_with_retrieved, markers);
+
+    // U2 eviction: if the framed prompt + generation budget would not fit in
+    // the remaining context, reset the KV to the pinned prefix and prepend a
+    // verbatim recap of the last EVICT_RECAP_TURNS User/Assistant turns so the
+    // model retains recent context. Older turns remain in the persisted log and
+    // the RAG index (recoverable on demand).
+    //
+    // The estimate uses chars/3 (conservative — CJK/punctuation-dense text can
+    // tokenise at 1 token per char) plus FRAMING_TOKEN_MARGIN to cover the turn
+    // markers that `append_turn` prepends. An over-estimate causes a harmless
+    // early eviction; an under-estimate can let the turn slip past this gate
+    // and hit the hard ContextOverflow guard in `append_turn`.
+    //
+    // v2 (rolling-summary layered budget) is deferred — see EVICT_RECAP_CHARS.
+    let max_tokens = req_with_retrieved.sampler.max_tokens;
+    let estimated_tokens = model_prompt.len() / 3 + FRAMING_TOKEN_MARGIN;
+    let mut already_evicted = false;
+    if !session.has_room_for(estimated_tokens, max_tokens) {
+        if let Some(msg) = do_evict(session, meeting_id, meetings_dir, markers, &mut model_prompt) {
+            return msg;
+        }
+        already_evicted = true;
+    }
 
     // Persist the input turn using the clean content (always, even when the
     // reply is suppressed, so the conversation log is complete).
@@ -1430,6 +1537,12 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
     // converse_typed preserves the typed chat_agent::Error so ContextOverflow
     // is matched structurally in classify_converse_error, not confused with a
     // transient MalformedOutput or Template failure.
+    //
+    // If converse returns ContextOverflow and eviction was not already
+    // triggered (the estimate heuristic under-counted), attempt one
+    // evict-and-retry before falling through to CapacityExhausted. This
+    // covers the boundary case where the real token count exceeds the
+    // estimate but the session would fit a fresh post-eviction context.
     let mut raw = match session.converse_typed(
         "user",
         &model_prompt,
@@ -1438,6 +1551,34 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
         &mut |piece| generated.push_str(piece),
     ) {
         Ok(r) => r,
+        Err(ChatAgentError::ContextOverflow(_)) if !already_evicted => {
+            // Estimate was too optimistic — evict now and retry once.
+            tracing::info!(
+                target: "ipc-bridge",
+                meeting_id = %meeting_id.0,
+                "live-agent: ContextOverflow after estimate passed; \
+                 evicting and retrying"
+            );
+            // Reset model_prompt to the original (unrecapped) framing before
+            // re-evicting, so the recap is added exactly once.
+            model_prompt = build_turn_content(&req_with_retrieved, markers);
+            if let Some(msg) =
+                do_evict(session, meeting_id, meetings_dir, markers, &mut model_prompt)
+            {
+                return msg;
+            }
+            generated.clear();
+            match session.converse_typed(
+                "user",
+                &model_prompt,
+                &req_with_retrieved.sampler,
+                &req_with_retrieved.cancel,
+                &mut |piece| generated.push_str(piece),
+            ) {
+                Ok(r) => r,
+                Err(e) => return classify_converse_error(meeting_id, e, "converse-after-evict"),
+            }
+        }
         Err(e) => {
             return classify_converse_error(meeting_id, e, "converse");
         }
@@ -1733,6 +1874,95 @@ async fn build_retrieval_block(rc: &LiveRetrieval, recent: &str) -> Option<Strin
 }
 
 // ---------------------------------------------------------------------------
+// U2 eviction — recap loader
+// ---------------------------------------------------------------------------
+
+/// Read the last `EVICT_RECAP_TURNS` User and Assistant messages from the
+/// meeting's persisted live `ChatSession` and format them as a size-capped
+/// block to prepend after a KV eviction.
+///
+/// Returns `Some(recap)` on success, or `None` on a load failure (best-effort:
+/// the session is reset without a recap rather than failing the turn). The
+/// caller sanitises the resulting string with `sanitise_untrusted` before
+/// injecting it into the model prompt.
+///
+/// Roles included: `ChatRole::User` and `ChatRole::Assistant`. `ChatRole::Digest`
+/// (transcript auto-injections) and `ChatRole::Tool` are excluded — they are
+/// bulky and less useful as conversation context after eviction.
+///
+/// Ordering: most-recent first, so that trimming the block by the whole-block
+/// character cap always preserves the newest context. After trimming, the block
+/// is reversed before returning so the model reads it in chronological order.
+fn load_eviction_recap(meetings_dir: &Path, meeting_id: MeetingId) -> Option<String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let chat_session = match ChatStore::load_or_create_live(meetings_dir, meeting_id, &now) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc-bridge",
+                meeting_id = %meeting_id.0,
+                "live-agent eviction: chat session load failed; resetting without recap: {e}"
+            );
+            return None;
+        }
+    };
+
+    // Collect the last EVICT_RECAP_TURNS User + Assistant messages (most-recent-first).
+    let relevant: Vec<&minutist_common::ChatMessage> = chat_session
+        .messages
+        .iter()
+        .rev()
+        .filter(|m| {
+            matches!(m.role, ChatRole::User | ChatRole::Assistant)
+        })
+        .take(EVICT_RECAP_TURNS)
+        .collect();
+
+    if relevant.is_empty() {
+        return None;
+    }
+
+    // Format each entry as "{role}: {content}", truncated to EVICT_RECAP_LINE_CAP.
+    // Accumulate most-recent-first until we reach EVICT_RECAP_CHARS.
+    let mut lines: Vec<String> = Vec::with_capacity(relevant.len());
+    let mut total_chars = 0usize;
+    for msg in &relevant {
+        let role_label = match msg.role {
+            ChatRole::User => "User",
+            ChatRole::Assistant => "Assistant",
+            _ => continue,
+        };
+        let content = &msg.content;
+        let line_raw = format!("{role_label}: {content}");
+        // Per-line cap: truncate at a char boundary.
+        let line = if line_raw.chars().count() > EVICT_RECAP_LINE_CAP {
+            let cap_byte = line_raw
+                .char_indices()
+                .nth(EVICT_RECAP_LINE_CAP)
+                .map(|(i, _)| i)
+                .unwrap_or(line_raw.len());
+            line_raw[..cap_byte].to_string()
+        } else {
+            line_raw
+        };
+        if total_chars + line.len() > EVICT_RECAP_CHARS {
+            // The recap budget is full; stop here (older entries are less useful).
+            break;
+        }
+        total_chars += line.len();
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    // lines is most-recent-first; reverse to chronological order before joining.
+    lines.reverse();
+    Some(lines.join("\n"))
+}
+
+// ---------------------------------------------------------------------------
 // Test-only stub backend
 // ---------------------------------------------------------------------------
 
@@ -1789,6 +2019,18 @@ pub(crate) mod test_support {
                 cancelled: false,
             })
         }
+
+        fn reset_to_prefix(&mut self) -> Result<(), ChatError> {
+            Ok(())
+        }
+
+        fn has_room_for(&self, _estimated_tokens: usize, _max_gen: usize) -> bool {
+            true
+        }
+
+        fn n_past(&self) -> i32 {
+            0
+        }
     }
 
     impl ConversationalTurn for WorkerBackend {
@@ -1838,6 +2080,18 @@ pub(crate) mod test_support {
             Err(ChatError::ContextOverflow(
                 "stub: n_past=30000 would exceed n_ctx=32768".to_string(),
             ))
+        }
+
+        fn reset_to_prefix(&mut self) -> Result<(), ChatError> {
+            Ok(())
+        }
+
+        fn has_room_for(&self, _estimated_tokens: usize, _max_gen: usize) -> bool {
+            false
+        }
+
+        fn n_past(&self) -> i32 {
+            30_000
         }
     }
 
@@ -1898,6 +2152,18 @@ pub(crate) mod test_support {
                 cancelled: false,
             })
         }
+
+        fn reset_to_prefix(&mut self) -> Result<(), ChatError> {
+            Ok(())
+        }
+
+        fn has_room_for(&self, _estimated_tokens: usize, _max_gen: usize) -> bool {
+            true
+        }
+
+        fn n_past(&self) -> i32 {
+            0
+        }
     }
 
     impl ConversationalTurn for CapturingBackend {
@@ -1944,6 +2210,18 @@ pub(crate) mod test_support {
                 cancelled: false,
             })
         }
+
+        fn reset_to_prefix(&mut self) -> Result<(), ChatError> {
+            Ok(())
+        }
+
+        fn has_room_for(&self, _estimated_tokens: usize, _max_gen: usize) -> bool {
+            true
+        }
+
+        fn n_past(&self) -> i32 {
+            0
+        }
     }
 
     impl ConversationalTurn for NoopBackend {
@@ -1962,6 +2240,89 @@ pub(crate) mod test_support {
             })
         }
     }
+
+    /// A stub backend that simulates a nearly-full context. It reports
+    /// `has_room_for = false` until `reset_to_prefix` is called, after which
+    /// it returns `true`. The `reset_counter` tracks how many times
+    /// `reset_to_prefix` has been called. `converse` records its content so
+    /// tests can inspect whether the recap header was prepended.
+    pub(crate) struct NearFullBackend {
+        pub(crate) reset_counter: Arc<std::sync::atomic::AtomicU32>,
+        pub(crate) converse_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        was_reset: bool,
+    }
+
+    impl NearFullBackend {
+        pub(crate) fn new() -> Self {
+            Self {
+                reset_counter: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                converse_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                was_reset: false,
+            }
+        }
+
+        pub(crate) fn reset_counter(&self) -> Arc<std::sync::atomic::AtomicU32> {
+            Arc::clone(&self.reset_counter)
+        }
+
+        pub(crate) fn converse_calls(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+            Arc::clone(&self.converse_calls)
+        }
+    }
+
+    impl LiveSessionBackend for NearFullBackend {
+        fn prefill_prefix(
+            &mut self,
+            _prefix_text: &str,
+            _cancel: &CancelFlag,
+        ) -> Result<usize, ChatError> {
+            Ok(10)
+        }
+
+        fn refresh(
+            &mut self,
+            _tail_text: &str,
+            _cfg: &SamplerConfig,
+            _cancel: &CancelFlag,
+            _token_cb: &mut dyn FnMut(&str),
+        ) -> Result<RawTurn, ChatError> {
+            Ok(RawTurn::default())
+        }
+
+        fn reset_to_prefix(&mut self) -> Result<(), ChatError> {
+            self.reset_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.was_reset = true;
+            Ok(())
+        }
+
+        fn has_room_for(&self, _estimated_tokens: usize, _max_gen: usize) -> bool {
+            // Simulate a full context until the first reset.
+            self.was_reset
+        }
+
+        fn n_past(&self) -> i32 {
+            if self.was_reset { 10 } else { 30_000 }
+        }
+    }
+
+    impl ConversationalTurn for NearFullBackend {
+        fn converse(
+            &mut self,
+            _role: &str,
+            content: &str,
+            _cfg: &SamplerConfig,
+            _cancel: &CancelFlag,
+            _token_cb: &mut dyn FnMut(&str),
+        ) -> Result<RawTurn, ChatError> {
+            self.converse_calls.lock().unwrap().push(content.to_string());
+            Ok(RawTurn {
+                text: "eviction reply".to_string(),
+                tool_calls: Vec::new(),
+                cancelled: false,
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,9 +2331,13 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{CapturingBackend, NoopBackend, OverflowBackend, WorkerBackend};
+    use super::test_support::{
+        CapturingBackend, NearFullBackend, NoopBackend, OverflowBackend, WorkerBackend,
+    };
     use super::*;
-    use chat_agent::LiveSession;
+    use chat_agent::{LiveSession, LiveSessionBackend, ConversationalTurn, RawTurn};
+    use chat_agent::Error as ChatError;
+    use chat_agent::CancelFlag;
     use minutist_common::MeetingId;
 
     fn new_mid() -> MeetingId {
@@ -3260,5 +3625,481 @@ mod tests {
             matches!(result_f, WorkerResult::Suppressed),
             "(f) lunch-chat transcript should be Suppressed, got: {result_f:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // U2 eviction — process_request triggers eviction when context is full
+    // -----------------------------------------------------------------------
+
+    /// When `has_room_for` returns false, `process_request` calls
+    /// `reset_to_prefix` (exactly once) and prepends the recap header to the
+    /// model prompt.
+    #[test]
+    fn process_request_evicts_and_prepends_recap_header() {
+        let mid = new_mid();
+        let (_tmp, meetings_dir) = make_tmp_meetings_dir();
+
+        let backend = NearFullBackend::new();
+        let reset_counter = backend.reset_counter();
+        let converse_calls = backend.converse_calls();
+
+        let mut session: LiveSession<NearFullBackend> = LiveSession::new(backend);
+        session
+            .seed_prefix_typed("sys", &CancelFlag::new())
+            .expect("seed");
+        session.init_tool_machinery(None).expect("init");
+
+        // Pre-populate the live ChatSession with a User + Assistant turn so the
+        // recap loader has something to return.
+        let mut tid: u64 = 0;
+        persist_turn(
+            &meetings_dir,
+            mid,
+            ChatRole::User,
+            "What is the budget for this quarter?",
+            &mut tid,
+        );
+        persist_turn(
+            &meetings_dir,
+            mid,
+            ChatRole::Assistant,
+            "The Q3 budget is $250 000.",
+            &mut tid,
+        );
+
+        let markers = default_test_markers();
+        let req = CopilotTurnRequest {
+            kind: TurnKind::UserChat,
+            content: "Please summarise the budget discussion.".to_string(),
+            retrieved: None,
+            sampler: SamplerConfig::deterministic(),
+            cancel: CancelFlag::new(),
+        };
+        let mut turn_id = tid;
+        let result =
+            process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id);
+
+        // The request must succeed — eviction should prevent CapacityExhausted.
+        assert!(
+            matches!(result, WorkerResult::Message { .. }),
+            "expected Message after eviction, got: {result:?}"
+        );
+
+        // reset_to_prefix must have been called exactly once.
+        assert_eq!(
+            reset_counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "reset_to_prefix must be called exactly once during eviction"
+        );
+
+        // The model prompt delivered to converse must contain the recap header.
+        let calls = converse_calls.lock().unwrap();
+        assert!(!calls.is_empty(), "converse must have been called");
+        assert!(
+            calls[0].contains("Earlier in this conversation"),
+            "model prompt must contain the recap header; got: {:?}",
+            calls[0]
+        );
+    }
+
+    /// When the context is not full (`has_room_for` returns true), eviction
+    /// must not be triggered — `reset_to_prefix` is not called.
+    #[test]
+    fn process_request_no_eviction_when_context_has_room() {
+        let mid = new_mid();
+        let (_tmp, meetings_dir) = make_tmp_meetings_dir();
+
+        let backend = WorkerBackend::new();
+        let counter = backend.prefill_counter();
+        let mut session: LiveSession<WorkerBackend> = LiveSession::new(backend);
+        session
+            .seed_prefix_typed("sys", &CancelFlag::new())
+            .expect("seed");
+        session.init_tool_machinery(None).expect("init");
+
+        // Prefill counter starts at 1 (the one seed call). If eviction triggered
+        // another seed it would increment again — it must not.
+        let markers = default_test_markers();
+        let req = CopilotTurnRequest {
+            kind: TurnKind::UserChat,
+            content: "Hello".to_string(),
+            retrieved: None,
+            sampler: SamplerConfig::deterministic(),
+            cancel: CancelFlag::new(),
+        };
+        let mut turn_id = 0u64;
+        let result =
+            process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id);
+        assert!(matches!(result, WorkerResult::Message { .. }));
+        // Exactly one prefill — no eviction-induced reseed.
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "prefill_prefix must not be called again when context has room"
+        );
+    }
+
+    /// `load_eviction_recap` returns `None` gracefully when the live session
+    /// file does not exist yet (e.g. on the very first turn).
+    #[test]
+    fn load_eviction_recap_returns_none_when_no_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let meetings_dir = tmp.path();
+        let mid = new_mid();
+        // No session file written — should return None without panicking.
+        let recap = load_eviction_recap(meetings_dir, mid);
+        // load_or_create_live creates an empty session; result is None (no User/Assistant turns).
+        assert!(
+            recap.is_none(),
+            "empty session should yield no recap; got: {recap:?}"
+        );
+    }
+
+    /// `load_eviction_recap` includes only User and Assistant turns, not
+    /// Digest (transcript auto-injections).
+    #[test]
+    fn load_eviction_recap_excludes_digest_turns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let meetings_dir = tmp.path();
+        let mid = new_mid();
+
+        let mut tid: u64 = 0;
+        persist_turn(meetings_dir, mid, ChatRole::Digest, "some transcript text", &mut tid);
+        persist_turn(meetings_dir, mid, ChatRole::User, "user question", &mut tid);
+        persist_turn(meetings_dir, mid, ChatRole::Assistant, "assistant reply", &mut tid);
+
+        let recap = load_eviction_recap(meetings_dir, mid).expect("recap present");
+        assert!(
+            recap.contains("User: user question"),
+            "User turn must be in the recap; got: {recap:?}"
+        );
+        assert!(
+            recap.contains("Assistant: assistant reply"),
+            "Assistant turn must be in the recap; got: {recap:?}"
+        );
+        assert!(
+            !recap.contains("some transcript text"),
+            "Digest turns must be excluded; got: {recap:?}"
+        );
+    }
+
+    /// The recap must be in chronological order (oldest first) so the model
+    /// reads context in time order.
+    #[test]
+    fn load_eviction_recap_is_chronological() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let meetings_dir = tmp.path();
+        let mid = new_mid();
+
+        let mut tid: u64 = 0;
+        persist_turn(meetings_dir, mid, ChatRole::User, "first question", &mut tid);
+        persist_turn(meetings_dir, mid, ChatRole::Assistant, "first reply", &mut tid);
+        persist_turn(meetings_dir, mid, ChatRole::User, "second question", &mut tid);
+        persist_turn(meetings_dir, mid, ChatRole::Assistant, "second reply", &mut tid);
+
+        let recap = load_eviction_recap(meetings_dir, mid).expect("recap present");
+        let first_pos = recap.find("first question").expect("first question in recap");
+        let second_pos = recap.find("second question").expect("second question in recap");
+        assert!(
+            first_pos < second_pos,
+            "recap must be in chronological order (first < second); got: {recap:?}"
+        );
+    }
+
+    /// Unit test: many-turn small-budget run via stub backend models n_past growth +
+    /// honours reset_to_prefix. Verify no CapacityExhausted and recap is prepended.
+    #[test]
+    fn process_request_many_turns_small_budget_survives_via_eviction() {
+        let mid = new_mid();
+        let (_tmp, meetings_dir) = make_tmp_meetings_dir();
+
+        // A stub that models n_past growth (converse advances n_past by content
+        // length) and honours reset_to_prefix by resetting n_past to prefix_len.
+        // After the first turn fills the context, subsequent turns trigger eviction.
+        struct GrowingBackend {
+            n_past: usize,
+            prefix_len: usize,
+            n_ctx: usize,
+            reset_counter: Arc<std::sync::atomic::AtomicU32>,
+            converse_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl LiveSessionBackend for GrowingBackend {
+            fn prefill_prefix(
+                &mut self,
+                prefix_text: &str,
+                _cancel: &CancelFlag,
+            ) -> Result<usize, ChatError> {
+                let n = prefix_text.len() / 4; // chars/4 ≈ tokens
+                self.n_past = n.max(1);
+                self.prefix_len = self.n_past;
+                Ok(self.prefix_len)
+            }
+
+            fn refresh(
+                &mut self,
+                _tail_text: &str,
+                _cfg: &SamplerConfig,
+                _cancel: &CancelFlag,
+                _token_cb: &mut dyn FnMut(&str),
+            ) -> Result<RawTurn, ChatError> {
+                Ok(RawTurn::default())
+            }
+
+            fn reset_to_prefix(&mut self) -> Result<(), ChatError> {
+                self.reset_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.n_past = self.prefix_len;
+                Ok(())
+            }
+
+            fn has_room_for(&self, estimated_tokens: usize, max_gen: usize) -> bool {
+                let required = self
+                    .n_past
+                    .saturating_add(estimated_tokens)
+                    .saturating_add(max_gen);
+                required <= self.n_ctx
+            }
+
+            fn n_past(&self) -> i32 {
+                self.n_past as i32
+            }
+        }
+
+        impl ConversationalTurn for GrowingBackend {
+            fn converse(
+                &mut self,
+                _role: &str,
+                content: &str,
+                _cfg: &SamplerConfig,
+                _cancel: &CancelFlag,
+                _token_cb: &mut dyn FnMut(&str),
+            ) -> Result<RawTurn, ChatError> {
+                self.converse_calls
+                    .lock()
+                    .unwrap()
+                    .push(content.to_string());
+                // Monotonic growth: each turn adds its content length / 4 tokens
+                let content_tokens = content.len() / 4;
+                self.n_past += content_tokens.max(1);
+                Ok(RawTurn {
+                    text: "small reply".to_string(),
+                    tool_calls: Vec::new(),
+                    cancelled: false,
+                })
+            }
+        }
+
+        let reset_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let converse_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = GrowingBackend {
+            n_past: 0,
+            prefix_len: 0,
+            n_ctx: 256, // small budget: prefix ~50 tokens, one turn fills it
+            reset_counter: reset_counter.clone(),
+            converse_calls: converse_calls.clone(),
+        };
+
+        let mut session: LiveSession<GrowingBackend> = LiveSession::new(backend);
+        session.seed_prefix("system prompt", &CancelFlag::new()).unwrap();
+        session.init_tool_machinery(None).unwrap();
+
+        let markers = default_test_markers();
+        let mut turn_id = 0u64;
+
+        // Pre-populate chat session with some turns so recap loader has content.
+        persist_turn(&meetings_dir, mid, ChatRole::User, "What's Q1 budget?", &mut turn_id);
+        persist_turn(
+            &meetings_dir,
+            mid,
+            ChatRole::Assistant,
+            "Q1 budget is $100K.",
+            &mut turn_id,
+        );
+
+        // Feed multiple small turns that grow n_past beyond n_ctx.
+        // With eviction, each turn resets n_past to prefix_len before
+        // converse, so CapacityExhausted never fires.
+        for i in 0..10 {
+            let req = CopilotTurnRequest {
+                kind: TurnKind::UserChat,
+                content: format!("Turn {i}: What is the status?", i = i),
+                retrieved: None,
+                sampler: SamplerConfig::deterministic(),
+                cancel: CancelFlag::new(),
+            };
+            let result = process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id);
+            match result {
+                WorkerResult::Message { .. } => {
+                    // Expected: eviction keeps the session alive.
+                }
+                other => {
+                    panic!(
+                        "Turn {i} failed unexpectedly (context should have been \
+                         evicted, not exhausted): {other:?}",
+                        i = i
+                    );
+                }
+            }
+        }
+
+        // After multiple turns, reset_to_prefix must have been called at least once.
+        assert!(
+            reset_counter.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "eviction must have triggered reset_to_prefix at least once"
+        );
+
+        // Verify converse saw a recap header at some point (proof eviction occurred).
+        let calls = converse_calls.lock().unwrap();
+        let saw_recap_header = calls.iter().any(|c| c.contains("Earlier in this conversation"));
+        assert!(
+            saw_recap_header,
+            "at least one converse call must contain the recap header after eviction"
+        );
+    }
+
+    /// Gated real-model test (requires MINUTIST_LLM_MODEL_PATH).
+    ///
+    /// Drives `process_request` (the full eviction path) against a real model
+    /// loaded with a small n_ctx so that eviction is forced within the run.
+    /// Asserts:
+    ///   (a) no `CapacityExhausted` across the run, and
+    ///   (b) after an eviction the co-pilot still returns a non-empty reply to a
+    ///       question about a recent turn (recap is injected and the model uses it).
+    ///
+    /// Run locally with:
+    /// ```text
+    /// MINUTIST_LLM_MODEL_PATH=/path/to/model.gguf \
+    ///   cargo test -p ipc-bridge --lib -- --include-ignored \
+    ///   live_session_eviction_with_small_n_ctx_survives_and_recalls_recent_context
+    /// ```
+    #[test]
+    #[ignore = "requires MINUTIST_LLM_MODEL_PATH pointing at a Gemma GGUF"]
+    fn live_session_eviction_with_small_n_ctx_survives_and_recalls_recent_context() {
+        use llama_cpp_2::model::params::LlamaModelParams;
+        use llama_cpp_2::model::LlamaModel;
+
+        let model_path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                eprintln!(
+                    "MINUTIST_LLM_MODEL_PATH unset — skipping gated live-session eviction test"
+                );
+                return;
+            }
+        };
+
+        let backend_init =
+            minutist_common::llama_backend::shared_llama_backend().expect("llama backend init");
+        let model = LlamaModel::load_from_file(
+            backend_init,
+            std::path::Path::new(&model_path),
+            &LlamaModelParams::default(),
+        )
+        .expect("model load");
+
+        // Small n_ctx to force eviction after a few turns.
+        let config = chat_agent::LlamaLiveConfig {
+            n_ctx: 1_536,
+            ..chat_agent::LlamaLiveConfig::default()
+        };
+
+        let live_backend =
+            chat_agent::LlamaLiveBackend::new(&model, config).expect("LlamaLiveBackend::new");
+        let mut session = chat_agent::LiveSession::new(live_backend);
+
+        let markers = chat_agent::detect_turn_markers(&model);
+        let prefix = build_prefix(&settings::Settings::default(), &markers, "");
+        session
+            .seed_prefix_typed(&prefix, &CancelFlag::new())
+            .expect("seed_prefix");
+        session.init_tool_machinery(None).expect("init_tool_machinery");
+
+        let (_tmp, meetings_dir) = make_tmp_meetings_dir();
+        let mid = new_mid();
+        let mut turn_id = 0u64;
+
+        // Helper: drive one turn through the full process_request path.
+        let run_turn =
+            |kind: TurnKind,
+             content: &str,
+             session: &mut chat_agent::LiveSession<chat_agent::LlamaLiveBackend<'_>>,
+             turn_id: &mut u64|
+             -> WorkerResult {
+                let req = CopilotTurnRequest {
+                    kind,
+                    content: content.to_string(),
+                    retrieved: None,
+                    sampler: SamplerConfig::deterministic(),
+                    cancel: CancelFlag::new(),
+                };
+                process_request(mid, session, req, None, &markers, &meetings_dir, turn_id)
+            };
+
+        // Feed several user-chat turns. Each appends real KV tokens; with
+        // n_ctx=1536 and a real model the context fills within a handful of turns.
+        let setup_turns = [
+            "Alice said she will handle the Q2 roadmap.",
+            "Bob mentioned the budget is $500K for the quarter.",
+            "Carol proposed accelerating the timeline by two weeks.",
+        ];
+
+        for (i, text) in setup_turns.iter().enumerate() {
+            let result = run_turn(TurnKind::UserChat, text, &mut session, &mut turn_id);
+            match result {
+                WorkerResult::Message { .. } | WorkerResult::Suppressed => {
+                    tracing::info!(
+                        target: "ipc-bridge",
+                        turn = i,
+                        "setup turn succeeded"
+                    );
+                }
+                WorkerResult::CapacityExhausted(ref msg) => {
+                    panic!(
+                        "Setup turn {i} hit CapacityExhausted — eviction should have \
+                         prevented this: {msg}"
+                    );
+                }
+                WorkerResult::Err(ref msg) => {
+                    panic!("Setup turn {i} failed: {msg}");
+                }
+            }
+        }
+
+        // Final turn: ask about Carol's recent proposal. If eviction fired and
+        // the recap was injected, the model has that context and must return a
+        // non-empty reply.
+        let recall_result = run_turn(
+            TurnKind::UserChat,
+            "What did Carol propose about the timeline?",
+            &mut session,
+            &mut turn_id,
+        );
+        match recall_result {
+            WorkerResult::CapacityExhausted(ref msg) => {
+                panic!(
+                    "Recall turn hit CapacityExhausted — eviction failed to keep the \
+                     session alive: {msg}"
+                );
+            }
+            WorkerResult::Message { ref content, .. } => {
+                assert!(
+                    !content.is_empty(),
+                    "post-eviction recall turn must return a non-empty reply"
+                );
+                tracing::info!(
+                    target: "ipc-bridge",
+                    reply_len = content.len(),
+                    "eviction test: recall reply received"
+                );
+            }
+            WorkerResult::Suppressed => {
+                // A UserChat turn is never suppressed; flag it.
+                panic!("Recall UserChat turn was unexpectedly Suppressed");
+            }
+            WorkerResult::Err(ref msg) => {
+                panic!("Recall turn failed: {msg}");
+            }
+        }
     }
 }

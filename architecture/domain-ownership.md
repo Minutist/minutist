@@ -137,6 +137,34 @@ restated. Adding any other edge requires updating
   transcript-refresh (`LiveSession::refresh_typed`) and the append-turn
   (`ConversationalTurn::append_turn`) paths from one loop. No new dependency
   edge is added (the `ipc-bridge → chat-agent` edge pre-exists).
+  **U2 eviction-when-full (chat-agent + ipc-bridge, ml-runtime-engineer +
+  systems-engineer).**
+  - `chat-agent` (`live.rs`, ml-runtime-engineer) adds two required methods to
+    `LiveSessionBackend`: `reset_to_prefix() -> Result<(), Error>` (prunes the KV
+    to the pinned prefix via `prune_kv_to_prefix`, shared with `refresh`'s restore
+    step) and `has_room_for(estimated_tokens, max_gen) -> bool` (capacity check:
+    `n_past + estimated + max_gen <= n_ctx`). A third method `n_past() -> i32` is
+    also added to the trait so the IPC worker can read the pre-eviction depth for
+    tracing without the `LlamaLiveBackend`-specialised accessor. `LiveSession<B>`
+    (generic) gains `reset_to_prefix() -> AppResult<()>` and
+    `has_room_for(estimated_tokens, max_gen) -> bool` and `n_past() -> i32`
+    passthroughs. No new dependency edge
+    (`chat-agent` has no new imports; all changes are within `live.rs`).
+  - `ipc-bridge` (`live_agent.rs`, systems-engineer) adds `process_request`
+    eviction logic: before each `converse` call, estimate `model_prompt.len() / 3 +
+    FRAMING_TOKEN_MARGIN` (a deliberate over-estimate); if `!session.has_room_for(...)`,
+    read the last-K recap from
+    the persisted live `ChatSession` (`load_eviction_recap`, best-effort), call
+    `session.reset_to_prefix()`, and prepend a sanitised recap header to the model
+    prompt. `tracing::info!` records the eviction (meeting id, n_past, recap
+    turns/chars). A post-`converse` `ContextOverflow` that was not pre-emptively
+    evicted triggers one evict-and-retry; a still-overflowing turn maps to
+    `CapacityExhausted` (an `already_evicted` guard bounds this to one eviction
+    per turn). No new dependency edge (the `ipc-bridge → chat-agent` and
+    `ipc-bridge → persistence` edges pre-exist).
+  **v2 rolling-summary layered budget** (summarising the evicted middle rather than
+  only keeping last-K verbatim) is **deferred**. The infrastructure is in place;
+  the summarisation call is the missing piece.
   **U2 attachment awareness (ipc-bridge + summariser + persistence,
   systems-engineer + ml-runtime-engineer + data-engineer).** The two-tier
   attachment context described in `cross-cutting.md` — "Two-tier attachment

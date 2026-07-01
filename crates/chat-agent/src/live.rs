@@ -135,6 +135,44 @@ pub trait LiveSessionBackend {
         cancel: &CancelFlag,
         token_cb: &mut dyn FnMut(&str),
     ) -> Result<RawTurn, Error>;
+
+    /// Prune the KV cache back to the pinned prefix without appending any tail.
+    ///
+    /// This is the eviction primitive for the U2 keep-alive loop: when the
+    /// growing conversational context approaches `n_ctx`, the worker calls this
+    /// to reset the KV to the known-good prefix checkpoint, then prepends a
+    /// verbatim recap of the last-K turns to the next `converse` call so the
+    /// model retains recent context (v1; v2 rolling-summary layered budget is
+    /// deferred).
+    ///
+    /// Guard: `prefix_len` must be positive (i.e. `prefill_prefix` has completed
+    /// successfully). Returns [`Error::Inference`] if the prefix has not been
+    /// seeded. When `n_past <= prefix_len` the call is a no-op (the KV is
+    /// already at or before the prefix boundary).
+    ///
+    /// The prune mechanism mirrors [`Self::refresh`]'s prune-to-prefix step
+    /// exactly — both delegate to the same shared logic — so the two cannot
+    /// diverge.
+    fn reset_to_prefix(&mut self) -> Result<(), Error>;
+
+    /// Returns `true` if a turn of `estimated_tokens` plus `max_gen` generation
+    /// tokens would fit within the context window given the current `n_past`.
+    ///
+    /// `estimated_tokens` — heuristic cost of the incoming turn's framing +
+    /// content (e.g. `chars / 4`). `max_gen` — generation budget reserved for
+    /// the reply (typically `cfg.max_tokens`).
+    ///
+    /// The check is: `n_past + estimated_tokens + max_gen <= n_ctx`.
+    ///
+    /// When `n_ctx` is unlimited (as in the unbounded stub) the method always
+    /// returns `true`.
+    fn has_room_for(&self, estimated_tokens: usize, max_gen: usize) -> bool;
+
+    /// Number of tokens currently resident in the held KV cache.
+    ///
+    /// Used by the U2 eviction trigger to record the pre-eviction depth for
+    /// tracing. Returns 0 for stubs that do not track a real KV.
+    fn n_past(&self) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +333,50 @@ impl<B: LiveSessionBackend> LiveSession<B> {
         self.refresh_typed(tail_text, cfg, cancel, token_cb)
             .map_err(Into::into)
     }
+
+    /// Prune the KV cache back to the pinned prefix, discarding all
+    /// conversational turns appended since `seed_prefix`.
+    ///
+    /// Called by the U2 eviction path when the growing context approaches
+    /// `n_ctx`. After this returns the caller prepends a verbatim recap of
+    /// the last-K turns to the next [`Self::converse`] call so the model
+    /// retains recent context (v1 — v2 rolling-summary layered budget is
+    /// deferred).
+    ///
+    /// Requires `prefix_seeded`; mirrors the guard on [`Self::refresh_typed`].
+    /// Returns [`Error::Inference`] if the prefix has not been seeded.
+    pub fn reset_to_prefix_typed(&mut self) -> Result<(), Error> {
+        if !self.prefix_seeded {
+            return Err(Error::Inference(
+                "live session reset_to_prefix called before seed_prefix".to_string(),
+            ));
+        }
+        self.backend.reset_to_prefix()
+    }
+
+    /// Like [`Self::reset_to_prefix_typed`] but converts to [`AppResult`].
+    pub fn reset_to_prefix(&mut self) -> AppResult<()> {
+        self.reset_to_prefix_typed().map_err(Into::into)
+    }
+
+    /// Returns `true` if a turn of `estimated_tokens` framing/content plus
+    /// `max_gen` generation tokens would fit within the context window.
+    ///
+    /// Used by the U2 eviction trigger (in `ipc-bridge::live_agent`) to decide
+    /// whether to evict before calling `converse`. Delegates to the backend so
+    /// the check is unit-testable against the stub.
+    pub fn has_room_for(&self, estimated_tokens: usize, max_gen: usize) -> bool {
+        self.backend.has_room_for(estimated_tokens, max_gen)
+    }
+
+    /// Number of tokens currently resident in the held KV cache.
+    ///
+    /// Used by the U2 eviction path to record the pre-eviction depth for
+    /// tracing. Delegates to the backend so it is readable from any context
+    /// where only `B: LiveSessionBackend` is required.
+    pub fn n_past(&self) -> i32 {
+        self.backend.n_past()
+    }
 }
 
 impl<B: LiveSessionBackend + ConversationalTurn> LiveSession<B> {
@@ -358,13 +440,8 @@ impl<B: LiveSessionBackend + ConversationalTurn> LiveSession<B> {
 }
 
 /// Passthrough accessors from [`LiveSession`] to the [`LlamaLiveBackend`] state
-/// queries. These are used by the IPC worker for capacity checks and framing.
+/// queries that are specific to the real backend (no generic trait method).
 impl<'m> LiveSession<LlamaLiveBackend<'m>> {
-    /// Number of tokens currently resident in the held KV cache.
-    pub fn n_past(&self) -> i32 {
-        self.backend.n_past()
-    }
-
     /// Remaining context capacity in tokens, reserving `cfg_max_tokens` for the
     /// next generation pass.
     pub fn remaining_capacity(&self, cfg_max_tokens: usize) -> usize {
@@ -809,7 +886,6 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
         token_cb: &mut dyn FnMut(&str),
     ) -> Result<RawTurn, Error> {
         use encoding_rs::UTF_8;
-        use llama_cpp_2::context::session::LlamaStateSeqFlags;
         use llama_cpp_2::llama_batch::LlamaBatch;
         use llama_cpp_2::model::AddBos;
         use llama_cpp_2::sampling::LlamaSampler;
@@ -825,88 +901,14 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
         // tail AND its generated answer, so `n_past` never grows beyond
         // `prefix_len + tail + generation`. The prefix prefill is paid once.
         //
-        // Two paths:
-        //   A (checkpoint, USE_KV_CHECKPOINT=true): restore via
-        //      `state_seq_set_data_ext` — the bool return gives a detectable
-        //      failure; false is treated as fatal and the context is marked
-        //      terminal. This is the preferred path once the round-trip test
-        //      confirms correctness across Gemma SWA.
-        //   B (fallback, USE_KV_CHECKPOINT=false / no snapshot): fall back to
-        //      `clear_kv_cache_seq` — the existing proven path, unchanged.
+        // Delegates to `prune_kv_to_prefix` (the shared prune helper also used
+        // by `reset_to_prefix`) so the two paths cannot diverge.
         if self.prefix_len <= 0 {
             return Err(Error::Inference(
                 "refresh called before the prefix was seeded".to_string(),
             ));
         }
-        #[cfg(test)]
-        let use_checkpoint = USE_KV_CHECKPOINT || self.force_kv_checkpoint;
-        #[cfg(not(test))]
-        let use_checkpoint = USE_KV_CHECKPOINT;
-
-        if self.n_past > self.prefix_len {
-            if use_checkpoint {
-                // Path A: snapshot restore (preferred — detectable failure).
-                //
-                // SAFETY: `snapshot` bytes were written by `state_seq_get_data_ext`
-                // on this same context immediately after `prefill_prefix`. The
-                // context has not been destroyed or replaced since then (it lives for
-                // `LlamaLiveBackend`'s lifetime). The buffer length is passed as
-                // `src.len()` inside `state_seq_set_data_ext`.
-                match &self.snapshot {
-                    Some(buf) => {
-                        let ok = unsafe {
-                            self.ctx.state_seq_set_data_ext(
-                                buf,
-                                0,
-                                LlamaStateSeqFlags::empty(),
-                            )
-                        };
-                        if !ok {
-                            return Err(Error::Inference(
-                                "state_seq_set_data_ext failed restoring KV checkpoint; \
-                                 context state is inconsistent"
-                                    .to_string(),
-                            ));
-                        }
-                        self.n_past = self.prefix_len;
-                    }
-                    None => {
-                        // Snapshot absent (e.g. prefill cancelled); fall back to
-                        // clear_kv_cache_seq so the session degrades gracefully.
-                        match self
-                            .ctx
-                            .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
-                        {
-                            Ok(true) => self.n_past = self.prefix_len,
-                            Ok(false) | Err(_) => {
-                                return Err(Error::Inference(
-                                    "clear_kv_cache_seq failed (checkpoint fallback); \
-                                     context state is inconsistent"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Path B (active): clear_kv_cache_seq — the proven prune path.
-                // The snapshot is captured in prefill_prefix but not applied here
-                // until USE_KV_CHECKPOINT is promoted to true.
-                match self
-                    .ctx
-                    .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
-                {
-                    Ok(true) => self.n_past = self.prefix_len,
-                    Ok(false) | Err(_) => {
-                        return Err(Error::Inference(
-                            "clear_kv_cache_seq failed pruning to prefix; \
-                             context state is inconsistent"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-        }
+        self.prune_kv_to_prefix()?;
 
         // --- Tokenise the tail ---
         //
@@ -1059,6 +1061,21 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
             cancelled,
         })
     }
+
+    fn reset_to_prefix(&mut self) -> Result<(), Error> {
+        self.prune_kv_to_prefix()
+    }
+
+    fn has_room_for(&self, estimated_tokens: usize, max_gen: usize) -> bool {
+        let required = (self.n_past as usize)
+            .saturating_add(estimated_tokens)
+            .saturating_add(max_gen);
+        required <= self.config.n_ctx as usize
+    }
+
+    fn n_past(&self) -> i32 {
+        self.n_past
+    }
 }
 
 impl<'m> LlamaLiveBackend<'m> {
@@ -1096,6 +1113,99 @@ impl<'m> LlamaLiveBackend<'m> {
     /// per-session memory cost of the checkpoint.
     pub fn snapshot_size(&self) -> Option<usize> {
         self.snapshot.as_ref().map(|b| b.len())
+    }
+
+    /// Prune the KV cache to exactly `prefix_len` tokens, using the same
+    /// two-path logic as `refresh`'s restore step.
+    ///
+    /// Guards: `prefix_len` must be positive. No-ops when
+    /// `n_past <= prefix_len`. Returns `Err` on a KV prune failure so the
+    /// caller can treat the session as terminal.
+    ///
+    /// Shared by `refresh` and `reset_to_prefix` so the two cannot diverge.
+    fn prune_kv_to_prefix(&mut self) -> Result<(), Error> {
+        use llama_cpp_2::context::session::LlamaStateSeqFlags;
+
+        if self.prefix_len <= 0 {
+            return Err(Error::Inference(
+                "prune_kv_to_prefix called before the prefix was seeded".to_string(),
+            ));
+        }
+
+        if self.n_past <= self.prefix_len {
+            // Already at or before the prefix boundary; nothing to prune.
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        let use_checkpoint = USE_KV_CHECKPOINT || self.force_kv_checkpoint;
+        #[cfg(not(test))]
+        let use_checkpoint = USE_KV_CHECKPOINT;
+
+        if use_checkpoint {
+            // Path A: snapshot restore (preferred — detectable failure).
+            //
+            // SAFETY: `snapshot` bytes were written by `state_seq_get_data_ext`
+            // on this same context immediately after `prefill_prefix`. The
+            // context has not been destroyed or replaced since then (it lives for
+            // `LlamaLiveBackend`'s lifetime). The buffer length is passed as
+            // `src.len()` inside `state_seq_set_data_ext`.
+            match &self.snapshot {
+                Some(buf) => {
+                    let ok = unsafe {
+                        self.ctx.state_seq_set_data_ext(
+                            buf,
+                            0,
+                            LlamaStateSeqFlags::empty(),
+                        )
+                    };
+                    if !ok {
+                        return Err(Error::Inference(
+                            "state_seq_set_data_ext failed restoring KV checkpoint; \
+                             context state is inconsistent"
+                                .to_string(),
+                        ));
+                    }
+                    self.n_past = self.prefix_len;
+                }
+                None => {
+                    // Snapshot absent (e.g. prefill cancelled); fall back to
+                    // clear_kv_cache_seq so the session degrades gracefully.
+                    match self
+                        .ctx
+                        .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
+                    {
+                        Ok(true) => self.n_past = self.prefix_len,
+                        Ok(false) | Err(_) => {
+                            return Err(Error::Inference(
+                                "clear_kv_cache_seq failed (checkpoint fallback); \
+                                 context state is inconsistent"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            // Path B (active): clear_kv_cache_seq — the proven prune path.
+            // The snapshot is captured in prefill_prefix but not applied here
+            // until USE_KV_CHECKPOINT is promoted to true.
+            match self
+                .ctx
+                .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
+            {
+                Ok(true) => self.n_past = self.prefix_len,
+                Ok(false) | Err(_) => {
+                    return Err(Error::Inference(
+                        "clear_kv_cache_seq failed pruning to prefix; \
+                         context state is inconsistent"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1698,6 +1808,36 @@ mod tests {
             // Confirm n_past was not advanced by generation.
             debug_assert_eq!(self.n_past, n_past_after_tail);
             Ok(raw)
+        }
+
+        fn reset_to_prefix(&mut self) -> Result<(), Error> {
+            if self.prefix_len == 0 {
+                return Err(Error::Inference(
+                    "stub reset_to_prefix called before prefix was seeded".to_string(),
+                ));
+            }
+            // No-op when already at or before the prefix boundary.
+            if self.n_past > self.prefix_len {
+                self.n_past = self.prefix_len;
+            }
+            Ok(())
+        }
+
+        fn has_room_for(&self, estimated_tokens: usize, max_gen: usize) -> bool {
+            match self.n_ctx {
+                None => true, // unlimited stub
+                Some(n_ctx) => {
+                    let required = self
+                        .n_past
+                        .saturating_add(estimated_tokens)
+                        .saturating_add(max_gen);
+                    required <= n_ctx
+                }
+            }
+        }
+
+        fn n_past(&self) -> i32 {
+            self.n_past as i32
         }
     }
 
@@ -2329,6 +2469,122 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], ("user".to_string(), "hello".to_string()));
         assert_eq!(calls[1], ("tool".to_string(), r#"{"result":"ok"}"#.to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // reset_to_prefix — unit tests (stub backend, no model)
+    // -----------------------------------------------------------------------
+
+    /// `reset_to_prefix` before `seed_prefix` must return an error.
+    #[test]
+    fn reset_to_prefix_before_seed_returns_error() {
+        let stub = StubLiveBackend::new(vec![]);
+        let mut session = LiveSession::new(stub);
+
+        let err = session.reset_to_prefix_typed();
+        assert!(
+            matches!(err, Err(Error::Inference(_))),
+            "reset_to_prefix before seed_prefix must be an Inference error, got {err:?}"
+        );
+    }
+
+    /// After `seed_prefix` and several `converse` calls, `reset_to_prefix` must
+    /// set `n_past` back to the prefix length.
+    #[test]
+    fn reset_to_prefix_after_converse_resets_n_past() {
+        // "prefix" = 6 bytes → prefix_len = 6 after seed.
+        // Two converse calls add "hello" (5) and "world" (5) → n_past = 16.
+        let converse_results = vec![RawTurn::default(), RawTurn::default()];
+        let stub = StubLiveBackend::new(vec![]).with_converse_results(converse_results);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("prefix", &CancelFlag::new()).unwrap();
+        let prefix_len = session.backend.prefix_len;
+        assert_eq!(prefix_len, 6);
+
+        session.init_tool_machinery(None).unwrap();
+        session
+            .converse("user", "hello", &SamplerConfig::deterministic(), &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+        session
+            .converse("user", "world", &SamplerConfig::deterministic(), &CancelFlag::new(), &mut |_| {})
+            .unwrap();
+
+        // n_past has grown beyond the prefix.
+        assert!(
+            session.backend.n_past > prefix_len,
+            "n_past must have grown beyond prefix_len before the reset"
+        );
+
+        session.reset_to_prefix().unwrap();
+
+        assert_eq!(
+            session.backend.n_past, prefix_len,
+            "reset_to_prefix must restore n_past to exactly prefix_len"
+        );
+    }
+
+    /// `reset_to_prefix` is a no-op when `n_past` is already at the prefix boundary.
+    #[test]
+    fn reset_to_prefix_is_noop_when_already_at_prefix() {
+        let stub = StubLiveBackend::new(vec![]);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("prefix", &CancelFlag::new()).unwrap();
+
+        // n_past == prefix_len immediately after seed; no converse calls.
+        let n_past_before = session.backend.n_past;
+        session.reset_to_prefix().unwrap();
+        assert_eq!(
+            session.backend.n_past, n_past_before,
+            "reset_to_prefix must be a no-op when n_past == prefix_len"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // has_room_for — boundary tests (stub backend)
+    // -----------------------------------------------------------------------
+
+    /// `has_room_for` returns `true` when the turn fits exactly in the remaining space.
+    #[test]
+    fn has_room_for_fits_exactly_returns_true() {
+        // n_ctx=100, prefix="prefix"(6), so n_past=6 after seed.
+        // estimated=50, max_gen=44 → required = 6+50+44 = 100 = n_ctx → fits.
+        let stub = StubLiveBackend::new(vec![]).with_n_ctx(100);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("prefix", &CancelFlag::new()).unwrap(); // n_past = 6
+        assert_eq!(session.backend.n_past, 6);
+
+        assert!(
+            session.has_room_for(50, 44),
+            "has_room_for must return true when required == n_ctx"
+        );
+    }
+
+    /// `has_room_for` returns `false` when the turn would exceed the context by one.
+    #[test]
+    fn has_room_for_exceeds_by_one_returns_false() {
+        // n_ctx=100, n_past=6; estimated=50, max_gen=45 → required=101 > 100.
+        let stub = StubLiveBackend::new(vec![]).with_n_ctx(100);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("prefix", &CancelFlag::new()).unwrap();
+
+        assert!(
+            !session.has_room_for(50, 45),
+            "has_room_for must return false when required == n_ctx + 1"
+        );
+    }
+
+    /// `has_room_for` always returns `true` for an unbounded stub.
+    #[test]
+    fn has_room_for_unbounded_stub_always_true() {
+        // No n_ctx set → unlimited.
+        let stub = StubLiveBackend::new(vec![]);
+        let mut session = LiveSession::new(stub);
+        session.seed_prefix("prefix", &CancelFlag::new()).unwrap();
+
+        assert!(
+            session.has_room_for(usize::MAX / 2, usize::MAX / 2),
+            "has_room_for on an unbounded stub must always return true"
+        );
     }
 
     // -----------------------------------------------------------------------

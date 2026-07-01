@@ -891,25 +891,52 @@ categories. Cross-cutting rules:
   flag on receipt, emits one `LiveDigestError` event, and dispatches no further
   turns. The worker also stops after a terminal result.
 
-  *Context overflow policy.* The grow-in-place context can reach `n_ctx` on a
-  long meeting. `Error::ContextOverflow` from `LlamaLiveBackend::append_turn`
-  (surfaced by `LiveSession::converse_typed`) maps to
-  `WorkerResult::CapacityExhausted` and is terminal. The driver emits ONE
-  `LiveDigestError` and sets a `terminal` flag that stops all further turn
-  dispatches for the session. Re-seeding mid-recording is NOT attempted (it
-  would re-prefill from scratch, starving ASR). `classify_converse_error`
+  *Context eviction policy (U2 v1).* `process_request` estimates the incoming
+  turn cost (`model_prompt.len() / 3 + FRAMING_TOKEN_MARGIN`, a deliberate
+  over-estimate so a boundary turn evicts early rather than hitting the hard
+  overflow) and calls `session.has_room_for(estimated_tokens, max_gen)` BEFORE
+  each `converse` call.
+  When the check fails the driver EVICTS: it reads the last 8 User + Assistant
+  turns from the persisted live `ChatSession` (`load_eviction_recap`,
+  `EVICT_RECAP_TURNS = 8`), formats them as a size-capped verbatim block
+  (`EVICT_RECAP_CHARS ≈ 4000`, most-recent-first trimming, then reversed to
+  chronological), calls `session.reset_to_prefix()` to prune the KV back to the
+  seeded prefix, and prepends
+  `"Earlier in this conversation (older context was condensed):\n{recap}\n\n"`
+  (sanitised with `sanitise_untrusted`) to the model prompt for that turn.
+  The eviction is logged via `tracing::info!` (meeting id, pre-eviction n_past,
+  recap turns/chars). Older context is dropped from the KV but remains in the
+  persisted log and the RAG index, recoverable on demand.
+
+  If `converse` returns `ContextOverflow` when the turn was NOT pre-emptively
+  evicted (the estimate was too optimistic), the worker evicts once and retries
+  that turn. If it STILL returns `ContextOverflow` after an eviction (a single
+  turn that exceeds the entire post-reset budget), `classify_converse_error` maps
+  it to `WorkerResult::CapacityExhausted` — a turn that cannot fit even a fresh
+  context is a genuine terminal condition. Eviction therefore happens at most
+  once per turn (an `already_evicted` guard prevents any retry loop). `classify_converse_error`
   classifies on the TYPED `chat_agent::Error` (not on `AppError::InvalidInput`,
   which conflates `ContextOverflow`, `MalformedOutput`, and `Template`) so only
   genuine overflow maps to `CapacityExhausted`; a transient parse glitch
   (`MalformedOutput`) maps to `WorkerResult::Err` with an accurate label.
 
-  *KV growth policy.* The context GROWS across turns — no per-turn prune.
-  `LlamaLiveBackend::append_turn` advances `n_past` monotonically. The
-  `clear_kv_cache_seq` / snapshot-restore mechanism is used only by
-  `LiveSessionBackend::refresh` (the post-meeting path); it is NOT on the
-  live path. `clear_kv_cache_seq` returns `Result<bool, KvCacheConversionError>`
-  on the `refresh` path; an unrecoverable return means the backend returns `Err`
-  there.
+  **Deferred — v2 rolling-summary layered budget.** Rather than only keeping
+  last-K verbatim turns, v2 would summarise the evicted middle and prepend that
+  summary to the recap. The `reset_to_prefix` + recap-header infrastructure is
+  in place; the summarisation call is the deferred piece. Tracked as a later U2
+  item.
+
+  *KV growth policy.* Between evictions the context GROWS across turns — no
+  per-turn prune. `LlamaLiveBackend::append_turn` advances `n_past` monotonically.
+  On eviction `reset_to_prefix` prunes back to `prefix_len` via
+  `clear_kv_cache_seq(Some(0), Some(prefix_len), None)` (Path B; Path A via
+  snapshot restore is gated on `USE_KV_CHECKPOINT = false`). The
+  `clear_kv_cache_seq` / snapshot-restore mechanism is available to both
+  `LiveSessionBackend::refresh` (the post-meeting path) and
+  `LiveSessionBackend::reset_to_prefix` (the eviction path); both delegate to
+  `prune_kv_to_prefix` so the two cannot diverge. `clear_kv_cache_seq` returns
+  `Result<bool, KvCacheConversionError>`; an unrecoverable return is treated as a
+  terminal error and mapped to `CapacityExhausted`.
 
   *Cancellability.* `prefill_prefix` and the tail-prefill loop in `refresh` both
   accept a `&CancelFlag` and check it between decoded chunks. A raised flag during
@@ -931,17 +958,19 @@ categories. Cross-cutting rules:
 
 - **Keep-alive append-turn model (U2).** The live cadence drives
   `LiveSession::converse` (backed by `LlamaLiveBackend::append_turn`) for BOTH
-  transcript and user-chat turns — no prune-to-prefix on the live path.
-  The context GROWS across turns; `prefix_len` marks the seeded system prompt and
-  the KV is never pruned back to it during the session. The two turn kinds differ
-  only in framing and response policy: `TurnKind::Transcript` wraps the retrieved
-  context block + NOOP-sentinel instruction and is stored with `ChatRole::Digest`;
-  `TurnKind::UserChat` delivers the user's literal message and is stored with
-  `ChatRole::User`. Both are served by `process_request`, which persists the clean
-  (unframed) input text to the live `ChatSession` and passes the framed model
-  prompt to `converse_typed`. The `LiveSession::refresh_typed` / prune-to-prefix
-  path is **not used on the live path** and remains available only for the
-  post-meeting `LiveSessionBackend::refresh` contract.
+  transcript and user-chat turns. The context GROWS across turns; `prefix_len`
+  marks the seeded system prompt. When the context approaches `n_ctx` the
+  eviction path (see *Context eviction policy* above) prunes the KV back to
+  `prefix_len` and prepends a verbatim last-K recap, keeping the session alive
+  across a long meeting. The two turn kinds differ only in framing and response
+  policy: `TurnKind::Transcript` wraps the retrieved context block + NOOP-sentinel
+  instruction and is stored with `ChatRole::Digest`; `TurnKind::UserChat` delivers
+  the user's literal message and is stored with `ChatRole::User`. Both are served
+  by `process_request`, which persists the clean (unframed) input text to the live
+  `ChatSession` and passes the framed model prompt to `converse_typed`. The
+  `LiveSession::refresh_typed` / prune-to-prefix path is **not used on the live
+  path** and remains available only for the post-meeting
+  `LiveSessionBackend::refresh` contract.
 
 - **Two-tier attachment context (U2 awareness).** Attachment content enters the
   live co-pilot via two complementary paths:

@@ -356,6 +356,77 @@ async fn run_convert_job(
             if let Some(handles) = &rag_handles {
                 crate::rag_index::index_attachment(handles, meeting_id, &hash_for_index).await;
             }
+            // Awareness (best-effort): generate a compact summary + keywords for
+            // the live co-pilot prefix. Runs after the RAG index so the conversion
+            // row is already Ready; a slow or failed awareness pass must not revert
+            // readiness or surface as a user-visible error.
+            //
+            // NOTE: mid-meeting re-seed is deferred. The awareness text is
+            // persisted here and loaded at worker startup; a live session that is
+            // already running when this attachment is added picks it up only after
+            // restart (the A1 dirty-prefix / eviction-rebuild mechanism is a later
+            // U2 item).
+            if let Some(handles) = &rag_handles {
+                match handles.ensure_summariser().await {
+                    Ok(summariser) => {
+                        let md_filename = format!("{}.md", hash_for_index);
+                        match persistence::read_attachment_markdown(
+                            meetings_dir,
+                            meeting_id,
+                            &md_filename,
+                        ) {
+                            Ok(md) => {
+                                let summariser_clone = summariser.clone();
+                                let awareness_result = tokio::task::spawn_blocking(move || {
+                                    summariser_clone.generate_attachment_awareness(&md)
+                                })
+                                .await;
+                                match awareness_result {
+                                    Ok(Ok(awareness)) => {
+                                        if let Err(e) = persistence::attachments::set_entry_awareness(
+                                            meetings_dir,
+                                            meeting_id,
+                                            attachment_id,
+                                            &awareness,
+                                        ) {
+                                            tracing::warn!(
+                                                target: "ipc-bridge",
+                                                meeting_id = %meeting_id.0,
+                                                attachment_id = %attachment_id.0,
+                                                "awareness persist failed: {e}"
+                                            );
+                                        }
+                                    }
+                                    Ok(Err(e)) => tracing::warn!(
+                                        target: "ipc-bridge",
+                                        meeting_id = %meeting_id.0,
+                                        attachment_id = %attachment_id.0,
+                                        "awareness generation failed: {e}"
+                                    ),
+                                    Err(join_err) => tracing::warn!(
+                                        target: "ipc-bridge",
+                                        meeting_id = %meeting_id.0,
+                                        attachment_id = %attachment_id.0,
+                                        "awareness task join failed: {join_err}"
+                                    ),
+                                }
+                            }
+                            Err(e) => tracing::warn!(
+                                target: "ipc-bridge",
+                                meeting_id = %meeting_id.0,
+                                attachment_id = %attachment_id.0,
+                                "awareness: could not read converted markdown: {e}"
+                            ),
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        target: "ipc-bridge",
+                        meeting_id = %meeting_id.0,
+                        attachment_id = %attachment_id.0,
+                        "awareness: summariser unavailable: {e}"
+                    ),
+                }
+            }
         }
         Ok(Ok(false)) => {
             // Row removed mid-conversion: the markdown was cleaned up above and
@@ -506,6 +577,7 @@ mod tests {
                 added_at: chrono::Utc::now().to_rfc3339(),
                 conversion: ConversionState::Pending,
                 converted_md_filename: None,
+                awareness: None,
             },
         )
         .expect("add manifest");
@@ -562,6 +634,7 @@ mod tests {
                 added_at: chrono::Utc::now().to_rfc3339(),
                 conversion: ConversionState::Pending,
                 converted_md_filename: None,
+                awareness: None,
             },
         )
         .expect("add manifest");
@@ -655,6 +728,7 @@ mod tests {
                 added_at: chrono::Utc::now().to_rfc3339(),
                 conversion: ConversionState::Ready,
                 converted_md_filename: Some("x.md".to_string()),
+                awareness: None,
             },
         )
         .expect("add ready");
@@ -703,6 +777,7 @@ mod tests {
                 added_at: chrono::Utc::now().to_rfc3339(),
                 conversion: ConversionState::Pending,
                 converted_md_filename: None,
+                awareness: None,
             },
         )
         .expect("add manifest");

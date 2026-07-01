@@ -418,6 +418,34 @@ pub fn set_entry_conversion(
     Ok(found)
 }
 
+/// Set the `awareness` text on an existing manifest row, under the per-meeting
+/// write lock.
+///
+/// Mirrors `set_entry_conversion`. Returns `true` when a row with `id` was
+/// found and updated, `false` when the id is absent (e.g. the attachment was
+/// removed while the awareness pass was running). A `false` result is not an
+/// error — the manifest is left unchanged (idempotent).
+pub fn set_entry_awareness(
+    root: &Path,
+    meeting_id: MeetingId,
+    id: AttachmentId,
+    awareness: &str,
+) -> AppResult<bool> {
+    let lock = manifest_lock(meeting_id);
+    let _guard = lock.lock().expect("manifest lock poisoned");
+
+    let mut entries = read_manifest_unlocked(root, meeting_id)?;
+    let found = match entries.iter_mut().find(|e| e.id == id) {
+        Some(row) => {
+            row.awareness = Some(awareness.to_owned());
+            true
+        }
+        None => false,
+    };
+    write_manifest_unlocked(root, meeting_id, &entries)?;
+    Ok(found)
+}
+
 /// Remove the manifest row for `id`, under the per-meeting write lock.
 ///
 /// After writing the new manifest, performs a dedup-safe unlink: the original
@@ -549,6 +577,7 @@ mod tests {
             added_at: "2026-06-22T10:00:00Z".to_string(),
             conversion: ConversionState::Pending,
             converted_md_filename: None,
+            awareness: None,
         }
     }
 
@@ -737,6 +766,73 @@ mod tests {
             ConversionState::Pending,
             "the present row's state must be untouched by the absent-id update"
         );
+    }
+
+    // -- set_entry_awareness --
+
+    #[test]
+    fn set_entry_awareness_roundtrip() {
+        let (_td, root, id) = make_meeting();
+        let entry = make_entry("awarehash", "pdf", "brief.pdf");
+        let eid = entry.id;
+
+        add_manifest_entry(&root, id, entry).expect("add");
+        let found =
+            set_entry_awareness(&root, id, eid, "One-sentence summary.\n\nKeywords: foo, bar")
+                .expect("set awareness");
+        assert!(found, "row was present so the update must report found");
+
+        let updated = read_manifest(&root, id).expect("read after set");
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0].awareness,
+            Some("One-sentence summary.\n\nKeywords: foo, bar".to_string())
+        );
+    }
+
+    #[test]
+    fn set_entry_awareness_absent_id_reports_false() {
+        let (_td, root, id) = make_meeting();
+        // One real row so the manifest/dir exists; update a different id.
+        let present = make_entry("livehash2", "pdf", "live2.pdf");
+        let present_id = present.id;
+        add_manifest_entry(&root, id, present).expect("add");
+
+        let found = set_entry_awareness(&root, id, AttachmentId::new(), "should not apply")
+            .expect("set awareness on absent id");
+        assert!(!found, "absent id must report not-found");
+
+        let entries = read_manifest(&root, id).expect("read");
+        assert_eq!(entries.len(), 1, "the present row must survive");
+        assert_eq!(entries[0].id, present_id);
+        assert_eq!(
+            entries[0].awareness, None,
+            "the present row's awareness must be untouched by the absent-id update"
+        );
+    }
+
+    #[test]
+    fn set_entry_awareness_absent_field_deserialises_from_old_manifest() {
+        // A manifest serialised without the `awareness` field must still
+        // deserialise — verifying the `#[serde(default)]` attribute works.
+        let (_td, root, id) = make_meeting();
+        let entry = make_entry("oldhash", "txt", "old.txt");
+        add_manifest_entry(&root, id, entry).expect("add");
+
+        // Rewrite the manifest JSON with the `awareness` key stripped out.
+        let dir = attachments_dir(&root, id);
+        let path = dir.join("attachments.json");
+        let raw = std::fs::read_to_string(&path).expect("read manifest");
+        let stripped = raw
+            .lines()
+            .filter(|l| !l.contains("\"awareness\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, stripped.as_bytes()).expect("write stripped manifest");
+
+        let entries = read_manifest(&root, id).expect("deserialise old manifest");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].awareness, None, "missing field defaults to None");
     }
 
     // -- Dedup-safe remove --

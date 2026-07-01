@@ -867,6 +867,16 @@ pub struct AttachmentEntry {
     /// once `conversion` is [`ConversionState::Ready`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub converted_md_filename: Option<String>,
+    /// A 1–3 sentence summary plus keyword list generated from the converted
+    /// markdown at attach time. `None` until the awareness pass completes;
+    /// deserialisable from manifests that predate this field (`#[serde(default)]`).
+    /// The live co-pilot worker pins this into the prefix so the co-pilot knows
+    /// which documents exist and can request detail via RAG on demand.
+    ///
+    /// Mid-meeting re-seed (adding an attachment while a live session is already
+    /// running) is deferred — awareness is loaded at worker startup only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awareness: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3065,5 +3075,59 @@ mod tests {
         let back: InterAgentReply = serde_json::from_str(&json).unwrap();
         assert_eq!(back.session_id, reply.session_id);
         assert_eq!(back.reply, reply.reply);
+    }
+
+    #[test]
+    fn attachment_entry_serde_with_awareness() {
+        // AttachmentEntry with awareness serialises and deserialises correctly.
+        let entry = AttachmentEntry {
+            id: AttachmentId::new(),
+            hash: "abc123".to_string(),
+            original_filename: "report.pdf".to_string(),
+            ext: "pdf".to_string(),
+            byte_len: 1024,
+            added_at: "2026-07-02T10:00:00Z".to_string(),
+            conversion: ConversionState::Ready,
+            converted_md_filename: Some("abc123.md".to_string()),
+            awareness: Some("Executive summary: A quarterly financial report.\n\nKeywords: finance, quarterly, analysis".to_string()),
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"awareness\""));
+        assert!(json.contains("Executive summary"));
+        assert!(json.contains("Keywords"));
+
+        let back: AttachmentEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, entry.id);
+        assert_eq!(back.awareness, entry.awareness);
+    }
+
+    #[test]
+    fn attachment_entry_serde_without_awareness_field_in_old_manifest() {
+        // An old manifest serialised before the awareness field was added must
+        // still deserialise — verifying #[serde(default)] on the awareness field.
+        let entry = AttachmentEntry {
+            id: AttachmentId::new(),
+            hash: "olddata".to_string(),
+            original_filename: "notes.txt".to_string(),
+            ext: "txt".to_string(),
+            byte_len: 512,
+            added_at: "2026-06-01T12:00:00Z".to_string(),
+            conversion: ConversionState::Ready,
+            converted_md_filename: Some("olddata.md".to_string()),
+            awareness: None,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        // Manually strip the awareness field to simulate an old manifest.
+        let stripped = json
+            .lines()
+            .filter(|l| !l.contains("\"awareness\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let back: AttachmentEntry = serde_json::from_str(&stripped).unwrap();
+        assert_eq!(back.id, entry.id);
+        assert_eq!(back.awareness, None, "missing awareness field must default to None");
     }
 }

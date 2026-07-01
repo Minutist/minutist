@@ -943,11 +943,37 @@ categories. Cross-cutting rules:
   path is **not used on the live path** and remains available only for the
   post-meeting `LiveSessionBackend::refresh` contract.
 
-- **Small-prefix + retrieve-into-tail constraint (Phase D).** Attachment markdown
-  is NOT pinned in the prefix — pinning a large set costs a one-time prefill (~40 s,
-  minutes on an integrated GPU) that would starve ASR and stall the recording UI.
-  Instead the prefix is just the system prompt + categories (sub-second prefill,
-  once at session spawn), and relevant attachment / earlier-transcript context is
+- **Two-tier attachment context (U2 awareness).** Attachment content enters the
+  live co-pilot via two complementary paths:
+  - **Awareness tier (pinned in prefix).** At attach time the conversion worker
+    generates a 1–3 sentence summary + topic keywords for each attachment via
+    `summariser::generate_attachment_awareness` (bounded to the first ~8–12 kB of
+    the markdown, capped output at 256 tokens). The result is persisted on
+    `AttachmentEntry::awareness` by `persistence::set_entry_awareness`. At worker
+    startup, `run_worker_thread` reads the manifest, collects `Ready` entries with
+    `awareness = Some(...)`, sanitises each with `sanitise_untrusted`, and builds a
+    compact `"- filename: summary\n"` block passed to `build_prefix` as
+    `awareness_block`. When non-empty, the block is injected between the system
+    prompt and the close marker under the heading
+    `## Attached documents (retrieve details on demand)`. A manifest read failure
+    or no attachments with awareness produces an empty block; the co-pilot runs as
+    before. This adds a negligible prefix cost (one short line per attachment).
+  - **Detail tier (retrieved on demand).** Full attachment chunks/embeddings are
+    retrieved each refresh via the existing RAG path (`build_retrieval_block`,
+    dense + lexical over `meeting.db`, fused by RRF). Nothing changes here.
+  - **Mid-session re-seed is deferred.** An attachment added DURING a live session
+    is not reflected in the prefix until the session restarts. The A1
+    dirty-prefix / eviction-rebuild mechanism (which would update the prefix
+    in-place without a full re-seed) is a later U2 item.
+  - The attach-worker → summariser dependency (`rag_handles.ensure_summariser`)
+    pre-exists via `rag_handles`; see the dependency table in `components.md`.
+
+- **Small-prefix + retrieve-into-tail constraint (Phase D).** Full attachment
+  markdown is NOT pinned in the prefix — pinning a large set costs a one-time
+  prefill (~40 s, minutes on an integrated GPU) that would starve ASR and stall
+  the recording UI. Instead the prefix carries the system prompt + compact
+  per-attachment awareness (the awareness tier above; sub-second prefill, once at
+  session spawn), and relevant attachment detail / earlier-transcript context is
   retrieved into the bounded tail each refresh. A tier-scaled `k` (halved on an
   integrated GPU) keeps the per-refresh prefill small. Subsequent `seed_prefix`
   calls on the same `LiveSession` are no-ops.

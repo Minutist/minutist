@@ -1361,7 +1361,18 @@ conversion: ConversionState;
  * The filename of the converted markdown sibling (`"<hash>.md"`), present
  * once `conversion` is [`ConversionState::Ready`].
  */
-converted_md_filename?: string | null }
+converted_md_filename?: string | null; 
+/**
+ * A 1–3 sentence summary plus keyword list generated from the converted
+ * markdown at attach time. `None` until the awareness pass completes;
+ * deserialisable from manifests that predate this field (`#[serde(default)]`).
+ * The live co-pilot worker pins this into the prefix so the co-pilot knows
+ * which documents exist and can request detail via RAG on demand.
+ * 
+ * Mid-meeting re-seed (adding an attachment while a live session is already
+ * running) is deferred — awareness is loaded at worker startup only.
+ */
+awareness?: string | null }
 /**
  * Stable identifier for a meeting attachment on disk. UUIDv4. Mirrors
  * [`MeetingId`].

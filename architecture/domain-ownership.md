@@ -137,6 +137,29 @@ restated. Adding any other edge requires updating
   transcript-refresh (`LiveSession::refresh_typed`) and the append-turn
   (`ConversationalTurn::append_turn`) paths from one loop. No new dependency
   edge is added (the `ipc-bridge → chat-agent` edge pre-exists).
+  **U2 attachment awareness (ipc-bridge + summariser + persistence,
+  systems-engineer + ml-runtime-engineer + data-engineer).** The two-tier
+  attachment context described in `cross-cutting.md` — "Two-tier attachment
+  context" is implemented across three domains:
+  - `summariser` (ml-runtime-engineer) gains
+    `LlamaSummariser::generate_attachment_awareness(&self, md: &str) ->
+    AppResult<String>` — a bounded (first ~8–12 kB of input, ≤ 256 output tokens)
+    one-shot call that produces a 1–3 sentence summary + `Keywords: …` line. No
+    new dependency edge (`summariser` already depends on `common`).
+  - `persistence` (data-engineer) gains `set_entry_awareness(root, meeting_id,
+    attachment_id, awareness: &str) -> AppResult<()>` — persists the generated
+    text onto `AttachmentEntry::awareness` under the per-meeting manifest lock.
+    No new dependency edge (`persistence` already depends on `common`).
+  - `ipc-bridge` (systems-engineer) calls `generate_attachment_awareness` inside
+    the conversion worker's `Ok(Ok(true))` arm (best-effort, never fails the
+    conversion), then `set_entry_awareness` on success. At worker startup,
+    `run_worker_thread` reads the manifest, collects `Ready` entries with
+    `awareness = Some(...)`, sanitises each, and passes the block to
+    `build_prefix(s, markers, awareness_block)`. The attach-worker → summariser
+    edge (`rag_handles.ensure_summariser`) already existed via `rag_handles`; no
+    new dependency-table edge is needed. The `ipc-bridge → persistence` edge
+    pre-exists. Mid-session re-seed (an attachment added while the session is
+    running) is deferred — see `cross-cutting.md` — "Two-tier attachment context".
 - **Voiceprint identity types + maths (issue #0003 WU0 — one-way door).**
   `VoiceprintIdentityId` and `VoiceprintCentroidId` are UUID newtypes added to
   `common` by the architecture-owner. Adding them is a **one-way-door** per

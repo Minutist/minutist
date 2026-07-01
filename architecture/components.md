@@ -365,12 +365,18 @@ single `collect_events![AppEventPayload]` registration — no second registratio
   carries a concise human reason string the UI shows on the attachment row.
 - `AttachmentEntry { id: AttachmentId, hash: String, original_filename: String,
   ext: String, byte_len: u64, added_at: String, conversion: ConversionState,
-  converted_md_filename: Option<String> }` — the manifest row that crosses IPC.
-  `hash` is the hex SHA-256 of the original bytes (the dedup key shared with the
-  on-disk `<hash>.<ext>` original and `<hash>.md` sibling). `added_at` is RFC 3339
-  (same convention as `ChatSession::created_at`). `converted_md_filename` is
-  `Some("<hash>.md")` once `ConversionState` reaches `Ready`; absent otherwise
-  (`serde(default, skip_serializing_if = "Option::is_none")`).
+  converted_md_filename: Option<String>, awareness: Option<String> }` — the
+  manifest row that crosses IPC. `hash` is the hex SHA-256 of the original bytes
+  (the dedup key shared with the on-disk `<hash>.<ext>` original and `<hash>.md`
+  sibling). `added_at` is RFC 3339 (same convention as `ChatSession::created_at`).
+  `converted_md_filename` is `Some("<hash>.md")` once `ConversionState` reaches
+  `Ready`; absent otherwise (`serde(default, skip_serializing_if =
+  "Option::is_none")`). `awareness` is `Some("1–3 sentence summary.\n\nKeywords:
+  …")` once the awareness pass completes at attach time; absent otherwise
+  (`serde(default, skip_serializing_if = "Option::is_none")`). The awareness text
+  is model-generated from the converted markdown and is pinned into the live
+  co-pilot prefix at worker startup (awareness tier); see
+  `cross-cutting.md` — "Two-tier attachment context".
 
 Four `AppEvent` variants (placed in a `--- Attachments ---` comment block after
 `TranslationReady`, serialised via the existing `#[serde(tag="kind",

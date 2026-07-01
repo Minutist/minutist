@@ -963,6 +963,7 @@ pub async fn add_attachment(
             added_at: chrono::Utc::now().to_rfc3339(),
             conversion: ConversionState::Pending,
             converted_md_filename: None,
+            awareness: None,
         };
         persistence::add_manifest_entry(&meetings_dir, meeting_id, entry.clone())?;
         Ok(entry)

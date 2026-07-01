@@ -671,13 +671,17 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
 
         // D3 (issue 0022): cap the pinned prefix at half of n_ctx so the other
         // half is always available for the per-refresh tail (retrieved context +
-        // running digest + recent transcript window) plus generation. Under the
-        // current driver the prefix is small (system prompt + category list + JSON
-        // contract), so this is a defensive guard — not normally hit — against a
-        // pathologically large system prompt. The instruction text sits at the
-        // FRONT of the prefix, so truncating the token tail drops trailing prefix
-        // content first and preserves the instructions: a soft degradation,
-        // whereas starving the per-refresh window is not.
+        // running digest + recent transcript window) plus generation. The prefix
+        // is a closed user turn (system prompt + bounded attachment awareness +
+        // close marker); the caller bounds the awareness block to a few kB, so
+        // this truncation guard is a last-resort backstop against a pathologically
+        // large system prompt. The instruction text sits at the FRONT of the
+        // prefix, so truncating the token tail is a soft degradation — it drops
+        // trailing awareness lines rather than the system instructions. The close
+        // marker at the very end is not dropped as long as the caller respects the
+        // awareness budget; if it were dropped (caller contract violated), the
+        // first append_turn would produce malformed framing, so the caller MUST
+        // keep the awareness block well within the n_ctx/2 headroom.
         let max_prefix_tokens = (self.config.n_ctx as usize) / 2;
         if tokens.len() > max_prefix_tokens {
             tracing::warn!(

@@ -810,6 +810,7 @@ fn seed_attachment(
         added_at: "2026-06-22T10:00:00Z".to_string(),
         conversion: minutist_common::ConversionState::Ready,
         converted_md_filename: Some(md_filename.clone()),
+        awareness: None,
     };
     persistence::add_manifest_entry(meetings_dir, meeting_id, entry).expect("add manifest entry");
     md_filename

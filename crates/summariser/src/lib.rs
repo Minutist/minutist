@@ -314,6 +314,58 @@ impl LlamaSummariser {
         Ok(strip_think_block(&raw))
     }
 
+    /// Generate a compact awareness summary for a converted attachment markdown.
+    ///
+    /// Produces 1–3 sentences describing the document, then `Keywords:` followed
+    /// by comma-separated topic keywords. The result is meant to be pinned into
+    /// the live co-pilot prefix so the co-pilot knows which documents exist and
+    /// can invoke the RAG detail path on demand.
+    ///
+    /// Input is capped at `AWARENESS_INPUT_CAP` characters before prompting so
+    /// that large documents do not overflow the model context. Only the leading
+    /// section is used — the summary of a long document is typically determined
+    /// by its opening content anyway.
+    ///
+    /// Mid-meeting re-seed is deferred: awareness generated here is persisted to
+    /// the manifest and loaded at worker startup, so a live session that is
+    /// already running when an attachment is added picks it up only after restart.
+    ///
+    /// The method is concrete on [`LlamaSummariser`] (no remote backend path) and
+    /// shares the same prompt-build + generate machinery as `translate_segment`.
+    pub fn generate_attachment_awareness(&self, md: &str) -> AppResult<String> {
+        // Cap the input to avoid blowing the model context on large documents.
+        // The leading ~10 000 characters capture the abstract and early content,
+        // which is sufficient for a 1–3 sentence summary.
+        //
+        // The cap is applied by character count so that the slice always falls
+        // on a valid UTF-8 boundary — slicing &str by a raw byte index panics
+        // when the byte falls inside a multi-byte codepoint.
+        const AWARENESS_INPUT_CAP: usize = 10_000;
+        let input = if md.chars().count() > AWARENESS_INPUT_CAP {
+            // Walk to the first char boundary at or beyond the cap.
+            let byte_end = md
+                .char_indices()
+                .nth(AWARENESS_INPUT_CAP)
+                .map(|(i, _)| i)
+                .unwrap_or(md.len());
+            &md[..byte_end]
+        } else {
+            md
+        };
+
+        let instruction = format!(
+            "Summarise this document in 1–3 sentences, then on a new line give \
+             `Keywords: ` followed by a comma-separated list of the main topics. \
+             Be concise and factual. Do not add anything else.\n\n{input}"
+        );
+
+        let prompt = self.build_translation_prompt(&instruction)?;
+        // Cap generation at 256 tokens — a 1–3 sentence summary plus a keyword
+        // line is well within that budget.
+        let raw = self.generate_bounded(&prompt, 256)?;
+        Ok(strip_think_block(&raw))
+    }
+
     /// Borrow the loaded [`LlamaModel`] for the chat engine (Phase 9, D5).
     ///
     /// The substrate seam: `ipc-bridge` holds the concrete
@@ -1734,6 +1786,67 @@ mod tests {
         assert!(
             !translation.contains("<think>"),
             "translation must not contain a think block: {translation:?}"
+        );
+    }
+
+    // Gated generate_attachment_awareness test — skips when MINUTIST_LLM_MODEL_PATH absent.
+    // ----------------------------------------------------------------------------------
+
+    /// Feed a short markdown document to `generate_attachment_awareness` and
+    /// assert the output is non-empty, reasonably short, and contains the word
+    /// "Keywords".
+    ///
+    /// To run:
+    ///   MINUTIST_LLM_MODEL_PATH=/path/to/model.gguf \
+    ///   cargo test -p summariser generate_attachment_awareness_produces_summary -- --include-ignored
+    #[test]
+    #[ignore = "requires MINUTIST_LLM_MODEL_PATH"]
+    fn generate_attachment_awareness_produces_summary() {
+        let model_path = match std::env::var("MINUTIST_LLM_MODEL_PATH") {
+            Ok(p) if !p.is_empty() => PathBuf::from(p),
+            _ => return,
+        };
+
+        let summariser = LlamaSummariser::open(model_path, SummariserConfig::default())
+            .expect("model load must succeed");
+
+        let doc = "# Q2 Revenue Report\n\n\
+                   Total revenue for Q2 reached AUD 4.2 million, up 18% year-on-year. \
+                   Growth was driven primarily by the enterprise segment, which contributed \
+                   62% of total billings. Operating costs remained stable at AUD 2.8 million, \
+                   yielding an operating margin of 33%.";
+
+        let start = std::time::Instant::now();
+        let awareness = summariser
+            .generate_attachment_awareness(doc)
+            .expect("generate_attachment_awareness must succeed");
+        let elapsed = start.elapsed();
+
+        eprintln!(
+            "generate_attachment_awareness ({} ms): {:?}",
+            elapsed.as_millis(),
+            awareness
+        );
+
+        assert!(!awareness.trim().is_empty(), "awareness must be non-empty");
+
+        // Output must be reasonably short — 1–3 sentences plus a keyword line.
+        // 600 characters is a generous upper bound.
+        assert!(
+            awareness.len() < 600,
+            "awareness output too long ({} chars): {awareness:?}",
+            awareness.len()
+        );
+
+        assert!(
+            awareness.contains("Keywords"),
+            "awareness must contain 'Keywords': {awareness:?}"
+        );
+
+        // Must not contain a think block (stripped before return).
+        assert!(
+            !awareness.contains("<think>"),
+            "awareness must not contain a think block: {awareness:?}"
         );
     }
 

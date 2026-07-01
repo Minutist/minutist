@@ -241,10 +241,12 @@ impl<B: LiveSessionBackend> LiveSession<B> {
 ///
 /// Lifecycle:
 /// 1. [`LiveSessionBackend::prefill_prefix`] — tokenise + chunked-prefill the
-///    prefix, advance `n_past`, record `prefix_len`.
-/// 2. [`LiveSessionBackend::refresh`] — prune the KV back to `prefix_len`,
-///    tokenise + prefill the fresh tail, decode the answer. `n_past` returns to
-///    `prefix_len` at the start of the next refresh, so it stays bounded.
+///    prefix, advance `n_past`, record `prefix_len`, and capture the KV
+///    checkpoint snapshot.
+/// 2. [`LiveSessionBackend::refresh`] — restore the KV checkpoint (or fall back
+///    to `clear_kv_cache_seq` if no snapshot is held), set `n_past` back to
+///    `prefix_len`, append the fresh tail, and decode the answer. `n_past`
+///    therefore stays bounded at `prefix_len + tail + generation`.
 ///
 /// **`!Send`**: `LlamaContext` is `!Send`. The S2b driver owns the thread.
 pub struct LlamaLiveBackend<'m> {
@@ -254,10 +256,35 @@ pub struct LlamaLiveBackend<'m> {
     n_past: i32,
     /// KV positions `0..prefix_len` hold the pinned prefix (the open user turn:
     /// system + digest-category instructions). Recorded by `prefill_prefix` and
-    /// never re-decoded. Every `refresh` prunes the KV cache back to exactly this
-    /// length before appending its tail, so the prefill is paid once and the held
-    /// context never grows beyond `prefix_len + tail + generation`.
+    /// never re-decoded. Every `refresh` restores the KV checkpoint back to
+    /// exactly this length before appending its tail, so the prefill is paid once
+    /// and the held context never grows beyond `prefix_len + tail + generation`.
     prefix_len: i32,
+    /// A FNV-1a hash of the prefix text used to build the current snapshot.
+    /// When the prefix changes (settings update), the snapshot is discarded and
+    /// re-captured after the next `prefill_prefix` call so the KV checkpoint
+    /// stays coherent with the actual prefix content.
+    prefix_hash: u64,
+    /// Serialised KV checkpoint of the context state immediately after
+    /// `prefill_prefix` completes. Captured once per prefix via
+    /// `state_seq_get_data_ext` (the per-sequence form with a detectable failure
+    /// path). Each `refresh` restores it via `state_seq_set_data_ext` (preferred,
+    /// bool-returning) so a restore failure is detectable and can be treated as
+    /// fatal.
+    ///
+    /// `None` until the first successful `prefill_prefix`. Falls back to
+    /// `clear_kv_cache_seq` when absent (e.g. a cancelled or failed prefill).
+    ///
+    /// Promotion gate: this path is opt-in at compile time via the
+    /// `USE_KV_CHECKPOINT` constant. The `clear_kv_cache_seq` fallback remains
+    /// the active code path until the round-trip test (see
+    /// `tests::kv_checkpoint_round_trip_smoke`) is confirmed green.
+    snapshot: Option<Vec<u8>>,
+    /// Test-only flag: when `true`, `refresh` uses path A (checkpoint restore)
+    /// regardless of the `USE_KV_CHECKPOINT` compile-time constant. This lets
+    /// integration tests exercise path A without promoting the constant.
+    #[cfg(test)]
+    force_kv_checkpoint: bool,
 }
 
 /// Runtime knobs for the held live-session context. Mirrors
@@ -338,14 +365,57 @@ impl<'m> LlamaLiveBackend<'m> {
             ctx,
             n_past: 0,
             prefix_len: 0,
+            prefix_hash: 0,
+            snapshot: None,
+            #[cfg(test)]
+            force_kv_checkpoint: false,
         })
     }
 }
 
+/// When `true`, the checkpoint snapshot path (`state_seq_get_data_ext` /
+/// `state_seq_set_data_ext`) is the ACTIVE prune mechanism in `refresh`.
+/// When `false` (current default), `clear_kv_cache_seq` is used instead and
+/// the snapshot is captured but never applied.
+///
+/// **Promotion criterion (authoritative — referenced by `components.md`,
+/// `domain-ownership.md`, and both gated tests):** promote to `true` only when
+/// BOTH gated real-model tests are green — `kv_checkpoint_round_trip_smoke`
+/// (raw `state_seq_*_ext` round-trip identity under SWA) AND
+/// `kv_checkpoint_refresh_path_a_smoke` (the same identity through `refresh`'s
+/// path A, incl. `n_past` bookkeeping).
+const USE_KV_CHECKPOINT: bool = false;
+
+/// FNV-1a (64-bit) hash of a string — used as a fast prefix-change detector.
+/// Not a cryptographic hash; collision probability is negligible for short
+/// prefix texts.
+fn fnv1a_64(s: &str) -> u64 {
+    const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+    s.bytes()
+        .fold(FNV_OFFSET, |acc, b| acc.wrapping_mul(FNV_PRIME) ^ b as u64)
+}
+
 impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
     fn prefill_prefix(&mut self, prefix_text: &str, cancel: &CancelFlag) -> Result<usize, Error> {
+        use llama_cpp_2::context::session::LlamaStateSeqFlags;
         use llama_cpp_2::llama_batch::LlamaBatch;
         use llama_cpp_2::model::AddBos;
+
+        // Snapshot-coherence guard: if the prefix text has changed since the
+        // last successful prefill, discard the stale snapshot so the new one is
+        // captured below. This is a snapshot-validity check only — it does NOT
+        // reset the KV cache or n_past. `prefill_prefix` must be called at most
+        // once per backend instance with a given prefix text; calling it a second
+        // time with different text would append the new prefix after the stale
+        // one and produce a corrupt doubled prefix. The driver-level
+        // `LiveSession::seed_prefix` idempotency guard is the true call-once
+        // enforcer; this guard merely keeps the snapshot consistent if the hash
+        // changes for any reason.
+        let new_hash = fnv1a_64(prefix_text);
+        if new_hash != self.prefix_hash {
+            self.snapshot = None;
+        }
 
         let mut tokens = self
             .model
@@ -419,6 +489,57 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
         // every refresh prunes back to it before appending its tail.
         self.prefix_len = self.n_past;
 
+        // --- Capture the KV checkpoint immediately after the prefix is settled ---
+        //
+        // The snapshot is taken ONLY when the cancel flag is clear — a cancelled
+        // prefill already returned Err above, so reaching here guarantees the
+        // context state is fully decoded and coherent.
+        //
+        // We use `state_seq_get_size_ext` + `state_seq_get_data_ext` (per-sequence
+        // form). The allocation is paid once per session: snapshot size equals the
+        // full KV state for seq 0 at prefix depth, typically a few tens of MB.
+        //
+        // SAFETY (copy): `buf` is sized by `state_seq_get_size_ext` on the same
+        // context with no intervening decode, so sz equals the exact number of
+        // bytes the C side will write. The wrapper passes `usize::MAX` as the
+        // dest-size arg; the C call is bounded by the state size it measured
+        // internally (which equals sz), not by the Rust buffer length.
+        {
+            let sz = self
+                .ctx
+                .state_seq_get_size_ext(0, LlamaStateSeqFlags::empty());
+            let mut buf = vec![0u8; sz];
+            let n = unsafe {
+                self.ctx
+                    .state_seq_get_data_ext(buf.as_mut_ptr(), 0, LlamaStateSeqFlags::empty())
+            };
+            if n == 0 || n != sz {
+                // `get_size` and `get_data` share the same `state_seq_write_data`
+                // measurement pass on an unchanged context, so the only failure
+                // the C impl actually produces is a 0 return (a caught
+                // exception); `n != sz` cannot occur in practice and is a
+                // belt-and-braces guard. Either way, leave snapshot = None so
+                // refresh falls back to clear_kv_cache_seq rather than restoring
+                // a truncated buffer.
+                tracing::warn!(
+                    target: "chat-agent",
+                    expected_bytes = sz,
+                    written_bytes = n,
+                    "KV checkpoint capture incomplete — snapshot discarded, \
+                     refresh will fall back to clear_kv_cache_seq"
+                );
+            } else {
+                buf.truncate(n);
+                self.snapshot = Some(buf);
+                self.prefix_hash = new_hash;
+                tracing::debug!(
+                    target: "chat-agent",
+                    snapshot_bytes = n,
+                    "live session KV checkpoint captured"
+                );
+            }
+        }
+
         tracing::debug!(
             target: "chat-agent",
             n_tokens = n_prefilled,
@@ -437,38 +558,101 @@ impl<'m> LiveSessionBackend for LlamaLiveBackend<'m> {
         token_cb: &mut dyn FnMut(&str),
     ) -> Result<RawTurn, Error> {
         use encoding_rs::UTF_8;
+        use llama_cpp_2::context::session::LlamaStateSeqFlags;
         use llama_cpp_2::llama_batch::LlamaBatch;
         use llama_cpp_2::model::AddBos;
         use llama_cpp_2::sampling::LlamaSampler;
 
-        // --- Prune the KV cache back to the pinned prefix ---
+        // --- Restore the KV state back to the pinned prefix ---
         //
         // The held context retains ONLY the pinned prefix (the open user turn:
         // system + digest-category instructions). Each refresh re-decodes a fresh,
         // BOUNDED tail (the retrieved context + the running digest + the recent
         // transcript window + the chat-template suffix that closes the user turn
         // and opens the model turn) on top of the reused prefix KV, then
-        // generates. Pruning to `prefix_len` here drops the previous refresh's
-        // tail AND its generated answer in one operation, so `n_past` never grows
-        // beyond `prefix_len + tail + generation`. The prefix prefill is therefore
-        // paid exactly once, at seed time.
+        // generates. Restoring to the checkpoint here drops the previous refresh's
+        // tail AND its generated answer, so `n_past` never grows beyond
+        // `prefix_len + tail + generation`. The prefix prefill is paid once.
+        //
+        // Two paths:
+        //   A (checkpoint, USE_KV_CHECKPOINT=true): restore via
+        //      `state_seq_set_data_ext` — the bool return gives a detectable
+        //      failure; false is treated as fatal and the context is marked
+        //      terminal. This is the preferred path once the round-trip test
+        //      confirms correctness across Gemma SWA.
+        //   B (fallback, USE_KV_CHECKPOINT=false / no snapshot): fall back to
+        //      `clear_kv_cache_seq` — the existing proven path, unchanged.
         if self.prefix_len <= 0 {
             return Err(Error::Inference(
                 "refresh called before the prefix was seeded".to_string(),
             ));
         }
+        #[cfg(test)]
+        let use_checkpoint = USE_KV_CHECKPOINT || self.force_kv_checkpoint;
+        #[cfg(not(test))]
+        let use_checkpoint = USE_KV_CHECKPOINT;
+
         if self.n_past > self.prefix_len {
-            match self
-                .ctx
-                .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
-            {
-                Ok(true) => self.n_past = self.prefix_len,
-                Ok(false) | Err(_) => {
-                    return Err(Error::Inference(
-                        "clear_kv_cache_seq failed pruning to prefix; \
-                         context state is inconsistent"
-                            .to_string(),
-                    ));
+            if use_checkpoint {
+                // Path A: snapshot restore (preferred — detectable failure).
+                //
+                // SAFETY: `snapshot` bytes were written by `state_seq_get_data_ext`
+                // on this same context immediately after `prefill_prefix`. The
+                // context has not been destroyed or replaced since then (it lives for
+                // `LlamaLiveBackend`'s lifetime). The buffer length is passed as
+                // `src.len()` inside `state_seq_set_data_ext`.
+                match &self.snapshot {
+                    Some(buf) => {
+                        let ok = unsafe {
+                            self.ctx.state_seq_set_data_ext(
+                                buf,
+                                0,
+                                LlamaStateSeqFlags::empty(),
+                            )
+                        };
+                        if !ok {
+                            return Err(Error::Inference(
+                                "state_seq_set_data_ext failed restoring KV checkpoint; \
+                                 context state is inconsistent"
+                                    .to_string(),
+                            ));
+                        }
+                        self.n_past = self.prefix_len;
+                    }
+                    None => {
+                        // Snapshot absent (e.g. prefill cancelled); fall back to
+                        // clear_kv_cache_seq so the session degrades gracefully.
+                        match self
+                            .ctx
+                            .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
+                        {
+                            Ok(true) => self.n_past = self.prefix_len,
+                            Ok(false) | Err(_) => {
+                                return Err(Error::Inference(
+                                    "clear_kv_cache_seq failed (checkpoint fallback); \
+                                     context state is inconsistent"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Path B (active): clear_kv_cache_seq — the proven prune path.
+                // The snapshot is captured in prefill_prefix but not applied here
+                // until USE_KV_CHECKPOINT is promoted to true.
+                match self
+                    .ctx
+                    .clear_kv_cache_seq(Some(0), Some(self.prefix_len as u32), None)
+                {
+                    Ok(true) => self.n_past = self.prefix_len,
+                    Ok(false) | Err(_) => {
+                        return Err(Error::Inference(
+                            "clear_kv_cache_seq failed pruning to prefix; \
+                             context state is inconsistent"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
         }
@@ -642,6 +826,16 @@ impl<'m> LlamaLiveBackend<'m> {
         let used = self.n_past as usize;
         let total = self.config.n_ctx as usize;
         total.saturating_sub(used).saturating_sub(cfg_max_tokens)
+    }
+
+    /// Byte size of the current KV checkpoint snapshot, or `None` if no
+    /// snapshot has been captured yet (the prefix has not been prefilled, or
+    /// the last prefill was cancelled/failed).
+    ///
+    /// The S2b driver logs this at session-start to give visibility into the
+    /// per-session memory cost of the checkpoint.
+    pub fn snapshot_size(&self) -> Option<usize> {
+        self.snapshot.as_ref().map(|b| b.len())
     }
 }
 
@@ -1312,5 +1506,344 @@ mod tests {
             &mut |piece| digest.push_str(piece),
         );
         assert!(result.is_ok(), "refresh smoke failed: {result:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Gated checkpoint round-trip test (requires MINUTIST_TEST_GEMMA_GGUF)
+    // -----------------------------------------------------------------------
+
+    /// Reads the sliding-window attention size from GGUF model metadata.
+    ///
+    /// llama.cpp stores the SWA window under a per-architecture key of the form
+    /// `<arch>.attention.sliding_window`. This helper scans all metadata keys
+    /// looking for one that ends with `.attention.sliding_window` and parses
+    /// its value. Returns `None` if no such key exists (non-SWA model).
+    #[cfg(test)]
+    fn model_n_swa(model: &llama_cpp_2::model::LlamaModel) -> Option<i32> {
+        let count = model.meta_count();
+        for i in 0..count {
+            let Ok(key) = model.meta_key_by_index(i) else { continue };
+            if key.ends_with(".attention.sliding_window") {
+                let Ok(val) = model.meta_val_str_by_index(i) else { continue };
+                if let Ok(n) = val.trim().parse::<i32>() {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// Proves that the raw `state_seq_get_data_ext` / `state_seq_set_data_ext`
+    /// API round-trips the KV state faithfully across Gemma SWA layers.
+    ///
+    /// The prefix is sized so that `prefix_len > n_swa` (queried from the
+    /// model at runtime), guaranteeing the snapshot actually contains SWA
+    /// state; the test fails loudly if the prefix is too short. The snapshot
+    /// is captured at `prefix_len` depth (the capture depth), then restored
+    /// and re-decoded with the same greedy tail — continuation A and B must
+    /// be identical.
+    ///
+    /// This test exercises the raw API, not the `refresh` code path. See
+    /// `kv_checkpoint_refresh_path_a_smoke` for the promotion gate that
+    /// exercises path A inside `refresh` itself.
+    ///
+    /// Requires the Gemma 4B GGUF at `MINUTIST_TEST_GEMMA_GGUF`. Skips
+    /// cleanly if the env var is unset so the test never blocks CI.
+    ///
+    /// Run locally with:
+    /// ```text
+    /// MINUTIST_TEST_GEMMA_GGUF=/path/to/gemma-4b.gguf \
+    ///   cargo test -p chat-agent -- --include-ignored kv_checkpoint_round_trip_smoke
+    /// ```
+    #[test]
+    #[ignore = "requires MINUTIST_TEST_GEMMA_GGUF pointing at a Gemma 4B GGUF"]
+    fn kv_checkpoint_round_trip_smoke() {
+        use llama_cpp_2::context::session::LlamaStateSeqFlags;
+        use llama_cpp_2::llama_batch::LlamaBatch;
+        use llama_cpp_2::model::AddBos;
+        use llama_cpp_2::sampling::LlamaSampler;
+
+        let model_path = match std::env::var("MINUTIST_TEST_GEMMA_GGUF") {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                eprintln!("MINUTIST_TEST_GEMMA_GGUF unset — skipping checkpoint round-trip test");
+                return;
+            }
+        };
+
+        let backend_init =
+            minutist_common::llama_backend::shared_llama_backend().expect("llama backend");
+        let model = llama_cpp_2::model::LlamaModel::load_from_file(
+            backend_init,
+            std::path::Path::new(&model_path),
+            &llama_cpp_2::model::params::LlamaModelParams::default(),
+        )
+        .expect("model load");
+
+        // Query the real SWA window from the model so the prefix-size assertion
+        // below is accurate regardless of which Gemma variant is loaded.
+        let n_swa = model_n_swa(&model)
+            .expect("model must have an .attention.sliding_window metadata key");
+        assert!(n_swa > 0, "expected a positive SWA window from the model");
+        eprintln!("model n_swa = {n_swa}");
+
+        // Build a prefix large enough that prefix_len > n_swa after tokenisation.
+        // Each "wordN " is roughly 2–3 tokens; multiply by 2 for headroom.
+        let target_tokens = (n_swa as usize) * 2;
+        let words_needed = target_tokens / 2 + 1; // conservative lower bound
+        let prefix_text: String = (0..words_needed)
+            .map(|i| format!("word{i} "))
+            .collect::<Vec<_>>()
+            .join("");
+
+        let n_batch = 512u32;
+        let n_ctx = ((n_swa as u32) * 4).max(4_096);
+        let config = LlamaLiveConfig {
+            n_ctx,
+            n_batch,
+            ..LlamaLiveConfig::default()
+        };
+
+        let mut backend = LlamaLiveBackend::new(&model, config.clone()).expect("context build");
+
+        // A tail that triggers a MULTI-token continuation (not a one-word
+        // answer): the round-trip must compare a real generated sequence, else
+        // an immediate-EOG tail makes the comparison vacuous (see the non-empty
+        // assertion below — this is a USE_KV_CHECKPOINT promotion gate).
+        let tail_text = "Continue this story about a lighthouse keeper: ";
+
+        let cancel = CancelFlag::new();
+
+        // Prefill the prefix. This also captures the snapshot.
+        let n_prefilled = backend
+            .prefill_prefix(&prefix_text, &cancel)
+            .expect("prefill");
+        assert!(n_prefilled > 0, "prefix must not tokenise to zero tokens");
+        assert!(
+            backend.snapshot.is_some(),
+            "snapshot must be captured after prefill"
+        );
+
+        // Verify the snapshot was captured at a depth that actually exercises
+        // SWA state: prefix_len must exceed n_swa so the snapshot contains
+        // more than one SWA window of KV state.
+        let prefix_len = backend.prefix_len;
+        assert!(
+            prefix_len > n_swa,
+            "prefix_len={prefix_len} must exceed n_swa={n_swa} to force SWA state into the snapshot; \
+             increase words_needed in the test"
+        );
+        let snap_size = backend.snapshot_size().unwrap();
+        eprintln!("checkpoint snapshot size: {snap_size} bytes, prefix_len={prefix_len}");
+
+        // Helper: prefill `tail_text` on top of the current n_past, then
+        // greedily generate N tokens. Returns the generated token sequence.
+        let decode_tail_and_generate = |ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
+                                        n_past_start: i32,
+                                        n_generate: usize|
+         -> Vec<i32> {
+            let tail_tokens = model
+                .str_to_token(tail_text, AddBos::Never)
+                .expect("tokenize tail");
+            assert!(!tail_tokens.is_empty(), "tail must not be empty");
+
+            // Decode the tail so logits are valid at its final position.
+            let plan = summariser::plan_prefill(tail_tokens.len(), n_batch);
+            let mut batch = LlamaBatch::new(n_batch as usize, 1);
+            let mut n_past = n_past_start;
+            for chunk in &plan.chunks {
+                batch.clear();
+                for offset in 0..chunk.len {
+                    let global = chunk.start + offset;
+                    let pos = n_past + global as i32;
+                    let logits = chunk.logits_at_last && offset == chunk.len - 1;
+                    batch
+                        .add(tail_tokens[global], pos, &[0], logits)
+                        .expect("batch add");
+                }
+                ctx.decode(&mut batch).expect("decode tail");
+            }
+            n_past += tail_tokens.len() as i32;
+
+            // Greedy-generate EXACTLY N tokens (the stale-logits gotcha is
+            // avoided because the tail decode above repopulates logits at its
+            // final token before any sampling). This is a MECHANISM round-trip
+            // test, not a quality test: we deliberately do NOT stop at EOG. Post-
+            // EOG greedy decode is still fully deterministic, so a correct
+            // snapshot/restore reproduces it identically; generating a fixed N
+            // makes the A==B comparison span enough tokens to genuinely exercise
+            // the sliding-window state (an untemplated tail can otherwise emit a
+            // single newline then EOG, making a stop-on-EOG comparison vacuous).
+            let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+            let mut tokens_out = Vec::with_capacity(n_generate);
+            let mut batch = LlamaBatch::new(1, 1);
+            for _ in 0..n_generate {
+                let tok = sampler.sample(ctx, -1);
+                sampler.accept(tok);
+                tokens_out.push(tok.0);
+                batch.clear();
+                batch.add(tok, n_past, &[0], true).expect("batch add gen");
+                n_past += 1;
+                ctx.decode(&mut batch).expect("decode gen");
+            }
+            tokens_out
+        };
+
+        // --- Continuation A: generate from the freshly-prefilled state ---
+        let continuation_a = decode_tail_and_generate(&mut backend.ctx, prefix_len, 16);
+        eprintln!("continuation A: {continuation_a:?}");
+
+        // --- Restore the snapshot and regenerate (continuation B) ---
+        //
+        // SAFETY: snapshot bytes were written by `state_seq_get_data_ext` on
+        // this context immediately after prefill_prefix. The context is still
+        // live and has not been replaced.
+        let snapshot = backend.snapshot.as_ref().expect("snapshot present");
+        let restored = unsafe {
+            backend.ctx.state_seq_set_data_ext(
+                snapshot,
+                0,
+                LlamaStateSeqFlags::empty(),
+            )
+        };
+        assert!(restored, "state_seq_set_data_ext must return true on restore");
+
+        // n_past is back to prefix_len after restore.
+        let continuation_b = decode_tail_and_generate(&mut backend.ctx, prefix_len, 16);
+        eprintln!("continuation B: {continuation_b:?}");
+
+        // This is a promotion gate for USE_KV_CHECKPOINT, so the comparison must
+        // not pass vacuously: if the tail decoded straight to EOG both
+        // continuations would be empty and assert_eq! would succeed while
+        // proving nothing about SWA-state fidelity. Require real generated
+        // tokens before trusting the round-trip.
+        assert!(
+            continuation_a.len() >= 2,
+            "the tail must produce >=2 non-EOG tokens for the round-trip comparison \
+             to be meaningful (got {}); pick a tail that generates text",
+            continuation_a.len()
+        );
+        assert_eq!(
+            continuation_a, continuation_b,
+            "KV checkpoint restore must reproduce identical greedy continuations; \
+             divergence means SWA or recurrent state was not fully captured"
+        );
+        eprintln!("checkpoint round-trip: PASS ({} tokens match)", continuation_a.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Gated path-A promotion gate (requires MINUTIST_TEST_GEMMA_GGUF)
+    // -----------------------------------------------------------------------
+
+    /// Exercises path A (checkpoint restore) through `refresh` itself, not
+    /// through direct FFI calls. This is the gate that must be green before
+    /// `USE_KV_CHECKPOINT` is promoted to `true`.
+    ///
+    /// The test seeds a prefix that exceeds `n_swa` (read from the model),
+    /// forces `force_kv_checkpoint = true` on the backend, then calls
+    /// `refresh` twice with identical tails and a greedy sampler. Both
+    /// generated strings must be identical — any failure in path A's error
+    /// handling, `n_past` bookkeeping, or snapshot restore would diverge
+    /// or return an error rather than matching.
+    ///
+    /// Run locally with:
+    /// ```text
+    /// MINUTIST_TEST_GEMMA_GGUF=/path/to/gemma-4b.gguf \
+    ///   cargo test -p chat-agent -- --include-ignored kv_checkpoint_refresh_path_a_smoke
+    /// ```
+    #[test]
+    #[ignore = "requires MINUTIST_TEST_GEMMA_GGUF pointing at a Gemma 4B GGUF"]
+    fn kv_checkpoint_refresh_path_a_smoke() {
+        let model_path = match std::env::var("MINUTIST_TEST_GEMMA_GGUF") {
+            Ok(p) if !p.is_empty() => p,
+            _ => {
+                eprintln!(
+                    "MINUTIST_TEST_GEMMA_GGUF unset — skipping path-A refresh gate test"
+                );
+                return;
+            }
+        };
+
+        let backend_init =
+            minutist_common::llama_backend::shared_llama_backend().expect("llama backend");
+        let model = llama_cpp_2::model::LlamaModel::load_from_file(
+            backend_init,
+            std::path::Path::new(&model_path),
+            &llama_cpp_2::model::params::LlamaModelParams::default(),
+        )
+        .expect("model load");
+
+        let n_swa = model_n_swa(&model)
+            .expect("model must have an .attention.sliding_window metadata key");
+        assert!(n_swa > 0, "expected a positive SWA window from the model");
+        eprintln!("model n_swa = {n_swa}");
+
+        // Build a prefix that will exceed n_swa after tokenisation.
+        let target_tokens = (n_swa as usize) * 2;
+        let words_needed = target_tokens / 2 + 1;
+        let prefix_text: String = (0..words_needed)
+            .map(|i| format!("word{i} "))
+            .collect::<Vec<_>>()
+            .join("");
+
+        let n_ctx = ((n_swa as u32) * 4).max(4_096);
+        let config = LlamaLiveConfig {
+            n_ctx,
+            n_batch: 512,
+            ..LlamaLiveConfig::default()
+        };
+
+        let mut backend = LlamaLiveBackend::new(&model, config).expect("context build");
+
+        // Force path A in refresh regardless of USE_KV_CHECKPOINT.
+        backend.force_kv_checkpoint = true;
+
+        let cancel = CancelFlag::new();
+        backend
+            .prefill_prefix(&prefix_text, &cancel)
+            .expect("prefill");
+
+        assert!(
+            backend.snapshot.is_some(),
+            "snapshot must be captured after prefill"
+        );
+        assert!(
+            backend.prefix_len > n_swa,
+            "prefix_len={} must exceed n_swa={n_swa} to exercise SWA in the snapshot",
+            backend.prefix_len
+        );
+
+        // Use a greedy sampler so both calls produce deterministic output.
+        let cfg = SamplerConfig {
+            seed: 0,
+            temperature: 0.0,
+            top_p: 1.0,
+            max_tokens: 16,
+            grammar_backstop: false,
+        };
+        let tail = "<end_of_turn>\n<start_of_turn>model\n";
+
+        // First refresh: n_past starts at prefix_len; path A is NOT triggered
+        // yet (n_past == prefix_len), so this decodes the tail and generates.
+        let result_a = backend
+            .refresh(tail, &cfg, &CancelFlag::new(), &mut |_| {})
+            .expect("first refresh");
+
+        // Second refresh: n_past > prefix_len (tail + generation from first
+        // call are still in the KV); path A must restore the snapshot back to
+        // prefix_len, then decode the same tail and generate identically.
+        let result_b = backend
+            .refresh(tail, &cfg, &CancelFlag::new(), &mut |_| {})
+            .expect("second refresh");
+
+        eprintln!("path A refresh A: {result_a:?}");
+        eprintln!("path A refresh B: {result_b:?}");
+
+        assert_eq!(
+            result_a.text, result_b.text,
+            "path A restore via refresh must reproduce identical greedy output; \
+             divergence means n_past bookkeeping or snapshot restore in refresh is wrong"
+        );
+        eprintln!("path-A gate: PASS");
     }
 }

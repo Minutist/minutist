@@ -2810,15 +2810,30 @@ tail (Phase D), not pinned. The surface is:
   `LlamaSummariser` substrate (`ipc-bridge` lends it), builds one `LlamaContext`
   at construction (n_ctx = 32 768, KV-quant OFF per SP-LIVE E3), and tracks
   `n_past` + `prefix_len`. **Prune-to-prefix bounded context (#0022):** each
-  `refresh` first prunes the KV back to `prefix_len` (`clear_kv_cache_seq`),
-  dropping the previous refresh's tail AND its generated answer, then decodes the
-  fresh tail on top — so the held context never grows beyond `prefix_len + tail +
-  generation` and cannot overflow on a long meeting (the failure mode the
-  cumulative-append design hit on its first live test). `prefill_prefix` caps the
-  prefix at `n_ctx / 2` so the per-refresh tail always has headroom. The tail is
-  always non-empty (it carries the chat-template suffix), so there is no empty-tail
-  logit-coherence hazard. `prefix_len` is a private field; the public API surface
-  is unchanged.
+  `refresh` first restores the KV back to `prefix_len`, dropping the previous
+  refresh's tail AND its generated answer, then decodes the fresh tail on top —
+  so the held context never grows beyond `prefix_len + tail + generation` and
+  cannot overflow on a long meeting.
+  **KV checkpoint (U2-A1):** immediately after `prefill_prefix` completes, the
+  full per-sequence KV state (positions `0..prefix_len`) is serialised into a
+  private `snapshot: Option<Vec<u8>>` via `state_seq_get_data_ext`. Each
+  `refresh` can restore it via `state_seq_set_data_ext` (bool-returning, so a
+  failure is detectable and treated as fatal) instead of `clear_kv_cache_seq`.
+  Promotion from the opt-in path (`USE_KV_CHECKPOINT = false`, active path
+  remains `clear_kv_cache_seq`) to active requires **both** `#[ignore]`d
+  real-model gated tests to pass (env var `MINUTIST_TEST_GEMMA_GGUF`):
+  `kv_checkpoint_round_trip_smoke` (raw `state_seq_*_ext` round-trip under SWA)
+  and `kv_checkpoint_refresh_path_a_smoke` (the same identity through `refresh`'s
+  path A). Dirty-prefix invalidation: a FNV-1a hash of the prefix text discards a
+  stale snapshot before re-capture — a snapshot-coherence backstop that is NOT
+  exercised under the current call-once driver (`prefill_prefix` runs at most
+  once per backend; a settings/recording change builds a fresh backend), so it
+  does not imply mid-recording re-seed support.
+  `snapshot_size() -> Option<usize>` is a public accessor for driver logging.
+  `prefill_prefix` caps the prefix at `n_ctx / 2` so the per-refresh tail always
+  has headroom. The tail is always non-empty (it carries the chat-template
+  suffix), so there is no empty-tail logit-coherence hazard. `prefix_len` is a
+  private field; the public API surface is otherwise unchanged.
   `LlamaContext` is `!Send`; `LlamaLiveBackend` is therefore also `!Send`. The
   S2b driver in `ipc-bridge` owns the dedicated thread and calls these methods
   only from there — this crate never asserts `Send` on it.

@@ -102,7 +102,15 @@ restated. Adding any other edge requires updating
   The live-agent driver implementation (S2b) lives in
   `crates/ipc-bridge/src/live_agent.rs` (systems-engineer). The held-context
   backend (S2a) lives in `crates/chat-agent/src/live.rs` (ml-runtime-engineer).
-  Neither adds a new dependency edge beyond what is already in the table.
+  The backend adds a KV checkpoint mechanism (U2-A1): immediately after
+  `prefill_prefix` completes, it captures the full per-sequence KV state via
+  `state_seq_get_data_ext` into a private `snapshot: Option<Vec<u8>>`. Each
+  `refresh` can restore from this snapshot via `state_seq_set_data_ext` instead
+  of `clear_kv_cache_seq`. Promotion from opt-in (`USE_KV_CHECKPOINT = false`)
+  to active requires the `kv_checkpoint_round_trip_smoke` test to pass. A
+  `snapshot_size()` accessor exposes the snapshot byte count for driver logging.
+  Neither the mechanism nor the accessor adds a new dependency edge beyond what
+  is already in the table.
 - **Voiceprint identity types + maths (issue #0003 WU0 — one-way door).**
   `VoiceprintIdentityId` and `VoiceprintCentroidId` are UUID newtypes added to
   `common` by the architecture-owner. Adding them is a **one-way-door** per

@@ -2787,6 +2787,7 @@ pub(crate) async fn load_or_new_session(
         messages: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
+        is_live: false,
     })
 }
 
@@ -2881,7 +2882,7 @@ pub(crate) fn run_chat_turn_on_held_model(
     // Rebuild the engine-internal history: pinned system prompt + the prior
     // persisted messages (which include the just-appended user message).
     let mut history = initial_history(system_prompt);
-    history.extend(session.messages.iter().map(engine_message_from_wire));
+    history.extend(session.messages.iter().filter_map(engine_message_from_wire));
     // Everything the driver appends to `history` past this point is THIS turn's
     // output (the assistant final + each tool result).
     let prefix_len = history.len();
@@ -4597,6 +4598,7 @@ mod tests {
             ],
             created_at: "2026-06-10T00:00:00Z".into(),
             updated_at: "2026-06-10T00:00:00Z".into(),
+            is_live: false,
         };
 
         persist_session(root, Some(meeting_id), session).await;

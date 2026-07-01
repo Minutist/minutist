@@ -155,6 +155,40 @@ impl ChatStore {
             Err(e) => Err(Error::Io(e).into()),
         }
     }
+
+    /// Find the meeting's single **live co-pilot** session — the one with
+    /// `is_live` set — or `Ok(None)` if none exists yet. This is the unified-log
+    /// target the live-agent digest writes into and in-meeting chat shares (U1).
+    /// If more than one is marked live (should not happen), the most-recently-
+    /// updated wins, matching [`Self::list`]'s ordering.
+    pub fn find_live(root: &Path, meeting_id: MeetingId) -> AppResult<Option<ChatSession>> {
+        Ok(Self::list(root, meeting_id)?.into_iter().find(|s| s.is_live))
+    }
+
+    /// Load the meeting's live co-pilot session, creating and persisting a fresh
+    /// empty one (`is_live = true`) when none exists. `now` is an RFC 3339
+    /// timestamp supplied by the caller (`common`/`persistence` pull no time
+    /// crate; the clock is the caller's, mirroring `ChatSession::created_at`).
+    pub fn load_or_create_live(
+        root: &Path,
+        meeting_id: MeetingId,
+        now: &str,
+    ) -> AppResult<ChatSession> {
+        if let Some(session) = Self::find_live(root, meeting_id)? {
+            return Ok(session);
+        }
+        let session = ChatSession {
+            id: ChatSessionId::new(),
+            meeting_id: Some(meeting_id),
+            title: None,
+            messages: Vec::new(),
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+            is_live: true,
+        };
+        Self::save(root, meeting_id, &session)?;
+        Ok(session)
+    }
 }
 
 /// Write `bytes` to `path` atomically: write to a sibling temp file, fsync,
@@ -256,6 +290,7 @@ mod tests {
             ],
             created_at: "2026-06-10T10:00:00Z".to_string(),
             updated_at: updated_at.to_string(),
+            is_live: false,
         }
     }
 
@@ -298,6 +333,39 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, newer.id, "most-recently-updated first");
         assert_eq!(sessions[1].id, older.id);
+    }
+
+    #[test]
+    fn load_or_create_live_creates_once_then_reuses() {
+        let (_tempdir, root, id) = make_meeting();
+        // No live session yet.
+        assert!(
+            ChatStore::find_live(&root, id).expect("find_live").is_none(),
+            "no live session before first create"
+        );
+
+        // First call creates + persists a fresh, empty, live session.
+        let created = ChatStore::load_or_create_live(&root, id, "2026-06-10T10:00:00Z")
+            .expect("create live");
+        assert!(created.is_live, "created session must be marked live");
+        assert!(created.messages.is_empty());
+
+        // Second call returns the SAME session, not a new one.
+        let again = ChatStore::load_or_create_live(&root, id, "2026-06-10T10:05:00Z")
+            .expect("reload live");
+        assert_eq!(again.id, created.id, "must reuse the existing live session");
+
+        // An ordinary (non-live) session is ignored by find_live.
+        let ordinary = sample_session(id, "2026-06-10T12:00:00Z"); // is_live = false
+        ChatStore::save(&root, id, &ordinary).expect("save ordinary");
+        let live = ChatStore::find_live(&root, id)
+            .expect("find_live")
+            .expect("a live session is present");
+        assert_eq!(
+            live.id, created.id,
+            "find_live must pick the live session, not the ordinary one"
+        );
+        assert!(live.is_live);
     }
 
     #[test]

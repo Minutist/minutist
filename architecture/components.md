@@ -337,7 +337,8 @@ used, not added here.
 `InterAgentRequest`, `InterAgentReply`,
 `AttachmentId`, `ConversionState`, `AttachmentEntry`,
 `LiveDigestItem`, `LiveDigest`, `LiveAgentMode`,
-`ProcessingLifecycle`, `ProcessingClaim`, `HostRef`),
+`ProcessingLifecycle`, `ProcessingClaim`, `HostRef`,
+`ChatSession`, `ChatMessage`, `ChatRole`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`, `DocVlm`, `Embedder` — the last is **batch-first** (`embed_batch`
 primary; scalar `embed` default-delegates), and `ModelKind` carries an `Embed`
@@ -423,6 +424,19 @@ registration — no second registration. One pure public function.
   by the live agent on each refresh. Each category is a `Vec<LiveDigestItem>`.
   `generated_at_ms` is wall-clock epoch milliseconds. Serde derives; `specta::Type`;
   serialises as the existing `AppEvent` nested JSON shape.
+
+- **U1 — unified co-pilot log.** `ChatRole` gains a `Digest` variant: an
+  auto-generated live-agent digest turn whose `content` carries the `LiveDigest`
+  serialised as JSON (mirroring how `Tool` turns carry a JSON result).
+  `ChatSession` gains `is_live: bool` — the single per-meeting **live co-pilot**
+  session the digest writes into (as one in-place-updated `Digest` turn,
+  approach A) and in-meeting chat shares. Digest turns are persisted in this log
+  but **excluded from the chat-engine prompt** (`engine_message_from_wire`
+  returns `None` for them); feeding them to the engine is U2. The write path is
+  `ipc-bridge`'s live-agent driver → `persistence::ChatStore::load_or_create_live`
+  (the meeting's `is_live` session) → `ChatStore::save`, best-effort (a
+  persistence error never breaks the digest stream). Both `common` changes cross
+  IPC (`specta::Type`).
 
 - `LiveAgentMode { Auto, On, Off }` — whether the live agent runs during an active
   recording. `Auto` (the default, `Default = Auto`) enables when GPU acceleration is

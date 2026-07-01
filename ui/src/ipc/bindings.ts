@@ -1454,7 +1454,15 @@ export type ChatRole =
 /**
  * A tool-result message appended after the driver ran a tool call.
  */
-"tool"
+"tool" | 
+/**
+ * An auto-generated live-agent digest turn. `content` carries the
+ * [`LiveDigest`] serialised as JSON (mirroring how `Tool` messages carry a
+ * JSON result in `content`). Distinct from `Assistant` so the unified
+ * co-pilot log can interleave auto-digest turns with user chat turns and a
+ * client can render them distinctly. (U1 — unified conversation log.)
+ */
+"digest"
 /**
  * A persisted chat session for one meeting.
  * 
@@ -1466,7 +1474,15 @@ export type ChatRole =
  * 3339 strings to avoid pulling a time crate into `common`, mirroring
  * `MeetingMeta::started_at`.
  */
-export type ChatSession = { id: ChatSessionId; meeting_id?: MeetingId | null; title?: string | null; messages: ChatMessage[]; created_at: string; updated_at: string }
+export type ChatSession = { id: ChatSessionId; meeting_id?: MeetingId | null; title?: string | null; messages: ChatMessage[]; created_at: string; updated_at: string; 
+/**
+ * `true` for the single per-meeting **live co-pilot** session — the unified
+ * log the live-agent digest writes into (as [`ChatRole::Digest`] turns) and
+ * the in-meeting chat shares. At most one per meeting. `false` (the serde
+ * default, so pre-U1 sessions reload) for ordinary post-hoc chat sessions.
+ * (U1 — unified conversation log.)
+ */
+is_live?: boolean }
 /**
  * Stable identifier for a chat session on disk. UUIDv4. Mirrors [`MeetingId`].
  * 

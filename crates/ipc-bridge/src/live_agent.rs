@@ -64,16 +64,18 @@
 //! ~40 s prefill and would starve ASR inference).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use chat_agent::{
     CancelFlag, LiveSession, LiveSessionBackend, LlamaLiveBackend, LlamaLiveConfig, SamplerConfig,
 };
-use minutist_common::{AppEvent, Embedder, LiveDigest, LiveDigestItem, MeetingId};
+use minutist_common::{
+    AppEvent, ChatMessage, ChatRole, Embedder, LiveDigest, LiveDigestItem, MeetingId,
+};
 use orchestrator::Orchestrator;
-use persistence::{meeting_db_path, RagStore, RetrievedChunk};
+use persistence::{meeting_db_path, ChatStore, RagStore, RetrievedChunk};
 use rag_retrieval::rrf_fuse;
 use settings::SettingsHandle;
 use summariser::LlamaSummariser;
@@ -234,6 +236,9 @@ pub fn spawn_live_agent(
     let worker_orchestrator = orchestrator.clone();
     let worker_settings = settings.clone();
     let worker_meetings_dir = meetings_dir.clone();
+    // U1: the driver persists each digest into the meeting's live co-pilot
+    // session (ChatStore root = the meetings dir), so it needs its own handle.
+    let driver_meetings_dir = meetings_dir.clone();
 
     // C2/M5: the startup cancel flag is shared between the driver (which raises
     // it on shutdown) and the worker thread (which uses it as the cancel token
@@ -278,6 +283,7 @@ pub fn spawn_live_agent(
             res_rx,
             &mut shutdown,
             driver_startup_cancel,
+            driver_meetings_dir,
         )
         .await;
         tracing::info!(
@@ -337,6 +343,9 @@ async fn run_driver_task(
     // C2/M5: raised on shutdown to abort the worker thread's startup prefix
     // seed if it is still in progress (the ~40 s prefill).
     startup_cancel: CancelFlag,
+    // U1: ChatStore root (the meetings dir) for persisting each digest into the
+    // meeting's live co-pilot session.
+    meetings_dir: PathBuf,
 ) {
     let mut events = orchestrator.subscribe_events();
 
@@ -456,7 +465,13 @@ async fn run_driver_task(
                 last_refresh = Instant::now();
                 match result {
                     Some(RefreshResult::Ok(text)) => {
-                        handle_digest_result(text, meeting_id, &mut prior_digest, &event_tx);
+                        handle_digest_result(
+                            text,
+                            meeting_id,
+                            &mut prior_digest,
+                            &event_tx,
+                            &meetings_dir,
+                        );
                     }
                     Some(RefreshResult::Err(e)) => {
                         // M3: a decode error leaves the held context in an
@@ -562,10 +577,16 @@ fn handle_digest_result(
     meeting_id: MeetingId,
     prior_digest: &mut Option<LiveDigest>,
     event_tx: &broadcast::Sender<AppEvent>,
+    meetings_dir: &Path,
 ) {
     match parse_digest(&text, meeting_id, prior_digest.as_ref()) {
         Ok(digest) => {
             *prior_digest = Some(digest.clone());
+            // U1: persist the (cumulative) digest into the meeting's live
+            // co-pilot session before emitting. Best-effort — a persistence
+            // failure must not break the live digest, so it is logged, not
+            // propagated.
+            persist_live_digest_turn(meetings_dir, meeting_id, &digest);
             let _ = event_tx.send(AppEvent::LiveDigestUpdated { meeting_id, digest });
         }
         Err(e) => {
@@ -579,6 +600,57 @@ fn handle_digest_result(
                 message: format!("digest parse error: {e}"),
             });
         }
+    }
+}
+
+/// U1: persist the cumulative live digest into the meeting's single live
+/// co-pilot session (approach A — ONE `Digest` turn updated in place each
+/// refresh, not a per-refresh timeline; the digest is cumulative so a single
+/// current turn captures it). Best-effort: any error is logged and swallowed so
+/// a persistence hiccup never breaks the live digest stream.
+fn persist_live_digest_turn(meetings_dir: &Path, meeting_id: MeetingId, digest: &LiveDigest) {
+    let content = match serde_json::to_string(digest) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                target: "ipc-bridge",
+                meeting_id = %meeting_id.0,
+                "live-agent: serialise digest for persistence failed: {e}"
+            );
+            return;
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let persisted = (|| -> minutist_common::AppResult<()> {
+        let mut session = ChatStore::load_or_create_live(meetings_dir, meeting_id, &now)?;
+        // Approach A: find the sole Digest turn and overwrite it; create it on
+        // the first refresh. Identified by role, not turn_id, so future chat
+        // turns in the same session do not collide.
+        if let Some(msg) = session
+            .messages
+            .iter_mut()
+            .find(|m| m.role == ChatRole::Digest)
+        {
+            msg.content = content;
+        } else {
+            session.messages.push(ChatMessage {
+                role: ChatRole::Digest,
+                content,
+                tool_name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                turn_id: 0,
+            });
+        }
+        session.updated_at = now.clone();
+        ChatStore::save(meetings_dir, meeting_id, &session)
+    })();
+    if let Err(e) = persisted {
+        tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "live-agent: persist digest turn failed: {e}"
+        );
     }
 }
 
@@ -1520,6 +1592,60 @@ mod tests {
 
     fn new_mid() -> MeetingId {
         MeetingId::new()
+    }
+
+    #[test]
+    fn persist_live_digest_turn_keeps_a_single_updated_digest_turn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let meetings_dir = tmp.path();
+        let mid = new_mid();
+        let mut digest = LiveDigest {
+            meeting_id: mid,
+            generated_at_ms: 0,
+            action_items: vec![LiveDigestItem {
+                text: "ship it".to_string(),
+                resolved: false,
+                source: None,
+            }],
+            decisions: Vec::new(),
+            open_asks: Vec::new(),
+            attachment_answers: Vec::new(),
+            unresolved_references: Vec::new(),
+        };
+
+        // First refresh: creates the live session + a single Digest turn.
+        persist_live_digest_turn(meetings_dir, mid, &digest);
+        let s1 = ChatStore::find_live(meetings_dir, mid)
+            .expect("find_live")
+            .expect("live session created on first refresh");
+        assert!(s1.is_live, "the persisted session is marked live");
+        let d1: Vec<_> = s1
+            .messages
+            .iter()
+            .filter(|m| m.role == ChatRole::Digest)
+            .collect();
+        assert_eq!(d1.len(), 1, "exactly one digest turn");
+        assert!(
+            d1[0].content.contains("ship it"),
+            "the digest JSON is persisted in the turn content"
+        );
+
+        // Second refresh: updates the SAME turn in place (approach A) — still one.
+        digest.action_items[0].text = "ship it tomorrow".to_string();
+        persist_live_digest_turn(meetings_dir, mid, &digest);
+        let s2 = ChatStore::find_live(meetings_dir, mid)
+            .expect("find_live")
+            .expect("present");
+        let d2: Vec<_> = s2
+            .messages
+            .iter()
+            .filter(|m| m.role == ChatRole::Digest)
+            .collect();
+        assert_eq!(d2.len(), 1, "still a single digest turn after the second refresh");
+        assert!(
+            d2[0].content.contains("tomorrow"),
+            "the digest turn content is updated in place"
+        );
     }
 
     fn seg_s(text: String) -> minutist_common::Segment {

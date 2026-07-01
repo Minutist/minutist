@@ -404,9 +404,14 @@ pub fn initial_history(system_prompt: &str) -> Vec<ChatMessage> {
 /// the valid `assistant(tool_calls) → tool(result)` sequence), and a `Tool`
 /// message uses its persisted `tool_call_id` so it re-links to the matching
 /// call rather than a synthesised id.
-pub fn engine_message_from_wire(m: &minutist_common::ChatMessage) -> ChatMessage {
+///
+/// Returns `None` for a [`ChatRole::Digest`] turn: digest turns are persisted in
+/// the unified co-pilot log (U1) but are NOT part of the chat-engine prompt — the
+/// engine consuming them is U2. Callers `filter_map` so digest turns are skipped
+/// when reconstructing engine history.
+pub fn engine_message_from_wire(m: &minutist_common::ChatMessage) -> Option<ChatMessage> {
     use minutist_common::ChatRole;
-    match m.role {
+    Some(match m.role {
         ChatRole::System => ChatMessage::system(m.content.clone()),
         ChatRole::User => ChatMessage::user(m.content.clone()),
         ChatRole::Assistant if !m.tool_calls.is_empty() => ChatMessage::assistant_tool_calls(
@@ -431,7 +436,9 @@ pub fn engine_message_from_wire(m: &minutist_common::ChatMessage) -> ChatMessage
             m.tool_name.clone().unwrap_or_default(),
             m.content.clone(),
         ),
-    }
+        // U1: digest turns are persisted context, not engine prompt (U2 wires them in).
+        ChatRole::Digest => return None,
+    })
 }
 
 /// Map the engine's role to the persisted/wire `common::ChatRole`.

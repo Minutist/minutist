@@ -715,6 +715,12 @@ pub enum ChatRole {
     Assistant,
     /// A tool-result message appended after the driver ran a tool call.
     Tool,
+    /// An auto-generated live-agent digest turn. `content` carries the
+    /// [`LiveDigest`] serialised as JSON (mirroring how `Tool` messages carry a
+    /// JSON result in `content`). Distinct from `Assistant` so the unified
+    /// co-pilot log can interleave auto-digest turns with user chat turns and a
+    /// client can render them distinctly. (U1 — unified conversation log.)
+    Digest,
 }
 
 /// One tool call an assistant message requested, in the persisted/wire shape.
@@ -792,6 +798,13 @@ pub struct ChatSession {
     pub messages: Vec<ChatMessage>,
     pub created_at: String,
     pub updated_at: String,
+    /// `true` for the single per-meeting **live co-pilot** session — the unified
+    /// log the live-agent digest writes into (as [`ChatRole::Digest`] turns) and
+    /// the in-meeting chat shares. At most one per meeting. `false` (the serde
+    /// default, so pre-U1 sessions reload) for ordinary post-hoc chat sessions.
+    /// (U1 — unified conversation log.)
+    #[serde(default)]
+    pub is_live: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2723,6 +2736,7 @@ mod tests {
             ],
             created_at: "2026-06-10T10:00:00Z".to_string(),
             updated_at: "2026-06-10T10:01:00Z".to_string(),
+            is_live: false,
         };
         let json = serde_json::to_string(&session).unwrap();
         assert!(json.contains("\"role\":\"system\""));
@@ -2754,6 +2768,7 @@ mod tests {
             messages: vec![],
             created_at: "2026-06-10T10:00:00Z".to_string(),
             updated_at: "2026-06-10T10:00:00Z".to_string(),
+            is_live: false,
         };
         let json = serde_json::to_string(&untitled).unwrap();
         assert!(

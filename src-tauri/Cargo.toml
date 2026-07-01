@@ -34,7 +34,7 @@ directml = ["ipc-bridge/directml"]
 # The free artifact is built with --no-default-features (plus an explicit GPU
 # feature when needed, e.g. --no-default-features --features vulkan).
 # See architecture/cross-cutting.md "Build variants".
-connected = ["dep:mcp-server", "dep:tunnel-client", "dep:sync", "dep:async-trait", "dep:rand", "dep:hex"]
+connected = ["dep:mcp-server", "dep:tunnel-client", "dep:sync", "dep:election", "dep:async-trait", "dep:rand", "dep:hex"]
 default = ["connected"]
 
 [build-dependencies]
@@ -54,6 +54,10 @@ tunnel-client = { path = "../crates/tunnel-client", optional = true }
 # protocol). The ConnectedSync impl of ipc_bridge::SyncControl is backed by this
 # crate. Part of the connected feature surface — the free build omits it.
 sync = { path = "../crates/sync", optional = true }
+# WS4-B producer-gate S4: the host-election state machine. The DesktopElectionDriver
+# (in `sync.rs`, connected-gated) wires it to the SyncEngine + Orchestrator. Part of
+# the connected feature surface — the free build omits it.
+election = { path = "../crates/election", optional = true }
 settings = { path = "../crates/settings" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-fs = { workspace = true }

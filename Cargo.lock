@@ -5050,6 +5050,7 @@ version = "0.0.0"
 dependencies = [
  "agent-tools",
  "async-trait",
+ "election",
  "hex",
  "ipc-bridge",
  "mcp-server",

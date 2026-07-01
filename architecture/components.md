@@ -633,6 +633,19 @@ time (`produced_by` / `produced_at`) bound to the bytes, so a relay or hub
 forwarding those bytes multi-hop can never let a stale copy supersede a newer one
 (see the `sync` `artifacts_proto` description).
 
+The desktop **capture-side** write path (WS4-B producer-gate S2) is `ipc-bridge`'s
+`stop_recording`: when delegation is enabled it marks the just-finalised meeting
+`PendingProcessing` synchronously (via `persistence::meeting_ops::apply_processing_lifecycle`,
+before returning, so the next discovery exchange advertises the offer) and skips the
+local post-stop passes, rather than running ASR/diarize/summarise itself. It is gated
+by the `MINUTIST_DELEGATE_PROCESSING` env knob (default OFF; a Settings toggle + UI is
+the productisation follow-up — the env knob is the v1 mechanism, matching
+`MINUTIST_SYNC_TOKEN` / `MINUTIST_ELECTION_*`). No new `ipc-bridge` edge — it already
+owns the `persistence` edge. On a lone device the meeting simply waits as
+`PendingProcessing` until an eligible host runs the election loop (S4); the audio is on
+disk regardless. The phone companion (0016) reaches the same state through its own
+capture path.
+
 **Transport is NOT in `common`:** `metadata.json` does not sync today, so the
 lifecycle has no transport on its own. It rides the bidirectional
 `StreamKind::Discovery` (tag `3`, **appended** so the tag stays the wire

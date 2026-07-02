@@ -8739,6 +8739,7 @@ name = "sync"
 version = "0.0.0"
 dependencies = [
  "chrono",
+ "futures-util",
  "iroh",
  "iroh-blobs",
  "iroh-tickets",

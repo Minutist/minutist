@@ -2266,18 +2266,26 @@ to it as follows:
   `MINUTIST_HUB_LOG_JSON=1` switches tracing to a structured JSON formatter for
   field-level event assertions. Production defaults are unchanged.
 - **Convergence (push-on-reconnect).** `SyncEngine` fires a bounded "peer arrived"
-  broadcast (`subscribe_peer_events`) each time a peer opens an authorised inbound
-  sync connection. The daemon reacts by calling `SyncEngine::push_all_to(peer)`,
-  which reconciles EVERY meeting the hub holds back to that peer (relay-addressed,
-  per-meeting notes + media, failures logged-and-skipped), debounced per peer. So a
-  device that reconnects to deposit one meeting also collects every other meeting
-  the hub accumulated while it was away — true convergence through the hub, not
-  passive responding. The reciprocal push is **raced against the shutdown signal**,
-  so a `SIGTERM` mid-push is honoured promptly (the push future is dropped — safe
-  and idempotent, since notes writes are atomic and media is content-addressed). A
-  `Lagged` peer-event (arrivals dropped under load) is recovered by reconciling
-  EVERY known peer, so no arrival is permanently missed. The desktop does not
-  subscribe to peer events.
+  broadcast (`subscribe_peer_events`, hex peer ids — not `iroh::EndpointId`, so a
+  non-`iroh` caller such as the mobile FFI wrapper can subscribe too) the first
+  time a peer opens an authorised inbound sync connection, and at most once again
+  per 3s window of silence from it after that (`endpoint::PeerArrivalTracker`):
+  one sync session dials several connections back-to-back (notes, media, and
+  discovery each separately) and this coalesces that burst into ONE notification
+  per visit rather than one per connection. The daemon reacts by calling
+  `SyncEngine::push_all_to_peer(peer_id)`, which reconciles EVERY meeting the hub
+  holds back to that peer (relay-addressed, per-meeting notes + media,
+  failures logged-and-skipped), separately debounced per peer
+  (`MINUTIST_HUB_PUSH_DEBOUNCE_MS`, default 15s — a longer, independent window
+  that rate-limits repeated pushes rather than de-duplicating one arrival's
+  connections). So a device that reconnects to deposit one meeting also collects
+  every other meeting the hub accumulated while it was away — true convergence
+  through the hub, not passive responding. The reciprocal push is **raced against
+  the shutdown signal**, so a `SIGTERM` mid-push is honoured promptly (the push
+  future is dropped — safe and idempotent, since notes writes are atomic and
+  media is content-addressed). A `Lagged` peer-event (arrivals dropped under
+  load) is recovered by reconciling EVERY known peer, so no arrival is
+  permanently missed. The desktop does not subscribe to peer events.
 - **Lifecycle discovery scheduling (§7 / recovery).** The processing-lifecycle
   exchange (`StreamKind::Discovery`, carrying `(MeetingId, ProcessingLifecycle)`)
   rides the sync flow rather than a separate skippable round: `push_all_to` runs a

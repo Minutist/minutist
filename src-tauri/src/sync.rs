@@ -301,10 +301,10 @@ impl SyncControl for ConnectedSync {
 
         let mut last_err: Option<String> = None;
         let mut done = 0usize;
-        for peer in peers {
+        for peer in &peers {
             // Phase 1: notes. The engine dials the peer on the sync ALPN and runs
             // the bidirectional CRDT-update exchange for this meeting.
-            if let Err(e) = engine.sync_notes(peer, meeting_id).await {
+            if let Err(e) = engine.sync_notes_to_peer(peer, meeting_id).await {
                 let message = format!("syncing notes with a peer: {e}");
                 tracing::warn!(target: "app-main", "sync: {message}");
                 last_err = Some(message);
@@ -321,7 +321,7 @@ impl SyncControl for ConnectedSync {
             // the same sync ALPN, and pulls the blobs it is missing over the blobs
             // ALPN — exporting each to the per-meeting `audio.opus` / `assets/*`
             // path and pinning it with a persistent tag for retention.
-            if let Err(e) = engine.sync_media(peer, meeting_id).await {
+            if let Err(e) = engine.sync_media_to_peer(peer, meeting_id).await {
                 let message = format!("syncing media with a peer: {e}");
                 tracing::warn!(target: "app-main", "sync: {message}");
                 last_err = Some(message);
@@ -338,7 +338,7 @@ impl SyncControl for ConnectedSync {
             // (and we learn the peer's for the meetings we hold). Best-effort and
             // NOT a progress step — a discovery failure does not fail the sync; the
             // lifecycle re-advertises on the next sync.
-            if let Err(e) = engine.discover_with(peer).await {
+            if let Err(e) = engine.discover_with_peer(peer).await {
                 tracing::warn!(target: "app-main", peer = %peer, error = %e, "ride-along discovery failed");
             }
         }
@@ -359,6 +359,26 @@ impl SyncControl for ConnectedSync {
                 Err(IpcError::Internal { context: message })
             }
         }
+    }
+
+    async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<(), IpcError> {
+        // Best-effort, and never fails the caller: the meeting folder is already
+        // gone by the time `delete_meeting` calls this, so a disabled connector or
+        // a not-yet-started engine has nothing left to do.
+        let rt = self.runtime.lock().await;
+        let Some(engine) = rt.engine.clone() else {
+            return Ok(());
+        };
+        drop(rt);
+        if let Err(e) = engine.delete_meeting_blobs(meeting_id).await {
+            tracing::warn!(
+                target: "app-main",
+                meeting_id = %meeting_id.0,
+                error = %e,
+                "sync: unpinning a deleted meeting's blobs failed (best-effort)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -413,11 +433,7 @@ impl ElectionDriver for DesktopElectionDriver {
         // `Processed`, so a consumer never learns `Processed` without the outputs
         // being retrievable (DESIGN_producer-gate.md §6.7). Best-effort per peer.
         for peer in self.engine.peer_ids() {
-            if let Err(e) = self
-                .engine
-                .sync_artifacts_to_peer(&peer.to_string(), meeting_id)
-                .await
-            {
+            if let Err(e) = self.engine.sync_artifacts_to_peer(&peer, meeting_id).await {
                 tracing::warn!(target: "app-main", peer = %peer, error = %e, "election: pushing artifacts to a peer failed");
             }
         }

@@ -9,9 +9,10 @@
 //! UniFFI surface, and this crate takes no `iroh` dependency of its own:
 //!
 //! - peers are [`EndpointTicket`](iroh_tickets) strings ([`FfiSyncEngine::my_ticket`]
-//!   / [`FfiSyncEngine::pair`]) and thereafter hex peer-id strings, passed
-//!   straight to `SyncEngine`'s string-keyed `*_to_peer` / `*_with_peer` methods
-//!   (which relay-address the peer internally — see `SyncEngine::push_all_to`);
+//!   / [`FfiSyncEngine::pair`]) and thereafter hex peer-id strings — `peer_ids` /
+//!   `subscribe_peers` hand them back, and the `*_to_peer` / `*_with_peer`
+//!   methods (which relay-address the peer internally — see
+//!   `SyncEngine::push_all_to_peer`) take them straight back in;
 //! - meetings are hyphenated UUID strings (`MeetingId`'s serde form);
 //! - the discovery lifecycle is the typed [`FfiLifecycle`] enum, mapped from
 //!   [`minutist_common::ProcessingLifecycle`];
@@ -302,12 +303,10 @@ impl FfiSyncEngine {
 
     /// Hex endpoint ids of every currently-registered peer.
     pub fn peer_ids(&self) -> Result<Vec<String>, SyncFfiError> {
-        Ok(self
-            .engine()?
-            .peer_ids()
-            .iter()
-            .map(|id| id.to_string())
-            .collect())
+        // `SyncEngine::peer_ids` is already hex-string-keyed, so no per-id
+        // conversion is needed here (unlike `endpoint_id` / `pair`, which map an
+        // `iroh`-typed return at the boundary).
+        Ok(self.engine()?.peer_ids())
     }
 
     /// Hyphenated UUID strings of the meetings this device holds on disk.
@@ -419,9 +418,12 @@ impl FfiSyncEngine {
     /// Drain "peer arrived" events into `listener` until shutdown. One listener
     /// per call (see [`Self::subscribe_lifecycle`]).
     pub fn subscribe_peers(&self, listener: Box<dyn PeerListener>) -> Result<(), SyncFfiError> {
+        // `SyncEngine::subscribe_peer_events` is already hex-string-keyed, so the
+        // event is forwarded as-is (unlike the lifecycle stream, whose
+        // `MeetingId` still needs its own string projection).
         let rx = self.engine()?.subscribe_peer_events();
         spawn_drain(rx, move |item| match item {
-            Drained::Event(peer) => listener.on_peer_arrived(peer.to_string()),
+            Drained::Event(peer) => listener.on_peer_arrived(peer),
             Drained::Lagged => listener.on_lagged(),
         });
         Ok(())

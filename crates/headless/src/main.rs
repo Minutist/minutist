@@ -431,14 +431,14 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
                     if !due {
                         continue;
                     }
-                    last_push.insert(peer, now);
+                    last_push.insert(peer.clone(), now);
                     // Race the push against shutdown so a SIGTERM mid-push is honoured
                     // promptly: the push future is dropped (iroh closes the connection;
                     // notes writes are atomic and media is content-addressed, so an
                     // abandoned push is safe and idempotent on the next reconcile).
                     tokio::select! {
                         _ = &mut shutdown => break 'serve,
-                        result = engine.push_all_to(peer) => match result {
+                        result = engine.push_all_to_peer(&peer) => match result {
                             Ok(n) => tracing::info!(target: "hub", peer = %peer, meetings = n, "pushed meetings to arrived peer"),
                             Err(e) => tracing::warn!(target: "hub", peer = %peer, error = %e, "push to arrived peer failed"),
                         },

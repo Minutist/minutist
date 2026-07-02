@@ -57,6 +57,14 @@ pub trait SyncControl: Send + Sync {
     /// completion arrive on the event bus (`SyncProgress` / `SyncReady`), not the
     /// return value; an error here means the sync could not be started.
     async fn sync_now(&self, meeting_id: MeetingId) -> Result<(), IpcError>;
+
+    /// Best-effort: unpin `meeting_id`'s media + derived-artifact blobs from the
+    /// local blob store (so the bytes become GC-eligible) after its folder has
+    /// already been deleted. Called from [`crate::commands::delete_meeting`]. A
+    /// free build, or a connected build whose sync engine has not started, is a
+    /// no-op — [`DisabledSync`] never errors here, since the meeting is gone
+    /// either way and there is nothing more this call could accomplish.
+    async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<(), IpcError>;
 }
 
 /// The no-op sync control used by the free build and by a connected build with
@@ -91,6 +99,13 @@ impl SyncControl for DisabledSync {
         Err(IpcError::Unsupported {
             context: SYNC_UNAVAILABLE.to_string(),
         })
+    }
+
+    async fn delete_meeting_blobs(&self, _meeting_id: MeetingId) -> Result<(), IpcError> {
+        // No blob store in this build — nothing to unpin. Never an error: the
+        // meeting folder is already gone by the time this is called, so a free
+        // build has genuinely finished the deletion.
+        Ok(())
     }
 }
 
@@ -160,6 +175,7 @@ mod tests {
             s.sync_now(MeetingId::new()).await,
             Err(IpcError::Unsupported { .. })
         ));
+        assert!(s.delete_meeting_blobs(MeetingId::new()).await.is_ok());
     }
 
     #[tokio::test]

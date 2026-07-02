@@ -18,16 +18,30 @@
 //! the authoritative media files remain the per-meeting `audio.opus` / `assets/*`
 //! that `persistence` owns — the store is a transport-and-dedup layer beside them.
 //!
-//! # Retention (GC)
+//! # Retention (GC) and reclamation
 //!
-//! [`FsStore::load`] starts with garbage collection DISABLED (its `Options` carry
-//! `gc: None` and no GC task is spawned), so an imported or downloaded blob is
-//! retained until explicitly deleted. We nonetheless pin every payload with a
-//! PERSISTENT, deterministically named tag (`meeting/{id}/audio`,
-//! `meeting/{id}/asset/{filename}`) so that retention survives a future decision
-//! to enable GC and so a payload can be found and unpinned when its meeting is
-//! deleted. Named tags survive restart; temp-tags (in-flight import protection)
-//! do not.
+//! Every payload is pinned with a PERSISTENT, deterministically named tag
+//! (`meeting/{id}/audio`, `meeting/{id}/asset/{filename}`,
+//! `meeting/{id}/artifact/{rel}`), so an imported or downloaded blob is retained
+//! regardless of GC state and can always be found by meeting id. [`BlobStore::open`]
+//! enables `iroh-blobs`' periodic mark-and-sweep GC ([`GC_INTERVAL`]): the mark
+//! phase roots every blob still referenced by SOME live tag (across every
+//! meeting), so a hash that is content-identical across two meetings (e.g. the
+//! same pasted image) survives as long as either meeting still tags it — the
+//! only reclamation strategy that is safe under content-addressed dedup, since
+//! directly deleting a blob's bytes on one meeting's deletion could not tell
+//! whether another meeting's tag still points at the same hash. Two paths remove
+//! a tag so its blob becomes sweep-eligible:
+//!
+//! - [`BlobStore::delete_meeting_blobs`] unpins every tag for a deleted meeting
+//!   (media + derived artifacts), called from the meeting-deletion path
+//!   (`ipc-bridge`'s `delete_meeting` command, via [`crate::SyncEngine`]).
+//! - re-tagging a superseded derived artifact ([`BlobStore::import_artifacts`])
+//!   overwrites the old tag -> hash mapping with the new one (`tags().set` is a
+//!   single-value-per-name map), so the superseded hash is no longer rooted by
+//!   that tag once the overwrite lands — no separate unpin step is needed.
+//!
+//! Named tags survive restart; temp-tags (in-flight import protection) do not.
 //!
 //! # Transport
 //!
@@ -40,15 +54,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset};
+use futures_util::StreamExt;
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::api::downloader::Shuffled;
+use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader, Shuffled};
 use iroh_blobs::api::Store;
 use iroh_blobs::store::fs::FsStore;
+use iroh_blobs::store::GcConfig;
 use iroh_blobs::HashAndFormat;
 use minutist_common::{HostRef, MeetingId};
 
+use crate::timeouts::BLOB_DOWNLOAD_TIMEOUT;
 use crate::{Error, Result};
 
 /// The BLAKE3 content hash type, re-exported from [`iroh_blobs`] so callers and
@@ -60,30 +78,80 @@ pub use iroh_blobs::Hash;
 /// per-meeting folder.
 const STORE_DIR: &str = ".blobs";
 
+/// Interval between the blob store's periodic mark-and-sweep GC runs (see the
+/// module doc — "Retention (GC) and reclamation"). A few minutes is generous
+/// enough that GC is never the bottleneck on a busy sync burst, while short
+/// enough that an unpinned meeting's blobs do not linger indefinitely.
+const GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Upper bound on a single downloaded blob's size, in bytes. Meeting audio is the
+/// largest legitimate payload; Opus at typical voice bitrates keeps even a
+/// multi-hour meeting well under this. Enforced against the downloader's own
+/// running byte-offset progress ([`download_capped`]), not a self-reported size —
+/// a hostile paired peer fully controls its own advertised manifest (it can
+/// declare any size it likes for a hash it also freely chose), so only real-time
+/// enforcement during the transfer actually bounds the bytes a peer can force
+/// onto this device's disk.
+pub(crate) const MAX_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// One file's `(size, mtime)` memoised against the [`Hash`] `sync` computed for
+/// it last time — see [`BlobStore::import_path`].
+#[derive(Debug, Clone, Copy)]
+struct HashMemoEntry {
+    size: u64,
+    mtime: std::time::SystemTime,
+    hash: Hash,
+}
+
 /// A content-addressed store for a device's meeting media, backed by an
 /// [`iroh_blobs`] [`FsStore`] at `{meetings_root}/.blobs`.
 ///
 /// Holds the owned [`FsStore`] (kept alive for the lifetime of the engine; the
 /// [`iroh_blobs::BlobsProtocol`] registered on the router borrows from a clone of
 /// the inner [`Store`]) and is cheap to clone (the store is internally an RPC
-/// client handle).
+/// client handle; the hash memo is an `Arc`, shared by every clone).
 #[derive(Debug, Clone)]
 pub struct BlobStore {
     store: FsStore,
+    /// `(path, size, mtime)` -> hash memo so [`Self::import_path`] can skip
+    /// re-hashing (and re-importing into the `iroh-blobs` store) a file whose
+    /// metadata hasn't changed since the last reconciliation — every peer
+    /// arrival (`push_all_to`) and every `sync_now` re-imports each meeting's
+    /// media/artifacts, so an unchanged multi-megabyte `audio.opus` would
+    /// otherwise be re-hashed from scratch on each pass. In-memory only, live for
+    /// this `BlobStore`'s process lifetime (a restart re-hashes once, which is
+    /// cheap relative to the reconciliation traffic this saves); grows by one
+    /// entry per distinct path ever imported and is never reclaimed, the same
+    /// bounded-by-meeting-count growth `notes_crdt::metadata_lock`'s registry
+    /// and the artifact-authority lock registry ([`ARTIFACT_AUTHORITY_LOCKS`])
+    /// already accept.
+    hash_memo: Arc<Mutex<HashMap<PathBuf, HashMemoEntry>>>,
 }
 
 impl BlobStore {
-    /// Open (or create) the blob store at `{meetings_root}/.blobs`.
+    /// Open (or create) the blob store at `{meetings_root}/.blobs`, with periodic
+    /// GC enabled ([`GC_INTERVAL`]) so a tag unpinned via
+    /// [`Self::delete_meeting_blobs`] or superseded by a re-tag actually reclaims
+    /// its blob's bytes — see the module doc, "Retention (GC) and reclamation".
     ///
     /// Creates the directory tree if absent. The meetings root is expected to be
     /// absolute (the app passes the XDG meetings root; tests pass a tempdir).
     pub async fn open(meetings_root: &Path) -> Result<Self> {
         let path = meetings_root.join(STORE_DIR);
         std::fs::create_dir_all(&path)?;
-        let store = FsStore::load(&path)
+        let db_path = path.join("blobs.db");
+        let mut options = iroh_blobs::store::fs::options::Options::new(&path);
+        options.gc = Some(GcConfig {
+            interval: GC_INTERVAL,
+            add_protected: None,
+        });
+        let store = FsStore::load_with_opts(db_path, options)
             .await
             .map_err(|e| Error::Endpoint(format!("opening blob store at {path:?}: {e}")))?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            hash_memo: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     /// The inner [`iroh_blobs`] [`Store`], used to construct the
@@ -154,9 +222,12 @@ impl BlobStore {
     /// `assets/{filename}`); it is re-validated here (defence in depth — the
     /// protocol already validated the whole manifest) so it cannot escape the
     /// meeting folder. The download dials `peer` through the engine's existing
-    /// [`Endpoint`] and blocks until the blob is local; the export then writes a
-    /// real copy to the per-meeting path, creating the immediate parent
-    /// (`assets/`) if needed. The returned path is the absolute export target.
+    /// [`Endpoint`], bounded by [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`]
+    /// ([`download_capped`]) so a stalled or hostile peer cannot pin this call or
+    /// fill the disk. The export is atomic ([`Self::export_atomic`]): a crash or
+    /// two concurrent syncs offering different hashes for the same `rel` cannot
+    /// leave a torn file at the real path. The returned path is the absolute
+    /// export target.
     ///
     /// The caller ensures the meeting folder via `notes_crdt::MeetingFolder`
     /// before reconciling media; this method writes only the media file itself.
@@ -174,17 +245,25 @@ impl BlobStore {
         }
 
         let downloader = self.store.downloader(endpoint);
-        downloader
-            .download(hash, Shuffled::new(vec![peer]))
-            .await
-            .map_err(|e| Error::Protocol(format!("downloading blob {hash} from {peer}: {e}")))?;
+        tokio::time::timeout(
+            BLOB_DOWNLOAD_TIMEOUT,
+            download_capped(&downloader, hash, peer, MAX_BLOB_BYTES),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                %hash, %peer,
+                timeout = ?BLOB_DOWNLOAD_TIMEOUT,
+                "downloading a media blob timed out"
+            );
+            Error::Protocol(format!(
+                "downloading blob {hash} from {peer} timed out after {BLOB_DOWNLOAD_TIMEOUT:?}"
+            ))
+        })??;
 
         let target = meetings_root.join(meeting_id.0.to_string()).join(rel);
-        self.store
-            .blobs()
-            .export(hash, &target)
-            .await
-            .map_err(|e| Error::Protocol(format!("exporting blob {hash} to {target:?}: {e}")))?;
+        self.export_atomic(hash, &target).await?;
         self.tag(&tag_for_rel(meeting_id, rel), hash).await?;
         Ok(target)
     }
@@ -296,16 +375,14 @@ impl BlobStore {
     /// pinning it with the per-meeting artifact tag.
     ///
     /// `rel` is re-validated against the artifact allow-list (defence in depth — the
-    /// manifest was validated whole). The export goes to a hash-suffixed sibling
-    /// `{rel}.{hash}.tmp` (so concurrent pulls of the same rel at different hashes do
-    /// not share a tmp) which is fsynced then atomically renamed over the target (the
-    /// durable tmp+fsync+rename the rest of the codebase uses for `transcript.json` /
-    /// `summary.md`), so a concurrent reader of `transcript.json` (read far more often
-    /// than `audio.opus`) never observes a partial file and a crash cannot commit a
-    /// truncated one. The caller ensures the meeting folder via
-    /// `notes_crdt::MeetingFolder::ensure` and records the received authority (it
-    /// holds the peer entry's `produced_by`/`produced_at`); this writes only the
-    /// artifact file.
+    /// manifest was validated whole). The download is bounded by
+    /// [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`] ([`download_capped`]), and
+    /// the export is atomic ([`Self::export_atomic`]): a concurrent reader of
+    /// `transcript.json` (read far more often than `audio.opus`) never observes a
+    /// partial file and a crash cannot commit a truncated one. The caller ensures
+    /// the meeting folder via `notes_crdt::MeetingFolder::ensure` and records the
+    /// received authority (it holds the peer entry's `produced_by`/`produced_at`);
+    /// this writes only the artifact file.
     pub async fn download_artifact(
         &self,
         endpoint: &Endpoint,
@@ -320,53 +397,129 @@ impl BlobStore {
         }
 
         let downloader = self.store.downloader(endpoint);
-        downloader
-            .download(hash, Shuffled::new(vec![peer]))
-            .await
-            .map_err(|e| {
-                Error::Protocol(format!("downloading artifact {hash} from {peer}: {e}"))
-            })?;
+        tokio::time::timeout(
+            BLOB_DOWNLOAD_TIMEOUT,
+            download_capped(&downloader, hash, peer, MAX_BLOB_BYTES),
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                %hash, %peer,
+                timeout = ?BLOB_DOWNLOAD_TIMEOUT,
+                "downloading an artifact blob timed out"
+            );
+            Error::Protocol(format!(
+                "downloading artifact {hash} from {peer} timed out after {BLOB_DOWNLOAD_TIMEOUT:?}"
+            ))
+        })??;
 
         let target = meetings_root.join(meeting_id.0.to_string()).join(rel);
-        // Include the content hash in the tmp name so two concurrent pulls of the
-        // same (meeting, rel) at DIFFERENT hashes never share a tmp and tear each
-        // other's export; same-hash concurrent pulls write byte-identical content to
-        // one name, which is harmless. (`import_artifacts` only ever reads the fixed
-        // ARTIFACT_RELS names, so a stale `.tmp` left by a crash is ignored.)
+        self.export_atomic(hash, &target).await?;
+        self.tag(&artifact_tag(meeting_id, rel), hash).await?;
+        Ok(target)
+    }
+
+    /// Export `hash`'s content to `target` atomically: write to a hash-suffixed
+    /// sibling `{target-name}.{hash}.tmp` (so two concurrent pulls of the same
+    /// target at DIFFERENT hashes never share a tmp and tear each other's export;
+    /// same-hash concurrent pulls write byte-identical content to one name,
+    /// harmless), fsync it, then atomically rename over `target`. So a crash or
+    /// two concurrent syncs offering different hashes for the same path cannot
+    /// leave a torn file at `target` — it is always either the previous complete
+    /// content or the new complete content, never a partial write. Shared by
+    /// [`Self::download`] (media) and [`Self::download_artifact`].
+    async fn export_atomic(&self, hash: Hash, target: &Path) -> Result<()> {
         let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
         let tmp = target.with_extension(format!("{ext}.{hash}.tmp"));
         self.store
             .blobs()
             .export(hash, &tmp)
             .await
-            .map_err(|e| Error::Protocol(format!("exporting artifact {hash} to {tmp:?}: {e}")))?;
+            .map_err(|e| Error::Protocol(format!("exporting blob {hash} to {tmp:?}: {e}")))?;
         // fsync the exported tmp so the rename below cannot commit a name that
         // points at not-yet-durable bytes (matches persistence's atomic writers).
         std::fs::File::open(&tmp)
             .and_then(|f| f.sync_all())
-            .map_err(|e| Error::Protocol(format!("fsyncing artifact tmp {tmp:?}: {e}")))?;
-        std::fs::rename(&tmp, &target).map_err(|e| {
+            .map_err(|e| Error::Protocol(format!("fsyncing export tmp {tmp:?}: {e}")))?;
+        std::fs::rename(&tmp, target).map_err(|e| {
             // Leave no tmp residue on a failed rename (the next download overwrites
             // it regardless, but a directory-scanning slice should not see it).
             let _ = std::fs::remove_file(&tmp);
             Error::Protocol(format!("atomically renaming {tmp:?} -> {target:?}: {e}"))
-        })?;
-        self.tag(&artifact_tag(meeting_id, rel), hash).await?;
-        Ok(target)
+        })
+    }
+
+    /// Unpin every blob tag this device holds for `meeting_id` — its media
+    /// (`meeting/{id}/audio`, `meeting/{id}/asset/*`) and any derived-artifact
+    /// tags (`meeting/{id}/artifact/*`) — so the underlying bytes become
+    /// GC-eligible on the store's next periodic sweep ([`GC_INTERVAL`]). Does not
+    /// force an immediate sweep; a hash still tagged by another meeting (dedup)
+    /// survives regardless, since GC roots from every remaining tag, not just this
+    /// meeting's. Called from the meeting-deletion path
+    /// (`ipc-bridge::delete_meeting` via [`crate::SyncEngine::delete_meeting_blobs`]);
+    /// idempotent (deleting an already-untagged prefix is a no-op).
+    pub async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<()> {
+        let prefix = meeting_tag_prefix(meeting_id);
+        self.store
+            .tags()
+            .delete_prefix(prefix.as_bytes())
+            .await
+            .map_err(|e| {
+                Error::Protocol(format!("unpinning blobs for meeting {meeting_id:?}: {e}"))
+            })?;
+        Ok(())
     }
 
     /// Import a single file into the store and return its [`Hash`].
+    ///
+    /// Consults [`Self::hash_memo`] first: when `path`'s current `(size, mtime)`
+    /// matches a memoised entry, the memoised hash is returned WITHOUT reading or
+    /// re-importing the file — content-addressing stays correct because a real
+    /// content change almost always changes the size and/or mtime, invalidating
+    /// the memo and falling through to a real re-hash. (The residual risk is the
+    /// same one any mtime-based change check accepts — e.g. `rsync`'s quick
+    /// check, `make`'s timestamp rule — a same-size rewrite landing within one
+    /// filesystem mtime tick; not a concern for the audio/artifact files this
+    /// memoises, which are written once by `persistence`/`orchestrator` and never
+    /// rewritten in place.) A memo miss re-hashes via `iroh-blobs`' `add_path`
+    /// (which also imports the bytes) and records the fresh entry.
     async fn import_path(&self, path: &Path) -> Result<Hash> {
+        let metadata = std::fs::metadata(path)
+            .map_err(|e| Error::Protocol(format!("stat-ing {path:?} before import: {e}")))?;
+        let size = metadata.len();
+        let mtime = metadata
+            .modified()
+            .map_err(|e| Error::Protocol(format!("reading mtime of {path:?}: {e}")))?;
+
+        if let Some(entry) = self.hash_memo.lock().expect("hash memo poisoned").get(path) {
+            if entry.size == size && entry.mtime == mtime {
+                return Ok(entry.hash);
+            }
+        }
+
         let tag = self
             .store
             .blobs()
             .add_path(path)
             .await
             .map_err(|e| Error::Protocol(format!("importing {path:?} into blob store: {e}")))?;
+        self.hash_memo.lock().expect("hash memo poisoned").insert(
+            path.to_path_buf(),
+            HashMemoEntry {
+                size,
+                mtime,
+                hash: tag.hash,
+            },
+        );
         Ok(tag.hash)
     }
 
     /// Set a persistent named tag pinning `hash` (as a raw blob) against GC.
+    /// Overwrites any prior value under `name` — a re-tag (e.g. a superseded
+    /// derived artifact in [`Self::import_artifacts`]) un-roots the old hash from
+    /// this tag in the same call, so the old bytes are reclaimed on the next GC
+    /// sweep unless another tag still pins them (dedup-safe).
     async fn tag(&self, name: &str, hash: Hash) -> Result<()> {
         self.store
             .tags()
@@ -374,6 +527,79 @@ impl BlobStore {
             .await
             .map_err(|e| Error::Protocol(format!("tagging blob {hash} as {name}: {e}")))
     }
+
+    /// Test-only seam: like [`Self::download`]'s size-capped transfer, but with an
+    /// explicit `max_bytes` in place of the production [`MAX_BLOB_BYTES`], so a
+    /// test can prove the size-cap rejection without needing a multi-gigabyte
+    /// payload. Gated behind `test-support`, mirroring [`crate::SyncEngine`]'s
+    /// other test seams.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn download_capped_for_test(
+        &self,
+        endpoint: &Endpoint,
+        peer: EndpointId,
+        hash: Hash,
+        max_bytes: u64,
+    ) -> Result<()> {
+        let downloader = self.store.downloader(endpoint);
+        download_capped(&downloader, hash, peer, max_bytes).await
+    }
+}
+
+/// The tag-name prefix shared by every tag [`BlobStore`] pins for `meeting_id` —
+/// media ([`audio_tag`] / [`asset_tag`]) and derived artifacts ([`artifact_tag`])
+/// all start with it — so [`BlobStore::delete_meeting_blobs`] can unpin all of
+/// them in one `delete_prefix` call.
+fn meeting_tag_prefix(meeting_id: MeetingId) -> String {
+    format!("meeting/{}/", meeting_id.0)
+}
+
+/// Pull `hash` from `peer` through `downloader`, aborting with
+/// [`Error::Protocol`] the moment the transfer's running byte offset exceeds
+/// `max_bytes`. Watches the downloader's own progress stream rather than
+/// checking the blob's size only after a (potentially oversized) transfer has
+/// already completed — a hostile peer fully controls the manifest entry it
+/// advertises (both the hash and any size it claims for it), so only a live
+/// check during the transfer actually bounds what it can write to this device's
+/// disk. Dropping the progress stream on a cap breach stops the downloader's
+/// background task from writing further bytes.
+async fn download_capped(
+    downloader: &Downloader,
+    hash: Hash,
+    peer: EndpointId,
+    max_bytes: u64,
+) -> Result<()> {
+    let mut progress = downloader
+        .download(hash, Shuffled::new(vec![peer]))
+        .stream()
+        .await
+        .map_err(|e| Error::Protocol(format!("starting download of {hash} from {peer}: {e}")))?;
+    while let Some(item) = progress.next().await {
+        match item {
+            DownloadProgressItem::Progress(offset) if offset > max_bytes => {
+                tracing::warn!(
+                    target: "sync",
+                    %hash, %peer, offset, cap = max_bytes,
+                    "peer's blob exceeded the per-blob size cap; aborting download"
+                );
+                return Err(Error::Protocol(format!(
+                    "blob {hash} from {peer} exceeded the {max_bytes}-byte cap"
+                )));
+            }
+            DownloadProgressItem::Error(e) => {
+                return Err(Error::Protocol(format!(
+                    "downloading blob {hash} from {peer}: {e}"
+                )));
+            }
+            DownloadProgressItem::DownloadError => {
+                return Err(Error::Protocol(format!(
+                    "downloading blob {hash} from {peer}: download failed"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Relative path of a meeting's primary audio file within its folder.
@@ -383,12 +609,12 @@ pub(crate) const ASSETS_DIR: &str = "assets";
 
 /// The persistent tag name pinning a meeting's audio blob.
 fn audio_tag(meeting_id: MeetingId) -> String {
-    format!("meeting/{}/audio", meeting_id.0)
+    format!("{}audio", meeting_tag_prefix(meeting_id))
 }
 
 /// The persistent tag name pinning one of a meeting's asset blobs.
 fn asset_tag(meeting_id: MeetingId, filename: &str) -> String {
-    format!("meeting/{}/asset/{filename}", meeting_id.0)
+    format!("{}asset/{filename}", meeting_tag_prefix(meeting_id))
 }
 
 /// The persistent tag name for a (meeting, relative-path) pair: the audio tag for
@@ -446,11 +672,12 @@ pub(crate) fn is_artifact_rel(rel: &str) -> bool {
 }
 
 /// The persistent tag name pinning one of a meeting's derived-artifact blobs.
-/// `rel` must already be an [`is_artifact_rel`] path. A namespace distinct from
-/// the media tags (`meeting/{id}/audio|asset/...`) so unpinning media never
-/// touches an artifact and vice versa.
+/// `rel` must already be an [`is_artifact_rel`] path. A sub-namespace distinct
+/// from the media tags (`meeting/{id}/audio|asset/...`) — both still share the
+/// [`meeting_tag_prefix`] so [`BlobStore::delete_meeting_blobs`] unpins media and
+/// artifacts together for a deleted meeting in one `delete_prefix` call.
 fn artifact_tag(meeting_id: MeetingId, rel: &str) -> String {
-    format!("meeting/{}/artifact/{rel}", meeting_id.0)
+    format!("{}artifact/{rel}", meeting_tag_prefix(meeting_id))
 }
 
 /// Upper bound on the number of entries in a manifest received from a peer. A
@@ -1126,5 +1353,175 @@ mod tests {
         assert_eq!(m.entries.len(), 1);
         assert_eq!(m.entries[0].produced_by, HostRef("host-a".to_string()));
         assert_eq!(m.entries[0].produced_at, "2026-06-30T10:00:00Z");
+    }
+
+    /// F3(a): deleting a meeting unpins every blob tag it holds — media AND
+    /// derived artifacts — so a subsequent GC sweep can reclaim the bytes. A
+    /// second delete on an already-untagged meeting is a no-op, not an error.
+    #[tokio::test]
+    async fn delete_meeting_blobs_unpins_media_and_artifact_tags() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = BlobStore::open(root).await.expect("open store");
+        let id = MeetingId::new();
+        let folder = root.join(id.0.to_string());
+        std::fs::create_dir_all(&folder).expect("mk folder");
+        std::fs::write(folder.join("audio.opus"), b"fake-opus-bytes").expect("write audio");
+        std::fs::write(folder.join("transcript.json"), b"[]").expect("write transcript");
+
+        store.import_meeting(root, id).await.expect("import media");
+        store
+            .import_artifacts(
+                root,
+                id,
+                Some((
+                    HostRef("host-a".to_string()),
+                    "2026-06-30T10:00:00Z".to_string(),
+                )),
+            )
+            .await
+            .expect("import artifact");
+
+        assert!(
+            store
+                .store
+                .tags()
+                .get(audio_tag(id))
+                .await
+                .expect("get audio tag")
+                .is_some(),
+            "audio tag must exist before deletion"
+        );
+        assert!(
+            store
+                .store
+                .tags()
+                .get(artifact_tag(id, "transcript.json"))
+                .await
+                .expect("get artifact tag")
+                .is_some(),
+            "artifact tag must exist before deletion"
+        );
+
+        store
+            .delete_meeting_blobs(id)
+            .await
+            .expect("delete meeting blobs");
+
+        assert!(
+            store
+                .store
+                .tags()
+                .get(audio_tag(id))
+                .await
+                .expect("get audio tag after delete")
+                .is_none(),
+            "audio tag must be unpinned after delete_meeting_blobs"
+        );
+        assert!(
+            store
+                .store
+                .tags()
+                .get(artifact_tag(id, "transcript.json"))
+                .await
+                .expect("get artifact tag after delete")
+                .is_none(),
+            "artifact tag must be unpinned after delete_meeting_blobs"
+        );
+
+        // Idempotent: an already-untagged meeting deletes cleanly again.
+        store
+            .delete_meeting_blobs(id)
+            .await
+            .expect("second delete is a no-op, not an error");
+    }
+
+    /// The minor "media export is non-atomic" fix, unit-tested directly against
+    /// the shared [`BlobStore::export_atomic`] helper (both [`BlobStore::download`]
+    /// and [`BlobStore::download_artifact`] route through it): exporting new
+    /// content over an existing target file replaces it completely and leaves no
+    /// `.tmp` residue, whether or not a stale file was already present.
+    #[tokio::test]
+    async fn export_atomic_replaces_target_and_leaves_no_tmp_residue() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = BlobStore::open(root).await.expect("open store");
+
+        // Seed a stale target as if from an earlier (non-atomic) write or crash.
+        let target = root.join("export-target.bin");
+        std::fs::write(&target, b"stale-content").expect("seed stale target");
+
+        let src = root.join("source.bin");
+        std::fs::write(&src, b"fresh-content").expect("write source");
+        let hash = store.import_path(&src).await.expect("import path");
+
+        store
+            .export_atomic(hash, &target)
+            .await
+            .expect("atomic export");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"fresh-content",
+            "export_atomic must fully replace the target with the new content"
+        );
+        let stray_tmp: Vec<_> = std::fs::read_dir(root)
+            .expect("read root dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            stray_tmp.is_empty(),
+            "no .tmp file must remain after export_atomic, found {stray_tmp:?}"
+        );
+    }
+
+    /// The re-hash memo ([`BlobStore::import_path`]) returns the memoised hash
+    /// without re-hashing when a file's `(size, mtime)` is unchanged — proven by
+    /// planting a deliberately WRONG hash under a matching memo entry and
+    /// observing `import_path` returns THAT wrong value (so the skip genuinely
+    /// happens, not just "happens to recompute the same value") — and correctly
+    /// invalidates and re-hashes once the file changes.
+    #[tokio::test]
+    async fn import_path_memo_skips_unchanged_files_and_invalidates_on_change() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = BlobStore::open(root).await.expect("open store");
+
+        let path = root.join("audio.opus");
+        std::fs::write(&path, b"original-bytes").expect("write file");
+        let real_hash = store.import_path(&path).await.expect("first import");
+
+        // Plant a deliberately wrong hash under the file's CURRENT (size, mtime).
+        // If the memo is genuinely consulted (rather than the file re-hashed for
+        // real), import_path must return this wrong value.
+        let metadata = std::fs::metadata(&path).expect("stat");
+        let planted = Hash::from([0xAAu8; 32]);
+        assert_ne!(
+            planted, real_hash,
+            "the planted hash must differ from the real one for this test to be meaningful"
+        );
+        store.hash_memo.lock().expect("memo lock").insert(
+            path.clone(),
+            HashMemoEntry {
+                size: metadata.len(),
+                mtime: metadata.modified().expect("mtime"),
+                hash: planted,
+            },
+        );
+        let memoised = store.import_path(&path).await.expect("second import");
+        assert_eq!(
+            memoised, planted,
+            "an unchanged (size, mtime) must return the memoised hash without re-hashing"
+        );
+
+        // Changing the file's content (and size) invalidates the memo: import_path
+        // must re-hash for real, never returning the stale planted value.
+        std::fs::write(&path, b"different-length-content-here").expect("rewrite file");
+        let rehashed = store.import_path(&path).await.expect("third import");
+        assert_ne!(
+            rehashed, planted,
+            "a changed file must invalidate the memo and be re-hashed for real"
+        );
     }
 }

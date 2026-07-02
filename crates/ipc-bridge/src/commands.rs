@@ -2308,9 +2308,11 @@ async fn route_live_chat_message(
     // Clears both the in-flight guard and cancel entry on completion.
     tokio::spawn(async move {
         let mut saw_terminal = false;
+        let mut streamed = String::new();
         while let Some(chunk) = reply_rx.recv().await {
             match chunk {
                 UserReplyChunk::Token(token) => {
+                    streamed.push_str(&token);
                     let _ = event_tx.send(AppEvent::ChatToken {
                         session_id: live_sid,
                         turn_id,
@@ -2336,13 +2338,24 @@ async fn route_live_chat_message(
                 }
             }
         }
-        // If the channel closed without a terminal chunk (worker crashed or
-        // was dropped mid-decode), emit ChatError so the UI unblocks.
+        // Channel closed without a terminal chunk. If tokens were streamed, the
+        // worker's try_send(Done) was dropped on a full buffer — treat the
+        // streamed text as the final so the turn still completes. With no tokens
+        // at all, the worker died before replying, so surface an error to unblock
+        // the UI.
         if !saw_terminal {
-            let _ = event_tx.send(AppEvent::ChatError {
-                session_id: live_sid,
-                message: "Live co-pilot reply channel closed unexpectedly.".to_string(),
-            });
+            if streamed.is_empty() {
+                let _ = event_tx.send(AppEvent::ChatError {
+                    session_id: live_sid,
+                    message: "Live co-pilot reply channel closed unexpectedly.".to_string(),
+                });
+            } else {
+                let _ = event_tx.send(AppEvent::ChatTurnComplete {
+                    session_id: live_sid,
+                    turn_id,
+                    final_text: streamed,
+                });
+            }
         }
         chat_in_flight
             .lock()

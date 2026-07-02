@@ -1833,24 +1833,27 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
                 &reply_text,
                 turn_id,
             );
-            // Send the authoritative final text on reply_tx so the command
-            // task can emit ChatTurnComplete. blocking_send is used here (not
-            // try_send) because Done is authoritative — dropping it would leave
-            // the command task's drain loop running until its receiver is
-            // dropped at shutdown. The worker thread is dedicated (not on the
-            // Tokio scheduler), so blocking is acceptable. A send failure means
-            // the command task already exited (user navigated away); log and
-            // continue — the persisted turn is already durable.
+            // Send the authoritative final text on reply_tx so the command task
+            // can emit ChatTurnComplete. This MUST be try_send, never
+            // blocking_send: `process_request` runs inside the worker's
+            // `rt.block_on(run_worker_loop)`, i.e. within a Tokio runtime
+            // context, where blocking_send panics ("Cannot block the current
+            // thread from within a runtime"). If the bounded buffer is full (the
+            // command-side drain has fallen behind), Done is dropped — but the
+            // drain reconstructs the final turn from the streamed Token chunks,
+            // so the turn still completes. A send failure equally covers the
+            // command task having already exited (user navigated away); the
+            // persisted turn is durable either way.
             if let Some(ref tx) = reply_tx {
                 if tx
-                    .blocking_send(UserReplyChunk::Done(reply_text.clone()))
+                    .try_send(UserReplyChunk::Done(reply_text.clone()))
                     .is_err()
                 {
                     tracing::debug!(
                         target: "ipc-bridge",
                         meeting_id = %meeting_id.0,
-                        "live-agent: reply_tx closed before Done could be sent \
-                         (command task exited early)"
+                        "live-agent: reply_tx Done not delivered (buffer full or \
+                         command task exited); drain reconstructs from streamed tokens"
                     );
                 }
             }
@@ -2833,8 +2836,15 @@ mod tests {
     /// than the callback, so the channel carries only the terminal `Done`.
     /// (A streaming backend would send Token chunks before Done; the Done is
     /// always authoritative regardless.)
-    #[test]
-    fn process_request_user_chat_with_reply_tx_sends_done() {
+    ///
+    /// Runs as a `#[tokio::test]` so `process_request` executes inside a Tokio
+    /// runtime context — the same condition as the real worker's
+    /// `rt.block_on(run_worker_loop)`. This is the regression guard for the Done
+    /// send: a `blocking_send` here panics ("Cannot block the current thread from
+    /// within a runtime"), whereas `try_send` does not. A plain `#[test]` has no
+    /// runtime context and so silently missed the original crash.
+    #[tokio::test]
+    async fn process_request_user_chat_with_reply_tx_sends_done() {
         let mid = new_mid();
         let (_tmp, meetings_dir) = make_tmp_meetings_dir();
         // WorkerBackend returns "stub reply" via raw.text (no token_cb calls).

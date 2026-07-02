@@ -47,14 +47,19 @@ Bounded channels everywhere. Unbounded queues are not allowed — they
 hide back-pressure that the live pipeline needs to surface.
 
 **Live co-pilot reply channel (U4 A3).** `UserChatRequest` carries a bounded
-`reply_tx: mpsc::Sender<UserReplyChunk>` (depth 32). The live worker's decode
-callbacks `try_send` `UserReplyChunk::Token` per piece (drop on full — tokens are
-hints; `ChatTurnComplete` is authoritative) and `blocking_send`
-`UserReplyChunk::Done(final_text)` or `UserReplyChunk::Err(msg)` at turn end. The
-`send_chat_message` command's drain task converts these into the standard chat
-broadcast events (`ChatToken` / `ChatTurnComplete` / `ChatError`) keyed to the
-live `ChatSessionId`, so the frontend chat panel handles the live reply identically
-to the post-meeting `LlamaTurnBackend` path — no frontend branching.
+`reply_tx: mpsc::Sender<UserReplyChunk>` (depth 32). The live worker `try_send`s
+EVERY chunk — `UserReplyChunk::Token` per decoded piece (drop on full; tokens are
+hints, `ChatTurnComplete` is authoritative) and the terminal
+`Done(final_text)` / `Err(msg)` at turn end. It must NOT `blocking_send`:
+`process_request` runs inside the worker's `rt.block_on(run_worker_loop)` runtime
+context, where `blocking_send` panics ("Cannot block the current thread from
+within a runtime"). The `send_chat_message` command's drain task converts these
+into the standard chat broadcast events (`ChatToken` / `ChatTurnComplete` /
+`ChatError`) keyed to the live `ChatSessionId`, so the frontend chat panel handles
+the live reply identically to the post-meeting `LlamaTurnBackend` path — no
+frontend branching. If the channel closes without a terminal chunk but tokens were
+streamed (a `Done` dropped on a full buffer), the drain reconstructs
+`ChatTurnComplete` from the streamed text so the turn still completes.
 
 **Split co-pilot surfaces (U4).** The live co-pilot feeds TWO separate surfaces:
 - **Co-pilot feed** (`LiveCopilotMessage` events → `LiveDigestPanel`): transcript-triggered

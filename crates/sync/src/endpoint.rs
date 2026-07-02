@@ -28,11 +28,14 @@
 //!   the new ALPN: the blobs protocol on its own serves any peer that connects,
 //!   so it must NEVER be registered unguarded.
 //!
-//! [`SyncEngine::connect`] dials a peer; [`SyncEngine::sync_notes`] /
+//! `SyncEngine::dial` (crate-internal) dials a peer; [`SyncEngine::sync_notes`] /
 //! [`SyncEngine::sync_media`] / [`SyncEngine::sync_artifacts`] dial and run the
 //! initiator side for one meeting.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -48,6 +51,7 @@ use crate::address_lookup::PeerDirectory;
 use crate::blobs::BlobStore;
 use crate::identity::DeviceIdentity;
 use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
+use crate::timeouts::ACCEPT_HANDSHAKE_TIMEOUT;
 use crate::{artifacts_proto, discovery_proto, media_proto, Error, Result, SyncConfig};
 
 /// Owns the iroh endpoint, the out-of-band peer directory, the content-addressed
@@ -68,14 +72,20 @@ pub struct SyncEngine {
     /// The configured relay URL, kept so [`Self::push_all_to`] can address a peer
     /// relay-only (id + relay) without a stored direct address.
     relay_url: String,
-    /// Fires the [`EndpointId`] of a peer each time it opens an authorised inbound
-    /// sync connection ("peer arrived"). An always-on hub subscribes via
+    /// Fires a peer's hex endpoint id at most once per [`PEER_ARRIVAL_DEBOUNCE`]
+    /// window of accepted inbound connections from it ("peer arrived"). One sync
+    /// "session" (e.g. the desktop's `sync_now` for a meeting) opens several
+    /// connections in quick succession — notes, media, and discovery each dial
+    /// separately — which [`PeerArrivalTracker`] coalesces into ONE event per
+    /// visit rather than one per connection. An always-on hub subscribes via
     /// [`Self::subscribe_peer_events`] and reciprocally pushes (see
     /// [`Self::push_all_to`]); the desktop ignores it. Bounded — a lagging receiver
     /// drops the oldest ids, so the consumer is expected to recover on a
     /// [`broadcast::error::RecvError::Lagged`] by reconciling all known peers
-    /// ([`Self::peer_ids`]); no arrival is then permanently missed.
-    peer_events: broadcast::Sender<EndpointId>,
+    /// ([`Self::peer_ids`]); no visit is then permanently missed. Hex strings, not
+    /// [`EndpointId`], so a consumer (including the mobile FFI wrapper) never
+    /// needs an `iroh` type.
+    peer_events: broadcast::Sender<String>,
     /// Fires each `(MeetingId, ProcessingLifecycle)` received from a discovery
     /// exchange ([`crate::discovery_proto`]). A consumer in a crate depending on
     /// both `sync` and `persistence` (ipc-bridge / headless) subscribes via
@@ -94,6 +104,54 @@ const PEER_EVENTS_CAP: usize = 64;
 /// peer-arrival channel because one discovery exchange emits one event per
 /// meeting; a lagging consumer re-runs discovery to recover.
 const LIFECYCLE_EVENTS_CAP: usize = 256;
+
+/// Coalescing window for [`PeerArrivalTracker`]. One sync "session" against a
+/// peer opens several connections back-to-back — the desktop's `sync_now` for a
+/// single meeting dials notes, media, and discovery separately, and the hub's own
+/// `push_all_to` does the same per meeting it holds — all normally landing within
+/// low single-digit seconds of each other. A peer that has been accepted more
+/// recently than this window does not re-fire "peer arrived"; one that has been
+/// silent for longer than it is treated as a fresh visit. Deliberately much
+/// shorter than the hub's own post-event push debounce
+/// (`MINUTIST_HUB_PUSH_DEBOUNCE_MS`, default 15s in `headless`) — that one rate-
+/// limits how often a genuinely-repeated arrival triggers a push; this one only
+/// suppresses the redundant re-signalling of ONE arrival across its own burst of
+/// connections.
+const PEER_ARRIVAL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Coalesces the burst of inbound connections one sync session opens (notes,
+/// media, artifacts, and discovery each dial separately — see
+/// [`SyncEngine::peer_events`]) into a single "peer arrived" notification per
+/// visit, tracking each peer's most recently accepted-connection time. Shared
+/// (cheap to clone) between [`SyncEngine`] and the [`AcceptHook`] the router
+/// dispatches inbound connections to.
+#[derive(Debug, Clone, Default)]
+struct PeerArrivalTracker {
+    last_seen: Arc<Mutex<HashMap<EndpointId, Instant>>>,
+}
+
+impl PeerArrivalTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an accepted connection from `peer` and report whether the caller
+    /// should treat it as a fresh arrival: `true` the first time `peer` is seen,
+    /// or the first time again after [`PEER_ARRIVAL_DEBOUNCE`] of silence from it.
+    fn note_connection(&self, peer: EndpointId) -> bool {
+        let now = Instant::now();
+        let mut last_seen = self
+            .last_seen
+            .lock()
+            .expect("peer arrival tracker poisoned");
+        let fire = match last_seen.get(&peer) {
+            Some(seen) => now.duration_since(*seen) >= PEER_ARRIVAL_DEBOUNCE,
+            None => true,
+        };
+        last_seen.insert(peer, now);
+        fire
+    }
+}
 
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
@@ -127,12 +185,15 @@ impl SyncEngine {
 
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
         let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
+        // Owned solely by the router's `AcceptHook` — `SyncEngine` itself never
+        // queries arrival state, only the events `AcceptHook` derives from it.
         let router = Self::build_router(
             &endpoint,
             &blobs,
             &peers,
             &meetings_root,
             peer_events.clone(),
+            PeerArrivalTracker::new(),
             lifecycle_events.clone(),
         );
 
@@ -158,7 +219,8 @@ impl SyncEngine {
         blobs: &BlobStore,
         peers: &PeerDirectory,
         meetings_root: &Path,
-        peer_events: broadcast::Sender<EndpointId>,
+        peer_events: broadcast::Sender<String>,
+        peer_arrivals: PeerArrivalTracker,
         lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
     ) -> Router {
         let blobs_protocol = iroh_blobs::BlobsProtocol::new(blobs.inner(), None);
@@ -171,6 +233,7 @@ impl SyncEngine {
                     blobs.clone(),
                     endpoint.clone(),
                     peer_events,
+                    peer_arrivals,
                     lifecycle_events,
                 ),
             )
@@ -206,6 +269,7 @@ impl SyncEngine {
             &peers,
             &meetings_root,
             peer_events.clone(),
+            PeerArrivalTracker::new(),
             lifecycle_events.clone(),
         );
         Ok(Self {
@@ -292,17 +356,26 @@ impl SyncEngine {
         Ok(id)
     }
 
-    /// The [`EndpointId`]s of every peer currently registered in the directory.
-    /// The connected `SyncControl` syncs a meeting against each of them.
-    pub fn peer_ids(&self) -> Vec<EndpointId> {
-        self.peers.ids()
+    /// The hex endpoint ids of every peer currently registered in the directory.
+    /// The connected `SyncControl` syncs a meeting against each of them. Hex
+    /// strings, not [`EndpointId`], so a caller off the FFI boundary (the mobile
+    /// wrapper) never needs an `iroh` type; an in-tree caller that needs to dial
+    /// uses one of the `*_to_peer` methods, which parse the string back
+    /// internally.
+    pub fn peer_ids(&self) -> Vec<String> {
+        self.peers
+            .ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect()
     }
 
-    /// Subscribe to "peer arrived" events: the [`EndpointId`] of each peer as it
-    /// opens an authorised inbound sync connection. An always-on hub reacts by
-    /// calling [`Self::push_all_to`] so a device that reconnects both deposits and
+    /// Subscribe to "peer arrived" events: a peer's hex endpoint id, fired at most
+    /// once per [`PEER_ARRIVAL_DEBOUNCE`] window of its accepted inbound
+    /// connections (see [`Self::peer_events`]). An always-on hub reacts by calling
+    /// [`Self::push_all_to_peer`] so a device that reconnects both deposits and
     /// collects (convergence through the hub). The desktop does not subscribe.
-    pub fn subscribe_peer_events(&self) -> broadcast::Receiver<EndpointId> {
+    pub fn subscribe_peer_events(&self) -> broadcast::Receiver<String> {
         self.peer_events.subscribe()
     }
 
@@ -379,6 +452,16 @@ impl SyncEngine {
         Ok(reconciled)
     }
 
+    /// [`Self::push_all_to`] addressing the peer by its hex endpoint-id string —
+    /// the form [`Self::peer_ids`] / [`Self::subscribe_peer_events`] hand back, so
+    /// the hub's convergence loop (`headless`) never constructs an `iroh` type.
+    pub async fn push_all_to_peer(&self, peer_id: &str) -> Result<usize> {
+        let id: EndpointId = peer_id
+            .parse()
+            .map_err(|e| Error::Protocol(format!("parsing peer id {peer_id:?}: {e}")))?;
+        self.push_all_to(id).await
+    }
+
     /// Resolve a hex endpoint-id string to a relay-routed [`EndpointAddr`] (id +
     /// the configured relay) — the addressing form [`Self::push_all_to`] uses.
     /// The string-keyed `*_to_peer` / `*_with_peer` methods below take this so an
@@ -423,12 +506,27 @@ impl SyncEngine {
 
     /// Dial a peer on the [`SYNC_ALPN`]. The peer must already be resolvable —
     /// either injected via [`Self::add_peer`] or passed as a full
-    /// [`EndpointAddr`] carrying its relay/direct addresses.
-    pub async fn connect(&self, peer: impl Into<EndpointAddr>) -> Result<Connection> {
+    /// [`EndpointAddr`] carrying its relay/direct addresses. Crate-internal: no
+    /// consumer outside `sync` needs the raw [`Connection`] (every real operation
+    /// goes through [`Self::sync_notes`] / [`Self::sync_media`] /
+    /// [`Self::sync_artifacts`] / [`Self::discover_with`]), so this stays off the
+    /// public API rather than widening it with an iroh-typed return. See
+    /// [`Self::connect`] for the test-only public seam.
+    async fn dial(&self, peer: impl Into<EndpointAddr>) -> Result<Connection> {
         self.endpoint
             .connect(peer, SYNC_ALPN)
             .await
             .map_err(|e| Error::Endpoint(format!("dialling peer on sync alpn: {e}")))
+    }
+
+    /// Test-only public seam wrapping [`Self::dial`] (mirrors [`Self::import_media`]
+    /// / [`Self::download_blob`]): lets an integration test prove the raw
+    /// connection identity / ALPN negotiation without a full protocol exchange.
+    /// Gated behind `test-support` so the production public API carries no
+    /// iroh-typed `Connection` return.
+    #[cfg(feature = "test-support")]
+    pub async fn connect(&self, peer: impl Into<EndpointAddr>) -> Result<Connection> {
+        self.dial(peer).await
     }
 
     /// Reconcile one meeting's notes with `peer`: dial it on the [`SYNC_ALPN`]
@@ -447,7 +545,7 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let conn = self.connect(peer).await?;
+        let conn = self.dial(peer).await?;
         let result = notes_proto::initiate_notes_sync(&conn, &self.meetings_root, meeting_id).await;
         conn.close(0u32.into(), b"notes-sync-done");
         result
@@ -470,7 +568,7 @@ impl SyncEngine {
     /// separate round. [`Self::discover_all`] drives it as a standalone recovery
     /// sweep (the hub's periodic re-discovery).
     pub async fn discover_with(&self, peer: impl Into<EndpointAddr>) -> Result<Vec<MeetingId>> {
-        let conn = self.connect(peer).await?;
+        let conn = self.dial(peer).await?;
         let result = discovery_proto::initiate_discovery(&conn, &self.meetings_root).await;
         conn.close(0u32.into(), b"discovery-done");
         let theirs = result?;
@@ -501,7 +599,9 @@ impl SyncEngine {
                 self.relay_url
             ))
         })?;
-        let peers = self.peer_ids();
+        // `self.peers.ids()` (not the string-keyed `Self::peer_ids`) — this is
+        // internal engine addressing, not the FFI-facing surface.
+        let peers = self.peers.ids();
         tracing::debug!(target: "sync", count = peers.len(), "sweeping peers for discovery");
         let mut discovered = 0usize;
         for peer in peers {
@@ -534,7 +634,7 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let conn = self.connect(peer).await?;
+        let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
         let result = media_proto::initiate_media_sync(
             &conn,
@@ -569,7 +669,7 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let conn = self.connect(peer).await?;
+        let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
         let result = artifacts_proto::initiate_artifacts_sync(
             &conn,
@@ -620,6 +720,31 @@ impl SyncEngine {
             .map(|_| ())
     }
 
+    /// Unpin this device's blobs (media + derived artifacts) for `meeting_id` so
+    /// they become GC-eligible — see [`crate::blobs::BlobStore::delete_meeting_blobs`].
+    /// Called from the meeting-deletion path (the `ipc-bridge` `delete_meeting`
+    /// command, via the connected `SyncControl::delete_meeting_blobs`) after the
+    /// on-disk meeting folder is already gone; this only touches the blob store.
+    pub async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<()> {
+        self.blobs.delete_meeting_blobs(meeting_id).await
+    }
+
+    /// Test-only seam: like [`Self::download_blob`] but with an explicit size cap
+    /// in place of the production ceiling, so a test can prove the per-blob
+    /// size-cap rejection without a multi-gigabyte payload. See
+    /// [`crate::blobs::BlobStore::download_capped_for_test`].
+    #[cfg(feature = "test-support")]
+    pub async fn download_blob_capped(
+        &self,
+        peer: EndpointId,
+        hash: crate::blobs::Hash,
+        max_bytes: u64,
+    ) -> Result<()> {
+        self.blobs
+            .download_capped_for_test(&self.endpoint, peer, hash, max_bytes)
+            .await
+    }
+
     /// Shut the router (and its endpoint) down gracefully, draining in-flight
     /// connections. Idempotent at the iroh layer.
     pub async fn shutdown(self) -> Result<()> {
@@ -662,9 +787,14 @@ struct AcceptHook {
     blobs: BlobStore,
     /// The endpoint, for the media responder's blob pulls.
     endpoint: Endpoint,
-    /// Fires the remote's id once it is authorised, so an always-on hub can push
-    /// back (see [`SyncEngine::subscribe_peer_events`]).
-    peer_events: broadcast::Sender<EndpointId>,
+    /// Fires the remote's hex id the first time it is authorised in a
+    /// [`PEER_ARRIVAL_DEBOUNCE`] window, so an always-on hub can push back (see
+    /// [`SyncEngine::subscribe_peer_events`]) once per visit rather than once per
+    /// connection.
+    peer_events: broadcast::Sender<String>,
+    /// Coalesces the burst of connections one sync session opens into a single
+    /// [`Self::peer_events`] fire per visit — see [`PeerArrivalTracker`].
+    peer_arrivals: PeerArrivalTracker,
     /// Fires each `(MeetingId, ProcessingLifecycle)` received on an inbound
     /// discovery exchange (see [`SyncEngine::subscribe_lifecycle_events`]).
     lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
@@ -676,7 +806,8 @@ impl AcceptHook {
         peers: PeerDirectory,
         blobs: BlobStore,
         endpoint: Endpoint,
-        peer_events: broadcast::Sender<EndpointId>,
+        peer_events: broadcast::Sender<String>,
+        peer_arrivals: PeerArrivalTracker,
         lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
     ) -> Self {
         Self {
@@ -685,6 +816,7 @@ impl AcceptHook {
             blobs,
             endpoint,
             peer_events,
+            peer_arrivals,
             lifecycle_events,
         }
     }
@@ -710,8 +842,14 @@ impl ProtocolHandler for AcceptHook {
         tracing::info!(target: "sync", peer = %peer, "accepted sync connection");
 
         // Notify any subscriber (the always-on hub) that this peer is online so it
-        // can reciprocally push. Best-effort: `send` errors only with no receivers.
-        let _ = self.peer_events.send(peer);
+        // can reciprocally push — but only on a genuine arrival (the first
+        // connection from this peer in a PEER_ARRIVAL_DEBOUNCE window), so a
+        // burst of connections from one sync session (notes/media/discovery each
+        // dial separately) fires ONE event, not one per connection. Best-effort:
+        // `send` errors only with no receivers.
+        if self.peer_arrivals.note_connection(peer) {
+            let _ = self.peer_events.send(peer.to_string());
+        }
 
         self.dispatch(&connection, peer)
             .await
@@ -721,16 +859,41 @@ impl ProtocolHandler for AcceptHook {
 
 impl AcceptHook {
     /// Accept the initiator's bidirectional stream, read its leading
-    /// [`StreamKind`] tag, and run the matching responder.
+    /// [`StreamKind`] tag, and run the matching responder. The accept + tag read
+    /// are bounded by [`ACCEPT_HANDSHAKE_TIMEOUT`]: this is the very first
+    /// exchange on a fresh connection, so a peer slow here is stalled or hostile
+    /// rather than merely on a slow network path.
     async fn dispatch(&self, connection: &Connection, peer: EndpointId) -> Result<()> {
-        let (mut send, mut recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| Error::Protocol(format!("accepting sync bi stream: {e}")))?;
+        let (mut send, mut recv) =
+            tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, connection.accept_bi())
+                .await
+                .map_err(|_| {
+                    tracing::warn!(
+                        target: "sync",
+                        peer = %peer,
+                        timeout = ?ACCEPT_HANDSHAKE_TIMEOUT,
+                        "accepting the sync bi stream timed out"
+                    );
+                    Error::Protocol(format!(
+                        "accepting sync bi stream timed out after {ACCEPT_HANDSHAKE_TIMEOUT:?}"
+                    ))
+                })?
+                .map_err(|e| Error::Protocol(format!("accepting sync bi stream: {e}")))?;
 
         let mut tag = [0u8; 1];
-        recv.read_exact(&mut tag)
+        tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, recv.read_exact(&mut tag))
             .await
+            .map_err(|_| {
+                tracing::warn!(
+                    target: "sync",
+                    peer = %peer,
+                    timeout = ?ACCEPT_HANDSHAKE_TIMEOUT,
+                    "reading the sync stream tag timed out"
+                );
+                Error::Protocol(format!(
+                    "reading sync stream tag timed out after {ACCEPT_HANDSHAKE_TIMEOUT:?}"
+                ))
+            })?
             .map_err(|e| Error::Protocol(format!("reading sync stream tag: {e}")))?;
 
         match StreamKind::from_tag(tag[0])? {
@@ -860,6 +1023,56 @@ mod tests {
         assert!(SyncEngine::relay_mode(&config).is_err());
     }
 
+    /// F1b: a burst of near-simultaneous connections from ONE peer (mirroring
+    /// notes/media/discovery each dialling separately in one sync session) must
+    /// coalesce to a single "fire" within the debounce window; a different peer's
+    /// arrival is tracked independently and always fires on its first connection.
+    #[test]
+    fn peer_arrival_tracker_coalesces_a_burst_from_one_peer() {
+        let tracker = PeerArrivalTracker::new();
+        let peer = iroh::SecretKey::generate().public();
+
+        assert!(
+            tracker.note_connection(peer),
+            "the first connection from a peer must fire"
+        );
+        assert!(
+            !tracker.note_connection(peer),
+            "a second connection within the debounce window must not re-fire"
+        );
+        assert!(
+            !tracker.note_connection(peer),
+            "a third connection within the debounce window must not re-fire either"
+        );
+
+        let other = iroh::SecretKey::generate().public();
+        assert!(
+            tracker.note_connection(other),
+            "a different peer's first connection must fire independently"
+        );
+    }
+
+    /// A peer silent for longer than the debounce window is treated as a fresh
+    /// visit — the burst-coalescing must not permanently suppress a genuine later
+    /// reconnection. Ages the recorded arrival directly (no real sleep) so the
+    /// test stays fast and deterministic.
+    #[test]
+    fn peer_arrival_tracker_refires_after_the_debounce_window_elapses() {
+        let tracker = PeerArrivalTracker::new();
+        let peer = iroh::SecretKey::generate().public();
+        assert!(tracker.note_connection(peer));
+
+        tracker.last_seen.lock().expect("tracker lock").insert(
+            peer,
+            Instant::now() - PEER_ARRIVAL_DEBOUNCE - std::time::Duration::from_millis(1),
+        );
+
+        assert!(
+            tracker.note_connection(peer),
+            "a connection after the debounce window has elapsed must fire again"
+        );
+    }
+
     #[tokio::test]
     async fn ticket_round_trips_an_endpoint_addr() {
         let dir_a = tempfile::TempDir::new().expect("tempdir a");
@@ -881,7 +1094,10 @@ mod tests {
             .add_peer_from_ticket(&ticket)
             .expect("import ticket");
         assert_eq!(parsed, engine_a.endpoint_id());
-        assert_eq!(engine_b.peer_ids(), vec![engine_a.endpoint_id()]);
+        assert_eq!(
+            engine_b.peer_ids(),
+            vec![engine_a.endpoint_id().to_string()]
+        );
 
         engine_a.shutdown().await.expect("shutdown a");
         engine_b.shutdown().await.expect("shutdown b");

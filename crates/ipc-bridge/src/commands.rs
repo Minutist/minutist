@@ -1242,6 +1242,16 @@ pub async fn delete_meeting(
         }
     }
 
+    // Best-effort: unpin this meeting's blobs from the local blob store (a no-op
+    // on the free build, or before the sync engine has started).
+    if let Err(e) = state.sync.delete_meeting_blobs(meeting_id).await {
+        tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "unpinning deleted meeting's blobs failed (best-effort): {e}"
+        );
+    }
+
     Ok(())
 }
 

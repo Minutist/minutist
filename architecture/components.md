@@ -134,8 +134,10 @@ and `notes-crdt` (the C-free leaf the phone data layer rides — `MeetingFolder`
 lifecycle-apply stay off `persistence`'s C-heavy graph). It takes
 **no `iroh` dependency of its own** — peers are addressed by passing hex id
 strings to `SyncEngine`'s string-keyed `*_to_peer` methods, which relay-address
-them internally (like `push_all_to`), so no `iroh` type crosses the UniFFI
-boundary and there is no version-lockstep to hand-maintain. Third-party:
+them internally (like `push_all_to_peer`), and `SyncEngine::peer_ids` /
+`subscribe_peer_events` hand peer identity back the same way (hex `String`, not
+`iroh::EndpointId`), so no `iroh` type crosses the UniFFI boundary and there is no
+version-lockstep to hand-maintain. Third-party:
 `uniffi` (binding generation) and `chrono` (epoch-ms ↔ RFC 3339 for the meeting
 timestamps the phone model carries as numbers; same workspace pin as
 `notes-crdt`, no new transitive crate). Because Option A wraps OUR `SyncEngine` (not
@@ -165,7 +167,11 @@ boundary. The blobs ALPN's accept side is wrapped in an authorising
 `ProtocolHandler` that rejects an inbound connection from a peer not in the paired
 `PeerDirectory` BEFORE delegating to `BlobsProtocol::accept` — the same
 mutual-pairing guard the notes ALPN's `AcceptHook` applies, so the new ALPN does
-not serve arbitrary peers.
+not serve arbitrary peers. `futures-util` (workspace-pinned, already a dep of
+`tunnel-client`) supplies `StreamExt` over the downloader's progress stream, so a
+blob pull can be watched byte-by-byte and cut off once it crosses the per-blob
+size cap (`blobs::MAX_BLOB_BYTES`) rather than only discovering an oversized
+transfer after it has already landed on disk.
 The notes-sync protocol exchanges yrs state vectors and computes the minimal
 lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
 operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —
@@ -187,8 +193,14 @@ exports them to the per-meeting paths under the meetings root
 (`notes_crdt::MeetingFolder::ensure` creates the folder; `sync` writes only the
 media file).
 Imported and downloaded blobs are pinned with persistent named tags
-(`meeting/{id}/audio`, `meeting/{id}/asset/{name}`) so retention does not depend
-on GC state. `sync` reads/writes only `audio.opus` and `assets/*` under the
+(`meeting/{id}/audio`, `meeting/{id}/asset/{name}`); the store's periodic
+mark-and-sweep GC is enabled, so a tag stays retained until something unpins it —
+either a deleted meeting (`BlobStore::delete_meeting_blobs`, called from
+`ipc-bridge`'s `delete_meeting` command via a new `SyncControl::delete_meeting_blobs`
+method — best-effort, a no-op on the free build or before the engine has started)
+or a re-tagged superseded derived artifact — and a hash still tagged by another
+meeting (content-addressed dedup) survives regardless, since GC roots from every
+remaining tag. `sync` reads/writes only `audio.opus` and `assets/*` under the
 meetings root — it does not touch metadata/transcript/notes projections in the
 media path.
 

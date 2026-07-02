@@ -67,6 +67,11 @@ uuid = { workspace = true }
 # precision / offsets wrong, so a real parse is required. Same workspace pin
 # `notes-crdt` already uses for the lifecycle merge, so the two agree.
 chrono = { workspace = true }
+# futures-util — `StreamExt::next()` over `iroh_blobs`' download-progress stream
+# (`blobs::download_capped`), so a blob pull can be watched byte-by-byte and cut
+# off once it crosses the per-blob size cap, rather than only checked after the
+# whole (potentially oversized) transfer has already landed on disk.
+futures-util = { workspace = true }
 
 [features]
 # Exposes the relay-less direct-connection path (`SyncEngine::start_direct` +

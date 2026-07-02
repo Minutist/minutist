@@ -66,6 +66,7 @@ use uuid::Uuid;
 use crate::blobs::{record_artifact_authority, ArtifactManifest, BlobStore};
 use crate::frame::{read_frame, write_frame};
 use crate::notes_proto::StreamKind;
+use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
 use crate::{discovery_proto, Error, Result};
 
 /// The completion-handshake byte exchanged after both sides finish pulling.
@@ -312,8 +313,22 @@ pub async fn respond_artifacts_sync(
     finish_done(send, recv).await?;
 
     // Hold the connection open until the initiator closes; returning here would let
-    // the router drop and abort the stream.
-    conn.closed().await;
+    // the router drop and abort the stream. Bounded by RESPONDER_CLOSE_TIMEOUT so
+    // a stalled or hostile initiator that never closes cannot pin this task
+    // forever.
+    tokio::time::timeout(RESPONDER_CLOSE_TIMEOUT, conn.closed())
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                peer = %peer,
+                timeout = ?RESPONDER_CLOSE_TIMEOUT,
+                "artifacts-sync responder timed out waiting for the initiator to close"
+            );
+            Error::Protocol(format!(
+                "artifacts-sync responder wait for close timed out after {RESPONDER_CLOSE_TIMEOUT:?}"
+            ))
+        })?;
     Ok(())
 }
 

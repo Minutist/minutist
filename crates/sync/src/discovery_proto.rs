@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::{read_frame, write_frame};
 use crate::notes_proto::StreamKind;
+use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
 use crate::{Error, Result};
 
 /// One meeting's identity + its host-authoritative processing state, as carried
@@ -158,7 +159,22 @@ pub async fn respond_discovery(
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing discovery send: {e}")))?;
 
-    conn.closed().await;
+    // Bounded by RESPONDER_CLOSE_TIMEOUT, mirroring the notes/media responders —
+    // a stalled or hostile initiator that never closes cannot pin this task
+    // forever.
+    tokio::time::timeout(RESPONDER_CLOSE_TIMEOUT, conn.closed())
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                peer = %conn.remote_id(),
+                timeout = ?RESPONDER_CLOSE_TIMEOUT,
+                "discovery responder timed out waiting for the initiator to close"
+            );
+            Error::Protocol(format!(
+                "discovery responder wait for close timed out after {RESPONDER_CLOSE_TIMEOUT:?}"
+            ))
+        })?;
     Ok(theirs)
 }
 

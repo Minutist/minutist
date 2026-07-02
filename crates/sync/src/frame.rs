@@ -9,6 +9,7 @@
 
 use iroh::endpoint::{RecvStream, SendStream};
 
+use crate::timeouts::FRAME_IO_TIMEOUT;
 use crate::{Error, Result};
 
 /// Upper bound on a single length-prefixed frame, in bytes. A whole-document Yjs
@@ -34,7 +35,27 @@ pub fn checked_frame_len(len_buf: [u8; 4]) -> Result<usize> {
 
 /// Read one length-prefixed frame from `recv`: a `u32` big-endian length then
 /// that many bytes. Rejects a length over [`MAX_FRAME`] before allocating.
+///
+/// Bounded by [`FRAME_IO_TIMEOUT`]: a peer that stops writing mid-frame (the
+/// length prefix or the body) cannot pin the stream — and the task behind it —
+/// indefinitely. Applies on both the initiator and responder side, since both
+/// call this to read a peer's frame.
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
+    tokio::time::timeout(FRAME_IO_TIMEOUT, read_frame_inner(recv))
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                target: "sync",
+                timeout = ?FRAME_IO_TIMEOUT,
+                "reading a sync frame timed out; dropping connection"
+            );
+            Err(Error::Protocol(format!(
+                "reading frame timed out after {FRAME_IO_TIMEOUT:?}"
+            )))
+        })
+}
+
+async fn read_frame_inner(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
@@ -49,6 +70,9 @@ pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
 
 /// Write one length-prefixed frame to `send`: a `u32` big-endian length then the
 /// bytes. Rejects a body over [`MAX_FRAME`] so both directions share the cap.
+///
+/// Bounded by [`FRAME_IO_TIMEOUT`], mirroring [`read_frame`]: a peer that stops
+/// reading (so the QUIC send buffer never drains) cannot pin the writer forever.
 pub async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
     if bytes.len() > MAX_FRAME {
         return Err(Error::Protocol(format!(
@@ -56,6 +80,21 @@ pub async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
             bytes.len()
         )));
     }
+    tokio::time::timeout(FRAME_IO_TIMEOUT, write_frame_inner(send, bytes))
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                target: "sync",
+                timeout = ?FRAME_IO_TIMEOUT,
+                "writing a sync frame timed out; dropping connection"
+            );
+            Err(Error::Protocol(format!(
+                "writing frame timed out after {FRAME_IO_TIMEOUT:?}"
+            )))
+        })
+}
+
+async fn write_frame_inner(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
     let len = bytes.len() as u32;
     send.write_all(&len.to_be_bytes())
         .await

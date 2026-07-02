@@ -52,6 +52,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
             tags "External" "Optional"
         }
 
+        phoneCompanion = softwareSystem "Phone companion (minutist-mobile)" "Android Capacitor app in the sibling minutist-mobile repo. Bundles the sync-ffi .so and calls its UniFFI surface to join the same paired-device sync mesh as the desktop and the headless hub." {
+            tags "External" "Optional"
+        }
+
         // ----------------------------------------------------------------
         // The minutist system
         // ----------------------------------------------------------------
@@ -111,6 +115,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 tunnelClient = component "tunnel-client" "App-side half of the connected-tier relay tunnel (WS4-A). Dials the hosted relay OUTBOUND over WSS, re-implements the relay's postcard wire frames, and replays relayed MCP requests against the loopback mcp-server with the internal bearer. No workspace edge; connected-feature gated; wired into app-main in S5." "Rust crate: crates/tunnel-client"
 
+                sync = component "sync" "Device-to-device sync engine (WS4-B): iroh QUIC transport over a custom SYNC_ALPN. Exchanges Yjs notes-update frames, content-addressed meeting media (audio + note assets, over a second iroh-blobs ALPN), the processing-lifecycle Discovery exchange, and derived-artifact (transcript.json / summary.md) reconciliation. A near-leaf: depends only on common + notes-crdt, never persistence, which keeps its lib cross-compilable to mobile targets. Connected-feature gated; wired into app-main in S5." "Rust crate: crates/sync"
+
+                election = component "election" "Host-election state machine for the producer gate (WS4-B): claims a claimable meeting (PendingProcessing, or a Claimed past its lease) with audio already synced in, runs the pipeline, and writes Processed — via the ElectionDriver trait. A leaf (common + persistence only): the sync (advertise) and orchestrator (process) collaborators sit behind the trait, so this crate takes no edge to either and the one state machine is reused by both eligible host types. Connected-feature gated; wired into app-main in S4." "Rust crate: crates/election"
+
                 settings = component "settings" "Settings schema, validation, change notifications. Persists via tauri-plugin-store." "Rust crate: crates/settings"
 
                 docConvert = component "doc-convert" "Converts attached document bytes (PDF, XLSX, PPTX, HTML, EML, ODS, txt/md) to canonical markdown. Pure-Rust in-process; catch_unwind sandboxed; no OCR. Public surface: convert_to_markdown + supported_exts." "Rust crate: crates/doc-convert"
@@ -139,6 +147,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
             headlessHub = container "Minutist Server" "User-installed headless daemon (minutist-hub). An always-on sync hub other devices converge through, and post-launch a GPU processing node. Pairs into the device mesh like a desktop; holds meeting plaintext in its own data root, on hardware the user owns. Optional; not the relay." "Rust / tokio (headless)" {
                 tags "Container" "Backend"
             }
+
+            syncFfiBridge = container "sync-ffi (phone bridge)" "UniFFI wrapper over sync::SyncEngine (crates/sync-ffi), cross-compiled to an aarch64-linux-android cdylib and bundled by the separate phone companion app. Mobile-only: not linked by app-main or headless; a workspace member built as its own artifact, not part of the Rust core process." "Rust crate: crates/sync-ffi (cdylib, aarch64-linux-android)" {
+                tags "Container" "Native"
+            }
         }
 
         // ----------------------------------------------------------------
@@ -152,6 +164,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist -> externalLlm "Optional: dispatches summary requests" "HTTP / loopback"
         mcpClient -> minutist "Reads meetings + messages the internal agent over MCP" "Streamable HTTP / loopback"
         minutist -> irohRelay "Syncs paired devices (NAT traversal / relay fallback; ciphertext only)" "QUIC / HTTPS"
+        phoneCompanion -> minutist "Syncs meetings/notes/lifecycle with paired devices" "QUIC (iroh)"
 
         // ----------------------------------------------------------------
         // Relationships — Container (Level 2)
@@ -171,6 +184,8 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core -> minutist.headlessHub "Reconciles notes + media + derived artifacts over iroh QUIC (mutual device sync)"
         minutist.core -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
         minutist.headlessHub -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
+        phoneCompanion -> minutist.syncFfiBridge "Bundles the .so; calls the UniFFI sync surface" "JNI"
+        minutist.syncFfiBridge -> phoneCompanion "Pushes lifecycle/peer-arrival events to registered listeners" "JNI callback"
 
         // ----------------------------------------------------------------
         // Relationships — Component (Level 3) — INSIDE the Rust core
@@ -185,6 +200,8 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.appMain      -> minutist.core.common "Uses interface types"
         minutist.core.ipcBridge    -> minutist.core.common "Uses interface types"
         minutist.core.notesCrdt    -> minutist.core.common "Uses interface types"
+        minutist.core.sync         -> minutist.core.common "Uses interface types"
+        minutist.core.election     -> minutist.core.common "Uses interface types"
 
         // Live pipeline. Orchestrator wires the dataflow.
         minutist.core.audioCapture -> microphone "Captures audio" "cpal"
@@ -246,6 +263,21 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.mcpServer -> minutist.core.agentTools "Projects the registry; dispatches tools/call"
         minutist.core.appMain   -> minutist.core.mcpServer  "Spawns the listener via tauri::async_runtime::spawn (settings-gated)"
         minutist.core.appMain   -> minutist.core.tunnelClient "Runs device pairing + the reconnect/lifecycle (connected-gated, WS4-A S5b); injects ConnectedTunnel as IpcState.tunnel"
+
+        // Sync engine + producer-gate election (WS4-B). sync is a near-leaf
+        // (common + notes-crdt only, never persistence) so its lib cross-compiles
+        // to mobile; election is a leaf (common + persistence only) — the sync
+        // (advertise) and orchestrator (process) collaborators it drives sit
+        // behind the ElectionDriver trait, so neither is a workspace edge of this
+        // crate. app-main injects the connected implementations of both behind
+        // the same `connected` feature as mcp-server / tunnel-client.
+        minutist.core.sync      -> minutist.core.notesCrdt "Reads/merges the authoritative notes.ydoc via NotesStore; MeetingFolder::ensure for inbound folders"
+        minutist.core.election  -> minutist.core.persistence "Scans candidates (folder::list_meeting_ids) and claims/renews/reaps via the guarded update_metadata_if re-export"
+        minutist.core.appMain   -> minutist.core.sync "Injects the connected SyncControl (ConnectedSync); the free build wires disabled_sync() instead (connected-gated)"
+        minutist.core.appMain   -> minutist.core.election "Spawns run_election_loop with the DesktopElectionDriver (connected-gated)"
+        minutist.headlessHub    -> minutist.core.sync "Wires SyncEngine into the always-on hub daemon"
+        minutist.syncFfiBridge  -> minutist.core.sync "Wraps SyncEngine's transport + lifecycle surface via UniFFI"
+        minutist.syncFfiBridge  -> minutist.core.notesCrdt "Reads/writes metadata.json + notes.ydoc via the lifted primitives (persistence-free)"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
         minutist.core.ipcBridge -> minutist.core.orchestrator "Invokes commands; subscribes to events"

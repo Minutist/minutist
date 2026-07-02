@@ -546,14 +546,27 @@ async fn run_driver_task(
                 let cancel = user_req.cancel.clone();
                 active_cancel = Some(cancel.clone());
                 in_flight = true;
+                // Flush any transcript accumulated since the last cadence turn
+                // into THIS user turn, so the co-pilot answers with the meeting
+                // current to now — not just to the last batch. Bounded to the
+                // recent window; older transcript is already in the held context
+                // (prior transcript turns) and reachable via RAG retrieval.
+                let pending = std::mem::take(&mut tail);
+                new_segments = 0;
+                let content = compose_user_turn_content(
+                    &user_req.message,
+                    tail_chars(&pending, LIVE_WINDOW_BUDGET_CHARS),
+                );
                 tracing::debug!(
                     target: "ipc-bridge",
                     meeting_id = %meeting_id.0,
-                    "live-agent user turn dispatched (preempts any pending transcript)"
+                    pending_chars = pending.len(),
+                    "live-agent user turn dispatched (preempts pending transcript; \
+                     flushed pending transcript into the turn)"
                 );
                 let req = CopilotTurnRequest {
                     kind: TurnKind::UserChat,
-                    content: user_req.message,
+                    content,
                     retrieved: None,
                     sampler: SamplerConfig {
                         max_tokens: 1024,
@@ -1456,6 +1469,23 @@ async fn run_worker_loop<B: LiveSessionBackend + ConversationalTurn>(
 /// is present so a future tool set can plug in without restructuring the loop.
 fn dispatch_tool(_name: &str, _args: &str) -> String {
     serde_json::json!({"error": "tool not found"}).to_string()
+}
+
+/// Compose a user-chat turn's content, prepending any transcript that has
+/// accumulated since the last cadence turn (`pending`) so the co-pilot answers
+/// with the meeting current to now, not only to the last batch. `pending` is
+/// already bounded by the caller; empty pending yields the message unchanged.
+/// (`build_turn_content` sanitises the whole result — the transcript is
+/// untrusted content.)
+fn compose_user_turn_content(message: &str, pending: &str) -> String {
+    if pending.trim().is_empty() {
+        message.to_string()
+    } else {
+        format!(
+            "Most recent meeting transcript, not yet processed:\n{pending}\n\n\
+             User message: {message}"
+        )
+    }
 }
 
 /// Build the framed turn content for one [`CopilotTurnRequest`].
@@ -2899,6 +2929,28 @@ mod tests {
         assert!(
             !done_texts[0].is_empty(),
             "Done must carry non-empty text; got: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn compose_user_turn_content_prepends_pending_transcript() {
+        // No pending transcript → the message is unchanged.
+        assert_eq!(compose_user_turn_content("hello", ""), "hello");
+        assert_eq!(compose_user_turn_content("hello", "   "), "hello");
+        // Pending transcript is prepended before the message, so a mid-meeting
+        // chat sees the latest talk that has not yet been batched into context.
+        let out = compose_user_turn_content("summarise so far", "Alice: we ship Friday.");
+        assert!(
+            out.contains("Alice: we ship Friday."),
+            "must carry the pending transcript: {out}"
+        );
+        assert!(
+            out.contains("summarise so far"),
+            "must carry the user message: {out}"
+        );
+        assert!(
+            out.find("Alice: we ship Friday.").unwrap() < out.find("summarise so far").unwrap(),
+            "transcript must precede the user message: {out}"
         );
     }
 

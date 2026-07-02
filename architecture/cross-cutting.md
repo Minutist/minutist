@@ -988,6 +988,15 @@ categories. Cross-cutting rules:
   min_seconds`, and `!in_flight`. The AND gate (not OR) prevents premature
   refreshes during sparse meetings with few utterances.
 
+- **User-chat transcript flush.** The cadence gate batches transcript into the
+  held context; between fires, recent segments sit un-batched in the driver's
+  `tail`. A user chat turn is high-priority (`user_msg_rx` drained before the
+  cadence gate) and, on dispatch, FLUSHES the pending `tail` into that turn's
+  content (`compose_user_turn_content`, bounded to the recent window) so the
+  co-pilot answers current to the moment of the question — not just to the last
+  batch. Older/earlier transcript is already resident (prior transcript turns)
+  and reachable via the per-turn RAG retrieval applied to every turn.
+
 - **Keep-alive append-turn model (U2).** The live cadence drives
   `LiveSession::converse` (backed by `LlamaLiveBackend::append_turn`) for BOTH
   transcript and user-chat turns. The context GROWS across turns; `prefix_len`

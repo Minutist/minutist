@@ -255,45 +255,17 @@ pub fn apply_own_processing_if_not_superseded(
 ///
 /// The lifecycle consumer (the `ipc-bridge` / `headless` subscriber to the sync
 /// engine's lifecycle-event stream) calls this for each `(MeetingId,
-/// ProcessingLifecycle)` a discovery exchange surfaces. Discovery advertises the
-/// PEER's meetings, which we may not have synced yet — for those, applying would
-/// be premature (the notes/media receive path seeds the folder, not the
-/// lifecycle stream), so this returns `Ok(false)` rather than erroring. For a
-/// meeting we do hold, the peer-advertised state is MERGED into the local one by
-/// precedence ([`notes_crdt::merge_processing`]) inside one guarded RMW — so a
-/// stale advertisement (an in-flight `PendingProcessing` after a host has
-/// `Claimed`/`Processed` the meeting, or a discovery sweep replaying an old view)
-/// can never walk the local state backwards under last-writer-wins — and returns
-/// `Ok(true)`.
-///
-/// Keeping this in `persistence` keeps the meeting-folder layout owned here: the
-/// subscriber never constructs `{meetings_root}/{uuid}` paths itself.
+/// ProcessingLifecycle)` a discovery exchange surfaces. A thin `async` re-export
+/// of [`notes_crdt::apply_synced_lifecycle_if_present`] at this historical path,
+/// so callers are unchanged; the precedence-merge-and-skip-if-absent body lives
+/// in the leaf (the single implementation also used directly by `sync-ffi`'s
+/// phone-side `apply_inbound_lifecycle`, which cannot link `persistence`).
 pub async fn apply_synced_lifecycle_if_present(
     meetings_root: &Path,
     id: MeetingId,
     processing: ProcessingLifecycle,
 ) -> AppResult<bool> {
-    // One lock acquisition covers the presence check + merge-write
-    // (skip-if-absent), so a meeting appearing or disappearing concurrently is
-    // handled atomically. The inbound state is MERGED by precedence, not written
-    // verbatim, so it cannot regress the local state under last-writer-wins. The
-    // closure returns the merged winner's label for an accurate log line.
-    let merged = update_metadata_if_present(meetings_root, id, |meta| {
-        meta.processing = notes_crdt::merge_processing(&meta.processing, processing);
-        lifecycle_state_label(&meta.processing)
-    })?;
-    match merged {
-        Some(state) => {
-            tracing::info!(
-                target: "persistence",
-                meeting_id = %id.0,
-                state,
-                "synced processing lifecycle merged"
-            );
-            Ok(true)
-        }
-        None => Ok(false),
-    }
+    notes_crdt::apply_synced_lifecycle_if_present(meetings_root, id, processing)
 }
 
 /// Delete a meeting: remove the folder recursively, then remove the index row.

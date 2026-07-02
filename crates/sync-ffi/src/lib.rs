@@ -721,15 +721,15 @@ fn project_meeting(meetings_root: &Path, id: MeetingId) -> Option<FfiMeeting> {
     }
 }
 
-/// Apply a peer-advertised lifecycle to our local `metadata.json` by precedence
-/// merge, skipping a meeting we do not hold yet — the phone-side equivalent of
-/// `persistence::apply_synced_lifecycle_if_present`, on the lifted notes-crdt
-/// primitives. Best-effort: a write failure is logged, not surfaced (the next
-/// discovery sweep re-applies).
+/// Apply a peer-advertised lifecycle to our local `metadata.json`, skipping a
+/// meeting we do not hold yet. Calls the shared
+/// [`notes_crdt::apply_synced_lifecycle_if_present`] directly — the phone has no
+/// `persistence` edge, so this is the same precedence-merge-and-skip-if-absent
+/// implementation `persistence::meeting_ops::apply_synced_lifecycle_if_present`
+/// re-exports for the desktop/hub, not a hand-rolled copy. Best-effort: a write
+/// failure is logged, not surfaced (the next discovery sweep re-applies).
 fn apply_inbound_lifecycle(meetings_root: &Path, id: MeetingId, incoming: ProcessingLifecycle) {
-    let result = notes_crdt::update_metadata_if_present(meetings_root, id, |meta| {
-        meta.processing = notes_crdt::merge_processing(&meta.processing, incoming);
-    });
+    let result = notes_crdt::apply_synced_lifecycle_if_present(meetings_root, id, incoming);
     if let Err(e) = result {
         tracing::warn!(target: "sync-ffi", meeting_id = %id.0, error = %e, "applying synced lifecycle failed");
     }

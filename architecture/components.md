@@ -160,8 +160,11 @@ pinned 1.91 toolchain), bundled by gradle. It is **mobile-only**: NOT linked by
 `ProcessingLifecycle`, `MeetingMeta`, `Segment`), `sync` (the engine it wraps),
 and `notes-crdt` (the C-free leaf the phone data layer rides — `MeetingFolder`,
 `NotesStore`, and the lifted `read_metadata` / `write_metadata` /
-`update_metadata_if_present` + `merge_processing` — so save / list / get +
-lifecycle-apply stay off `persistence`'s C-heavy graph). It takes
+`update_metadata_if_present` + `merge_processing` + `apply_synced_lifecycle_if_present`
+— so save / list / get + lifecycle-apply stay off `persistence`'s C-heavy graph,
+and the inbound-lifecycle precedence-merge-and-skip-if-absent logic is the SAME
+implementation the desktop/hub use via `persistence`'s re-export, not a
+hand-mirrored copy). It takes
 **no `iroh` dependency of its own** — peers are addressed by passing hex id
 strings to `SyncEngine`'s string-keyed `*_to_peer` methods, which relay-address
 them internally (like `push_all_to_peer`), and `SyncEngine::peer_ids` /
@@ -1469,6 +1472,20 @@ on-disk layout (`{root}/{uuid}/`, including `ensure` and the canonical
 `folder::list_meeting_ids` scan), and the public `metadata.json` writer
 (`write_metadata` + the shared `write_metadata_atomic`).
 
+**`apply_synced_lifecycle_if_present(meetings_root, id, processing) ->
+AppResult<bool>` (`lifecycle.rs`).** The inbound-lifecycle-apply body: applies a
+peer-advertised `ProcessingLifecycle` to a meeting's `metadata.json` by
+precedence merge (`merge_processing`) via `update_metadata_if_present`,
+skipping (`Ok(false)`) a meeting not held locally. It uses only primitives
+already owned by this leaf (`update_metadata_if_present` + `merge_processing` +
+a private log-label helper) — never `libsql` or `index.db` — so it belongs here
+rather than in `persistence`. `persistence::meeting_ops::apply_synced_lifecycle_if_present`
+re-exports it (a thin `async` wrapper at the historical call-site path, since
+the desktop/hub subscribers `.await` it); `sync-ffi`'s `apply_inbound_lifecycle`
+calls it directly (the phone has no `persistence` edge). This is the SINGLE
+implementation of the merge-and-skip-if-absent logic — previously `sync-ffi`
+carried a hand-mirrored copy of the same body.
+
 **`notes_lock` — per-meeting `notes.ydoc` write serialisation.** `NotesStore`'s
 three `notes.ydoc` writers (`save`, `apply_update`, `seed_ydoc_if_needed`) each
 do a read→merge/rebuild→write over the file; without serialisation, two
@@ -1920,16 +1937,24 @@ on `common`.
   §7 Q4). Its consumer-side wrapper `apply_synced_lifecycle_if_present(root, id,
   processing) -> AppResult<bool>` applies a peer-advertised state only when the
   meeting is held locally (else `Ok(false)` — discovery advertises the peer's
-  meetings, and the notes/media receive path, not this stream, seeds a folder),
-  keeping the folder layout owned here; the `ipc-bridge` / `headless` lifecycle
-  subscribers call it per discovery event.
+  meetings, and the notes/media receive path, not this stream, seeds a folder).
+  The precedence-merge-and-skip-if-absent BODY is owned by the `notes-crdt` leaf
+  (see that crate's section above) — this is a thin `async` re-export at the
+  historical `persistence::meeting_ops` path so the `ipc-bridge` / `headless`
+  lifecycle subscribers, which `.await` it, are unchanged; `sync-ffi` calls the
+  `notes-crdt` implementation directly. Keeping the meeting-folder layout owned
+  in that leaf means neither caller constructs `{meetings_root}/{uuid}` paths
+  itself.
   `apply_own_processing_if_not_superseded(root, id, processing) ->
   AppResult<MetaUpdate<()>>` (issue 0028 follow-up M2) is a fifth, GUARDED
   counterpart for a host's own terminal `Processed` write: unlike
   `apply_processing_lifecycle`'s unconditional overwrite, it routes through the
-  SAME `notes_crdt::merge_processing` precedence `apply_synced_lifecycle_if_present`
+  SAME `notes_crdt::merge_processing` precedence `notes_crdt::apply_synced_lifecycle_if_present`
   applies to an inbound peer state, committing only when `processing` wins the
-  merge against the current on-disk state. The `crates/election` loop's terminal
+  merge against the current on-disk state. This op itself stays in `persistence`
+  (it needs `update_metadata_if`'s conditional-commit shape, not the
+  skip-if-absent one, and is `election`'s terminal write, not a lifecycle-sync
+  consumer). The `crates/election` loop's terminal
   write uses this (not the unconditional op) so a host whose `process()` finishes
   after a peer's stronger/tied state (e.g. a lower-`HostRef` `Processed` that
   already converged onto this disk) cannot regress it. Synchronous (like

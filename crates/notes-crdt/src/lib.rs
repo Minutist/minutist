@@ -26,6 +26,11 @@
 //! - [`merge_processing`]: the precedence merge for the processing-lifecycle
 //!   field, applied on the inbound (synced) write path so a peer's stale state
 //!   cannot walk the local one backwards.
+//! - [`apply_synced_lifecycle_if_present`]: the guarded read-modify-write that
+//!   applies a peer-advertised lifecycle state to a meeting's `metadata.json` via
+//!   [`merge_processing`], skipping a meeting not held locally. The single
+//!   implementation shared by `persistence` (desktop/hub) and `sync-ffi` (phone)
+//!   — the two previously carried independent copies of the same body.
 //!
 //! These were extracted from `persistence` so `sync` can transport / merge the
 //! notes CRDT without pulling in `persistence`'s C-heavy graph (libsql /
@@ -47,7 +52,7 @@ pub mod ydoc;
 
 pub use error::Error;
 pub use folder::MeetingFolder;
-pub use lifecycle::merge_processing;
+pub use lifecycle::{apply_synced_lifecycle_if_present, merge_processing};
 pub use metadata::{
     read_metadata, update_metadata, update_metadata_if, update_metadata_if_present, write_metadata,
     write_metadata_atomic, MetaUpdate,

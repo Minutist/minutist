@@ -16,8 +16,12 @@
 //! idempotent (for `Claimed`, the later lease wins so an out-of-order replay of an
 //! older lease cannot shorten reap timing).
 
+use std::path::Path;
+
 use chrono::DateTime;
-use minutist_common::ProcessingLifecycle;
+use minutist_common::{AppResult, MeetingId, ProcessingLifecycle};
+
+use crate::metadata::update_metadata_if_present;
 
 /// Merge an inbound (peer-advertised) `ProcessingLifecycle` into the `current`
 /// local one, returning the winner by precedence — so applying a peer's state can
@@ -105,6 +109,66 @@ fn lease_ge(a: &str, b: &str) -> bool {
     match (DateTime::parse_from_rfc3339(a), DateTime::parse_from_rfc3339(b)) {
         (Ok(a), Ok(b)) => a >= b,
         _ => false,
+    }
+}
+
+/// A stable, log-safe discriminant for a [`ProcessingLifecycle`] — the variant
+/// name only (the `HostRef` inside a claim is a device key, not user content,
+/// but is omitted to keep log lines minimal).
+fn lifecycle_state_label(processing: &ProcessingLifecycle) -> &'static str {
+    match processing {
+        ProcessingLifecycle::Local => "local",
+        ProcessingLifecycle::PendingProcessing => "pending_processing",
+        ProcessingLifecycle::Claimed { .. } => "claimed",
+        ProcessingLifecycle::Processed { .. } => "processed",
+    }
+}
+
+/// Apply a peer-advertised processing-lifecycle state to a meeting we hold, or
+/// skip it if that meeting is not present locally yet.
+///
+/// This is the ONE precedence-merge-and-skip-if-absent implementation for the
+/// inbound lifecycle-apply path, shared by every writer of `metadata.json` that
+/// can reach this leaf: `persistence::meeting_ops::apply_synced_lifecycle_if_present`
+/// re-exports it for the desktop lifecycle subscriber (`ipc-bridge`) and the hub
+/// (`headless`); `sync-ffi`'s `apply_inbound_lifecycle` calls it directly for the
+/// phone. Discovery advertises a peer's full meeting set, which we may not have
+/// synced in yet — for those, applying would be premature (the notes/media
+/// receive path seeds the folder, not the lifecycle stream), so this returns
+/// `Ok(false)` rather than erroring. For a meeting we do hold, the
+/// peer-advertised state is MERGED into the local one by precedence
+/// ([`merge_processing`]) inside one guarded RMW — so a stale advertisement (an
+/// in-flight `PendingProcessing` after a host has `Claimed`/`Processed` the
+/// meeting, or a discovery sweep replaying an old view) can never walk the local
+/// state backwards under last-writer-wins — and returns `Ok(true)`.
+///
+/// Keeping this in `notes-crdt` keeps the meeting-folder layout owned in one
+/// leaf: no caller constructs `{meetings_root}/{uuid}` paths itself.
+pub fn apply_synced_lifecycle_if_present(
+    meetings_root: &Path,
+    id: MeetingId,
+    processing: ProcessingLifecycle,
+) -> AppResult<bool> {
+    // One lock acquisition covers the presence check + merge-write
+    // (skip-if-absent), so a meeting appearing or disappearing concurrently is
+    // handled atomically. The inbound state is MERGED by precedence, not written
+    // verbatim, so it cannot regress the local state under last-writer-wins. The
+    // closure returns the merged winner's label for an accurate log line.
+    let merged = update_metadata_if_present(meetings_root, id, |meta| {
+        meta.processing = merge_processing(&meta.processing, processing);
+        lifecycle_state_label(&meta.processing)
+    })?;
+    match merged {
+        Some(state) => {
+            tracing::info!(
+                target: "persistence",
+                meeting_id = %id.0,
+                state,
+                "synced processing lifecycle merged"
+            );
+            Ok(true)
+        }
+        None => Ok(false),
     }
 }
 

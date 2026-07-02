@@ -194,6 +194,62 @@ pub async fn apply_processing_lifecycle(
     Ok(())
 }
 
+/// Guarded terminal write of a meeting's OWN processing-completion state
+/// (`Processed`), routed through the SAME precedence [`notes_crdt::merge_processing`]
+/// applies to an inbound peer state — rather than the unconditional overwrite
+/// [`apply_processing_lifecycle`] performs — so a host whose `process()` finished
+/// after a peer's stronger or tied state (e.g. a lower-`HostRef` `Processed` that
+/// synced in and converged onto this disk while we were still processing) can
+/// never regress it.
+///
+/// This is the guarded counterpart the producer-gate election loop's terminal
+/// write uses (`crates/election`, M2): [`update_metadata_if`] with a predicate
+/// that only commits when `processing` WINS the merge against the current
+/// on-disk state. Returns the [`MetaUpdate`] so the caller can log which branch
+/// fired: [`MetaUpdate::Applied`] iff `processing` won and was written,
+/// [`MetaUpdate::SkippedPredicate`] when a stronger/tied state already on disk
+/// was left untouched, [`MetaUpdate::SkippedAbsent`] when the meeting folder is
+/// gone.
+///
+/// Synchronous (like [`update_metadata_if`]), so an async caller runs it on
+/// `spawn_blocking`.
+pub fn apply_own_processing_if_not_superseded(
+    meetings_root: &Path,
+    id: MeetingId,
+    processing: ProcessingLifecycle,
+) -> AppResult<MetaUpdate<()>> {
+    let state = lifecycle_state_label(&processing);
+    let result = update_metadata_if(meetings_root, id, move |meta| {
+        let merged = notes_crdt::merge_processing(&meta.processing, processing.clone());
+        if merged == processing {
+            meta.processing = merged;
+            Some(())
+        } else {
+            None
+        }
+    })?;
+    match &result {
+        MetaUpdate::Applied(()) => tracing::info!(
+            target: "persistence",
+            meeting_id = %id.0,
+            state,
+            "processing lifecycle applied (merge-checked terminal write)"
+        ),
+        MetaUpdate::SkippedPredicate => tracing::debug!(
+            target: "persistence",
+            meeting_id = %id.0,
+            state,
+            "terminal write skipped: a converged/stronger state is already on disk"
+        ),
+        MetaUpdate::SkippedAbsent => tracing::debug!(
+            target: "persistence",
+            meeting_id = %id.0,
+            "terminal write skipped: meeting folder absent"
+        ),
+    }
+    Ok(result)
+}
+
 /// Apply a peer-advertised processing-lifecycle state to a meeting we hold, or
 /// skip it if that meeting is not present locally yet.
 ///

@@ -1498,9 +1498,10 @@ bodies. See `planning/DESIGN_notes-crdt.md`.
 the producer side of the processing lifecycle (`planning/DESIGN_producer-gate.md`).
 `run_election_loop(config, driver, meetings_root, capability)` polls the meetings on
 disk and, for each claimable one (`PendingProcessing`, or a `Claimed` whose lease
-has expired), claims it via the conditional guarded RMW (`update_metadata_if`), runs
-the pipeline, and writes `Processed` — propagating each state change over the
-existing Discovery exchange via the driver's `advertise()`. No new wire message.
+has expired) **with `audio.opus` already present in its folder**, claims it via the
+conditional guarded RMW (`update_metadata_if`), runs the pipeline, and writes
+`Processed` — propagating each state change over the existing Discovery exchange via
+the driver's `advertise()`. No new wire message.
 
 A **leaf** (`common` + `persistence` only). The two collaborators it must not depend
 on directly — the `sync` `SyncEngine` (advertise) and the `orchestrator` (reprocess)
@@ -1527,6 +1528,45 @@ duplicate-but-idempotent work; the authoritative winner falls out of convergence
 (`merge_processing` + the Artifacts authority rule), not a settle timer — so the loop
 never cancels an in-flight `process()`. The desktop `DesktopElectionDriver` (app-main,
 `connected`-gated) and the future headless GPU-node driver implement the trait.
+
+**Candidate scan skips audio not yet synced (issue 0028 follow-up F4c).** In the hub
+topology `metadata.json`'s lifecycle state can propagate over Discovery before the
+`audio.opus` media blob has synced in (the two are separate protocols). `process()`
+(→ `Orchestrator::reprocess`) reads `audio.opus` from disk with no way to wait for
+it, so the scan (`scan_candidates`) additionally requires `audio.opus` to already be
+a file in the meeting folder before a candidate is claimable; a candidate missing its
+audio is skipped (logged at debug) and stays `PendingProcessing` for a host that
+already has it, or for this host once the blob arrives on a later poll.
+
+**Failed `process()` releases the claim (F4a).** On a `process()` error the loop no
+longer leaves the claim `Claimed{self}` to lapse the full (default 30 min) lease —
+that stranded the recorder-busy and audio-not-yet-synced cases for the whole hold
+window with no early reap. It instead releases the claim back to `PendingProcessing`
+via a guarded `update_metadata_if` (only if the on-disk claim is still ours), so the
+very next poll tick — this host's or a peer's — retries immediately, decoupling
+recovery latency from the lease sizing.
+
+**Lease renewals propagate to peers (F4b).** `renewal_loop` takes the driver `Arc`
+and calls `driver.advertise()` after every tick that keeps renewing (a successful
+re-stamp, or a harmless no-write skip), not just on the initial claim and the
+terminal `Processed`. Previously the renewer only re-stamped the LOCAL lease, so a
+peer's copy of the lease never advanced past the original claim-time value and would
+reap + duplicate any job that outlived it, deterministically, with no hub required.
+
+**Terminal write is merge-aware (M2).** The final `Processed{self}` write
+(`persistence::meeting_ops::apply_own_processing_if_not_superseded`) routes through
+`notes_crdt::merge_processing`'s precedence rather than writing unconditionally, so
+a host whose `process()` finishes after a peer's stronger/tied state (e.g. a
+lower-`HostRef` `Processed` that converged onto this disk while we were still
+processing) cannot regress it.
+
+**Blocking `std::fs` runs on `spawn_blocking`.** The per-poll candidate scan and
+every guarded RMW (claim, release-on-failure, lease renewal, the terminal write) are
+blocking filesystem work; each is wrapped in `tokio::task::spawn_blocking` rather
+than run inline on the async worker, so a slow disk cannot stall the tokio scheduler
+that also serves IPC and events. The per-meeting `std::sync::Mutex` guard inside each
+RMW is still never held across an `.await` — it lives entirely inside the
+`spawn_blocking` closure.
 
 ### `persistence`
 **Crate:** `crates/persistence`
@@ -1852,7 +1892,19 @@ on `common`.
   meeting is held locally (else `Ok(false)` — discovery advertises the peer's
   meetings, and the notes/media receive path, not this stream, seeds a folder),
   keeping the folder layout owned here; the `ipc-bridge` / `headless` lifecycle
-  subscribers call it per discovery event. Like `set_speaker_name` it touches no
+  subscribers call it per discovery event.
+  `apply_own_processing_if_not_superseded(root, id, processing) ->
+  AppResult<MetaUpdate<()>>` (issue 0028 follow-up M2) is a fifth, GUARDED
+  counterpart for a host's own terminal `Processed` write: unlike
+  `apply_processing_lifecycle`'s unconditional overwrite, it routes through the
+  SAME `notes_crdt::merge_processing` precedence `apply_synced_lifecycle_if_present`
+  applies to an inbound peer state, committing only when `processing` wins the
+  merge against the current on-disk state. The `crates/election` loop's terminal
+  write uses this (not the unconditional op) so a host whose `process()` finishes
+  after a peer's stronger/tied state (e.g. a lower-`HostRef` `Processed` that
+  already converged onto this disk) cannot regress it. Synchronous (like
+  `update_metadata_if`), so `election` runs it on `spawn_blocking`. Like
+  `set_speaker_name` it touches no
   index row (`processing` is not
   indexed) and adds no cross-component dependency edge (stays inside
   `persistence`; its workspace edges remain `common` + `notes-crdt`). Privacy

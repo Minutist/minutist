@@ -1439,6 +1439,28 @@ on-disk layout (`{root}/{uuid}/`, including `ensure` and the canonical
 `folder::list_meeting_ids` scan), and the public `metadata.json` writer
 (`write_metadata` + the shared `write_metadata_atomic`).
 
+**`notes_lock` — per-meeting `notes.ydoc` write serialisation.** `NotesStore`'s
+three `notes.ydoc` writers (`save`, `apply_update`, `seed_ydoc_if_needed`) each
+do a read→merge/rebuild→write over the file; without serialisation, two
+concurrent writers of the same meeting — routine when the sync inbound path
+(`crates/sync/src/notes_proto.rs` `apply_inbound`) races a local editor
+autosave, or when two hub peers reconcile the same meeting — each load the
+same base doc and last-writer-wins on the file, silently dropping the other's
+merged update (the atomic tmp+fsync+rename rules out a *torn* file, not a
+*lost* one). `notes_lock(id)` is a process-wide per-meeting
+`Arc<Mutex<()>>` registry (`std::sync::Mutex`, never held across an `.await` —
+every guarded RMW is synchronous `std::fs`), the same shape as `metadata_lock`
+(`crates/notes-crdt/src/metadata_lock.rs`, the equivalent lock for
+`metadata.json` — see the guarded-RMW note in the `persistence` section
+below). It is a **dedicated** lock, not shared with `metadata_lock`:
+`notes.ydoc` and `metadata.json` are independent files with independent
+writers, and sharing one lock would needlessly serialise unrelated updates
+(e.g. a title rename blocking on an in-flight notes merge). All three writers
+acquire the lock once at the public entry point and delegate to a `_locked`
+inner body (`std::sync::Mutex` is not reentrant, so `apply_update` — which
+calls `seed_ydoc_if_needed` internally — calls that function's `_locked` body
+directly rather than re-acquiring the lock).
+
 `folder::list_meeting_ids(root)` is the ONE enumeration of "which meetings this
 device holds" — the `{uuid}` directories under the meetings root (`.blobs` and
 non-UUID entries skipped). It lives here, beside the folder layout it scans;

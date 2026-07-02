@@ -18,6 +18,11 @@
 //! - [`metadata_lock`]: the process-wide per-meeting lock that serialises every
 //!   `metadata.json` read-modify-write (shared by `persistence::meeting_ops` and
 //!   [`MeetingFolder::ensure`]).
+//! - [`notes_lock`]: the process-wide per-meeting lock that serialises every
+//!   `notes.ydoc` read-modify-write ([`NotesStore::save`], `apply_update`, and
+//!   `seed_ydoc_if_needed`) — dedicated to `notes.ydoc`, separate from
+//!   `metadata_lock` because the two files have independent writers and
+//!   sharing one lock would needlessly serialise unrelated updates.
 //! - [`merge_processing`]: the precedence merge for the processing-lifecycle
 //!   field, applied on the inbound (synced) write path so a peer's stale state
 //!   cannot walk the local one backwards.
@@ -37,6 +42,7 @@ pub mod lifecycle;
 pub mod metadata;
 pub mod metadata_lock;
 pub mod notes;
+pub mod notes_lock;
 pub mod ydoc;
 
 pub use error::Error;
@@ -48,3 +54,4 @@ pub use metadata::{
 };
 pub use metadata_lock::metadata_lock;
 pub use notes::{note_blocks_from_json, NotesData, NotesStore};
+pub use notes_lock::notes_lock;

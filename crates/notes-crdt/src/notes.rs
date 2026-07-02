@@ -112,7 +112,27 @@ impl NotesStore {
     /// [`NotesStore::apply_update`] (which merges, preserving history) instead.
     /// `save` remains the legitimate writer only for the **first** write of a
     /// meeting that has no `notes.ydoc` yet.
+    ///
+    /// The whole exists-check→build→write sequence runs under this meeting's
+    /// [`crate::notes_lock`] so it cannot interleave with a concurrent
+    /// `apply_update` / `seed_ydoc_if_needed` on the same meeting (see that
+    /// module's docs for the lost-update this closes).
     pub fn save(
+        root: &Path,
+        meeting_id: MeetingId,
+        notes_json: &serde_json::Value,
+        notes_md: &str,
+    ) -> AppResult<()> {
+        let guard = crate::notes_lock::notes_lock(meeting_id);
+        let _guard = guard.lock().expect("notes lock poisoned");
+        Self::save_locked(root, meeting_id, notes_json, notes_md)
+    }
+
+    /// The body of [`NotesStore::save`], run with the caller already holding
+    /// this meeting's `notes_lock`. Never call this directly except from
+    /// another function that already holds that lock — `std::sync::Mutex` is
+    /// not reentrant, so acquiring it twice on one thread deadlocks.
+    fn save_locked(
         root: &Path,
         meeting_id: MeetingId,
         notes_json: &serde_json::Value,
@@ -184,7 +204,31 @@ impl NotesStore {
     /// a mid-save crash leaves the prior files intact and the projections
     /// self-heal on next open. Like [`NotesStore::save`] this does **not** create
     /// the meeting folder.
+    ///
+    /// The whole seed→load→merge→write sequence runs under this meeting's
+    /// [`crate::notes_lock`], so two concurrent callers merging onto the same
+    /// meeting — e.g. `sync`'s inbound path (`crates/sync/src/notes_proto.rs`
+    /// `apply_inbound`) racing a local editor autosave, or two hub peers
+    /// reconciling the same meeting — cannot both load the same base doc and
+    /// last-writer-wins on the file. yrs merges are commutative, so serialising
+    /// the RMW (rather than the merge itself) is sufficient: each call's result
+    /// becomes the next call's base.
     pub fn apply_update(
+        root: &Path,
+        meeting_id: MeetingId,
+        update: &[u8],
+        notes_md: &str,
+    ) -> AppResult<()> {
+        let guard = crate::notes_lock::notes_lock(meeting_id);
+        let _guard = guard.lock().expect("notes lock poisoned");
+        Self::apply_update_locked(root, meeting_id, update, notes_md)
+    }
+
+    /// The body of [`NotesStore::apply_update`], run with the caller already
+    /// holding this meeting's `notes_lock`. Never call this directly except
+    /// from another function that already holds that lock — `std::sync::Mutex`
+    /// is not reentrant, so acquiring it twice on one thread deadlocks.
+    fn apply_update_locked(
         root: &Path,
         meeting_id: MeetingId,
         update: &[u8],
@@ -198,8 +242,11 @@ impl NotesStore {
         // Seed from a legacy `notes.json` before merging so a pre-CRDT meeting's
         // content is not dropped on the first incremental write (this is the same
         // migration the on-open seed performs; calling it here closes the gap
-        // when an edit reaches `apply_update` before any open-seed has run).
-        Self::seed_ydoc_if_needed(root, meeting_id)?;
+        // when an edit reaches `apply_update` before any open-seed has run). Calls
+        // the already-locked body directly: the lock is already held by this
+        // function's caller, so re-entering the public `seed_ydoc_if_needed`
+        // would deadlock.
+        Self::seed_ydoc_if_needed_locked(root, meeting_id)?;
 
         // Load the authoritative doc (or start fresh when the editor is the first
         // writer and there is no legacy `notes.json` to seed from) and MERGE the
@@ -322,7 +369,22 @@ impl NotesStore {
     /// as a one-time origin for a never-synced document, which is exactly the
     /// migration case (a pre-CRDT meeting has no peer to share ancestry with).
     /// After seeding, `notes.ydoc` is authoritative.
+    ///
+    /// The exists-check→read→build→write sequence runs under this meeting's
+    /// [`crate::notes_lock`] so a concurrent `apply_update`/`save` on the same
+    /// meeting cannot interleave with the seed.
     pub fn seed_ydoc_if_needed(root: &Path, meeting_id: MeetingId) -> AppResult<bool> {
+        let guard = crate::notes_lock::notes_lock(meeting_id);
+        let _guard = guard.lock().expect("notes lock poisoned");
+        Self::seed_ydoc_if_needed_locked(root, meeting_id)
+    }
+
+    /// The body of [`NotesStore::seed_ydoc_if_needed`], run with the caller
+    /// already holding this meeting's `notes_lock`. Never call this directly
+    /// except from another function that already holds that lock —
+    /// `std::sync::Mutex` is not reentrant, so acquiring it twice on one thread
+    /// deadlocks.
+    fn seed_ydoc_if_needed_locked(root: &Path, meeting_id: MeetingId) -> AppResult<bool> {
         let folder = Self::folder_path(root, meeting_id);
         let ydoc_path = folder.join("notes.ydoc");
         let json_path = folder.join("notes.json");
@@ -1002,6 +1064,80 @@ mod tests {
             crate::ydoc::ydoc_to_json(&target),
             doc,
             "the seeded state handed to the editor must carry the legacy content"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. Concurrency: apply_update must not lose either of two concurrent
+    //    updates to the same fresh meeting (F1 review finding).
+    // -----------------------------------------------------------------------
+
+    /// Two threads race `apply_update` against the same fresh meeting with two
+    /// independent, non-conflicting updates. Before the per-meeting
+    /// `notes_lock` serialised the read→merge→write, each thread could load the
+    /// same base doc, merge its own update in isolation, and last-writer-wins on
+    /// the file — silently dropping the other thread's update. yrs merges are
+    /// commutative, so the serialised RMW retains BOTH updates regardless of
+    /// which thread's critical section runs first.
+    #[test]
+    fn concurrent_apply_update_retains_both_updates() {
+        let (_tempdir, root, id) = make_meeting();
+
+        // Two independent documents, each carrying one distinguishable
+        // paragraph. Their whole-state v1 encodings are the "different yrs
+        // updates" applied concurrently below.
+        let doc_a = crate::ydoc::json_to_ydoc(&json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": "from thread A" }]
+            }]
+        }));
+        let doc_b = crate::ydoc::json_to_ydoc(&json!({
+            "type": "doc",
+            "content": [{
+                "type": "paragraph",
+                "content": [{ "type": "text", "text": "from thread B" }]
+            }]
+        }));
+        let update_a = crate::ydoc::encode_state_v1(&doc_a);
+        let update_b = crate::ydoc::encode_state_v1(&doc_b);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let root_a = root.clone();
+        let barrier_a = barrier.clone();
+        let handle_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            NotesStore::apply_update(&root_a, id, &update_a, "md-a")
+        });
+
+        let root_b = root.clone();
+        let barrier_b = barrier.clone();
+        let handle_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            NotesStore::apply_update(&root_b, id, &update_b, "md-b")
+        });
+
+        handle_a
+            .join()
+            .expect("thread a panicked")
+            .expect("apply_update a");
+        handle_b
+            .join()
+            .expect("thread b panicked")
+            .expect("apply_update b");
+
+        let loaded = NotesStore::load(&root, id).expect("load").expect("present");
+        let blocks = note_blocks_from_json(&loaded.json);
+        let texts: Vec<&str> = blocks.iter().map(|b| b.text.as_str()).collect();
+        assert!(
+            texts.contains(&"from thread A"),
+            "thread A's concurrent update must survive the serialised RMW, got {texts:?}"
+        );
+        assert!(
+            texts.contains(&"from thread B"),
+            "thread B's concurrent update must survive the serialised RMW, got {texts:?}"
         );
     }
 }

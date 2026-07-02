@@ -46,8 +46,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use minutist_common::{AppResult, HostRef, MeetingId, ProcessingClaim, ProcessingLifecycle};
-use persistence::meeting_ops::{apply_processing_lifecycle, update_metadata_if, MetaUpdate};
+use minutist_common::{
+    AppError, AppResult, HostRef, MeetingId, ProcessingClaim, ProcessingLifecycle,
+};
+use persistence::meeting_ops::{apply_own_processing_if_not_superseded, update_metadata_if, MetaUpdate};
 use tokio::sync::Notify;
 
 /// Tuning for the election loop. Durations are read from `MINUTIST_ELECTION_*`
@@ -119,7 +121,9 @@ pub trait ElectionDriver: Send + Sync {
     async fn advertise(&self);
 
     /// Run the offline pipeline for `meeting_id` (→ `Orchestrator::reprocess`).
-    /// `audio.opus` has synced in, so a re-electing host has the audio.
+    /// The election loop only claims a candidate once its scan has confirmed
+    /// `audio.opus` is present in the meeting folder (F4c), so by the time this
+    /// is called the audio is there to read.
     async fn process(&self, meeting_id: MeetingId) -> AppResult<()>;
 
     /// Push the derived artifacts for `meeting_id` to peers BEFORE `Processed` is
@@ -194,6 +198,53 @@ fn read_processing(meetings_root: &Path, id: MeetingId) -> Option<ProcessingLife
     persistence::read_metadata(&dir).ok().map(|m| m.processing)
 }
 
+/// Whether `audio.opus` is present in `id`'s meeting folder.
+///
+/// In the hub topology, `metadata.json`'s lifecycle state propagates over the
+/// Discovery exchange independently of — and typically before — the media blob
+/// pull, so a `PendingProcessing`/reapable meeting may not yet have its audio
+/// synced in locally (F4c). `process()` (→ `Orchestrator::reprocess`) reads
+/// `audio.opus` from disk and has no way to wait for it, so claiming before the
+/// blob has arrived just burns a claim/fail cycle. A blocking `std::fs` check,
+/// run from [`scan_candidates`] on `spawn_blocking`.
+fn audio_present(meetings_root: &Path, id: MeetingId) -> bool {
+    meetings_root
+        .join(id.0.to_string())
+        .join("audio.opus")
+        .is_file()
+}
+
+/// Scan the meetings on disk for candidates this host may claim now: the state
+/// is [`claimable`] AND (F4c) `audio.opus` is already present. A candidate whose
+/// audio has not synced in yet is skipped — it remains claimable for a host that
+/// already has the audio, or for this host once the blob arrives on a later
+/// poll.
+///
+/// Blocking `std::fs` work (the directory scan + a `metadata.json` read + an
+/// `audio.opus` stat per meeting); callers run this on `spawn_blocking`.
+fn scan_candidates(meetings_root: &Path, now: DateTime<Utc>) -> Vec<MeetingId> {
+    persistence::folder::list_meeting_ids(meetings_root)
+        .into_iter()
+        .filter(|id| {
+            let Some(state) = read_processing(meetings_root, *id) else {
+                return false;
+            };
+            if !claimable(&state, now) {
+                return false;
+            }
+            if !audio_present(meetings_root, *id) {
+                tracing::debug!(
+                    target: "election",
+                    meeting_id = %id.0,
+                    "skipping candidate: audio.opus has not synced in yet"
+                );
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The loop
 // ---------------------------------------------------------------------------
@@ -219,14 +270,24 @@ pub async fn run_election_loop(
     tracing::info!(target: "election", host = %host.0, "election loop started");
     loop {
         // Scan THEN sleep, so a freshly-eligible host claims an already-pending
-        // meeting on startup rather than waiting a full poll interval first.
+        // meeting on startup rather than waiting a full poll interval first. The
+        // scan is blocking `std::fs` work (a directory listing plus a
+        // `metadata.json` read + an `audio.opus` stat per meeting), so it runs
+        // on `spawn_blocking` rather than inline on the async worker.
         let now = Utc::now();
-        let candidates: Vec<MeetingId> = persistence::folder::list_meeting_ids(&meetings_root)
-            .into_iter()
-            .filter(|id| read_processing(&meetings_root, *id).is_some_and(|s| claimable(&s, now)))
-            .collect();
+        let scan_root = meetings_root.clone();
+        let candidates: Vec<MeetingId> = tokio::task::spawn_blocking(move || {
+            scan_candidates(&scan_root, now)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "election", error = %e, "candidate scan task join failed");
+            Vec::new()
+        });
         for id in candidates {
-            if let Err(e) = try_elect_and_process(&*driver, &host, &meetings_root, id, &config).await
+            if let Err(e) =
+                try_elect_and_process(Arc::clone(&driver), &host, &meetings_root, id, &config)
+                    .await
             {
                 tracing::warn!(target: "election", meeting_id = %id.0, error = %e, "election attempt failed");
             }
@@ -241,9 +302,15 @@ pub async fn run_election_loop(
 /// current on-disk state is still claimable (so a concurrent claimant or a state
 /// that moved under us cleanly yields). On a win it advertises, spawns a lease
 /// renewer, runs `process()` to completion (no mid-process cancel — duplicate work
-/// is accepted, §10 6.4), then on success pushes artifacts and writes `Processed`.
+/// is accepted, §10 6.4), then on success pushes artifacts and writes `Processed`;
+/// on failure it releases the claim back to `PendingProcessing` (F4a) rather than
+/// leaving it to lapse the full lease.
+///
+/// `driver` is an owned `Arc` (not a borrow) so the same handle can be cloned into
+/// the spawned lease-renewal task, which needs `'static` (F4b — the renewer calls
+/// `driver.advertise()` after every successful re-stamp).
 async fn try_elect_and_process(
-    driver: &dyn ElectionDriver,
+    driver: Arc<dyn ElectionDriver>,
     host: &HostRef,
     meetings_root: &Path,
     id: MeetingId,
@@ -251,16 +318,24 @@ async fn try_elect_and_process(
 ) -> AppResult<()> {
     let now = Utc::now();
     let claim = build_claim(host, now, config.lease);
-    let applied = update_metadata_if(meetings_root, id, |m| {
-        if claimable(&m.processing, now) {
-            m.processing = ProcessingLifecycle::Claimed {
-                claim: claim.clone(),
-            };
-            Some(())
-        } else {
-            None
-        }
-    })?;
+    let claim_root = meetings_root.to_path_buf();
+    let claim_for_write = claim.clone();
+    let applied = tokio::task::spawn_blocking(move || {
+        update_metadata_if(&claim_root, id, move |m| {
+            if claimable(&m.processing, now) {
+                m.processing = ProcessingLifecycle::Claimed {
+                    claim: claim_for_write.clone(),
+                };
+                Some(())
+            } else {
+                None
+            }
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("election claim task join failed: {e}"),
+    })??;
     if !matches!(applied, MetaUpdate::Applied(())) {
         // Not claimable any more (a peer claimed it, or it moved to Processed) —
         // nothing to do.
@@ -278,6 +353,7 @@ async fn try_elect_and_process(
         host.clone(),
         config.clone(),
         stop.clone(),
+        Arc::clone(&driver),
     ));
 
     let result = driver.process(id).await;
@@ -288,47 +364,139 @@ async fn try_elect_and_process(
         Ok(()) => {
             // Artifacts BEFORE advertising Processed (§6.7).
             driver.push_artifacts(id).await;
-            apply_processing_lifecycle(
-                meetings_root,
-                id,
-                ProcessingLifecycle::Processed {
-                    processed_by: host.clone(),
-                    at: Utc::now().to_rfc3339(),
-                },
-            )
-            .await?;
-            tracing::info!(target: "election", meeting_id = %id.0, "processed");
+            let processed = ProcessingLifecycle::Processed {
+                processed_by: host.clone(),
+                at: Utc::now().to_rfc3339(),
+            };
+            // Merge-aware terminal write (M2): a peer may already have converged
+            // `Processed` (by a lower `HostRef`, synced in while we were
+            // mid-process — duplicate-but-idempotent work is accepted, §10 6.4)
+            // before we finished. Route the terminal write through the SAME
+            // precedence `merge_processing` applies to an inbound peer state
+            // (`apply_own_processing_if_not_superseded`), rather than an
+            // unconditional overwrite, so our own local write can never regress
+            // an already-converged winner. Blocking `std::fs`, run on
+            // `spawn_blocking`.
+            let write_root = meetings_root.to_path_buf();
+            let write_outcome = tokio::task::spawn_blocking(move || {
+                apply_own_processing_if_not_superseded(&write_root, id, processed)
+            })
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("election terminal write task join failed: {e}"),
+            })??;
+            match write_outcome {
+                MetaUpdate::Applied(()) => {
+                    tracing::info!(target: "election", meeting_id = %id.0, "processed")
+                }
+                MetaUpdate::SkippedPredicate => tracing::debug!(
+                    target: "election",
+                    meeting_id = %id.0,
+                    "terminal write skipped: a converged/stronger state is already on disk"
+                ),
+                MetaUpdate::SkippedAbsent => tracing::debug!(
+                    target: "election",
+                    meeting_id = %id.0,
+                    "terminal write skipped: meeting folder absent"
+                ),
+            }
             driver.advertise().await;
         }
         Err(e) => {
-            // Leave the claim to lapse — a peer (or this host on a later poll) reaps
-            // and re-elects. Covers recorder-busy and model-load failures alike.
-            tracing::warn!(target: "election", meeting_id = %id.0, error = %e, "processing failed; leaving the claim to lapse");
+            // F4a: release the claim back to `PendingProcessing` for immediate
+            // retry (this host's next poll tick, or a peer's) instead of leaving
+            // it to lapse the full (default 30 min) lease — recorder-busy and
+            // on-demand-model-load failures both hit this routinely, and
+            // recovery latency should not be tied to the hold-lease sizing.
+            //
+            // An unconditional local write would be convergence-safe on its own
+            // terms (`PendingProcessing` is the lowest-ranked non-`Local` state
+            // in `merge_processing`, so it can never outrank a peer's `Claimed`/
+            // `Processed`), but the release is still routed through the guarded
+            // `update_metadata_if` — checking the on-disk claim is still ours —
+            // so it matches the claim/renewal discipline the rest of this crate
+            // uses and never fires against a state we no longer hold (e.g. a
+            // peer's `Processed` that landed on our disk while `process()` ran;
+            // we do not cancel in-flight work on supersession, §10 6.4). A
+            // short-backoff-lease alternative was considered and rejected: it
+            // would need its own tuning knob for no correctness benefit over
+            // releasing, which lets the very next poll retry.
+            let release_root = meetings_root.to_path_buf();
+            let release_host = host.clone();
+            let released = tokio::task::spawn_blocking(move || {
+                update_metadata_if(&release_root, id, move |m| match &m.processing {
+                    ProcessingLifecycle::Claimed { claim } if claim.host == release_host => {
+                        m.processing = ProcessingLifecycle::PendingProcessing;
+                        Some(())
+                    }
+                    _ => None,
+                })
+            })
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("election release task join failed: {e}"),
+            })?;
+            match released {
+                Ok(MetaUpdate::Applied(())) => tracing::warn!(
+                    target: "election",
+                    meeting_id = %id.0,
+                    error = %e,
+                    "processing failed; released the claim back to PendingProcessing for immediate retry"
+                ),
+                Ok(_) => tracing::warn!(
+                    target: "election",
+                    meeting_id = %id.0,
+                    error = %e,
+                    "processing failed; the claim was already superseded, nothing to release"
+                ),
+                Err(release_err) => tracing::warn!(
+                    target: "election",
+                    meeting_id = %id.0,
+                    error = %e,
+                    release_error = %release_err,
+                    "processing failed AND releasing the claim failed; leaving it to lapse"
+                ),
+            }
         }
     }
     Ok(())
 }
 
 /// Re-stamp the lease on the `renew` cadence while we hold the claim, stopping when
-/// signalled (process finished) or when genuinely superseded.
+/// signalled (process finished) or when genuinely superseded. On every tick that
+/// keeps renewing, propagates the fresh lease to peers via `driver.advertise()`
+/// (F4b) — without this, a peer's disk only ever sees the ORIGINAL claim-time
+/// lease, so a job that outlives the lease gets reaped and duplicated the instant
+/// that stale lease expires on the peer's side, with no hub required.
 async fn renewal_loop(
     meetings_root: PathBuf,
     id: MeetingId,
     host: HostRef,
     config: ElectionConfig,
     stop: Arc<Notify>,
+    driver: Arc<dyn ElectionDriver>,
 ) {
     loop {
         tokio::select! {
             _ = tokio::time::sleep(config.renew) => {}
             _ = stop.notified() => return,
         }
-        if matches!(
-            renewal_step(&meetings_root, id, &host, Utc::now(), config.lease),
-            RenewOutcome::Stop
-        ) {
+        // Blocking `std::fs` RMW; run on `spawn_blocking` rather than inline on
+        // the async worker.
+        let step_root = meetings_root.clone();
+        let step_host = host.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            renewal_step(&step_root, id, &step_host, Utc::now(), config.lease)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(target: "election", meeting_id = %id.0, error = %e, "lease renewal task join failed");
+            RenewOutcome::Continue
+        });
+        if outcome == RenewOutcome::Stop {
             return;
         }
+        driver.advertise().await;
     }
 }
 
@@ -413,6 +581,7 @@ fn renewal_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use persistence::meeting_ops::{apply_processing_lifecycle, update_metadata};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -523,6 +692,13 @@ mod tests {
         /// Order log so we can assert push_artifacts happens before the Processed advertise.
         order: Mutex<Vec<&'static str>>,
         fail_process: bool,
+        /// Real-time delay `process()` awaits before returning, so a test can let
+        /// the renewal loop tick (F4b) while a claim is held.
+        process_delay: Duration,
+        /// Run synchronously inside `process()`, before it returns — lets a test
+        /// simulate a peer's stronger state converging onto disk WHILE we are
+        /// mid-process (M2).
+        on_process: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     #[async_trait::async_trait]
@@ -535,8 +711,14 @@ mod tests {
             self.order.lock().unwrap().push("advertise");
         }
         async fn process(&self, _id: MeetingId) -> AppResult<()> {
+            if !self.process_delay.is_zero() {
+                tokio::time::sleep(self.process_delay).await;
+            }
             self.processes.fetch_add(1, Ordering::SeqCst);
             self.order.lock().unwrap().push("process");
+            if let Some(f) = &self.on_process {
+                f();
+            }
             if self.fail_process {
                 Err(minutist_common::AppError::Internal {
                     context: "mock process failure".to_string(),
@@ -572,13 +754,14 @@ mod tests {
         let id = MeetingId::new();
         seed(root, id, ProcessingLifecycle::PendingProcessing).await;
 
-        let driver = MockDriver { host: "m".into(), ..Default::default() };
-        try_elect_and_process(&driver, &host("m"), root, id, &cfg())
+        let mock = Arc::new(MockDriver { host: "m".into(), ..Default::default() });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+        try_elect_and_process(driver, &host("m"), root, id, &cfg())
             .await
             .expect("elect");
 
-        assert_eq!(driver.processes.load(Ordering::SeqCst), 1);
-        assert_eq!(driver.push_artifacts.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.processes.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.push_artifacts.load(Ordering::SeqCst), 1);
         // Final state is Processed by us.
         assert_eq!(
             read_processing(root, id),
@@ -588,7 +771,7 @@ mod tests {
             })
         );
         // push_artifacts precedes the Processed advertise (the §6.7 order).
-        let order = driver.order.lock().unwrap().clone();
+        let order = mock.order.lock().unwrap().clone();
         let pa = order.iter().position(|s| *s == "push_artifacts").unwrap();
         let last_adv = order.iter().rposition(|s| *s == "advertise").unwrap();
         assert!(pa < last_adv, "push_artifacts must precede the Processed advertise: {order:?}");
@@ -607,13 +790,14 @@ mod tests {
         )
         .await;
 
-        let driver = MockDriver { host: "m".into(), ..Default::default() };
-        try_elect_and_process(&driver, &host("m"), root, id, &cfg())
+        let mock = Arc::new(MockDriver { host: "m".into(), ..Default::default() });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+        try_elect_and_process(driver, &host("m"), root, id, &cfg())
             .await
             .expect("elect");
 
         // We never processed and never touched the foreign live claim.
-        assert_eq!(driver.processes.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.processes.load(Ordering::SeqCst), 0);
         assert!(matches!(
             read_processing(root, id),
             Some(ProcessingLifecycle::Claimed { claim }) if claim.host == host("a")
@@ -633,13 +817,14 @@ mod tests {
         )
         .await;
 
-        let driver = MockDriver { host: "m".into(), ..Default::default() };
-        try_elect_and_process(&driver, &host("m"), root, id, &cfg())
+        let mock = Arc::new(MockDriver { host: "m".into(), ..Default::default() });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+        try_elect_and_process(driver, &host("m"), root, id, &cfg())
             .await
             .expect("elect");
 
         // The expired foreign claim was reaped, processed, and marked Processed by us.
-        assert_eq!(driver.processes.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.processes.load(Ordering::SeqCst), 1);
         assert!(matches!(
             read_processing(root, id),
             Some(ProcessingLifecycle::Processed { processed_by, .. }) if processed_by == host("m")
@@ -647,24 +832,152 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_process_does_not_write_processed() {
+    async fn failed_process_releases_claim_to_pending_processing() {
+        // F4a: a failed process() releases the claim back to `PendingProcessing`
+        // for immediate retry, rather than leaving it `Claimed` to lapse the full
+        // (default 30 min) lease.
         let tmp = tempfile::TempDir::new().expect("tmp");
         let root = tmp.path();
         let id = MeetingId::new();
         seed(root, id, ProcessingLifecycle::PendingProcessing).await;
 
-        let driver = MockDriver { host: "m".into(), fail_process: true, ..Default::default() };
-        try_elect_and_process(&driver, &host("m"), root, id, &cfg())
+        let mock = Arc::new(MockDriver { host: "m".into(), fail_process: true, ..Default::default() });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+        try_elect_and_process(driver, &host("m"), root, id, &cfg())
             .await
             .expect("elect");
 
-        assert_eq!(driver.processes.load(Ordering::SeqCst), 1);
-        assert_eq!(driver.push_artifacts.load(Ordering::SeqCst), 0);
-        // Left Claimed (by us) to lapse — NOT Processed.
-        assert!(matches!(
+        assert_eq!(mock.processes.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.push_artifacts.load(Ordering::SeqCst), 0);
+        assert_eq!(
             read_processing(root, id),
-            Some(ProcessingLifecycle::Claimed { claim }) if claim.host == host("m")
-        ));
+            Some(ProcessingLifecycle::PendingProcessing),
+            "a failed process must release the claim, not leave it to lapse"
+        );
+    }
+
+    #[tokio::test]
+    async fn renewer_advertises_on_tick_and_failed_process_releases_the_claim() {
+        // A short renew so the renewer ticks multiple times while the mock
+        // process() is still running (a real `tokio::time::sleep` inside
+        // `process()`), proving F4b's wiring: the renewer calls
+        // `driver.advertise()` after each successful re-stamp (the re-stamp's OWN
+        // correctness — e.g. preserving `claimed_at` — is covered by the
+        // `renewal_step_*` unit tests above). The process then fails, proving F4a:
+        // the claim is released to `PendingProcessing` rather than left to lapse.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let id = MeetingId::new();
+        seed(root, id, ProcessingLifecycle::PendingProcessing).await;
+
+        let cfg = ElectionConfig {
+            poll: Duration::from_millis(10),
+            lease: Duration::from_secs(1800),
+            renew: Duration::from_millis(15),
+        };
+
+        let mock = Arc::new(MockDriver {
+            host: "m".into(),
+            fail_process: true,
+            process_delay: Duration::from_millis(90),
+            ..Default::default()
+        });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+
+        try_elect_and_process(driver, &host("m"), root, id, &cfg)
+            .await
+            .expect("elect");
+
+        // The claim-time advertise (1) plus at least one renewal-tick advertise —
+        // a 90 ms process at a 15 ms renew cadence fits several ticks. No
+        // Processed advertise fires since process() failed.
+        assert!(
+            mock.advertises.load(Ordering::SeqCst) >= 2,
+            "the renewer must advertise on at least one tick during the slow process"
+        );
+        assert_eq!(mock.processes.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.push_artifacts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            read_processing(root, id),
+            Some(ProcessingLifecycle::PendingProcessing)
+        );
+    }
+
+    #[test]
+    fn scan_candidates_skips_a_pending_meeting_missing_audio() {
+        // F4c: in the hub topology `metadata.json`'s lifecycle state can
+        // propagate before the `audio.opus` blob has synced in. A candidate
+        // missing its audio must be skipped so it stays `PendingProcessing` for a
+        // host that already has the audio (or for this host once it arrives).
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let now = Utc::now();
+
+        let no_audio = MeetingId::new();
+        persistence::MeetingFolder::ensure(root, no_audio).expect("ensure");
+        update_metadata(root, no_audio, |m| {
+            m.processing = ProcessingLifecycle::PendingProcessing;
+        })
+        .expect("seed no-audio pending");
+
+        let with_audio = MeetingId::new();
+        persistence::MeetingFolder::ensure(root, with_audio).expect("ensure");
+        update_metadata(root, with_audio, |m| {
+            m.processing = ProcessingLifecycle::PendingProcessing;
+        })
+        .expect("seed with-audio pending");
+        std::fs::write(root.join(with_audio.0.to_string()).join("audio.opus"), b"opus")
+            .expect("write audio.opus");
+
+        let candidates = scan_candidates(root, now);
+
+        assert_eq!(
+            candidates,
+            vec![with_audio],
+            "a candidate missing audio.opus must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_write_does_not_regress_a_converged_lower_processed() {
+        // M2: while our process() is running, simulate a peer's stronger state
+        // (a lower-HostRef Processed, converged via the lifecycle subscriber's
+        // merge_processing) landing on our own disk. Our own terminal write must
+        // not clobber it back to Processed{self}.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let id = MeetingId::new();
+        seed(root, id, ProcessingLifecycle::PendingProcessing).await;
+
+        let converge_root = root.to_path_buf();
+        let mock = Arc::new(MockDriver {
+            host: "m".into(),
+            on_process: Some(Box::new(move || {
+                update_metadata(&converge_root, id, |m| {
+                    m.processing = ProcessingLifecycle::Processed {
+                        processed_by: host("a"), // "a" < "m" — a lower, stronger winner
+                        at: "2026-07-01T10:00:00Z".to_string(),
+                    };
+                })
+                .expect("simulate a converged peer Processed landing mid-process");
+            })),
+            ..Default::default()
+        });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+
+        try_elect_and_process(driver, &host("m"), root, id, &cfg())
+            .await
+            .expect("elect");
+
+        // Our own Processed{m} must not have clobbered the already-converged
+        // Processed{a}.
+        assert!(
+            matches!(
+                read_processing(root, id),
+                Some(ProcessingLifecycle::Processed { processed_by, .. }) if processed_by == host("a")
+            ),
+            "the terminal write must not regress an already-converged lower-HostRef winner"
+        );
     }
 
     fn read_processed_at(root: &Path, id: MeetingId) -> String {

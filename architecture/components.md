@@ -3993,19 +3993,36 @@ The driver has two halves:
   raw-pointer lifetime extension that is safe because the Arc outlives the session
   by stack-declaration order. The test-only stub `WorkerBackend` (`#[cfg(test)]`)
   drives the protocol without a model.
-  **Three bounded channels** (depth 1 each) carry work: a HIGH-priority user-chat
-  lane (`user_req`), a LOW-priority transcript lane (`transcript_req`), and a raw
-  `String` lane (`user_msg`) from the registry handle. The worker's
+  **Three bounded channels** (depth 1 each) carry work: a HIGH-priority
+  user-chat lane (`user_req`, carrying `UserChatRequest { message, reply_tx }`),
+  a LOW-priority transcript lane (`transcript_req`), and a `UserChatRequest`
+  lane (`user_msg`) from the registry handle. The worker's
   `tokio::select! { biased; }` loop drains the HIGH lane first, ensuring a user
   message preempts a pending transcript refresh. In-flight is enforced without a
   separate mutex because each lane is depth-1 and the driver only sends on a lane
   after receiving the previous `WorkerResult`.
 
+  **Per-request reply channel (A3 / U4).** Each `UserChatRequest` carries a
+  bounded `reply_tx: mpsc::Sender<UserReplyChunk>` (depth 32). The worker's
+  `converse_typed` `token_cb` `try_send`s `UserReplyChunk::Token` per piece
+  (drop on full — tokens are hints); at turn end it `blocking_send`s
+  `UserReplyChunk::Done(final_text)` or `UserReplyChunk::Err(msg)`. The
+  `send_chat_message` command spawns a drain task that converts these chunks
+  into `ChatToken` / `ChatTurnComplete` / `ChatError` events on the broadcast
+  bus with the live session id, so the chat panel renders the reply exactly as
+  it does for the non-live `LlamaTurnBackend` path. `LiveCopilotMessage` is NOT
+  emitted for UserChat turns (that would double-render in the co-pilot feed);
+  transcript-triggered replies still emit `LiveCopilotMessage` as before.
+
 `spawn_live_agent` also accepts a **registry** (`Arc<Mutex<HashMap<MeetingId,
 LiveCopilotHandle>>>`). It inserts a `LiveCopilotHandle { user_tx }` keyed by
 `MeetingId` before the driver starts, and removes it when the driver exits. The
-registry is stored on `IpcState::live_copilot_handles`; the chat-command redirect
-that checks it to route a user message to the live session is DEFERRED.
+registry is stored on `IpcState::live_copilot_handles`. `send_chat_message`
+checks the registry; when a handle exists for the target meeting it resolves the
+live `ChatSessionId` via `ChatStore::load_or_create_live`, sends a
+`UserChatRequest`, and drains the reply channel into chat events — routing the
+user turn into the ONE live co-pilot context rather than spinning up a fresh
+`LlamaTurnBackend`.
 
 **Context overflow policy.** The keep-alive context GROWS across turns; on a long
 meeting it can reach `n_ctx`. `Error::ContextOverflow` from
@@ -4034,8 +4051,11 @@ over the meeting's `RagStore`, fused by `rrf_fuse`. The top-`k` fused chunks
 discrete one) are packed into a "Relevant context" block, capped by
 `live_agent_retrieval_budget_chars`. The retrieved block and the turn content are
 sanitised with `sanitise_untrusted` (neutralising embedded Gemma control tokens)
-before passing to `converse_typed`. A non-suppressed reply emits
-`AppEvent::LiveCopilotMessage`; terminal errors emit `AppEvent::LiveDigestError`.
+before passing to `converse_typed`. A non-suppressed reply from a **transcript
+turn** emits `AppEvent::LiveCopilotMessage` (the co-pilot feed surface); a reply
+from a **user-chat turn** is streamed on `reply_tx` only — no
+`LiveCopilotMessage` (the chat-panel surface; see the reply-channel note above).
+Terminal errors emit `AppEvent::LiveDigestError`.
 `AppEvent::LiveDigestUpdated` is **not emitted on the live path** (the digest-JSON
 contract is retired for live sessions).
 

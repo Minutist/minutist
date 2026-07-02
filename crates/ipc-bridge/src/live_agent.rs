@@ -19,8 +19,12 @@
 //!    turns before transcript turns.
 //! 6. The worker calls `session.converse("user", content, ...)`, applies the
 //!    NOOP-sentinel response policy, and replies with a [`WorkerResult`].
-//! 7. A non-suppressed [`WorkerResult::Message`] emits
+//! 7. A non-suppressed [`WorkerResult::Message`] from a Transcript turn emits
 //!    [`AppEvent::LiveCopilotMessage`] and is persisted to the live `ChatSession`.
+//!    A non-suppressed message from a UserChat turn streams back on the
+//!    request's `reply_tx` ([`UserReplyChunk`]) instead; the `send_chat_message`
+//!    command task drains those chunks and emits `ChatToken`/`ChatTurnComplete`
+//!    events on the broadcast bus so the chat panel renders the reply.
 //!
 //! # Threading
 //!
@@ -38,10 +42,12 @@
 //! registry (`Arc<Mutex<HashMap<MeetingId, LiveCopilotHandle>>>`) on start and
 //! removes it on teardown. The registry is stored on [`crate::IpcState`] so the
 //! `send_chat_message` command can route user messages to the live co-pilot when
-//! the target meeting is currently recording. The full chat-command redirect
-//! (checking the registry and bypassing the fresh-context `LlamaTurnBackend`
-//! path) is DEFERRED to the next wiring step; the registry and user lane are
-//! present and functional.
+//! the target meeting is currently recording. The command resolves the live
+//! [`minutist_common::ChatSessionId`] via `ChatStore::find_live`, sends a
+//! [`UserChatRequest`] on [`LiveCopilotHandle::user_tx`], and spawns a task that
+//! drains the reply channel into `ChatToken` / `ChatTurnComplete` / `ChatError`
+//! broadcast events — the same events the post-meeting `LlamaTurnBackend` path
+//! emits, so the chat UI renders the reply without any per-path branching.
 //!
 //! # Prefix and retrieval
 //!
@@ -75,6 +81,12 @@
 //! `terminal` flag that stops all further turns for the session.
 //! This is the v1 policy: no re-seed mid-recording (re-seeding costs another
 //! ~40 s prefill and would starve ASR inference).
+//!
+//! After the terminal flag is set, the driver's select arm (gated
+//! `if !in_flight`) remains enabled for `user_msg_rx` and immediately rejects
+//! any incoming [`UserChatRequest`] with a [`UserReplyChunk::Err`], so the
+//! drain task in `send_chat_message` terminates promptly and clears both
+//! `chat_in_flight` and `chat_cancel` rather than hanging indefinitely.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -106,6 +118,39 @@ const WORKER_CHANNEL_DEPTH: usize = 1;
 // Registry handle
 // ---------------------------------------------------------------------------
 
+/// One chunk in the streaming reply from the live co-pilot to the
+/// `send_chat_message` command. The command spawns a drain task that converts
+/// these into [`minutist_common::AppEvent`] chat events on the broadcast bus.
+///
+/// `Token` chunks are best-effort hints; `Done` is authoritative (its payload
+/// is the full reconciled text). A dropped `Token` is harmless because the
+/// `ChatTurnComplete` event carries `final_text`.
+#[derive(Debug)]
+pub enum UserReplyChunk {
+    /// One streamed token (or token fragment) from the decode loop.
+    Token(String),
+    /// The turn completed. `0` is the full reply text.
+    Done(String),
+    /// The turn failed. `0` is a human-readable error description.
+    Err(String),
+}
+
+/// A user-chat turn request sent from `send_chat_message` into the live worker
+/// via [`LiveCopilotHandle::user_tx`].
+pub struct UserChatRequest {
+    /// The verbatim message the user typed.
+    pub message: String,
+    /// Bounded channel the worker uses to stream the reply back. The command
+    /// task drains this and emits `ChatToken` / `ChatTurnComplete` / `ChatError`
+    /// on the broadcast bus. Depth 32 — each send is `try_send` (tokens are
+    /// dropped on full; `Done`/`Err` block because they are authoritative).
+    pub reply_tx: mpsc::Sender<UserReplyChunk>,
+    /// Per-turn cancel flag registered in `IpcState::chat_cancel` by the
+    /// command task. The driver forwards it onto `CopilotTurnRequest::cancel`
+    /// so that `cancel_chat_turn` reaches the worker's decode loop.
+    pub cancel: CancelFlag,
+}
+
 /// A lightweight handle to the live co-pilot for one meeting, stored in the
 /// per-session registry on [`crate::IpcState`].
 ///
@@ -116,9 +161,10 @@ const WORKER_CHANNEL_DEPTH: usize = 1;
 /// `LlamaTurnBackend` path.
 pub struct LiveCopilotHandle {
     /// The HIGH-priority user-chat input channel into the live worker. Send a
-    /// `String` here to inject a user turn; the worker drains this channel
-    /// before the LOW-priority transcript channel on each `biased` select.
-    pub user_tx: mpsc::Sender<String>,
+    /// [`UserChatRequest`] here to inject a user turn; the worker drains this
+    /// channel before the LOW-priority transcript channel on each `biased`
+    /// select and streams the reply back on the request's `reply_tx`.
+    pub user_tx: mpsc::Sender<UserChatRequest>,
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +277,10 @@ pub(crate) struct CopilotTurnRequest {
     pub(crate) retrieved: Option<String>,
     pub(crate) sampler: SamplerConfig,
     pub(crate) cancel: CancelFlag,
+    /// For `TurnKind::UserChat` turns only: the channel the worker uses to
+    /// stream the reply back to the `send_chat_message` command. `None` for
+    /// transcript turns (those surface via `AppEvent::LiveCopilotMessage`).
+    pub(crate) reply_tx: Option<mpsc::Sender<UserReplyChunk>>,
 }
 
 /// The result of one worker turn.
@@ -314,9 +364,9 @@ pub fn spawn_live_agent(
     let (res_tx, res_rx) = mpsc::channel::<WorkerResult>(WORKER_CHANNEL_DEPTH);
 
     // The user-lane sender is exposed through the handle inserted into the registry.
-    // The driver task wraps raw String messages from the registry handle into full
-    // CopilotTurnRequests before forwarding on user_req_tx.
-    let (user_msg_tx, user_msg_rx) = mpsc::channel::<String>(WORKER_CHANNEL_DEPTH);
+    // The driver task wraps UserChatRequests from the registry handle into full
+    // CopilotTurnRequests (carrying the reply_tx) before forwarding on user_req_tx.
+    let (user_msg_tx, user_msg_rx) = mpsc::channel::<UserChatRequest>(WORKER_CHANNEL_DEPTH);
 
     // Clone the fields needed for model loading and prefix building inside the
     // worker thread.
@@ -450,8 +500,8 @@ async fn run_driver_task(
     transcript_req_tx: mpsc::Sender<CopilotTurnRequest>,
     // HIGH-priority user-turn sender (wraps raw user messages from user_msg_rx).
     user_req_tx: mpsc::Sender<CopilotTurnRequest>,
-    // Raw user messages arriving from the registry handle (via send_chat_message).
-    mut user_msg_rx: mpsc::Receiver<String>,
+    // User-chat requests arriving from the registry handle (via send_chat_message).
+    mut user_msg_rx: mpsc::Receiver<UserChatRequest>,
     mut res_rx: mpsc::Receiver<WorkerResult>,
     shutdown: &mut watch::Receiver<bool>,
     // C2/M5: raised on shutdown to abort the worker thread's startup prefix
@@ -490,8 +540,10 @@ async fn run_driver_task(
         // in rapid succession, which is now impossible because the driver
         // drains the user lane first.
         if !in_flight && !terminal {
-            if let Ok(msg) = user_msg_rx.try_recv() {
-                let cancel = CancelFlag::new();
+            if let Ok(user_req) = user_msg_rx.try_recv() {
+                // Use the cancel flag from the request so that `cancel_chat_turn`
+                // registered by the command task can raise it to stop the decode loop.
+                let cancel = user_req.cancel.clone();
                 active_cancel = Some(cancel.clone());
                 in_flight = true;
                 tracing::debug!(
@@ -501,13 +553,14 @@ async fn run_driver_task(
                 );
                 let req = CopilotTurnRequest {
                     kind: TurnKind::UserChat,
-                    content: msg,
+                    content: user_req.message,
                     retrieved: None,
                     sampler: SamplerConfig {
                         max_tokens: 1024,
                         ..SamplerConfig::deterministic()
                     },
                     cancel,
+                    reply_tx: Some(user_req.reply_tx),
                 };
                 if user_req_tx.send(req).await.is_err() {
                     tracing::warn!(
@@ -516,6 +569,38 @@ async fn run_driver_task(
                         "live-agent worker disappeared while forwarding user message"
                     );
                 }
+            }
+        }
+
+        // === Terminal-state rejection ===
+        //
+        // When the held context is terminal (capacity exhausted or decode
+        // error), new user requests cannot be dispatched via the normal path
+        // (both consumption sites above are gated `!terminal`). Drain any
+        // pending requests here and reply immediately with `UserReplyChunk::Err`
+        // so the drain task in `route_live_chat_message` terminates promptly,
+        // clearing `chat_in_flight` and unblocking the chat UI. Without this
+        // drain a queued `UserChatRequest` sits in `user_msg_rx` indefinitely
+        // and `reply_rx.recv()` in the drain task never returns.
+        //
+        // `try_recv` is used deliberately: this path must not block the loop
+        // iteration waiting for a message that may never arrive. Any request
+        // already queued is drained on this pass; a request that arrives later
+        // (after the `select!` below yields) is caught on the next loop iteration
+        // or — if the channel is still open — by the `select!` arm below which
+        // is enabled whenever `terminal && !in_flight` to make the loop
+        // responsive without busy-spinning on an empty channel.
+        if terminal {
+            while let Ok(user_req) = user_msg_rx.try_recv() {
+                tracing::debug!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "live-agent: rejecting user message after terminal state"
+                );
+                let _ = user_req.reply_tx.try_send(UserReplyChunk::Err(
+                    "Live co-pilot paused: context window filled for this session."
+                        .to_string(),
+                ));
             }
         }
 
@@ -551,6 +636,7 @@ async fn run_driver_task(
                             ..SamplerConfig::deterministic()
                         },
                         cancel,
+                        reply_tx: None,
                     })
                     .await
                 {
@@ -600,25 +686,50 @@ async fn run_driver_task(
 
             // A raw user message arrived from the registry handle but was not
             // caught by the try_recv above (e.g. arrived after the try_recv but
-            // before the select, or while in_flight was true). Wrap it into a
-            // CopilotTurnRequest and forward on the HIGH-priority channel when
-            // the worker is free. The `try_recv` path above handles the
-            // preemption case; this arm handles the normal !in_flight arrival.
-            user_msg = user_msg_rx.recv(), if !in_flight && !terminal => {
+            // before the select, or while in_flight was true).
+            //
+            // When the driver is not terminal: wrap the request into a
+            // CopilotTurnRequest and forward on the HIGH-priority channel.
+            //
+            // When the driver is terminal (context exhausted or decode error):
+            // reject the request immediately via its embedded reply_tx so the
+            // drain task in `route_live_chat_message` terminates and clears
+            // both `chat_in_flight` and the chat UI. The guard includes
+            // `terminal` (enabling the arm when terminal && !in_flight) so the
+            // select wakes up promptly for newly queued requests even after the
+            // context is exhausted — otherwise the select would sleep until
+            // another arm fires, delaying the rejection.
+            user_msg = user_msg_rx.recv(), if !in_flight => {
                 match user_msg {
-                    Some(msg) => {
-                        let cancel = CancelFlag::new();
+                    Some(user_req) if terminal => {
+                        // Terminal: reject the request and let the drain task
+                        // clear chat_in_flight / chat_cancel.
+                        tracing::debug!(
+                            target: "ipc-bridge",
+                            meeting_id = %meeting_id.0,
+                            "live-agent: rejecting user message after terminal state"
+                        );
+                        let _ = user_req.reply_tx.try_send(UserReplyChunk::Err(
+                            "Live co-pilot paused: context window filled for this session."
+                                .to_string(),
+                        ));
+                    }
+                    Some(user_req) => {
+                        // Use the cancel flag from the request so that `cancel_chat_turn`
+                        // registered by the command task can reach the decode loop.
+                        let cancel = user_req.cancel.clone();
                         active_cancel = Some(cancel.clone());
                         in_flight = true;
                         let req = CopilotTurnRequest {
                             kind: TurnKind::UserChat,
-                            content: msg,
+                            content: user_req.message,
                             retrieved: None,
                             sampler: SamplerConfig {
                                 max_tokens: 1024,
                                 ..SamplerConfig::deterministic()
                             },
                             cancel,
+                            reply_tx: Some(user_req.reply_tx),
                         };
                         if user_req_tx.send(req).await.is_err() {
                             tracing::warn!(
@@ -645,29 +756,30 @@ async fn run_driver_task(
                 last_refresh = Instant::now();
                 match result {
                     Some(WorkerResult::Message { role_is_user_reply, content }) => {
-                        // Both transcript-triggered and user-chat replies are authored
-                        // by the assistant; `role_is_user_reply` distinguishes the
-                        // originating input lane but does not change the reply's role.
-                        // Emitting `ChatRole::User` here would contradict the
-                        // `ChatRole::Assistant` stored by `persist_turn` for the same
-                        // message.
-                        let _ = role_is_user_reply; // lane tag only — not the reply role
-                        tracing::debug!(
-                            target: "ipc-bridge",
-                            meeting_id = %meeting_id.0,
-                            role_is_user_reply,
-                            "live-agent: surfacing co-pilot message"
-                        );
-                        // turn_id from the persisted ChatMessage is not yet
-                        // threaded back through WorkerResult. DEFERRED: plumb
-                        // turn_id through WorkerResult for event correlation
-                        // (next wiring step with the chat-command redirect).
-                        let _ = event_tx.send(AppEvent::LiveCopilotMessage {
-                            meeting_id,
-                            turn_id: 0,
-                            role: ChatRole::Assistant,
-                            content,
-                        });
+                        // Transcript-triggered replies surface via the co-pilot feed
+                        // (LiveCopilotMessage → LiveDigestPanel). User-chat replies
+                        // stream back on reply_tx (ChatToken/ChatTurnComplete events)
+                        // and render in the chat panel — emitting LiveCopilotMessage for
+                        // those would double-render the reply in the feed.
+                        if role_is_user_reply {
+                            tracing::debug!(
+                                target: "ipc-bridge",
+                                meeting_id = %meeting_id.0,
+                                "live-agent: user-chat reply streamed via reply_tx (no co-pilot feed event)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "ipc-bridge",
+                                meeting_id = %meeting_id.0,
+                                "live-agent: surfacing transcript-triggered co-pilot message"
+                            );
+                            let _ = event_tx.send(AppEvent::LiveCopilotMessage {
+                                meeting_id,
+                                turn_id: 0,
+                                role: ChatRole::Assistant,
+                                content,
+                            });
+                        }
                     }
                     Some(WorkerResult::Suppressed) => {
                         // Transcript turn produced the NOOP sentinel — nothing
@@ -1494,6 +1606,10 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
     // sanitised copies) that is only for the model's consumption.
     let log_content = req.content.clone();
 
+    // Extract the reply channel BEFORE moving req into req_with_retrieved, so
+    // it is available for the token callback and the terminal send below.
+    let reply_tx = req.reply_tx.as_ref().cloned();
+
     // Build the full framed prompt: retrieved context block + kind-specific
     // instructions. This is passed to the model only, never persisted.
     let req_with_retrieved = CopilotTurnRequest {
@@ -1520,6 +1636,11 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
     let mut already_evicted = false;
     if !session.has_room_for(estimated_tokens, max_tokens) {
         if let Some(msg) = do_evict(session, meeting_id, meetings_dir, markers, &mut model_prompt) {
+            if let Some(ref tx) = reply_tx {
+                if let WorkerResult::Err(ref e) | WorkerResult::CapacityExhausted(ref e) = msg {
+                    let _ = tx.try_send(UserReplyChunk::Err(e.clone()));
+                }
+            }
             return msg;
         }
         already_evicted = true;
@@ -1538,49 +1659,103 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
     // is matched structurally in classify_converse_error, not confused with a
     // transient MalformedOutput or Template failure.
     //
+    // For UserChat turns, each decoded piece is forwarded via reply_tx so the
+    // command task can emit ChatToken events in real time. try_send is used —
+    // tokens are best-effort hints; a full buffer drops the piece and decoding
+    // continues unblocked. ChatTurnComplete (sent at the end with the full text)
+    // is authoritative and reconciles any dropped tokens.
+    //
+    // For Transcript turns, reply_tx is None and the callback only accumulates
+    // the generated text; LiveCopilotMessage is emitted by the driver on
+    // WorkerResult::Message.
+
+    // Inline helper: sends an Err chunk on reply_tx when a terminal WorkerResult is
+    // about to be returned early, so the command task's drain loop is unblocked.
+    // try_send is used — a send failure means the receiver already exited.
+    macro_rules! send_err_chunk {
+        ($result:expr) => {
+            if let Some(ref tx) = reply_tx {
+                if let WorkerResult::Err(ref e) | WorkerResult::CapacityExhausted(ref e) =
+                    $result
+                {
+                    let _ = tx.try_send(UserReplyChunk::Err(e.clone()));
+                }
+            }
+        };
+    }
+
     // If converse returns ContextOverflow and eviction was not already
     // triggered (the estimate heuristic under-counted), attempt one
     // evict-and-retry before falling through to CapacityExhausted. This
     // covers the boundary case where the real token count exceeds the
     // estimate but the session would fit a fresh post-eviction context.
-    let mut raw = match session.converse_typed(
-        "user",
-        &model_prompt,
-        &req_with_retrieved.sampler,
-        &req_with_retrieved.cancel,
-        &mut |piece| generated.push_str(piece),
-    ) {
-        Ok(r) => r,
-        Err(ChatAgentError::ContextOverflow(_)) if !already_evicted => {
-            // Estimate was too optimistic — evict now and retry once.
-            tracing::info!(
-                target: "ipc-bridge",
-                meeting_id = %meeting_id.0,
-                "live-agent: ContextOverflow after estimate passed; \
-                 evicting and retrying"
-            );
-            // Reset model_prompt to the original (unrecapped) framing before
-            // re-evicting, so the recap is added exactly once.
-            model_prompt = build_turn_content(&req_with_retrieved, markers);
-            if let Some(msg) =
-                do_evict(session, meeting_id, meetings_dir, markers, &mut model_prompt)
-            {
-                return msg;
+    //
+    // Clone the sender for the decode callbacks: mpsc::Sender is cheaply
+    // cloneable (Arc-backed). The clones are only live for the duration of
+    // their enclosing converse_typed call; `reply_tx` is retained for the
+    // terminal Done/Err sends below.
+    let mut raw = {
+        let cb_tx = reply_tx.clone();
+        match session.converse_typed(
+            "user",
+            &model_prompt,
+            &req_with_retrieved.sampler,
+            &req_with_retrieved.cancel,
+            &mut |piece: &str| {
+                generated.push_str(piece);
+                if let Some(ref tx) = cb_tx {
+                    // try_send: drop the token on a full buffer. The authoritative
+                    // final text is carried on UserReplyChunk::Done.
+                    let _ = tx.try_send(UserReplyChunk::Token(piece.to_string()));
+                }
+            },
+        ) {
+            Ok(r) => r,
+            Err(ChatAgentError::ContextOverflow(_)) if !already_evicted => {
+                // Estimate was too optimistic — evict now and retry once.
+                tracing::info!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "live-agent: ContextOverflow after estimate passed; \
+                     evicting and retrying"
+                );
+                // Reset model_prompt to the original (unrecapped) framing before
+                // re-evicting, so the recap is added exactly once.
+                model_prompt = build_turn_content(&req_with_retrieved, markers);
+                if let Some(msg) =
+                    do_evict(session, meeting_id, meetings_dir, markers, &mut model_prompt)
+                {
+                    send_err_chunk!(msg);
+                    return msg;
+                }
+                generated.clear();
+                let cb_tx2 = reply_tx.clone();
+                match session.converse_typed(
+                    "user",
+                    &model_prompt,
+                    &req_with_retrieved.sampler,
+                    &req_with_retrieved.cancel,
+                    &mut |piece: &str| {
+                        generated.push_str(piece);
+                        if let Some(ref tx) = cb_tx2 {
+                            let _ = tx.try_send(UserReplyChunk::Token(piece.to_string()));
+                        }
+                    },
+                ) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let result =
+                            classify_converse_error(meeting_id, e, "converse-after-evict");
+                        send_err_chunk!(result);
+                        return result;
+                    }
+                }
             }
-            generated.clear();
-            match session.converse_typed(
-                "user",
-                &model_prompt,
-                &req_with_retrieved.sampler,
-                &req_with_retrieved.cancel,
-                &mut |piece| generated.push_str(piece),
-            ) {
-                Ok(r) => r,
-                Err(e) => return classify_converse_error(meeting_id, e, "converse-after-evict"),
+            Err(e) => {
+                let result = classify_converse_error(meeting_id, e, "converse");
+                send_err_chunk!(result);
+                return result;
             }
-        }
-        Err(e) => {
-            return classify_converse_error(meeting_id, e, "converse");
         }
     };
 
@@ -1598,25 +1773,35 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
         }
         let tool_feed = tool_result_parts.join("\n");
         generated.clear();
+        let cb_tx_tool = reply_tx.clone();
         raw = match session.converse_typed(
             "tool",
             &tool_feed,
             &req_with_retrieved.sampler,
             &req_with_retrieved.cancel,
-            &mut |piece| generated.push_str(piece),
+            &mut |piece: &str| {
+                generated.push_str(piece);
+                if let Some(ref tx) = cb_tx_tool {
+                    let _ = tx.try_send(UserReplyChunk::Token(piece.to_string()));
+                }
+            },
         ) {
             Ok(r) => r,
             Err(e) => {
-                return classify_converse_error(meeting_id, e, "tool converse");
+                let result = classify_converse_error(meeting_id, e, "tool converse");
+                send_err_chunk!(result);
+                return result;
             }
         };
     }
 
-    let reply_text = if generated.is_empty() {
-        raw.text
-    } else {
-        generated
-    };
+    // Use raw.text when the callback-accumulated buffer is empty (happens when
+    // the model returns the full text via raw.text rather than incremental pieces).
+    if generated.is_empty() {
+        generated = raw.text;
+    }
+    // `generated` now holds the complete reply text.
+    let reply_text = generated;
 
     // Response policy (B3 §4).
     match kind {
@@ -1648,6 +1833,27 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
                 &reply_text,
                 turn_id,
             );
+            // Send the authoritative final text on reply_tx so the command
+            // task can emit ChatTurnComplete. blocking_send is used here (not
+            // try_send) because Done is authoritative — dropping it would leave
+            // the command task's drain loop running until its receiver is
+            // dropped at shutdown. The worker thread is dedicated (not on the
+            // Tokio scheduler), so blocking is acceptable. A send failure means
+            // the command task already exited (user navigated away); log and
+            // continue — the persisted turn is already durable.
+            if let Some(ref tx) = reply_tx {
+                if tx
+                    .blocking_send(UserReplyChunk::Done(reply_text.clone()))
+                    .is_err()
+                {
+                    tracing::debug!(
+                        target: "ipc-bridge",
+                        meeting_id = %meeting_id.0,
+                        "live-agent: reply_tx closed before Done could be sent \
+                         (command task exited early)"
+                    );
+                }
+            }
             WorkerResult::Message {
                 role_is_user_reply: true,
                 content: reply_text,
@@ -2544,6 +2750,7 @@ mod tests {
             retrieved: None,
             sampler: SamplerConfig::deterministic(),
             cancel: CancelFlag::new(),
+            reply_tx: None,
         };
         let mut turn_id = 0u64;
         match process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id)
@@ -2574,6 +2781,7 @@ mod tests {
             retrieved: None,
             sampler: SamplerConfig::deterministic(),
             cancel: CancelFlag::new(),
+            reply_tx: None,
         };
         let mut turn_id = 0u64;
         match process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id)
@@ -2604,6 +2812,7 @@ mod tests {
             retrieved: None,
             sampler: SamplerConfig::deterministic(),
             cancel: CancelFlag::new(),
+            reply_tx: None,
         };
         let mut turn_id = 0u64;
         match process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id)
@@ -2613,6 +2822,115 @@ mod tests {
             }
             other => panic!("expected Message for user-chat, got {other:?}"),
         }
+    }
+
+    /// `process_request` with a `UserChat` turn and `Some(reply_tx)`:
+    /// - sends the authoritative `Done` chunk with the full reply text, and
+    /// - returns `WorkerResult::Message { role_is_user_reply: true }`.
+    ///
+    /// `Token` chunks are only sent when the backend calls `token_cb` during
+    /// decoding; the stub backend returns the full text via `raw.text` rather
+    /// than the callback, so the channel carries only the terminal `Done`.
+    /// (A streaming backend would send Token chunks before Done; the Done is
+    /// always authoritative regardless.)
+    #[test]
+    fn process_request_user_chat_with_reply_tx_sends_done() {
+        let mid = new_mid();
+        let (_tmp, meetings_dir) = make_tmp_meetings_dir();
+        // WorkerBackend returns "stub reply" via raw.text (no token_cb calls).
+        let mut session: LiveSession<WorkerBackend> = LiveSession::new(WorkerBackend::new());
+        session
+            .seed_prefix_typed("sys", &CancelFlag::new())
+            .expect("seed");
+        session.init_tool_machinery(None).expect("init");
+
+        let markers = default_test_markers();
+        // Use a depth-8 channel; the stub reply is short so nothing is dropped.
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<UserReplyChunk>(8);
+        let req = CopilotTurnRequest {
+            kind: TurnKind::UserChat,
+            content: "What are the action items?".to_string(),
+            retrieved: None,
+            sampler: SamplerConfig::deterministic(),
+            cancel: CancelFlag::new(),
+            reply_tx: Some(reply_tx),
+        };
+        let mut turn_id = 0u64;
+        let result =
+            process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id);
+
+        assert!(
+            matches!(result, WorkerResult::Message { role_is_user_reply: true, .. }),
+            "user-chat must yield Message{{role_is_user_reply:true}}, got {result:?}"
+        );
+
+        // Drain all chunks.
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = reply_rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        // Exactly one Done must be present, carrying the full reply text.
+        let done_texts: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| {
+                if let UserReplyChunk::Done(t) = c {
+                    Some(t.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            done_texts.len(),
+            1,
+            "exactly one Done expected; got: {chunks:?}"
+        );
+        assert!(
+            !done_texts[0].is_empty(),
+            "Done must carry non-empty text; got: {chunks:?}"
+        );
+    }
+
+    /// A `Transcript` turn does NOT send anything on `reply_tx`; the driver is
+    /// responsible for emitting `LiveCopilotMessage` from the returned
+    /// `WorkerResult::Message { role_is_user_reply: false }` instead. This
+    /// asserts the split-surfaces contract: user replies → `reply_tx`; transcript
+    /// observations → `LiveCopilotMessage` (via the driver).
+    #[test]
+    fn process_request_transcript_turn_does_not_send_on_reply_tx() {
+        let mid = new_mid();
+        let (_tmp, meetings_dir) = make_tmp_meetings_dir();
+        let mut session: LiveSession<WorkerBackend> = LiveSession::new(WorkerBackend::new());
+        session
+            .seed_prefix_typed("sys", &CancelFlag::new())
+            .expect("seed");
+        session.init_tool_machinery(None).expect("init");
+
+        let markers = default_test_markers();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<UserReplyChunk>(8);
+        let req = CopilotTurnRequest {
+            kind: TurnKind::Transcript,
+            content: "Alice: let's meet on Thursday".to_string(),
+            retrieved: None,
+            sampler: SamplerConfig::deterministic(),
+            cancel: CancelFlag::new(),
+            reply_tx: Some(reply_tx),
+        };
+        let mut turn_id = 0u64;
+        let result =
+            process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id);
+
+        assert!(
+            matches!(result, WorkerResult::Message { role_is_user_reply: false, .. }),
+            "transcript turn must yield Message{{role_is_user_reply:false}}, got {result:?}"
+        );
+
+        // No chunks must have been sent — the reply channel stays empty.
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "transcript turn must NOT send on reply_tx"
+        );
     }
 
     /// `ContextOverflow` from `converse` maps to `WorkerResult::CapacityExhausted`.
@@ -2633,6 +2951,7 @@ mod tests {
             retrieved: None,
             sampler: SamplerConfig::deterministic(),
             cancel: CancelFlag::new(),
+            reply_tx: None,
         };
         let mut turn_id = 0u64;
         match process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id)
@@ -2663,6 +2982,7 @@ mod tests {
                 retrieved: None,
                 sampler: SamplerConfig::deterministic(),
                 cancel: CancelFlag::new(),
+                reply_tx: None,
             };
             let mut turn_id = 0u64;
             process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id);
@@ -2721,6 +3041,7 @@ mod tests {
                 retrieved: None,
                 sampler: SamplerConfig::deterministic(),
                 cancel: CancelFlag::new(),
+                reply_tx: None,
             })
             .await
             .expect("send user");
@@ -2732,6 +3053,7 @@ mod tests {
                 retrieved: None,
                 sampler: SamplerConfig::deterministic(),
                 cancel: CancelFlag::new(),
+                reply_tx: None,
             })
             .await
             .expect("send transcript");
@@ -3109,6 +3431,7 @@ mod tests {
                 retrieved: None,
                 sampler: SamplerConfig::deterministic(),
                 cancel: CancelFlag::new(),
+                reply_tx: None,
             })
             .await
             .expect("send req");
@@ -3423,6 +3746,7 @@ mod tests {
             retrieved: retrieved_block,
             sampler: SamplerConfig::deterministic(),
             cancel: CancelFlag::new(),
+            reply_tx: None,
         };
         let mut turn_id = 0u64;
         // Pass `retrieved = None` through the `process_request` signature
@@ -3532,6 +3856,7 @@ mod tests {
                 retrieved: None,
                 sampler: SamplerConfig::deterministic(),
                 cancel: CancelFlag::new(),
+                reply_tx: None,
             };
             process_request(mid, session, req, None, &markers, &meetings_dir, turn_id)
         };
@@ -3674,6 +3999,7 @@ mod tests {
             retrieved: None,
             sampler: SamplerConfig::deterministic(),
             cancel: CancelFlag::new(),
+            reply_tx: None,
         };
         let mut turn_id = tid;
         let result =
@@ -3726,6 +4052,7 @@ mod tests {
             retrieved: None,
             sampler: SamplerConfig::deterministic(),
             cancel: CancelFlag::new(),
+            reply_tx: None,
         };
         let mut turn_id = 0u64;
         let result =
@@ -3927,6 +4254,7 @@ mod tests {
                 retrieved: None,
                 sampler: SamplerConfig::deterministic(),
                 cancel: CancelFlag::new(),
+                reply_tx: None,
             };
             let result = process_request(mid, &mut session, req, None, &markers, &meetings_dir, &mut turn_id);
             match result {
@@ -4032,6 +4360,7 @@ mod tests {
                     retrieved: None,
                     sampler: SamplerConfig::deterministic(),
                     cancel: CancelFlag::new(),
+                    reply_tx: None,
                 };
                 process_request(mid, session, req, None, &markers, &meetings_dir, turn_id)
             };

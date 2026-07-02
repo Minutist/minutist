@@ -41,9 +41,28 @@ that.
 | Attachment conversion | A SINGLE long-lived worker task (`tauri::async_runtime::spawn`, same pattern as `spawn_event_forwarder`). Jobs arrive on a **bounded** `tokio::sync::mpsc` channel; the worker processes them one at a time, each on `spawn_blocking`. Best-effort: every error is logged (`target: "ipc-bridge"`); the worker never panics. Back-pressure: `add_attachment` uses `try_send`; a full queue marks the entry `Failed("conversion queue full")` immediately. |
 | Persistence writes | `spawn_blocking` per write op for now; revisit if it shows up in profiling. |
 | Tauri command handlers | Tokio worker threads. Short-lived, dispatch to the above. |
+| Live co-pilot reply drain (U4 A3) | A `tokio::spawn` task per user chat turn when the meeting is live. It drains a bounded `mpsc::Receiver<UserReplyChunk>` (depth 32) and emits `ChatToken`/`ChatTurnComplete`/`ChatError` on the broadcast bus. Terminates on the first terminal chunk (`Done`/`Err`) or channel close. `chat_in_flight` is cleared by this task, not the worker thread (mirroring the non-live path). |
 
 Bounded channels everywhere. Unbounded queues are not allowed — they
 hide back-pressure that the live pipeline needs to surface.
+
+**Live co-pilot reply channel (U4 A3).** `UserChatRequest` carries a bounded
+`reply_tx: mpsc::Sender<UserReplyChunk>` (depth 32). The live worker's decode
+callbacks `try_send` `UserReplyChunk::Token` per piece (drop on full — tokens are
+hints; `ChatTurnComplete` is authoritative) and `blocking_send`
+`UserReplyChunk::Done(final_text)` or `UserReplyChunk::Err(msg)` at turn end. The
+`send_chat_message` command's drain task converts these into the standard chat
+broadcast events (`ChatToken` / `ChatTurnComplete` / `ChatError`) keyed to the
+live `ChatSessionId`, so the frontend chat panel handles the live reply identically
+to the post-meeting `LlamaTurnBackend` path — no frontend branching.
+
+**Split co-pilot surfaces (U4).** The live co-pilot feeds TWO separate surfaces:
+- **Co-pilot feed** (`LiveCopilotMessage` events → `LiveDigestPanel`): transcript-triggered
+  assistant replies only (turn kind = `Transcript`). The panel accumulates these as
+  proactive observations/alerts visible to the user during the meeting.
+- **Chat panel** (`ChatToken` / `ChatTurnComplete` events → `ChatView`): user-typed
+  message replies only (turn kind = `UserChat`). The reply flows on `reply_tx`;
+  `LiveCopilotMessage` is NOT emitted for user-chat turns to prevent double-rendering.
 
 `unsafe` Send/Sync assertions in the workspace (each documents its full
 safety argument at the impl site):

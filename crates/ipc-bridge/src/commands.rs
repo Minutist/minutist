@@ -50,6 +50,7 @@ use crate::chat::{
     engine_message_from_wire, initial_history, run_chat_turn, wire_role, CHAT_N_CTX,
 };
 use crate::chat_runtime::ChatHandles;
+use crate::live_agent::{UserChatRequest, UserReplyChunk};
 use crate::output_language::resolve_output_language;
 use crate::{error::IpcError, IpcState};
 
@@ -2199,20 +2200,180 @@ pub(crate) fn chat_system_prompt_for_meeting(
     )
 }
 
+/// Inner implementation of the live co-pilot chat routing path (A3).
+///
+/// Routes a user message into the live co-pilot session for `mid` via `user_tx`,
+/// resolves the live [`ChatSessionId`], registers a cancel flag, spawns the
+/// reply-drain task, and returns the session id immediately.
+///
+/// Extracted from `send_chat_message` so the live-routing logic (cancel
+/// registration, drain lifecycle, guard release) can be tested without
+/// constructing a full `tauri::State`.
+///
+/// Returns `Ok(live_sid)` on success or an error when the session lookup fails.
+/// If the worker is gone at send time, `Ok(live_sid)` is returned but a
+/// `ChatError` event is emitted (matching the outer command's contract).
+async fn route_live_chat_message(
+    meetings_dir: &Path,
+    mid: MeetingId,
+    user_tx: tokio::sync::mpsc::Sender<UserChatRequest>,
+    message: String,
+    event_tx: broadcast::Sender<AppEvent>,
+    chat_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<ChatSessionId>>>,
+    chat_cancel: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<ChatSessionId, chat_agent::CancelFlag>,
+        >,
+    >,
+) -> Result<ChatSessionId, AppError> {
+    // Resolve the live ChatSessionId (read-only; spawn_blocking for the
+    // filesystem scan under ChatStore::find_live / ChatStore::load_or_create_live).
+    let md = meetings_dir.to_path_buf();
+    let live_session = tokio::task::spawn_blocking(move || {
+        let now = chrono::Utc::now().to_rfc3339();
+        ChatStore::load_or_create_live(&md, mid, &now)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("live session lookup task join failed: {e}"),
+    })??;
+    let live_sid = live_session.id;
+
+    // Single in-flight turn per session. Use the live session id as the
+    // guard key so the per-session busy check applies to the live log.
+    {
+        let mut in_flight = chat_in_flight.lock().expect("chat_in_flight poisoned");
+        if !in_flight.insert(live_sid) {
+            return Err(AppError::InvalidInput {
+                context: "session busy: a turn is already running".into(),
+            });
+        }
+    }
+
+    // Compute the turn_id from the live session's existing messages.
+    let turn_id = live_session
+        .messages
+        .iter()
+        .map(|m| m.turn_id)
+        .max()
+        .map_or(0, |t| t + 1);
+
+    // Bounded reply channel from the live worker back to this drain task.
+    // Depth 32 — tokens are best-effort (try_send); Done/Err block.
+    const LIVE_REPLY_DEPTH: usize = 32;
+    let (reply_tx, mut reply_rx) =
+        tokio::sync::mpsc::channel::<UserReplyChunk>(LIVE_REPLY_DEPTH);
+
+    // Register the cancel flag before handing off, so that
+    // `cancel_chat_turn(live_sid)` can raise it at any time after this point.
+    // The flag is forwarded into the live worker via `UserChatRequest::cancel`;
+    // the worker's decode loop observes it between tokens. The drain task
+    // removes the entry on completion.
+    let cancel = chat_agent::CancelFlag::new();
+    {
+        chat_cancel
+            .lock()
+            .expect("chat_cancel poisoned")
+            .insert(live_sid, cancel.clone());
+    }
+
+    // Send the user turn into the live worker. If the worker is already
+    // gone (worker thread exited between the handle snapshot and now),
+    // emit ChatError and clear both guards.
+    if user_tx
+        .send(UserChatRequest {
+            message,
+            reply_tx,
+            cancel: cancel.clone(),
+        })
+        .await
+        .is_err()
+    {
+        chat_in_flight
+            .lock()
+            .expect("chat_in_flight poisoned")
+            .remove(&live_sid);
+        chat_cancel
+            .lock()
+            .expect("chat_cancel poisoned")
+            .remove(&live_sid);
+        let _ = event_tx.send(AppEvent::ChatError {
+            session_id: live_sid,
+            message: "Live co-pilot stopped before the message could be delivered.".to_string(),
+        });
+        return Ok(live_sid);
+    }
+
+    // Spawn the drain task: converts reply chunks to broadcast events.
+    // Clears both the in-flight guard and cancel entry on completion.
+    tokio::spawn(async move {
+        let mut saw_terminal = false;
+        while let Some(chunk) = reply_rx.recv().await {
+            match chunk {
+                UserReplyChunk::Token(token) => {
+                    let _ = event_tx.send(AppEvent::ChatToken {
+                        session_id: live_sid,
+                        turn_id,
+                        token,
+                    });
+                }
+                UserReplyChunk::Done(final_text) => {
+                    let _ = event_tx.send(AppEvent::ChatTurnComplete {
+                        session_id: live_sid,
+                        turn_id,
+                        final_text,
+                    });
+                    saw_terminal = true;
+                    break;
+                }
+                UserReplyChunk::Err(msg) => {
+                    let _ = event_tx.send(AppEvent::ChatError {
+                        session_id: live_sid,
+                        message: msg,
+                    });
+                    saw_terminal = true;
+                    break;
+                }
+            }
+        }
+        // If the channel closed without a terminal chunk (worker crashed or
+        // was dropped mid-decode), emit ChatError so the UI unblocks.
+        if !saw_terminal {
+            let _ = event_tx.send(AppEvent::ChatError {
+                session_id: live_sid,
+                message: "Live co-pilot reply channel closed unexpectedly.".to_string(),
+            });
+        }
+        chat_in_flight
+            .lock()
+            .expect("chat_in_flight poisoned")
+            .remove(&live_sid);
+        chat_cancel
+            .lock()
+            .expect("chat_cancel poisoned")
+            .remove(&live_sid);
+    });
+
+    Ok(live_sid)
+}
+
 /// Send a user message to the chat agent for a meeting, streaming the reply.
 ///
-/// Creates or loads the chat [`ChatSession`], appends the user message, and
-/// **spawns the turn on a background task**, returning the session id
-/// immediately. The turn streams to the webview via the chat `AppEvent`s
-/// (`ChatToken` / `ChatToolCall` / `ChatToolResult` / `ChatTurnComplete` /
-/// `ChatError`) on the shared bus; the updated session is persisted via
-/// [`ChatStore`] at turn end. A second `send_chat_message` for a session whose
-/// turn is still running is rejected with `InvalidInput { "session busy" }`
-/// (§6 — single in-flight turn per session).
+/// **Live path (A3):** when the target meeting is currently recording (a
+/// [`crate::live_agent::LiveCopilotHandle`] exists for it), the message is
+/// routed into the live co-pilot's held-context session. The live session id is
+/// resolved via [`ChatStore::load_or_create_live`] and returned immediately; a
+/// drain task converts the per-request reply channel into the same
+/// `ChatToken` / `ChatTurnComplete` / `ChatError` events the non-live path
+/// emits. Persistence is handled by [`crate::live_agent::process_request`].
 ///
-/// The engine work runs on `spawn_blocking` (the LLM is FFI-bound); tool
-/// dispatch re-enters async via a captured `Handle::block_on` for the dispatch
-/// step only (§4.5 — the one place async/sync cross).
+/// **Non-live path:** creates or loads a standard [`ChatSession`], appends the
+/// user message, and spawns a `LlamaTurnBackend` turn on `spawn_blocking`,
+/// returning the session id immediately. The turn streams via the same chat
+/// `AppEvent`s; tool dispatch re-enters async via a captured
+/// `Handle::block_on`. A second `send_chat_message` for a session whose turn
+/// is still running is rejected with `InvalidInput { "session busy" }`
+/// (§6 — single in-flight turn per session).
 #[tauri::command]
 #[specta::specta]
 pub async fn send_chat_message(
@@ -2230,6 +2391,41 @@ pub async fn send_chat_message(
 
     let meetings_dir = state.meetings_dir.clone();
 
+    // --- Live co-pilot routing (A3) ---
+    //
+    // When the target meeting is currently recording (a LiveCopilotHandle exists
+    // for it), route the message into the live co-pilot's held-context session
+    // rather than spinning up a fresh LlamaTurnBackend. The implementation lives
+    // in `route_live_chat_message` so the logic is testable without a full
+    // Tauri runtime.
+    if let Some(mid) = meeting_id {
+        // Snapshot the handle while holding the lock for the minimum time.
+        let live_handle = state
+            .live_copilot_handles
+            .lock()
+            .expect("live_copilot_handles poisoned")
+            .get(&mid)
+            .map(|h| h.user_tx.clone());
+
+        if let Some(user_tx) = live_handle {
+            return route_live_chat_message(
+                &meetings_dir,
+                mid,
+                user_tx,
+                message,
+                state.event_tx.clone(),
+                Arc::clone(&state.chat_in_flight),
+                Arc::clone(&state.chat_cancel),
+            )
+            .await
+            .map_err(IpcError::from);
+        }
+    }
+    // --- End live routing ---
+
+    // Non-live path: load or create a standard (post-meeting / off-meeting) chat
+    // session and run a fresh LlamaTurnBackend turn.
+    //
     // Load the existing session (when a session id + meeting id are given) or
     // start a fresh one. Persistence reads run on a blocking thread.
     let mut session = load_or_new_session(&meetings_dir, meeting_id, session_id).await?;
@@ -4703,6 +4899,279 @@ mod tests {
         assert!(
             result.ends_with("\n\nRespond entirely in German."),
             "output-language instruction must be appended after the full prompt"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Live co-pilot routing — route_live_chat_message (U4 A3)
+    // -----------------------------------------------------------------------
+
+    /// A fake live worker task: reads one `UserChatRequest` then streams one
+    /// `Token` + `Done` on the request's `reply_tx`.
+    async fn fake_live_worker(
+        mut rx: tokio::sync::mpsc::Receiver<crate::live_agent::UserChatRequest>,
+    ) {
+        if let Some(req) = rx.recv().await {
+            let _ = req
+                .reply_tx
+                .try_send(crate::live_agent::UserReplyChunk::Token("hello".to_string()));
+            let _ = req
+                .reply_tx
+                .send(crate::live_agent::UserReplyChunk::Done(
+                    "hello world".to_string(),
+                ))
+                .await;
+        }
+    }
+
+    /// `route_live_chat_message` routes to the live path when a handle exists,
+    /// emits `ChatToken` + `ChatTurnComplete` with the live session id, and
+    /// clears `chat_in_flight` on completion.
+    #[tokio::test]
+    async fn route_live_chat_message_emits_token_and_complete_then_clears_guard() {
+        let tmp = TempDir::new().expect("tempdir");
+        let meetings_dir = tmp.path().to_path_buf();
+        let mid = MeetingId::new();
+
+        // Create the meeting folder so ChatStore::load_or_create_live can write.
+        persistence::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
+
+        // Fake worker: reads one request and sends Token + Done.
+        let (user_tx, user_rx) =
+            tokio::sync::mpsc::channel::<crate::live_agent::UserChatRequest>(4);
+        tokio::spawn(fake_live_worker(user_rx));
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<AppEvent>(32);
+        let chat_in_flight: Arc<
+            std::sync::Mutex<std::collections::HashSet<ChatSessionId>>,
+        > = Arc::new(std::sync::Mutex::new(Default::default()));
+        let chat_cancel: Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<ChatSessionId, chat_agent::CancelFlag>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(Default::default()));
+
+        let live_sid = route_live_chat_message(
+            &meetings_dir,
+            mid,
+            user_tx,
+            "hello?".to_string(),
+            event_tx,
+            Arc::clone(&chat_in_flight),
+            Arc::clone(&chat_cancel),
+        )
+        .await
+        .expect("live route must succeed");
+
+        // We have a live session id — it will be verified by the event assertions below.
+
+        // Drain events until we see ChatTurnComplete.
+        let mut saw_token = false;
+        let mut saw_complete = false;
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout_at(
+                deadline,
+                event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Ok(AppEvent::ChatToken { session_id, .. })) => {
+                    assert_eq!(session_id, live_sid, "ChatToken must carry the live session id");
+                    saw_token = true;
+                }
+                Ok(Ok(AppEvent::ChatTurnComplete { session_id, final_text, .. })) => {
+                    assert_eq!(
+                        session_id, live_sid,
+                        "ChatTurnComplete must carry the live session id"
+                    );
+                    assert_eq!(final_text, "hello world");
+                    saw_complete = true;
+                    break;
+                }
+                Ok(Ok(_)) => {} // other events are ignored
+                Ok(Err(_)) => break,
+                Err(_) => panic!("timed out waiting for ChatTurnComplete"),
+            }
+        }
+        assert!(saw_token, "expected at least one ChatToken event");
+        assert!(saw_complete, "expected ChatTurnComplete");
+
+        // Give the drain task time to clear the guards.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(
+            chat_in_flight
+                .lock()
+                .expect("poisoned")
+                .get(&live_sid)
+                .is_none(),
+            "chat_in_flight must be cleared after the terminal event"
+        );
+        assert!(
+            chat_cancel
+                .lock()
+                .expect("poisoned")
+                .get(&live_sid)
+                .is_none(),
+            "chat_cancel must be cleared after the terminal event"
+        );
+    }
+
+    /// When no live handle is present, `route_live_chat_message` falls through
+    /// (this path is not exercised here; we test the non-live path by verifying
+    /// the command selects the fresh-context path when no handle is registered).
+    ///
+    /// Specifically: when the worker channel is already closed, the function
+    /// emits a `ChatError` and returns `Ok(live_sid)` (does not panic or hang).
+    #[tokio::test]
+    async fn route_live_chat_message_worker_gone_emits_error_returns_ok() {
+        let tmp = TempDir::new().expect("tempdir");
+        let meetings_dir = tmp.path().to_path_buf();
+        let mid = MeetingId::new();
+        persistence::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
+
+        // Drop the receiver immediately — the worker is gone.
+        let (user_tx, _rx) =
+            tokio::sync::mpsc::channel::<crate::live_agent::UserChatRequest>(1);
+        drop(_rx);
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<AppEvent>(8);
+        let chat_in_flight: Arc<
+            std::sync::Mutex<std::collections::HashSet<ChatSessionId>>,
+        > = Arc::new(std::sync::Mutex::new(Default::default()));
+        let chat_cancel: Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<ChatSessionId, chat_agent::CancelFlag>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(Default::default()));
+
+        let live_sid = route_live_chat_message(
+            &meetings_dir,
+            mid,
+            user_tx,
+            "hello?".to_string(),
+            event_tx,
+            Arc::clone(&chat_in_flight),
+            Arc::clone(&chat_cancel),
+        )
+        .await
+        .expect("must return Ok even when worker is gone");
+
+        // A ChatError should have been emitted.
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            event_rx.recv(),
+        )
+        .await
+        .expect("timeout waiting for ChatError")
+        .expect("event");
+        assert!(
+            matches!(event, AppEvent::ChatError { session_id, .. } if session_id == live_sid),
+            "expected ChatError for the live session id, got: {event:?}"
+        );
+
+        // Guards must be cleared (not leaked).
+        assert!(
+            chat_in_flight.lock().expect("poisoned").is_empty(),
+            "chat_in_flight must be cleared on worker-gone path"
+        );
+        assert!(
+            chat_cancel.lock().expect("poisoned").is_empty(),
+            "chat_cancel must be cleared on worker-gone path"
+        );
+    }
+
+    /// A fake driver that immediately sets terminal state and never drains
+    /// `user_msg_rx` through the normal path — simulating the context-exhausted
+    /// driver loop after `WorkerResult::CapacityExhausted`.
+    ///
+    /// The fix adds a `select!` arm gated `if terminal` that drains
+    /// `user_msg_rx` and replies with `UserReplyChunk::Err`. This test asserts
+    /// that `route_live_chat_message`'s drain task terminates within a bounded
+    /// time and clears both `chat_in_flight` and `chat_cancel`, rather than
+    /// hanging indefinitely.
+    async fn fake_terminal_driver(
+        mut rx: tokio::sync::mpsc::Receiver<crate::live_agent::UserChatRequest>,
+    ) {
+        // Simulate the terminal-but-alive driver: immediately reject every
+        // incoming request with an Err chunk (mirrors the new `if terminal`
+        // select arm in `run_driver_task`).
+        while let Some(user_req) = rx.recv().await {
+            let _ = user_req.reply_tx.try_send(crate::live_agent::UserReplyChunk::Err(
+                "Live co-pilot paused: context window filled for this session.".to_string(),
+            ));
+        }
+    }
+
+    /// When the live driver is in terminal state, `route_live_chat_message`
+    /// must still clear `chat_in_flight` and `chat_cancel` within a bounded
+    /// time. Without the terminal-drain fix the drain task hangs on
+    /// `reply_rx.recv()` forever, permanently leaking both guards and leaving
+    /// the chat UI in "Sending…" with Stop unable to clear it.
+    #[tokio::test]
+    async fn route_live_chat_message_terminal_driver_clears_guards() {
+        let tmp = TempDir::new().expect("tempdir");
+        let meetings_dir = tmp.path().to_path_buf();
+        let mid = MeetingId::new();
+        persistence::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
+
+        let (user_tx, user_rx) =
+            tokio::sync::mpsc::channel::<crate::live_agent::UserChatRequest>(4);
+        tokio::spawn(fake_terminal_driver(user_rx));
+
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<AppEvent>(32);
+        let chat_in_flight: Arc<
+            std::sync::Mutex<std::collections::HashSet<ChatSessionId>>,
+        > = Arc::new(std::sync::Mutex::new(Default::default()));
+        let chat_cancel: Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<ChatSessionId, chat_agent::CancelFlag>,
+            >,
+        > = Arc::new(std::sync::Mutex::new(Default::default()));
+
+        let live_sid = route_live_chat_message(
+            &meetings_dir,
+            mid,
+            user_tx,
+            "hello?".to_string(),
+            event_tx,
+            Arc::clone(&chat_in_flight),
+            Arc::clone(&chat_cancel),
+        )
+        .await
+        .expect("live route must return Ok even when driver is terminal");
+
+        // The terminal driver emits a ChatError via UserReplyChunk::Err.
+        let event = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            event_rx.recv(),
+        )
+        .await
+        .expect("timed out waiting for ChatError from terminal driver")
+        .expect("event channel closed");
+        assert!(
+            matches!(event, AppEvent::ChatError { session_id, .. } if session_id == live_sid),
+            "expected ChatError for the live session id from terminal driver, got: {event:?}"
+        );
+
+        // Give the drain task time to clear the guards after receiving the error.
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(
+            chat_in_flight
+                .lock()
+                .expect("poisoned")
+                .get(&live_sid)
+                .is_none(),
+            "chat_in_flight must be cleared after terminal driver emits Err"
+        );
+        assert!(
+            chat_cancel
+                .lock()
+                .expect("poisoned")
+                .get(&live_sid)
+                .is_none(),
+            "chat_cancel must be cleared after terminal driver emits Err"
         );
     }
 }

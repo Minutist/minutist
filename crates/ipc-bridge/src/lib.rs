@@ -326,18 +326,16 @@ pub struct IpcState {
     ///
     /// No new dependency edge: `ipc-bridge` already depends on `persistence`.
     pub voiceprints: Arc<Option<persistence::VoiceprintStore>>,
-    /// Per-meeting live co-pilot handles (U2 B5).
+    /// Per-meeting live co-pilot handles (U2 B5 / U4 A3).
     ///
     /// `spawn_live_agent` inserts a [`LiveCopilotHandle`] keyed by `MeetingId`
     /// when a recording starts and removes it when the agent exits. The
     /// `send_chat_message` command checks this registry to determine whether the
-    /// target meeting is currently live and, if so, should route the user message
-    /// to the live co-pilot rather than spinning up a fresh `LlamaTurnBackend`
-    /// context.
-    ///
-    /// DEFERRED: the `send_chat_message` redirect to the live co-pilot is the
-    /// remaining wiring step; the registry and the user lane are built and
-    /// functional. See `live_agent.rs` — "Registry and chat routing".
+    /// target meeting is currently live: if a handle exists, the user message is
+    /// sent to the live co-pilot via `handle.user_tx`; the reply streams back on a
+    /// per-request [`crate::live_agent::UserChatRequest::reply_tx`] channel. See
+    /// `commands.rs` — `send_chat_message` live path (A3) and `live_agent.rs` —
+    /// "Registry and chat routing".
     ///
     /// A `std::sync::Mutex<HashMap>` (not async): every access is a brief
     /// non-awaiting insert / lookup / remove, mirroring `chat_in_flight`.

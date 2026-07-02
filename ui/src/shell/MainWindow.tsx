@@ -6,7 +6,7 @@ import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
 import { useReportProblemStore } from "../state/report-problem";
 import { useSyncStatusStore } from "../state/sync-status";
-import { useLiveDigestStore } from "../state/liveDigest";
+import { useLiveCopilotStore } from "../state/liveCopilot";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
@@ -97,7 +97,7 @@ export function MainWindow() {
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
-  const digestFor = useLiveDigestStore((s) => s.digestFor);
+  const copilotHasMessages = useLiveCopilotStore((s) => s.hasMessages);
   // Re-processing (re-transcribe / re-identify speakers) is a rare action that
   // lives in the transcript pane's action toolbar (#67) — see TranscriptPane —
   // not on this heading or the meeting list.
@@ -149,18 +149,14 @@ export function MainWindow() {
   // (unlike summary). Hidden by default; one click on the toggle reveals it.
   const showAttachmentsPane = inWorkspace && activeMeetingId !== null;
 
-  // The live digest panel toggle is offered once the backend has signalled the
-  // agent is active for this meeting. The driver emits an initial empty digest
-  // the moment it spawns (issue 0022), so the toggle appears as soon as the
-  // agent starts — not only after the first real refresh (≥ one cadence
-  // interval away, and on the first live test the only events that ever arrived
-  // were errors). This avoids re-deriving the Auto gate in the frontend (which
-  // would require mirroring GPU-probe state to the UI). When `mode=Off` the
-  // backend never spawns the agent, so no event fires and the panel stays
-  // hidden.
+  // The co-pilot toggle is offered once the co-pilot has emitted at least one
+  // proactive message for this meeting. This is the natural gate for the
+  // repurposed pane: no message, no toggle. When `mode=Off` the backend never
+  // spawns the agent, so no event fires and the panel stays hidden.
   const showLiveDigestPane =
     activeMeetingId !== null &&
-    digestFor(activeMeetingId) !== null;
+    isLiveRecording &&
+    copilotHasMessages(activeMeetingId);
 
   // Pane visibility (FR-21/FR-30). Panes are included/excluded from the Group
   // rather than collapsed to zero width. Reset to the per-mode default whenever
@@ -350,7 +346,7 @@ export function MainWindow() {
                     togglePane(liveDigestShown, setLiveDigestShown)
                   }
                 >
-                  Digest
+                  Co-pilot
                 </button>
               )}
             </div>
@@ -536,24 +532,7 @@ export function MainWindow() {
                   minSize="18%"
                   defaultSize="28%"
                 >
-                  <LiveDigestPanel
-                    meetingId={activeMeetingId}
-                    showActionItems={
-                      settings?.live_agent_digest_action_items ?? true
-                    }
-                    showDecisions={
-                      settings?.live_agent_digest_decisions ?? true
-                    }
-                    showOpenAsks={
-                      settings?.live_agent_digest_open_asks ?? true
-                    }
-                    showAttachmentAnswers={
-                      settings?.live_agent_digest_attachment_answers ?? true
-                    }
-                    showUnresolvedReferences={
-                      settings?.live_agent_digest_unresolved_references ?? true
-                    }
-                  />
+                  <LiveDigestPanel meetingId={activeMeetingId} />
                 </Panel>
               ),
           ])}

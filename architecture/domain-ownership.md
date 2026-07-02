@@ -130,13 +130,33 @@ restated. Adding any other edge requires updating
   now runs a two-lane biased select: HIGH-priority user-chat requests are always
   drained before LOW-priority transcript requests, so a user message preempts a
   pending cadence refresh. Three depth-1 channels replace the prior single
-  channel: `user_req`, `transcript_req`, and `user_msg` (raw Strings from the
-  handle). The registry is stored on `IpcState::live_copilot_handles`; the
-  `send_chat_message` redirect that checks it is DEFERRED. The `ConversationalTurn`
-  trait bound is added to `run_worker_loop`'s `B` parameter to allow both the
+  channel: `user_req`, `transcript_req`, and `user_msg`. The registry is stored
+  on `IpcState::live_copilot_handles`. The `ConversationalTurn` trait bound is
+  added to `run_worker_loop`'s `B` parameter to allow both the
   transcript-refresh (`LiveSession::refresh_typed`) and the append-turn
   (`ConversationalTurn::append_turn`) paths from one loop. No new dependency
   edge is added (the `ipc-bridge → chat-agent` edge pre-exists).
+  **U4 A3 chat→live-worker routing (`ipc-bridge`, systems-engineer).** The
+  `send_chat_message` command now checks `IpcState::live_copilot_handles`; when
+  a handle exists for the target meeting it routes the user message into the live
+  co-pilot session rather than a fresh `LlamaTurnBackend` context. Concretely:
+  - `LiveCopilotHandle::user_tx` changes from `mpsc::Sender<String>` to
+    `mpsc::Sender<UserChatRequest>` where `UserChatRequest { message, reply_tx }`.
+  - `UserReplyChunk { Token(String), Done(String), Err(String) }` is a new type
+    carrying the streaming reply from the worker back to the command task.
+  - `CopilotTurnRequest` gains `reply_tx: Option<mpsc::Sender<UserReplyChunk>>`
+    (Some for UserChat turns, None for Transcript turns).
+  - The worker's `converse_typed` token callback `try_send`s `Token` per piece;
+    at turn end `blocking_send`s `Done`/`Err`. UserChat turns do NOT emit
+    `LiveCopilotMessage` (chat-panel surface only); Transcript turns keep emitting
+    it (co-pilot feed surface).
+  - `send_chat_message` resolves the live `ChatSessionId` via
+    `ChatStore::load_or_create_live` (`spawn_blocking`), inserts it into
+    `chat_in_flight`, and spawns a drain task that converts reply chunks into
+    `ChatToken` / `ChatTurnComplete` / `ChatError` events with the live session id.
+  No new crate dependency edge is added (all within `ipc-bridge`; existing
+  `ipc-bridge → persistence` and `ipc-bridge → chat-agent` edges cover the
+  `ChatStore` and `CancelFlag` uses).
   **U2 eviction-when-full (chat-agent + ipc-bridge, ml-runtime-engineer +
   systems-engineer).**
   - `chat-agent` (`live.rs`, ml-runtime-engineer) adds two required methods to

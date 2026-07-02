@@ -164,6 +164,7 @@ pub use attachments::{
     ATTACHMENT_CONVERT_QUEUE_BOUND,
 };
 pub use chat_runtime::ChatHandles;
+pub use commands::run_held_summarise;
 pub use error::{Error, IpcError};
 pub use events::{spawn_event_forwarder, AppEventPayload};
 pub use inter_agent::spawn_inter_agent_driver;

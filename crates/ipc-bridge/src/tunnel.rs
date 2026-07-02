@@ -161,13 +161,30 @@ pub async fn tunnel_poll_pairing(state: State<'_, IpcState>) -> Result<TunnelSta
 
 /// Enable or disable the connector. Enabling with a stored credential starts the
 /// tunnel; disabling stops it cleanly. Returns the resulting snapshot.
+///
+/// Also flips the sync engine (F5): before this fix, enabling the connector at
+/// runtime started the relay tunnel but never the sync engine (or its
+/// producer-gate election loop), so `sync_status` stayed `Disabled` and every
+/// engine-backed sync call kept failing even after the toggle. The sync flip
+/// rides alongside the tunnel's own — it is best-effort and never fails this
+/// command: a start failure is logged and reflected in a later `sync_status`
+/// read, exactly like the tunnel's own asynchronous connect.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_connector_enabled(
     state: State<'_, IpcState>,
     enabled: bool,
 ) -> Result<TunnelSnapshot, IpcError> {
-    state.tunnel.set_enabled(enabled).await
+    let snapshot = state.tunnel.set_enabled(enabled).await?;
+    if let Err(e) = state.sync.set_enabled(enabled).await {
+        tracing::warn!(
+            target: "ipc-bridge",
+            error = ?e,
+            enabled,
+            "set_connector_enabled: flipping the sync engine failed (best-effort)"
+        );
+    }
+    Ok(snapshot)
 }
 
 /// The connector snapshot for the Settings → Connection pane: the enabled flag,

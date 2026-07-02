@@ -80,20 +80,50 @@ that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
 the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
 — "Build variants".
 
+`SyncControl` gains `set_enabled(bool)` (issue 0028 follow-up F5): before this,
+`ConnectedSync::new` read `settings.connector_enabled` only ONCE at construction,
+so enabling the connector at RUNTIME (the Settings toggle, which already started
+the relay tunnel via `TunnelControl::set_enabled`) never started the sync engine or
+its election loop — `sync_status` stayed `Disabled` and every engine-backed call
+kept failing even after the toggle. `ipc_bridge::tunnel::set_connector_enabled`
+now calls `state.sync.set_enabled(enabled)` alongside the tunnel's own (best-effort;
+a sync-start failure never fails the command). `DisabledSync::set_enabled` is a
+no-op; `ConnectedSync::set_enabled(true)` requests the SAME idempotent start path
+`new()` uses at launch (`ConnectedSync::request_start`, guarded by an atomic flag so
+construction-time auto-start and a later runtime enable can never double-spawn the
+engine or the election loop). `set_enabled(false)` persists the disabled setting
+(via the tunnel's write of the shared `connector_enabled` field) but does not tear
+down an already-started engine — `SyncEngine` exposes only an owning
+`shutdown(self)`, and the engine `Arc` is shared with the spawned election loop and
+lifecycle subscriber, so a clean stop needs a cancellation path threaded through
+both; tracked as a follow-up, not a regression (before F5 a runtime disable-after-
+enable was not a reachable state at all). No new dependency-table edge: the trait
+lives in `ipc-bridge` (already unconditional) and the implementation in `app-main`
+(already the `sync` edge above).
+
 ※ `election` is an **optional** edge of `app-main`, gated by the same `connected`
 Cargo feature as `mcp-server` / `tunnel-client` / `sync` (it is part of the
 connected-tier surface — the free build runs no election loop and never delegates
 or claims processing). The edge is live as of WS4-B producer-gate S4: the
 `DesktopElectionDriver` in `src-tauri/src/sync.rs` (co-located with the connected
 `SyncControl`) implements `election::ElectionDriver`, adapting the leaf's `advertise`
-to the `SyncEngine` discovery exchange and its `process` to `orchestrator::reprocess`;
-`app-main` spawns `election::run_election_loop` once the sync engine is bound, passing
-the `Capability` it derives from `common::probe_primary_gpu` (an eligible host claims
+to the `SyncEngine` discovery exchange and its `process` to `orchestrator::reprocess`
+followed by (issue 0028 follow-up F4-summary) a best-effort held-summariser pass via
+`ipc_bridge::run_held_summarise` — gated on `settings.auto_summarise_on_stop`, so a
+delegated meeting converges with a real `summary.md` matching the non-delegated
+default, rather than the permanently-empty Artifacts slot `reprocess` alone left
+behind (`reprocess` itself never summarises — parity with the standalone offline
+ops). `DesktopElectionDriver` carries the SAME `ipc_bridge::ChatHandles` bundle
+`app-main` builds for the attachment-conversion VLM (`ElectionDeps::chat_handles`),
+so `process()` drives both `reprocess` and the summarise pass through it — no new
+`app-main → ipc-bridge` edge (it already has one). `app-main` spawns
+`election::run_election_loop` once the sync engine is bound, passing the
+`Capability` it derives from `common::probe_primary_gpu` (an eligible host claims
 and processes; a GPU-less one parks sync-only). The election leaf itself takes no
-`sync` / `orchestrator` / `tauri` edge — those collaborators sit behind the trait — so
-this is the single point that binds them together, exactly as `app-main` injects the
-connected `SyncControl`. The free artifact omits it. See `cross-cutting.md` — "Build
-variants".
+`sync` / `orchestrator` / `tauri` / `ipc-bridge` edge — those collaborators sit
+behind the trait — so this is the single point that binds them together, exactly as
+`app-main` injects the connected `SyncControl`. The free artifact omits it. See
+`cross-cutting.md` — "Build variants".
 
 ‖ `headless` (bin) is a SECOND workspace binary beside `app-main` — the
 user-installed headless server daemon (`minutist-hub`): an always-on sync hub
@@ -3220,8 +3250,12 @@ generated from the FINAL transcript, emitting the determinate
 user-triggered `summarise_meeting` does (the summarise body is shared — both call
 `run_held_summarise`, which resolves the held `LlamaSummariser`, runs the heavy
 `summarise_with_progress` on `spawn_blocking`, refreshes the index excerpt, and
-emits `SummaryReady`). The reprocess pass refreshes the index row and emits its
-events on completion (`TranscriptReady` / `DiarizationComplete`); both passes are
+emits `SummaryReady`). `run_held_summarise` is `pub` (re-exported at the `ipc-bridge`
+crate root) so `app-main`'s `DesktopElectionDriver` (issue 0028 follow-up
+F4-summary; see the `election` section's `※` footnote above) can drive the same
+pass for a delegated meeting after `Orchestrator::reprocess`, from a plain
+`ChatHandles` with no Tauri `State` — the second caller beyond `stop_recording` and
+the `summarise_meeting` command. The reprocess pass refreshes the index row and emits its
 best-effort (errors logged, claim-skips logged at info — auto-summarise leaves the
 meeting without a summary on failure, recoverable via the Summarise action). While
 the reprocess pass holds the offline claim the recorder reports the

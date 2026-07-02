@@ -10,10 +10,16 @@
 //!
 //! [`ConnectedSync::new`] returns immediately and spawns engine startup in the
 //! background (binding the iroh endpoint is async and `setup` has no entered
-//! runtime to block on). Startup runs only when the connector is enabled
+//! runtime to block on) when the connector is enabled at construction time
 //! (`settings.connector_enabled` — sync is part of the same connected tier as
-//! the relay tunnel); a disabled connector leaves the engine unbuilt and the
-//! status [`SyncStatus::Disabled`]. Startup:
+//! the relay tunnel). A connector disabled at launch leaves the engine unbuilt
+//! and the status [`SyncStatus::Disabled`] until [`SyncControl::set_enabled`] is
+//! called (F5) — the runtime toggle in Settings, wired alongside the tunnel's own
+//! enable/disable in `ipc_bridge::tunnel::set_connector_enabled`. Both paths
+//! converge on the same idempotent [`ConnectedSync::request_start`]: a start is
+//! requested at most once (guarded by an atomic flag), so construction-time
+//! auto-start and a later runtime enable can never double-spawn the engine.
+//! Startup:
 //!
 //! 1. loads (or generates) the device [`DeviceIdentity`] under the app-data BASE
 //!    (the device key lives at `{app-data}/sync_node_key`, not under
@@ -39,13 +45,13 @@
 //! blobs) — and emits these as it runs.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use election::{Capability, ElectionConfig, ElectionDriver};
-use ipc_bridge::{IpcError, MeetingIndex, SyncControl};
+use ipc_bridge::{ChatHandles, IpcError, SyncControl};
 use minutist_common::{AppEvent, AppResult, HostRef, MeetingId, SyncStatus};
-use orchestrator::Orchestrator;
 use settings::SettingsHandle;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use tokio::sync::broadcast;
@@ -70,12 +76,17 @@ struct Runtime {
 }
 
 /// The collaborators the producer-gate election loop needs, passed in from
-/// `app-main` (which links `sync` + `orchestrator` + `election` together). Held so
-/// [`ConnectedSync::start_engine`] can spawn the loop once the engine binds. `None`
-/// disables the gate (the connected E2E tests build the sync control without it).
+/// `app-main` (which links `sync` + `orchestrator` + `ipc-bridge` + `election`
+/// together). Held so [`ConnectedSync::start_engine`] can spawn the loop once the
+/// engine binds. `None` disables the gate (the connected E2E tests build the
+/// sync control without it).
 pub struct ElectionDeps {
-    pub orchestrator: Arc<Orchestrator>,
-    pub index: Arc<MeetingIndex>,
+    /// The bundle the [`DesktopElectionDriver`] drives `reprocess` through AND
+    /// (F4-summary) the post-reprocess summarise pass through — the same
+    /// [`ChatHandles`] `app-main` builds for the attachment-conversion VLM,
+    /// carrying the orchestrator, the meeting index, the meetings dir, the event
+    /// bus, settings, and the shared held-summariser cell.
+    pub chat_handles: ChatHandles,
 }
 
 /// The connected `SyncControl` implementation.
@@ -85,18 +96,35 @@ pub struct ConnectedSync {
     /// When set (production), the engine-bind path spawns the producer-gate election
     /// loop with a [`DesktopElectionDriver`] over these + the bound engine.
     election: Option<ElectionDeps>,
+    settings: SettingsHandle,
+    app_data_base: PathBuf,
+    meetings_dir: PathBuf,
+    /// Guards [`Self::request_start`] so the engine is started at most once:
+    /// construction with the connector already enabled, and a later runtime
+    /// [`SyncControl::set_enabled`] (F5), both funnel through it — whichever
+    /// wins the atomic swap spawns the bind; the other (or a racing duplicate
+    /// call) is a no-op.
+    start_requested: AtomicBool,
+    /// Set once, immediately after construction, so [`Self::request_start`] (an
+    /// `&self` method — trait methods never see the owning `Arc`) can obtain an
+    /// owned `Arc<Self>` to move into the spawned bind task.
+    self_ref: OnceLock<Weak<ConnectedSync>>,
 }
 
 impl ConnectedSync {
-    /// Build the control and, when the connector is enabled, spawn engine startup
-    /// in the background. Returns immediately; the engine becomes available once
-    /// the spawned bind completes (the status moves `Connecting → Idle`).
+    /// Build the control and, when the connector is enabled, request engine
+    /// startup in the background. Returns immediately; the engine becomes
+    /// available once the spawned bind completes (the status moves
+    /// `Connecting → Idle`). A connector disabled at construction leaves the
+    /// engine unstarted until [`SyncControl::set_enabled`] requests it later
+    /// (F5).
     ///
-    /// `relay_token` is the resolved access token (env-or-settings) the caller
-    /// passes in. The two directories are DISTINCT: `app_data_base` holds the
-    /// device key (`{app-data}/sync_node_key`); `meetings_dir`
-    /// (`{app-data}/meetings`) holds the per-meeting `{uuid}` folders the notes
-    /// protocol reads/writes — the same root the rest of the app uses.
+    /// The two directories are DISTINCT: `app_data_base` holds the device key
+    /// (`{app-data}/sync_node_key`); `meetings_dir` (`{app-data}/meetings`)
+    /// holds the per-meeting `{uuid}` folders the notes protocol reads/writes —
+    /// the same root the rest of the app uses. Both are retained on `self` (not
+    /// just threaded through this call) so a later runtime enable can start the
+    /// engine without the caller re-supplying them.
     pub fn new(
         settings: SettingsHandle,
         event_tx: broadcast::Sender<AppEvent>,
@@ -105,31 +133,64 @@ impl ConnectedSync {
         election: Option<ElectionDeps>,
     ) -> Arc<Self> {
         let enabled = settings.current().connector_enabled;
-        let initial_status = if enabled {
-            SyncStatus::Connecting
-        } else {
-            SyncStatus::Disabled
-        };
         let this = Arc::new(Self {
             event_tx,
             runtime: Arc::new(Mutex::new(Runtime {
                 engine: None,
-                status: initial_status,
+                status: SyncStatus::Disabled,
             })),
             election,
+            settings,
+            app_data_base,
+            meetings_dir,
+            start_requested: AtomicBool::new(false),
+            self_ref: OnceLock::new(),
         });
+        let _ = this.self_ref.set(Arc::downgrade(&this));
 
         if enabled {
-            let relay_token = resolve_relay_token(&settings);
             let starter = Arc::clone(&this);
             tauri::async_runtime::spawn(async move {
-                starter
-                    .start_engine(app_data_base, meetings_dir, relay_token)
-                    .await;
+                starter.request_start().await;
             });
         }
 
         this
+    }
+
+    /// Request the engine start, at most once (F5). The first caller — either
+    /// construction with the connector already enabled, or a later
+    /// [`SyncControl::set_enabled(true)`](SyncControl::set_enabled) — wins the
+    /// atomic flag, marks the status [`SyncStatus::Connecting`] synchronously
+    /// (so an immediate `status()` read reflects the request rather than a stale
+    /// `Disabled`), and spawns [`Self::start_engine`] in the background. A
+    /// second call — the engine already running or its bind already in flight —
+    /// is a no-op, so re-enabling an already-started connector can never
+    /// double-spawn the engine or its election loop.
+    async fn request_start(&self) {
+        if self.start_requested.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut rt = self.runtime.lock().await;
+            rt.status = SyncStatus::Connecting;
+        }
+        let Some(this) = self.self_ref.get().and_then(Weak::upgrade) else {
+            // Unreachable in practice (`self_ref` is set immediately after the
+            // `Arc` is constructed, before any caller can reach `request_start`),
+            // but never panic on it — leave the status Connecting; a stuck
+            // engine is visible and recoverable (e.g. an app restart), never a
+            // crash.
+            tracing::error!(target: "app-main", "sync: request_start could not upgrade self_ref");
+            return;
+        };
+        let relay_token = resolve_relay_token(&self.settings);
+        let app_data_base = self.app_data_base.clone();
+        let meetings_dir = self.meetings_dir.clone();
+        tauri::async_runtime::spawn(async move {
+            this.start_engine(app_data_base, meetings_dir, relay_token)
+                .await;
+        });
     }
 
     /// Bind the engine in the background, recording the result on the runtime.
@@ -185,8 +246,7 @@ impl ConnectedSync {
                 if let Some(deps) = &self.election {
                     let driver: Arc<dyn ElectionDriver> = Arc::new(DesktopElectionDriver {
                         engine: Arc::clone(&engine),
-                        orchestrator: Arc::clone(&deps.orchestrator),
-                        index: Arc::clone(&deps.index),
+                        chat_handles: deps.chat_handles.clone(),
                         host: HostRef(engine.endpoint_id().to_string()),
                     });
                     tauri::async_runtime::spawn(async move {
@@ -196,7 +256,14 @@ impl ConnectedSync {
                             capability_from_gpu(minutist_common::probe_primary_gpu().is_some())
                         })
                         .await
-                        .unwrap_or(Capability::ParkSyncOnly);
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                target: "app-main",
+                                error = %e,
+                                "election: GPU capability probe task join failed; parking sync-only"
+                            );
+                            Capability::ParkSyncOnly
+                        });
                         election::run_election_loop(
                             ElectionConfig::from_env(),
                             driver,
@@ -380,6 +447,30 @@ impl SyncControl for ConnectedSync {
         }
         Ok(())
     }
+
+    async fn set_enabled(&self, enabled: bool) -> Result<(), IpcError> {
+        // F5: request the engine start when the connector is turned on at
+        // runtime. `request_start` is idempotent (an atomic-guarded one-shot),
+        // so this is safe whether the engine is already running, already
+        // starting, or has never been requested.
+        //
+        // Disabling does NOT tear down an already-started engine: `SyncEngine`
+        // offers only an owning `shutdown(self)`, and the engine `Arc` here is
+        // shared with the spawned election loop and the lifecycle subscriber, so
+        // a clean stop would need a cancellation path threaded through both —
+        // out of scope for this fix, which targets the enable path the report
+        // describes (status staying `Disabled` after enabling). Turning the
+        // connector back off still persists `settings.connector_enabled = false`
+        // (via `TunnelControl::set_enabled`, called alongside this) and stops
+        // the RELAY TUNNEL; a lingering sync engine after a runtime disable is a
+        // known follow-up, not a behaviour this call regresses (before this fix
+        // the engine could only ever be started at launch, so "disable after a
+        // runtime enable" was not a reachable state at all).
+        if enabled {
+            self.request_start().await;
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the relay access token: `MINUTIST_SYNC_TOKEN` if set and non-empty,
@@ -394,14 +485,15 @@ fn resolve_relay_token(_settings: &SettingsHandle) -> Option<String> {
 }
 
 /// The desktop's [`ElectionDriver`] (producer-gate S4): drives the election loop's
-/// two collaborators — the bound [`SyncEngine`] (advertise lifecycle state over
-/// discovery; push derived artifacts to peers) and the [`Orchestrator`] (run the
-/// offline reprocess pipeline). This is the only place that links `election` +
-/// `sync` + `orchestrator`, which is why the loop abstracts them behind the trait.
+/// collaborators — the bound [`SyncEngine`] (advertise lifecycle state over
+/// discovery; push derived artifacts to peers), the orchestrator (run the offline
+/// reprocess pipeline), and — after a successful reprocess — the held-summariser
+/// pass (F4-summary), all via the [`ChatHandles`] bundle `app-main` injects. This
+/// is the only place that links `election` + `sync` + `ipc-bridge`, which is why
+/// the loop abstracts them behind the trait.
 struct DesktopElectionDriver {
     engine: Arc<SyncEngine>,
-    orchestrator: Arc<Orchestrator>,
-    index: Arc<MeetingIndex>,
+    chat_handles: ChatHandles,
     /// This host's identity (the endpoint id) — the lowest-`HostRef` tiebreak key.
     host: HostRef,
 }
@@ -423,9 +515,33 @@ impl ElectionDriver for DesktopElectionDriver {
 
     async fn process(&self, meeting_id: MeetingId) -> AppResult<()> {
         // The offline pipeline (re-transcribe + diarize) over the synced-in
-        // `audio.opus`, rewriting `transcript.json` / `summary.md`. `reprocess`
-        // takes one offline claim for the whole pass.
-        self.orchestrator.reprocess(&self.index, meeting_id).await
+        // `audio.opus`, rewriting `transcript.json`. `reprocess` takes one
+        // offline claim for the whole pass; it does NOT summarise (parity with
+        // the standalone offline ops — see `orchestrator::reprocess`'s doc).
+        self.chat_handles
+            .orchestrator
+            .reprocess(&self.chat_handles.index, meeting_id)
+            .await?;
+
+        // F4-summary: run the held-summariser pass AFTER reprocess, matching the
+        // non-delegated default (`settings.auto_summarise_on_stop`) so a
+        // delegated meeting converges with a real `summary.md` rather than a
+        // permanently-empty Artifacts slot. Best-effort: reprocess already
+        // produced the authoritative transcript + diarization, so a failed
+        // summarise must not fail the whole claim (which would leave it to
+        // lapse and reprocess a meeting that is otherwise done for no reason).
+        if self.chat_handles.settings.current().auto_summarise_on_stop {
+            if let Err(e) = ipc_bridge::run_held_summarise(&self.chat_handles, meeting_id).await {
+                tracing::warn!(
+                    target: "app-main",
+                    meeting_id = %meeting_id.0,
+                    error = %e,
+                    "election: post-reprocess summarise failed (best-effort; transcript + diarization remain valid)"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn push_artifacts(&self, meeting_id: MeetingId) {

@@ -66,7 +66,7 @@ use yrs::updates::encoder::Encode;
 use yrs::Update;
 
 use crate::frame::{read_frame, write_frame};
-use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
+use crate::timeouts::{FRAME_IO_TIMEOUT, RESPONDER_CLOSE_TIMEOUT};
 use crate::{Error, Result};
 
 /// ALPN for the sync-update protocol. Bumping the suffix is a wire break.
@@ -269,10 +269,24 @@ pub async fn respond_notes_sync(
     recv: &mut RecvStream,
     root: &Path,
 ) -> Result<()> {
-    // REQUEST: meeting id then the initiator's state vector.
+    // REQUEST: meeting id then the initiator's state vector. Bounded by
+    // FRAME_IO_TIMEOUT like every other frame read on this stream — this one is
+    // a raw fixed-size read rather than a length-prefixed frame, so it needs its
+    // own explicit bound to stay off the unbounded-await slowloris surface.
     let mut id_buf = [0u8; 16];
-    recv.read_exact(&mut id_buf)
+    tokio::time::timeout(FRAME_IO_TIMEOUT, recv.read_exact(&mut id_buf))
         .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                peer = %conn.remote_id(),
+                timeout = ?FRAME_IO_TIMEOUT,
+                "reading the notes-sync meeting id timed out"
+            );
+            Error::Protocol(format!(
+                "reading notes-sync meeting id timed out after {FRAME_IO_TIMEOUT:?}"
+            ))
+        })?
         .map_err(|e| Error::Protocol(format!("reading meeting id: {e}")))?;
     let meeting_id = MeetingId(Uuid::from_bytes(id_buf));
     let init_sv = read_frame(recv).await?;

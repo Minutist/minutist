@@ -43,3 +43,14 @@ pub(crate) const RESPONDER_CLOSE_TIMEOUT: Duration = Duration::from_secs(120);
 /// that advertises a blob and then serves it too slowly (or not at all) cannot
 /// pin the downloader forever.
 pub(crate) const BLOB_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Bound on the final one-byte DONE read in the media/artifacts completion
+/// handshake ([`crate::media_proto::finish_done`] /
+/// [`crate::artifacts_proto::finish_done`]), shared by both the initiator and
+/// responder side of that call. The read spans however long the PEER takes to
+/// finish pulling every blob IT lacks over the separate blobs ALPN before it
+/// writes its DONE byte — a manifest can list more than one blob, so this is
+/// set well above a single [`BLOB_DOWNLOAD_TIMEOUT`] rather than reusing it
+/// directly, while still being finite so a peer that never sends DONE cannot
+/// pin the handshake forever.
+pub(crate) const PEER_PULL_TIMEOUT: Duration = Duration::from_secs(1800);

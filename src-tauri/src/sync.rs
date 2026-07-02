@@ -291,12 +291,27 @@ impl ConnectedSync {
         self.runtime.lock().await.status = status;
     }
 
-    /// Record an error status and emit [`AppEvent::SyncError`].
+    /// Record an error status, emit [`AppEvent::SyncError`], and re-arm
+    /// [`Self::start_requested`] so a later [`SyncControl::set_enabled(true)`]
+    /// can retry the bind. Called only from [`Self::start_engine`]'s two
+    /// failure arms (identity load, engine bind) — never from the success
+    /// path or from [`Self::request_start`] itself — so the reset targets
+    /// exactly "the bind failed" and never re-arms a request that is still in
+    /// flight or that already succeeded (either of which would let a second
+    /// caller double-spawn the engine).
+    ///
+    /// The status write happens BEFORE the flag reset, not after: this
+    /// terminal write is the last thing this spawned task ever does to
+    /// `runtime`, so once the flag is cleared a fresh [`Self::request_start`]
+    /// racing in immediately after can safely move the status on to
+    /// `Connecting` without risk of this call's `Error` write landing after
+    /// it and clobbering it.
     async fn fail(&self, message: String) {
         tracing::error!(target: "app-main", "sync: {message}");
         self.runtime.lock().await.status = SyncStatus::Error {
             message: message.clone(),
         };
+        self.start_requested.store(false, Ordering::SeqCst);
         let _ = self.event_tx.send(AppEvent::SyncError { context: message });
     }
 

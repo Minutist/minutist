@@ -973,12 +973,22 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 ipc_event_tx.clone(),
                 app_data_dir.clone(),
                 notes_meetings_dir.clone(),
-                // Producer-gate S4: hand the election loop its collaborators so it
-                // can claim + reprocess PendingProcessing meetings once the engine
-                // binds. It self-gates on GPU capability (a CPU-only host parks).
+                // Producer-gate S4: hand the election loop its collaborators — the
+                // same `ChatHandles` bundle built for the attachment-conversion VLM
+                // above, so `DesktopElectionDriver::process` can drive `reprocess`
+                // AND (F4-summary) the post-reprocess held-summariser pass through
+                // it — so it can claim + reprocess PendingProcessing meetings once
+                // the engine binds. It self-gates on GPU capability (a CPU-only
+                // host parks).
                 Some(sync::ElectionDeps {
-                    orchestrator: orchestrator.clone(),
-                    index: index.clone(),
+                    chat_handles: ipc_bridge::ChatHandles {
+                        orchestrator: orchestrator.clone(),
+                        index: index.clone(),
+                        meetings_dir: notes_meetings_dir.clone(),
+                        event_tx: ipc_event_tx.clone(),
+                        settings: settings_handle.clone(),
+                        summariser: summariser_cell.clone(),
+                    },
                 }),
             );
             #[cfg(not(feature = "connected"))]

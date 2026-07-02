@@ -1480,9 +1480,16 @@ pub async fn summarise_meeting(
 /// the command. Takes a [`ChatHandles`] — the same bundle the chat path uses —
 /// so it shares the SAME lazily-loaded held model `Arc` (no GGUF reload).
 ///
+/// `pub` (re-exported at the crate root) so `app-main`'s `DesktopElectionDriver`
+/// (`src-tauri/src/sync.rs`, producer-gate F4-summary) can drive the same
+/// summarise pass for a delegated meeting after `Orchestrator::reprocess`,
+/// without a Tauri `State` — it only needs a [`ChatHandles`], which its own
+/// caller constructs directly (mirroring the pattern `app-main` already uses for
+/// `GemmaVlm`).
+///
 /// Returns the summary markdown on success. The heavy `summarise` runs on
 /// `spawn_blocking`, per the threading-model rule.
-async fn run_held_summarise(
+pub async fn run_held_summarise(
     handles: &ChatHandles,
     meeting_id: MeetingId,
 ) -> Result<String, IpcError> {

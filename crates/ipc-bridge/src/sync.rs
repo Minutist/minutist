@@ -65,6 +65,26 @@ pub trait SyncControl: Send + Sync {
     /// no-op — [`DisabledSync`] never errors here, since the meeting is gone
     /// either way and there is nothing more this call could accomplish.
     async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<(), IpcError>;
+
+    /// Enable or disable the connector's sync engine (and, transitively, the
+    /// producer-gate election loop it starts once bound). Called from
+    /// [`crate::tunnel::set_connector_enabled`] alongside `TunnelControl::set_enabled`
+    /// (F5): before this, enabling the connector at runtime started the relay
+    /// tunnel but never the sync engine, so `sync_status` stayed `Disabled` and
+    /// every engine-backed call kept failing even after the user turned the
+    /// connector on.
+    ///
+    /// `true` starts the engine if it is not already running or starting
+    /// (idempotent — a re-enable, or a race between two calls, never
+    /// double-spawns it). `false` persists the disabled setting via the SAME
+    /// `settings.connector_enabled` field `TunnelControl::set_enabled` already
+    /// writes; an implementation MAY leave an already-started engine running
+    /// (there is no requirement here to tear one down — see [`DisabledSync`] and
+    /// the connected implementation's doc for what each actually does).
+    /// Never errors: a start failure is logged and reflected in
+    /// [`Self::status`], mirroring how [`Self::my_ticket`] et al. surface a
+    /// still-starting or failed engine.
+    async fn set_enabled(&self, enabled: bool) -> Result<(), IpcError>;
 }
 
 /// The no-op sync control used by the free build and by a connected build with
@@ -105,6 +125,11 @@ impl SyncControl for DisabledSync {
         // No blob store in this build — nothing to unpin. Never an error: the
         // meeting folder is already gone by the time this is called, so a free
         // build has genuinely finished the deletion.
+        Ok(())
+    }
+
+    async fn set_enabled(&self, _enabled: bool) -> Result<(), IpcError> {
+        // No engine in this build — nothing to start or stop.
         Ok(())
     }
 }
@@ -176,6 +201,7 @@ mod tests {
             Err(IpcError::Unsupported { .. })
         ));
         assert!(s.delete_meeting_blobs(MeetingId::new()).await.is_ok());
+        assert!(s.set_enabled(true).await.is_ok());
     }
 
     #[tokio::test]

@@ -35,6 +35,7 @@ pub mod frame;
 pub mod identity;
 pub mod media_proto;
 pub mod notes_proto;
+pub(crate) mod timeouts;
 
 use std::path::PathBuf;
 

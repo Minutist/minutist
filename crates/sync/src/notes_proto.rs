@@ -66,6 +66,7 @@ use yrs::updates::encoder::Encode;
 use yrs::Update;
 
 use crate::frame::{read_frame, write_frame};
+use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
 use crate::{Error, Result};
 
 /// ALPN for the sync-update protocol. Bumping the suffix is a wire break.
@@ -293,7 +294,21 @@ pub async fn respond_notes_sync(
 
     // Hold the connection open until the initiator finishes reading our diff and
     // closes; returning here would let the router drop and abort the stream.
-    conn.closed().await;
+    // Bounded by RESPONDER_CLOSE_TIMEOUT so an initiator that never closes (a
+    // stalled or hostile peer) cannot pin this task forever.
+    tokio::time::timeout(RESPONDER_CLOSE_TIMEOUT, conn.closed())
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                peer = %conn.remote_id(),
+                timeout = ?RESPONDER_CLOSE_TIMEOUT,
+                "notes-sync responder timed out waiting for the initiator to close"
+            );
+            Error::Protocol(format!(
+                "notes-sync responder wait for close timed out after {RESPONDER_CLOSE_TIMEOUT:?}"
+            ))
+        })?;
     Ok(())
 }
 

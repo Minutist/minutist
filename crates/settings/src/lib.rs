@@ -245,17 +245,41 @@ const fn default_live_agent_retrieval_k() -> usize {
 /// so action items and open asks accumulate and are resolved as the meeting
 /// progresses rather than being discarded on each refresh.
 fn default_live_agent_system_prompt() -> String {
-    "You are a live meeting assistant maintaining a structured digest of an \
-     ongoing meeting. You receive the current standing digest and a batch of \
-     new transcript segments. UPDATE the digest in place: mark resolved items \
-     as resolved, add newly observed action items / decisions / open asks / \
-     attachment-sourced answers / unresolved references, and update existing \
-     items when more detail is available. Do NOT regenerate the entire list \
-     from scratch — preserve items from prior refreshes unless they are \
-     superseded. Return a complete updated digest in the structured format \
-     requested. Be concise and factual; do not invent information not present \
-     in the transcript or attached documents."
+    "You are a live meeting co-pilot. The meeting transcript is delivered to you \
+     as the meeting happens, and the user may also type messages to you directly. \
+     Use everything said in the meeting so far to answer the user's questions and \
+     to help during the meeting. When you are shown new transcript, stay silent \
+     unless there is something genuinely worth surfacing — a decision, an action \
+     item, an answer to a standing request from the user, or an unresolved \
+     reference (the instructions accompanying each transcript update tell you how \
+     to stay silent). Always answer a direct question from the user, drawing on \
+     the meeting so far. Be concise and factual; never invent information that is \
+     not in the transcript or the attached documents."
         .to_string()
+}
+
+/// A distinctive phrase from the legacy digest-maintenance system prompt (the
+/// pre-U2 default). Detects a persisted store still carrying that prompt so it
+/// can be migrated to the co-pilot default: the U2 cutover changed the live
+/// agent from a digest updater to a conversational co-pilot, but a store written
+/// before then still holds the old instruction — which makes the model ask the
+/// user to "provide the current digest and new transcript segments" instead of
+/// answering.
+const LEGACY_DIGEST_PROMPT_MARKER: &str = "maintaining a structured digest";
+
+/// Deserialize `live_agent_system_prompt`, upgrading a persisted legacy
+/// digest-maintenance prompt to the current co-pilot default. A prompt the user
+/// has genuinely customised (not containing the legacy marker) is preserved.
+fn deserialize_live_agent_system_prompt<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    if s.contains(LEGACY_DIGEST_PROMPT_MARKER) {
+        Ok(default_live_agent_system_prompt())
+    } else {
+        Ok(s)
+    }
 }
 
 /// Built-in summary prompt presets (Phase 9 — D4).
@@ -680,12 +704,15 @@ pub struct Settings {
     #[serde(default = "default_live_agent_retrieval_k")]
     pub live_agent_retrieval_k: usize,
 
-    /// The system prompt passed to the live agent on every refresh. Instructs
-    /// the model to UPDATE the standing digest rather than regenerate it,
-    /// preserving the 'asked-for-but-missed' tracker across refreshes.
-    /// `#[serde(default = ...)]` → the built-in digest-maintenance instruction;
-    /// an older store written before this field existed adopts that default.
-    #[serde(default = "default_live_agent_system_prompt")]
+    /// The system prompt for the live co-pilot, pinned as the prefix of the one
+    /// keep-alive conversation. A persisted store still carrying the pre-U2
+    /// digest-maintenance prompt is migrated to the co-pilot default on load (see
+    /// [`deserialize_live_agent_system_prompt`]); `#[serde(default = ...)]`
+    /// supplies it when the field is absent.
+    #[serde(
+        default = "default_live_agent_system_prompt",
+        deserialize_with = "deserialize_live_agent_system_prompt"
+    )]
     pub live_agent_system_prompt: String,
 }
 
@@ -1126,6 +1153,26 @@ mod tests {
         assert_eq!(restored.gpu_acceleration, GpuAcceleration::Auto);
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);
+    }
+
+    #[test]
+    fn live_agent_system_prompt_migrates_legacy_digest_store() {
+        // A store persisted before the U2 cutover carries the digest-maintenance
+        // prompt; it must migrate to the co-pilot default on load so the model
+        // stops asking the user to "provide the digest and transcript segments".
+        let legacy = r#"{ "live_agent_system_prompt": "You are a live meeting assistant maintaining a structured digest of an ongoing meeting. UPDATE the digest in place." }"#;
+        let s: Settings = serde_json::from_str(legacy).expect("deserialise legacy store");
+        assert_eq!(s.live_agent_system_prompt, default_live_agent_system_prompt());
+        assert!(!s.live_agent_system_prompt.contains(LEGACY_DIGEST_PROMPT_MARKER));
+
+        // A genuinely customised prompt (no legacy marker) is preserved verbatim.
+        let custom = r#"{ "live_agent_system_prompt": "Be my terse meeting helper." }"#;
+        let s2: Settings = serde_json::from_str(custom).expect("deserialise custom store");
+        assert_eq!(s2.live_agent_system_prompt, "Be my terse meeting helper.");
+
+        // An absent field falls back to the co-pilot default.
+        let s3: Settings = serde_json::from_str("{}").expect("deserialise empty store");
+        assert_eq!(s3.live_agent_system_prompt, default_live_agent_system_prompt());
     }
 
     // -----------------------------------------------------------------------

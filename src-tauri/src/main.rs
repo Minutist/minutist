@@ -1379,18 +1379,27 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             // Build the tray icon.
             build_tray(app)?;
 
-            // Respect start_hidden setting: show the window unless the user
-            // prefers the app to start in the tray.
+            // The main window is created hidden (tauri.conf.json `visible:
+            // false`) to avoid a white flash: the OS would otherwise paint an
+            // empty frame before the webview renders. Reveal it a short moment
+            // after setup — by then the webview has loaded and painted the app —
+            // unless the user prefers to start in the tray (`start_hidden`). The
+            // delay is a self-contained heuristic (no frontend round-trip) and
+            // can never leave the window permanently hidden.
             let start_hidden = {
                 let state = app.state::<IpcState>();
                 state.settings.current().start_hidden
             };
 
             if !start_hidden {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    if let Some(window) = handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                });
             }
 
             tracing::info!(target: "app-main", "setup complete");

@@ -69,6 +69,14 @@ streamed (a `Done` dropped on a full buffer), the drain reconstructs
   message replies only (turn kind = `UserChat`). The reply flows on `reply_tx`;
   `LiveCopilotMessage` is NOT emitted for user-chat turns to prevent double-rendering.
 
+**Co-pilot system prompt (U2/U4).** The pinned prefix uses
+`settings.live_agent_system_prompt`, which is the CO-PILOT role (answer the user
+using the meeting so far; stay silent on unremarkable transcript). A store written
+before the U2 cutover holds the retired digest-maintenance prompt and is migrated
+to the co-pilot default on load (`settings::deserialize_live_agent_system_prompt`);
+leaving the digest prompt in place makes the model ask the user to "provide the
+digest and transcript segments" instead of answering.
+
 `unsafe` Send/Sync assertions in the workspace (each documents its full
 safety argument at the impl site):
 

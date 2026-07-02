@@ -61,7 +61,7 @@ use uuid::Uuid;
 use crate::blobs::{BlobStore, Manifest};
 use crate::frame::{read_frame, write_frame};
 use crate::notes_proto::StreamKind;
-use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
+use crate::timeouts::{FRAME_IO_TIMEOUT, PEER_PULL_TIMEOUT, RESPONDER_CLOSE_TIMEOUT};
 use crate::{Error, Result};
 
 /// Decode a [`Manifest`] from a received frame body.
@@ -196,10 +196,24 @@ pub async fn respond_media_sync(
     peer: EndpointId,
     root: &Path,
 ) -> Result<()> {
-    // REQUEST: meeting id then the initiator's manifest.
+    // REQUEST: meeting id then the initiator's manifest. Bounded by
+    // FRAME_IO_TIMEOUT like every other frame read on this stream — this one is
+    // a raw fixed-size read rather than a length-prefixed frame, so it needs its
+    // own explicit bound to stay off the unbounded-await slowloris surface.
     let mut id_buf = [0u8; 16];
-    recv.read_exact(&mut id_buf)
+    tokio::time::timeout(FRAME_IO_TIMEOUT, recv.read_exact(&mut id_buf))
         .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                peer = %peer,
+                timeout = ?FRAME_IO_TIMEOUT,
+                "reading the media-sync meeting id timed out"
+            );
+            Error::Protocol(format!(
+                "reading media-sync meeting id timed out after {FRAME_IO_TIMEOUT:?}"
+            ))
+        })?
         .map_err(|e| Error::Protocol(format!("reading meeting id: {e}")))?;
     let meeting_id = MeetingId(Uuid::from_bytes(id_buf));
     let peer_manifest = decode_manifest(&read_frame(recv).await?)?;
@@ -256,6 +270,11 @@ pub async fn respond_media_sync(
 /// then read the peer's one-byte DONE. The write and read do not deadlock — a
 /// single byte fits the QUIC send buffer, so both sides write before either
 /// blocks on the read.
+///
+/// The read is bounded by [`PEER_PULL_TIMEOUT`], not [`FRAME_IO_TIMEOUT`]:
+/// unlike every other read on this stream, this one legitimately spans however
+/// long the peer takes to pull every blob it lacks over the separate blobs ALPN
+/// before it writes its byte, not just one frame's transfer time.
 async fn finish_done(send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
     send.write_all(&[DONE])
         .await
@@ -263,8 +282,18 @@ async fn finish_done(send: &mut SendStream, recv: &mut RecvStream) -> Result<()>
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing media-sync send: {e}")))?;
     let mut done = [0u8; 1];
-    recv.read_exact(&mut done)
+    tokio::time::timeout(PEER_PULL_TIMEOUT, recv.read_exact(&mut done))
         .await
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                timeout = ?PEER_PULL_TIMEOUT,
+                "reading the peer's media-sync done byte timed out"
+            );
+            Error::Protocol(format!(
+                "reading media-sync done timed out after {PEER_PULL_TIMEOUT:?}"
+            ))
+        })?
         .map_err(|e| Error::Protocol(format!("reading media-sync done: {e}")))?;
     if done[0] != DONE {
         return Err(Error::Protocol(format!(

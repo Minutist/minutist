@@ -42,6 +42,14 @@
 //!   that tag once the overwrite lands — no separate unpin step is needed.
 //!
 //! Named tags survive restart; temp-tags (in-flight import protection) do not.
+//! Every persistent tag this crate ever sets starts with [`meeting_tag_prefix`]
+//! (`meeting/{id}/...`) — never the `auto-` prefix `iroh-blobs`' own
+//! `Tags::create` mints for an un-named tag (see [`Self::import_path`]'s doc for
+//! why this crate never lets that path run). [`BlobStore::open`] therefore
+//! deletes every `auto-`-prefixed tag on load ([`reclaim_stray_auto_tags`]): a
+//! store from before this distinction was enforced could hold one, and the
+//! prefix match can only ever remove that stray kind, never a deterministic
+//! meeting tag.
 //!
 //! # Transport
 //!
@@ -60,7 +68,7 @@ use chrono::{DateTime, FixedOffset};
 use futures_util::StreamExt;
 use iroh::{Endpoint, EndpointId};
 use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader, Shuffled};
-use iroh_blobs::api::Store;
+use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::GcConfig;
 use iroh_blobs::HashAndFormat;
@@ -133,6 +141,8 @@ impl BlobStore {
     /// GC enabled ([`GC_INTERVAL`]) so a tag unpinned via
     /// [`Self::delete_meeting_blobs`] or superseded by a re-tag actually reclaims
     /// its blob's bytes — see the module doc, "Retention (GC) and reclamation".
+    /// Also reconciles away any stray `auto-`-prefixed tag left in the store
+    /// ([`reclaim_stray_auto_tags`]).
     ///
     /// Creates the directory tree if absent. The meetings root is expected to be
     /// absolute (the app passes the XDG meetings root; tests pass a tempdir).
@@ -148,6 +158,7 @@ impl BlobStore {
         let store = FsStore::load_with_opts(db_path, options)
             .await
             .map_err(|e| Error::Endpoint(format!("opening blob store at {path:?}: {e}")))?;
+        reclaim_stray_auto_tags(&store).await?;
         Ok(Self {
             store,
             hash_memo: Arc::new(Mutex::new(HashMap::new())),
@@ -180,8 +191,7 @@ impl BlobStore {
 
         let audio = folder.join(AUDIO_REL);
         if audio.is_file() {
-            let hash = self.import_path(&audio).await?;
-            self.tag(&audio_tag(meeting_id), hash).await?;
+            let hash = self.import_path(&audio, &audio_tag(meeting_id)).await?;
             entries.push(ManifestEntry {
                 rel_path: AUDIO_REL.to_string(),
                 hash,
@@ -203,8 +213,9 @@ impl BlobStore {
             names.sort();
             for name in names {
                 let path = assets_dir.join(&name);
-                let hash = self.import_path(&path).await?;
-                self.tag(&asset_tag(meeting_id, &name), hash).await?;
+                let hash = self
+                    .import_path(&path, &asset_tag(meeting_id, &name))
+                    .await?;
                 entries.push(ManifestEntry {
                     rel_path: format!("{ASSETS_DIR}/{name}"),
                     hash,
@@ -224,10 +235,12 @@ impl BlobStore {
     /// meeting folder. The download dials `peer` through the engine's existing
     /// [`Endpoint`], bounded by [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`]
     /// ([`download_capped`]) so a stalled or hostile peer cannot pin this call or
-    /// fill the disk. The export is atomic ([`Self::export_atomic`]): a crash or
-    /// two concurrent syncs offering different hashes for the same `rel` cannot
-    /// leave a torn file at the real path. The returned path is the absolute
-    /// export target.
+    /// fill the disk. The export-and-tag step ([`Self::export_and_tag_downloaded`])
+    /// keeps the downloaded blob continuously GC-rooted from the moment the
+    /// transfer completes through to the deterministic tag landing, and is atomic
+    /// with respect to the target file ([`Self::export_atomic`]): a crash or two
+    /// concurrent syncs offering different hashes for the same `rel` cannot leave a
+    /// torn file at the real path. The returned path is the absolute export target.
     ///
     /// The caller ensures the meeting folder via `notes_crdt::MeetingFolder`
     /// before reconciling media; this method writes only the media file itself.
@@ -263,8 +276,8 @@ impl BlobStore {
         })??;
 
         let target = meetings_root.join(meeting_id.0.to_string()).join(rel);
-        self.export_atomic(hash, &target).await?;
-        self.tag(&tag_for_rel(meeting_id, rel), hash).await?;
+        self.export_and_tag_downloaded(hash, &target, &tag_for_rel(meeting_id, rel))
+            .await?;
         Ok(target)
     }
 
@@ -326,8 +339,9 @@ impl BlobStore {
             if !path.is_file() {
                 continue;
             }
-            let hash = self.import_path(&path).await?;
-            self.tag(&artifact_tag(meeting_id, rel), hash).await?;
+            let hash = self
+                .import_path(&path, &artifact_tag(meeting_id, rel))
+                .await?;
             imported.push((rel, hash));
         }
 
@@ -377,9 +391,12 @@ impl BlobStore {
     /// `rel` is re-validated against the artifact allow-list (defence in depth — the
     /// manifest was validated whole). The download is bounded by
     /// [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`] ([`download_capped`]), and
-    /// the export is atomic ([`Self::export_atomic`]): a concurrent reader of
-    /// `transcript.json` (read far more often than `audio.opus`) never observes a
-    /// partial file and a crash cannot commit a truncated one. The caller ensures
+    /// the export-and-tag step ([`Self::export_and_tag_downloaded`]) keeps the
+    /// downloaded blob continuously GC-rooted through to the deterministic tag
+    /// landing and is atomic with respect to the target file
+    /// ([`Self::export_atomic`]): a concurrent reader of `transcript.json` (read
+    /// far more often than `audio.opus`) never observes a partial file and a
+    /// crash cannot commit a truncated one. The caller ensures
     /// the meeting folder via `notes_crdt::MeetingFolder::ensure` and records the
     /// received authority (it holds the peer entry's `produced_by`/`produced_at`);
     /// this writes only the artifact file.
@@ -415,8 +432,8 @@ impl BlobStore {
         })??;
 
         let target = meetings_root.join(meeting_id.0.to_string()).join(rel);
-        self.export_atomic(hash, &target).await?;
-        self.tag(&artifact_tag(meeting_id, rel), hash).await?;
+        self.export_and_tag_downloaded(hash, &target, &artifact_tag(meeting_id, rel))
+            .await?;
         Ok(target)
     }
 
@@ -450,6 +467,51 @@ impl BlobStore {
         })
     }
 
+    /// Export a just-downloaded blob to `target` and pin it under `tag_name`,
+    /// keeping the blob continuously GC-rooted across the whole export.
+    /// [`download_capped`] (via [`Self::download`] / [`Self::download_artifact`])
+    /// writes the blob's bytes into the store but sets no tag of its own, so a
+    /// mark-and-sweep landing between the transfer completing and the
+    /// deterministic tag below would otherwise find the blob unrooted and
+    /// reclaim it. A [`TempTag`] taken on the already-present hash roots it for
+    /// the duration of [`Self::export_atomic`]; [`Self::commit_deterministic_tag`]
+    /// then sets `tag_name` while that temp tag still holds and only drops it
+    /// once the deterministic tag is live — see the module doc, "Retention (GC)
+    /// and reclamation".
+    async fn export_and_tag_downloaded(
+        &self,
+        hash: Hash,
+        target: &Path,
+        tag_name: &str,
+    ) -> Result<()> {
+        let temp_tag = self
+            .store
+            .tags()
+            .temp_tag(HashAndFormat::raw(hash))
+            .await
+            .map_err(|e| {
+                Error::Protocol(format!("protecting downloaded blob {hash} for export: {e}"))
+            })?;
+        self.export_atomic(hash, target).await?;
+        self.commit_deterministic_tag(temp_tag, tag_name).await?;
+        Ok(())
+    }
+
+    /// Set `tag_name` on `temp_tag`'s hash while the temp tag still roots it
+    /// against GC, then release the temp tag — so the blob stays continuously
+    /// GC-rooted across the handoff from iroh-blobs' own ephemeral protection to
+    /// this crate's persistent, deterministically-named tag. Shared by
+    /// [`Self::import_path`] (a temp tag from an `add_path`) and
+    /// [`Self::export_and_tag_downloaded`] (a temp tag taken explicitly on an
+    /// already-downloaded hash) — see the module doc, "Retention (GC) and
+    /// reclamation".
+    async fn commit_deterministic_tag(&self, temp_tag: TempTag, tag_name: &str) -> Result<Hash> {
+        let hash = temp_tag.hash();
+        self.tag(tag_name, hash).await?;
+        drop(temp_tag);
+        Ok(hash)
+    }
+
     /// Unpin every blob tag this device holds for `meeting_id` — its media
     /// (`meeting/{id}/audio`, `meeting/{id}/asset/*`) and any derived-artifact
     /// tags (`meeting/{id}/artifact/*`) — so the underlying bytes become
@@ -471,20 +533,34 @@ impl BlobStore {
         Ok(())
     }
 
-    /// Import a single file into the store and return its [`Hash`].
+    /// Import a single file into the store under the deterministic `tag_name`
+    /// and return its [`Hash`].
     ///
     /// Consults [`Self::hash_memo`] first: when `path`'s current `(size, mtime)`
-    /// matches a memoised entry, the memoised hash is returned WITHOUT reading or
-    /// re-importing the file — content-addressing stays correct because a real
-    /// content change almost always changes the size and/or mtime, invalidating
-    /// the memo and falling through to a real re-hash. (The residual risk is the
-    /// same one any mtime-based change check accepts — e.g. `rsync`'s quick
-    /// check, `make`'s timestamp rule — a same-size rewrite landing within one
+    /// matches a memoised entry, the memoised hash is returned WITHOUT re-hashing
+    /// or re-tagging — content-addressing stays correct because a real content
+    /// change almost always changes the size and/or mtime, invalidating the memo
+    /// and falling through to a real re-import. (The residual risk is the same
+    /// one any mtime-based change check accepts — e.g. `rsync`'s quick check,
+    /// `make`'s timestamp rule — a same-size rewrite landing within one
     /// filesystem mtime tick; not a concern for the audio/artifact files this
     /// memoises, which are written once by `persistence`/`orchestrator` and never
-    /// rewritten in place.) A memo miss re-hashes via `iroh-blobs`' `add_path`
-    /// (which also imports the bytes) and records the fresh entry.
-    async fn import_path(&self, path: &Path) -> Result<Hash> {
+    /// rewritten in place.) Skipping the re-tag on a memo hit is sound because
+    /// `path` is unique per (meeting, rel) across every call site, so a memo
+    /// entry can only exist because a PRIOR call already imported and tagged it
+    /// under this exact `tag_name`.
+    ///
+    /// A memo miss imports via `iroh-blobs`' `add_path(path).temp_tag()` rather
+    /// than awaiting `add_path(path)` bare: a bare await resolves through
+    /// iroh-blobs' `IntoFuture` impl to `with_tag()`, which mints its own
+    /// PERSISTENT, uniquely-named `auto-<timestamp>` tag — a second, permanent
+    /// root for the same hash that this crate never unpins, defeating
+    /// [`Self::delete_meeting_blobs`] for every locally-imported blob.
+    /// [`Self::commit_deterministic_tag`] instead sets ONLY `tag_name` while the
+    /// import's own temp tag still roots the blob, then drops the temp tag — so
+    /// the blob is continuously GC-rooted and no auto tag is ever created. See
+    /// the module doc, "Retention (GC) and reclamation".
+    async fn import_path(&self, path: &Path, tag_name: &str) -> Result<Hash> {
         let metadata = std::fs::metadata(path)
             .map_err(|e| Error::Protocol(format!("stat-ing {path:?} before import: {e}")))?;
         let size = metadata.len();
@@ -498,21 +574,19 @@ impl BlobStore {
             }
         }
 
-        let tag = self
+        let temp_tag = self
             .store
             .blobs()
             .add_path(path)
+            .temp_tag()
             .await
             .map_err(|e| Error::Protocol(format!("importing {path:?} into blob store: {e}")))?;
-        self.hash_memo.lock().expect("hash memo poisoned").insert(
-            path.to_path_buf(),
-            HashMemoEntry {
-                size,
-                mtime,
-                hash: tag.hash,
-            },
-        );
-        Ok(tag.hash)
+        let hash = self.commit_deterministic_tag(temp_tag, tag_name).await?;
+        self.hash_memo
+            .lock()
+            .expect("hash memo poisoned")
+            .insert(path.to_path_buf(), HashMemoEntry { size, mtime, hash });
+        Ok(hash)
     }
 
     /// Set a persistent named tag pinning `hash` (as a raw blob) against GC.
@@ -552,6 +626,38 @@ impl BlobStore {
 /// them in one `delete_prefix` call.
 fn meeting_tag_prefix(meeting_id: MeetingId) -> String {
     format!("meeting/{}/", meeting_id.0)
+}
+
+/// The tag-name prefix iroh-blobs' own `Tags::create` (reached via `with_tag()`,
+/// `store::util::Tag::auto`) mints for an un-named tag: `auto-<RFC-3339-ish
+/// timestamp>`. This crate never sets a tag under this prefix itself — every
+/// persistent tag it creates starts with [`meeting_tag_prefix`] — so a tag under
+/// it can only be a stray left by an import that (pre-fix) awaited `add_path`
+/// bare instead of going through [`BlobStore::import_path`]'s
+/// `temp_tag()`-then-[`BlobStore::commit_deterministic_tag`] path.
+const AUTO_TAG_PREFIX: &str = "auto-";
+
+/// Delete every tag under [`AUTO_TAG_PREFIX`], called once from
+/// [`BlobStore::open`] — see the module doc, "Retention (GC) and reclamation".
+/// Scoped to exactly that prefix via `delete_prefix`, so it can only ever
+/// remove a stray auto-named tag and can never touch a deterministic
+/// `meeting/{id}/...` tag. A no-op (and not an error) when no such tag exists,
+/// which is the steady-state case for a store that has only ever been written
+/// by the fixed [`BlobStore::import_path`].
+async fn reclaim_stray_auto_tags(store: &Store) -> Result<()> {
+    let removed = store
+        .tags()
+        .delete_prefix(AUTO_TAG_PREFIX)
+        .await
+        .map_err(|e| Error::Protocol(format!("reclaiming stray auto-* blob tags: {e}")))?;
+    if removed > 0 {
+        tracing::info!(
+            target: "sync",
+            removed,
+            "reclaimed stray auto-named blob tags left by a pre-fix import"
+        );
+    }
+    Ok(())
 }
 
 /// Pull `hash` from `peer` through `downloader`, aborting with
@@ -1453,7 +1559,10 @@ mod tests {
 
         let src = root.join("source.bin");
         std::fs::write(&src, b"fresh-content").expect("write source");
-        let hash = store.import_path(&src).await.expect("import path");
+        let hash = store
+            .import_path(&src, "test/export-atomic")
+            .await
+            .expect("import path");
 
         store
             .export_atomic(hash, &target)
@@ -1490,7 +1599,10 @@ mod tests {
 
         let path = root.join("audio.opus");
         std::fs::write(&path, b"original-bytes").expect("write file");
-        let real_hash = store.import_path(&path).await.expect("first import");
+        let real_hash = store
+            .import_path(&path, "test/memo")
+            .await
+            .expect("first import");
 
         // Plant a deliberately wrong hash under the file's CURRENT (size, mtime).
         // If the memo is genuinely consulted (rather than the file re-hashed for
@@ -1509,7 +1621,10 @@ mod tests {
                 hash: planted,
             },
         );
-        let memoised = store.import_path(&path).await.expect("second import");
+        let memoised = store
+            .import_path(&path, "test/memo")
+            .await
+            .expect("second import");
         assert_eq!(
             memoised, planted,
             "an unchanged (size, mtime) must return the memoised hash without re-hashing"
@@ -1518,10 +1633,128 @@ mod tests {
         // Changing the file's content (and size) invalidates the memo: import_path
         // must re-hash for real, never returning the stale planted value.
         std::fs::write(&path, b"different-length-content-here").expect("rewrite file");
-        let rehashed = store.import_path(&path).await.expect("third import");
+        let rehashed = store
+            .import_path(&path, "test/memo")
+            .await
+            .expect("third import");
         assert_ne!(
             rehashed, planted,
             "a changed file must invalidate the memo and be re-hashed for real"
+        );
+    }
+
+    /// The producer-gate merge gate for the auto-tag leak: a LOCALLY-IMPORTED
+    /// blob (via [`BlobStore::import_meeting`], the dominant case — a
+    /// recorded/produced meeting, not a downloaded one) is fully GC-eligible
+    /// after [`BlobStore::delete_meeting_blobs`] — no tag, named or temporary,
+    /// still roots its hash. Before the [`BlobStore::import_path`] fix, a bare
+    /// `add_path(path).await` minted a PERSISTENT `auto-*` tag alongside the
+    /// deterministic `meeting/{id}/audio` tag; `delete_meeting_blobs` only
+    /// deletes the `meeting/{id}/...` prefix, so the `auto-*` tag survived and
+    /// this test's tag-list scan found it — this test fails against that code
+    /// and passes once `import_path` leaves no such orphan.
+    #[tokio::test]
+    async fn local_import_is_fully_reclaimable_after_meeting_delete() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = BlobStore::open(root).await.expect("open store");
+        let id = MeetingId::new();
+        let folder = root.join(id.0.to_string());
+        std::fs::create_dir_all(&folder).expect("mk folder");
+        std::fs::write(folder.join("audio.opus"), b"locally-recorded-audio").expect("write audio");
+
+        let manifest = store
+            .import_meeting(root, id)
+            .await
+            .expect("import meeting");
+        let hash = manifest.entries[0].hash;
+
+        store
+            .delete_meeting_blobs(id)
+            .await
+            .expect("delete meeting blobs");
+
+        // No NAMED tag — including any stray `auto-*` tag a bare
+        // `add_path(...).await` would have left behind — still roots the hash.
+        let mut tags = store.store.tags().list().await.expect("list tags");
+        while let Some(tag) = tags.next().await {
+            let info = tag.expect("tag info");
+            assert_ne!(
+                info.hash, hash,
+                "tag {:?} still roots the deleted meeting's blob",
+                info.name
+            );
+        }
+
+        // No TEMP tag roots the hash either: the transient protection
+        // `import_path` holds while it sets the deterministic tag must not
+        // outlive that call.
+        let mut temp_tags = store
+            .store
+            .tags()
+            .list_temp_tags()
+            .await
+            .expect("list temp tags");
+        while let Some(haf) = temp_tags.next().await {
+            assert_ne!(
+                haf.hash, hash,
+                "a temp tag still roots the deleted meeting's blob"
+            );
+        }
+    }
+
+    /// [`reclaim_stray_auto_tags`] (run from [`BlobStore::open`]) removes a
+    /// pre-existing `auto-*` tag — the kind a bare `add_path(...).await` used to
+    /// leave behind — while leaving a deterministic `meeting/{id}/...` tag
+    /// untouched, proving the prefix scoping can only ever hit the stray kind.
+    #[tokio::test]
+    async fn reclaim_stray_auto_tags_removes_auto_leaves_deterministic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = BlobStore::open(root).await.expect("open store");
+        let id = MeetingId::new();
+
+        // Seed a stray auto tag directly (standing in for one left by a pre-fix
+        // import) alongside a legitimate deterministic tag.
+        let stray_hash = Hash::from([0x11u8; 32]);
+        let kept_hash = Hash::from([0x22u8; 32]);
+        store
+            .store
+            .tags()
+            .set(
+                "auto-2026-01-01T00:00:00.000Z",
+                HashAndFormat::raw(stray_hash),
+            )
+            .await
+            .expect("seed stray auto tag");
+        store
+            .tag(&audio_tag(id), kept_hash)
+            .await
+            .expect("seed deterministic tag");
+
+        reclaim_stray_auto_tags(&store.store)
+            .await
+            .expect("reconcile");
+
+        assert!(
+            store
+                .store
+                .tags()
+                .get("auto-2026-01-01T00:00:00.000Z")
+                .await
+                .expect("get stray tag")
+                .is_none(),
+            "the stray auto-* tag must be removed"
+        );
+        assert!(
+            store
+                .store
+                .tags()
+                .get(audio_tag(id))
+                .await
+                .expect("get deterministic tag")
+                .is_some(),
+            "the deterministic meeting tag must survive the reconciliation"
         );
     }
 }

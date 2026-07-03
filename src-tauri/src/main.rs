@@ -1000,6 +1000,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                         event_tx: ipc_event_tx.clone(),
                         settings: settings_handle.clone(),
                         summariser: summariser_cell.clone(),
+                        embedder: embedder_cell.clone(),
                     },
                 }),
             );

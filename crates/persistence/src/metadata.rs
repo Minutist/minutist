@@ -71,6 +71,9 @@ pub(crate) fn write_initial_metadata_if_absent(
         notes_format: 0,
         collection_id: None,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
+        // Local recording processed on this device (the back-compat default);
+        // the lifecycle field is owned by the sync/producer-gate work.
+        processing: Default::default(),
     };
 
     write_metadata_to_path(path, &meta)

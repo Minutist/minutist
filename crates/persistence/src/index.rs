@@ -486,6 +486,9 @@ fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error
         notes_format: 0,
         collection_id: None,
         app_version: String::new(),
+        // A recovered local recording; the lifecycle field defaults to the
+        // local-processed state (owned by the sync/producer-gate work).
+        processing: Default::default(),
     };
 
     crate::metadata::write_metadata_to_path(&folder.join("metadata.json"), &meta)

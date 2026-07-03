@@ -175,7 +175,10 @@ version-lockstep to hand-maintain. Third-party:
 timestamps the phone model carries as numbers; same workspace pin as
 `notes-crdt`, no new transitive crate). Because Option A wraps OUR `SyncEngine` (not
 upstream `iroh-ffi`), `iroh-blobs` stays encapsulated behind `sync_media` /
-`import_media` and needs no separate FFI surface. The wrapper owns its tokio
+`sync_artifacts` / `import_media` and needs no separate FFI surface. `sync_artifacts`
+is the phone-initiated artifact pull (a passive capture device fetching a
+processing host's `transcript.json` / `summary.md`), complementing the host-side
+push in `DesktopElectionDriver`. The wrapper owns its tokio
 runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS
 threads so a re-entrant foreign callback never `block_on`s from within the
 runtime. No `tauri::*` / `ipc-bridge` imports. See `cross-cutting.md` — "Build

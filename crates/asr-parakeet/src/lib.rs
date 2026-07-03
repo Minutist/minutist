@@ -57,11 +57,19 @@ pub struct ParakeetConfig {
 }
 
 impl ParakeetConfig {
-    /// Default to 4 decode threads — comfortably real-time for the int8 model.
+    /// Derive the ONNX Runtime intra-op thread count from the host: the CPU core
+    /// count, capped at 6. A fixed 4 left the 0.6B int8 transducer riding the
+    /// real-time edge on this class of APU; 6 keeps comfortable headroom while
+    /// leaving cores for VAD, diarisation, the UI, and the OS, and is the point
+    /// of diminishing returns for a model this size.
     pub fn new(model_dir: impl Into<PathBuf>) -> Self {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(1, 6) as i32;
         Self {
             model_dir: model_dir.into(),
-            num_threads: 4,
+            num_threads,
         }
     }
 }

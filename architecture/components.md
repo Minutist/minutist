@@ -1712,6 +1712,17 @@ container) and `metadata.json` per meeting. Pause/resume inserts zero-sample
 pauses (±20 ms per frame). The libsql index (`index.db`) and
 transcript/notes/summary storage are Phase 4.
 
+**Meeting durability — `metadata.json` written at open, not only finalise.**
+`MeetingWriter::open` writes an in-progress `metadata.json` stub
+(`duration_ms = 0`, a synthesised `"Recording <timestamp>"` title,
+`started_at = now`) as its last step, before returning the writer — so the
+meeting folder is a real, self-heal-recoverable meeting the moment recording
+starts rather than only once it finalises. `finalise` overwrites the stub with
+the complete record. The write is guarded on the metadata file not already
+existing, so it never downgrades an already-finalised (richer) record. See
+`cross-cutting.md` — "`metadata.json` is written at recording start, not only
+at finalise".
+
 **Phase 2 surface growth:** `TranscriptWriter` writes `transcript.json` (JSON array of `Segment`) per meeting. Flushed on each ASR-worker return so a crash mid-recording loses at most one flush's worth of transcript.
 
 **Phase 4 surface growth — `write_transcript(meeting_dir, &[Segment])`.** A free
@@ -1975,7 +1986,16 @@ on `common`.
     `metadata`/transcript read + `upsert`. Called by `ipc-bridge`'s
     `list_meetings` so a meeting can never stay hidden after a missed stop-time
     `upsert` (e.g. the process killed between finalise and the upsert) without
-    waiting for the next startup `rebuild_from_disk`.
+    waiting for the next startup `rebuild_from_disk`. A folder with **no**
+    `metadata.json` but real recording data (`audio.opus` and/or
+    `transcript.json`) is recovered rather than skipped: a minimal metadata is
+    synthesised (`started_at` from the earlier of the two files' mtimes, title
+    `"Recovered recording <date>"`, `duration_ms` from the last transcript
+    segment) and written before the folder is indexed via the normal path —
+    this recovers a meeting killed before `MeetingWriter::open`'s own initial
+    write landed, and pre-durability-fix orphans recorded before that write
+    existed at all. A folder with neither file is left alone. Synthesis
+    failures are logged and that folder is skipped, never aborting the reconcile.
 - **Meeting operations (`meeting_ops` module).** `rename_meeting(root, &index,
   id, new_title)` and `delete_meeting(root, &index, id)` (both `async fn ->
   AppResult<()>`) keep the on-disk folder and the index row consistent: the
@@ -2231,10 +2251,14 @@ decision and needs an architecture-doc update.
 `Recording`/`Paused` meeting (via `InternalState::live_meeting_id`), reset at
 `start()`. `stop()` consumes it as the finished `MeetingMeta.title` in place of
 the synthesized `Recording <timestamp>` default. This is how the UI names a
-meeting DURING recording — the live meeting has no `metadata.json` yet, so
-`rename_meeting` cannot be used and writing metadata early would break the
-"metadata present ⇒ finalised" index invariant. The title is user content and is
-never logged (#0014, mirroring `rename_meeting`).
+meeting DURING recording. `MeetingWriter::open` does write an in-progress
+`metadata.json` stub the moment recording starts (so the folder is
+self-heal-recoverable — see `persistence`'s "Meeting durability" note above),
+but `rename_meeting` still cannot be used on the live meeting: `finalise`
+unconditionally overwrites `metadata.json` with the full record at stop, so a
+`rename_meeting` write racing the live recording would be silently discarded
+the moment it finishes. The title is user content and is never logged (#0014,
+mirroring `rename_meeting`).
 
 **Phase 1 surface (broadcast policy).** `AppEvent` fan-out uses
 `broadcast::channel(256)` (~8 s of meter at 30 Hz). Slow subscribers

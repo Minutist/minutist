@@ -6,7 +6,7 @@ use minutist_common::{AppResult, AudioFormat, MeetingId, MeetingMeta, Segment};
 
 use crate::error::Error;
 use crate::folder::MeetingFolder;
-use crate::metadata::write_metadata_to_path;
+use crate::metadata::{write_initial_metadata_if_absent, write_metadata_to_path};
 use crate::opus_encoder::OggOpusEncoder;
 use crate::transcript::TranscriptWriter;
 
@@ -27,6 +27,12 @@ use crate::transcript::TranscriptWriter;
 /// `write_transcript_segment` needs no fallible lazy-init path. If no
 /// segments are ever written, `finalise` calls `TranscriptWriter::finalise`
 /// which is a no-op for an empty buffer, leaving `transcript.json` absent.
+///
+/// # `metadata.json` durability
+///
+/// `open` writes an in-progress `metadata.json` stub (`duration_ms = 0`) as
+/// its last step, so the meeting is a real, indexable folder before a single
+/// sample is pushed. `finalise` overwrites the stub with the complete record.
 pub struct MeetingWriter {
     folder: MeetingFolder,
     encoder: Option<OggOpusEncoder<BufWriter<File>>>,
@@ -37,7 +43,12 @@ pub struct MeetingWriter {
 impl MeetingWriter {
     /// Open a new `MeetingWriter` for `meeting_id` under `root`.
     ///
-    /// Creates the per-meeting folder and opens `audio.opus` for writing.
+    /// Creates the per-meeting folder, opens `audio.opus` for writing, and
+    /// writes an initial in-progress `metadata.json` stub (`duration_ms = 0`)
+    /// so the folder is a durable, self-heal-recoverable meeting from the
+    /// first moment — see [`crate::MeetingIndex::reconcile_orphans`]. A crash
+    /// or kill before `finalise` therefore still leaves a recoverable meeting
+    /// on disk instead of an invisible orphan.
     pub fn open(root: &Path, meeting_id: MeetingId, format: AudioFormat) -> AppResult<Self> {
         let folder = MeetingFolder::create(root, meeting_id)?;
         let audio_path = folder.audio_path();
@@ -50,6 +61,9 @@ impl MeetingWriter {
         let encoder = OggOpusEncoder::new(buffered).map_err(minutist_common::AppError::from)?;
 
         let transcript_writer = TranscriptWriter::open(&folder)?;
+
+        write_initial_metadata_if_absent(&folder.metadata_path(), meeting_id, &format)
+            .map_err(minutist_common::AppError::from)?;
 
         tracing::info!(
             target: "persistence",

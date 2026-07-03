@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use libsql::{Builder, Connection, Database};
-use minutist_common::{AppResult, CollectionId, MeetingId, MeetingListEntry};
+use minutist_common::{AppResult, AudioFormat, CollectionId, MeetingId, MeetingListEntry, MeetingMeta};
 
 use crate::error::Error;
 use crate::{migrations, reader};
@@ -294,8 +294,18 @@ impl MeetingIndex {
     /// `list_meetings` runs this so a meeting present on disk can never stay
     /// hidden until the next startup `rebuild_from_disk`. Unlike
     /// [`Self::rebuild_from_disk`] it never deletes — a folder removed off-app
-    /// is reconciled by the next rebuild, not here. Returns the number of orphan
-    /// meetings newly indexed.
+    /// is reconciled by the next rebuild, not here.
+    ///
+    /// A folder with no `metadata.json` but real recording data (`audio.opus`
+    /// and/or `transcript.json`) is recovered rather than skipped: a minimal
+    /// metadata is synthesised (see [`synthesize_metadata`]) and written before
+    /// the folder is indexed via the normal path. This is what makes a
+    /// crash/kill mid-recording recoverable even for meetings started before
+    /// `MeetingWriter::open` began writing its own initial metadata — `index.db`
+    /// stays a derived cache, but `metadata.json` is now guaranteed to exist for
+    /// every folder that holds recording data. A folder with neither file is
+    /// unrelated clutter and is left alone. Returns the number of orphan
+    /// meetings newly indexed (including recovered ones).
     pub async fn reconcile_orphans(&self, meetings_root: &Path) -> AppResult<usize> {
         Ok(self.reconcile_orphans_inner(meetings_root).await?)
     }
@@ -325,7 +335,42 @@ impl MeetingIndex {
                 None => continue,
             };
             if !path.join("metadata.json").exists() {
-                continue;
+                let has_recording_data =
+                    path.join("audio.opus").exists() || path.join("transcript.json").exists();
+                if !has_recording_data {
+                    // No metadata and no recording data — unrelated clutter,
+                    // not a meeting folder.
+                    continue;
+                }
+
+                let meeting_id = match parse_meeting_id(&id) {
+                    Ok(mid) => mid,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "persistence",
+                            folder = %path.display(),
+                            error = %e,
+                            "skipping recording-data folder with a non-uuid name during orphan reconcile"
+                        );
+                        continue;
+                    }
+                };
+
+                if let Err(e) = synthesize_metadata(&path, meeting_id) {
+                    tracing::warn!(
+                        target: "persistence",
+                        folder = %path.display(),
+                        error = %e,
+                        "failed to recover incomplete recording during orphan reconcile"
+                    );
+                    continue;
+                }
+
+                tracing::info!(
+                    target: "persistence",
+                    meeting_id = %id,
+                    "recovered incomplete recording (self-heal)"
+                );
             }
 
             match entry_from_folder(&path).await {
@@ -391,6 +436,96 @@ fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> 
         excerpt,
         collection_id: meta.collection_id,
     })
+}
+
+/// Synthesise and atomically write a minimal `metadata.json` for a folder that
+/// holds recording data (`audio.opus` and/or `transcript.json`) but no
+/// metadata — used by [`MeetingIndex::reconcile_orphans`] to recover meetings
+/// that never reached `finalise` (a crash/kill mid-recording, most commonly a
+/// pre-durability-fix orphan; see `architecture/cross-cutting.md`
+/// "`metadata.json` is written at recording start, not only at finalise").
+///
+/// Neither `audio.opus` nor `transcript.json` records an absolute wall-clock
+/// time — transcript segments carry only offsets from the recording's start —
+/// so `started_at` is the best available on-disk proxy: the earlier of the two
+/// files' modification times, falling back to the current time if neither
+/// file's metadata is readable. `duration_ms` is the last transcript segment's
+/// end offset (`0` when there is no transcript), and `speaker_count` is the
+/// number of distinct `speaker_id` labels seen. The synthesised record uses
+/// the app's one supported recording format (16 kHz mono Opus), the same
+/// placeholder `audio_format` [`notes_crdt::MeetingFolder::ensure`] seeds for
+/// an inbound sync folder.
+fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error> {
+    let segments = reader::read_transcript_inner(folder).unwrap_or_default();
+    let started_at = recovered_started_at(folder);
+    let duration_ms = segments.last().map(|s| s.end_ms).unwrap_or(0);
+    let speaker_count = segments
+        .iter()
+        .filter_map(|s| s.speaker_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u32;
+    let title = recovered_title(&started_at);
+
+    let meta = MeetingMeta {
+        uuid: meeting_id,
+        title,
+        started_at,
+        ended_at: None,
+        duration_ms,
+        speaker_count,
+        audio_format: AudioFormat {
+            codec: "opus".to_string(),
+            sample_rate: 16_000,
+            channels: 1,
+            bitrate_kbps: Some(32),
+        },
+        asr_model: None,
+        llm_model: None,
+        diarizer: None,
+        speaker_names: std::collections::BTreeMap::new(),
+        notes_format: 0,
+        collection_id: None,
+        app_version: String::new(),
+    };
+
+    crate::metadata::write_metadata_to_path(&folder.join("metadata.json"), &meta)
+}
+
+/// Derive a recovered folder's `started_at`, preferring the earlier of
+/// `transcript.json`'s and `audio.opus`'s modification times (see
+/// [`synthesize_metadata`] for why neither file carries an absolute
+/// timestamp directly), falling back to the current time if neither file's
+/// metadata can be read.
+fn recovered_started_at(folder: &Path) -> String {
+    let transcript_mtime = file_mtime_utc(&folder.join("transcript.json"));
+    let audio_mtime = file_mtime_utc(&folder.join("audio.opus"));
+
+    let earliest = match (transcript_mtime, audio_mtime) {
+        (Some(t), Some(a)) => Some(t.min(a)),
+        (Some(t), None) => Some(t),
+        (None, Some(a)) => Some(a),
+        (None, None) => None,
+    };
+
+    earliest.unwrap_or_else(chrono::Utc::now).to_rfc3339()
+}
+
+/// A file's modification time as a UTC `DateTime`, or `None` if the file is
+/// absent or its metadata cannot be read.
+fn file_mtime_utc(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Utc>::from(modified))
+}
+
+/// The recovered-meeting title: "Recovered recording <YYYY-MM-DD HH:MM>",
+/// derived from `started_at`. Falls back to the raw `started_at` string if it
+/// does not parse as RFC 3339 (defensive; `started_at` is always produced by
+/// [`recovered_started_at`], which only ever emits RFC 3339).
+fn recovered_title(started_at: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(started_at) {
+        Ok(dt) => format!("Recovered recording {}", dt.format("%Y-%m-%d %H:%M")),
+        Err(_) => format!("Recovered recording {started_at}"),
+    }
 }
 
 /// Derive the meeting-list excerpt for a folder (live-test UX T6).

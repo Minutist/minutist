@@ -501,6 +501,64 @@ fn test_zero_segment_meeting_finalise_ok() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Meeting durability: metadata.json is written at `open`, not only `finalise`
+// ---------------------------------------------------------------------------
+
+/// `MeetingWriter::open` writes an in-progress `metadata.json` stub before
+/// any sample is pushed: `duration_ms == 0`, `started_at` is present and
+/// parses, and the folder is a real meeting on disk from the first moment
+/// (the durability fix — a crash right after `open` must still leave a
+/// recoverable folder, not an invisible orphan).
+#[test]
+fn test_open_writes_initial_metadata_stub() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+
+    let writer = MeetingWriter::open(tempdir.path(), id, opus_format()).expect("open writer");
+
+    let metadata_path = tempdir.path().join(id.0.to_string()).join("metadata.json");
+    assert!(
+        metadata_path.exists(),
+        "metadata.json must exist immediately after open, before finalise"
+    );
+
+    let json = std::fs::read_to_string(&metadata_path).expect("read metadata.json");
+    let meta: MeetingMeta = serde_json::from_str(&json).expect("parse metadata.json");
+
+    assert_eq!(meta.uuid, id);
+    assert_eq!(meta.duration_ms, 0, "an in-progress stub has no duration yet");
+    assert!(!meta.title.is_empty(), "the stub carries a default title");
+    // `started_at` must be a well-formed RFC 3339 timestamp.
+    chrono::DateTime::parse_from_rfc3339(&meta.started_at)
+        .expect("started_at must be RFC 3339");
+
+    drop(writer);
+}
+
+/// `finalise` overwrites the `open`-time stub with the full record:
+/// `duration_ms` becomes non-zero and the caller-supplied title/timestamps
+/// win over the stub's defaults.
+#[test]
+fn test_finalise_overwrites_initial_metadata_stub() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+
+    let mut writer = MeetingWriter::open(tempdir.path(), id, opus_format()).expect("open writer");
+    let samples = sine_samples(0.1);
+    writer.push_samples(&samples).expect("push_samples");
+
+    let meta = dummy_meta(id, 12_345);
+    let folder = writer.finalise(meta.clone()).expect("finalise");
+
+    let json = std::fs::read_to_string(folder.metadata_path()).expect("read metadata.json");
+    let back: MeetingMeta = serde_json::from_str(&json).expect("parse metadata.json");
+
+    assert_eq!(back.duration_ms, 12_345, "finalise must overwrite the stub's duration_ms = 0");
+    assert_eq!(back.title, meta.title, "finalise must overwrite the stub's default title");
+    assert_eq!(back.started_at, meta.started_at);
+}
+
 // ===========================================================================
 // Phase 4 tests
 // ===========================================================================
@@ -1496,6 +1554,107 @@ async fn test_reconcile_orphans_indexes_only_missing() {
     // Idempotent: a second reconcile finds nothing new.
     assert_eq!(index.reconcile_orphans(root).await.expect("reconcile 2"), 0);
     assert_eq!(index.list_meetings().await.expect("list").len(), 2);
+}
+
+/// Meeting durability: a folder with `audio.opus` + `transcript.json` but no
+/// `metadata.json` (a crash/kill mid-recording, or a pre-durability-fix
+/// orphan) is recovered rather than skipped — a minimal metadata is
+/// synthesised, written to disk, and the folder is indexed like any other
+/// meeting.
+#[tokio::test]
+async fn test_reconcile_orphans_recovers_audio_and_transcript_folder_without_metadata() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = MeetingId::new();
+    let folder_dir = root.join(id.0.to_string());
+    std::fs::create_dir_all(&folder_dir).expect("create orphan folder");
+    std::fs::write(folder_dir.join("audio.opus"), b"not decoded by reconcile")
+        .expect("write audio.opus");
+    crate::write_transcript(
+        &folder_dir,
+        &[
+            make_segment(0, 1_000, "hello"),
+            make_segment(1_000, 4_500, "world"),
+        ],
+    )
+    .expect("write transcript.json");
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    let added = index.reconcile_orphans(root).await.expect("reconcile");
+    assert_eq!(
+        added, 1,
+        "the audio+transcript orphan must be recovered and indexed"
+    );
+
+    // The recovery is durable — metadata.json now exists on disk, not just an
+    // in-memory index row.
+    assert!(
+        folder_dir.join("metadata.json").exists(),
+        "synthesised metadata.json must be written to disk"
+    );
+
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    let entry = &listed[0];
+    assert_eq!(entry.id, id);
+    assert!(
+        entry.title.starts_with("Recovered recording "),
+        "got title {:?}",
+        entry.title
+    );
+    assert_eq!(
+        entry.duration_ms, 4_500,
+        "duration is the last transcript segment's end_ms"
+    );
+    assert_eq!(entry.excerpt.as_deref(), Some("hello"));
+
+    // Idempotent: the folder is now indexed, so a second reconcile is a no-op.
+    assert_eq!(
+        index.reconcile_orphans(root).await.expect("reconcile 2"),
+        0
+    );
+}
+
+/// A folder with only `audio.opus` (no transcript, no metadata) is still
+/// recovered — `duration_ms` falls back to `0` and the title is still
+/// synthesised from the audio file's mtime.
+#[tokio::test]
+async fn test_reconcile_orphans_recovers_audio_only_folder_without_metadata() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = MeetingId::new();
+    let folder_dir = root.join(id.0.to_string());
+    std::fs::create_dir_all(&folder_dir).expect("create orphan folder");
+    std::fs::write(folder_dir.join("audio.opus"), b"not decoded by reconcile")
+        .expect("write audio.opus");
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    let added = index.reconcile_orphans(root).await.expect("reconcile");
+    assert_eq!(added, 1, "the audio-only orphan must be recovered and indexed");
+
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].duration_ms, 0, "no transcript ⇒ duration_ms 0");
+    assert!(listed[0].title.starts_with("Recovered recording "));
+}
+
+/// A folder with neither `metadata.json` nor any recording data is unrelated
+/// clutter and stays skipped — recovery must not manufacture meetings out of
+/// thin air.
+#[tokio::test]
+async fn test_reconcile_orphans_skips_folder_with_no_recording_data() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    std::fs::create_dir_all(root.join("not-a-meeting")).expect("stray dir");
+    std::fs::write(root.join("not-a-meeting").join("readme.txt"), b"x").expect("stray file");
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    let added = index.reconcile_orphans(root).await.expect("reconcile");
+    assert_eq!(added, 0, "a folder with no metadata and no recording data must be skipped");
+    assert_eq!(index.list_meetings().await.expect("list").len(), 0);
 }
 
 #[tokio::test]

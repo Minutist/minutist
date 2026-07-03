@@ -1391,6 +1391,23 @@ is versioned and the migration runner is **forward-only** (a `schema_version`
 gate; opening an empty DB or a prior-schema DB migrates up without data loss).
 Nothing depends on `index.db` being byte-stable or even present.
 
+**`metadata.json` is written at recording start, not only at finalise.**
+`MeetingWriter::open` writes an in-progress stub (`duration_ms = 0`, a
+synthesised `"Recording <timestamp>"` title) as its last step, before any
+audio sample is pushed; `MeetingWriter::finalise` overwrites it with the
+complete record. This makes every meeting folder a real, indexable meeting
+from the moment recording starts, so a crash or kill mid-recording leaves a
+recoverable folder rather than an invisible one. `reconcile_orphans`
+additionally recovers folders that hold `audio.opus` and/or `transcript.json`
+but have **no** `metadata.json` at all (a crash before `open`'s write landed,
+or a meeting recorded before this fix existed): it synthesises a minimal
+metadata — `started_at` from the earlier of the two files' modification times
+(falling back to now), title `"Recovered recording <date>"`, `duration_ms`
+from the last transcript segment's end offset — and writes it before indexing
+the folder through the normal path. A folder with neither file is left alone.
+Recovery is best-effort: a synthesis failure is logged and the folder is
+skipped, never aborting the wider reconcile.
+
 **Headless server data root (`headless` / `minutist-hub`).** The headless server
 (WS4-B; see "Headless server daemon") runs over its OWN data root, supplied as an
 absolute path at startup (`--data-dir`), entirely separate from any desktop's

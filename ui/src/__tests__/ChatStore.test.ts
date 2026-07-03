@@ -10,9 +10,13 @@
  *   - `chat_tool_call` / `chat_tool_result` drive the transient tool indicator,
  *   - `chat_error` surfaces the error and clears the in-flight state,
  *   - an event for a NON-active session is ignored (per-session scoping),
+ *   - `live_copilot_message` for the open meeting is folded into the timeline
+ *     as an assistant message (the merged co-pilot feed — U2 unification),
  *   - `send` appends the user message optimistically + enters the in-flight
  *     state, and adopts the returned session id,
- *   - `loadSessions` / `openSession` / `deleteSession` route through the seam.
+ *   - `loadSessions` / `openSession` / `deleteSession` route through the seam,
+ *   - `setMeeting` auto-opens the meeting's live co-pilot session, if one
+ *     exists, instead of leaving the chat blank.
  *
  * The IPC calls are mocked at the `../ipc/chat` seam (per the architecture
  * testing policy — do not fake the generated bindings file).
@@ -222,6 +226,110 @@ describe("useChatStore — event reconciliation", () => {
       .getState()
       .handleEvent({ kind: "summary_ready", meeting_id: MEETING } as AppEvent);
     expect(useChatStore.getState().streaming).toBe("kept");
+  });
+});
+
+describe("useChatStore — the merged live co-pilot feed (live_copilot_message)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore();
+  });
+
+  it("appends an assistant message for the open meeting", () => {
+    useChatStore.getState().handleEvent({
+      kind: "live_copilot_message",
+      meeting_id: MEETING,
+      turn_id: 3,
+      role: "assistant",
+      content: "Action item: follow up with Alice.",
+    } as AppEvent);
+
+    const state = useChatStore.getState();
+    const last = state.messages[state.messages.length - 1];
+    expect(last.role).toBe("assistant");
+    expect(last.content).toBe("Action item: follow up with Alice.");
+    expect(last.turn_id).toBe(3);
+  });
+
+  it("ignores a live_copilot_message for a different meeting", () => {
+    useChatStore.getState().handleEvent({
+      kind: "live_copilot_message",
+      meeting_id: "some-other-meeting",
+      turn_id: 1,
+      role: "assistant",
+      content: "should not appear",
+    } as AppEvent);
+
+    expect(
+      useChatStore
+        .getState()
+        .messages.some((m) => m.content === "should not appear"),
+    ).toBe(false);
+  });
+
+  it("does not append an identical repeat of the last assistant message (dedupe guard)", () => {
+    useChatStore.setState({
+      messages: [
+        { role: "assistant", content: "Repeated note.", tool_calls: [], turn_id: 1 },
+      ],
+    });
+    useChatStore.getState().handleEvent({
+      kind: "live_copilot_message",
+      meeting_id: MEETING,
+      turn_id: 2,
+      role: "assistant",
+      content: "Repeated note.",
+    } as AppEvent);
+
+    expect(useChatStore.getState().messages).toHaveLength(1);
+  });
+});
+
+describe("useChatStore — setMeeting continues the live co-pilot session", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStore();
+  });
+
+  it("auto-opens the meeting's is_live session instead of leaving sessionId null", async () => {
+    const liveSession: ChatSession = {
+      id: "live-session",
+      meeting_id: MEETING,
+      title: null,
+      messages: [
+        { role: "assistant", content: "already in progress", tool_calls: [], turn_id: 0 },
+      ],
+      created_at: "2026-06-10T00:00:00Z",
+      updated_at: "2026-06-10T00:00:00Z",
+      is_live: true,
+    };
+    vi.mocked(listChatSessions).mockResolvedValueOnce([liveSession]);
+    vi.mocked(getChatSession).mockResolvedValueOnce(liveSession);
+
+    await useChatStore.getState().setMeeting(MEETING);
+
+    expect(getChatSession).toHaveBeenCalledWith(MEETING, "live-session");
+    const state = useChatStore.getState();
+    expect(state.sessionId).toBe("live-session");
+    expect(state.messages).toEqual(liveSession.messages);
+  });
+
+  it("leaves sessionId null when no session is live", async () => {
+    const finished: ChatSession = {
+      id: "old-session",
+      meeting_id: MEETING,
+      title: "Past chat",
+      messages: [],
+      created_at: "2026-06-10T00:00:00Z",
+      updated_at: "2026-06-10T00:00:00Z",
+      is_live: false,
+    };
+    vi.mocked(listChatSessions).mockResolvedValueOnce([finished]);
+
+    await useChatStore.getState().setMeeting(MEETING);
+
+    expect(getChatSession).not.toHaveBeenCalled();
+    expect(useChatStore.getState().sessionId).toBeNull();
   });
 });
 

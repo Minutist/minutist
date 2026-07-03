@@ -425,6 +425,22 @@ registration — no second registration. One pure public function.
   `#[serde(default, skip_serializing_if = "Option::is_none")]` so the common
   source-less case stays compact.
 
+- **Post-Stop continuation (`ipc-bridge::commands::load_or_new_session` /
+  `chat_turn_base_prompt`).** The meeting's `is_live` session is the co-pilot's
+  one conversation for the whole meeting lifetime, not just the recording
+  window. `send_chat_message` with `meeting_id` set and no `session_id` — the
+  webview's shape after Stop, before the user has picked a session — resolves
+  via `ChatStore::find_live` and continues that session; a fresh session is only
+  minted when the meeting genuinely has none. Because that turn now runs on the
+  non-live `run_chat_turn_on_held_model` path (the live worker has shut down),
+  `chat_turn_base_prompt` swaps the persona base to
+  `settings.live_agent_system_prompt` whenever `session.is_live`, so the
+  co-pilot's voice does not shift to the generic chat persona mid-conversation.
+  The tool registry and the "# Current meeting" scoping (`chat_system_prompt_for_meeting`)
+  are unchanged — the co-pilot keeps its own tools post-Stop. An explicit
+  `session_id` (an ordinary chat session opened alongside the live one) is
+  honoured as before and is unaffected.
+
 - `LiveDigest { meeting_id, generated_at_ms, action_items, decisions, open_asks,
   attachment_answers, unresolved_references }` — the full digest payload produced
   by the live agent on each refresh. Each category is a `Vec<LiveDigestItem>`.
@@ -2232,6 +2248,10 @@ uses an `Arc<Mutex<VecDeque<FlushPayload>>>` (capacity 4) + `Arc<Notify>`
 instead of a plain `mpsc`. On overflow the runner drops the **oldest**
 pending flush (not the newest) from the front of the deque and emits
 `AppEvent::ErrorOccurred`. Audio is always preserved in `audio.opus`.
+The live co-pilot driver (`ipc-bridge::live_agent::run_driver_task`) also
+subscribes to this event and pauses its own transcript-turn cadence for a
+cooldown window so it does not compound the backpressure — see
+`cross-cutting.md` "Cadence yields under ASR backpressure".
 
 **Panic safety (Phase 2 close-out).** Each per-flush `transcribe_chunk` call is wrapped in `std::panic::catch_unwind`; a panic is caught, converted to `AppError::Internal`, emitted as `AppEvent::ErrorOccurred`, and the worker continues to the next flush. A `worker_exited` flag on `FlushQueue` ensures `stop()` is never wedged by a terminated worker.
 
@@ -4011,8 +4031,11 @@ The driver has two halves:
   into `ChatToken` / `ChatTurnComplete` / `ChatError` events on the broadcast
   bus with the live session id, so the chat panel renders the reply exactly as
   it does for the non-live `LlamaTurnBackend` path. `LiveCopilotMessage` is NOT
-  emitted for UserChat turns (that would double-render in the co-pilot feed);
-  transcript-triggered replies still emit `LiveCopilotMessage` as before.
+  emitted for UserChat turns (it would double-render the reply that already
+  streamed as chat events); transcript-triggered replies still emit
+  `LiveCopilotMessage` as before. Both event families render into the SAME chat
+  timeline (there is no separate proactive-feed panel) — see `cross-cutting.md`
+  "One co-pilot surface".
 
 `spawn_live_agent` also accepts a **registry** (`Arc<Mutex<HashMap<MeetingId,
 LiveCopilotHandle>>>`). It inserts a `LiveCopilotHandle { user_tx }` keyed by

@@ -2168,6 +2168,27 @@ pub(crate) async fn read_meeting_title(
         .flatten()
 }
 
+/// Choose the persona base for a non-live chat turn (B2).
+///
+/// A session that is the meeting's live co-pilot session (`session_is_live`)
+/// keeps the co-pilot's own persona even when the turn runs on the non-live
+/// (`run_chat_turn_on_held_model`) path — e.g. post-Stop, once the live worker
+/// has shut down and no held-context session remains. Every other session
+/// (a fresh or ordinary chat) uses the standard chat persona. Both keep the
+/// same tool registry and the "# Current meeting" scoping applied afterwards
+/// by [`chat_system_prompt_for_meeting`] — only the base voice differs.
+pub(crate) fn chat_turn_base_prompt<'a>(
+    session_is_live: bool,
+    chat_system_prompt: &'a str,
+    live_agent_system_prompt: &'a str,
+) -> &'a str {
+    if session_is_live {
+        live_agent_system_prompt
+    } else {
+        chat_system_prompt
+    }
+}
+
 /// Scope the chat system prompt to the open meeting.
 ///
 /// When the chat is meeting-scoped, the agent must GROUND its answers in that
@@ -2512,17 +2533,26 @@ pub async fn send_chat_message(
     // default to this meeting) instead of asking the user for a meeting id.
     // The output-language instruction is appended last so it wins over any
     // conflicting text in a custom chat_system_prompt.
+    //
+    // A session that is the meeting's live co-pilot session (`is_live`) keeps
+    // the co-pilot's persona (`live_agent_system_prompt`) even though it now
+    // runs on this non-live turn path post-Stop — otherwise the voice would
+    // shift mid-conversation from co-pilot to generic chat assistant. It still
+    // gets the full tool registry and the "# Current meeting" scoping below,
+    // so the co-pilot can look things up after recording ends. Ordinary
+    // (non-live) sessions are unaffected.
     let title = match meeting_id {
         Some(mid) => read_meeting_title(&meetings_dir, mid).await,
         None => None,
     };
     let current_settings = state.settings.current();
+    let base_prompt = chat_turn_base_prompt(
+        session.is_live,
+        &current_settings.chat_system_prompt,
+        &current_settings.live_agent_system_prompt,
+    );
     let system_prompt = apply_output_language(
-        &chat_system_prompt_for_meeting(
-            &current_settings.chat_system_prompt,
-            meeting_id,
-            title.as_deref(),
-        ),
+        &chat_system_prompt_for_meeting(base_prompt, meeting_id, title.as_deref()),
         &current_settings.output_language,
     );
     let registry = Arc::clone(&state.tool_registry);
@@ -2966,10 +2996,15 @@ pub async fn delete_chat_session(
 
 /// Load the session named by `session_id` for `meeting_id`, or build a fresh one.
 ///
-/// A given `(meeting_id, session_id)` that exists is loaded; otherwise a new
-/// session with a fresh id is returned (and `session_id`, if it was supplied but
-/// not found, is honoured so the webview's chosen id is kept). Blocking reads on
-/// `spawn_blocking`.
+/// A given `(meeting_id, session_id)` that exists is loaded; otherwise, when no
+/// `session_id` was supplied, the meeting's live co-pilot session (if any) is
+/// continued — `send_chat_message` from the webview after Stop omits
+/// `session_id` on the meeting's first post-recording open, and the
+/// conversation the co-pilot held during recording must carry on rather than
+/// be orphaned behind a fresh, unrelated session. Only when neither an exact
+/// match nor a live session exists is a new session (with a fresh id, or the
+/// caller-supplied `session_id` if one was given but not found) returned.
+/// Blocking reads on `spawn_blocking`.
 pub(crate) async fn load_or_new_session(
     meetings_dir: &std::path::Path,
     meeting_id: Option<MeetingId>,
@@ -2987,6 +3022,21 @@ pub(crate) async fn load_or_new_session(
             .map_err(IpcError::from)?;
         if let Some(session) = existing {
             return Ok(session);
+        }
+    }
+
+    if session_id.is_none() {
+        if let Some(mid) = meeting_id {
+            let dir = meetings_dir.to_path_buf();
+            let live = tokio::task::spawn_blocking(move || ChatStore::find_live(&dir, mid))
+                .await
+                .map_err(|e| AppError::Internal {
+                    context: format!("load_or_new_session live lookup task join failed: {e}"),
+                })?
+                .map_err(IpcError::from)?;
+            if let Some(session) = live {
+                return Ok(session);
+            }
         }
     }
 
@@ -4836,6 +4886,86 @@ mod tests {
         );
         assert_eq!(tool.tool_name.as_deref(), Some("get_summary"));
         assert_eq!(loaded.messages.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // load_or_new_session — post-Stop continuation of the live co-pilot
+    // session (B1): a `send_chat_message` with no `session_id` must continue
+    // the meeting's live session rather than mint an unrelated fresh one.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn load_or_new_session_continues_the_live_session_when_none_given() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = MeetingId::new();
+        MeetingFolder::create(root, meeting_id).expect("meeting folder");
+
+        let live = ChatStore::load_or_create_live(root, meeting_id, "2026-07-01T00:00:00Z")
+            .expect("create live session");
+
+        let loaded = load_or_new_session(root, Some(meeting_id), None)
+            .await
+            .expect("load_or_new_session");
+        assert_eq!(
+            loaded.id, live.id,
+            "no session_id given must continue the meeting's live session, not mint a fresh one"
+        );
+        assert!(loaded.is_live);
+    }
+
+    #[tokio::test]
+    async fn load_or_new_session_mints_fresh_session_when_no_live_session_exists() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = MeetingId::new();
+        MeetingFolder::create(root, meeting_id).expect("meeting folder");
+
+        let session = load_or_new_session(root, Some(meeting_id), None)
+            .await
+            .expect("load_or_new_session");
+        assert!(
+            !session.is_live,
+            "with no live session on disk, a fresh non-live session is minted"
+        );
+        assert!(session.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_or_new_session_honours_an_explicit_session_id_over_the_live_session() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let meeting_id = MeetingId::new();
+        MeetingFolder::create(root, meeting_id).expect("meeting folder");
+
+        // A live session exists, but the caller explicitly names a different,
+        // not-yet-persisted session id — that id must be honoured, not silently
+        // swapped for the live session.
+        ChatStore::load_or_create_live(root, meeting_id, "2026-07-01T00:00:00Z")
+            .expect("create live session");
+        let explicit_sid = ChatSessionId::new();
+
+        let session = load_or_new_session(root, Some(meeting_id), Some(explicit_sid))
+            .await
+            .expect("load_or_new_session");
+        assert_eq!(session.id, explicit_sid);
+        assert!(!session.is_live);
+    }
+
+    // -----------------------------------------------------------------------
+    // chat_turn_base_prompt — the co-pilot keeps its own persona post-Stop (B2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_session_keeps_the_copilot_persona() {
+        let base = chat_turn_base_prompt(true, "Ordinary chat persona.", "Co-pilot persona.");
+        assert_eq!(base, "Co-pilot persona.");
+    }
+
+    #[test]
+    fn ordinary_session_uses_the_chat_persona() {
+        let base = chat_turn_base_prompt(false, "Ordinary chat persona.", "Co-pilot persona.");
+        assert_eq!(base, "Ordinary chat persona.");
     }
 
     // -----------------------------------------------------------------------

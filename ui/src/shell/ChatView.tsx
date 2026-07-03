@@ -71,9 +71,14 @@ export function ChatView({ meetingId }: ChatViewProps) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streaming, toolActivity]);
 
-  // The system message (turn 0) is the persona/context prompt — not shown.
+  // The system message (turn 0) is the persona/context prompt, and a "digest"
+  // message is raw transcript context auto-fed to the co-pilot (it belongs in
+  // the transcript pane, not as a chat bubble) — neither is shown here. The
+  // co-pilot's proactive OUTPUT still renders as an ordinary assistant bubble
+  // (see `state/chat.ts`'s handling of `live_copilot_message`), so co-pilot
+  // observations and chat replies read as one continuous conversation.
   const visibleMessages = useMemo(
-    () => messages.filter((m) => m.role !== "system"),
+    () => messages.filter((m) => m.role !== "system" && m.role !== "digest"),
     [messages],
   );
 

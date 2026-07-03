@@ -41,6 +41,14 @@
  * `session_id` is not the currently-open session is IGNORED, so a turn streaming
  * for a backgrounded session never clobbers the open one (the pane shows a
  * single session at a time).
+ *
+ * The live co-pilot's proactive feed is folded into this same timeline:
+ * `live_copilot_message` (scoped by `meeting_id`, not `session_id` — it is the
+ * co-pilot speaking unprompted, not a reply to the open session's turn) is
+ * appended to `messages` as an assistant message when it matches the open
+ * meeting. There is no separate digest pane; a persisted `"digest"` message
+ * (raw transcript context fed to the model) is excluded from the rendered
+ * timeline by `ChatView`, not by this store.
  */
 import { create } from "zustand";
 import {
@@ -94,7 +102,11 @@ export type ChatStore = {
    */
   historyTrimmed: boolean;
 
-  /** Scope the chat to a meeting (on open); loads its sessions. */
+  /**
+   * Scope the chat to a meeting (on open); loads its sessions and, if the
+   * meeting has an ongoing live co-pilot session (`is_live === true`), opens
+   * it so the conversation continues rather than starting blank.
+   */
   setMeeting: (meetingId: MeetingId | null) => Promise<void>;
   /** Refresh the session list for the open meeting (the switcher). */
   loadSessions: () => Promise<void>;
@@ -148,6 +160,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
     if (meetingId === null) return;
     await get().loadSessions();
+    // Continue the meeting's live co-pilot session, if one exists, instead of
+    // leaving `sessionId` null — so (re)mounting the chat pane shows the
+    // ongoing co-pilot conversation rather than a blank "new session"
+    // placeholder. At most one session per meeting has `is_live === true`.
+    if (get().meetingId !== meetingId) return; // a later setMeeting won the race
+    const liveSession = get().sessions.find((s) => s.is_live === true);
+    if (liveSession) {
+      await get().openSession(liveSession.id);
+    }
   },
 
   loadSessions: async () => {
@@ -304,6 +325,38 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   handleEvent: (event) => {
+    // `live_copilot_message` is scoped by MEETING id, not session id (the
+    // event predates the concept of "the open session" — it is the live
+    // co-pilot speaking proactively) — handle it separately from the
+    // session-scoped switch below. Folds the co-pilot's proactive feed into
+    // the chat timeline as one continuous conversation instead of a separate
+    // pane: appended as an assistant message so it renders as an assistant
+    // bubble alongside ordinary chat replies.
+    if (event.kind === "live_copilot_message") {
+      const { meetingId, messages } = get();
+      if (meetingId === null || event.meeting_id !== meetingId) return;
+      const last = messages[messages.length - 1];
+      // Defensive dedupe: skip if the last message is already this exact
+      // assistant reply. In practice this event is emitted only for
+      // transcript-driven turns (not the reply to a user-typed message, which
+      // already arrives via `chat_turn_complete`), so no duplicate occurs.
+      if (last?.role === "assistant" && last.content === event.content) {
+        return;
+      }
+      set({
+        messages: [
+          ...messages,
+          {
+            role: "assistant",
+            content: event.content,
+            tool_calls: [],
+            turn_id: event.turn_id,
+          },
+        ],
+      });
+      return;
+    }
+
     switch (event.kind) {
       case "chat_token":
       case "chat_tool_call":

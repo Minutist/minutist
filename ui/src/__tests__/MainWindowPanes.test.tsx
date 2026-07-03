@@ -12,7 +12,10 @@
  * - a LIVE recording defaults to notes + transcript (no summary column);
  * - the toggle shows/hides a pane and reflects visibility via `aria-pressed`;
  * - a resize handle renders between visible panes and a drag does not throw;
- * - the last visible pane cannot be hidden.
+ * - the last visible pane cannot be hidden;
+ * - a pane the user reveals mid-recording is NOT collapsed when the recording
+ *   stops (the entry-default reset fires once, on entering the workspace, not
+ *   on every live→finished flip).
  *
  * Numeric resize outcomes (exact pixel/percent sizes) are not asserted: they
  * depend on measured element dimensions, which jsdom reports as 0.
@@ -188,7 +191,7 @@ describe("MainWindow workspace columns", () => {
     expect(screen.getAllByRole("separator")).toHaveLength(2);
   });
 
-  it("re-defaults to notes + summary when a recording stops and the meeting opens", async () => {
+  it("shows notes + summary once a recording stops and the meeting opens", async () => {
     // Start live (notes only — transcript hidden, no summary).
     act(() => {
       useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
@@ -202,7 +205,11 @@ describe("MainWindow workspace columns", () => {
     expect(screen.queryByTestId("summary")).not.toBeInTheDocument();
 
     // Recording stops and the just-recorded meeting is opened (idle + open id):
-    // the mode flips to finished IN PLACE and the reset re-defaults the panes.
+    // the workspace stays continuously "open" through the flip (`inWorkspace`
+    // never drops to false), so the entry-default pane visibility set when the
+    // recording started is untouched — the Summary column simply appears
+    // because `showSummaryPane` itself now evaluates true, not because
+    // anything reset.
     act(() => {
       useRecordingStore.setState({ state: { kind: "idle" } });
       useMeetingsStore.setState({
@@ -214,6 +221,39 @@ describe("MainWindow workspace columns", () => {
       expect(screen.getByTestId("summary")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("transcript")).not.toBeInTheDocument();
+  });
+
+  it("does not collapse a pane the user revealed mid-recording when the recording stops", async () => {
+    // Guards the F1 fix directly: previously, stopping a recording re-ran the
+    // per-mode pane defaults and forced a user-revealed pane shut again. Now
+    // the defaults are applied only once, on entering the workspace, so a
+    // pane the user opened mid-recording survives the live→finished flip.
+    act(() => {
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+      useRecordingStore.setState({
+        state: { kind: "recording", meeting_id: "rec-1", started_at_ms: 0 },
+      });
+    });
+    render(<MainWindow />);
+    await waitFor(() => expect(screen.getByTestId("notes")).toBeInTheDocument());
+
+    act(() => fireEvent.click(segment("Attachments")));
+    expect(screen.getByTestId("attachments")).toBeInTheDocument();
+    await waitFor(() => expect(listAttachments).toHaveBeenCalledWith("rec-1"));
+
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" } });
+      useMeetingsStore.setState({
+        openMeetingId: "rec-1",
+        openMeetingState: null,
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("summary")).toBeInTheDocument(),
+    );
+    // The Attachments pane the user opened before Stop is still open.
+    expect(screen.getByTestId("attachments")).toBeInTheDocument();
+    expect(segment("Attachments")).toHaveAttribute("aria-pressed", "true");
   });
 
   it("the Attachments pane is hidden by default but revealable via the toggle", async () => {

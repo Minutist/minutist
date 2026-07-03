@@ -91,6 +91,34 @@ describe("ChatView (Phase 9)", () => {
     expect(screen.getByText("Bold").tagName.toLowerCase()).toBe("strong");
   });
 
+  it("does not render a digest-role message as a bubble", async () => {
+    render(<ChatView meetingId={MEETING} />);
+    await waitFor(() => expect(listChatSessions).toHaveBeenCalled());
+    act(() => {
+      useChatStore.setState({
+        sessionId: SESSION,
+        messages: [
+          {
+            role: "digest",
+            content: "raw transcript context fed to the model",
+            tool_calls: [],
+            turn_id: 0,
+          },
+          {
+            role: "assistant",
+            content: "Here's what stood out.",
+            tool_calls: [],
+            turn_id: 1,
+          },
+        ],
+      });
+    });
+    expect(
+      screen.queryByText(/raw transcript context fed to the model/i),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/what stood out/i)).toBeInTheDocument();
+  });
+
   it("typing + Enter sends through the seam and shows the user message", async () => {
     render(<ChatView meetingId={MEETING} />);
     await waitFor(() => expect(listChatSessions).toHaveBeenCalled());

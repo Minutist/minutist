@@ -6,7 +6,6 @@ import { useModelsStore } from "../state/models";
 import { useMeetingsStore } from "../state/meetings";
 import { useReportProblemStore } from "../state/report-problem";
 import { useSyncStatusStore } from "../state/sync-status";
-import { useLiveCopilotStore } from "../state/liveCopilot";
 import { MeetingControls } from "./MeetingControls";
 import { AudioMeter } from "./AudioMeter";
 import { ModelDownloadStatus } from "./ModelDownloadStatus";
@@ -17,7 +16,6 @@ import { MeetingList } from "./MeetingList";
 import { SummaryView } from "./SummaryView";
 import { AttachmentsPane } from "./AttachmentsPane";
 import { ChatView } from "./ChatView";
-import { LiveDigestPanel } from "./LiveDigestPanel";
 import { SettingsDrawer } from "./SettingsDrawer";
 import { About } from "./About";
 import { UpdateBanner } from "./UpdateBanner";
@@ -97,7 +95,6 @@ export function MainWindow() {
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
   const closeMeeting = useMeetingsStore((s) => s.close);
-  const copilotHasMessages = useLiveCopilotStore((s) => s.hasMessages);
   // Re-processing (re-transcribe / re-identify speakers) is a rare action that
   // lives in the transcript pane's action toolbar (#67) — see TranscriptPane —
   // not on this heading or the meeting list.
@@ -149,18 +146,11 @@ export function MainWindow() {
   // (unlike summary). Hidden by default; one click on the toggle reveals it.
   const showAttachmentsPane = inWorkspace && activeMeetingId !== null;
 
-  // The co-pilot toggle is offered once the co-pilot has emitted at least one
-  // proactive message for this meeting. This is the natural gate for the
-  // repurposed pane: no message, no toggle. When `mode=Off` the backend never
-  // spawns the agent, so no event fires and the panel stays hidden.
-  const showLiveDigestPane =
-    activeMeetingId !== null &&
-    isLiveRecording &&
-    copilotHasMessages(activeMeetingId);
-
   // Pane visibility (FR-21/FR-30). Panes are included/excluded from the Group
-  // rather than collapsed to zero width. Reset to the per-mode default whenever
-  // the workspace is (re-)entered or the mode flips (see the effect below).
+  // rather than collapsed to zero width. Set to the entry default when the
+  // workspace is (re-)entered (see the effect below); never reset again while
+  // it stays open, so stopping a recording does not disturb what the user has
+  // open.
   const [notesShown, setNotesShown] = useState(true);
   const [transcriptShown, setTranscriptShown] = useState(true);
   const [summaryShown, setSummaryShown] = useState(true);
@@ -169,8 +159,6 @@ export function MainWindow() {
   const [chatShown, setChatShown] = useState(false);
   // Attachments are OFF by default; one click on the toggle reveals the column.
   const [attachmentsShown, setAttachmentsShown] = useState(false);
-  // Live digest is OFF by default; one click on the toggle reveals the column.
-  const [liveDigestShown, setLiveDigestShown] = useState(false);
 
   // The About dialog (Phase 7, S6) is hidden by default; a header affordance
   // opens it. Presentational overlay; closing returns to the prior surface.
@@ -191,16 +179,22 @@ export function MainWindow() {
     void prewarmAsr();
   }, [refreshDevices, refreshSettings, refreshModels, prewarmAsr]);
 
-  // Reset pane visibility to the per-mode default. The deps are deliberately
-  // [inWorkspace, showSummaryPane] only: this fires on entering the workspace
-  // and on the finished-meeting↔live-recording mode flip, but NOT on benign
-  // re-renders within a mode (e.g. pause/resume), so a transcript the user
-  // revealed stays open. (Do NOT add `openMeetingId` here — it would re-default
-  // the panes on every meeting switch, which already happens for free via the
-  // meeting list remounting the workspace.) The live transcript is HIDDEN by
-  // default in both modes — a scrolling transcript distracts from note-taking —
-  // and is one click away on the toggle. Finished: notes + summary. Recording:
-  // notes only. A LAYOUT effect so the corrected visibility commits before paint
+  // Apply the entry-default pane visibility once, when the workspace is
+  // (re-)entered. The dep array is deliberately `[inWorkspace]` ONLY, so this
+  // fires when `inWorkspace` flips false→true (opening a meeting, or starting
+  // a recording, from the meeting-list entry surface) and does NOT refire for
+  // the rest of that workspace session — in particular NOT on the live→finished
+  // flip when a recording stops (`inWorkspace` stays true the whole way through
+  // recording → stopping → finalising → the opened finished meeting; see its
+  // definition above), so stopping a recording never collapses or re-hides
+  // whichever panes the user had open. `showSummaryPane` itself still switches
+  // with the mode (it is derived fresh every render), so the Summary column
+  // appears/disappears correctly without this effect re-running. (Do NOT add
+  // `openMeetingId` here — it would re-default the panes on every meeting
+  // switch, which already happens for free via the meeting list remounting the
+  // workspace.) The live transcript is HIDDEN by default in both modes — a
+  // scrolling transcript distracts from note-taking — and is one click away on
+  // the toggle. A LAYOUT effect so the default visibility commits before paint
   // (the workspace never flashes the all-panes initial state for a frame).
   useLayoutEffect(() => {
     if (!inWorkspace) return;
@@ -209,8 +203,7 @@ export function MainWindow() {
     setSummaryShown(true); // only rendered when showSummaryPane (finished meeting)
     setChatShown(false); // chat is one click away on the toggle
     setAttachmentsShown(false); // attachments are one click away on the toggle
-    setLiveDigestShown(false); // live digest is one click away on the toggle
-  }, [inWorkspace, showSummaryPane]);
+  }, [inWorkspace]);
 
   // How many panes are currently visible — used to forbid hiding the last one.
   const visibleCount =
@@ -218,8 +211,7 @@ export function MainWindow() {
     (transcriptShown ? 1 : 0) +
     (showSummaryPane && summaryShown ? 1 : 0) +
     (showChatPane && chatShown ? 1 : 0) +
-    (showAttachmentsPane && attachmentsShown ? 1 : 0) +
-    (showLiveDigestPane && liveDigestShown ? 1 : 0);
+    (showAttachmentsPane && attachmentsShown ? 1 : 0);
 
   function togglePane(shown: boolean, setShown: (next: boolean) => void) {
     // Never hide the last visible pane — the workspace must show something.
@@ -335,18 +327,6 @@ export function MainWindow() {
                   }
                 >
                   Attachments
-                </button>
-              )}
-              {showLiveDigestPane && (
-                <button
-                  type="button"
-                  className="main-window__view-seg"
-                  aria-pressed={liveDigestShown}
-                  onClick={() =>
-                    togglePane(liveDigestShown, setLiveDigestShown)
-                  }
-                >
-                  Co-pilot
                 </button>
               )}
             </div>
@@ -520,19 +500,6 @@ export function MainWindow() {
                   defaultSize="30%"
                 >
                   <AttachmentsPane meetingId={activeMeetingId} />
-                </Panel>
-              ),
-            showLiveDigestPane &&
-              liveDigestShown &&
-              activeMeetingId !== null && (
-                <Panel
-                  key="live-digest"
-                  id="live-digest"
-                  className="main-window__pane main-window__pane--live-digest"
-                  minSize="18%"
-                  defaultSize="28%"
-                >
-                  <LiveDigestPanel meetingId={activeMeetingId} />
                 </Panel>
               ),
           ])}

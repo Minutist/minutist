@@ -61,13 +61,21 @@ frontend branching. If the channel closes without a terminal chunk but tokens we
 streamed (a `Done` dropped on a full buffer), the drain reconstructs
 `ChatTurnComplete` from the streamed text so the turn still completes.
 
-**Split co-pilot surfaces (U4).** The live co-pilot feeds TWO separate surfaces:
-- **Co-pilot feed** (`LiveCopilotMessage` events → `LiveDigestPanel`): transcript-triggered
-  assistant replies only (turn kind = `Transcript`). The panel accumulates these as
-  proactive observations/alerts visible to the user during the meeting.
-- **Chat panel** (`ChatToken` / `ChatTurnComplete` events → `ChatView`): user-typed
-  message replies only (turn kind = `UserChat`). The reply flows on `reply_tx`;
-  `LiveCopilotMessage` is NOT emitted for user-chat turns to prevent double-rendering.
+**One co-pilot surface (unified chat timeline).** The chat panel (`ChatView`) is
+the co-pilot's ONLY visible surface — there is no separate proactive-feed panel.
+Two distinct event families still carry the two turn kinds (the backend routing
+is unchanged from U4), but both now render into the same chronological timeline:
+- **Transcript-triggered turns** (`LiveCopilotMessage` events, turn kind =
+  `Transcript`): the chat store appends these as ASSISTANT-role messages when the
+  event's `meeting_id` matches the open meeting.
+- **User-typed turns** (`ChatToken` / `ChatTurnComplete` events, turn kind =
+  `UserChat`): stream on `reply_tx` as before. `LiveCopilotMessage` is NOT emitted
+  for user-chat turns (unchanged — it would double-render the reply that already
+  streamed as chat events).
+
+`ChatRole::Digest` turns (the raw transcript window fed to the model, persisted
+in the same `is_live` session for engine context) are excluded from the
+rendered timeline — they are model input, not a co-pilot utterance.
 
 **Co-pilot system prompt (U2/U4).** The pinned prefix uses
 `settings.live_agent_system_prompt`, which is the CO-PILOT role (answer the user
@@ -988,6 +996,19 @@ categories. Cross-cutting rules:
   min_seconds`, and `!in_flight`. The AND gate (not OR) prevents premature
   refreshes during sparse meetings with few utterances.
 
+- **Cadence yields under ASR backpressure.** The driver also watches the shared
+  `AppEvent` bus for the orchestrator's flush-queue-full signal (see
+  "ASR flush backpressure" in `components.md`) — matched defensively on the
+  rendered error text (`is_asr_backpressure_error`), not a dedicated event
+  variant. On a match it sets a cooldown (`asr_pressure_until`, 8 s) during which
+  a transcript turn that is otherwise due is skipped (`tracing::debug!`) rather
+  than dispatched — the co-pilot's own decode would otherwise compete with the
+  ASR worker for the same CPU/GPU cycles while it is already dropping flushes.
+  Skipped ticks are not lost: `tail`/`new_segments` stay accumulated and the next
+  cadence check (once the cooldown elapses) picks up everything gathered in the
+  meantime. The user-chat lane is never gated — a user message is always
+  dispatched immediately regardless of ASR pressure.
+
 - **User-chat transcript flush.** The cadence gate batches transcript into the
   held context; between fires, recent segments sit un-batched in the driver's
   `tail`. A user chat turn is high-priority (`user_msg_rx` drained before the
@@ -1085,9 +1106,22 @@ categories. Cross-cutting rules:
   context. n_ctx = 32 768.
 
 - **Co-pilot panel is PASSIVE.** The live agent never writes to the transcript,
-  notes, or metadata. It is a read/compute-only agent in v1. The co-pilot chat
-  panel receives `AppEvent::LiveCopilotMessage` events and renders them passively;
-  it does NOT interrupt the user or modify any meeting document.
+  notes, or metadata. It is a read/compute-only agent in v1. The chat panel
+  receives `AppEvent::LiveCopilotMessage` events and appends them to the
+  timeline passively; it does NOT interrupt the user or modify any meeting
+  document.
+
+- **The co-pilot persona survives Stop.** The meeting's `is_live` chat session
+  is the co-pilot's single conversation, live or finished. Recording end does
+  not start a new session or switch persona: `send_chat_message` with no
+  `session_id` continues the meeting's live session (`ChatStore::find_live`)
+  rather than minting an unrelated one, and — because that turn now runs on the
+  ordinary (non-live) `run_chat_turn_on_held_model` path once the live worker
+  has shut down — the base system prompt for an `is_live` session is
+  `settings.live_agent_system_prompt`, not `settings.chat_system_prompt`. It
+  still gets the full tool registry and the "# Current meeting" scoping applied
+  to every meeting-scoped chat turn, so the co-pilot can look things up
+  post-Stop. Ordinary (non-live) sessions are unaffected.
 
 - **Events ride the existing bus.** `LiveCopilotMessage` and `LiveDigestError`
   ride the existing `AppEventPayload` newtype + the single

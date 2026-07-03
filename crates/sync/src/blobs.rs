@@ -1213,10 +1213,17 @@ pub(crate) fn record_artifact_authority(
 /// Whether an export fsync/rename io error is a transient Windows sharing/access
 /// violation worth retrying (an antivirus scan or indexer briefly holding the
 /// tmp handle): `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32),
-/// `ERROR_LOCK_VIOLATION` (33). On other platforms these raw codes do not arise
-/// from the export path, so it returns `false` and the export never retries.
+/// `ERROR_LOCK_VIOLATION` (33). This mitigation is Windows-only — off Windows the
+/// same raw codes mean unrelated, genuine errors (notably `EIO` is also errno 5),
+/// so a fsync/rename failure there is not transient and the export never retries.
+#[cfg(windows)]
 fn is_transient_export_lock(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
+#[cfg(not(windows))]
+fn is_transient_export_lock(_err: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -1224,17 +1231,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transient_export_lock_matches_windows_share_violations() {
-        // The three Win32 codes an AV/indexer lock surfaces on the tmp handle.
+    fn transient_export_lock_is_windows_only() {
+        // The three Win32 codes an AV/indexer lock surfaces on the tmp handle are
+        // transient ONLY on Windows; off Windows the same raw codes mean unrelated
+        // genuine errors (e.g. EIO = 5) and must NOT be retried.
+        #[cfg(windows)]
         for code in [5, 32, 33] {
             assert!(
                 is_transient_export_lock(&std::io::Error::from_raw_os_error(code)),
-                "os error {code} should be retryable"
+                "os error {code} should be retryable on Windows"
             );
         }
-        // Terminal errors are not retried: a genuine ENOENT/permission-shaped
-        // failure, or a non-OS error, must surface immediately.
-        assert!(!is_transient_export_lock(&std::io::Error::from_raw_os_error(2)));
+        #[cfg(not(windows))]
+        for code in [5, 32, 33] {
+            assert!(
+                !is_transient_export_lock(&std::io::Error::from_raw_os_error(code)),
+                "os error {code} must not be retried off Windows (genuine error)"
+            );
+        }
+        // A clearly non-lock error is terminal everywhere.
         assert!(!is_transient_export_lock(&std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "no os code"

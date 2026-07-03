@@ -454,53 +454,49 @@ impl BlobStore {
             .export(hash, &tmp)
             .await
             .map_err(|e| Error::Protocol(format!("exporting blob {hash} to {tmp:?}: {e}")))?;
-        // fsync the exported tmp (so the rename cannot commit a name pointing at
-        // not-yet-durable bytes — matches persistence's atomic writers), then
-        // atomically rename over `target`.
-        //
-        // Retry the fsync+rename on a transient Windows sharing/access violation:
-        // an antivirus real-time scan (or a search indexer) can briefly hold an
-        // open handle to the freshly-written tmp, failing the fsync-open or the
-        // rename with ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION /
-        // ERROR_LOCK_VIOLATION. The scan releases within milliseconds, so back off
-        // and retry rather than tear down the whole media/artifacts connection over
-        // a lock that is already gone — the bytes are already durable and
-        // content-verified in the blob store; only this exported copy is at risk.
-        // On non-Windows platforms those codes do not arise here, so the first
-        // attempt always wins.
-        const EXPORT_RETRY_BACKOFF_MS: [u64; 5] = [20, 50, 100, 250, 500];
-        let mut attempt = 0usize;
-        loop {
-            let finalized = std::fs::File::open(&tmp)
-                .and_then(|f| f.sync_all())
-                .and_then(|()| std::fs::rename(&tmp, target));
-            match finalized {
-                Ok(()) => return Ok(()),
-                Err(e)
-                    if is_transient_export_lock(&e) && attempt < EXPORT_RETRY_BACKOFF_MS.len() =>
-                {
-                    tracing::warn!(
-                        target: "sync",
-                        tmp = ?tmp,
-                        attempt,
-                        error = %e,
-                        "export fsync/rename hit a transient sharing violation; retrying"
-                    );
-                    tokio::time::sleep(Duration::from_millis(EXPORT_RETRY_BACKOFF_MS[attempt]))
-                        .await;
-                    attempt += 1;
-                }
-                Err(e) => {
-                    // Leave no tmp residue on a terminal failure (the next download
-                    // overwrites it regardless, but a directory-scanning slice should
-                    // not see it).
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err(Error::Protocol(format!(
-                        "finalising export {tmp:?} → {target:?}: {e}"
-                    )));
-                }
+        // Best-effort fsync of the exported tmp: on a clean host this makes the
+        // rename below commit durable bytes (matching persistence's atomic
+        // writers), but it is NOT required — the authoritative, content-verified
+        // copy lives in the blob store, so a lost export self-heals on the next
+        // media sync. On Windows an antivirus real-time scan of the freshly-written
+        // tmp frequently holds its handle and fails THIS open with a sharing
+        // violation (the observed failure); treat that as best-effort and proceed
+        // to the rename rather than fail the whole media/artifacts connection over
+        // a durability nicety. A genuine (non-lock) fsync error still fails fast.
+        match std::fs::File::open(&tmp).and_then(|f| f.sync_all()) {
+            Ok(()) => {}
+            Err(e) if is_transient_export_lock(&e) => tracing::debug!(
+                target: "sync",
+                tmp = ?tmp,
+                error = %e,
+                "export tmp fsync skipped under a transient lock; relying on blob-store durability"
+            ),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Protocol(format!("fsyncing export tmp {tmp:?}: {e}")));
             }
         }
+        // Atomically rename the tmp over `target`, retrying on a transient Windows
+        // sharing violation (an antivirus scan holding the tmp/target handle) with
+        // exponential backoff over a wide (~9.5s) budget — a real-time scan of a
+        // fresh file can hold it for several seconds, and delivering the file a few
+        // seconds late beats tearing down the connection and delivering nothing.
+        // Terminal errors fail fast and leave no tmp residue (the next media sync
+        // re-exports regardless). The retry never fires on non-Windows platforms
+        // (those raw codes are not transient there — see `is_transient_export_lock`).
+        const RENAME_RETRY_BACKOFF_MS: [u64; 8] = [50, 100, 200, 400, 800, 1500, 2500, 4000];
+        retry_on_transient(
+            || std::fs::rename(&tmp, target),
+            is_transient_export_lock,
+            &RENAME_RETRY_BACKOFF_MS,
+        )
+        .await
+        .map_err(|e| {
+            // Terminal or budget-exhausted failure: leave no tmp residue — the next
+            // media sync re-exports regardless.
+            let _ = std::fs::remove_file(&tmp);
+            Error::Protocol(format!("renaming export {tmp:?} → {target:?}: {e}"))
+        })
     }
 
     /// Export a just-downloaded blob to `target` and pin it under `tag_name`,
@@ -1226,6 +1222,41 @@ fn is_transient_export_lock(_err: &std::io::Error) -> bool {
     false
 }
 
+/// Run a fallible filesystem finalize step (`op`), retrying while `is_retryable`
+/// says its error is transient — sleeping `backoff_ms[attempt]` between tries and
+/// giving up once the schedule is exhausted (returning the last error) or the
+/// error is terminal. Used for the export rename under a Windows AV lock; the
+/// retry predicate is injected (rather than calling [`is_transient_export_lock`]
+/// directly) so the loop is testable independently of the platform-gated
+/// classifier.
+async fn retry_on_transient<F, P>(
+    mut op: F,
+    is_retryable: P,
+    backoff_ms: &[u64],
+) -> std::io::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+    P: Fn(&std::io::Error) -> bool,
+{
+    let mut attempt = 0usize;
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(e) if is_retryable(&e) && attempt < backoff_ms.len() => {
+                tracing::warn!(
+                    target: "sync",
+                    attempt,
+                    error = %e,
+                    "export rename hit a transient sharing violation; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms[attempt])).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +1285,64 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "no os code"
         )));
+    }
+
+    #[tokio::test]
+    async fn retry_on_transient_succeeds_after_transient_failures() {
+        // Fails twice (transient), then succeeds — the export rename recovering
+        // once the AV lock releases.
+        let calls = std::cell::Cell::new(0u32);
+        let res = retry_on_transient(
+            || {
+                let n = calls.get();
+                calls.set(n + 1);
+                if n < 2 {
+                    Err(std::io::Error::from_raw_os_error(5))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| true,
+            &[1, 1, 1, 1],
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(calls.get(), 3, "two failures then success = 3 calls");
+    }
+
+    #[tokio::test]
+    async fn retry_on_transient_gives_up_after_the_bound() {
+        // Always transiently fails: initial attempt + one retry per backoff entry,
+        // then the last error surfaces.
+        let calls = std::cell::Cell::new(0u32);
+        let res = retry_on_transient(
+            || {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::from_raw_os_error(5))
+            },
+            |_| true,
+            &[1, 1, 1],
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 4, "initial + 3 retries, then give up");
+    }
+
+    #[tokio::test]
+    async fn retry_on_transient_does_not_retry_terminal_errors() {
+        // A non-retryable error surfaces immediately, no retries.
+        let calls = std::cell::Cell::new(0u32);
+        let res = retry_on_transient(
+            || {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::from_raw_os_error(2))
+            },
+            |_| false,
+            &[1, 1, 1],
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(calls.get(), 1, "terminal error is not retried");
     }
 
     #[test]

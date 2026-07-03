@@ -454,17 +454,53 @@ impl BlobStore {
             .export(hash, &tmp)
             .await
             .map_err(|e| Error::Protocol(format!("exporting blob {hash} to {tmp:?}: {e}")))?;
-        // fsync the exported tmp so the rename below cannot commit a name that
-        // points at not-yet-durable bytes (matches persistence's atomic writers).
-        std::fs::File::open(&tmp)
-            .and_then(|f| f.sync_all())
-            .map_err(|e| Error::Protocol(format!("fsyncing export tmp {tmp:?}: {e}")))?;
-        std::fs::rename(&tmp, target).map_err(|e| {
-            // Leave no tmp residue on a failed rename (the next download overwrites
-            // it regardless, but a directory-scanning slice should not see it).
-            let _ = std::fs::remove_file(&tmp);
-            Error::Protocol(format!("atomically renaming {tmp:?} -> {target:?}: {e}"))
-        })
+        // fsync the exported tmp (so the rename cannot commit a name pointing at
+        // not-yet-durable bytes — matches persistence's atomic writers), then
+        // atomically rename over `target`.
+        //
+        // Retry the fsync+rename on a transient Windows sharing/access violation:
+        // an antivirus real-time scan (or a search indexer) can briefly hold an
+        // open handle to the freshly-written tmp, failing the fsync-open or the
+        // rename with ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION /
+        // ERROR_LOCK_VIOLATION. The scan releases within milliseconds, so back off
+        // and retry rather than tear down the whole media/artifacts connection over
+        // a lock that is already gone — the bytes are already durable and
+        // content-verified in the blob store; only this exported copy is at risk.
+        // On non-Windows platforms those codes do not arise here, so the first
+        // attempt always wins.
+        const EXPORT_RETRY_BACKOFF_MS: [u64; 5] = [20, 50, 100, 250, 500];
+        let mut attempt = 0usize;
+        loop {
+            let finalized = std::fs::File::open(&tmp)
+                .and_then(|f| f.sync_all())
+                .and_then(|()| std::fs::rename(&tmp, target));
+            match finalized {
+                Ok(()) => return Ok(()),
+                Err(e)
+                    if is_transient_export_lock(&e) && attempt < EXPORT_RETRY_BACKOFF_MS.len() =>
+                {
+                    tracing::warn!(
+                        target: "sync",
+                        tmp = ?tmp,
+                        attempt,
+                        error = %e,
+                        "export fsync/rename hit a transient sharing violation; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(EXPORT_RETRY_BACKOFF_MS[attempt]))
+                        .await;
+                    attempt += 1;
+                }
+                Err(e) => {
+                    // Leave no tmp residue on a terminal failure (the next download
+                    // overwrites it regardless, but a directory-scanning slice should
+                    // not see it).
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(Error::Protocol(format!(
+                        "finalising export {tmp:?} → {target:?}: {e}"
+                    )));
+                }
+            }
+        }
     }
 
     /// Export a just-downloaded blob to `target` and pin it under `tag_name`,
@@ -1174,9 +1210,36 @@ pub(crate) fn record_artifact_authority(
     })
 }
 
+/// Whether an export fsync/rename io error is a transient Windows sharing/access
+/// violation worth retrying (an antivirus scan or indexer briefly holding the
+/// tmp handle): `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32),
+/// `ERROR_LOCK_VIOLATION` (33). On other platforms these raw codes do not arise
+/// from the export path, so it returns `false` and the export never retries.
+fn is_transient_export_lock(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_export_lock_matches_windows_share_violations() {
+        // The three Win32 codes an AV/indexer lock surfaces on the tmp handle.
+        for code in [5, 32, 33] {
+            assert!(
+                is_transient_export_lock(&std::io::Error::from_raw_os_error(code)),
+                "os error {code} should be retryable"
+            );
+        }
+        // Terminal errors are not retried: a genuine ENOENT/permission-shaped
+        // failure, or a non-OS error, must surface immediately.
+        assert!(!is_transient_export_lock(&std::io::Error::from_raw_os_error(2)));
+        assert!(!is_transient_export_lock(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no os code"
+        )));
+    }
 
     #[test]
     fn safe_rel_accepts_audio_and_assets() {

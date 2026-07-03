@@ -110,11 +110,17 @@ clean-all: clean ## Also remove the UI node_modules
 # WIN_BUILD_DIR: the Windows-side mirror directory where robocopy stages the
 #   source before cargo builds.  Defaults to C:\Users\<your-Windows-user>\meeting-app.
 #   Override e.g. WIN_BUILD_DIR=C:\dev\minutist to use a different drive/path.
+# WIN_TARGET_DIR: the cargo cache dir (CARGO_TARGET_DIR). Left empty, the PS script
+#   derives it from WIN_BUILD_DIR — the canonical live-test dir keeps the shared
+#   C:\mt (warm cache + run-path); any other worktree gets its own short cache, so
+#   two worktrees building concurrently cannot poison each other's crate rlibs.
+#   Override to pin a specific short cache, e.g. WIN_TARGET_DIR=C:\mtc.
 WIN_SRC_UNC   ?= $(shell wslpath -w "$(CURDIR)" 2>/dev/null || echo '\\wsl.localhost\Ubuntu\home\anl\meeting-app')
 WIN_BUILD_DIR ?= C:\Users\anl\meeting-app
+WIN_TARGET_DIR ?=
 WIN_SCRIPT    ?= $(WIN_SRC_UNC)\scripts\build-windows-app.ps1
 WIN_RUN       := powershell.exe -NoProfile -ExecutionPolicy Bypass \
-                 -File '$(WIN_SCRIPT)' -WslSrc '$(WIN_SRC_UNC)' -BuildDir '$(WIN_BUILD_DIR)'
+                 -File '$(WIN_SCRIPT)' -WslSrc '$(WIN_SRC_UNC)' -BuildDir '$(WIN_BUILD_DIR)' -TargetDir '$(WIN_TARGET_DIR)'
 
 windows-build: ## Build the portable Windows CPU app (WSL -> Windows MSVC)
 	$(WIN_RUN)

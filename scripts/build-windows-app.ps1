@@ -34,7 +34,13 @@ param(
     # this via wslpath; override when running the script directly.
     [string]$WslSrc    = '\\wsl.localhost\Ubuntu\home\anl\meeting-app',
     # Windows-side mirror directory; cargo builds here.
-    [string]$BuildDir  = 'C:\Users\anl\meeting-app'
+    [string]$BuildDir  = 'C:\Users\anl\meeting-app',
+    # Cargo target/cache dir (CARGO_TARGET_DIR). MUST be a short root — rc.exe's
+    # 260-char MAX_PATH. Empty => derived from BuildDir (see below): the canonical
+    # live-test BuildDir keeps the shared 'C:\mt'; any other worktree gets its own
+    # short cache so concurrent multi-worktree builds cannot poison each other's
+    # crate rlibs. Override explicitly to pin a specific cache.
+    [string]$TargetDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,8 +93,26 @@ Write-Host ("==> PATH length after dedup: " + $env:PATH.Length)
 # build\ggml\src\ggml-vulkan\... tree, pushes the generated manifest.rc path past
 # rc.exe's 260-char MAX_PATH (rc.exe does not honour the LongPathsEnabled opt-in)
 # and fails with "RC2136: missing '=' in EXSTYLE". A short root keeps every path
-# well under 260. Set for both builds so the CPU and feature caches share it.
-$env:CARGO_TARGET_DIR = 'C:\mt'
+# well under 260.
+#
+# Per-worktree isolation: the canonical live-test BuildDir keeps 'C:\mt' (its warm
+# cache + the run-path the user launches). Any OTHER worktree's BuildDir derives a
+# short unique cache ('C:\mt-<4hex>' of the BuildDir) so two worktrees building
+# concurrently cannot reuse each other's stale crate rlibs (robocopy preserves
+# source mtimes, so cargo would otherwise trust a sibling's newer artifact and
+# emit phantom cross-crate errors). An explicit -TargetDir wins over the derivation.
+if (-not $TargetDir) {
+    if ($BuildDir -eq 'C:\Users\anl\meeting-app') {
+        $TargetDir = 'C:\mt'
+    } else {
+        $md5  = [System.Security.Cryptography.MD5]::Create()
+        $hash = [System.BitConverter]::ToString(
+                    $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($BuildDir))
+                ).Replace('-', '').Substring(0, 4).ToLower()
+        $TargetDir = "C:\mt-$hash"
+    }
+}
+$env:CARGO_TARGET_DIR = $TargetDir
 Write-Host "==> CARGO_TARGET_DIR=$env:CARGO_TARGET_DIR (short path; avoids rc.exe MAX_PATH in nested CMake)"
 
 Set-Location $build

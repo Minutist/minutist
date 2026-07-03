@@ -362,21 +362,27 @@ async fn try_elect_and_process(
 
     match result {
         Ok(()) => {
-            // Artifacts BEFORE advertising Processed (§6.7).
-            driver.push_artifacts(id).await;
+            // Record our own `Processed` to local `metadata.json` BEFORE pushing
+            // artifacts. `push_artifacts` → `import_artifacts` gates each derived
+            // output (`transcript.json` / `summary.md`) on a provable authority
+            // (`producer_authority`), which reads the on-disk lifecycle: only a
+            // meeting whose `metadata.json` already reads `Processed` yields a
+            // non-empty artifact manifest. Writing `Processed` first is therefore
+            // what lets the push actually carry the outputs to a peer — pushing
+            // while still `Claimed` sends an empty manifest and delivers nothing.
+            //
+            // Merge-aware terminal write (M2): a peer may already have converged
+            // `Processed` (by a lower `HostRef`, synced in while we were
+            // mid-process — duplicate-but-idempotent work is accepted, §10 6.4)
+            // before we finished. Route the write through the SAME precedence
+            // `merge_processing` applies to an inbound peer state
+            // (`apply_own_processing_if_not_superseded`), rather than an
+            // unconditional overwrite, so our own local write can never regress an
+            // already-converged winner. Blocking `std::fs`, run on `spawn_blocking`.
             let processed = ProcessingLifecycle::Processed {
                 processed_by: host.clone(),
                 at: Utc::now().to_rfc3339(),
             };
-            // Merge-aware terminal write (M2): a peer may already have converged
-            // `Processed` (by a lower `HostRef`, synced in while we were
-            // mid-process — duplicate-but-idempotent work is accepted, §10 6.4)
-            // before we finished. Route the terminal write through the SAME
-            // precedence `merge_processing` applies to an inbound peer state
-            // (`apply_own_processing_if_not_superseded`), rather than an
-            // unconditional overwrite, so our own local write can never regress
-            // an already-converged winner. Blocking `std::fs`, run on
-            // `spawn_blocking`.
             let write_root = meetings_root.to_path_buf();
             let write_outcome = tokio::task::spawn_blocking(move || {
                 apply_own_processing_if_not_superseded(&write_root, id, processed)
@@ -400,6 +406,12 @@ async fn try_elect_and_process(
                     "terminal write skipped: meeting folder absent"
                 ),
             }
+            // Push artifacts AFTER the write: the on-disk lifecycle now reads
+            // `Processed`, so `import_artifacts` has a provable authority and the
+            // manifest carries the real `transcript.json` / `summary.md`. Still
+            // before `advertise()`, so peers receive the bytes before they learn
+            // `Processed` over discovery (§6.7).
+            driver.push_artifacts(id).await;
             driver.advertise().await;
         }
         Err(e) => {
@@ -699,6 +711,10 @@ mod tests {
         /// simulate a peer's stronger state converging onto disk WHILE we are
         /// mid-process (M2).
         on_process: Option<Box<dyn Fn() + Send + Sync>>,
+        /// Run synchronously inside `push_artifacts()` — lets a test observe the
+        /// on-disk lifecycle at the exact moment artifacts are pushed, which is
+        /// what the artifact authority-gate reads.
+        on_push_artifacts: Option<Box<dyn Fn() + Send + Sync>>,
     }
 
     #[async_trait::async_trait]
@@ -730,6 +746,9 @@ mod tests {
         async fn push_artifacts(&self, _id: MeetingId) {
             self.push_artifacts.fetch_add(1, Ordering::SeqCst);
             self.order.lock().unwrap().push("push_artifacts");
+            if let Some(f) = &self.on_push_artifacts {
+                f();
+            }
         }
     }
 
@@ -775,6 +794,45 @@ mod tests {
         let pa = order.iter().position(|s| *s == "push_artifacts").unwrap();
         let last_adv = order.iter().rposition(|s| *s == "advertise").unwrap();
         assert!(pa < last_adv, "push_artifacts must precede the Processed advertise: {order:?}");
+    }
+
+    #[tokio::test]
+    async fn push_artifacts_runs_after_the_processed_write() {
+        // Regression (producer-gate artifact-return bug): `push_artifacts` →
+        // `import_artifacts` gates each derived output on the on-disk lifecycle
+        // reading `Processed` (`producer_authority`). If the push runs while the
+        // meeting is still `Claimed`, the artifact manifest is empty and a passive
+        // peer receives no `transcript.json` / `summary.md`. Assert the metadata
+        // already reads `Processed` at the moment artifacts are pushed.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let id = MeetingId::new();
+        seed(root, id, ProcessingLifecycle::PendingProcessing).await;
+
+        let seen: Arc<Mutex<Option<Option<ProcessingLifecycle>>>> = Arc::new(Mutex::new(None));
+        let seen_cl = Arc::clone(&seen);
+        let root_cl = root.to_path_buf();
+        let mock = Arc::new(MockDriver {
+            host: "m".into(),
+            on_push_artifacts: Some(Box::new(move || {
+                *seen_cl.lock().unwrap() = Some(read_processing(&root_cl, id));
+            })),
+            ..Default::default()
+        });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+        try_elect_and_process(driver, &host("m"), root, id, &cfg())
+            .await
+            .expect("elect");
+
+        let observed = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("push_artifacts must have run");
+        assert!(
+            matches!(observed, Some(ProcessingLifecycle::Processed { .. })),
+            "metadata at push_artifacts time must already read Processed, was {observed:?}"
+        );
     }
 
     #[tokio::test]

@@ -379,6 +379,23 @@ impl FfiSyncEngine {
         Ok(())
     }
 
+    /// Reconcile one meeting's derived artifacts (`transcript.json` +
+    /// `summary.md`) with a paired peer — the phone-initiated pull. The exchange
+    /// is bidirectional (`producer_authority`-gated): this device receives any of
+    /// the peer's artifacts that supersede its own, and offers its own in return.
+    /// Complements the host's push
+    /// ([`DesktopElectionDriver::push_artifacts`](../../src-tauri/src/sync.rs)) so
+    /// a passive or reconnecting capture device can proactively fetch a processing
+    /// host's outputs rather than depend on being reachable at the host's push
+    /// moment. Blocking.
+    pub fn sync_artifacts(&self, peer_id: String, meeting_id: String) -> Result<(), SyncFfiError> {
+        let engine = self.engine()?;
+        let meeting = parse_meeting(&meeting_id)?;
+        self.rt
+            .block_on(engine.sync_artifacts_to_peer(&peer_id, meeting))?;
+        Ok(())
+    }
+
     /// Exchange the meeting list + lifecycle with a peer; returns the peer's
     /// meeting ids (hyphenated UUID strings). Each received lifecycle also fires
     /// on a registered [`LifecycleListener`].

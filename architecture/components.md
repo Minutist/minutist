@@ -230,6 +230,44 @@ not serve arbitrary peers. `futures-util` (workspace-pinned, already a dep of
 blob pull can be watched byte-by-byte and cut off once it crosses the per-blob
 size cap (`blobs::MAX_BLOB_BYTES`) rather than only discovering an oversized
 transfer after it has already landed on disk.
+
+**Device pairing — ticket lifecycle and peer-store persistence.** Two devices
+pair by exchanging `EndpointTicket`s out-of-band (there is no automatic peer
+discovery). `SyncEngine::my_ticket()` encodes this device's `EndpointAddr` — its
+`EndpointId` (the ed25519 public key) plus the current relay URL and direct
+socket addresses — as an `iroh-tickets` `EndpointTicket` base32 string (the
+`endpoint…` form); it carries only public addressing, never the secret device key
+(`{app-data}/sync_node_key`, `0600`). The peer feeds that string to
+`SyncEngine::add_peer_from_ticket()`, which parses it back to the `EndpointAddr`
+and registers it in the `PeerDirectory`. Pairing is **mutual**: each side must
+add-peer the other's ticket, and the notes/blobs `AcceptHook` rejects an inbound
+connection from any peer absent from the directory. Dialing is relay-brokered —
+the `PeerDirectory` backs iroh's `MemoryLookup`, so a peer resolves by
+`EndpointId` + relay even when the ticket's direct addresses are on an
+unreachable network (iroh uses the direct addresses opportunistically and falls
+back to the relay).
+
+The `PeerDirectory` the engine holds is **in-memory** and process-scoped — the
+engine persists no peer list itself. Durable pairing is the `sync::peers` module:
+a shared `{root}/peers` file (one ticket per line; blank lines and `#`-comments
+ignored) with `append` (validate + dedup) and `reload_into` (authorise every
+not-yet-applied ticket against the bound engine). Both frontends use it, each
+rooted at its own data directory (single-writer per root):
+
+- **Headless hub (`minutist-hub`)** roots it at `--data-dir`, pairs via the
+  one-shot `print-ticket` / `add-peer` CLI subcommands, and re-reads the file on a
+  poll so an `add-peer` made while it runs is honoured without a restart.
+- **Desktop app (`ConnectedSync` in `app-main`)** roots it at the app-data base
+  (beside `sync_node_key`). On each engine bind it loads the file, writes its own
+  ticket to `{app-data}/my_ticket`, and polls the file (`PEERS_POLL_INTERVAL`) so
+  a ticket appended while running is authorised without a restart. The Sync pane's
+  `sync_get_my_ticket` / `sync_add_peer` Tauri commands remain the interactive
+  surface, and `sync_add_peer` also appends to the file — so a desktop pairing now
+  survives a restart. Because both `my_ticket` and `peers` are plain files under
+  the app-data root, the desktop can also be paired out-of-band — read `my_ticket`,
+  append a peer's ticket to `peers` — without the GUI; there is no MCP-tool pairing
+  surface.
+
 The notes-sync protocol exchanges yrs state vectors and computes the minimal
 lib0-v1 diff with `yrs::{encode_state_vector_from_update_v1, diff_updates_v1}`
 operating on the v1 update bytes `NotesStore::read_ydoc_state` already returns —

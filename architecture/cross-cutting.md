@@ -1420,6 +1420,12 @@ change.
 ├── mcp_token                   MCP bearer token; owned by `app-main`
 ├── tunnel_device.json          relay device credential (connected
 │                               build only); owned by `app-main`; 0600
+├── sync_node_key               0600 ed25519 sync device identity (connected build);
+│                               owned by `sync` — see "Device pairing" in components.md
+├── peers                       paired-device tickets, one per line; durable pairing
+│                               store, shared with the hub via `sync::peers`
+├── my_ticket                   this device's own pairing ticket, rewritten on each
+│                               sync bind (public addressing only); owned by `app-main`
 │
 │   The four entries below are placed at {app-data} by default.
 │   When settings.data_directory is set to a valid absolute path they move

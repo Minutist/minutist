@@ -38,8 +38,6 @@
 //! with another process.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -220,34 +218,21 @@ async fn print_ticket(
 /// `{data-dir}/peers` (deduplicated). A running daemon picks it up on its next
 /// poll; otherwise it is loaded at the next start.
 fn add_peer(data_dir: &Path, ticket: &str) -> AppResult<()> {
-    let ticket = ticket.trim();
-    // Fail fast on a malformed ticket rather than writing garbage the daemon will
-    // later reject.
-    ticket
-        .parse::<EndpointTicket>()
-        .map_err(|e| AppError::InvalidInput {
-            context: format!("not a valid pairing ticket: {e}"),
-        })?;
-
-    let path = peers_path(data_dir);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if existing.lines().any(|line| line.trim() == ticket) {
-        println!("peer already registered in {}", path.display());
-        return Ok(());
+    let path = sync::peers::peers_path(data_dir);
+    match sync::peers::append(data_dir, ticket) {
+        Ok(sync::peers::AppendOutcome::Added) => {
+            println!("registered peer in {}", path.display());
+            Ok(())
+        }
+        Ok(sync::peers::AppendOutcome::AlreadyPresent) => {
+            println!("peer already registered in {}", path.display());
+            Ok(())
+        }
+        // A malformed ticket is bad operator input; keep the InvalidInput variant
+        // (the parse guard in `sync::peers::append` surfaces it as `Protocol`).
+        Err(sync::Error::Protocol(msg)) => Err(AppError::InvalidInput { context: msg }),
+        Err(e) => Err(AppError::from(e)),
     }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| AppError::Io {
-            context: format!("opening peers file {}: {e}", path.display()),
-        })?;
-    writeln!(file, "{ticket}").map_err(|e| AppError::Io {
-        context: format!("writing peers file {}: {e}", path.display()),
-    })?;
-    println!("registered peer in {}", path.display());
-    Ok(())
 }
 
 /// JSON shape printed by the `status` subcommand.
@@ -301,7 +286,7 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
         None
     };
 
-    let peers: Vec<String> = read_peer_tickets(data_dir)
+    let peers: Vec<String> = sync::peers::read_peer_tickets(data_dir)
         .iter()
         .filter_map(|t| t.parse::<EndpointTicket>().ok())
         .map(|t| iroh::EndpointAddr::from(t).id.to_string())
@@ -411,7 +396,7 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
     'serve: loop {
         tokio::select! {
             _ = &mut shutdown => break 'serve,
-            _ = poll.tick() => reload_peers(engine, data_dir, seen),
+            _ = poll.tick() => { sync::peers::reload_into(engine, data_dir, seen); },
             _ = discovery_poll.tick() => {
                 // Recovery sweep: re-discover every known peer so a lifecycle state
                 // a consumer dropped (Lagged) or skipped (a meeting not present when
@@ -523,43 +508,6 @@ async fn shutdown_signal() {
     }
 }
 
-/// Read the peers file and authorise any ticket not already applied this run.
-/// Malformed lines are logged and skipped (and marked seen so they are not
-/// re-warned each poll); the file's absence is normal (no peers paired yet).
-fn reload_peers(engine: &SyncEngine, data_dir: &Path, seen: &mut HashSet<String>) {
-    for ticket in read_peer_tickets(data_dir) {
-        if !seen.insert(ticket.clone()) {
-            continue;
-        }
-        match engine.add_peer_from_ticket(&ticket) {
-            Ok(id) => tracing::info!(target: "hub", peer = %id, "authorised paired peer"),
-            Err(e) => {
-                tracing::warn!(target: "hub", error = %e, "skipping malformed peer ticket")
-            }
-        }
-    }
-}
-
-/// Parse `{data-dir}/peers`: one pairing ticket per line; blank lines and
-/// `#`-prefixed comments are ignored. A missing file yields an empty list.
-fn read_peer_tickets(data_dir: &Path) -> Vec<String> {
-    let contents = match std::fs::read_to_string(peers_path(data_dir)) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect()
-}
-
-/// The peers file path under the data root.
-fn peers_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("peers")
-}
-
 /// Validate and create the daemon's data root. The path MUST be absolute: the
 /// daemon resolves identity, settings, logs, and meetings beneath it, and a
 /// relative path would resolve against an unpredictable working directory under
@@ -633,26 +581,8 @@ mod tests {
         assert!(target.is_dir(), "the data dir must be created");
     }
 
-    #[test]
-    fn peers_file_parsing_skips_comments_and_blanks() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let dir = base.path();
-        std::fs::write(
-            peers_path(dir),
-            "# a comment\n\n  ticket-one  \nticket-two\n   \n# trailing\n",
-        )
-        .expect("write peers file");
-        assert_eq!(
-            read_peer_tickets(dir),
-            vec!["ticket-one".to_string(), "ticket-two".to_string()]
-        );
-    }
-
-    #[test]
-    fn missing_peers_file_is_empty() {
-        let base = tempfile::tempdir().expect("tempdir");
-        assert!(read_peer_tickets(base.path()).is_empty());
-    }
+    // Peers-file parsing (comment/blank skipping, missing-file → empty) is tested
+    // in `sync::peers`, the shared implementation this binary now delegates to.
 
     #[test]
     fn add_peer_rejects_a_malformed_ticket() {
@@ -661,7 +591,7 @@ mod tests {
             .expect_err("a malformed ticket must be rejected");
         assert!(matches!(err, AppError::InvalidInput { .. }));
         // Nothing should have been written.
-        assert!(!peers_path(base.path()).exists());
+        assert!(!sync::peers::peers_path(base.path()).exists());
     }
 
     #[test]

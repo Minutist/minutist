@@ -63,6 +63,17 @@ use tokio::sync::Mutex;
 /// `AccessControl`; it is never logged.
 const RELAY_TOKEN_ENV: &str = "MINUTIST_SYNC_TOKEN";
 
+/// The file under `{app-data}` where the desktop writes its OWN pairing ticket on
+/// each engine bind, so another device can be paired out-of-band without reading
+/// it from the Sync pane. Public addressing only (no secret) — a sibling of the
+/// device key (`sync_node_key`).
+const MY_TICKET_FILE: &str = "my_ticket";
+
+/// How often the bound engine re-reads `{app-data}/peers`, so a ticket appended
+/// while the app is running is authorised without a restart (the load on bind
+/// covers the already-present peers).
+const PEERS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The mutable runtime state, guarded by one async mutex held only briefly. A
 /// `sync_now` clones the engine `Arc` out under the lock and runs the per-peer
 /// notes + media reconciliation without holding it, re-locking only to flip the
@@ -228,6 +239,37 @@ impl ConnectedSync {
         match SyncEngine::start(config, identity).await {
             Ok(engine) => {
                 let engine = Arc::new(engine);
+
+                // Peers-file pairing (shared with the headless hub via
+                // `sync::peers`). The engine's `PeerDirectory` is in-memory and
+                // forgets peers on exit; the `{app-data}/peers` file gives the
+                // desktop peer PERSISTENCE across restarts AND a filesystem pairing
+                // surface an external tool can drive without the Sync pane. Load
+                // the already-paired peers on bind, then poll so a ticket appended
+                // while running is authorised without a restart.
+                let mut seen = std::collections::HashSet::new();
+                sync::peers::reload_into(&engine, &app_data_base, &mut seen);
+                // Expose this device's own ticket for out-of-band pairing. Written
+                // on every bind (the addressed ticket can change across binds).
+                // Best-effort: a failure only means it must be read from the Sync
+                // pane instead.
+                match std::fs::write(app_data_base.join(MY_TICKET_FILE), engine.my_ticket()) {
+                    Ok(()) => tracing::info!(target: "app-main", "sync: wrote pairing ticket to {MY_TICKET_FILE}"),
+                    Err(e) => tracing::warn!(target: "app-main", error = %e, "sync: could not write pairing ticket file"),
+                }
+                {
+                    let engine = Arc::clone(&engine);
+                    let root = app_data_base.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let mut poll = tokio::time::interval(PEERS_POLL_INTERVAL);
+                        poll.tick().await; // immediate first tick — the bind load already ran.
+                        loop {
+                            poll.tick().await;
+                            sync::peers::reload_into(&engine, &root, &mut seen);
+                        }
+                    });
+                }
+
                 // Persist the processing-lifecycle states the engine surfaces from
                 // discovery. The subscriber loop lives in `ipc-bridge` (which owns
                 // the `persistence` edge); here we only hand it the engine's
@@ -347,6 +389,13 @@ impl SyncControl for ConnectedSync {
         let peer = engine
             .add_peer_from_ticket(&ticket)
             .map_err(minutist_common::AppError::from)?;
+        // Persist the pairing so it survives a restart and stays consistent with a
+        // filesystem-driven add-peer. Best-effort: the in-memory registration above
+        // already succeeded, so a peers-file write failure must not fail the
+        // command — the peer is paired for this session regardless.
+        if let Err(e) = sync::peers::append(&self.app_data_base, &ticket) {
+            tracing::warn!(target: "app-main", error = %e, "sync: peer registered in-memory but not persisted to peers file");
+        }
         tracing::info!(target: "app-main", peer = %peer, "sync: registered peer from ticket");
         Ok(())
     }

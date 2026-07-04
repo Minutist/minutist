@@ -97,6 +97,11 @@ pub async fn run_account_refresh_loop(
     }
 
     let mut ticker = tokio::time::interval(interval);
+    // Restore the full `interval` spacing after a slow/hung `list_endpoints` rather
+    // than firing a catch-up burst of ticks with no inter-fetch delay (the default
+    // `Burst`), so a stalled account service can never provoke a fetch burst on
+    // recovery. Matches the election loop's sleep-after-work spacing.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             _ = stop.notified() => return,

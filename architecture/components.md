@@ -82,6 +82,29 @@ that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
 the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
 — "Build variants".
 
+**Account-mediated peer discovery (B2, `planning/DESIGN_account-peer-source.md`).**
+`sync::account` adds a SECOND, additive source of peer addresses beside manual
+ticket pairing: `account::AccountEndpointSource` is a trait `sync` defines and
+the consumer implements — the account-service HTTP fetcher bound to the device's
+credential — so `sync` gains **no** new dependency-table edge (no HTTP/account
+crate; the trait is the boundary, exactly as `election::ElectionDriver` keeps
+`election` off `sync`/`orchestrator`). `account::run_account_refresh_loop` takes
+the injected source, registers this device's endpoint, then on each tick fetches
+the account's endpoint list and calls a caller-supplied `add_peer` closure for
+every entry `account::peers_to_add` selects (self filtered, de-duplicated by
+endpoint id) — `add_peer` is a closure rather than a direct `SyncEngine` call so
+the loop is unit-testable without a live engine. The loop takes its `stop:
+Arc<tokio::sync::Notify>` as a parameter rather than creating one, so the spawner
+(app-main, B4) can wire it onto the same cancellation token as the local
+peers-file poll. `SyncEngine::add_account_peer(endpoint_id: &str, relay_url:
+&str) -> Result<()>` is the string-keyed primitive both the loop's `add_peer`
+closure and `sync-ffi`'s wrapper call: parses both, builds the same `id + relay`
+`EndpointAddr` shape `push_all_to`/`peer_relay_addr` already dial with, and
+registers it via `add_peer`. Account-source and manual pairing / the file-source
+fallback are additive — all feed the one `PeerDirectory`; B4 (desktop wiring,
+layering account-source as primary) and peer eviction (removing a device that
+left the account) are follow-ups, not part of this surface.
+
 `SyncControl` gains `set_enabled(bool)` (issue 0028 follow-up F5): before this,
 `ConnectedSync::new` read `settings.connector_enabled` only ONCE at construction,
 so enabling the connector at RUNTIME (the Settings toggle, which already started

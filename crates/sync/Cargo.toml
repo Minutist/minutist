@@ -23,6 +23,11 @@ authors.workspace = true
 
 [dependencies]
 minutist-common = { path = "../common" }
+# async-trait: the injected `account::AccountEndpointSource` seam (the account-
+# service HTTP fetcher), mirroring `election::ElectionDriver`'s trait-object
+# collaborator boundary. No HTTP/account-service dependency of its own — the
+# consumer (app-main / sync-ffi) supplies the implementation.
+async-trait = { workspace = true }
 # notes-crdt: the notes-CRDT primitives this crate transports — `NotesStore`
 # (read the authoritative `notes.ydoc`; merge received updates) and
 # `MeetingFolder::ensure` (the inbound-meeting folder seam). Depending on the

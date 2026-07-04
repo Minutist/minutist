@@ -19,13 +19,16 @@
 //!
 //! Peers are learned out-of-band from the account service (the same connected-tier
 //! surface as `tunnel-client`), so addressing uses iroh's `MemoryLookup` rather
-//! than DNS/pkarr discovery.
+//! than DNS/pkarr discovery. [`account`] carries the account-mediated peer-
+//! discovery loop; manual pairing ([`SyncEngine::add_peer_from_ticket`]) is the
+//! other, additive source that feeds the same [`address_lookup::PeerDirectory`].
 //!
 //! This crate is part of the CONNECTED feature surface. It lives in the workspace
 //! unconditionally; the free build omits the `app-main -> sync` wiring.
 //!
 //! [iroh]: https://docs.rs/iroh/1.0.0/iroh/
 
+pub mod account;
 pub mod address_lookup;
 pub mod artifacts_proto;
 pub mod blobs;
@@ -39,6 +42,7 @@ pub(crate) mod timeouts;
 
 use std::path::PathBuf;
 
+pub use account::{peers_to_add, run_account_refresh_loop, AccountEndpoint, AccountEndpointSource};
 pub use endpoint::SyncEngine;
 pub use identity::DeviceIdentity;
 

@@ -301,6 +301,19 @@ impl FfiSyncEngine {
         Ok(self.engine()?.add_peer_from_ticket(&ticket)?.to_string())
     }
 
+    /// Register a peer learned from the account service (the phone's own
+    /// list→add loop over `GET /v1/account/devices`, `TODO(B2)`), addressed by
+    /// its hex endpoint id and relay URL. Wraps
+    /// [`sync::SyncEngine::add_account_peer`]; no `iroh` type crosses the
+    /// boundary. Additive to [`Self::pair`] — both feed the same peer directory.
+    pub fn add_account_peer(
+        &self,
+        endpoint_id: String,
+        relay_url: String,
+    ) -> Result<(), SyncFfiError> {
+        Ok(self.engine()?.add_account_peer(&endpoint_id, &relay_url)?)
+    }
+
     /// Hex endpoint ids of every currently-registered peer.
     pub fn peer_ids(&self) -> Result<Vec<String>, SyncFfiError> {
         // `SyncEngine::peer_ids` is already hex-string-keyed, so no per-id

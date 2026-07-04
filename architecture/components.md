@@ -203,7 +203,12 @@ upstream `iroh-ffi`), `iroh-blobs` stays encapsulated behind `sync_media` /
 `sync_artifacts` / `import_media` and needs no separate FFI surface. `sync_artifacts`
 is the phone-initiated artifact pull (a passive capture device fetching a
 processing host's `transcript.json` / `summary.md`), complementing the host-side
-push in `DesktopElectionDriver`. The wrapper owns its tokio
+push in `DesktopElectionDriver`. `add_account_peer(endpoint_id: String, relay_url:
+String) -> Result<(), SyncFfiError>` wraps `SyncEngine::add_account_peer` (the B2
+account-peer-source seam, above) for the phone's own list→add loop over the
+account service's device directory — strings only, no `iroh` type crosses the
+boundary, additive to `pair` (both feed the same peer directory). The wrapper
+owns its tokio
 runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS
 threads so a re-entrant foreign callback never `block_on`s from within the
 runtime. No `tauri::*` / `ipc-bridge` imports. See `cross-cutting.md` — "Build

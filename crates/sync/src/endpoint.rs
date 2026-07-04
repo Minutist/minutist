@@ -331,6 +331,24 @@ impl SyncEngine {
         self.peers.add(addr);
     }
 
+    /// Register a peer learned from the account service ([`crate::account`]),
+    /// addressed by its hex endpoint id and relay URL — the string-keyed
+    /// primitive [`crate::account::run_account_refresh_loop`]'s `add_peer`
+    /// closure calls, and what `sync-ffi` wraps for the phone. Parses both,
+    /// builds the same `id + relay` [`EndpointAddr`] shape [`Self::push_all_to`]
+    /// dials with, and registers it via [`Self::add_peer`]. No `iroh` type in
+    /// the signature, so a caller off the FFI boundary never needs one.
+    pub fn add_account_peer(&self, endpoint_id: &str, relay_url: &str) -> Result<()> {
+        let id: EndpointId = endpoint_id.parse().map_err(|e| {
+            Error::Protocol(format!("parsing account endpoint id {endpoint_id:?}: {e}"))
+        })?;
+        let relay: RelayUrl = relay_url.parse().map_err(|e| {
+            Error::Endpoint(format!("parsing account relay url {relay_url:?}: {e}"))
+        })?;
+        self.add_peer(EndpointAddr::new(id).with_relay_url(relay));
+        Ok(())
+    }
+
     /// This device's shareable ticket: its [`EndpointAddr`] (id + current
     /// relay/direct addresses) encoded as an [`EndpointTicket`] string. The user
     /// copies it to another of their devices, which feeds it to
@@ -1120,5 +1138,55 @@ mod tests {
             ));
             engine.shutdown().await.expect("shutdown");
         });
+    }
+
+    #[tokio::test]
+    async fn add_account_peer_registers_a_valid_id_and_relay() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
+        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        let other = iroh::SecretKey::generate().public();
+        engine
+            .add_account_peer(&other.to_string(), "https://sync.example/relay")
+            .expect("add account peer");
+
+        assert_eq!(engine.peer_ids(), vec![other.to_string()]);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn add_account_peer_rejects_a_malformed_endpoint_id() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
+        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        assert!(matches!(
+            engine.add_account_peer("not-hex", "https://sync.example/relay"),
+            Err(Error::Protocol(_))
+        ));
+
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn add_account_peer_rejects_a_malformed_relay_url() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
+        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        let other = iroh::SecretKey::generate().public();
+        assert!(matches!(
+            engine.add_account_peer(&other.to_string(), "not a url"),
+            Err(Error::Endpoint(_))
+        ));
+
+        engine.shutdown().await.expect("shutdown");
     }
 }

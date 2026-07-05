@@ -1183,6 +1183,16 @@ pub enum AppEvent {
         meeting_id: MeetingId,
         segment: Segment,
     },
+    /// ASR flush-queue backpressure: the runner dropped the oldest pending flush
+    /// because the ASR worker fell behind. A NON-error signal, deliberately
+    /// distinct from [`AppEvent::ErrorOccurred`] — the webview ignores it (it can
+    /// fire repeatedly under sustained load, e.g. CPU-only ASR), while the live
+    /// co-pilot driver observes it and pauses its transcript-turn cadence for a
+    /// cooldown so it does not compound the backpressure. The dropped flush's
+    /// audio survives in `audio.opus` and its transcript is restored by the
+    /// post-stop re-transcribe (the runner's `incomplete` flag). See
+    /// `architecture/cross-cutting.md` — "Cadence yields under ASR backpressure".
+    AsrBackpressure { meeting_id: MeetingId },
     /// The live recording clock advanced. Emitted at a throttled rate
     /// (~5 Hz) while recording. `clock_ms` is the capture-sample,
     /// pause-*excluding* offset from the start of the recording — the same

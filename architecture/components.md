@@ -2302,7 +2302,12 @@ pending flush (not the newest) from the front of the deque; this is a
 self-healing, log-only WARN (NOT an `AppEvent::ErrorOccurred` — it can fire
 repeatedly under sustained load, e.g. CPU-only ASR). Audio is always preserved
 in `audio.opus`, and the `incomplete` flag drives a post-stop re-transcribe that
-restores the dropped flush's transcript.
+restores the dropped flush's transcript. The runner additionally emits a
+dedicated, non-error `AppEvent::AsrBackpressure { meeting_id }` on the drop: the
+webview ignores it, while the live co-pilot driver
+(`ipc-bridge::live_agent::run_driver_task`) observes it and pauses its own
+transcript-turn cadence for a cooldown so it does not compound the backpressure
+(see `cross-cutting.md` — "Cadence yields under ASR backpressure").
 
 **Panic safety (Phase 2 close-out).** Each per-flush `transcribe_chunk` call is wrapped in `std::panic::catch_unwind`; a panic is caught, converted to `AppError::Internal`, emitted as `AppEvent::ErrorOccurred`, and the worker continues to the next flush. A `worker_exited` flag on `FlushQueue` ensures `stop()` is never wedged by a terminated worker.
 

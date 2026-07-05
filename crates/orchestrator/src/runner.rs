@@ -804,7 +804,7 @@ fn run_drain_loop(
                         speaker_ids,
                         meeting_id,
                     };
-                    dispatch_flush(&flush_queue, payload);
+                    dispatch_flush(&flush_queue, payload, &event_tx, meeting_id);
                 }
             }
             Err(mpsc::error::TryRecvError::Empty) => {
@@ -824,7 +824,7 @@ fn run_drain_loop(
                         speaker_ids,
                         meeting_id,
                     };
-                    dispatch_flush(&flush_queue, payload);
+                    dispatch_flush(&flush_queue, payload, &event_tx, meeting_id);
                 } else {
                     std::thread::sleep(POLL_INTERVAL);
                 }
@@ -868,7 +868,7 @@ fn run_drain_loop(
                             speaker_ids,
                             meeting_id,
                         };
-                        dispatch_flush(&flush_queue, payload);
+                        dispatch_flush(&flush_queue, payload, &event_tx, meeting_id);
                     }
                     // Wait for the ASR worker to process any remaining flushes.
                     wait_for_asr_worker_drain(
@@ -909,24 +909,43 @@ fn run_drain_loop(
 /// can fire repeatedly under sustained load, e.g. CPU-only ASR). Audio is always
 /// preserved in `audio.opus`; the dropped flush's transcript is restored by the
 /// post-stop re-transcribe that the `incomplete` flag triggers.
-fn dispatch_flush(flush_queue: &FlushQueue, payload: FlushPayload) {
-    dispatch_flush_inner(flush_queue, payload);
+fn dispatch_flush(
+    flush_queue: &FlushQueue,
+    payload: FlushPayload,
+    event_tx: &broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+) {
+    if dispatch_flush_inner(flush_queue, payload) {
+        // A pending flush was dropped under backpressure. Emit a NON-error
+        // signal (NOT `ErrorOccurred`): the live co-pilot driver observes it and
+        // pauses its transcript-turn cadence so its own decodes do not compound
+        // the backpressure; the webview ignores it. The dropped audio survives
+        // in `audio.opus` and the `incomplete` flag drives the post-stop
+        // re-transcribe. Send is best-effort (no subscribers → dropped), like
+        // the other event emissions in this loop.
+        let _ = event_tx.send(AppEvent::AsrBackpressure { meeting_id });
+    }
 }
 
-/// Public wrapper for `dispatch_flush` used by tests.
+/// Public wrapper for `dispatch_flush` used by tests. Returns whether a pending
+/// flush was dropped under backpressure.
 ///
 /// Only available under the `test-source` feature (or in `#[cfg(test)]`).
 #[cfg(any(test, feature = "test-source"))]
-pub(crate) fn dispatch_flush_pub(flush_queue: &FlushQueue, payload: FlushPayload) {
-    dispatch_flush_inner(flush_queue, payload);
+pub(crate) fn dispatch_flush_pub(flush_queue: &FlushQueue, payload: FlushPayload) -> bool {
+    dispatch_flush_inner(flush_queue, payload)
 }
 
-fn dispatch_flush_inner(flush_queue: &FlushQueue, payload: FlushPayload) {
+/// Enqueue `payload`, dropping the oldest pending flush first if the bounded
+/// queue is already full. Returns `true` iff a pending flush was dropped
+/// (backpressure), so the caller can emit [`AppEvent::AsrBackpressure`].
+fn dispatch_flush_inner(flush_queue: &FlushQueue, payload: FlushPayload) -> bool {
     let mut deque = flush_queue
         .deque
         .lock()
         .expect("flush queue mutex poisoned");
 
+    let mut dropped = false;
     if deque.len() >= FLUSH_CHANNEL_CAP {
         // Drop the OLDEST pending flush (the front of the queue).
         let _dropped = deque.pop_front();
@@ -934,10 +953,12 @@ fn dispatch_flush_inner(flush_queue: &FlushQueue, payload: FlushPayload) {
         // re-transcribe of the complete audio after stop (the dropped flush's
         // audio survives in audio.opus; only its transcript was lost).
         flush_queue.incomplete.store(true, Ordering::Release);
+        dropped = true;
         // Self-healing backpressure: the audio survives in `audio.opus` and the
         // `incomplete` flag above triggers a full re-transcribe after stop, so
         // this is a log-only WARN — NOT surfaced to the UI as an error (it can
-        // fire repeatedly under sustained load, e.g. CPU-only ASR).
+        // fire repeatedly under sustained load, e.g. CPU-only ASR). The caller
+        // additionally emits a non-error `AsrBackpressure` event for the co-pilot.
         tracing::warn!(
             target: "orchestrator",
             "ASR flush queue full (backpressure); dropping oldest pending flush \
@@ -951,6 +972,8 @@ fn dispatch_flush_inner(flush_queue: &FlushQueue, payload: FlushPayload) {
     // Signal the worker that a new payload is available.
     flush_queue.notify.notify_one();
     tracing::debug!(target: "orchestrator", "runner: flush dispatched to ASR worker");
+
+    dropped
 }
 
 // ---------------------------------------------------------------------------
@@ -1489,7 +1512,11 @@ fn finalise_on_stop(
             speaker_ids,
             meeting_id,
         };
-        dispatch_flush(flush_queue, payload);
+        // Final stop-time drain: use the inner enqueue directly. If it drops
+        // under a full queue the `incomplete` flag is still set (→ post-stop
+        // re-transcribe), but no `AsrBackpressure` event is emitted — the
+        // recording is ending, so the co-pilot cooldown it drives is moot.
+        let _ = dispatch_flush_inner(flush_queue, payload);
     }
 
     // Wait for the ASR worker to process any remaining flushes so that
@@ -2848,7 +2875,10 @@ mod tests {
                 speaker_ids: vec![None],
                 meeting_id,
             };
-            dispatch_flush(&flush_queue, payload);
+            assert!(
+                !dispatch_flush_pub(&flush_queue, payload),
+                "no drop while filling below capacity"
+            );
         }
 
         // No drop yet → the live transcript is still complete.
@@ -2865,7 +2895,10 @@ mod tests {
             speaker_ids: vec![None],
             meeting_id,
         };
-        dispatch_flush(&flush_queue, newest_payload);
+        assert!(
+            dispatch_flush_pub(&flush_queue, newest_payload),
+            "dispatching into a full queue must report a drop (backpressure)"
+        );
 
         // Drain the queue and collect start_ms values.
         let deque = flush_queue.deque.lock().unwrap();

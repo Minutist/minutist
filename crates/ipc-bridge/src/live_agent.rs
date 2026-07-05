@@ -495,17 +495,6 @@ pub fn should_refresh(
 /// tick picks it up once the cooldown elapses).
 const ASR_BACKPRESSURE_COOLDOWN: Duration = Duration::from_secs(8);
 
-/// Whether `error` is the ASR flush-queue backpressure signal (`orchestrator`
-/// dropping the oldest pending flush because the ASR worker cannot keep up).
-///
-/// Matched defensively on the rendered error text (via `AppError`'s
-/// `Display`) rather than the enum shape, since the backpressure signal is a
-/// plain [`minutist_common::AppError::Internal`] with a descriptive context
-/// string, not a dedicated variant.
-fn is_asr_backpressure_error(error: &minutist_common::AppError) -> bool {
-    error.to_string().contains("flush queue full")
-}
-
 // ---------------------------------------------------------------------------
 // Async driver task
 // ---------------------------------------------------------------------------
@@ -910,7 +899,7 @@ async fn run_driver_task(
                             }
                         }
                     }
-                    Ok(AppEvent::ErrorOccurred { error }) if is_asr_backpressure_error(&error) => {
+                    Ok(AppEvent::AsrBackpressure { meeting_id: mid }) if mid == meeting_id => {
                         asr_pressure_until = Instant::now() + ASR_BACKPRESSURE_COOLDOWN;
                         tracing::debug!(
                             target: "ipc-bridge",
@@ -2712,38 +2701,6 @@ mod tests {
     #[test]
     fn should_refresh_one_below_time_threshold() {
         assert!(!should_refresh(20, 44.9, false, 8, 45));
-    }
-
-    // -----------------------------------------------------------------------
-    // is_asr_backpressure_error — ASR flush-queue backpressure detection (B3)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn detects_the_asr_flush_queue_full_error() {
-        let error = minutist_common::AppError::Internal {
-            context: "ASR flush queue full; oldest pending flush dropped (audio.opus unaffected)"
-                .to_string(),
-        };
-        assert!(is_asr_backpressure_error(&error));
-    }
-
-    #[test]
-    fn ignores_unrelated_errors() {
-        let error = minutist_common::AppError::Internal {
-            context: "model failed to load".to_string(),
-        };
-        assert!(!is_asr_backpressure_error(&error));
-    }
-
-    #[test]
-    fn matches_defensively_regardless_of_variant() {
-        // The signal is matched on rendered text, not a dedicated enum variant,
-        // so any AppError variant whose Display happens to mention the phrase
-        // is still recognised.
-        let error = minutist_common::AppError::Unsupported {
-            context: "flush queue full elsewhere".to_string(),
-        };
-        assert!(is_asr_backpressure_error(&error));
     }
 
     // -----------------------------------------------------------------------

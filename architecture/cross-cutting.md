@@ -997,13 +997,15 @@ categories. Cross-cutting rules:
   refreshes during sparse meetings with few utterances.
 
 - **Cadence yields under ASR backpressure.** The driver also watches the shared
-  `AppEvent` bus for the orchestrator's flush-queue-full signal (see
-  "ASR flush backpressure" in `components.md`) — matched defensively on the
-  rendered error text (`is_asr_backpressure_error`), not a dedicated event
-  variant. On a match it sets a cooldown (`asr_pressure_until`, 8 s) during which
-  a transcript turn that is otherwise due is skipped (`tracing::debug!`) rather
-  than dispatched — the co-pilot's own decode would otherwise compete with the
-  ASR worker for the same CPU/GPU cycles while it is already dropping flushes.
+  `AppEvent` bus for the orchestrator's dedicated `AppEvent::AsrBackpressure`
+  signal (see "ASR flush backpressure" in `components.md`), emitted when the
+  runner drops the oldest pending flush. This is a NON-error event, distinct
+  from `ErrorOccurred` — the webview ignores it, so backpressure never surfaces
+  as a user-facing error even though it drives this cooldown. On receipt (for
+  the driver's own meeting) it sets a cooldown (`asr_pressure_until`, 8 s) during
+  which a transcript turn that is otherwise due is skipped (`tracing::debug!`)
+  rather than dispatched — the co-pilot's own decode would otherwise compete with
+  the ASR worker for the same CPU/GPU cycles while it is already dropping flushes.
   Skipped ticks are not lost: `tail`/`new_segments` stay accumulated and the next
   cadence check (once the cooldown elapses) picks up everything gathered in the
   meantime. The user-chat lane is never gated — a user message is always

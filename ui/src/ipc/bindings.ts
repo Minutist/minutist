@@ -610,18 +610,21 @@ async saveSummary(meetingId: MeetingId, summaryMarkdown: string) : Promise<Resul
 /**
  * Send a user message to the chat agent for a meeting, streaming the reply.
  * 
- * Creates or loads the chat [`ChatSession`], appends the user message, and
- * **spawns the turn on a background task**, returning the session id
- * immediately. The turn streams to the webview via the chat `AppEvent`s
- * (`ChatToken` / `ChatToolCall` / `ChatToolResult` / `ChatTurnComplete` /
- * `ChatError`) on the shared bus; the updated session is persisted via
- * [`ChatStore`] at turn end. A second `send_chat_message` for a session whose
- * turn is still running is rejected with `InvalidInput { "session busy" }`
- * (§6 — single in-flight turn per session).
+ * **Live path (A3):** when the target meeting is currently recording (a
+ * [`crate::live_agent::LiveCopilotHandle`] exists for it), the message is
+ * routed into the live co-pilot's held-context session. The live session id is
+ * resolved via [`ChatStore::load_or_create_live`] and returned immediately; a
+ * drain task converts the per-request reply channel into the same
+ * `ChatToken` / `ChatTurnComplete` / `ChatError` events the non-live path
+ * emits. Persistence is handled by [`crate::live_agent::process_request`].
  * 
- * The engine work runs on `spawn_blocking` (the LLM is FFI-bound); tool
- * dispatch re-enters async via a captured `Handle::block_on` for the dispatch
- * step only (§4.5 — the one place async/sync cross).
+ * **Non-live path:** creates or loads a standard [`ChatSession`], appends the
+ * user message, and spawns a `LlamaTurnBackend` turn on `spawn_blocking`,
+ * returning the session id immediately. The turn streams via the same chat
+ * `AppEvent`s; tool dispatch re-enters async via a captured
+ * `Handle::block_on`. A second `send_chat_message` for a session whose turn
+ * is still running is rejected with `InvalidInput { "session busy" }`
+ * (§6 — single in-flight turn per session).
  */
 async sendChatMessage(meetingId: MeetingId | null, sessionId: ChatSessionId | null, message: string) : Promise<Result<ChatSessionId, IpcError>> {
     try {
@@ -941,6 +944,14 @@ async tunnelPollPairing() : Promise<Result<TunnelStatus, IpcError>> {
 /**
  * Enable or disable the connector. Enabling with a stored credential starts the
  * tunnel; disabling stops it cleanly. Returns the resulting snapshot.
+ * 
+ * Also flips the sync engine (F5): before this fix, enabling the connector at
+ * runtime started the relay tunnel but never the sync engine (or its
+ * producer-gate election loop), so `sync_status` stayed `Disabled` and every
+ * engine-backed sync call kept failing even after the toggle. The sync flip
+ * rides alongside the tunnel's own — it is best-effort and never fails this
+ * command: a start failure is logged and reflected in a later `sync_status`
+ * read, exactly like the tunnel's own asynchronous connect.
  */
 async setConnectorEnabled(enabled: boolean) : Promise<Result<TunnelSnapshot, IpcError>> {
     try {
@@ -1066,6 +1077,18 @@ export type AppEvent =
  * A new transcript segment was produced.
  */
 { kind: "transcript_segment"; meeting_id: MeetingId; segment: Segment } | 
+/**
+ * ASR flush-queue backpressure: the runner dropped the oldest pending flush
+ * because the ASR worker fell behind. A NON-error signal, deliberately
+ * distinct from [`AppEvent::ErrorOccurred`] — the webview ignores it (it can
+ * fire repeatedly under sustained load, e.g. CPU-only ASR), while the live
+ * co-pilot driver observes it and pauses its transcript-turn cadence for a
+ * cooldown so it does not compound the backpressure. The dropped flush's
+ * audio survives in `audio.opus` and its transcript is restored by the
+ * post-stop re-transcribe (the runner's `incomplete` flag). See
+ * `architecture/cross-cutting.md` — "Cadence yields under ASR backpressure".
+ */
+{ kind: "asr_backpressure"; meeting_id: MeetingId } | 
 /**
  * The live recording clock advanced. Emitted at a throttled rate
  * (~5 Hz) while recording. `clock_ms` is the capture-sample,
@@ -2421,11 +2444,11 @@ live_agent_retrieval_budget_chars?: number;
  */
 live_agent_retrieval_k?: number; 
 /**
- * The system prompt passed to the live agent on every refresh. Instructs
- * the model to UPDATE the standing digest rather than regenerate it,
- * preserving the 'asked-for-but-missed' tracker across refreshes.
- * `#[serde(default = ...)]` → the built-in digest-maintenance instruction;
- * an older store written before this field existed adopts that default.
+ * The system prompt for the live co-pilot, pinned as the prefix of the one
+ * keep-alive conversation. A persisted store still carrying the pre-U2
+ * digest-maintenance prompt is migrated to the co-pilot default on load (see
+ * [`deserialize_live_agent_system_prompt`]); `#[serde(default = ...)]`
+ * supplies it when the field is absent.
  */
 live_agent_system_prompt?: string }
 /**

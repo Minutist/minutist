@@ -23,7 +23,55 @@
 .meeting-list__header {
   width: 100%;
   max-width: 72rem;
-  margin-bottom: 1.75rem;
+  margin-bottom: 1.5rem;
+  /* Title on the left, search + count on the right, on one baseline-aligned
+     row; wraps to two rows only on a narrow window. */
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+  flex-wrap: wrap;
+}
+
+/* Right-hand tools group: the search field + the count. */
+.meeting-list__tools {
+  display: flex;
+  align-items: baseline;
+  gap: 0.9rem;
+  flex: 1 1 22rem;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.meeting-list__search {
+  flex: 0 1 20rem;
+  min-width: 0;
+  font-family: var(--font-text);
+  font-size: 0.9rem;
+  color: var(--ink);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.7rem;
+  transition: border-color 120ms ease;
+}
+
+.meeting-list__search::placeholder {
+  color: var(--stone);
+}
+
+.meeting-list__search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.meeting-list__count {
+  flex: 0 0 auto;
+  font-family: var(--font-text);
+  font-size: 0.8rem;
+  color: var(--stone);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
 }
 
 /* Two-column body: folder sidebar (left) + the filtered rows (right). */
@@ -66,18 +114,10 @@
   font-size: 2rem;
   font-weight: 540;
   color: var(--ink);
-  margin: 0 0 0.25rem;
+  margin: 0;
   line-height: 1.1;
   font-variation-settings: "opsz" 60, "SOFT" 24, "WONK" 0;
   letter-spacing: -0.005em;
-}
-
-.meeting-list__subhead {
-  font-family: var(--font-text);
-  font-size: 0.95rem;
-  font-style: italic;
-  color: var(--stone);
-  margin: 0;
 }
 
 .meeting-list__empty {

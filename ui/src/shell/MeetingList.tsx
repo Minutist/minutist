@@ -276,26 +276,56 @@ export function MeetingList() {
     void refreshCollections();
   }, [refresh, refreshCollections]);
 
-  const visible = meetings.filter((m) =>
+  const [query, setQuery] = useState("");
+
+  const inFolder = meetings.filter((m) =>
     meetingMatchesFilter(filter, m.collection_id),
   );
 
+  // Client-side title/excerpt search over the folder-filtered set. Case-
+  // insensitive substring; empty query is a no-op passthrough.
+  const q = query.trim().toLowerCase();
+  const visible = q
+    ? inFolder.filter(
+        (m) =>
+          m.title.toLowerCase().includes(q) ||
+          (m.excerpt?.toLowerCase().includes(q) ?? false),
+      )
+    : inFolder;
+
   // Distinguish "nothing recorded yet" (whole index empty) from "this folder is
-  // empty" (the active filter excludes every meeting) so the empty copy is honest.
+  // empty" and from "no search match" so the empty copy is honest.
   const emptyMessage =
     meetings.length === 0
       ? loading
         ? "Loading meetings…"
         : "No meetings yet. Start a recording to begin."
-      : "No meetings in this folder.";
+      : q
+        ? `No meetings match “${query.trim()}”.`
+        : "No meetings in this folder.";
+
+  // Count reads as a plain total normally, or "shown of total" while searching.
+  const countLabel = q
+    ? `${visible.length} of ${inFolder.length}`
+    : `${inFolder.length} ${inFolder.length === 1 ? "meeting" : "meetings"}`;
 
   return (
     <section className="meeting-list ink-reveal" aria-label="Meetings">
       <header className="meeting-list__header">
         <h1 className="meeting-list__heading">Meetings</h1>
-        <p className="meeting-list__subhead">
-          A quiet index of everything you've recorded.
-        </p>
+        <div className="meeting-list__tools">
+          <input
+            type="search"
+            className="meeting-list__search"
+            placeholder="Search meetings…"
+            aria-label="Search meetings"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <span className="meeting-list__count tnum" aria-live="polite">
+            {countLabel}
+          </span>
+        </div>
       </header>
 
       <div className="meeting-list__body">

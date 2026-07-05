@@ -2366,7 +2366,7 @@ checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "election"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2411,7 +2411,7 @@ checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
 name = "embedder"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "llama-cpp-2",
  "minutist-common",
@@ -7068,7 +7068,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rag-retrieval"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "minutist-common",
  "serde",
@@ -8783,7 +8783,7 @@ dependencies = [
 
 [[package]]
 name = "sync-ffi"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "minutist-common",

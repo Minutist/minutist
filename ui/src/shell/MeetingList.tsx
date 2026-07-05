@@ -135,6 +135,12 @@ function MeetingRow(props: MeetingRowProps) {
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(meeting.title);
 
+  // A meeting that was never named (empty title in metadata) would otherwise
+  // render an invisible, zero-height heading — the row loses its anchor and
+  // leads with the dim meta line. Fall back to a stable placeholder for display
+  // (the stored title stays empty, so renaming still starts from blank).
+  const displayTitle = meeting.title.trim() || "Untitled meeting";
+
   function commitRename() {
     const trimmed = draftTitle.trim();
     setRenaming(false);
@@ -184,10 +190,14 @@ function MeetingRow(props: MeetingRowProps) {
         ) : (
           <button
             type="button"
-            className="meeting-list__title"
+            className={
+              meeting.title.trim()
+                ? "meeting-list__title"
+                : "meeting-list__title meeting-list__title--placeholder"
+            }
             onClick={props.onOpen}
           >
-            {meeting.title}
+            {displayTitle}
           </button>
         )}
 

@@ -13,7 +13,7 @@
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 2.75rem 1.5rem 4rem;
+  padding: 1.25rem 1.5rem 4rem;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -53,6 +53,11 @@
     border-right: none;
     border-bottom: 1px solid var(--rule);
     padding-bottom: 0.75rem;
+    /* Stacked above the rows on a narrow window — scroll with the page rather
+       than pinning as a sticky rail. */
+    position: static;
+    max-height: none;
+    overflow-y: visible;
   }
 }
 
@@ -62,6 +67,7 @@
   font-weight: 540;
   color: var(--ink);
   margin: 0 0 0.25rem;
+  line-height: 1.1;
   font-variation-settings: "opsz" 60, "SOFT" 24, "WONK" 0;
   letter-spacing: -0.005em;
 }
@@ -146,6 +152,13 @@
 
 .meeting-list__title:hover {
   color: var(--accent);
+}
+
+/* An unnamed meeting: a quiet italic placeholder so the row keeps its heading
+   without masquerading as a real, user-given title. */
+.meeting-list__title--placeholder {
+  color: var(--stone);
+  font-style: italic;
 }
 
 .meeting-list__title-input {

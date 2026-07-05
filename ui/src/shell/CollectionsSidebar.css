@@ -14,6 +14,14 @@
   padding-right: 1.4rem;
   border-right: 1px solid var(--rule);
   min-width: 0;
+  /* Folder navigation is primary — keep it pinned while the meeting rows scroll
+     inside the shared `.meeting-list` scroller (it sticks to the scrollport top,
+     just below the list padding). A long folder list scrolls on its own. */
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  max-height: calc(100vh - 2.5rem);
+  overflow-y: auto;
 }
 
 .collections-sidebar__head {

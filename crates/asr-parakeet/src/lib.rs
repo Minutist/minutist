@@ -19,7 +19,7 @@
 
 use std::ffi::{CStr, CString};
 use std::mem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use minutist_common::{AppError, AppResult, AudioChunk, Segment, WordTimestamp};
 use sherpa_rs::sherpa_rs_sys as sys;
@@ -45,6 +45,49 @@ const PHRASE_MIN_WORDS: usize = 8;
 /// least `PHRASE_MIN_WORDS` words) means a whole clause is looping even though
 /// no single word dominates.
 const PHRASE_DISTINCT_RATIO: f32 = 0.35;
+
+/// The four files [`ParakeetBackend::new`] requires in `model_dir`.
+const REQUIRED_MODEL_FILES: [&str; 4] = [
+    "encoder.int8.onnx",
+    "decoder.int8.onnx",
+    "joiner.int8.onnx",
+    "tokens.txt",
+];
+
+/// Reject a model file that is missing, not a regular file, or empty, before
+/// it is handed to `SherpaOnnxCreateOfflineRecognizer`.
+///
+/// onnxruntime throws a C++ exception across the `extern "C"` boundary when
+/// handed a nonexistent or truncated model file; `std::panic::catch_unwind`
+/// cannot catch a foreign exception, so once that call is made there is no way
+/// to recover — the only viable defence is refusing the call up front. This is
+/// a cheap, self-contained `std::fs` check (no `model-registry` dependency
+/// edge); it catches an absent file and a zero-byte file (the shape a
+/// truncated in-progress download leaves before it reaches its expected size),
+/// but not a file that is the right size yet still corrupt — the
+/// model-registry hash check upstream is the authoritative guard for that.
+fn require_model_file(path: &Path) -> AppResult<()> {
+    let meta = std::fs::metadata(path).map_err(|e| AppError::ModelLoad {
+        model_id: MODEL_ID.into(),
+        context: format!("model file missing or unreadable at {}: {e}", path.display()),
+    })?;
+    if !meta.is_file() {
+        return Err(AppError::ModelLoad {
+            model_id: MODEL_ID.into(),
+            context: format!("model path is not a regular file: {}", path.display()),
+        });
+    }
+    if meta.len() == 0 {
+        return Err(AppError::ModelLoad {
+            model_id: MODEL_ID.into(),
+            context: format!(
+                "model file is empty (incomplete download?): {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Construction inputs for [`ParakeetBackend`].
 #[derive(Debug, Clone)]
@@ -86,8 +129,15 @@ unsafe impl Send for ParakeetBackend {}
 
 impl ParakeetBackend {
     /// Build the recogniser from the four model files in `config.model_dir`.
+    ///
+    /// Every file is pre-flight validated ([`require_model_file`]) before the
+    /// sherpa FFI call — a recoverable `AppError::ModelLoad` on a missing or
+    /// empty file, never a call into sherpa with a bad path.
     pub fn new(config: ParakeetConfig) -> AppResult<Self> {
         let dir = &config.model_dir;
+        for name in REQUIRED_MODEL_FILES {
+            require_model_file(&dir.join(name))?;
+        }
         let cpath = |name: &str| -> AppResult<CString> {
             let p = dir.join(name);
             let s = p.to_str().ok_or_else(|| AppError::ModelLoad {
@@ -410,6 +460,51 @@ mod tests {
     #[test]
     fn empty_tokens_yield_no_words() {
         assert!(aggregate_words(&[], &[], 0, 1_000).is_empty());
+    }
+
+    #[test]
+    fn require_model_file_rejects_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.onnx");
+        match require_model_file(&path) {
+            Err(AppError::ModelLoad { .. }) => {}
+            other => panic!("expected AppError::ModelLoad, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_model_file_rejects_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.onnx");
+        std::fs::write(&path, []).expect("write empty file");
+        match require_model_file(&path) {
+            Err(AppError::ModelLoad { .. }) => {}
+            other => panic!("expected AppError::ModelLoad, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_model_file_accepts_nonempty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, [0u8; 16]).expect("write file");
+        assert!(require_model_file(&path).is_ok());
+    }
+
+    #[test]
+    fn new_rejects_incomplete_model_dir_without_panicking() {
+        // A model dir with only some of the required files present (the shape
+        // an in-progress download leaves) must surface as an `AppError`, never
+        // reach the sherpa FFI call, and never panic/abort.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("encoder.int8.onnx"), [0u8; 16]).unwrap();
+        // decoder.int8.onnx, joiner.int8.onnx, tokens.txt intentionally absent.
+        let result = ParakeetBackend::new(ParakeetConfig::new(dir.path()));
+        match result {
+            Err(AppError::ModelLoad { .. }) => {}
+            Err(other) => panic!("expected AppError::ModelLoad, got: {other:?}"),
+            Ok(_) => panic!("expected an error for an incomplete model dir"),
+        }
     }
 
     #[test]

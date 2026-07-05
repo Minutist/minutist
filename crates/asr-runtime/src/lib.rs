@@ -131,6 +131,41 @@ fn require_supported_sample_rate(sample_rate: u32) -> AppResult<()> {
     Ok(())
 }
 
+/// Reject a model path that is missing, not a regular file, or empty, before it
+/// is handed to llama.cpp's `load_from_file` / mtmd `init_from_file` FFI.
+///
+/// The native library aborts (rather than returning an error) on a missing or
+/// truncated path, and a foreign C++ abort cannot be caught by
+/// `std::panic::catch_unwind` — so validation must happen before the call. A
+/// self-contained `std::fs` check (no `model-registry` dependency edge): it
+/// catches an absent file and a zero-byte file (the shape a truncated
+/// in-progress download leaves), but not a size-complete-yet-corrupt file — the
+/// model-registry hash check upstream is the authoritative guard for that.
+fn require_model_file(path: &Path) -> AppResult<()> {
+    let meta = std::fs::metadata(path).map_err(|e| -> AppError {
+        Error::ModelLoad {
+            path: path.display().to_string(),
+            context: format!("model file missing or unreadable: {e}"),
+        }
+        .into()
+    })?;
+    if !meta.is_file() {
+        return Err(Error::ModelLoad {
+            path: path.display().to_string(),
+            context: "model path is not a regular file".to_string(),
+        }
+        .into());
+    }
+    if meta.len() == 0 {
+        return Err(Error::ModelLoad {
+            path: path.display().to_string(),
+            context: "model file is empty (incomplete download?)".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // LlamaBackend singleton
 // ---------------------------------------------------------------------------
@@ -475,14 +510,19 @@ impl AsrRuntime {
     ) -> AppResult<Self> {
         let backend = get_or_init_backend().map_err(AppError::from)?;
 
-        // Check existence before calling into llama.cpp — the C library panics on
-        // a missing path rather than returning an error.
-        if !model_path.exists() {
-            return Err(AppError::from(Error::ModelLoad {
-                path: model_path.display().to_string(),
-                context: "file not found".to_string(),
-            }));
-        }
+        // Pre-flight validation before calling into llama.cpp / mtmd. The native
+        // C++ library aborts (rather than returning an error) when handed a
+        // missing or truncated path, and a foreign C++ abort/exception cannot be
+        // caught by `std::panic::catch_unwind` on the Rust side — so the only
+        // viable defence is refusing the call up front. This catches an absent
+        // file and a zero-byte file (the shape a truncated in-progress download
+        // leaves before it reaches its expected size); the model-registry hash
+        // check upstream is the authoritative guard for a size-complete-but-
+        // corrupt file. Both the GGUF and the mmproj are validated because the
+        // mtmd context init is a second FFI entry point with the same failure
+        // mode.
+        require_model_file(model_path)?;
+        require_model_file(mmproj_path)?;
 
         // GPU offload is a RUNTIME decision driven by `config.n_gpu_layers`
         // (the orchestrator sets it from the `gpu_acceleration` setting; the
@@ -1120,6 +1160,35 @@ mod tests {
             ..AsrRuntimeConfig::default()
         };
         assert!(cfg_gpu.n_gpu_layers > 0, "non-zero layers enable mtmd GPU");
+    }
+
+    #[test]
+    fn require_model_file_rejects_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.gguf");
+        match require_model_file(&path) {
+            Err(AppError::ModelLoad { .. }) => {}
+            other => panic!("expected AppError::ModelLoad, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_model_file_rejects_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.gguf");
+        std::fs::write(&path, []).expect("write empty file");
+        match require_model_file(&path) {
+            Err(AppError::ModelLoad { .. }) => {}
+            other => panic!("expected AppError::ModelLoad, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_model_file_accepts_nonempty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.gguf");
+        std::fs::write(&path, [0u8; 16]).expect("write file");
+        require_model_file(&path).expect("non-empty file must be accepted");
     }
 
     #[test]

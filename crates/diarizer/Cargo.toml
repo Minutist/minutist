@@ -30,3 +30,4 @@ hound = { workspace = true }
 # (dev-dependency), so no `diarizer → persistence` runtime edge — persistence
 # depends only on `common`, so there is no cycle.
 persistence = { path = "../persistence" }
+tempfile = "3"

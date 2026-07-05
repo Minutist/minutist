@@ -280,6 +280,44 @@ fn require_supported_sample_rate(sample_rate: u32) -> AppResult<()> {
     Ok(())
 }
 
+/// Reject a model path that is missing, not a regular file, or empty, before it
+/// is handed to sherpa's `Diarize::new` / `EmbeddingExtractor::new` FFI.
+///
+/// onnxruntime throws a C++ exception across the `extern "C"` boundary when
+/// handed a nonexistent or truncated model file; `std::panic::catch_unwind`
+/// cannot catch a foreign exception, so Rust has no way to recover once that
+/// call is made. The only viable defence is refusing the call up front. This
+/// is a cheap, self-contained `std::fs` check (no `model-registry` dependency
+/// edge) — it catches an absent file, a directory passed by mistake, and a
+/// zero-byte file (the shape a truncated in-progress download leaves before it
+/// reaches its expected size), but it cannot detect a file that is the right
+/// size yet still corrupt; the model-registry hash check upstream is the
+/// authoritative guard for that.
+fn require_model_file(path: &Path) -> AppResult<()> {
+    let meta = std::fs::metadata(path).map_err(|e| -> minutist_common::AppError {
+        Error::ModelLoad {
+            path: path.display().to_string(),
+            context: format!("model file missing or unreadable: {e}"),
+        }
+        .into()
+    })?;
+    if !meta.is_file() {
+        return Err(Error::ModelLoad {
+            path: path.display().to_string(),
+            context: "model path is not a regular file".to_string(),
+        }
+        .into());
+    }
+    if meta.len() == 0 {
+        return Err(Error::ModelLoad {
+            path: path.display().to_string(),
+            context: "model file is empty (incomplete download?)".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// A speaker diarizer backed by a sherpa-onnx segmentation + embedding pipeline.
 ///
 /// Construct with [`SherpaDiarizer::open`]. The loaded sherpa `Diarize` engine
@@ -302,11 +340,18 @@ impl SherpaDiarizer {
     /// per Spike 4) selects the agglomerative `cluster_threshold` path. A
     /// sherpa `eyre::Result` error is mapped to `AppError::ModelLoad` at the
     /// boundary (no `eyre` dependency leaks out of this crate).
+    ///
+    /// Both paths are pre-flight validated ([`require_model_file`]) before the
+    /// sherpa FFI call — a recoverable `AppError::ModelLoad` on a missing or
+    /// empty file, never a call into sherpa with a bad path.
     pub fn open(
         segmentation_path: &Path,
         embedding_path: &Path,
         config: DiarizerConfig,
     ) -> AppResult<Self> {
+        require_model_file(segmentation_path)?;
+        require_model_file(embedding_path)?;
+
         let sherpa_config = sherpa_diarize_config(&config);
 
         let engine = Diarize::new(segmentation_path, embedding_path, sherpa_config).map_err(|e| {
@@ -1206,6 +1251,53 @@ mod tests {
                 matches!(err, minutist_common::AppError::InvalidInput { .. }),
                 "expected InvalidInput for {bad} Hz, got {err}"
             );
+        }
+    }
+
+    #[test]
+    fn require_model_file_rejects_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.onnx");
+        let err = require_model_file(&path).expect_err("missing file must be rejected");
+        assert!(
+            matches!(err, minutist_common::AppError::ModelLoad { .. }),
+            "expected ModelLoad, got {err}"
+        );
+    }
+
+    #[test]
+    fn require_model_file_rejects_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.onnx");
+        std::fs::write(&path, []).expect("write empty file");
+        let err = require_model_file(&path).expect_err("empty file must be rejected");
+        assert!(
+            matches!(err, minutist_common::AppError::ModelLoad { .. }),
+            "expected ModelLoad, got {err}"
+        );
+    }
+
+    #[test]
+    fn require_model_file_accepts_nonempty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, [0u8; 16]).expect("write file");
+        require_model_file(&path).expect("non-empty file must be accepted");
+    }
+
+    #[test]
+    fn open_rejects_missing_models_without_panicking() {
+        // Neither path exists (the shape a not-yet-downloaded or in-progress
+        // model directory leaves): `SherpaDiarizer::open` must surface an
+        // `AppError` from the pre-flight check, never reach the sherpa FFI
+        // call, and never panic/abort.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seg = dir.path().join("segmentation.onnx");
+        let emb = dir.path().join("embedding.onnx");
+        match SherpaDiarizer::open(&seg, &emb, DiarizerConfig::default()) {
+            Err(minutist_common::AppError::ModelLoad { .. }) => {}
+            Err(other) => panic!("expected ModelLoad, got {other}"),
+            Ok(_) => panic!("expected an error for missing model files"),
         }
     }
 

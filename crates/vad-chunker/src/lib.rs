@@ -67,6 +67,37 @@ impl From<Error> for AppError {
     }
 }
 
+/// Reject a model path that is missing, not a regular file, or empty, before
+/// it is handed to `Vad::new`'s onnxruntime FFI call.
+///
+/// onnxruntime throws a C++ exception across the FFI boundary when handed a
+/// nonexistent or truncated model file; `std::panic::catch_unwind` cannot
+/// catch a foreign exception, so once that call is made there is no way to
+/// recover — the only viable defence is refusing the call up front. Silero is
+/// a bundled Tauri resource rather than a `model-registry` download (see
+/// `architecture/cross-cutting.md` — "Model lifecycle" — "Exception: Silero
+/// VAD"), so this guards against a corrupted or missing install rather than
+/// an in-progress download.
+fn require_model_file(path: &Path) -> Result<(), Error> {
+    let meta = std::fs::metadata(path).map_err(|e| Error::ModelLoad {
+        path: path.display().to_string(),
+        context: format!("model file missing or unreadable: {e}"),
+    })?;
+    if !meta.is_file() {
+        return Err(Error::ModelLoad {
+            path: path.display().to_string(),
+            context: "model path is not a regular file".to_string(),
+        });
+    }
+    if meta.len() == 0 {
+        return Err(Error::ModelLoad {
+            path: path.display().to_string(),
+            context: "model file is empty (incomplete or corrupt install?)".to_string(),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Public configuration
 // ---------------------------------------------------------------------------
@@ -269,8 +300,13 @@ impl VadChunker {
     ///
     /// # Errors
     ///
-    /// Returns `AppError::ModelLoad` if the ONNX model cannot be opened.
+    /// Returns `AppError::ModelLoad` if the ONNX model cannot be opened, or if
+    /// pre-flight validation ([`require_model_file`]) rejects the path as
+    /// missing, not a regular file, or empty — checked before the onnxruntime
+    /// FFI call, never after.
     pub fn open(model_path: &Path, config: VadConfig) -> AppResult<Self> {
+        require_model_file(model_path)?;
+
         let vad = Vad::new(model_path, SAMPLE_RATE).map_err(|e| Error::ModelLoad {
             path: model_path.display().to_string(),
             context: e.to_string(),
@@ -663,6 +699,42 @@ mod tests {
         chunker
             .process_samples(samples, start_ms)
             .expect("process_samples failed")
+    }
+
+    #[test]
+    fn require_model_file_rejects_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.onnx");
+        let err = require_model_file(&path).expect_err("missing file must be rejected");
+        assert!(matches!(err, Error::ModelLoad { .. }), "expected ModelLoad, got {err}");
+    }
+
+    #[test]
+    fn require_model_file_rejects_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("truncated.onnx");
+        std::fs::write(&path, []).expect("write empty file");
+        let err = require_model_file(&path).expect_err("empty file must be rejected");
+        assert!(matches!(err, Error::ModelLoad { .. }), "expected ModelLoad, got {err}");
+    }
+
+    #[test]
+    fn require_model_file_accepts_nonempty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("model.onnx");
+        std::fs::write(&path, [0u8; 16]).expect("write file");
+        require_model_file(&path).expect("non-empty file must be accepted");
+    }
+
+    #[test]
+    fn open_rejects_missing_model_without_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("silero.onnx");
+        match VadChunker::open(&missing, VadConfig::default()) {
+            Err(AppError::ModelLoad { .. }) => {}
+            Err(other) => panic!("expected ModelLoad, got {other}"),
+            Ok(_) => panic!("expected an error for a missing model"),
+        }
     }
 
     // -----------------------------------------------------------------------

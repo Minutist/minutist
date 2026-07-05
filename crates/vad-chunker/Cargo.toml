@@ -14,3 +14,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 hound = { workspace = true }
+tempfile = "3"

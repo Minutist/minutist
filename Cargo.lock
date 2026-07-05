@@ -368,6 +368,7 @@ version = "0.1.0"
 dependencies = [
  "minutist-common",
  "sherpa-rs",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -381,6 +382,7 @@ dependencies = [
  "llama-cpp-2",
  "minutist-common",
  "num_cpus",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
@@ -2072,6 +2074,7 @@ dependencies = [
  "minutist-common",
  "persistence",
  "sherpa-rs",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -10296,6 +10299,7 @@ version = "0.1.0"
 dependencies = [
  "hound",
  "minutist-common",
+ "tempfile",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",

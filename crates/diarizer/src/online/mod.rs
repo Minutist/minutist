@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use minutist_common::AppResult;
 use sherpa_rs::speaker_id::{EmbeddingExtractor, ExtractorConfig};
 
-use crate::{alpha_label, require_supported_sample_rate, Error, REQUIRED_SAMPLE_RATE};
+use crate::{alpha_label, require_model_file, require_supported_sample_rate, Error, REQUIRED_SAMPLE_RATE};
 
 use clusterer::{OnlineClusterer, OnlineClustererConfig};
 
@@ -67,7 +67,11 @@ impl OnlineDiarizer {
     ///
     /// NOTE: takes ONLY the embedding model path — the online path needs no
     /// segmentation model (VAD upstream already supplies segment boundaries).
+    ///
+    /// Pre-flight validated ([`require_model_file`]) before the sherpa FFI call.
     pub fn open(embedding_path: &Path, config: OnlineDiarizerConfig) -> AppResult<Self> {
+        require_model_file(embedding_path)?;
+
         let extractor_config = ExtractorConfig {
             model: embedding_path.display().to_string(),
             provider: None,
@@ -179,7 +183,11 @@ impl VoiceprintExtractor {
     /// `ExtractorConfig { model: <path string>, provider: None, num_threads:
     /// None, debug: false }`, calls `EmbeddingExtractor::new(cfg)`, and maps the
     /// sherpa `eyre` error to `Error::ModelLoad`.
+    ///
+    /// Pre-flight validated ([`require_model_file`]) before the sherpa FFI call.
     pub fn open(embedding_path: &Path) -> AppResult<Self> {
+        require_model_file(embedding_path)?;
+
         let extractor_config = ExtractorConfig {
             model: embedding_path.display().to_string(),
             provider: None,
@@ -286,5 +294,33 @@ impl VoiceprintExtractor {
         let vector = minutist_common::voiceprint_math::weighted_merge(&pairs);
 
         Ok(crate::Voiceprint { vector })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn online_diarizer_open_rejects_missing_model_without_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("embedding.onnx");
+        match OnlineDiarizer::open(&missing, OnlineDiarizerConfig::default()) {
+            Err(minutist_common::AppError::ModelLoad { .. }) => {}
+            Err(other) => panic!("expected ModelLoad, got {other}"),
+            Ok(_) => panic!("expected an error for a missing embedding model"),
+        }
+    }
+
+    #[test]
+    fn voiceprint_extractor_open_rejects_empty_model_without_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("embedding.onnx");
+        std::fs::write(&path, []).expect("write empty file");
+        match VoiceprintExtractor::open(&path) {
+            Err(minutist_common::AppError::ModelLoad { .. }) => {}
+            Err(other) => panic!("expected ModelLoad, got {other}"),
+            Ok(_) => panic!("expected an error for an empty embedding model"),
+        }
     }
 }

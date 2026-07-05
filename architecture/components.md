@@ -3460,6 +3460,16 @@ llama edge. Depends on `common` (`Embedder`, `AppError`, `shared_llama_backend`,
   is per-call, never stored). Reuses the process-wide `shared_llama_backend`.
   Constructed + held by `ipc-bridge` (lazy `ensure_embedder`); consumed by the
   attach/transcript write path and the `retrieve_chunks` tool.
+- **Test-only dev-deps.** The `#[ignore]`d real-model retrieval-quality eval
+  (`tests/retrieval_quality_eval.rs`, gated on `MINUTIST_BGE_M3_PATH`) drives the
+  full retrieval path end-to-end — it embeds a planted-fact corpus with the real
+  bge-m3, indexes via `persistence::RagStore`, and fuses the dense + lexical legs
+  with `rag_retrieval::rrf_fuse` — so it catches a degraded / mis-quantised
+  embedder (near-zero or scrambled vectors) that the stub-embedder unit coverage
+  cannot. This adds test-only dev-dep edges `embedder → persistence` and
+  `embedder → rag-retrieval` (both depend only on `common`, so no cycle); they are
+  **NOT** runtime edges and do not appear in the dependency table (mirrors
+  `diarizer`'s test-only `persistence` dev-dep).
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`

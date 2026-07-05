@@ -2418,6 +2418,9 @@ version = "0.1.0"
 dependencies = [
  "llama-cpp-2",
  "minutist-common",
+ "persistence",
+ "rag-retrieval",
+ "tokio",
  "tracing",
 ]
 

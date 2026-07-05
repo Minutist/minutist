@@ -18,6 +18,16 @@ minutist-common = { path = "../common", features = ["llama-backend"] }
 llama-cpp-2 = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# Test-only: the #[ignore]d real-model retrieval-quality eval
+# (`tests/retrieval_quality_eval.rs`) drives the full chat-window retrieval path —
+# `persistence::RagStore` (index + dense/lexical legs) fused via
+# `rag-retrieval::rrf_fuse`. Both depend only on `common`, so there is no cycle and
+# NO runtime edge (mirrors `diarizer`'s test-only `persistence` dev-dep).
+persistence = { path = "../persistence" }
+rag-retrieval = { path = "../rag-retrieval" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [features]
 # GPU acceleration backends, OFF by default — forward to llama-cpp-2, mirroring
 # `summariser` / `asr-runtime`. `ipc-bridge` enables these transitively.

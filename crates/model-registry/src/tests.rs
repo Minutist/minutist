@@ -105,6 +105,21 @@ fn manifest_parses_cleanly() {
     assert_eq!(entries[0].files[0].filename, "model.bin");
 }
 
+#[test]
+fn manifest_rejects_unsupported_version() {
+    const FUTURE_VERSION_MANIFEST: &[u8] = br#"{
+        "version": 999,
+        "models": []
+    }"#;
+    match parse_manifest(FUTURE_VERSION_MANIFEST) {
+        Err(crate::error::Error::UnsupportedManifestVersion { found, supported }) => {
+            assert_eq!(found, 999);
+            assert_eq!(supported, crate::manifest::SUPPORTED_MANIFEST_VERSION);
+        }
+        other => panic!("expected UnsupportedManifestVersion, got: {other:?}"),
+    }
+}
+
 // -----------------------------------------------------------------------
 // Test 2: list_models — Missing on empty cache; Available after placing files
 // -----------------------------------------------------------------------
@@ -507,4 +522,51 @@ async fn multi_file_entry_reports_aggregate_progress() {
         Some(grand_total),
         "final progress event must reach the aggregate total"
     );
+}
+
+// -----------------------------------------------------------------------
+// Test 8: verify_file_hash streams the file rather than buffering it whole,
+// and still produces the correct digest.
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn verify_file_hash_matches_known_digest() {
+    use crate::registry::verify_file_hash;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Larger than one hash chunk so the chunked read loop actually iterates
+    // more than once.
+    let content: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    let expected = sha256_hex(&content);
+
+    let path = dir.path().join("streamed.bin");
+    tokio::fs::write(&path, &content).await.expect("write");
+
+    assert!(
+        verify_file_hash(&path, &expected)
+            .await
+            .expect("hashing should succeed"),
+        "digest of the file's actual contents must match"
+    );
+    assert!(
+        !verify_file_hash(
+            &path,
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .await
+        .expect("hashing should succeed"),
+        "a wrong expected digest must not match"
+    );
+}
+
+#[tokio::test]
+async fn verify_file_hash_missing_file_is_false_not_error() {
+    use crate::registry::verify_file_hash;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("does-not-exist.bin");
+
+    assert!(!verify_file_hash(&path, "anything")
+        .await
+        .expect("missing file should be Ok(false), not an error"));
 }

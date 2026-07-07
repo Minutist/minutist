@@ -266,9 +266,11 @@ impl VoiceprintExtractor {
     /// produced here is directly comparable (via cosine) to a centroid the online
     /// clusterer has accumulated.
     ///
-    /// Rejects `sr != 16000`, an empty `windows` slice, or any window whose
-    /// embedding is degenerate (zero/non-finite norm — `unit_normalise` is a
-    /// no-op on those).
+    /// Rejects `sr != 16000` or an empty `windows` slice outright. A window
+    /// whose embedding is degenerate (zero or non-finite norm) is skipped
+    /// rather than contaminating the centroid with an unusable direction; if
+    /// every window turns out degenerate the call is rejected (there is then
+    /// nothing left to build a centroid from).
     pub fn centroid(&self, windows: &[&[f32]], sr: u32) -> AppResult<crate::Voiceprint> {
         require_supported_sample_rate(sr)?;
 
@@ -279,12 +281,23 @@ impl VoiceprintExtractor {
             );
         }
 
-        // Embed + unit-normalise each window.
+        // Embed + unit-normalise each window, skipping any whose embedding is
+        // degenerate — the same zero/non-finite-norm reject criteria the
+        // online clusterer applies to a live embedding (`clusterer::unit_normalise`).
         let mut unit_vecs: Vec<Vec<f32>> = Vec::with_capacity(windows.len());
         for &window in windows {
-            let mut emb = self.embed(window, sr)?;
-            minutist_common::voiceprint_math::unit_normalise(&mut emb);
-            unit_vecs.push(emb);
+            let emb = self.embed(window, sr)?;
+            if let Ok(unit) = clusterer::unit_normalise(&emb) {
+                unit_vecs.push(unit);
+            }
+        }
+
+        if unit_vecs.is_empty() {
+            return Err(Error::InvalidInput(
+                "centroid: every audio window had a degenerate (zero/non-finite-norm) embedding"
+                    .to_string(),
+            )
+            .into());
         }
 
         // Count-weighted merge (equal counts of 1 for independently-normalised
@@ -322,5 +335,28 @@ mod tests {
             Err(other) => panic!("expected ModelLoad, got {other}"),
             Ok(_) => panic!("expected an error for an empty embedding model"),
         }
+    }
+
+    /// `VoiceprintExtractor::centroid` skips a degenerate window rather than
+    /// letting it contaminate the centroid, by feeding each raw embedding
+    /// through [`clusterer::unit_normalise`] and dropping the ones that error.
+    /// This exercises that exact reject/accept criterion (a zero-norm or
+    /// NaN-laden vector must error; a normal one must be accepted and come
+    /// back unit-normalised) without needing a real embedding model.
+    #[test]
+    fn centroid_skip_criterion_rejects_degenerate_and_accepts_normal_embeddings() {
+        assert!(
+            clusterer::unit_normalise(&[0.0, 0.0, 0.0]).is_err(),
+            "a zero-norm embedding must be rejected"
+        );
+        assert!(
+            clusterer::unit_normalise(&[f32::NAN, 1.0, 0.0]).is_err(),
+            "a NaN-laden embedding must be rejected"
+        );
+
+        let unit =
+            clusterer::unit_normalise(&[3.0, 4.0]).expect("a normal embedding must be accepted");
+        assert!((unit[0] - 0.6).abs() < 1e-6);
+        assert!((unit[1] - 0.8).abs() < 1e-6);
     }
 }

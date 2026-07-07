@@ -379,6 +379,26 @@ resolves the engine once at recording start (and at re-transcribe) in
 and GPU layers. `model-registry` only fetches the model(s) for the selected
 engine; pulling all three is opt-in (disk).
 
+## FFI null-safety at C-API boundaries
+
+`asr-parakeet` calls into sherpa-onnx's C API directly (`sherpa-rs`'s `sys`
+feature, `sherpa_rs_sys`, `unsafe extern "C"` functions) rather than through
+the safe Rust wrapper, because the wrapper drops per-token timestamps (see
+`components.md` — `asr-parakeet` "Timestamps"). `diarizer` depends on
+`sherpa-rs` without the `sys` feature and uses only the safe wrapper
+(`EmbeddingExtractor`, `Diarize`); it has no raw C-API call sites, so this
+section does not apply to it. None of `SherpaOnnxCreateOfflineStream`,
+`SherpaOnnxGetOfflineStreamResult`, or the `SherpaOnnxOfflineRecognizerResult`
+fields it returns (`text`, `tokens`, `timestamps`) are documented as
+infallible. Every pointer such a call returns MUST be null-checked before it is
+read or passed to `CStr::from_ptr` / `slice::from_raw_parts`; a null read
+segfaults the whole process instead of surfacing a recoverable error. A null
+result maps to `AppError::Inference` (crate-specific caller-facing error,
+naming the failing C API call) rather than propagating a fabricated model
+output. This binds any future direct C-API call added to `asr-parakeet`. If
+`diarizer` ever gains a raw C-API call site, it falls under this same rule and
+this section must be updated to cover it.
+
 ## Notes paragraph-anchor clock
 
 Phase 3 binding rule (stress-test correction A4). Notes paragraph anchors
@@ -572,6 +592,11 @@ Owned by `model-registry`. The contract:
   button reads as a no-op. Relatedly, `ensure`'s validity check skips hashing an
   absent/wrong-size file (size pre-check) rather than reading a multi-GB partial
   in full only to fail.
+- **Hash verification is streamed, not buffered.** `verify_file_hash` and the
+  resume-seed path (feeding the hasher with an on-disk partial before
+  appending) both read the file in fixed-size chunks through a `BufReader`
+  rather than loading it whole into a `Vec`, so hashing a multi-gigabyte model
+  file has bounded memory use regardless of file size.
 - Loaded models are owned by the consuming crate (`asr-runtime`,
   `summariser`, `diarizer`). The registry hands out paths, not loaded
   models — we don't want a model cache that two crates can hold

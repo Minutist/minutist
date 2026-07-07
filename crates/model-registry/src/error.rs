@@ -23,6 +23,9 @@ pub enum Error {
     #[error("manifest entry not found: {model_id}")]
     ManifestEntryNotFound { model_id: String },
 
+    #[error("unsupported manifest version {found} (supported: {supported})")]
+    UnsupportedManifestVersion { found: u32, supported: u32 },
+
     #[error("cancelled")]
     Cancelled,
 }
@@ -50,6 +53,9 @@ impl From<Error> for AppError {
                 ),
             },
             ManifestEntryNotFound { model_id } => AppError::ModelNotFound { model_id },
+            UnsupportedManifestVersion { found, supported } => AppError::ModelDownload {
+                context: format!("unsupported manifest version {found} (supported: {supported})"),
+            },
             Cancelled => AppError::Cancelled,
         }
     }

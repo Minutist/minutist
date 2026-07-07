@@ -222,9 +222,15 @@ impl ParakeetBackend {
 
     /// Run one offline decode, returning (text, tokens, per-token start times in
     /// seconds). Reads the full C result so the timestamps survive.
-    fn transcribe_raw(&self, samples: &[f32]) -> (String, Vec<String>, Vec<f32>) {
+    ///
+    /// Every pointer sherpa-onnx hands back across the FFI boundary is
+    /// null-checked before it is dereferenced: none of these calls are
+    /// documented as infallible, and reading through a null pointer here
+    /// would segfault the process rather than surface a recoverable error.
+    fn transcribe_raw(&self, samples: &[f32]) -> AppResult<(String, Vec<String>, Vec<f32>)> {
         unsafe {
             let stream = sys::SherpaOnnxCreateOfflineStream(self.recognizer);
+            require_non_null(stream, "SherpaOnnxCreateOfflineStream")?;
             sys::SherpaOnnxAcceptWaveformOffline(
                 stream,
                 SAMPLE_RATE as i32,
@@ -233,6 +239,10 @@ impl ParakeetBackend {
             );
             sys::SherpaOnnxDecodeOfflineStream(self.recognizer, stream);
             let result_ptr = sys::SherpaOnnxGetOfflineStreamResult(stream);
+            if let Err(e) = require_non_null(result_ptr, "SherpaOnnxGetOfflineStreamResult") {
+                sys::SherpaOnnxDestroyOfflineStream(stream);
+                return Err(e);
+            }
             let raw = result_ptr.read();
 
             let text = cptr_to_string(raw.text);
@@ -242,18 +252,43 @@ impl ParakeetBackend {
             } else {
                 std::slice::from_raw_parts(raw.timestamps, count).to_vec()
             };
-            let mut tokens = Vec::with_capacity(count);
-            let mut next = raw.tokens;
-            for _ in 0..count {
-                let t = CStr::from_ptr(next);
-                tokens.push(t.to_string_lossy().into_owned());
-                next = next.wrapping_byte_offset(t.to_bytes_with_nul().len() as isize);
-            }
+            let tokens = if count == 0 {
+                Vec::new()
+            } else if let Err(e) =
+                require_non_null(raw.tokens, "SherpaOnnxOfflineRecognizerResult.tokens")
+            {
+                sys::SherpaOnnxDestroyOfflineRecognizerResult(result_ptr);
+                sys::SherpaOnnxDestroyOfflineStream(stream);
+                return Err(e);
+            } else {
+                let mut tokens = Vec::with_capacity(count);
+                let mut next = raw.tokens;
+                for _ in 0..count {
+                    let t = CStr::from_ptr(next);
+                    tokens.push(t.to_string_lossy().into_owned());
+                    next = next.wrapping_byte_offset(t.to_bytes_with_nul().len() as isize);
+                }
+                tokens
+            };
 
             sys::SherpaOnnxDestroyOfflineRecognizerResult(result_ptr);
             sys::SherpaOnnxDestroyOfflineStream(stream);
-            (text, tokens, timestamps)
+            Ok((text, tokens, timestamps))
         }
+    }
+}
+
+/// Validate a pointer sherpa-onnx returned across the FFI boundary before it
+/// is dereferenced, naming the C API call that produced it in the error so a
+/// null failure is diagnosable instead of a silent segfault.
+fn require_non_null<T>(ptr: *const T, source: &str) -> AppResult<()> {
+    if ptr.is_null() {
+        Err(AppError::Inference {
+            backend: "asr-parakeet".into(),
+            context: format!("{source} returned a null pointer"),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -279,7 +314,7 @@ impl minutist_common::AsrBackend for ParakeetBackend {
             return Ok(vec![]);
         }
 
-        let (text, tokens, timestamps) = self.transcribe_raw(&chunk.samples);
+        let (text, tokens, timestamps) = self.transcribe_raw(&chunk.samples)?;
         let text = text.trim().to_string();
         if text.is_empty() {
             return Ok(vec![]);
@@ -460,6 +495,24 @@ mod tests {
     #[test]
     fn empty_tokens_yield_no_words() {
         assert!(aggregate_words(&[], &[], 0, 1_000).is_empty());
+    }
+
+    #[test]
+    fn require_non_null_rejects_null_pointer() {
+        let ptr: *const u8 = std::ptr::null();
+        match require_non_null(ptr, "SomeSherpaCall") {
+            Err(AppError::Inference { backend, context }) => {
+                assert_eq!(backend, "asr-parakeet");
+                assert!(context.contains("SomeSherpaCall"));
+            }
+            other => panic!("expected AppError::Inference, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn require_non_null_accepts_non_null_pointer() {
+        let value = 42u8;
+        assert!(require_non_null(&value as *const u8, "SomeSherpaCall").is_ok());
     }
 
     #[test]

@@ -232,8 +232,13 @@ impl OnlineClusterer {
 /// Validates the input fully, then delegates the actual normalisation to
 /// [`minutist_common::voiceprint_math::unit_normalise`]. The common function is
 /// a no-op on degenerate inputs; the explicit pre-check here converts those
-/// cases into `AppError::InvalidInput` as the clusterer requires.
-fn unit_normalise(x: &[f32]) -> AppResult<Vec<f32>> {
+/// cases into `AppError::InvalidInput`.
+///
+/// `pub(crate)` because [`crate::online::VoiceprintExtractor::centroid`] reuses
+/// it (via an `Err` → skip, rather than propagate) to keep a degenerate window
+/// out of a re-embedded centroid, with the same reject criteria the online
+/// clusterer applies to a live embedding.
+pub(crate) fn unit_normalise(x: &[f32]) -> AppResult<Vec<f32>> {
     // Reject non-finite components (NaN, ±Inf): the norm would be undefined.
     for &v in x {
         if !v.is_finite() {

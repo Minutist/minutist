@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, watch, Mutex};
 
 use minutist_common::{
@@ -269,7 +269,7 @@ impl ModelRegistry {
         let mut hasher = Sha256::new();
         let mut bytes_done: u64 = 0;
 
-        let (mut fs_file, request_builder) = if existing_bytes > 0
+        let (fs_file, request_builder) = if existing_bytes > 0
             && existing_bytes < file.size
         {
             tracing::info!(
@@ -280,10 +280,11 @@ impl ModelRegistry {
                 "resuming partial download"
             );
 
-            // Seed the hasher with the existing partial bytes.
-            let partial = tokio::fs::read(&dest).await.map_err(Error::Io)?;
-            hasher.update(&partial);
-            bytes_done = partial.len() as u64;
+            // Seed the hasher with the existing partial bytes, streamed
+            // rather than read whole so a large partial download stays out
+            // of memory.
+            feed_hasher_from_file(&dest, &mut hasher).await?;
+            bytes_done = existing_bytes;
 
             let file_handle = tokio::fs::OpenOptions::new()
                 .append(true)
@@ -356,6 +357,84 @@ impl ModelRegistry {
             "downloading model file"
         );
 
+        self.stream_and_verify(
+            model_id,
+            file,
+            &dest,
+            fs_file,
+            response,
+            hasher,
+            base_offset,
+            bytes_done,
+            grand_total,
+        )
+        .await?;
+
+        tracing::info!(
+            target: "model-registry",
+            model_id = %model_id.0,
+            filename = %file.filename,
+            "model file download complete and verified"
+        );
+
+        Ok(())
+    }
+
+    /// Fresh (no Range) download of a single file — used when the server
+    /// rejected our Range request.
+    async fn download_file_fresh(
+        &self,
+        model_id: &ModelId,
+        file: &ModelFileEntry,
+        model_dir: &Path,
+        base_offset: u64,
+        grand_total: u64,
+    ) -> Result<(), Error> {
+        let dest = model_dir.join(&file.filename);
+        let fs_file = tokio::fs::File::create(&dest).await.map_err(Error::Io)?;
+        let response = self
+            .http
+            .get(&file.url)
+            .send()
+            .await
+            .map_err(Error::Http)?
+            .error_for_status()
+            .map_err(Error::Http)?;
+
+        self.stream_and_verify(
+            model_id,
+            file,
+            &dest,
+            fs_file,
+            response,
+            Sha256::new(),
+            base_offset,
+            0,
+            grand_total,
+        )
+        .await
+    }
+
+    /// Stream `response`'s body into `fs_file`, updating `hasher` and
+    /// emitting throttled progress events, then verify the accumulated
+    /// digest against `file.sha256` and delete `dest` on mismatch. Shared by
+    /// the resume path (`download_file`, `hasher`/`bytes_done` already seeded
+    /// from the on-disk partial) and the fresh-download path
+    /// (`download_file_fresh`, both start at zero) — the two differ only in
+    /// how the file handle and response were obtained.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_and_verify(
+        &self,
+        model_id: &ModelId,
+        file: &ModelFileEntry,
+        dest: &Path,
+        mut fs_file: tokio::fs::File,
+        response: reqwest::Response,
+        mut hasher: Sha256,
+        base_offset: u64,
+        mut bytes_done: u64,
+        grand_total: u64,
+    ) -> Result<(), Error> {
         let mut last_emit = Instant::now();
         let mut stream = response.bytes_stream();
 
@@ -382,73 +461,7 @@ impl ModelRegistry {
 
         let actual_hex = format!("{:x}", hasher.finalize());
         if actual_hex != file.sha256 {
-            tokio::fs::remove_file(&dest).await.map_err(Error::Io)?;
-            return Err(Error::HashMismatch {
-                filename: file.filename.clone(),
-                expected: file.sha256.clone(),
-                actual: actual_hex,
-            });
-        }
-
-        tracing::info!(
-            target: "model-registry",
-            model_id = %model_id.0,
-            filename = %file.filename,
-            "model file download complete and verified"
-        );
-
-        Ok(())
-    }
-
-    /// Fresh (no Range) download of a single file — used when the server
-    /// rejected our Range request.
-    async fn download_file_fresh(
-        &self,
-        model_id: &ModelId,
-        file: &ModelFileEntry,
-        model_dir: &Path,
-        base_offset: u64,
-        grand_total: u64,
-    ) -> Result<(), Error> {
-        let dest = model_dir.join(&file.filename);
-        let mut fs_file = tokio::fs::File::create(&dest).await.map_err(Error::Io)?;
-        let response = self
-            .http
-            .get(&file.url)
-            .send()
-            .await
-            .map_err(Error::Http)?
-            .error_for_status()
-            .map_err(Error::Http)?;
-
-        let mut hasher = Sha256::new();
-        let mut bytes_done: u64 = 0;
-        let mut last_emit = Instant::now();
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(Error::Http)?;
-            hasher.update(&chunk);
-            fs_file.write_all(&chunk).await.map_err(Error::Io)?;
-            bytes_done += chunk.len() as u64;
-
-            let now = Instant::now();
-            if now.duration_since(last_emit) >= PROGRESS_MIN_INTERVAL {
-                last_emit = now;
-                let _ = self.event_tx.send(AppEvent::ModelDownloadProgress {
-                    model_id: model_id.clone(),
-                    bytes_done: base_offset + bytes_done,
-                    bytes_total: Some(grand_total),
-                });
-            }
-        }
-
-        fs_file.flush().await.map_err(Error::Io)?;
-        drop(fs_file);
-
-        let actual_hex = format!("{:x}", hasher.finalize());
-        if actual_hex != file.sha256 {
-            tokio::fs::remove_file(&dest).await.map_err(Error::Io)?;
+            tokio::fs::remove_file(dest).await.map_err(Error::Io)?;
             return Err(Error::HashMismatch {
                 filename: file.filename.clone(),
                 expected: file.sha256.clone(),
@@ -502,16 +515,40 @@ fn compute_status_sync(entry: &ModelManifestEntry, model_dir: &Path) -> ModelSta
     }
 }
 
+/// Chunk size used to stream a file into a hasher — large enough to amortise
+/// the per-read syscall cost, small enough that hashing a multi-gigabyte
+/// model file never buffers more than this much of it at once.
+const HASH_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Feed the SHA-256 `hasher` with the full contents of `path`, read in fixed
+/// `HASH_CHUNK_SIZE` chunks rather than loaded whole into a `Vec` — bounds
+/// memory use when hashing a multi-gigabyte model file (either to verify a
+/// completed download or to seed the hasher when resuming a partial one).
+async fn feed_hasher_from_file(path: &Path, hasher: &mut Sha256) -> Result<(), Error> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut reader = tokio::io::BufReader::with_capacity(HASH_CHUNK_SIZE, file);
+    let mut buf = vec![0u8; HASH_CHUNK_SIZE];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(())
+}
+
 /// Async hash verification of a single file.  Returns `Ok(true)` if the file
-/// exists and its SHA-256 matches `expected_hex`.
+/// exists and its SHA-256 matches `expected_hex`. Streams the file through
+/// [`feed_hasher_from_file`] rather than reading it whole, so verifying a
+/// multi-gigabyte model file has bounded memory use.
 pub(crate) async fn verify_file_hash(path: &Path, expected_hex: &str) -> Result<bool, Error> {
-    let bytes = match tokio::fs::read(path).await {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(Error::Io(e)),
-    };
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    match feed_hasher_from_file(path, &mut hasher).await {
+        Ok(()) => {}
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    }
     let actual = format!("{:x}", hasher.finalize());
     Ok(actual == expected_hex)
 }

@@ -45,6 +45,7 @@ use std::sync::{Mutex, OnceLock};
 
 use encoding_rs::UTF_8;
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
@@ -599,37 +600,21 @@ impl LlamaSummariser {
         // Prefill: the image chunk is encoded via mtmd_encode inside
         // `eval_chunks`, the text chunks via llama_decode. `n_batch` is the
         // chunked-prefill chunk size (cross-cutting "llama.cpp prefill batching").
-        let mut n_past = chunks
+        let n_past = chunks
             .eval_chunks(mtmd_ctx, &llama_ctx, 0, 0, self.config.n_batch as i32, true)
             .map_err(|e| Error::Inference(format!("eval_chunks: {e}")))?;
 
-        // Greedy decode with EOG stop.
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
+        // Greedy decode with EOG stop — the OCR path reports no progress, so
+        // the per-token callback is a no-op.
         let mut batch = LlamaBatch::new(self.config.n_batch as usize, 1);
-        let mut decoder = UTF_8.new_decoder();
-        let mut markdown = String::new();
-
-        for _ in 0..self.config.max_tokens {
-            let token = sampler.sample(&llama_ctx, -1);
-            sampler.accept(token);
-            if self.model.is_eog_token(token) {
-                break;
-            }
-            let piece = self
-                .model
-                .token_to_piece(token, &mut decoder, true, None)
-                .map_err(|e| Error::Inference(format!("token_to_piece: {e}")))?;
-            markdown.push_str(&piece);
-
-            batch.clear();
-            batch
-                .add(token, n_past, &[0], true)
-                .map_err(|e| Error::Inference(format!("batch.add (gen): {e}")))?;
-            n_past += 1;
-            llama_ctx
-                .decode(&mut batch)
-                .map_err(|e| Error::Inference(format!("decode (gen): {e}")))?;
-        }
+        let markdown = greedy_decode(
+            &self.model,
+            &mut llama_ctx,
+            &mut batch,
+            n_past,
+            self.config.max_tokens,
+            |_done| {},
+        )?;
 
         Ok(markdown.trim().to_string())
     }
@@ -842,22 +827,58 @@ fn generate_with_config(
     }
 
     // --- Greedy generation ---
+    // `done == config.max_tokens` on the EOG callback jumps the progress bar
+    // to 100 % so a short output still completes the bar rather than leaving
+    // it stuck mid-way (see `greedy_decode`).
+    let n_past = tokens.len() as i32;
+    let text = greedy_decode(
+        model,
+        &mut llama_ctx,
+        &mut batch,
+        n_past,
+        config.max_tokens,
+        |done| {
+            on_progress(SummariseProgress::Generate {
+                done,
+                max: config.max_tokens,
+            })
+        },
+    )?;
+
+    Ok(text)
+}
+
+/// Greedily decode from an already-prefilled context until an EOG token or
+/// `max_tokens` is reached, appending each detokenised piece.
+///
+/// `n_past` is the KV-cache position immediately after prefill; `batch` is
+/// reused (cleared each iteration) rather than reallocated per token.
+/// `on_token` is called after each generated token with the running count —
+/// `max_tokens` itself on the EOG token, so a caller reporting progress can
+/// jump straight to 100 % rather than getting stuck one token short.
+///
+/// Shared by [`generate_with_config`] (text-prompt prefill) and
+/// [`LlamaSummariser::run_image_to_markdown`] (mtmd image prefill): the two
+/// prefill the KV cache differently, but decode identically once `n_past`
+/// tokens are already in it.
+fn greedy_decode(
+    model: &LlamaModel,
+    llama_ctx: &mut LlamaContext<'_>,
+    batch: &mut LlamaBatch,
+    mut n_past: i32,
+    max_tokens: usize,
+    mut on_token: impl FnMut(usize),
+) -> Result<String, Error> {
     let mut sampler = LlamaSampler::chain_simple([LlamaSampler::greedy()]);
     let mut decoder = UTF_8.new_decoder();
     let mut text = String::new();
-    let mut n_past = tokens.len() as i32;
 
-    for i in 0..config.max_tokens {
-        let token = sampler.sample(&llama_ctx, -1);
+    for i in 0..max_tokens {
+        let token = sampler.sample(llama_ctx, -1);
         sampler.accept(token);
 
         if model.is_eog_token(token) {
-            // EOG: jump the bar to 100 % so a short output still completes the
-            // bar rather than leaving it stuck mid-way.
-            on_progress(SummariseProgress::Generate {
-                done: config.max_tokens,
-                max: config.max_tokens,
-            });
+            on_token(max_tokens);
             break;
         }
 
@@ -865,11 +886,7 @@ fn generate_with_config(
             .token_to_piece(token, &mut decoder, true, None)
             .map_err(|e| Error::Inference(format!("token_to_piece: {e}")))?;
         text.push_str(&piece);
-
-        on_progress(SummariseProgress::Generate {
-            done: i + 1,
-            max: config.max_tokens,
-        });
+        on_token(i + 1);
 
         batch.clear();
         batch
@@ -878,7 +895,7 @@ fn generate_with_config(
         n_past += 1;
 
         llama_ctx
-            .decode(&mut batch)
+            .decode(batch)
             .map_err(|e| Error::Inference(format!("decode (gen): {e}")))?;
     }
 

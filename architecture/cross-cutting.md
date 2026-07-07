@@ -203,6 +203,59 @@ Panics: never as control flow. A panic inside a `spawn_blocking` task
 must abort the parent orchestrator task and surface as a recoverable
 `AppError`. The app does not exit on a single bad recording.
 
+## Durability guarantees
+
+Every on-disk write that replaces an existing file, across `persistence`,
+`notes-crdt`, and `settings`, follows the same pattern: write to a sibling
+`.tmp` file, `fsync` it, then `rename` it into place. A crash or kill at any
+point up to the `rename` leaves the previous file intact — nothing ever
+observes a truncated or half-written result. `persistence` applies this to
+`transcript.json` (both the free-function `write_transcript` and
+`TranscriptWriter::flush`), `summary.md`, chat sessions, and the attachments
+manifest; `notes-crdt` applies it to `notes.md` / `notes.json` / `notes.ydoc`
+and `metadata.json` (`persistence::metadata` delegates to
+`notes_crdt::write_metadata_atomic` rather than writing those files itself);
+`settings` applies it to `settings.store`.
+
+**Residual: the parent directory is not fsync'd.** The guarantee above is
+"no torn/partial file, and the prior file survives intact" — it does not make
+the *newest* rename itself power-loss durable. A directory-entry update from
+`rename` is only guaranteed to survive a crash once the directory's own
+metadata is flushed; without an explicit `fsync` on the parent directory, a
+power loss immediately after `rename` returns can still leave the visible
+file at the previous version on some filesystems. Closing this gap means
+fsyncing the parent directory of every write above, including the sync
+peers' — deferred rather than done piecemeal.
+
+**Migrations are transactional.** Both schema-migration runners
+(`persistence::migrations` for `index.db`, `persistence::voiceprints_migrations`
+for `voiceprints.db`) wrap each step's DDL and its `schema_version` bump in one
+`BEGIN IMMEDIATE`/`COMMIT` transaction. A crash between applying a step's DDL
+and recording the version bump is therefore never observable as a half-applied
+state: SQLite rolls the whole step back, so the next `run` re-applies it from
+scratch instead of hitting a non-idempotent DDL failure (e.g. `ALTER TABLE ...
+ADD COLUMN` against a column that already exists).
+
+**Multi-statement transactions on `index.db` and `voiceprints.db` are
+serialised.** `MeetingIndex` and `VoiceprintStore` are each shared app-wide via
+`Arc`, and libsql's local connection has no locking of its own, so two
+concurrent transaction-bearing calls on the shared connection could otherwise
+interleave their statements — erroring with "cannot start a transaction within
+a transaction", or worse, having one call's write silently absorbed into, and
+then lost with, another call's rolled-back transaction. Both stores hold a
+`tokio::sync::Mutex<()>` (`tx_lock`) acquired for the full span of any `BEGIN
+IMMEDIATE`..`COMMIT`/`ROLLBACK` block (`MeetingIndex::rebuild_transaction`;
+`VoiceprintStore::enrol`, `refine`, `merge_identities`, `forget_meeting`,
+`forget_contribution`, `clear_all`). Single-statement writers are atomic in
+SQLite's autocommit mode on their own, but SQLite transactions are
+connection-scoped: a plain statement issued while another call holds one of
+these open transactions on the shared connection can be silently absorbed
+into it — committing or rolling back together with it — and a concurrent
+read can dirty-read its uncommitted rows. For the rebuildable `index.db`
+cache this window is accepted; every multi-statement mutation on either
+store, including `clear_all`, holds `tx_lock` and a transaction for exactly
+this reason.
+
 ## Logging
 
 `tracing` crate. Subscriber configured in `app-main`:

@@ -78,6 +78,13 @@ pub struct OggOpusEncoder<W: Write> {
     pause_state: PauseState,
     /// Whether the Ogg/Opus headers have been written.
     headers_written: bool,
+    /// Reused encode target for `OpusEncoder::encode_float`, sized once to
+    /// [`MAX_PACKET_BYTES`] instead of allocating fresh on every 20 ms frame.
+    /// `PacketWriter::write_packet` may retain a packet inside a
+    /// partially-built Ogg page past the call that submits it, so only the
+    /// encoded byte range is copied out into an owned buffer for the writer;
+    /// this field itself is never handed away.
+    scratch: Vec<u8>,
 }
 
 impl<W: Write> OggOpusEncoder<W> {
@@ -106,6 +113,7 @@ impl<W: Write> OggOpusEncoder<W> {
             pending: Vec::new(),
             pause_state: PauseState::Recording,
             headers_written: false,
+            scratch: vec![0u8; MAX_PACKET_BYTES],
         })
     }
 
@@ -312,15 +320,14 @@ impl<W: Write> OggOpusEncoder<W> {
     fn encode_frame(&mut self, frame: &[f32]) -> Result<()> {
         debug_assert_eq!(frame.len(), FRAME_SAMPLES);
 
-        let mut buf = vec![0u8; MAX_PACKET_BYTES];
-        let n = self.encoder.encode_float(frame, &mut buf)?;
-        buf.truncate(n);
+        let n = self.encoder.encode_float(frame, &mut self.scratch)?;
+        let packet = self.scratch[..n].to_vec();
 
         self.granule += GRANULE_PER_FRAME;
 
         self.writer
             .write_packet(
-                buf,
+                packet,
                 self.serial,
                 PacketWriteEndInfo::NormalPacket,
                 self.granule,
@@ -334,15 +341,14 @@ impl<W: Write> OggOpusEncoder<W> {
     fn encode_frame_end(&mut self, frame: Vec<f32>) -> Result<()> {
         debug_assert_eq!(frame.len(), FRAME_SAMPLES);
 
-        let mut buf = vec![0u8; MAX_PACKET_BYTES];
-        let n = self.encoder.encode_float(&frame, &mut buf)?;
-        buf.truncate(n);
+        let n = self.encoder.encode_float(&frame, &mut self.scratch)?;
+        let packet = self.scratch[..n].to_vec();
 
         self.granule += GRANULE_PER_FRAME;
 
         self.writer
             .write_packet(
-                buf,
+                packet,
                 self.serial,
                 PacketWriteEndInfo::EndStream,
                 self.granule,

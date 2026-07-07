@@ -53,6 +53,13 @@ const MAX_ZIP_UNCOMPRESSED_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
 /// Maximum number of zip entries to process (prevents zip-entry-count bombs).
 const MAX_ZIP_ENTRIES: usize = 10_000;
 
+/// Raster-image decode-bomb guard: the maximum pixel-buffer allocation
+/// [`converters::image`]'s decode permits. Mirrors [`MAX_ZIP_UNCOMPRESSED_BYTES`]'s
+/// reasoning — [`MAX_INPUT_BYTES`] bounds only the COMPRESSED input, so a small
+/// file declaring huge dimensions could otherwise force an unbounded decode
+/// allocation before this limit is checked.
+const MAX_IMAGE_DECODED_BYTES: u64 = 500 * 1024 * 1024; // 500 MiB
+
 /// The file extensions this crate can convert. Lower-cased, dot-less.
 ///
 /// The image extensions (`png`/`jpg`/`jpeg`/`tiff`) have no pure-Rust text

@@ -36,6 +36,26 @@ pub struct MeetingIndex {
     #[allow(dead_code)]
     db: Database,
     conn: Connection,
+    /// Serialises the `BEGIN IMMEDIATE`..`COMMIT`/`ROLLBACK` span of
+    /// [`Self::rebuild_transaction`]. `conn` is a bare `libsql::Connection`
+    /// shared app-wide via `Arc<MeetingIndex>` with no locking of its own, so
+    /// two concurrent calls into a multi-statement transaction could otherwise
+    /// interleave their statements on the same connection (`cannot start a
+    /// transaction within a transaction`, or a write silently absorbed into —
+    /// and lost with — another call's rolled-back transaction). Held for the
+    /// full BEGIN..COMMIT span.
+    ///
+    /// Single-statement methods on `conn` (`upsert`, `delete`) are atomic in
+    /// SQLite's autocommit mode on their own, but SQLite transactions are
+    /// connection-scoped: a plain statement issued while
+    /// `rebuild_transaction` holds an open `BEGIN IMMEDIATE` on this same
+    /// connection can be silently absorbed into that transaction — committing
+    /// or rolling back together with it — and a concurrent read can
+    /// dirty-read its uncommitted rows. `index.db` is a rebuildable cache
+    /// (`rebuild_from_disk` recovers it from the meeting folders), so this
+    /// window is accepted rather than closed with a lock; every
+    /// multi-statement mutation still must hold `tx_lock` for its whole span.
+    tx_lock: tokio::sync::Mutex<()>,
 }
 
 impl MeetingIndex {
@@ -52,7 +72,11 @@ impl MeetingIndex {
         let db = Builder::new_local(db_path.as_ref()).build().await?;
         let conn = db.connect()?;
         migrations::run(&conn).await?;
-        Ok(Self { db, conn })
+        Ok(Self {
+            db,
+            conn,
+            tx_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// All meetings, most-recent first (ordered by `started_at` descending).
@@ -253,7 +277,11 @@ impl MeetingIndex {
     /// transaction so concurrent readers on the shared connection never see a
     /// half-rebuilt table. Rolls back (best-effort) on any error so a failed
     /// rebuild leaves the prior contents intact.
+    ///
+    /// Holds `tx_lock` for the whole span so a second concurrent call cannot
+    /// open its own `BEGIN` on the same connection mid-transaction.
     async fn rebuild_transaction(&self, entries: Vec<MeetingListEntry>) -> Result<(), Error> {
+        let _guard = self.tx_lock.lock().await;
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
         let result = async {
@@ -267,7 +295,19 @@ impl MeetingIndex {
 
         match result {
             Ok(()) => {
-                self.conn.execute("COMMIT", ()).await?;
+                if let Err(e) = self.conn.execute("COMMIT", ()).await {
+                    // A failed COMMIT can leave the transaction open; roll it
+                    // back (best-effort) so the next `tx_lock` holder's BEGIN
+                    // IMMEDIATE does not error with a nested transaction.
+                    if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "index rebuild rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
                 Ok(())
             }
             Err(e) => {
@@ -635,4 +675,64 @@ fn escape_like(input: &str) -> String {
 /// place for callers that build the path from the root.
 pub fn index_db_path(app_data_root: &Path) -> PathBuf {
     app_data_root.join("index.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_entry(n: u32, label: &str) -> MeetingListEntry {
+        MeetingListEntry {
+            id: MeetingId::new(),
+            title: format!("{label} #{n}"),
+            started_at: "2026-07-01T10:00:00Z".to_string(),
+            duration_ms: 1000,
+            speaker_count: 1,
+            excerpt: None,
+            collection_id: None,
+        }
+    }
+
+    /// Two concurrent calls into `rebuild_transaction` (the `BEGIN
+    /// IMMEDIATE`..`COMMIT` span) must not interleave on the shared
+    /// connection: neither call may error with "cannot start a transaction
+    /// within a transaction", and the surviving batch must be complete — never
+    /// a partial mix of the two, which would mean one call's writes were
+    /// silently lost inside the other's transaction.
+    ///
+    /// Runs on a real multi-thread runtime (parity with the voiceprints
+    /// interleave test) so the two tasks can genuinely race on `conn` rather
+    /// than only cooperatively yield on one OS thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rebuild_transactions_do_not_interleave() {
+        let index = std::sync::Arc::new(MeetingIndex::open(":memory:").await.unwrap());
+
+        let batch_a: Vec<MeetingListEntry> = (0..5).map(|i| sample_entry(i, "batch-a")).collect();
+        let batch_b: Vec<MeetingListEntry> = (0..5).map(|i| sample_entry(i, "batch-b")).collect();
+
+        let task_a = {
+            let index = std::sync::Arc::clone(&index);
+            tokio::spawn(async move { index.rebuild_transaction(batch_a).await })
+        };
+        let task_b = {
+            let index = std::sync::Arc::clone(&index);
+            tokio::spawn(async move { index.rebuild_transaction(batch_b).await })
+        };
+
+        let (result_a, result_b) = tokio::join!(task_a, task_b);
+        result_a
+            .expect("task a must not panic")
+            .expect("first rebuild_transaction must not error");
+        result_b
+            .expect("task b must not panic")
+            .expect("second rebuild_transaction must not error");
+
+        let listed = index.list_meetings().await.unwrap();
+        assert_eq!(
+            listed.len(),
+            5,
+            "the final rebuild must leave exactly one complete 5-row batch, \
+             never an interleaved partial mix of both"
+        );
+    }
 }

@@ -25,6 +25,12 @@ pub const CURRENT_VERSION: i64 = 1;
 /// version (0 for a fresh DB), then applies each migration `v` for
 /// `current < v <= CURRENT_VERSION` in order. Idempotent: a DB already at
 /// `CURRENT_VERSION` is left untouched.
+///
+/// Each step's DDL and version bump run inside one `BEGIN IMMEDIATE`/`COMMIT`
+/// transaction, so a crash between them can never happen: either both land or
+/// neither does, and the next `run` call resumes from the last committed
+/// version rather than re-applying (non-idempotent) DDL against a half-applied
+/// schema.
 pub async fn run(conn: &Connection) -> Result<(), Error> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version (
@@ -38,8 +44,43 @@ pub async fn run(conn: &Connection) -> Result<(), Error> {
     let current = read_version(conn).await?;
 
     for v in (current + 1)..=CURRENT_VERSION {
-        apply_migration(conn, v).await?;
-        write_version(conn, v).await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let result = async {
+            apply_migration(conn, v).await?;
+            write_version(conn, v).await?;
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = conn.execute("COMMIT", ()).await {
+                    // A failed COMMIT can leave the transaction open; roll it
+                    // back (best-effort) so the next `run` iteration's BEGIN
+                    // IMMEDIATE does not error with a nested transaction.
+                    if let Err(rb) = conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "voiceprints.db migration rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            }
+            Err(e) => {
+                if let Err(rb) = conn.execute("ROLLBACK", ()).await {
+                    tracing::warn!(
+                        target: "persistence",
+                        error = %rb,
+                        "voiceprints.db migration rollback failed after a migration error"
+                    );
+                }
+                return Err(e);
+            }
+        }
+
         tracing::info!(
             target: "persistence",
             from = current,
@@ -167,5 +208,87 @@ async fn apply_migration(conn: &Connection, version: i64) -> Result<(), Error> {
         other => Err(Error::Migration(format!(
             "no voiceprints migration defined for schema version {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libsql::Builder;
+
+    async fn open_mem() -> Connection {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        db.connect().unwrap()
+    }
+
+    #[tokio::test]
+    async fn run_migrates_fresh_db_to_current_version() {
+        let conn = open_mem().await;
+        run(&conn).await.unwrap();
+        assert_eq!(read_version(&conn).await.unwrap(), CURRENT_VERSION);
+    }
+
+    /// A migration step that fails *after* creating some of its tables must
+    /// leave nothing half-applied: `run` rolls the whole step back and does
+    /// not advance `schema_version`, so a later `run` re-creates the schema
+    /// from scratch. Drives the failure through `run` itself, so it is RED if
+    /// the per-step `BEGIN IMMEDIATE`/`COMMIT` wrapping is removed: without
+    /// it, the `CREATE TABLE`s that ran before the failing statement commit in
+    /// autocommit mode and stay behind.
+    #[tokio::test]
+    async fn run_rolls_back_a_partially_applied_migration_step() {
+        let conn = open_mem().await;
+
+        // Sabotage migration 1's *third* statement — `CREATE INDEX IF NOT
+        // EXISTS idx_centroid_identity` — by pre-creating a *table* of that
+        // name. `IF NOT EXISTS` suppresses a clash only with an existing
+        // INDEX, not a TABLE, so the statement errors ("there is already a
+        // table named …"). Crucially it fails only after migration 1's first
+        // two statements (`CREATE TABLE voiceprint_identity` and
+        // `voiceprint_centroid`) have already run — a real partial change.
+        conn.execute(
+            "CREATE TABLE idx_centroid_identity (placeholder INTEGER)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let result = run(&conn).await;
+        assert!(
+            result.is_err(),
+            "migration 1 must fail on the index/table name collision"
+        );
+
+        // schema_version must NOT advance from 0: the version bump shares the
+        // step's transaction, which rolled back with the DDL.
+        assert_eq!(read_version(&conn).await.unwrap(), 0);
+
+        // The partial change — the two tables created before the failing
+        // CREATE INDEX — must have rolled back. This is the assertion that
+        // fails without the wrapping transaction: in autocommit mode
+        // `voiceprint_identity` would persist even though a later statement
+        // in the same step errored, leaving a half-applied migration.
+        let table_exists = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='voiceprint_identity'",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap();
+        assert!(
+            table_exists.is_none(),
+            "aborted migration 1 must not leave voiceprint_identity behind"
+        );
+
+        // With the sabotage removed, `run` must converge cleanly from the
+        // rolled-back state to CURRENT_VERSION — the step re-applies whole.
+        conn.execute("DROP TABLE idx_centroid_identity", ())
+            .await
+            .unwrap();
+        run(&conn).await.unwrap();
+        assert_eq!(read_version(&conn).await.unwrap(), CURRENT_VERSION);
     }
 }

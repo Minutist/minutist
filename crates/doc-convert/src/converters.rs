@@ -7,7 +7,7 @@
 
 use crate::error::{ConvertError, Result};
 use crate::normalise::normalise;
-use crate::{MAX_ZIP_ENTRIES, MAX_ZIP_UNCOMPRESSED_BYTES};
+use crate::{MAX_IMAGE_DECODED_BYTES, MAX_ZIP_ENTRIES, MAX_ZIP_UNCOMPRESSED_BYTES};
 
 // ---------------------------------------------------------------------------
 // txt / md passthrough
@@ -441,8 +441,22 @@ pub fn image(
 
 /// Decode an image (any format `image` recognises by content) and re-encode it
 /// as PNG, so the [`minutist_common::DocVlm`] always receives a valid PNG.
+///
+/// Decodes via [`image::ImageReader`] with an explicit [`image::Limits::max_alloc`]
+/// ([`MAX_IMAGE_DECODED_BYTES`]) rather than [`image::load_from_memory`]: the
+/// 50 MiB [`crate::MAX_INPUT_BYTES`] cap bounds only the COMPRESSED input, so a
+/// small file declaring huge pixel dimensions could otherwise force an
+/// unbounded decode allocation (the same decompression-bomb shape as the zip
+/// guard below, applied to raster images instead of zip containers).
 fn reencode_to_png(bytes: &[u8]) -> Result<Vec<u8>> {
-    let img = image::load_from_memory(bytes)
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| ConvertError::Image(format!("guessing image format: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_IMAGE_DECODED_BYTES);
+    reader.limits(limits);
+    let img = reader
+        .decode()
         .map_err(|e| ConvertError::Image(format!("decoding image: {e}")))?;
     let mut buf = std::io::Cursor::new(Vec::new());
     img.write_to(&mut buf, image::ImageFormat::Png)
@@ -974,5 +988,39 @@ mod tests {
         // The zip guard runs before calamine: a non-zip blob is rejected up front
         // rather than handed to calamine's internal decompressor.
         assert!(spreadsheet(b"not a zip at all", "xlsx").is_err());
+    }
+
+    #[test]
+    fn image_decode_rejects_a_bomb_declaring_huge_dimensions() {
+        // A minimal 54-byte BMP (BITMAPFILEHEADER + BITMAPINFOHEADER, no pixel
+        // data) declaring 0xFFFF x 0xFFFF at 24 bits/pixel — the largest
+        // dimensions the `image` crate's own BMP decoder accepts. Decoding it
+        // would need 65535 * 65535 * 3 ≈ 12.9 GB; the crate's per-format sanity
+        // cap does not stop that, so `MAX_IMAGE_DECODED_BYTES` must.
+        let mut bmp = Vec::with_capacity(54);
+        bmp.extend_from_slice(b"BM"); // signature
+        bmp.extend_from_slice(&54u32.to_le_bytes()); // bfSize (unchecked by the decoder)
+        bmp.extend_from_slice(&0u16.to_le_bytes()); // bfReserved1
+        bmp.extend_from_slice(&0u16.to_le_bytes()); // bfReserved2
+        bmp.extend_from_slice(&54u32.to_le_bytes()); // bfOffBits
+        bmp.extend_from_slice(&40u32.to_le_bytes()); // biSize (BITMAPINFOHEADER)
+        bmp.extend_from_slice(&0xFFFFi32.to_le_bytes()); // biWidth
+        bmp.extend_from_slice(&0xFFFFi32.to_le_bytes()); // biHeight
+        bmp.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        bmp.extend_from_slice(&24u16.to_le_bytes()); // biBitCount (RGB24)
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biXPelsPerMeter
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biYPelsPerMeter
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        assert_eq!(bmp.len(), 54, "hand-built BMP header must be exactly 54 bytes");
+
+        let err = reencode_to_png(&bmp).expect_err("a multi-GB decode allocation must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Memory limit exceeded"),
+            "expected the image crate's allocation-limit error, got: {msg}"
+        );
     }
 }

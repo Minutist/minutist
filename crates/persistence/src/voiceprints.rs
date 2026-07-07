@@ -20,7 +20,9 @@
 //! contributions atomically (via [`recompute_centroid`]). Every multi-statement
 //! mutating method wraps its work in a `BEGIN IMMEDIATE`/`COMMIT` block so that
 //! the contribution-set change and the centroid recompute are committed together
-//! or rolled back entirely.
+//! or rolled back entirely, and holds [`VoiceprintStore::tx_lock`] for that same
+//! span so two such calls on the shared connection can never interleave their
+//! statements into one another's transaction.
 //!
 //! # Corruption contract
 //!
@@ -157,6 +159,27 @@ pub struct VoiceprintStore {
     #[allow(dead_code)]
     db: Database,
     conn: Connection,
+    /// Serialises the `BEGIN IMMEDIATE`..`COMMIT`/`ROLLBACK` span of every
+    /// multi-statement mutating method (`enrol`, `refine`, `merge_identities`,
+    /// `forget_meeting`, `forget_contribution`, `clear_all`). `conn` is a bare
+    /// `libsql::Connection` with no locking of its own, shared app-wide via
+    /// `Arc<VoiceprintStore>`, so two concurrent transaction-bearing calls
+    /// could otherwise interleave their statements on the same connection
+    /// (`cannot start a transaction within a transaction`, or a write silently
+    /// absorbed into — and lost with — another call's rolled-back
+    /// transaction). Each such method holds `tx_lock` for its full span,
+    /// including any read that must happen before the `BEGIN` (see
+    /// `forget_meeting_inner`).
+    ///
+    /// Single-statement writers (`rename_identity`, `delete_identity`) are
+    /// atomic in SQLite's autocommit mode on their own, but SQLite
+    /// transactions are connection-scoped: a plain statement issued while
+    /// another method holds `tx_lock`'s open transaction can be silently
+    /// absorbed into it — committing or rolling back together with it — and
+    /// a concurrent read can dirty-read its uncommitted rows. Every
+    /// multi-statement mutation of this store's tables must go through
+    /// `tx_lock` and an explicit transaction for exactly this reason.
+    tx_lock: tokio::sync::Mutex<()>,
 }
 
 impl VoiceprintStore {
@@ -177,7 +200,11 @@ impl VoiceprintStore {
         let db = Builder::new_local(db_path.as_ref()).build().await?;
         let conn = db.connect()?;
         voiceprints_migrations::run(&conn).await?;
-        Ok(Self { db, conn })
+        Ok(Self {
+            db,
+            conn,
+            tx_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -244,6 +271,7 @@ impl VoiceprintStore {
         let blob = f32_slice_to_blob(&centroid_vec);
         let count: i64 = 1;
 
+        let _guard = self.tx_lock.lock().await;
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
         let result = async {
@@ -291,7 +319,19 @@ impl VoiceprintStore {
 
         match result {
             Ok(()) => {
-                self.conn.execute("COMMIT", ()).await?;
+                if let Err(e) = self.conn.execute("COMMIT", ()).await {
+                    // A failed COMMIT can leave the transaction open; roll it
+                    // back (best-effort) so the next `tx_lock` holder's BEGIN
+                    // IMMEDIATE does not error with a nested transaction.
+                    if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "enrol rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
             }
             Err(e) => {
                 if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
@@ -384,6 +424,7 @@ impl VoiceprintStore {
         let now = Utc::now().to_rfc3339();
         let blob = f32_slice_to_blob(&contrib_vec);
 
+        let _guard = self.tx_lock.lock().await;
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
         let result = async {
@@ -538,7 +579,19 @@ impl VoiceprintStore {
 
         match result {
             Ok(()) => {
-                self.conn.execute("COMMIT", ()).await?;
+                if let Err(e) = self.conn.execute("COMMIT", ()).await {
+                    // A failed COMMIT can leave the transaction open; roll it
+                    // back (best-effort) so the next `tx_lock` holder's BEGIN
+                    // IMMEDIATE does not error with a nested transaction.
+                    if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "refine rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
             }
             Err(e) => {
                 if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
@@ -597,6 +650,7 @@ impl VoiceprintStore {
 
         let now = Utc::now().to_rfc3339();
 
+        let _guard = self.tx_lock.lock().await;
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
         let result = async {
@@ -638,7 +692,19 @@ impl VoiceprintStore {
 
         match result {
             Ok(()) => {
-                self.conn.execute("COMMIT", ()).await?;
+                if let Err(e) = self.conn.execute("COMMIT", ()).await {
+                    // A failed COMMIT can leave the transaction open; roll it
+                    // back (best-effort) so the next `tx_lock` holder's BEGIN
+                    // IMMEDIATE does not error with a nested transaction.
+                    if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "merge_identities rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
             }
             Err(e) => {
                 if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
@@ -689,17 +755,50 @@ impl VoiceprintStore {
     }
 
     async fn clear_all_inner(&self) -> Result<(), Error> {
-        // Delete in dependency order (CASCADE handles the chain, but explicit
-        // deletes give clearer audit log entries).
-        self.conn
-            .execute("DELETE FROM voiceprint_contribution", ())
-            .await?;
-        self.conn
-            .execute("DELETE FROM voiceprint_centroid", ())
-            .await?;
-        self.conn
-            .execute("DELETE FROM voiceprint_identity", ())
-            .await?;
+        let _guard = self.tx_lock.lock().await;
+        self.conn.execute("BEGIN IMMEDIATE", ()).await?;
+
+        let result = async {
+            // Delete in dependency order (CASCADE handles the chain, but explicit
+            // deletes give clearer audit log entries).
+            self.conn
+                .execute("DELETE FROM voiceprint_contribution", ())
+                .await?;
+            self.conn
+                .execute("DELETE FROM voiceprint_centroid", ())
+                .await?;
+            self.conn
+                .execute("DELETE FROM voiceprint_identity", ())
+                .await?;
+            Ok::<(), Error>(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute("COMMIT", ()).await {
+                    if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "clear_all rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            }
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                    tracing::warn!(
+                        target: "persistence",
+                        error = %rb,
+                        "clear_all rollback failed after a clear_all error"
+                    );
+                }
+                return Err(e);
+            }
+        }
+
         tracing::info!(target: "persistence", "all voiceprints cleared");
         Ok(())
     }
@@ -716,6 +815,11 @@ impl VoiceprintStore {
 
     async fn forget_meeting_inner(&self, meeting_id: MeetingId) -> Result<(), Error> {
         let now = Utc::now().to_rfc3339();
+
+        // Held from before the pre-transaction SELECT through COMMIT/ROLLBACK:
+        // the affected-centroid list gathered below must not go stale from a
+        // concurrent enrol/refine landing between the SELECT and the BEGIN.
+        let _guard = self.tx_lock.lock().await;
 
         // Collect the affected centroid IDs before opening the write transaction,
         // so the SELECT does not hold a read cursor inside BEGIN IMMEDIATE.
@@ -774,7 +878,19 @@ impl VoiceprintStore {
 
         match result {
             Ok(()) => {
-                self.conn.execute("COMMIT", ()).await?;
+                if let Err(e) = self.conn.execute("COMMIT", ()).await {
+                    // A failed COMMIT can leave the transaction open; roll it
+                    // back (best-effort) so the next `tx_lock` holder's BEGIN
+                    // IMMEDIATE does not error with a nested transaction.
+                    if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "forget_meeting rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
             }
             Err(e) => {
                 if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
@@ -834,6 +950,7 @@ impl VoiceprintStore {
     ) -> Result<(), Error> {
         let now = Utc::now().to_rfc3339();
 
+        let _guard = self.tx_lock.lock().await;
         self.conn.execute("BEGIN IMMEDIATE", ()).await?;
 
         let result = async {
@@ -878,7 +995,19 @@ impl VoiceprintStore {
 
         match result {
             Ok(()) => {
-                self.conn.execute("COMMIT", ()).await?;
+                if let Err(e) = self.conn.execute("COMMIT", ()).await {
+                    // A failed COMMIT can leave the transaction open; roll it
+                    // back (best-effort) so the next `tx_lock` holder's BEGIN
+                    // IMMEDIATE does not error with a nested transaction.
+                    if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
+                        tracing::warn!(
+                            target: "persistence",
+                            error = %rb,
+                            "forget_contribution rollback failed after a COMMIT error"
+                        );
+                    }
+                    return Err(e.into());
+                }
             }
             Err(e) => {
                 if let Err(rb) = self.conn.execute("ROLLBACK", ()).await {
@@ -2868,5 +2997,143 @@ mod tests {
         assert_eq!(alice.model_id, "cam-v1");
         assert_eq!(alice.centroids.len(), 1);
         assert_eq!(alice.centroids[0].sample_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent transaction-bearing calls must not interleave (A4)
+    // -----------------------------------------------------------------------
+
+    /// Several concurrent `enrol` calls — each opening its own `BEGIN
+    /// IMMEDIATE`..`COMMIT` span on the shared connection — must not
+    /// interleave: none may error (e.g. "cannot start a transaction within a
+    /// transaction"), and every identity must survive, never lost to another
+    /// call's transaction absorbing and then rolling back its statements.
+    /// Runs on a real multi-thread runtime so the tasks can genuinely race on
+    /// `conn` rather than only cooperatively yield on one OS thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_enrolments_do_not_interleave_transactions() {
+        let store = std::sync::Arc::new(open_mem().await);
+        let dim = 4;
+        const N: u8 = 8;
+
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let store = std::sync::Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                let emb = synthetic_embedding(dim, 0.5 + (i as f32) * 0.01);
+                store
+                    .enrol(&format!("Speaker{i}"), &emb, dim, "cam-v1", mid(i), "A")
+                    .await
+            }));
+        }
+
+        for handle in handles {
+            handle
+                .await
+                .expect("enrol task must not panic")
+                .expect(
+                    "concurrent enrol must not error (e.g. \"cannot start a \
+                     transaction within a transaction\")",
+                );
+        }
+
+        let gallery = store.all("cam-v1").await.unwrap();
+        assert_eq!(
+            gallery.len(),
+            N as usize,
+            "every concurrent enrolment must survive — none lost to an interleaved transaction"
+        );
+    }
+
+    /// `clear_all`'s three `DELETE`s must run inside the same `tx_lock` +
+    /// `BEGIN IMMEDIATE` span as every other mutating method, not as three
+    /// bare autocommit statements. Races a batch of concurrent `enrol` calls
+    /// against a concurrent `clear_all` on a real multi-thread runtime.
+    ///
+    /// Each `enrol` inserts exactly one row into each of
+    /// `voiceprint_identity`, `voiceprint_centroid`, and
+    /// `voiceprint_contribution`; `clear_all` deletes all rows from all
+    /// three. Because `tx_lock` serialises every transaction-bearing call,
+    /// whatever order the runtime picks, the three tables must end up with
+    /// equal row counts: either every table still holds the identities
+    /// enrolled after `clear_all`'s serial position, or all three are empty.
+    /// Without the lock/transaction, `clear_all`'s un-locked `DELETE FROM
+    /// voiceprint_centroid` (say) could land between an in-flight `enrol`'s
+    /// `INSERT INTO voiceprint_identity` and its `INSERT INTO
+    /// voiceprint_centroid`, leaving an identity row with no matching
+    /// centroid — the exact interleaving this test would catch as unequal
+    /// counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_clear_all_and_enrol_do_not_interleave() {
+        let store = std::sync::Arc::new(open_mem().await);
+        let dim = 4;
+        const N: u8 = 8;
+
+        let mut enrol_handles = Vec::new();
+        for i in 0..N {
+            let store = std::sync::Arc::clone(&store);
+            enrol_handles.push(tokio::spawn(async move {
+                let emb = synthetic_embedding(dim, 0.5 + (i as f32) * 0.01);
+                store
+                    .enrol(&format!("Speaker{i}"), &emb, dim, "cam-v1", mid(i), "A")
+                    .await
+            }));
+        }
+        let clear_handle = {
+            let store = std::sync::Arc::clone(&store);
+            tokio::spawn(async move { store.clear_all().await })
+        };
+
+        for handle in enrol_handles {
+            handle.await.expect("enrol task must not panic").expect(
+                "concurrent enrol must not error (e.g. \"cannot start a \
+                 transaction within a transaction\")",
+            );
+        }
+        clear_handle
+            .await
+            .expect("clear_all task must not panic")
+            .expect(
+                "concurrent clear_all must not error (e.g. \"cannot start a \
+                 transaction within a transaction\")",
+            );
+
+        let identity_count: i64 = {
+            let mut rows = store
+                .conn
+                .query("SELECT COUNT(*) FROM voiceprint_identity", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        let centroid_count: i64 = {
+            let mut rows = store
+                .conn
+                .query("SELECT COUNT(*) FROM voiceprint_centroid", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+        let contribution_count: i64 = {
+            let mut rows = store
+                .conn
+                .query("SELECT COUNT(*) FROM voiceprint_contribution", ())
+                .await
+                .unwrap();
+            rows.next().await.unwrap().unwrap().get(0).unwrap()
+        };
+
+        assert_eq!(
+            centroid_count, identity_count,
+            "every surviving identity must have exactly one centroid — \
+             clear_all must never delete only part of the schema out from \
+             under a concurrent enrol"
+        );
+        assert_eq!(
+            contribution_count, identity_count,
+            "every surviving identity must have exactly one contribution — \
+             clear_all must never delete only part of the schema out from \
+             under a concurrent enrol"
+        );
     }
 }

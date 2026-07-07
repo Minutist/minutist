@@ -1715,6 +1715,27 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // 4b. Atomic save leaves no `.tmp` litter behind
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_file_store_save_leaves_no_tmp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.store");
+        let tmp_path = path.with_extension("store.tmp");
+
+        let store = JsonFileStore::new(path.clone());
+        store.save(&Settings::default()).expect("save");
+
+        assert!(path.exists(), "the target file must exist after save");
+        assert!(
+            !tmp_path.exists(),
+            "the fsync'd tmp file must be renamed away, not left behind"
+        );
+        assert_eq!(store.load().expect("reload"), Settings::default());
+    }
+
     #[tokio::test]
     async fn handle_new_corrupt_file_falls_back_to_defaults() {
         // Install a no-op tracing subscriber so warn! doesn't panic in tests.

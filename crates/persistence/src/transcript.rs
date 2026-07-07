@@ -170,23 +170,36 @@ impl TranscriptWriter {
 
     // ----- Private helpers -----
 
-    /// Serialise `self.buffer` and overwrite `self.path`.
+    /// Serialise `self.buffer` and atomically overwrite `self.path`.
+    ///
+    /// Writes to a sibling `transcript.json.tmp`, `fsync`s it, then renames it
+    /// into place — the same pattern as [`write_transcript_inner`] — so a crash
+    /// mid-write leaves the previous `transcript.json` intact rather than
+    /// truncated or half-written.
     fn write_to_disk(&self) -> AppResult<()> {
-        let json = serde_json::to_string_pretty(&self.buffer)
+        let json = serde_json::to_vec_pretty(&self.buffer)
             .map_err(Error::Serialise)
             .map_err(minutist_common::AppError::from)?;
 
-        let mut file = std::fs::File::create(&self.path)
-            .map_err(Error::Io)
-            .map_err(minutist_common::AppError::from)?;
+        let tmp_path = self.path.with_extension("json.tmp");
 
-        file.write_all(json.as_bytes())
-            .map_err(Error::Io)
-            .map_err(minutist_common::AppError::from)?;
+        let write_result = (|| -> Result<(), std::io::Error> {
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(&json)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
 
-        file.flush()
-            .map_err(Error::Io)
-            .map_err(minutist_common::AppError::from)?;
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(minutist_common::AppError::from(Error::Io(e)));
+        }
+
+        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(minutist_common::AppError::from(Error::Io(e)));
+        }
 
         tracing::debug!(
             target: "persistence",
@@ -196,5 +209,65 @@ impl TranscriptWriter {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minutist_common::MeetingId;
+    use tempfile::TempDir;
+
+    fn seg(start_ms: u64, end_ms: u64, text: &str) -> Segment {
+        Segment {
+            start_ms,
+            end_ms,
+            text: text.to_string(),
+            speaker_id: None,
+            confidence: None,
+            words: vec![],
+            shared_speakers: Vec::new(),
+        }
+    }
+
+    /// A write that fails between the temp-file write and the rename must
+    /// leave the previous `transcript.json` untouched.
+    ///
+    /// Simulates the failure by occupying `write_to_disk`'s `.tmp` target with
+    /// a directory before the second flush, so the temp-file open fails and
+    /// the rename that would replace `transcript.json` never runs — exercising
+    /// exactly the ordering the atomic write depends on: the destination path
+    /// is only ever touched by the final `rename`, never by the write itself.
+    #[test]
+    fn write_to_disk_failure_before_rename_preserves_prior_content() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let id = MeetingId::new();
+        let folder = MeetingFolder::create(tempdir.path(), id).expect("create folder");
+
+        let mut tw = TranscriptWriter::open(&folder).expect("open TranscriptWriter");
+        tw.append(seg(0, 100, "old")).expect("append old");
+        tw.flush().expect("flush old content");
+
+        let path = folder.path().join("transcript.json");
+        let old_json = std::fs::read_to_string(&path).expect("read prior content");
+
+        // Occupy the tmp path with a directory so `File::create` in
+        // `write_to_disk` fails before any rename is attempted.
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::create_dir(&tmp_path).expect("seed a directory at the tmp path");
+
+        tw.append(seg(200, 300, "new")).expect("append new");
+        let result = tw.flush();
+        assert!(
+            result.is_err(),
+            "flush must surface the tmp-file-open failure rather than silently succeeding"
+        );
+
+        let content_after_failure =
+            std::fs::read_to_string(&path).expect("transcript.json must remain readable");
+        assert_eq!(
+            content_after_failure, old_json,
+            "a write that fails before rename must leave the previous transcript.json intact"
+        );
     }
 }

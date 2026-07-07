@@ -15,9 +15,11 @@ use crate::{error::Error, Settings};
 pub trait SettingsStore: Send + Sync {
     /// Load settings from the backing store.
     ///
-    /// A missing or corrupt store MUST return `Settings::default()` and log a
-    /// warning rather than propagating an error — the app must always be able
-    /// to start with defaults.
+    /// A missing store returns `Settings::default()` (see [`JsonFileStore::load`]).
+    /// A corrupt store propagates `Err`; the default-on-corrupt-with-warning
+    /// contract the app needs is provided one layer up, by
+    /// `SettingsHandle::new` (`crates/settings/src/handle.rs`), which is the
+    /// sole production caller of this method.
     fn load(&self) -> Result<Settings, Error>;
 
     /// Persist `settings` to the backing store.
@@ -27,9 +29,11 @@ pub trait SettingsStore: Send + Sync {
 /// A `SettingsStore` backed by a single JSON file on disk.
 ///
 /// The file path is supplied by the caller at construction time (typically
-/// `{app-data}/settings.store`).  Corrupt or missing files fall back to
-/// `Settings::default()` — the caller is responsible for logging the warning
-/// (or see `SettingsHandle::new` which does it automatically).
+/// `{app-data}/settings.store`). A missing file yields `Settings::default()`
+/// directly from [`Self::load`]; a corrupt file's `Err` propagates to the
+/// caller. `SettingsHandle::new` is the sole production caller, and applies
+/// the default-on-corrupt-with-warning fallback the app needs on top of this
+/// store.
 pub struct JsonFileStore {
     path: PathBuf,
 }
@@ -59,15 +63,24 @@ impl SettingsStore for JsonFileStore {
     }
 
     fn save(&self, settings: &Settings) -> Result<(), Error> {
+        use std::io::Write;
+
         // Create parent directories if they don't exist.
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(settings)?;
-        // Write atomically: write to a temp file alongside the target, then
-        // rename.  This avoids leaving a half-written settings file on crash.
+        // Write atomically: write to a temp file alongside the target, fsync
+        // it so the bytes are durable before the rename links them in under
+        // the real name, then rename. Without the fsync, the OS is free to
+        // reorder or delay the tmp file's writeback past a crash, so the
+        // rename could hand the real name to a file the crash never actually
+        // persisted; the fsync closes that gap.
         let tmp_path = self.path.with_extension("store.tmp");
-        std::fs::write(&tmp_path, content)?;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp_path, &self.path)?;
         Ok(())
     }

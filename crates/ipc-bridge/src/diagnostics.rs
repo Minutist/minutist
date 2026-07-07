@@ -169,18 +169,22 @@ pub fn assemble_report(
 }
 
 /// Best-effort GPU string for the report: the resolved plan summary for the
-/// current settings, or `"cpu"` when no usable GPU. Reuses the same plan
-/// resolution as the startup `log_gpu_probe`.
-fn gpu_string(state: &IpcState) -> String {
-    let s = state.settings.current();
+/// configured `gpu_acceleration` mode, or `"cpu"` when no usable GPU. Reuses
+/// the same plan resolution as the startup `log_gpu_probe`.
+///
+/// Takes the mode by value (rather than `&IpcState`) so the caller can run it
+/// inside `spawn_blocking` alongside the other blocking work: `probe_primary_gpu`
+/// blocks (it inits the llama backend), so it must never run on the async
+/// command thread.
+fn gpu_string(gpu_acceleration: minutist_common::GpuAcceleration) -> String {
     let probe = minutist_common::probe_primary_gpu();
-    let plan = minutist_common::resolve_gpu_plan(probe.as_ref(), s.gpu_acceleration, true);
+    let plan = minutist_common::resolve_gpu_plan(probe.as_ref(), gpu_acceleration, true);
     match probe {
         Some(p) => format!(
             "{} (mode={:?}, summariser_gpu={}, asr_gpu={})",
-            p.name, s.gpu_acceleration, plan.summariser_gpu, plan.asr_gpu
+            p.name, gpu_acceleration, plan.summariser_gpu, plan.asr_gpu
         ),
-        None => format!("cpu (mode={:?})", s.gpu_acceleration),
+        None => format!("cpu (mode={:?})", gpu_acceleration),
     }
 }
 
@@ -188,8 +192,9 @@ fn gpu_string(state: &IpcState) -> String {
 /// priority (`last-crash.txt` then the rolling log tail) and the privacy
 /// invariant.
 ///
-/// `probe_primary_gpu` can block (it inits the llama backend), so the work runs
-/// on `spawn_blocking` rather than the async command thread.
+/// `probe_primary_gpu` can block (it inits the llama backend), so `gpu_string`
+/// runs on `spawn_blocking` alongside the other blocking file I/O rather than
+/// on the async command thread.
 #[tauri::command]
 #[specta::specta]
 pub async fn get_diagnostic_report(
@@ -198,9 +203,10 @@ pub async fn get_diagnostic_report(
     let logs_dir = state.logs_dir.clone();
     let app_version = state.app_version.clone();
     let platform = state.platform.clone();
-    let gpu = gpu_string(&state);
+    let gpu_acceleration = state.settings.current().gpu_acceleration;
 
     let report = tokio::task::spawn_blocking(move || {
+        let gpu = gpu_string(gpu_acceleration);
         let crash_path = logs_dir.join("last-crash.txt");
         if let Ok(crash_body) = std::fs::read_to_string(&crash_path) {
             let (backtrace, recent) = parse_crash_file(&crash_body);

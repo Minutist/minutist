@@ -899,8 +899,9 @@ async forgetMeetingVoiceprints(meetingId: MeetingId) : Promise<Result<null, IpcE
  * priority (`last-crash.txt` then the rolling log tail) and the privacy
  * invariant.
  * 
- * `probe_primary_gpu` can block (it inits the llama backend), so the work runs
- * on `spawn_blocking` rather than the async command thread.
+ * `probe_primary_gpu` can block (it inits the llama backend), so `gpu_string`
+ * runs on `spawn_blocking` alongside the other blocking file I/O rather than
+ * on the async command thread.
  */
 async getDiagnosticReport() : Promise<Result<DiagnosticReport, IpcError>> {
     try {
@@ -2185,10 +2186,13 @@ llm_model_id?: ModelId | null;
 /**
  * Whether the post-recording diarization pass runs (FR-11).
  * 
- * Diarization is post-hoc and off by default: the orchestrator gates its
+ * **On by default** as of 2026-06-25 (product decision — "Identify
+ * speakers" is the expected default; supersedes FR-11's original
+ * off-by-default). Diarization is post-hoc: the orchestrator gates its
  * on-stop diarizer pass (and the user-triggered re-diarize) on this flag.
- * `#[serde(default)]` defaults to `false`; an older store written before
- * this field existed deserialises to `false`.
+ * `default_diarization_enabled` returns `true`, so both a fresh install and
+ * an older store that predates this field default to on; a user who
+ * explicitly turned it off keeps that choice (their store persists `false`).
  */
 diarization_enabled?: boolean; 
 /**

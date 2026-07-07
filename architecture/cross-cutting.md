@@ -1961,12 +1961,16 @@ The content-hash filename means identical pastes dedupe to one file.
   `Content-Type` from the extension, and returns an empty **404** on ANY
   validation/read failure so no detail leaks.
 
-- **Path-traversal guard (binding).** The protocol exposes **only**
-  `{meetings_dir}/<uuid>/assets/<filename>` — never the whole filesystem.
-  `resolve_note_asset` parses the request path into a `Uuid` + single filename
-  segment (rejecting non-UUID ids and nested paths), and
-  `persistence::read_note_asset` rejects any filename containing a path
-  separator or `..` before reading.
+- **Percent-decoding + path-traversal guard (binding).** `convertFileSrc`
+  percent-encodes the whole `<meeting_id>/<filename>` string, so the separating
+  `/` arrives as `%2F` (one path segment) and `request.uri().path()` is not
+  pre-decoded — the same shape as the `meetingrecording:` request below.
+  `resolve_note_asset` percent-decodes the path (via the same helper
+  `parse_recording_request` uses) before splitting it into a `Uuid` + single
+  filename segment (rejecting non-UUID ids and nested paths), so the protocol
+  exposes **only** `{meetings_dir}/<uuid>/assets/<filename>` — never the whole
+  filesystem. `persistence::read_note_asset` rejects any filename containing a
+  path separator or `..` before reading.
 
 - **`ext` allowlist.** The `save_note_image` command and the content-type map
   accept only `png` / `jpg` / `jpeg` / `gif` / `webp`; anything else is an

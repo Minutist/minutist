@@ -2498,6 +2498,18 @@ pub async fn send_chat_message(
         turn_id,
     });
 
+    // Register the per-session cancel flag (P1) BEFORE `ensure_summariser`,
+    // which can block for a long time on the first call (it loads and warms
+    // the multi-GB GGUF). `cancel_chat_turn` finds a flag to raise only via
+    // this map; registering it after the load would leave a `cancel_chat_turn`
+    // that arrives during a slow first load silently dropped.
+    let cancel_map = Arc::clone(&state.chat_cancel);
+    let cancel = chat_agent::CancelFlag::new();
+    cancel_map
+        .lock()
+        .expect("chat_cancel poisoned")
+        .insert(sid, cancel.clone());
+
     // Ensure the held model is loaded (downloads on first use) BEFORE spawning,
     // so a load failure surfaces synchronously to the caller rather than only as
     // a ChatError event. Cheap after the first call.
@@ -2508,6 +2520,10 @@ pub async fn send_chat_message(
                 .chat_in_flight
                 .lock()
                 .expect("chat_in_flight poisoned")
+                .remove(&sid);
+            cancel_map
+                .lock()
+                .expect("chat_cancel poisoned")
                 .remove(&sid);
             return Err(e);
         }
@@ -2558,17 +2574,11 @@ pub async fn send_chat_message(
     let registry = Arc::clone(&state.tool_registry);
     let event_tx = state.event_tx.clone();
     let in_flight = Arc::clone(&state.chat_in_flight);
-    let cancel_map = Arc::clone(&state.chat_cancel);
     let handle = tokio::runtime::Handle::current();
-
-    // Register a fresh per-session cancel flag (P1) before spawning, so a
-    // `cancel_chat_turn` arriving any time after this returns can raise it. The
-    // decode loop checks it between tokens; the driver clears the entry at end.
-    let cancel = chat_agent::CancelFlag::new();
-    cancel_map
-        .lock()
-        .expect("chat_cancel poisoned")
-        .insert(sid, cancel.clone());
+    // `cancel_map` and `cancel` are already registered above, before
+    // `ensure_summariser`, and are reused as-is here — re-registering a fresh
+    // flag at this point would silently discard a cancel raised during the
+    // model load that just completed.
 
     // Spawn the driver; the turn streams via events. The session id is returned
     // to the caller now. The turn task OWNS `session` (already carrying the user

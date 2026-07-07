@@ -3763,6 +3763,14 @@ no-`block_on` rule binds command handlers, not bootstrap). `MeetingListEntry` /
 `MeetingState` are the canonical `common` types (Phase-4 precursors), so the
 generated bindings consume them directly with no mirror.
 
+`open_meeting_index` never aborts startup on a bad `index.db`: it is a derived
+cache (the same contract as the voiceprint store below), so a failed open
+quarantines the file — and its `-wal`/`-shm` sidecars — under a fixed
+`.corrupt` suffix, recreates a fresh `index.db`, and rebuilds it from
+`meetings_root`. If even the fresh open fails (e.g. an unwritable app-data
+directory), the helper falls back to an in-memory index so startup still
+completes, degraded rather than panicking.
+
 **Issue #0003 WU3 — `IpcState::voiceprints: Arc<Option<VoiceprintStore>>`.** The
 voiceprint library handle, mirroring `IpcState::index` — an already-open handle
 shared via `Arc`. Opened at startup by the `ipc_bridge::open_voiceprints` helper
@@ -3907,8 +3915,14 @@ WS4-A S5b tunnel surface's `tunnel_begin_pairing` + `tunnel_poll_pairing` +
 `sync_add_peer` + `sync_now` = 46; #0003 WU5 adds `reject_match` +
 `clear_all_voiceprints` = 48; #0003 WU8 adds `list_voiceprints` +
 `merge_voiceprint_identities` + `rename_voiceprint_identity` +
-`delete_voiceprint_identity` + `forget_meeting_voiceprints` = 53), asserted by
-the `bindings_builder_registers_expected_command_ledger` test.
+`delete_voiceprint_identity` + `forget_meeting_voiceprints` = 53). The
+`bindings_builder_output_matches_committed_bindings_ts` test asserts the
+generated TypeScript is byte-identical to the committed `ui/src/ipc/bindings.ts`
+rather than checking a hand-maintained command-name array against the in-memory
+export — the array could (and did) drift silently from the frontend's actual
+command surface since it never compared against the file the app loads.
+Regenerate `bindings.ts` with `make bindings` after any command or
+command-reachable-type change and commit the result.
 
 **Issue #0003 WU8 — identity management commands (53 commands total).**
 

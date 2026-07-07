@@ -458,6 +458,15 @@ impl IpcState {
 ///
 /// A rebuild failure is logged and swallowed (the existing index is kept) so a
 /// single unreadable folder never blocks startup.
+///
+/// `index.db` itself is a derived cache (see the module doc on
+/// `persistence::index`), so a corrupt or unreadable file is never fatal: a
+/// failed open quarantines the file (and its WAL/SHM sidecars, if any) under a
+/// fixed `.corrupt` suffix — overwriting any previous quarantine — recreates a
+/// fresh `index.db`, and rebuilds it from `meetings_root`. This never panics;
+/// the absolute last resort (the fresh open itself also failing, e.g. an
+/// unwritable app-data directory) falls back to an in-memory index so startup
+/// still completes, degraded rather than aborted.
 pub fn open_meeting_index(
     app_data_root: &std::path::Path,
     meetings_root: &std::path::Path,
@@ -467,9 +476,31 @@ pub fn open_meeting_index(
     let db_path = index_db_path.clone();
 
     let index = tauri::async_runtime::block_on(async move {
-        let index = MeetingIndex::open(&db_path)
-            .await
-            .expect("failed to open index.db");
+        let index = match MeetingIndex::open(&db_path).await {
+            Ok(index) => index,
+            Err(e) => {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    path = %db_path.display(),
+                    "index.db open failed ({e}); quarantining the corrupt file and rebuilding"
+                );
+                quarantine_corrupt_db_file(&db_path);
+                match MeetingIndex::open(&db_path).await {
+                    Ok(index) => index,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "ipc-bridge",
+                            path = %db_path.display(),
+                            "index.db could not be recreated after quarantining ({e}); \
+                             falling back to an in-memory index for this session"
+                        );
+                        MeetingIndex::open(":memory:")
+                            .await
+                            .expect("in-memory libsql database must always open")
+                    }
+                }
+            }
+        };
         match index.rebuild_from_disk(&meetings_root).await {
             Ok(n) => tracing::info!(
                 target: "ipc-bridge",
@@ -485,6 +516,39 @@ pub fn open_meeting_index(
     });
 
     (index_db_path, index)
+}
+
+/// Move a corrupt/unreadable `index.db` (plus its `-wal`/`-shm` sidecars, if
+/// present) aside to a fixed `.corrupt` suffix so a fresh database can be
+/// created at the original path.
+///
+/// The suffix is fixed rather than timestamped (no clock is threaded through
+/// this helper) — a repeat corruption simply overwrites the previous
+/// quarantine copy. Best-effort: a rename failure is logged and otherwise
+/// ignored, since the subsequent open attempt is the real success signal.
+fn quarantine_corrupt_db_file(db_path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let src = append_to_file_name(db_path, suffix);
+        if !src.exists() {
+            continue;
+        }
+        let dest = append_to_file_name(db_path, &format!("{suffix}.corrupt"));
+        if let Err(e) = std::fs::rename(&src, &dest) {
+            tracing::warn!(
+                target: "ipc-bridge",
+                path = %src.display(),
+                "failed to quarantine corrupt index.db file component ({e})"
+            );
+        }
+    }
+}
+
+/// Append `suffix` to a path's file name, e.g. `index.db` + `-wal` ->
+/// `index.db-wal`.
+fn append_to_file_name(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -556,14 +620,19 @@ pub struct ResolvedNoteAsset {
 ///
 /// The request path is `/<meeting_id>/<filename>` (URL path component, as
 /// produced by `convertFileSrc(<meeting_id>/<filename>, MEETING_ASSET_SCHEME)`).
-/// This:
+/// `convertFileSrc` percent-encodes the whole `<meeting_id>/<filename>` string
+/// (the separating `/` arrives as `%2F`, one path segment) and
+/// `request.uri().path()` is not pre-decoded, so this:
 ///
-/// 1. Splits the path into exactly `meeting_id` + `filename` (rejecting any
-///    extra segments — no nesting),
-/// 2. Parses `meeting_id` as a UUID (rejecting anything else),
-/// 3. Reads the bytes via `persistence::read_note_asset`, which applies its own
+/// 1. Percent-decodes the path via the same [`percent_decode_path`] helper
+///    [`parse_recording_request`] uses (a no-op on an already-decoded path, so
+///    this is also correct if a caller ever passes one),
+/// 2. Splits the decoded path into exactly `meeting_id` + `filename` (rejecting
+///    any extra segments — no nesting),
+/// 3. Parses `meeting_id` as a UUID (rejecting anything else),
+/// 4. Reads the bytes via `persistence::read_note_asset`, which applies its own
 ///    path-traversal guard on `filename` (separator / `..` rejected),
-/// 4. Infers the `Content-Type` from the filename extension.
+/// 5. Infers the `Content-Type` from the filename extension.
 ///
 /// Lives here (not in `app-main`) so the `persistence` dependency edge stays
 /// inside `ipc-bridge` (the dependency table grants `ipc-bridge → persistence`,
@@ -580,8 +649,10 @@ pub fn resolve_note_asset(
 ) -> Result<ResolvedNoteAsset, minutist_common::AppError> {
     use minutist_common::{AppError, MeetingId};
 
-    // Strip the leading '/', then split into exactly two non-empty segments.
-    let trimmed = request_path.trim_start_matches('/');
+    // Decode first, then strip the leading '/' and split into exactly two
+    // non-empty segments — see the decode-then-split note above.
+    let decoded = percent_decode_path(request_path);
+    let trimmed = decoded.trim_start_matches('/');
     let mut parts = trimmed.splitn(2, '/');
     let (id_str, filename) = match (parts.next(), parts.next()) {
         (Some(id), Some(file)) if !id.is_empty() && !file.is_empty() => (id, file),
@@ -894,6 +965,28 @@ mod tests {
         assert_eq!(resolved.content_type, "image/png");
     }
 
+    #[test]
+    fn resolve_note_asset_decodes_percent_encoded_separator() {
+        use minutist_common::MeetingId;
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+        persistence::MeetingFolder::create(root, id).expect("folder");
+
+        let bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let filename = persistence::save_note_asset(root, id, &bytes, "png").expect("save");
+
+        // `convertFileSrc` percent-encodes the whole "<id>/<filename>" string,
+        // so the separating '/' arrives as "%2F" (one path segment) and
+        // `request.uri().path()` is not pre-decoded — this is the realistic
+        // shape of a real `meetingasset:` request, unlike the literal-slash
+        // path used above.
+        let path = format!("/{}%2F{}", id.0, filename);
+        let resolved = resolve_note_asset(root, &path).expect("resolve encoded path");
+        assert_eq!(resolved.bytes, bytes);
+        assert_eq!(resolved.content_type, "image/png");
+    }
+
     // -----------------------------------------------------------------------
     // Recording-slice request parsing (`meetingrecording:` scheme). Pure — no
     // Orchestrator/Tauri runtime; drives `parse_recording_request` directly.
@@ -993,145 +1086,81 @@ mod tests {
         assert_eq!(content_type_for("noext"), "application/octet-stream");
     }
 
-    /// Verify that `bindings_builder()` produces a builder with the full command
-    /// surface registered, by inspecting the TypeScript export.
+    // -----------------------------------------------------------------------
+    // Meeting-index bootstrap: corrupt-file recovery.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn open_meeting_index_recovers_from_a_corrupt_db_file() {
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let app_data_root = tempdir.path();
+        let meetings_root = tempdir.path().join("meetings");
+        std::fs::create_dir_all(&meetings_root).expect("meetings root");
+
+        let db_path = persistence::index::index_db_path(app_data_root);
+        std::fs::write(&db_path, b"not a valid sqlite/libsql database file")
+            .expect("write corrupt index.db");
+
+        // Must not panic, and must return a working index rebuilt from disk.
+        let (returned_path, index) = open_meeting_index(app_data_root, &meetings_root);
+        assert_eq!(returned_path, db_path);
+        let meetings = tauri::async_runtime::block_on(index.list_meetings())
+            .expect("recovered index should be queryable");
+        assert!(meetings.is_empty());
+
+        // The corrupt file was quarantined (renamed aside), not silently
+        // deleted or left blocking the fresh database.
+        let quarantined = append_to_file_name(&db_path, ".corrupt");
+        assert!(
+            quarantined.exists(),
+            "corrupt index.db should be quarantined at {quarantined:?}"
+        );
+    }
+
+    /// Verify that `bindings_builder()`'s TypeScript export is byte-identical
+    /// to the checked-in `ui/src/ipc/bindings.ts`.
     ///
-    /// tauri-specta rc.21 does not expose the internal command list publicly.
-    /// We use `export_str` to generate the TypeScript bindings string and scan
-    /// it for each expected command name.  Each command appears in the TS
-    /// as a string literal in the `invoke` call.
-    ///
-    /// Command-count ledger: P1 8 → P2 10 → P3 12 → P4 18 → P5 20 → P6 21 → P9 25
-    /// → P10 26 → P9 review-fix 27 → +prewarm_asr 28 → +save_note_image 29 → P4
-    /// transcript-rename adds `set_speaker_name` 30 → +translate_meeting
-    /// +get_translations 32 → +get_diagnostic_report 33 (#0014) →
-    /// +apply_notes_update +load_notes_ydoc 35 (B6 WU7 — CRDT editor binding) (P5 removes
-    /// `re_summarise` and adds `summarise_meeting`
-    /// / `get_summary` / `save_summary`: 18 − 1 + 3 = 20; P6 adds
-    /// `rediarize_meeting`: 20 + 1 = 21; P9 adds `send_chat_message` /
-    /// `get_chat_session` / `list_chat_sessions` / `delete_chat_session`: 21 + 4
-    /// = 25; P10 adds `get_mcp_server_info`: 25 + 1 = 26; the P9 chat review-fix
-    /// adds `cancel_chat_turn` (P1 — turn cancellation): 26 + 1 = 27;
-    /// `prewarm_asr` (live-test UX T2): 27 + 1 = 28; `save_note_image` (note image
-    /// paste/drop): 28 + 1 = 29; `set_speaker_name` (transcript speaker rename):
-    /// 29 + 1 = 30; translation commands: 30 + 2 = 32; `get_diagnostic_report`
-    /// (#0014 — the "Report a problem" snapshot): 32 + 1 = 33;
-    /// `apply_notes_update` + `load_notes_ydoc` (B6 WU7 — CRDT editor binding):
-    /// 33 + 2 = 35; the WS4-A S5b tunnel surface adds `tunnel_begin_pairing` /
-    /// `tunnel_poll_pairing` / `set_connector_enabled` / `tunnel_status`:
-    /// 35 + 4 = 39; #0015 merges `re_transcribe` + `rediarize_meeting` into one
-    /// `reprocess`: 39 − 2 + 1 = 38; the WS4-B S5 sync surface adds `sync_status`
-    /// / `sync_get_my_ticket` / `sync_add_peer` / `sync_now`: 38 + 4 = 42; #0016
-    /// adds the attachments surface `add_attachment` / `list_attachments` /
-    /// `open_attachment` / `remove_attachment`: 42 + 4 = 46).
+    /// A hand-maintained command-name ledger drifts silently from the real
+    /// command surface (it only ever checked the in-memory export against
+    /// itself, never against the committed frontend file the app actually
+    /// loads). Comparing directly against the committed file makes drift a
+    /// build failure: after adding, removing, or renaming a `#[tauri::command]`
+    /// or changing a type reachable from one, regenerate the bindings with
+    /// `make bindings` (`cargo run -p minutist --bin generate-bindings`,
+    /// which uses this same builder and export config) and commit the result.
     ///
     /// `BigIntExportBehavior::Number` is used to allow `u64` fields (e.g.,
     /// timestamps and byte counts) to export as TypeScript `number` rather
-    /// than erroring.  This matches the Handy project's pattern per Phase 1.
+    /// than erroring — matching `generate-bindings`'s export config exactly.
     #[test]
-    fn bindings_builder_registers_expected_command_ledger() {
+    fn bindings_builder_output_matches_committed_bindings_ts() {
         use specta_typescript::{BigIntExportBehavior, Typescript};
 
         let builder = bindings_builder();
-        let ts = builder
+        let generated = builder
             .export_str(Typescript::default().bigint(BigIntExportBehavior::Number))
             .expect("export_str should succeed for a correctly-configured builder");
 
-        // Each command appears as a string literal in the `invoke(...)` call.
-        let expected = [
-            "list_devices",
-            "start_recording",
-            "prewarm_asr",
-            "pause_recording",
-            "resume_recording",
-            "stop_recording",
-            "get_recording_state",
-            "get_settings",
-            "update_settings",
-            "list_models",
-            "ensure_model",
-            "save_notes",
-            "load_notes",
-            "apply_notes_update",
-            "load_notes_ydoc",
-            "save_note_image",
-            "add_attachment",
-            "list_attachments",
-            "open_attachment",
-            "remove_attachment",
-            "list_meetings",
-            "open_meeting",
-            "rename_meeting",
-            "set_speaker_name",
-            "delete_meeting",
-            "reprocess",
-            "summarise_meeting",
-            "get_summary",
-            "save_summary",
-            "send_chat_message",
-            "cancel_chat_turn",
-            "get_chat_session",
-            "list_chat_sessions",
-            "delete_chat_session",
-            "get_mcp_server_info",
-            "translate_meeting",
-            "get_translations",
-            "get_diagnostic_report",
-            "tunnel_begin_pairing",
-            "tunnel_poll_pairing",
-            "set_connector_enabled",
-            "tunnel_status",
-            "sync_status",
-            "sync_get_my_ticket",
-            "sync_add_peer",
-            "sync_now",
-            "reject_match",
-            "clear_all_voiceprints",
-            "list_voiceprints",
-            "merge_voiceprint_identities",
-            "rename_voiceprint_identity",
-            "delete_voiceprint_identity",
-            "forget_meeting_voiceprints",
-        ];
+        let committed_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("ui")
+            .join("src")
+            .join("ipc")
+            .join("bindings.ts");
+        let committed = std::fs::read_to_string(&committed_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read committed bindings file at {}: {e}",
+                committed_path.display()
+            )
+        });
 
         assert_eq!(
-            expected.len(),
-            53,
-            "command ledger must be 53 (46 pre-WU5; +2 #0003 WU5 commands \
-             (reject_match / clear_all_voiceprints); +5 #0003 WU8 commands \
-             (list_voiceprints / merge_voiceprint_identities / \
-             rename_voiceprint_identity / delete_voiceprint_identity / \
-             forget_meeting_voiceprints))"
+            generated, committed,
+            "ui/src/ipc/bindings.ts is stale relative to the Rust IPC command \
+             surface. Regenerate it with `make bindings` \
+             (cargo run -p minutist --bin generate-bindings) and commit the result."
         );
-
-        // #0015 — the two former offline commands merged into `reprocess`; assert
-        // both are gone from the COMMAND surface. Match the `TAURI_INVOKE("name"`
-        // call, NOT a raw substring: `OperationKind::ReTranscribe` legitimately
-        // serialises to `"re_transcribe"` in the generated TS union (the reprocess
-        // op still emits a re-transcribe progress phase), so a bare `contains`
-        // would false-positive on that progress variant.
-        assert!(
-            !ts.contains("TAURI_INVOKE(\"re_transcribe\""),
-            "the re_transcribe command must be merged into reprocess in #0015"
-        );
-        assert!(
-            !ts.contains("TAURI_INVOKE(\"rediarize_meeting\""),
-            "the rediarize_meeting command must be merged into reprocess in #0015"
-        );
-
-        // `re_summarise` was removed in Phase 5 (no caller once
-        // `summarise_meeting` landed); assert it is gone from the surface.
-        assert!(
-            !ts.contains("re_summarise"),
-            "re_summarise must be removed from the command surface in Phase 5"
-        );
-
-        for name in &expected {
-            assert!(
-                ts.contains(name),
-                "expected command '{name}' not found in generated TypeScript:\n{ts}"
-            );
-        }
     }
 
     /// Verify that `AppEventPayload` is registered in the builder's event

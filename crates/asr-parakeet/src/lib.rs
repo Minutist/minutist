@@ -289,7 +289,7 @@ impl minutist_common::AsrBackend for ParakeetBackend {
         // burst) makes the decoder repeat a word or clause indefinitely.
         if is_degenerate_repetition(&text) {
             tracing::warn!(
-                target = "asr-parakeet",
+                target: "asr-parakeet",
                 start_ms = chunk.start_ms,
                 end_ms = chunk.end_ms,
                 text_chars = text.chars().count(),
@@ -303,7 +303,7 @@ impl minutist_common::AsrBackend for ParakeetBackend {
         // log stream, because the crash-capture ring buffer lifts log lines into
         // a user-facing diagnostic report (see cross-cutting.md "Crash capture").
         tracing::debug!(
-            target = "asr-parakeet",
+            target: "asr-parakeet",
             start_ms = chunk.start_ms,
             end_ms = chunk.end_ms,
             words = words.len(),

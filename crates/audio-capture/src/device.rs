@@ -190,7 +190,7 @@ pub(crate) fn preferred_config(
         Ok(cfgs) => cfgs,
         Err(e) => {
             tracing::warn!(
-                target = "audio-capture",
+                target: "audio-capture",
                 "could not enumerate input configs for device, using default: {e}"
             );
             return Ok(default_cfg);
@@ -226,7 +226,7 @@ pub(crate) fn preferred_config(
         Some(r) => Ok(r.with_sample_rate(target_rate)),
         None => {
             tracing::warn!(
-                target = "audio-capture",
+                target: "audio-capture",
                 "no supported config matched device default rate {:?}, using device default",
                 target_rate
             );

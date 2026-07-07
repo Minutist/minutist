@@ -111,7 +111,7 @@ fn run(
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(
-                target = "audio-capture",
+                target: "audio-capture",
                 "WASAPI communications-mode mic capture unavailable ({e}); falling back to cpal"
             );
             let _ = ready_tx.send(false);
@@ -119,7 +119,7 @@ fn run(
         }
     };
     tracing::info!(
-        target = "audio-capture",
+        target: "audio-capture",
         "mic capture via WASAPI communications mode (OS beamforming/AEC/NS → 16 kHz mono)"
     );
     let _ = ready_tx.send(true);
@@ -132,7 +132,7 @@ fn run(
             continue;
         }
         if capture_client.read_from_device_to_deque(&mut deque).is_err() {
-            tracing::warn!(target = "audio-capture", "WASAPI capture read failed; stopping path");
+            tracing::warn!(target: "audio-capture", "WASAPI capture read failed; stopping path");
             break;
         }
         // The stream is mono f32, so consume whole 4-byte samples and leave any

@@ -47,7 +47,7 @@ impl SettingsHandle {
             Ok(s) => s,
             Err(Error::Serialise(ref e)) => {
                 tracing::warn!(
-                    target = "settings",
+                    target: "settings",
                     error = %e,
                     "settings file is corrupt; falling back to defaults"
                 );

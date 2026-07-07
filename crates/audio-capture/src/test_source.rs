@@ -149,7 +149,7 @@ fn send_batch(tx: &mpsc::Sender<AudioFrameBatch>, batch: AudioFrameBatch) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             tracing::warn!(
-                target = "audio-capture",
+                target: "audio-capture",
                 "sample channel full; dropping oldest frame (back-pressure)"
             );
             // We can't drain from a Sender. The channel is full; drop this batch.
@@ -164,7 +164,7 @@ fn send_meter(tx: &mpsc::Sender<AudioMeterFrame>, mf: AudioMeterFrame) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             tracing::warn!(
-                target = "audio-capture",
+                target: "audio-capture",
                 "meter channel full; dropping meter frame (back-pressure)"
             );
         }

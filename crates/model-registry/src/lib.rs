@@ -30,7 +30,7 @@
 //!
 //! # Tracing target
 //!
-//! All log calls use `target = "model-registry"` so they can be filtered
+//! All log calls use `target: "model-registry"` so they can be filtered
 //! independently.
 
 pub mod error;

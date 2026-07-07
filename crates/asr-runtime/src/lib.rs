@@ -540,7 +540,7 @@ impl AsrRuntime {
             })?;
 
         tracing::info!(
-            target = "asr-runtime",
+            target: "asr-runtime",
             model = %model_path.display(),
             "model loaded"
         );
@@ -582,7 +582,7 @@ impl AsrRuntime {
         }
 
         tracing::info!(
-            target = "asr-runtime",
+            target: "asr-runtime",
             mmproj = %mmproj_path.display(),
             audio_sample_rate = ?mtmd_ctx.get_audio_sample_rate(),
             "mtmd context initialised"
@@ -650,7 +650,7 @@ impl AsrBackend for AsrRuntime {
         // log stream, because the crash-capture ring buffer lifts log lines into
         // a user-facing diagnostic report (see cross-cutting.md "Crash capture").
         tracing::debug!(
-            target = "asr-runtime",
+            target: "asr-runtime",
             start_ms = chunk.start_ms,
             end_ms = chunk.end_ms,
             text_chars = final_text.chars().count(),
@@ -712,7 +712,7 @@ impl AsrRuntime {
             let forced_wins = plausible && score_diff > LOGPROB_EPSILON;
 
             tracing::debug!(
-                target = "asr-runtime",
+                target: "asr-runtime",
                 start_ms = chunk.start_ms,
                 end_ms = chunk.end_ms,
                 cjk_fraction = %format!("{:.2}", cjk_frac),
@@ -729,7 +729,7 @@ impl AsrRuntime {
                 forced_text
             } else {
                 tracing::warn!(
-                    target = "asr-runtime",
+                    target: "asr-runtime",
                     start_ms = chunk.start_ms,
                     auto_logprob = %format!("{:.4}", auto_result.mean_logprob),
                     forced_logprob = %format!("{:.4}", forced_result.mean_logprob),

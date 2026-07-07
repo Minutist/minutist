@@ -212,10 +212,14 @@ must abort the parent orchestrator task and surface as a recoverable
 - Console output in debug builds only.
 - `RUST_LOG`-style filtering honoured at startup.
 
-Each component uses a static `target` matching the crate name:
-`tracing::info!(target = "asr-runtime", ...)`. The reviewer is expected
-to flag log calls without a target — that's how we keep logs
-filterable.
+Each component uses a static `target` matching the crate name, set with
+the macro's `target:` directive (colon):
+`tracing::info!(target: "asr-runtime", ...)`. Note the colon — `target =`
+(equals) is field syntax: it records a *field* named `target` on the event
+and leaves the event's actual target as the module path, silently defeating
+`RUST_LOG` target filtering. The reviewer is expected to flag both forms —
+`target =` misuse and log calls with no target at all — that's how we keep
+logs filterable.
 
 No `println!` or `eprintln!` outside test code. Two narrow exceptions:
 

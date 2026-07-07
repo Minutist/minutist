@@ -79,7 +79,7 @@ pub(crate) fn open_loopback() -> Result<LoopbackSource, Error> {
     let channels = config.channels() as usize;
 
     tracing::info!(
-        target = "audio-capture",
+        target: "audio-capture",
         sample_rate = in_rate,
         channels,
         format = ?config.sample_format(),
@@ -130,7 +130,7 @@ fn loopback_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig,
         Ok(cfg) => Ok(cfg),
         Err(e) => {
             tracing::warn!(
-                target = "audio-capture",
+                target: "audio-capture",
                 "no default output config for loopback ({e}); trying supported configs"
             );
             let mut supported = device

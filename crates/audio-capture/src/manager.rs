@@ -121,7 +121,7 @@ impl DropOldestChannel {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
                 tracing::warn!(
-                    target = "audio-capture",
+                    target: "audio-capture",
                     "cpal→forwarder channel busy; dropping frame to avoid blocking RT callback"
                 );
                 return;
@@ -137,7 +137,7 @@ impl DropOldestChannel {
             // Evict the OLDEST frame, then enqueue the newest.
             inner.queue.pop_front();
             tracing::warn!(
-                target = "audio-capture",
+                target: "audio-capture",
                 "cpal→forwarder channel full (capacity {}); dropped oldest frame",
                 self.capacity
             );
@@ -279,7 +279,7 @@ impl AudioCaptureManager {
         let audio_device = device::describe_device(device_id.as_deref())?;
 
         tracing::info!(
-            target = "audio-capture",
+            target: "audio-capture",
             device = %audio_device.name,
             id = %audio_device.id,
             is_default = audio_device.is_default,
@@ -352,7 +352,7 @@ impl AudioCaptureManager {
         let (mic_backend, in_rate) = match wasapi_mic {
             Some((handle, rate)) => {
                 tracing::info!(
-                    target = "audio-capture",
+                    target: "audio-capture",
                     device = %device_name,
                     sample_rate = rate,
                     channels = 1usize,
@@ -366,7 +366,7 @@ impl AudioCaptureManager {
                 let in_rate = config.sample_rate().0;
                 let channels = config.channels() as usize;
                 tracing::info!(
-                    target = "audio-capture",
+                    target: "audio-capture",
                     device = %device_name,
                     sample_rate = in_rate,
                     channels,
@@ -395,7 +395,7 @@ impl AudioCaptureManager {
                 Ok(lb) => Some(lb),
                 Err(e) => {
                     tracing::warn!(
-                        target = "audio-capture",
+                        target: "audio-capture",
                         "system-audio capture requested but loopback unavailable ({e}); \
                          falling back to mic-only"
                     );
@@ -414,7 +414,7 @@ impl AudioCaptureManager {
             // ---------- Mic + loopback: resample each, then mix ----------
             Some(lb) => {
                 tracing::info!(
-                    target = "audio-capture",
+                    target: "audio-capture",
                     loopback_rate = lb.in_rate,
                     "loopback opened; mixing microphone + system audio \
                      (a starved/idle source is zero-filled so the mic keeps flowing)"
@@ -493,7 +493,7 @@ impl AudioCaptureManager {
             src.backend.set_device_paused(true)?;
         }
         self.state = StreamState::Paused;
-        tracing::info!(target = "audio-capture", "capture paused");
+        tracing::info!(target: "audio-capture", "capture paused");
         Ok(())
     }
 
@@ -514,7 +514,7 @@ impl AudioCaptureManager {
             src.backend.set_device_paused(false)?;
         }
         self.state = StreamState::Running;
-        tracing::info!(target = "audio-capture", "capture resumed");
+        tracing::info!(target: "audio-capture", "capture resumed");
         Ok(())
     }
 
@@ -542,7 +542,7 @@ impl AudioCaptureManager {
         self.loopback = None;
         self.stopped = None;
         self.state = StreamState::Idle;
-        tracing::info!(target = "audio-capture", "capture stopped");
+        tracing::info!(target: "audio-capture", "capture stopped");
         Ok(())
     }
 
@@ -571,7 +571,7 @@ fn spawn_mic_only_forwarder(
         let mut resampler = match StreamResampler::new(in_rate) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(target = "audio-capture", "failed to create resampler: {e}");
+                tracing::error!(target: "audio-capture", "failed to create resampler: {e}");
                 return;
             }
         };
@@ -591,14 +591,14 @@ fn spawn_mic_only_forwarder(
                 let batch = batch_from(chunk, &mut out_clock_samples);
                 if sample_tx.blocking_send(batch).is_err() {
                     tracing::warn!(
-                        target = "audio-capture",
+                        target: "audio-capture",
                         "sample channel closed; forwarder exiting"
                     );
                     return;
                 }
                 meter.push(chunk, |mf| {
                     if meter_tx.blocking_send(mf).is_err() {
-                        tracing::warn!(target = "audio-capture", "meter channel closed");
+                        tracing::warn!(target: "audio-capture", "meter channel closed");
                     }
                 });
             });
@@ -618,7 +618,7 @@ fn spawn_mic_only_forwarder(
         });
 
         tracing::debug!(
-            target = "audio-capture",
+            target: "audio-capture",
             out_samples = out_clock_samples,
             "mic-only forwarder task exiting"
         );
@@ -641,7 +641,7 @@ fn spawn_resample_forwarder(
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(
-                    target = "audio-capture",
+                    target: "audio-capture",
                     "failed to create {source} resampler: {e}"
                 );
                 return;
@@ -663,7 +663,7 @@ fn spawn_resample_forwarder(
                 let batch = batch_from(chunk, &mut clock);
                 if batch_tx.blocking_send(batch).is_err() {
                     tracing::warn!(
-                        target = "audio-capture",
+                        target: "audio-capture",
                         "{source} mixer channel closed; forwarder exiting"
                     );
                 }
@@ -676,7 +676,7 @@ fn spawn_resample_forwarder(
                 let _ = batch_tx.blocking_send(batch);
             }
         });
-        tracing::debug!(target = "audio-capture", "{source} resample forwarder exiting");
+        tracing::debug!(target: "audio-capture", "{source} resample forwarder exiting");
     });
 }
 
@@ -719,7 +719,7 @@ fn spawn_mixer(
             while let Some(batch) = state.drain_paired() {
                 meter_then_send(&mut meter, &batch.samples, &meter_tx);
                 if sample_tx.send(batch).await.is_err() {
-                    tracing::warn!(target = "audio-capture", "sample channel closed; mixer exiting");
+                    tracing::warn!(target: "audio-capture", "sample channel closed; mixer exiting");
                     return;
                 }
             }
@@ -731,7 +731,7 @@ fn spawn_mixer(
             while let Some(batch) = state.drain_starved() {
                 meter_then_send(&mut meter, &batch.samples, &meter_tx);
                 if sample_tx.send(batch).await.is_err() {
-                    tracing::warn!(target = "audio-capture", "sample channel closed; mixer exiting");
+                    tracing::warn!(target: "audio-capture", "sample channel closed; mixer exiting");
                     return;
                 }
             }
@@ -745,7 +745,7 @@ fn spawn_mixer(
         meter.flush(|mf| {
             let _ = meter_tx.try_send(mf);
         });
-        tracing::debug!(target = "audio-capture", "mixer task exiting");
+        tracing::debug!(target: "audio-capture", "mixer task exiting");
     });
 }
 
@@ -851,7 +851,7 @@ where
             });
         },
         move |err| {
-            tracing::error!(target = "audio-capture", "cpal stream error: {err}");
+            tracing::error!(target: "audio-capture", "cpal stream error: {err}");
         },
         None,
     )?;

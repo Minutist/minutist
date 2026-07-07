@@ -58,7 +58,7 @@ impl TunnelHandle {
             Err(join_err) => {
                 // The task panicked or was aborted; treat as cancelled for the
                 // lifecycle (the caller is tearing down regardless).
-                tracing::warn!(%join_err, "tunnel: lifecycle task did not exit cleanly");
+                tracing::warn!(target: "tunnel-client", %join_err, "tunnel: lifecycle task did not exit cleanly");
                 ReconnectExit::Cancelled
             }
         }

@@ -142,19 +142,21 @@ where
             SessionResult::Cancelled => return ReconnectExit::Cancelled,
             SessionResult::Ended(Ok(())) => {
                 // Clean close. Redial (the relay may cycle a connection).
-                tracing::info!("tunnel: session closed cleanly; reconnecting");
+                tracing::info!(target: "tunnel-client", "tunnel: session closed cleanly; reconnecting");
             }
             SessionResult::Ended(Err(TunnelError::HelloRejected(reason))) => {
                 use crate::frame::HelloErrReason;
                 match reason {
                     HelloErrReason::AuthFailed if ever_connected => {
                         tracing::warn!(
+                            target: "tunnel-client",
                             "tunnel: credential rejected after a working session — device revoked; needs re-pair"
                         );
                         return ReconnectExit::NeedsRepair;
                     }
                     HelloErrReason::AuthFailed => {
                         tracing::warn!(
+                            target: "tunnel-client",
                             "tunnel: credential rejected and never worked — bad credential; stopping"
                         );
                         return ReconnectExit::AuthFailed;
@@ -164,7 +166,7 @@ where
                         // the same version cannot help, but this is not a
                         // credential problem — back off (a relay rollback/forward
                         // may restore compatibility) rather than demand a re-pair.
-                        tracing::warn!("tunnel: relay rejected the protocol version; backing off");
+                        tracing::warn!(target: "tunnel-client", "tunnel: relay rejected the protocol version; backing off");
                     }
                 }
             }
@@ -172,7 +174,7 @@ where
                 // Transient: connect/transport/protocol/decode. A successful
                 // handshake during this session would have logged "online"; the
                 // error here means the session dropped or never connected.
-                tracing::warn!(%error, "tunnel: session ended with error; backing off");
+                tracing::warn!(target: "tunnel-client", %error, "tunnel: session ended with error; backing off");
             }
         }
 

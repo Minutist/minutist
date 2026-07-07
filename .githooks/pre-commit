@@ -1,29 +1,45 @@
 #!/usr/bin/env bash
 #
-# pre-commit — architecture drift guard
+# pre-commit — architecture drift guard + mechanical guardrails
 #
 # Fails the commit if source under crates/, src-tauri/, or ui/src/ is staged
 # without a matching change under architecture/. The intent is to
 # keep the live architecture docs honest: a structural change is incomplete
 # until the C4 docs reflect it.
 #
+# Also runs two mechanical lints (scripts/check-dep-table.py,
+# scripts/check-tracing-targets.py) against the working tree whenever the
+# commit has any staged files. These enforce the components.md dependency
+# table and the tracing target: convention respectively — see
+# architecture/cross-cutting.md. They run unconditionally (independent of the
+# architecture-drift outcome below, including under SKIP_ARCH_CHECK) because
+# they check working-tree state, not the drift-guard's staged/doc-touch
+# heuristic.
+#
 # Install once per clone:
 #     git config core.hooksPath .githooks
 #
-# Override (rarely justified):
+# Override the architecture drift check only (rarely justified; the
+# guardrail lints below are not affected):
 #     SKIP_ARCH_CHECK=1 git commit ...
 
 set -euo pipefail
-
-if [ "${SKIP_ARCH_CHECK:-0}" = "1" ]; then
-    echo "[pre-commit] SKIP_ARCH_CHECK=1 — architecture drift check bypassed" >&2
-    exit 0
-fi
 
 # Staged-paths-only; we do not look at unstaged or untracked changes.
 staged="$(git diff --cached --name-only --diff-filter=ACMRTD)"
 
 if [ -z "$staged" ]; then
+    exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+echo "[pre-commit] running guardrails: dependency-table + tracing-target checks" >&2
+uv run "$repo_root/scripts/check-dep-table.py"
+uv run "$repo_root/scripts/check-tracing-targets.py"
+
+if [ "${SKIP_ARCH_CHECK:-0}" = "1" ]; then
+    echo "[pre-commit] SKIP_ARCH_CHECK=1 — architecture drift check bypassed" >&2
     exit 0
 fi
 

@@ -35,6 +35,24 @@ jobs:
       - name: reuse lint
         uses: fsfe/reuse-action@v5
 
+  # Mechanical architecture guardrails (see architecture/cross-cutting.md —
+  # "Logging" / the dependency-table note): the components.md dependency
+  # table against every Cargo.toml, and the tracing target: convention. Same
+  # two checks the pre-commit hook runs on the working tree; here they run
+  # against the checked-out commit.
+  guardrails:
+    name: guardrails (dep-table, tracing-targets)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Dependency-table check
+        run: uv run scripts/check-dep-table.py
+      - name: Tracing-target check
+        run: uv run scripts/check-tracing-targets.py
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -128,11 +128,11 @@ where
 
     match read_handshake_reply(&mut ws_rx).await? {
         HandshakeReply::Ack => {
-            tracing::info!(account = %config.account_id, "tunnel: handshake acknowledged");
+            tracing::info!(target: "tunnel-client", account = %config.account_id, "tunnel: handshake acknowledged");
             on_handshake();
         }
         HandshakeReply::Err(reason) => {
-            tracing::warn!(?reason, "tunnel: relay rejected the device");
+            tracing::warn!(target: "tunnel-client", ?reason, "tunnel: relay rejected the device");
             return Err(TunnelError::HelloRejected(reason));
         }
     }
@@ -145,12 +145,12 @@ where
             let bytes = match frame.encode() {
                 Ok(b) => b,
                 Err(error) => {
-                    tracing::error!(%error, "tunnel: outbound frame encode failed; dropping");
+                    tracing::error!(target: "tunnel-client", %error, "tunnel: outbound frame encode failed; dropping");
                     continue;
                 }
             };
             if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
-                tracing::info!("tunnel: write failed; writer stopping");
+                tracing::info!(target: "tunnel-client", "tunnel: write failed; writer stopping");
                 break;
             }
         }
@@ -269,6 +269,7 @@ where
             Message::Binary(bytes) => {
                 if bytes.len() > MAX_TUNNEL_MESSAGE_BYTES {
                     tracing::warn!(
+                        target: "tunnel-client",
                         len = bytes.len(),
                         "tunnel: oversized inbound frame; closing"
                     );
@@ -301,7 +302,7 @@ where
                     | Frame::ResponseChunk(_)
                     | Frame::ResponseEnd(_)
                     | Frame::ResponseError(_) => {
-                        tracing::warn!("tunnel: relay sent a device→relay frame; closing");
+                        tracing::warn!(target: "tunnel-client", "tunnel: relay sent a device→relay frame; closing");
                         return Err(TunnelError::Protocol("relay sent a device→relay frame"));
                     }
                 }
@@ -309,7 +310,7 @@ where
             Message::Close(_) => return Ok(()),
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Text(_) => {
-                tracing::warn!("tunnel: relay sent a text message; closing");
+                tracing::warn!(target: "tunnel-client", "tunnel: relay sent a text message; closing");
                 return Err(TunnelError::Protocol("relay sent a text message"));
             }
         }

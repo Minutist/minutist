@@ -219,7 +219,12 @@ the macro's `target:` directive (colon):
 and leaves the event's actual target as the module path, silently defeating
 `RUST_LOG` target filtering. The reviewer is expected to flag both forms —
 `target =` misuse and log calls with no target at all — that's how we keep
-logs filterable.
+logs filterable. `scripts/check-tracing-targets.py` enforces both mechanically:
+the pre-commit hook and the CI `guardrails` job run it against every
+`tracing::*!` call under `crates/*/src/` and `src-tauri/src/`, failing on a
+`target =` field-form call anywhere, and on a `tunnel-client` call with no
+`target:` at all (the crate-by-crate rollout is tracked in the script's
+`NETWORKED_CRATES` constant).
 
 No `println!` or `eprintln!` outside test code. Two narrow exceptions:
 
@@ -253,6 +258,18 @@ titles. Re-introducing a content-bearing log field would breach this guarantee. 
 sent off the machine; the user reviews + submits from their own browser. This is
 NOT telemetry (see "Telemetry" below): there is no automatic transmission and no
 network hook.
+
+### Dependency-table guardrail
+
+`scripts/check-dep-table.py` mechanically enforces the dependency table in
+`architecture/components.md` (see that file's "Dependency rule" section)
+against every workspace crate's `Cargo.toml`: it resolves each crate's
+runtime `path = "..."` dependencies (from `[dependencies]` and any
+`[target.*.dependencies]`, never `[dev-dependencies]`/`[build-dependencies]`)
+and fails if any edge is not listed in the target crate's "May depend on"
+column. The pre-commit hook and the CI `guardrails` job both run it, so a
+new inter-crate dependency edge fails before merge unless the table is
+updated in the same commit.
 
 ## IPC contract
 

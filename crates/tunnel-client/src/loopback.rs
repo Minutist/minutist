@@ -102,7 +102,7 @@ pub(crate) async fn loopback_replay(
 ) {
     let request_id = request.request_id;
     let url = target.url_for(&request.path);
-    tracing::debug!(request_id, method = %request.method, path = %request.path, "tunnel: replaying request to loopback");
+    tracing::debug!(target: "tunnel-client", request_id, method = %request.method, path = %request.path, "tunnel: replaying request to loopback");
 
     let method = match reqwest::Method::from_bytes(request.method.as_bytes()) {
         Ok(m) => m,
@@ -130,7 +130,7 @@ pub(crate) async fn loopback_replay(
         Err(error) => {
             // `error` is logged WITHOUT the URL bearer (reqwest errors do not
             // carry header values); keep the message coarse for the relay.
-            tracing::warn!(request_id, %error, "tunnel: loopback request failed");
+            tracing::warn!(target: "tunnel-client", request_id, %error, "tunnel: loopback request failed");
             send_error(outbound_tx, request_id, "loopback request failed").await;
             return;
         }
@@ -138,7 +138,7 @@ pub(crate) async fn loopback_replay(
 
     let status = response.status().as_u16();
     let headers = filter_response_headers(response.headers());
-    tracing::debug!(request_id, status, "tunnel: loopback responded");
+    tracing::debug!(target: "tunnel-client", request_id, status, "tunnel: loopback responded");
 
     if outbound_tx
         .send(Frame::ResponseStart(ResponseStart {
@@ -173,7 +173,7 @@ pub(crate) async fn loopback_replay(
             Err(error) => {
                 // Mid-stream failure: the relay already saw ResponseStart, so a
                 // ResponseError now terminates the request cleanly.
-                tracing::warn!(request_id, %error, "tunnel: loopback body stream error");
+                tracing::warn!(target: "tunnel-client", request_id, %error, "tunnel: loopback body stream error");
                 send_error(outbound_tx, request_id, "loopback body stream error").await;
                 return;
             }

@@ -3660,6 +3660,30 @@ re-transcribe / diarize passes then update the now-open meeting in place
 `Finalising` variant and `AppEvent` a `MeetingFinalised` variant — bindings
 regenerated.
 
+**Finalise-failure invariant.** Every exit out of `stop()`'s finalise
+handshake — the runner-command channel closing before `Stop` can be sent, the
+finalise reply channel dropping, or `MeetingWriter::finalise` itself returning
+an error — drives the state machine (`Stopping`/`Finalising`) back to `Idle`
+and broadcasts `StateChanged(Idle)` before the error is returned, via
+`Orchestrator::abort_finalise`. `stop()`'s sole caller
+(`ipc-bridge::commands::stop_recording`) only forwards the `Err`, so a
+handshake failure that skipped this recovery would leave the recorder wedged
+reporting `Finalising` with no further recording possible short of a process
+restart — every new early-return added to the handshake must route through
+`abort_finalise` rather than a bare `?`.
+
+**`incomplete`-flag repair contract.** `FlushQueue::incomplete` is the single
+signal gating the post-stop re-transcribe (`ipc-bridge`'s background repair
+that re-runs ASR over the complete `audio.opus`). It must be set on every path
+that broadcasts a `TranscriptSegment` to the live view but then fails to
+persist it to `transcript.json` — not only the drop-oldest queue-full path
+(`dispatch_flush`, see "ASR flush backpressure" above) and the stop-drain
+timeout (`wait_for_asr_worker_drain`), but also a `WriterCommand` send failing
+after the segment was already broadcast
+(`process_flush_with_backend`'s writer-channel `try_send`). A future
+broadcast-then-persist path must extend this list or a segment can silently
+vanish from the saved transcript with no repair triggered.
+
 **Responsive start.** `start()` emits `StateChanged(Recording)` as soon as audio
 capture is running and the `MeetingWriter` is open — BEFORE the GPU probe, the
 optional live-diarizer model load, and the runner spawn — so the webview switches

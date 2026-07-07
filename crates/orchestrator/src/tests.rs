@@ -196,6 +196,80 @@ async fn clean_recording_is_not_flagged_transcript_incomplete() {
     );
 }
 
+/// B1 — a failure inside the `stop()` finalise handshake must NOT wedge the
+/// orchestrator in `Stopping`/`Finalising`. Fault-inject by removing the
+/// meeting folder out from under the writer right after `start`: the audio
+/// encoder's already-open fd keeps accepting writes (an unlink does not
+/// invalidate an open fd on Linux), so recording proceeds normally, but
+/// `MeetingWriter::finalise`'s `metadata.json` write opens a FRESH file in the
+/// now-missing directory and fails with a real I/O error — the same failure
+/// shape as a disk unmount or permission change mid-recording.
+///
+/// Before the B1 fix this error propagated out of `stop()` via a bare `?`
+/// that skipped the `transition_idle` + `StateChanged(Idle)` steps, leaving
+/// the recorder stuck reporting `Finalising` forever (no further recording
+/// possible without a process restart). This test starts a SECOND recording
+/// immediately after the failed `stop()` to prove that symptom is gone.
+#[tokio::test]
+async fn stop_failure_still_returns_to_idle_and_emits_state_changed() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let (orch, dir) = make_orchestrator();
+    let mut rx = orch.subscribe_events();
+
+    let source = dummy_source();
+    let streams = source.generate_streams(4, 32, 64);
+    let meeting_id = orch
+        .start_with_streams(streams)
+        .await
+        .expect("start_with_streams");
+
+    // `MeetingWriter::open` (awaited inside `start_with_streams`) has already
+    // created the folder by the time `start_with_streams` returns.
+    let meeting_dir = dir.path().join(meeting_id.0.to_string());
+    std::fs::remove_dir_all(&meeting_dir).expect("remove meeting dir to fault-inject");
+
+    let err = orch
+        .stop()
+        .await
+        .expect_err("finalise must fail once its metadata write has no directory to write into");
+    assert!(
+        matches!(err, AppError::Io { .. }),
+        "expected the metadata write's I/O error to surface from stop(), got {err:?}"
+    );
+
+    // Not wedged: the internal state machine is back to Idle...
+    assert_eq!(orch.state().await, RecordingState::Idle);
+
+    // ...and a StateChanged(Idle) was broadcast (not just the internal field —
+    // this is what lets a listening UI un-stick its busy indicator).
+    let mut saw_idle = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline && !saw_idle {
+        match rx.try_recv() {
+            Ok(AppEvent::StateChanged {
+                state: RecordingState::Idle,
+            }) => saw_idle = true,
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_idle,
+        "expected a StateChanged(Idle) broadcast after the finalise failure"
+    );
+
+    // The actual "wedged" symptom: recording must be possible again right
+    // away, with no process restart.
+    let source2 = dummy_source();
+    let streams2 = source2.generate_streams(4, 32, 64);
+    orch.start_with_streams(streams2)
+        .await
+        .expect("a new recording must be startable immediately after a failed finalise");
+}
+
 // ---------------------------------------------------------------------------
 // Test 2: Invalid transitions return AppError::InvalidInput
 // ---------------------------------------------------------------------------

@@ -1057,136 +1057,150 @@ fn run_asr_worker(
             rt.block_on(flush_queue.notify.notified());
         }
 
-        // Pop the oldest pending payload.
-        let (payload, is_closed) = {
-            let mut deque = flush_queue
-                .deque
-                .lock()
-                .expect("flush queue mutex poisoned");
-            let p = deque.pop_front();
-            let closed = flush_queue.closed.load(Ordering::Acquire);
-            (p, closed)
-        };
+        // Drain the queue fully before waiting on the next notification.
+        // `Notify` coalesces any `notify_one()` calls that land while this
+        // worker is busy processing into a single stored permit, so popping
+        // only one item per wakeup would park the rest of a burst until some
+        // UNRELATED later push notifies again (B3b) — instead loop popping
+        // until the deque reports empty, then break out to wait again.
+        loop {
+            // Pop the oldest pending payload.
+            let (payload, is_closed) = {
+                let mut deque = flush_queue
+                    .deque
+                    .lock()
+                    .expect("flush queue mutex poisoned");
+                let p = deque.pop_front();
+                let closed = flush_queue.closed.load(Ordering::Acquire);
+                (p, closed)
+            };
 
-        // Once the runner signals closed we keep draining without waiting.
-        if is_closed {
-            pending_closed = true;
-        }
-
-        let payload = match payload {
-            Some(p) => {
-                // Track that we have a payload in-flight; decremented via
-                // InFlightGuard below regardless of how this iteration exits.
-                flush_queue.in_flight.fetch_add(1, Ordering::AcqRel);
-                p
+            // Once the runner signals closed we keep draining without waiting.
+            if is_closed {
+                pending_closed = true;
             }
-            None => {
-                if pending_closed {
-                    // Queue is empty and runner has exited — we're done.
-                    tracing::debug!(
+
+            let payload = match payload {
+                Some(p) => {
+                    // Track that we have a payload in-flight; decremented via
+                    // InFlightGuard below regardless of how this iteration exits.
+                    flush_queue.in_flight.fetch_add(1, Ordering::AcqRel);
+                    p
+                }
+                None => {
+                    if pending_closed {
+                        // Queue is empty and runner has exited — we're done.
+                        tracing::debug!(
+                            target: "orchestrator",
+                            "ASR worker: flush queue closed and drained; exiting"
+                        );
+                        return;
+                    }
+                    // Deque drained; go back to waiting for the next notification.
+                    break;
+                }
+            };
+
+            // Guard that decrements `in_flight` when dropped (on any loop
+            // iteration exit path: return, continue, or falling through).
+            struct InFlightGuard<'a>(&'a Arc<AtomicUsize>);
+            impl Drop for InFlightGuard<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _in_flight_guard = InFlightGuard(&flush_queue.in_flight);
+
+            // Determine the backend to use.
+            let backend: &mut dyn AsrBackend = if let Some(ref mut pb) = prebuilt {
+                pb.as_mut()
+            } else {
+                // Lazy-initialise the ASR backend on the first flush (production
+                // path). The engine (Parakeet vs a Qwen tier) was resolved at start
+                // from the transcription-language setting.
+                if lazy_runtime.is_none() {
+                    // `init_asr_backend` runs at most once (lazy init), but the
+                    // borrow checker can't see that across the loop, so clone the
+                    // owned hint into the one-shot call.
+                    let result = rt.block_on(init_asr_backend(
+                        &model_registry,
+                        engine,
+                        n_gpu_layers,
+                        language.clone(),
+                    ));
+                    match result {
+                        Ok(Some(runtime)) => {
+                            lazy_runtime = Some(runtime);
+                        }
+                        Ok(None) => {
+                            // Model not available; skip this flush, keep draining.
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "orchestrator", "ASR backend init failed: {e}");
+                            let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
+                            continue;
+                        }
+                    }
+                }
+                lazy_runtime.as_mut().expect("just initialised").as_mut()
+            };
+
+            // Wrap the per-flush call in `catch_unwind` so a panic inside
+            // `transcribe_chunk` is caught, converted to `AppError::Internal`, and
+            // emitted as `AppEvent::ErrorOccurred`. The worker then continues to the
+            // next flush — one bad flush must not kill the worker or the recording.
+            //
+            // Per `architecture/cross-cutting.md`: "A panic inside a `spawn_blocking`
+            // task must abort the parent orchestrator task and surface as a
+            // recoverable `AppError`. The app does not exit on a single bad recording."
+            //
+            // `AssertUnwindSafe` is required because `&mut dyn AsrBackend`,
+            // `broadcast::Sender`, and `mpsc::Sender` are not `UnwindSafe` by default.
+            // We uphold the invariant: on unwind we do not use the backend again in
+            // the same call (the closure is consumed), and the senders are only used
+            // for a `send` before we return from the closure, so there is no risk of
+            // leaving them in a broken intermediate state after an unwind.
+            let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                process_flush_with_backend(
+                    payload,
+                    backend,
+                    &event_tx,
+                    &writer_cmd_tx,
+                    &flush_queue.incomplete,
+                )
+            }));
+
+            match call_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Backend returned an error; surface it and continue.
+                    tracing::warn!(target: "orchestrator", "ASR flush error: {e}");
+                    let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
+                }
+                Err(panic_payload) => {
+                    // Backend panicked; extract the message if possible.
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
+                    tracing::warn!(
                         target: "orchestrator",
-                        "ASR worker: flush queue closed and drained; exiting"
+                        "ASR worker caught panic in transcribe_chunk: {msg}; \
+                         continuing to next flush"
                     );
-                    return;
-                }
-                // Spurious wakeup; continue waiting.
-                continue;
-            }
-        };
-
-        // Guard that decrements `in_flight` when dropped (on any loop iteration
-        // exit path: return, continue, or falling through).
-        struct InFlightGuard<'a>(&'a Arc<AtomicUsize>);
-        impl Drop for InFlightGuard<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-        let _in_flight_guard = InFlightGuard(&flush_queue.in_flight);
-
-        // Determine the backend to use.
-        let backend: &mut dyn AsrBackend = if let Some(ref mut pb) = prebuilt {
-            pb.as_mut()
-        } else {
-            // Lazy-initialise the ASR backend on the first flush (production
-            // path). The engine (Parakeet vs a Qwen tier) was resolved at start
-            // from the transcription-language setting.
-            if lazy_runtime.is_none() {
-                // `init_asr_backend` runs at most once (lazy init), but the
-                // borrow checker can't see that across the loop, so clone the
-                // owned hint into the one-shot call.
-                let result = rt.block_on(init_asr_backend(
-                    &model_registry,
-                    engine,
-                    n_gpu_layers,
-                    language.clone(),
-                ));
-                match result {
-                    Ok(Some(runtime)) => {
-                        lazy_runtime = Some(runtime);
-                    }
-                    Ok(None) => {
-                        // Model not available; skip this flush.
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "orchestrator", "ASR backend init failed: {e}");
-                        let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
-                        continue;
-                    }
+                    let _ = event_tx.send(AppEvent::ErrorOccurred {
+                        error: AppError::Internal {
+                            context: format!("ASR worker panicked: {msg}"),
+                        },
+                    });
                 }
             }
-            lazy_runtime.as_mut().expect("just initialised").as_mut()
-        };
-
-        // Wrap the per-flush call in `catch_unwind` so a panic inside
-        // `transcribe_chunk` is caught, converted to `AppError::Internal`, and
-        // emitted as `AppEvent::ErrorOccurred`. The worker then continues to the
-        // next flush — one bad flush must not kill the worker or the recording.
-        //
-        // Per `architecture/cross-cutting.md`: "A panic inside a `spawn_blocking`
-        // task must abort the parent orchestrator task and surface as a
-        // recoverable `AppError`. The app does not exit on a single bad recording."
-        //
-        // `AssertUnwindSafe` is required because `&mut dyn AsrBackend`,
-        // `broadcast::Sender`, and `mpsc::Sender` are not `UnwindSafe` by default.
-        // We uphold the invariant: on unwind we do not use the backend again in
-        // the same call (the closure is consumed), and the senders are only used
-        // for a `send` before we return from the closure, so there is no risk of
-        // leaving them in a broken intermediate state after an unwind.
-        let call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_flush_with_backend(payload, backend, &event_tx, &writer_cmd_tx)
-        }));
-
-        match call_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                // Backend returned an error; surface it and continue.
-                tracing::warn!(target: "orchestrator", "ASR flush error: {e}");
-                let _ = event_tx.send(AppEvent::ErrorOccurred { error: e });
-            }
-            Err(panic_payload) => {
-                // Backend panicked; extract the message if possible.
-                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic payload".to_string()
-                };
-                tracing::warn!(
-                    target: "orchestrator",
-                    "ASR worker caught panic in transcribe_chunk: {msg}; \
-                     continuing to next flush"
-                );
-                let _ = event_tx.send(AppEvent::ErrorOccurred {
-                    error: AppError::Internal {
-                        context: format!("ASR worker panicked: {msg}"),
-                    },
-                });
-            }
+            // `_in_flight_guard` drops here, decrementing in_flight.
         }
-        // `_in_flight_guard` drops here, decrementing in_flight.
     }
 }
 
@@ -1352,6 +1366,7 @@ fn process_flush_with_backend(
     backend: &mut dyn AsrBackend,
     event_tx: &broadcast::Sender<AppEvent>,
     writer_cmd_tx: &mpsc::Sender<WriterCommand>,
+    incomplete: &AtomicBool,
 ) -> AppResult<()> {
     if payload.vad_segments.is_empty() {
         return Ok(());
@@ -1392,8 +1407,13 @@ fn process_flush_with_backend(
             meeting_id: payload.meeting_id,
             segment: seg.clone(),
         });
-        // Send to runner for persistence write.
+        // Send to runner for persistence write. This segment was already
+        // broadcast above (the live transcript view has it), so a dropped send
+        // here means it silently vanishes from `transcript.json` unless flagged:
+        // set `incomplete` so the post-stop re-transcribe restores it from
+        // `audio.opus` (the same repair the drop-oldest queue path drives).
         if let Err(e) = writer_cmd_tx.try_send(WriterCommand::WriteSegment(seg)) {
+            incomplete.store(true, Ordering::Release);
             tracing::warn!(
                 target: "orchestrator",
                 "writer command channel full or closed; transcript segment dropped from persistence: {e}"
@@ -1752,28 +1772,30 @@ pub(crate) fn pcm16_wav(samples: &[f32]) -> Vec<u8> {
 
 /// Inverse of [`pcm_window_for_excluding_range`]: map a pause-INCLUDING PCM
 /// sample index back to its position on the pause-EXCLUDING transcript clock,
-/// in milliseconds (#0015 phase 4).
+/// in milliseconds (#0015 phase 4), given an already-computed [`KeptRegion`]
+/// table (see [`pause_excluding_segments`]).
 ///
 /// [`pcm_window_for_excluding_range`] is forward-only (excluding-ms → PCM
 /// range), so the re-ASR split needs this inverse to stamp each single-speaker
 /// sub-clip's `start_ms` on the transcript clock. Without it a sub-clip cut at a
 /// pause-INCLUDING sample would inherit the cumulative pre-segment pause padding
-/// and drift forward by every pause before it.
+/// and drift forward by every pause before it. Takes `regions` rather than
+/// `pcm` directly because the re-ASR split calls this once per interior cut —
+/// the caller computes the O(samples) [`pause_excluding_segments`] scan ONCE
+/// per segment and shares the table across every cut (B2).
 ///
-/// Walks the SAME [`pause_excluding_segments`] kept regions the forward map uses
-/// and inverts the per-region accounting: for the kept region that contains
-/// `sample`, the excluding-clock position is the region's `excl_start_ms` plus
-/// the kept-audio duration from the region start up to `sample`. A `sample` that
-/// falls inside a skipped pause (between two kept regions) clamps to the END of
-/// the preceding kept region — the same instant the excluding clock froze when
-/// the pause began — so a cut energy-snapped a few ms into pause padding still
-/// lands coherently. A `sample` past the last kept region clamps to the total
-/// kept duration. Pure (no FFI/IO) so the inverse round-trips under unit test.
-pub(crate) fn excluding_ms_for_pcm_sample(pcm: &[f32], sample: usize) -> u64 {
-    let regions = pause_excluding_segments(pcm);
-
+/// Walks the kept regions and inverts the per-region accounting: for the
+/// region that contains `sample`, the excluding-clock position is the
+/// region's `excl_start_ms` plus the kept-audio duration from the region start
+/// up to `sample`. A `sample` that falls inside a skipped pause (between two
+/// kept regions) clamps to the END of the preceding kept region — the same
+/// instant the excluding clock froze when the pause began — so a cut
+/// energy-snapped a few ms into pause padding still lands coherently. A
+/// `sample` past the last kept region clamps to the total kept duration. Pure
+/// (no FFI/IO) so the inverse round-trips under unit test.
+pub(crate) fn excluding_ms_for_pcm_sample_in_regions(regions: &[KeptRegion], sample: usize) -> u64 {
     let mut last_region_excl_end_ms: u64 = 0;
-    for region in &regions {
+    for region in regions {
         let region_kept_samples = region.src_end - region.src_start;
         let region_excl_len_ms = (region_kept_samples as u64 * 1000) / SAMPLE_RATE_HZ;
         let region_excl_end_ms = region.excl_start_ms + region_excl_len_ms;
@@ -2934,6 +2956,116 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // B3a: a dropped writer-channel send must flag `incomplete`
+    // -----------------------------------------------------------------------
+
+    /// A segment that fails to reach the writer (the `try_send` in
+    /// `process_flush_with_backend` returning `Err`, e.g. because the writer
+    /// task has already exited) was already broadcast to the live transcript,
+    /// so silently dropping it would let it vanish from `transcript.json`
+    /// forever. `incomplete` must be set so the post-stop re-transcribe
+    /// restores it from `audio.opus`.
+    #[test]
+    fn writer_send_failure_sets_incomplete() {
+        let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(16);
+        // Capacity 1, and the receiver is dropped immediately, so `try_send`
+        // fails with `Closed` regardless of capacity.
+        let (writer_cmd_tx, writer_cmd_rx) = mpsc::channel::<WriterCommand>(1);
+        drop(writer_cmd_rx);
+
+        let incomplete = AtomicBool::new(false);
+        let payload = FlushPayload {
+            samples: vec![0.0f32; ms_to_samples(100)],
+            vad_segments: vec![(0, 100)],
+            speaker_ids: vec![None],
+            meeting_id: MeetingId::new(),
+        };
+        let mut backend = crate::test_support::StubAsrBackend::new("hello");
+
+        process_flush_with_backend(payload, &mut backend, &event_tx, &writer_cmd_tx, &incomplete)
+            .expect("a dropped writer send must not fail the flush itself");
+
+        assert!(
+            incomplete.load(Ordering::Acquire),
+            "a dropped writer-channel send must flag the transcript incomplete"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B3b: the ASR worker must drain a Notify-coalesced burst in one wakeup
+    // -----------------------------------------------------------------------
+
+    /// `tokio::sync::Notify` stores at most one permit: several `notify_one()`
+    /// calls issued before the worker is waiting collapse into a SINGLE
+    /// `notified().await` wakeup. A worker that pops only one queue item per
+    /// wakeup (the pre-fix shape) therefore leaves the rest of a burst parked
+    /// until some unrelated later push notifies again. This test enqueues five
+    /// payloads directly (bypassing `dispatch_flush`, which would call
+    /// `notify_one()` once per push — already coalesced to one permit by the
+    /// time the worker thread starts) and asserts the worker drains ALL of them
+    /// from that one wakeup, with no further push or notify.
+    #[test]
+    fn asr_worker_drains_full_burst_from_a_single_notify_wakeup() {
+        const N: usize = 5;
+
+        let flush_queue = FlushQueue::new();
+        let meeting_id = MeetingId::new();
+
+        // Enqueue the whole burst BEFORE the worker thread exists, so there is
+        // no waiter yet: every `notify_one()` below coalesces into one stored
+        // permit, reproducing the real runner's rapid-push burst pattern.
+        for i in 0..N {
+            let payload = FlushPayload {
+                samples: vec![0.0f32; ms_to_samples(20)],
+                vad_segments: vec![(i as u64 * 100, i as u64 * 100 + 20)],
+                speaker_ids: vec![None],
+                meeting_id,
+            };
+            flush_queue.deque.lock().unwrap().push_back(payload);
+            flush_queue.notify.notify_one();
+        }
+
+        let (event_tx, _event_rx) = broadcast::channel::<AppEvent>(64);
+        let (writer_cmd_tx, _writer_cmd_rx) = mpsc::channel::<WriterCommand>(64);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (registry_event_tx, _) = broadcast::channel::<AppEvent>(16);
+        let model_registry = Arc::new(
+            ModelRegistry::new(tmp.path().to_path_buf(), Vec::new(), registry_event_tx)
+                .expect("test ModelRegistry construction should not fail"),
+        );
+
+        let worker_queue = flush_queue.consumer_clone();
+        let worker = std::thread::spawn(move || {
+            run_asr_worker(
+                worker_queue,
+                Some(Box::new(crate::test_support::StubAsrBackend::new("hi"))),
+                model_registry,
+                0,
+                None,
+                AsrEngine::ParakeetEuV3,
+                event_tx,
+                writer_cmd_tx,
+            );
+        });
+
+        // The fixed worker drains the whole burst from the ONE coalesced
+        // notification without any further push/notify; `wait_all_processed`
+        // (queue empty AND nothing in-flight) must go true well inside this
+        // bound. Before the fix this timed out with 4 of 5 payloads still
+        // queued, parked behind a `notified()` nobody was ever going to call
+        // again.
+        assert!(
+            flush_queue.wait_all_processed(Duration::from_secs(2), Duration::from_millis(5)),
+            "the worker must drain the full burst from a single notify wakeup"
+        );
+
+        // Let the worker exit cleanly and reclaim the thread.
+        flush_queue.close();
+        worker.join().expect("ASR worker thread must not panic");
+    }
+
+    // -----------------------------------------------------------------------
     // pause_excluding_segments (TIMELINE-DRIFT #4)
     // -----------------------------------------------------------------------
 
@@ -3097,6 +3229,44 @@ mod tests {
         assert!(pcm_window_for_excluding_range(&pcm, 5000, 6000).is_none());
     }
 
+    /// B2: the cached-region path ([`excluding_range_to_pcm_slice`] against a
+    /// [`pause_excluding_segments`] table computed ONCE) must yield exactly the
+    /// same window as the per-call path ([`pcm_window_for_excluding_range`],
+    /// which recomputes the region scan every call) for every one of several
+    /// requests over the SAME meeting — including a request that straddles a
+    /// pause and one that is out of range. Guards the B2 refactor: callers that
+    /// switched from the recomputing form to the cached form (the per-segment /
+    /// per-cut loops in `lib.rs`) must observe bit-identical windows.
+    #[test]
+    fn cached_region_path_matches_per_call_path_across_many_requests() {
+        // 2 s speech, 6 s pause (> PAUSE_MIN_MS), 3 s speech, 5 s pause, 1 s speech.
+        let mut pcm = vec![0.5f32; ms_to_samples(2000)];
+        pcm.extend(std::iter::repeat_n(0.0f32, ms_to_samples(6000)));
+        pcm.extend(std::iter::repeat_n(0.5f32, ms_to_samples(3000)));
+        pcm.extend(std::iter::repeat_n(0.0f32, ms_to_samples(5000)));
+        pcm.extend(std::iter::repeat_n(0.5f32, ms_to_samples(1000)));
+
+        let regions = pause_excluding_segments(&pcm);
+
+        let requests: &[(u64, u64)] = &[
+            (0, 1000),        // wholly inside region 0
+            (1500, 2500),     // straddles the region 0 → region 1 pause
+            (2000, 4000),     // wholly inside region 1 (post first pause)
+            (2000, 10_000),   // straddles the region 1 → region 2 pause
+            (3000, 3100),     // inside region 2 (post second pause)
+            (100_000, 101_000), // out of range
+        ];
+
+        for &(start_ms, end_ms) in requests {
+            let cached = excluding_range_to_pcm_slice(&regions, start_ms, end_ms);
+            let per_call = pcm_window_for_excluding_range(&pcm, start_ms, end_ms);
+            assert_eq!(
+                cached, per_call,
+                "cached vs per-call mismatch for window [{start_ms}, {end_ms})"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // pcm16_wav (the transcript "play segment" clip encoder)
     // -----------------------------------------------------------------------
@@ -3205,7 +3375,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // excluding_ms_for_pcm_sample — the PCM→excluding-ms inverse (#0015 phase 4)
+    // excluding_ms_for_pcm_sample_in_regions — the PCM→excluding-ms inverse
+    // (#0015 phase 4)
     // -----------------------------------------------------------------------
 
     /// Inside a single kept region (no pause) the inverse is the straight
@@ -3213,8 +3384,12 @@ mod tests {
     #[test]
     fn inverse_maps_within_single_region() {
         let pcm = vec![0.5f32; ms_to_samples(5000)];
-        assert_eq!(excluding_ms_for_pcm_sample(&pcm, ms_to_samples(1500)), 1500);
-        assert_eq!(excluding_ms_for_pcm_sample(&pcm, 0), 0);
+        let regions = pause_excluding_segments(&pcm);
+        assert_eq!(
+            excluding_ms_for_pcm_sample_in_regions(&regions, ms_to_samples(1500)),
+            1500
+        );
+        assert_eq!(excluding_ms_for_pcm_sample_in_regions(&regions, 0), 0);
     }
 
     /// CLOCK REGRESSION GUARD: with a ≥4 s pause, the forward map and the inverse
@@ -3231,6 +3406,7 @@ mod tests {
         let mut pcm = vec![0.5f32; speech_a];
         pcm.extend(std::iter::repeat_n(0.0f32, pause));
         pcm.extend(std::iter::repeat_n(0.5f32, speech_b));
+        let regions = pause_excluding_segments(&pcm);
 
         // Post-pause excluding clock: region 2 starts at excluding 2000 ms. Pick a
         // point 1000 ms into it → excluding 3000 ms.
@@ -3240,12 +3416,18 @@ mod tests {
         // The forward map lands on pause-INCLUDING samples AFTER the pause.
         assert_eq!(range.start, speech_a + pause + ms_to_samples(1000));
         // The inverse takes that PCM sample back to the SAME excluding ms.
-        assert_eq!(excluding_ms_for_pcm_sample(&pcm, range.start), excl_ms);
+        assert_eq!(
+            excluding_ms_for_pcm_sample_in_regions(&regions, range.start),
+            excl_ms
+        );
 
         // A sample INSIDE the skipped pause clamps to the pre-pause region end
         // (excluding 2000 ms — the instant the clock froze).
         let mid_pause = speech_a + ms_to_samples(3000);
-        assert_eq!(excluding_ms_for_pcm_sample(&pcm, mid_pause), 2000);
+        assert_eq!(
+            excluding_ms_for_pcm_sample_in_regions(&regions, mid_pause),
+            2000
+        );
     }
 
     // -----------------------------------------------------------------------

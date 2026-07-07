@@ -693,62 +693,74 @@ impl Orchestrator {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 
-        // Send stop command to runner and await the finalised metadata.
+        // Send stop command to runner and await the finalised metadata. The whole
+        // handshake below is one fallible unit: a channel-send failure, a dropped
+        // reply, or `MeetingWriter::finalise` returning an I/O error must all
+        // release the recorder back to `Idle` rather than leaving it wedged in
+        // `Stopping`/`Finalising` — see `Self::abort_finalise`.
         let finalised_meta = if let Some(handle) = runner_handle {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            handle
-                .cmd_tx
-                .send(runner::RunnerCommand::Stop {
-                    meta: Box::new(meta.clone()),
-                    reply: reply_tx,
-                })
-                .await
-                .map_err(|_| AppError::Internal {
-                    context: "runner command channel closed before stop could be sent".into(),
-                })?;
+            let handshake: AppResult<MeetingMeta> = async {
+                handle
+                    .cmd_tx
+                    .send(runner::RunnerCommand::Stop {
+                        meta: Box::new(meta.clone()),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .map_err(|_| AppError::Internal {
+                        context: "runner command channel closed before stop could be sent".into(),
+                    })?;
 
-            // Capture has stopped and the Stop command is dispatched; the runner
-            // now finalises (drain + writes) on its own thread. Mark the recorder
-            // Finalising and broadcast it so the UI stays responsive while the
-            // (possibly slow) drain runs — `Stopping` was momentary; only a NEW
-            // recording is gated until finalise completes.
-            {
-                let mut guard = self.inner.lock().await;
-                if let Err(e) = transition_finalising(&mut guard.state) {
-                    tracing::warn!(
-                        target: "orchestrator",
-                        "unexpected state entering finalise: {e:?}"
-                    );
+                // Capture has stopped and the Stop command is dispatched; the runner
+                // now finalises (drain + writes) on its own thread. Mark the recorder
+                // Finalising and broadcast it so the UI stays responsive while the
+                // (possibly slow) drain runs — `Stopping` was momentary; only a NEW
+                // recording is gated until finalise completes.
+                {
+                    let mut guard = self.inner.lock().await;
+                    if let Err(e) = transition_finalising(&mut guard.state) {
+                        tracing::warn!(
+                            target: "orchestrator",
+                            "unexpected state entering finalise: {e:?}"
+                        );
+                    }
                 }
+                self.emit(AppEvent::StateChanged {
+                    state: RecordingState::Finalising { meeting_id },
+                });
+                // Live-test UX T4(c): the finalise drain (ASR-backlog drain + the
+                // transcript/metadata/audio writes) is opaque, so emit an
+                // INDETERMINATE progress event for it. The terminal
+                // `AppEvent::MeetingFinalised` below clears the per-row indicator.
+                self.emit(AppEvent::OperationProgress {
+                    meeting_id,
+                    op: minutist_common::OperationKind::Finalise,
+                    fraction: None,
+                    label: "Finalising…".to_string(),
+                });
+
+                let finalised = reply_rx.await.map_err(|_| AppError::Internal {
+                    context: "runner reply channel closed before finalise completed".into(),
+                })??;
+
+                // Record whether the live transcript fell behind (drop-oldest loss
+                // or a stop-drain timeout). The runner sets this before sending the
+                // reply, so it is visible now. `ipc-bridge` reads it via
+                // `take_transcript_incomplete()` to trigger a background re-transcribe.
+                self.last_transcript_incomplete.store(
+                    handle.transcript_incomplete.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+
+                Ok(finalised)
             }
-            self.emit(AppEvent::StateChanged {
-                state: RecordingState::Finalising { meeting_id },
-            });
-            // Live-test UX T4(c): the finalise drain (ASR-backlog drain + the
-            // transcript/metadata/audio writes) is opaque, so emit an
-            // INDETERMINATE progress event for it. The terminal
-            // `AppEvent::MeetingFinalised` below clears the per-row indicator.
-            self.emit(AppEvent::OperationProgress {
-                meeting_id,
-                op: minutist_common::OperationKind::Finalise,
-                fraction: None,
-                label: "Finalising…".to_string(),
-            });
+            .await;
 
-            let finalised = reply_rx.await.map_err(|_| AppError::Internal {
-                context: "runner reply channel closed before finalise completed".into(),
-            })??;
-
-            // Record whether the live transcript fell behind (drop-oldest loss
-            // or a stop-drain timeout). The runner sets this before sending the
-            // reply, so it is visible now. `ipc-bridge` reads it via
-            // `take_transcript_incomplete()` to trigger a background re-transcribe.
-            self.last_transcript_incomplete.store(
-                handle.transcript_incomplete.load(Ordering::Acquire),
-                Ordering::Release,
-            );
-
-            finalised
+            match handshake {
+                Ok(finalised) => finalised,
+                Err(err) => return self.abort_finalise(meeting_id, err).await,
+            }
         } else {
             // No runner (e.g. test path with no real audio device).
             self.last_transcript_incomplete
@@ -796,6 +808,53 @@ impl Orchestrator {
         // the meeting (the original failure mode). See
         // `architecture/components.md`, orchestrator "on-stop diarization".
         Ok(finalised_meta)
+    }
+
+    /// Recover from a failure in the [`Self::stop`] finalise handshake (the
+    /// runner-command channel closing before `Stop` could be sent, the finalise
+    /// reply channel dropping, or `MeetingWriter::finalise` itself returning an
+    /// I/O error): release the recorder back to `Idle` and surface the failure,
+    /// then return it as `Err` so the caller can `return
+    /// self.abort_finalise(...).await;` directly from the handshake's error arm.
+    ///
+    /// Every exit path out of the handshake MUST go through here rather than
+    /// propagating with a bare `?` — without it the state machine stays in
+    /// `Stopping`/`Finalising` forever (no further recording is possible until
+    /// the process restarts), because only the happy path drove the
+    /// `Stopping`/`Finalising` → `Idle` transition.
+    async fn abort_finalise(&self, meeting_id: MeetingId, err: AppError) -> AppResult<MeetingMeta> {
+        {
+            let mut guard = self.inner.lock().await;
+            if let Err(e) = transition_idle(&mut guard.state) {
+                tracing::warn!(
+                    target: "orchestrator",
+                    "unexpected state aborting finalise: {e:?}"
+                );
+            }
+        }
+        self.emit(AppEvent::StateChanged {
+            state: RecordingState::Idle,
+        });
+        // Surfaces the failure as a global notification. This does NOT clear the
+        // per-row `Finalise` `OperationProgress` indicator started above:
+        // `ErrorOccurred` carries no `meeting_id`, and the webview's
+        // per-meeting progress store (`ui/src/state/operation-progress.ts`)
+        // only clears on `transcript_ready` / `diarization_complete` /
+        // `summary_ready` / `summary_unavailable` / `meeting_finalised` /
+        // `translation_ready` — `error_occurred` is not among them, so the
+        // "Finalising…" spinner is left showing on this meeting's row.
+        // Clearing it requires a UI-side change (treating `error_occurred` as
+        // terminal, or a new meeting-scoped failure event); tracked as a
+        // follow-up outside this crate.
+        self.emit(AppEvent::ErrorOccurred { error: err.clone() });
+
+        tracing::warn!(
+            target: "orchestrator",
+            meeting_id = %meeting_id.0,
+            "finalise handshake failed, recorder released to Idle: {err:?}"
+        );
+
+        Err(err)
     }
 
     /// Whether the on-stop diarization pass should run (the user's
@@ -1163,15 +1222,7 @@ impl Orchestrator {
 
             // §2.3.1 cleanliness filter: speaker_id == label, shared_speakers empty,
             // duration >= 1.0 s (1000 ms).
-            const MIN_CLEAN_DURATION_MS: u64 = 1000;
-            let clean_segs: Vec<&Segment> = segments
-                .iter()
-                .filter(|seg| {
-                    seg.speaker_id.as_deref() == Some(&label_clone)
-                        && seg.shared_speakers.is_empty()
-                        && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
-                })
-                .collect();
+            let clean_segs = clean_segments_for_label(&segments, &label_clone);
 
             if clean_segs.is_empty() {
                 tracing::debug!(
@@ -1183,19 +1234,11 @@ impl Orchestrator {
             }
 
             // Map each clean segment through the pause-excl → incl clock mapper
-            // (§2.3 clock-mismatch hazard). Collect only those windows that the
-            // mapper resolves to a non-empty PCM slice.
-            let mut windows: Vec<Vec<f32>> = Vec::with_capacity(clean_segs.len());
-            for seg in &clean_segs {
-                if let Some(range) =
-                    runner::pcm_window_for_excluding_range(&pcm, seg.start_ms, seg.end_ms)
-                {
-                    let window = pcm[range].to_vec();
-                    if !window.is_empty() {
-                        windows.push(window);
-                    }
-                }
-            }
+            // (§2.3 clock-mismatch hazard), against ONE pause scan for this meeting
+            // (B2). Collect only those windows that the mapper resolves to a
+            // non-empty PCM slice.
+            let regions = runner::pause_excluding_segments(&pcm);
+            let windows = segment_windows(&pcm, &regions, &clean_segs);
 
             if windows.is_empty() {
                 tracing::debug!(
@@ -1206,9 +1249,7 @@ impl Orchestrator {
                 return Ok(None);
             }
 
-            let window_count = windows.len() as u64;
-            let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
-            let centroid = extractor.centroid(&window_refs, 16_000)?;
+            let (centroid, window_count) = centroid_from_windows(&extractor, &windows, 16_000)?;
 
             tracing::debug!(
                 target: "orchestrator",
@@ -2642,19 +2683,13 @@ impl Orchestrator {
             )?;
             let extractor = diarizer::VoiceprintExtractor::open(&emb_onnx)?;
             let pcm = persistence::read_audio_pcm(&meeting_dir_owned)?;
+            // ONE pause scan for the whole meeting (B2), shared across every label.
+            let regions = runner::pause_excluding_segments(&pcm);
 
-            const MIN_CLEAN_DURATION_MS: u64 = 1000;
             let mut clusters = Vec::new();
 
             for label in &labels {
-                let clean_segs: Vec<&Segment> = segments_owned
-                    .iter()
-                    .filter(|seg| {
-                        seg.speaker_id.as_deref() == Some(label.as_str())
-                            && seg.shared_speakers.is_empty()
-                            && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
-                    })
-                    .collect();
+                let clean_segs = clean_segments_for_label(&segments_owned, label);
 
                 if clean_segs.is_empty() {
                     tracing::debug!(
@@ -2665,28 +2700,14 @@ impl Orchestrator {
                     continue;
                 }
 
-                let mut windows: Vec<Vec<f32>> = Vec::with_capacity(clean_segs.len());
-                for seg in &clean_segs {
-                    if let Some(range) = runner::pcm_window_for_excluding_range(
-                        &pcm,
-                        seg.start_ms,
-                        seg.end_ms,
-                    ) {
-                        let window = pcm[range].to_vec();
-                        if !window.is_empty() {
-                            windows.push(window);
-                        }
-                    }
-                }
+                let windows = segment_windows(&pcm, &regions, &clean_segs);
 
                 if windows.is_empty() {
                     continue;
                 }
 
-                let window_count = windows.len() as u64;
-                let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
-                match extractor.centroid(&window_refs, 16_000) {
-                    Ok(centroid) => clusters.push(QueryCluster {
+                match centroid_from_windows(&extractor, &windows, 16_000) {
+                    Ok((centroid, window_count)) => clusters.push(QueryCluster {
                         label: label.clone(),
                         centroid: centroid.vector,
                         window_count,
@@ -2993,8 +3014,9 @@ impl Orchestrator {
             )?;
             let extractor = diarizer::VoiceprintExtractor::open(&emb_onnx)?;
             let pcm = persistence::read_audio_pcm(&meeting_dir_owned)?;
-
-            const MIN_CLEAN_DURATION_MS: u64 = 1000;
+            // ONE pause scan for the whole meeting (B2), shared across both loops
+            // below (old labels, then fresh labels).
+            let regions = runner::pause_excluding_segments(&pcm);
 
             // Build an ephemeral gallery from the old named labels.
             // Each old label becomes a `StoredVoiceprint` (with a placeholder
@@ -3004,34 +3026,16 @@ impl Orchestrator {
             let mut id_to_name: std::collections::HashMap<VoiceprintIdentityId, String> = Default::default();
 
             for (old_label, name) in &old_names_owned {
-                let clean_segs: Vec<&Segment> = old_segments_owned
-                    .iter()
-                    .filter(|seg| {
-                        seg.speaker_id.as_deref() == Some(old_label.as_str())
-                            && seg.shared_speakers.is_empty()
-                            && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
-                    })
-                    .collect();
+                let clean_segs = clean_segments_for_label(&old_segments_owned, old_label);
                 if clean_segs.is_empty() {
                     continue;
                 }
-                let mut windows: Vec<Vec<f32>> = Vec::new();
-                for seg in &clean_segs {
-                    if let Some(range) =
-                        runner::pcm_window_for_excluding_range(&pcm, seg.start_ms, seg.end_ms)
-                    {
-                        let w = pcm[range].to_vec();
-                        if !w.is_empty() {
-                            windows.push(w);
-                        }
-                    }
-                }
+                let windows = segment_windows(&pcm, &regions, &clean_segs);
                 if windows.is_empty() {
                     continue;
                 }
-                let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
-                match extractor.centroid(&window_refs, 16_000) {
-                    Ok(vp) => {
+                match centroid_from_windows(&extractor, &windows, 16_000) {
+                    Ok((vp, window_count)) => {
                         let eph_id = VoiceprintIdentityId::new();
                         let dim = vp.vector.len();
                         id_to_name.insert(eph_id, name.clone());
@@ -3041,7 +3045,7 @@ impl Orchestrator {
                             display_name: name.clone(),
                             embedding: vp.vector,
                             dim,
-                            sample_count: windows.len() as u64,
+                            sample_count: window_count,
                             model_id: runner::DIARIZE_EMB_MODEL_ID.to_string(),
                             condition_label: None,
                         });
@@ -3064,35 +3068,16 @@ impl Orchestrator {
             // Extract centroids for fresh labels.
             let mut queries: Vec<QueryCluster> = Vec::new();
             for label in new_segments_owned.iter().filter_map(|s| s.speaker_id.as_ref()).collect::<std::collections::HashSet<_>>() {
-                let clean_segs: Vec<&Segment> = new_segments_owned
-                    .iter()
-                    .filter(|seg| {
-                        seg.speaker_id.as_deref() == Some(label.as_str())
-                            && seg.shared_speakers.is_empty()
-                            && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_DURATION_MS
-                    })
-                    .collect();
+                let clean_segs = clean_segments_for_label(&new_segments_owned, label);
                 if clean_segs.is_empty() {
                     continue;
                 }
-                let mut windows: Vec<Vec<f32>> = Vec::new();
-                for seg in &clean_segs {
-                    if let Some(range) =
-                        runner::pcm_window_for_excluding_range(&pcm, seg.start_ms, seg.end_ms)
-                    {
-                        let w = pcm[range].to_vec();
-                        if !w.is_empty() {
-                            windows.push(w);
-                        }
-                    }
-                }
+                let windows = segment_windows(&pcm, &regions, &clean_segs);
                 if windows.is_empty() {
                     continue;
                 }
-                let window_count = windows.len() as u64;
-                let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
-                match extractor.centroid(&window_refs, 16_000) {
-                    Ok(vp) => queries.push(QueryCluster {
+                match centroid_from_windows(&extractor, &windows, 16_000) {
+                    Ok((vp, window_count)) => queries.push(QueryCluster {
                         label: label.clone(),
                         centroid: vp.vector,
                         window_count,
@@ -3422,17 +3407,13 @@ async fn run_diarization_blocking(
         // split runs on this one thread; the `Send` bound is only needed to move
         // the backend into the closure).
         let backend = backend.map(|b| b as Box<dyn minutist_common::AsrBackend>);
-        diarize_split_merge(
-            &turns,
-            segments,
-            &pcm,
-            backend,
-            &config,
-            &veto_verdicts,
-            &merge_map,
-            &event_tx,
+        let ctx = SplitMergeContext {
+            turns: &turns,
+            pcm: &pcm,
+            event_tx: &event_tx,
             meeting_id,
-        )
+        };
+        diarize_split_merge(&ctx, segments, backend, &config, &veto_verdicts, &merge_map)
     })
     .await
     .map_err(|e| AppError::Internal {
@@ -3488,16 +3469,32 @@ fn dominant_cluster(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> Option
         .map(|(id, _)| id)
 }
 
+/// Read-only per-meeting context shared by [`diarize_split_merge`] and
+/// [`split_mixed_qwen_segment`]: the pause-INCLUDING [`SpeakerTurn`]s + decoded
+/// PCM, the event bus, and the meeting id. Bundled into one struct rather than
+/// four parallel parameters so a future meeting-wide input (like the
+/// per-segment cache work in B2) does not grow either function's argument
+/// list further.
+struct SplitMergeContext<'a> {
+    /// Raw [`SpeakerTurn`]s from `compute_turns`, on the pause-INCLUDING clock
+    /// `pcm` shares.
+    turns: &'a [SpeakerTurn],
+    /// The pause-INCLUDING decoded audio.
+    pcm: &'a [f32],
+    event_tx: &'a broadcast::Sender<AppEvent>,
+    meeting_id: MeetingId,
+}
+
 /// Re-ASR split core (#0015 phase 4) — the BLOCKING, model-free-testable funnel.
 ///
 /// A free fn taking EXPLICIT params (mirroring [`transcribe_pcm_window_blocking`]
 /// rather than dispatching through the `common::Diarizer` trait) so the default
 /// suite can drive the whole split with a stub-supplied `turns` + stub `AsrBackend` —
 /// no `SherpaDiarizer`, no Qwen GGUF:
-/// - `turns` are the raw [`SpeakerTurn`]s from `compute_turns`, on the
-///   pause-INCLUDING clock the `pcm` shares.
+/// - `ctx.turns` are the raw [`SpeakerTurn`]s from `compute_turns`, on the
+///   pause-INCLUDING clock `ctx.pcm` shares.
 /// - `segments` is the ASR transcript (pause-EXCLUDING `start_ms`).
-/// - `pcm` is the pause-INCLUDING decoded audio.
+/// - `ctx.pcm` is the pause-INCLUDING decoded audio.
 /// - `backend` is the routed Qwen re-ASR backend, or `None` (model absent /
 ///   degrade to keep-whole — no regression vs. the pre-split behaviour).
 /// - `config` is the `DiarizerConfig` the overlay + flag use.
@@ -3510,10 +3507,11 @@ fn dominant_cluster(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> Option
 /// 3. For each KEPT mixed Qwen segment (non-empty `shared_speakers` AND empty
 ///    `words`) with a `backend`: take [`diarizer::turn_boundaries_within`] cuts
 ///    on the SAME pause-INCLUDING clock (mapped via
-///    [`runner::pcm_window_for_excluding_range`]), energy-snap each cut, slice the
+///    [`runner::excluding_range_to_pcm_slice`] against one meeting-wide
+///    [`runner::pause_excluding_segments`] scan), energy-snap each cut, slice the
 ///    PCM, re-ASR each single-speaker sub-clip, letter it from the map by its
 ///    dominant [`SpeakerTurn`] cluster, and stamp its `start_ms` on the EXCLUDING
-///    clock via [`runner::excluding_ms_for_pcm_sample`]. Keep-whole if the cuts
+///    clock via [`runner::excluding_ms_for_pcm_sample_in_regions`]. Keep-whole if the cuts
 ///    are empty, any snap returns `None`, or `backend` is `None`.
 /// 4. Re-run [`diarizer::merge_adjacent_speakers`] (the split may have produced
 ///    adjacent same-letter sub-clips across segments) and recompute the count.
@@ -3537,15 +3535,12 @@ fn dominant_cluster(turns: &[SpeakerTurn], start_ms: u64, end_ms: u64) -> Option
 /// merge pass (#0023). An empty slice is the no-merge baseline (bit-identical to
 /// the pre-merge behaviour).
 fn diarize_split_merge(
-    turns: &[SpeakerTurn],
+    ctx: &SplitMergeContext<'_>,
     segments: Vec<Segment>,
-    pcm: &[f32],
     mut backend: Option<Box<dyn minutist_common::AsrBackend>>,
     config: &diarizer::DiarizerConfig,
     veto_verdicts: &[(i32, String)],
     merge_map: &[(i32, i32)],
-    event_tx: &broadcast::Sender<AppEvent>,
-    meeting_id: MeetingId,
 ) -> AppResult<(Vec<Segment>, u32, Vec<(String, String)>)> {
     // Extract cluster ids for the veto; names are resolved below once the
     // cluster→letter map is available.
@@ -3555,13 +3550,18 @@ fn diarize_split_merge(
     // Pass veto_ids (enrolled cluster rescue) and merge_map (same-identity cluster
     // unification, #0023) — applied together in a single overlay pass.
     let (mut segments, _count, cluster_letters) =
-        diarizer::overlay_speakers(turns, segments, config, &veto_ids, merge_map);
+        diarizer::overlay_speakers(ctx.turns, segments, config, &veto_ids, merge_map);
 
     // 2. Collapse fragments so a turn reads as one row (#0015 phase 1).
     diarizer::merge_adjacent_speakers(&mut segments, MERGE_GAP_MS);
 
-    // 3. Re-ASR split, only when a backend is present.
+    // 3. Re-ASR split, only when a backend is present. The pause-excluding kept
+    // regions are computed ONCE for the whole meeting here — `pause_excluding_segments`
+    // is an O(samples) scan — rather than once per segment (or per interior cut)
+    // inside `split_mixed_qwen_segment`, which is what made this pass
+    // O(segments × cuts × samples) for a long recording (B2).
     if backend.is_some() {
+        let regions = runner::pause_excluding_segments(ctx.pcm);
         let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
         for seg in segments.into_iter() {
             // A kept mixed Qwen segment: flagged by `overlay_speakers` with
@@ -3574,13 +3574,11 @@ fn diarize_split_merge(
             }
 
             match split_mixed_qwen_segment(
+                ctx,
                 &seg,
-                turns,
-                pcm,
+                &regions,
                 backend.as_deref_mut().expect("backend present in this branch"),
                 &cluster_letters,
-                event_tx,
-                meeting_id,
             )? {
                 Some(sub_segments) => out.extend(sub_segments),
                 // Keep-whole: empty cuts, a snap with no clear minimum, or a
@@ -3617,6 +3615,69 @@ fn diarize_split_merge(
         .collect();
 
     Ok((segments, count, veto_names))
+}
+
+/// Minimum "clean" segment duration for voiceprint extraction (§2.3.1): long
+/// enough that a single short interjection does not distort a speaker's
+/// average embedding. Shared by every "segments → PCM windows → centroid"
+/// extraction site: enrolment, cross-meeting matching, and ephemeral
+/// name-carry matching.
+const MIN_CLEAN_VOICEPRINT_DURATION_MS: u64 = 1000;
+
+/// Segments belonging to `label`: excludes mixed (non-empty `shared_speakers`)
+/// segments and any shorter than [`MIN_CLEAN_VOICEPRINT_DURATION_MS`] (the
+/// §2.3.1 cleanliness filter every voiceprint-extraction call site applies
+/// before mapping segments to PCM windows).
+fn clean_segments_for_label<'a>(segments: &'a [Segment], label: &str) -> Vec<&'a Segment> {
+    segments
+        .iter()
+        .filter(|seg| {
+            seg.speaker_id.as_deref() == Some(label)
+                && seg.shared_speakers.is_empty()
+                && seg.end_ms.saturating_sub(seg.start_ms) >= MIN_CLEAN_VOICEPRINT_DURATION_MS
+        })
+        .collect()
+}
+
+/// Map `segs` through the pause-excl → incl clock mapper against the caller's
+/// precomputed `regions`, collecting the non-empty PCM windows.
+///
+/// `regions` is one [`runner::pause_excluding_segments`] scan for the whole
+/// meeting, computed ONCE by the caller and shared across every label's
+/// mapping — the O(samples) scan must not re-run per segment (B2). `segs`
+/// should already be filtered to one label/cleanliness criterion (see
+/// [`clean_segments_for_label`]); a segment the mapper cannot resolve (out of
+/// range) is silently skipped, matching
+/// [`runner::excluding_range_to_pcm_slice`]'s documented behaviour.
+fn segment_windows(pcm: &[f32], regions: &[runner::KeptRegion], segs: &[&Segment]) -> Vec<Vec<f32>> {
+    segs.iter()
+        .filter_map(|seg| {
+            let range = runner::excluding_range_to_pcm_slice(regions, seg.start_ms, seg.end_ms)?;
+            let window = pcm[range].to_vec();
+            (!window.is_empty()).then_some(window)
+        })
+        .collect()
+}
+
+/// Build a speaker centroid from non-empty PCM `windows`.
+///
+/// The common tail of every "segments/turns → PCM windows → centroid"
+/// extraction site (voiceprint enrolment, cross-meeting matching, ephemeral
+/// name-carry matching, and the library-merge prune-veto pass) — those sites
+/// differ only in how `windows` is gathered and in what they do with an
+/// extraction `Err` (propagate vs. log-and-skip), both left to the caller.
+/// The caller checks `windows.is_empty()` itself: the two possible "no usable
+/// audio" cases (no clean segments vs. every clean segment mapping to nothing)
+/// log distinct messages at several call sites.
+fn centroid_from_windows(
+    extractor: &diarizer::VoiceprintExtractor,
+    windows: &[Vec<f32>],
+    sample_rate: u32,
+) -> AppResult<(diarizer::Voiceprint, u64)> {
+    let window_count = windows.len() as u64;
+    let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
+    let centroid = extractor.centroid(&window_refs, sample_rate)?;
+    Ok((centroid, window_count))
 }
 
 /// Second embedding pass: compute prune-veto verdicts AND the library-informed
@@ -3752,13 +3813,11 @@ fn compute_prune_veto_verdicts(
             continue;
         }
 
-        let window_count = windows.len() as u64;
         // The noise guard threshold (T_ACCEPT_NOISY vs T_ACCEPT) depends on
         // window_count; it is applied inside match_each_cluster via the
-        let window_refs: Vec<&[f32]> = windows.iter().map(|w| w.as_slice()).collect();
-
-        let centroid = match extractor.centroid(&window_refs, SR) {
-            Ok(vp) => vp,
+        // per-cluster QueryCluster below.
+        let (centroid, window_count) = match centroid_from_windows(extractor, &windows, SR) {
+            Ok(pair) => pair,
             Err(e) => {
                 tracing::debug!(
                     target: "orchestrator",
@@ -3897,18 +3956,20 @@ fn compute_prune_veto_verdicts(
 /// `cluster_letters` by its dominant [`SpeakerTurn`] cluster, with empty
 /// `shared_speakers` (no longer mixed) and `start_ms` on the EXCLUDING clock.
 fn split_mixed_qwen_segment(
+    ctx: &SplitMergeContext<'_>,
     seg: &Segment,
-    turns: &[SpeakerTurn],
-    pcm: &[f32],
+    regions: &[runner::KeptRegion],
     backend: &mut dyn minutist_common::AsrBackend,
     cluster_letters: &[(i32, String)],
-    event_tx: &broadcast::Sender<AppEvent>,
-    meeting_id: MeetingId,
 ) -> AppResult<Option<Vec<Segment>>> {
+    let turns = ctx.turns;
+    let pcm = ctx.pcm;
     // Map the segment's pause-EXCLUDING [start_ms, end_ms) to the single
     // pause-INCLUDING PCM range the turns share (the clamp matches the offline
-    // pause model — a mixed Qwen segment never straddles a ≥4 s pause).
-    let seg_range = match runner::pcm_window_for_excluding_range(pcm, seg.start_ms, seg.end_ms) {
+    // pause model — a mixed Qwen segment never straddles a ≥4 s pause). `regions`
+    // is the caller's ONE pause scan for the whole meeting (B2) — this is the
+    // cheap per-segment half, [`runner::excluding_range_to_pcm_slice`].
+    let seg_range = match runner::excluding_range_to_pcm_slice(regions, seg.start_ms, seg.end_ms) {
         Some(r) => r,
         None => return Ok(None),
     };
@@ -3967,7 +4028,7 @@ fn split_mixed_qwen_segment(
         // Stamp each sub-clip's start on the EXCLUDING transcript clock (the
         // inverse map); the chunk's own clock is the INCLUDING ms so the backend's
         // word offsets stay self-consistent within the clip.
-        let excl_start_ms = runner::excluding_ms_for_pcm_sample(pcm, lo);
+        let excl_start_ms = runner::excluding_ms_for_pcm_sample_in_regions(regions, lo);
         let chunk_incl_start_ms = (lo as u64 * 1000) / 16_000;
         let chunk_incl_end_ms = (hi as u64 * 1000) / 16_000;
         let chunk = minutist_common::AudioChunk {
@@ -3999,15 +4060,15 @@ fn split_mixed_qwen_segment(
             start_ms: excl_start_ms,
             // The sub-clip's excluding end is the next slice's excluding start;
             // compute it from `hi` directly (the inverse clamps a trailing edge).
-            end_ms: runner::excluding_ms_for_pcm_sample(pcm, hi),
+            end_ms: runner::excluding_ms_for_pcm_sample_in_regions(regions, hi),
             text,
             speaker_id: letter,
             confidence: seg.confidence,
             words: Vec::new(),
             shared_speakers: Vec::new(),
         };
-        let _ = event_tx.send(AppEvent::TranscriptSegment {
-            meeting_id,
+        let _ = ctx.event_tx.send(AppEvent::TranscriptSegment {
+            meeting_id: ctx.meeting_id,
             segment: sub.clone(),
         });
         sub_segments.push(sub);

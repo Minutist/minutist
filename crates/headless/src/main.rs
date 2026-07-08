@@ -253,7 +253,9 @@ fn add_peer(data_dir: &Path, ticket: &str) -> AppResult<()> {
 /// JSON shape printed by the `status` subcommand.
 #[derive(Serialize)]
 struct HubStatus {
-    endpoint_id: String,
+    /// `None` when `data_dir` has no persisted device identity yet — `status`
+    /// reports that state rather than minting one just to fill this field.
+    endpoint_id: Option<String>,
     relay_url: String,
     /// Authorised peers (their `EndpointId`s), resolved from the peers file.
     peers: Vec<String>,
@@ -271,14 +273,33 @@ struct MeetingStatus {
 }
 
 /// Print the hub's state as JSON to stdout and exit. A pure filesystem read (no
-/// tracing init, no engine bind; it does NOT contact the running daemon), so an
-/// automated harness can use it as an oracle: which peers are authorised and which
-/// meetings the hub holds, with a per-meeting notes digest for convergence
-/// assertions.
+/// tracing init, no engine bind, and no identity generation; it does NOT contact
+/// the running daemon), so an automated harness can use it as an oracle: which
+/// peers are authorised and which meetings the hub holds, with a per-meeting
+/// notes digest for convergence assertions.
 fn print_status(data_dir: &Path, relay_url: String) -> AppResult<()> {
-    let endpoint_id = DeviceIdentity::load_or_generate(data_dir)?
-        .endpoint_id()
-        .to_string();
+    let status = build_status(data_dir, relay_url)?;
+    let json = serde_json::to_string_pretty(&status).map_err(|e| AppError::Internal {
+        context: format!("serialising status: {e}"),
+    })?;
+    println!("{json}");
+    Ok(())
+}
+
+/// Build the `status` payload without any side effect on `data_dir`. In
+/// particular, `endpoint_id` is `None` on a data root with no persisted device
+/// identity yet — a fresh root is reported as fresh, never mutated by a `status`
+/// call minting (and persisting) a key just to report on it.
+fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
+    let endpoint_id = if DeviceIdentity::key_path(data_dir).exists() {
+        Some(
+            DeviceIdentity::load_or_generate(data_dir)?
+                .endpoint_id()
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     let peers: Vec<String> = read_peer_tickets(data_dir)
         .iter()
@@ -300,17 +321,12 @@ fn print_status(data_dir: &Path, relay_url: String) -> AppResult<()> {
         .collect();
     meetings.sort_by(|a, b| a.id.cmp(&b.id));
 
-    let status = HubStatus {
+    Ok(HubStatus {
         endpoint_id,
         relay_url,
         peers,
         meetings,
-    };
-    let json = serde_json::to_string_pretty(&status).map_err(|e| AppError::Internal {
-        context: format!("serialising status: {e}"),
-    })?;
-    println!("{json}");
-    Ok(())
+    })
 }
 
 /// sha256 (hex) of a meeting's `notes.ydoc` PROJECTED to canonical JSON — stable
@@ -674,5 +690,35 @@ mod tests {
         let empty = MeetingId(uuid::Uuid::new_v4());
         persistence::MeetingFolder::ensure(root, empty).expect("ensure empty");
         assert_eq!(meeting_digest(root, empty), None);
+    }
+
+    #[test]
+    fn status_on_a_fresh_root_reports_no_identity_and_does_not_mint_one() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path();
+
+        let status = build_status(dir, "wss://relay.example".to_string()).expect("build status");
+        assert_eq!(
+            status.endpoint_id, None,
+            "a fresh root has no identity to report"
+        );
+        assert!(
+            !DeviceIdentity::key_path(dir).exists(),
+            "status must not mint (and persist) a device key just to report on it"
+        );
+    }
+
+    #[test]
+    fn status_reports_the_identity_once_one_exists() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path();
+        let identity = DeviceIdentity::load_or_generate(dir).expect("generate identity");
+
+        let status = build_status(dir, "wss://relay.example".to_string()).expect("build status");
+        assert_eq!(
+            status.endpoint_id.as_deref(),
+            Some(identity.endpoint_id().to_string().as_str()),
+            "status must report the pre-existing identity"
+        );
     }
 }

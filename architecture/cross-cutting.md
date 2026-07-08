@@ -1290,7 +1290,10 @@ revision 2025-11-25). Binding controls:
   `127.0.0.1:{mcp_port}` only (never `0.0.0.0`). Every request must carry
   `Authorization: Bearer <token>` (a ≥256-bit CSPRNG token; a thin wrapper service
   returns 401 before rmcp sees the request — the `Mcp-Session-Id` is routing state
-  only, never the credential). rmcp's `StreamableHttpServerConfig` enforces the
+  only, never the credential). The token comparison (`mcp-server::auth::bearer_ok`)
+  is constant-time (`subtle::ConstantTimeEq`) rather than a plain `==`, so it does
+  not leak the length of a matching prefix through timing to another process on
+  the same machine. rmcp's `StreamableHttpServerConfig` enforces the
   `Host` allowlist (loopback default, `rmcp >= 1.4.0` — GHSA-89vp-x53w-74fx,
   DNS-rebinding) and the `Origin` allowlist (set to the loopback origins → 403 on
   a cross-origin browser request). Cautionary precedent: CVE-2025-49596 (MCP

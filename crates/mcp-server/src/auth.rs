@@ -13,6 +13,7 @@
 //! request that would otherwise pass Host/Origin.
 
 use http::HeaderMap;
+use subtle::ConstantTimeEq;
 
 /// Whether `headers` carry a `Authorization: Bearer <token>` that matches
 /// `expected`. Pure so it is unit-testable without a live HTTP client.
@@ -22,10 +23,12 @@ use http::HeaderMap;
 /// - Wrong token → `false`.
 /// - Exact `Bearer <expected>` → `true`.
 ///
-/// The comparison is a plain `==`; the token is a ≥256-bit CSPRNG value, so a
-/// constant-time compare buys little against a loopback-only attacker who would
-/// need ~2^255 attempts, and the value is not a low-entropy password. The
-/// loopback bind + Host/Origin checks are the primary controls (§4.3).
+/// The token comparison is constant-time (`subtle::ConstantTimeEq`). The
+/// loopback bind + Host/Origin checks are the primary controls (§4.3) — the
+/// token is a ≥256-bit CSPRNG value, not a low-entropy password — but a plain
+/// `==` still leaks the length of the matching prefix through timing to any
+/// process on the same machine that can hit this endpoint, so the compare
+/// itself costs nothing extra to harden.
 pub fn bearer_ok(headers: &HeaderMap, expected: &str) -> bool {
     let Some(value) = headers.get(http::header::AUTHORIZATION) else {
         return false;
@@ -41,7 +44,7 @@ pub fn bearer_ok(headers: &HeaderMap, expected: &str) -> bool {
         return false;
     };
     let token = token.trim();
-    !expected.is_empty() && token == expected
+    !expected.is_empty() && bool::from(token.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 #[cfg(test)]

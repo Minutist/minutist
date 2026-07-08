@@ -3404,6 +3404,20 @@ requests multiplex by `request_id`, echoed unchanged on every response frame.
 inflight semaphore + the bounded outbound channel bound the work). Inbound
 messages are capped at 4 MiB, matching the relay.
 
+The read loop's `tokio::select!` also drains the per-request `JoinSet` as
+entries complete (`join_next()`, guarded by `!tasks.is_empty()`), rather than
+only at `tasks.shutdown()` on session end: without this, a `JoinSet` entry
+survives for every request EVER served on a long-lived connection (bounded
+concurrency, but unbounded set growth over the session's lifetime). The
+loopback `reqwest::Client` carries a connect timeout and a whole-request
+timeout (`LOOPBACK_CONNECT_TIMEOUT` / `LOOPBACK_REQUEST_TIMEOUT`, sized above
+the longest MCP-exposed `agent-tools` call's own internal budget), so a stalled
+loopback response cannot hold an inflight permit — and its `JoinSet` slot —
+indefinitely. If the writer task fails to `postcard`-encode an outbound
+`Response*` frame, it synthesizes a `ResponseError` for that `request_id`
+instead of dropping the frame silently, so the relay's request fails cleanly
+rather than hanging forever waiting for a chunk/end that will never arrive.
+
 **Security (binding).** The internal loopback bearer is held in `InternalBearer`,
 whose `Debug` redacts the value. It is attached only to the outbound loopback
 HTTP request and is **never** serialised into a tunnel frame nor logged. Response
@@ -3414,9 +3428,18 @@ Loopback **response headers are allowlisted** before they cross to the untrusted
 relay (`FORWARDED_RESPONSE_HEADERS` — content-type/length, cache-control, and the
 SSE/MCP session headers), mirroring the relay's inbound request-header filtering
 so a future `set-cookie`/`authorization` echo cannot transit the trust boundary.
-`run_tunnel` **refuses a non-`wss://` relay** (`TunnelError::Config`) before
-dialing — `ws://` is tolerated only for a loopback host, where cleartext never
-leaves the machine.
+Symmetrically, **inbound request headers are allowlisted** before the loopback
+call is built (`FORWARDED_REQUEST_HEADERS` — content-type, accept, and the
+SSE/MCP session headers): `RequestFrame::headers` is documented as already
+excluding the inbound `authorization` (the relay strips it before framing), but
+the replay does not depend on that holding, since the relay is a separate,
+network-facing service. The internal bearer is set on the outbound `HeaderMap`
+with `insert` (replace), never `RequestBuilder::header` (append) — appending
+would let a relay-supplied `authorization` ride alongside the internal one, and
+`HeaderMap::get` (what the loopback server's bearer check reads) returns
+whichever was inserted FIRST, i.e. the untrusted one. `run_tunnel` **refuses a
+non-`wss://` relay** (`TunnelError::Config`) before dialing — `ws://` is
+tolerated only for a loopback host, where cleartext never leaves the machine.
 
 ### `rag-retrieval`
 **Crate:** `crates/rag-retrieval` (RAG)

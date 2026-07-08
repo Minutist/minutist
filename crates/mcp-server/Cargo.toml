@@ -39,6 +39,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tracing = { workspace = true }
+# Constant-time bearer-token comparison in `auth.rs`, so the token check does
+# not leak the length of a matching prefix through timing. Already in the
+# workspace lockfile transitively (the ed25519 stack pulls it); this is its
+# only direct dependent.
+subtle = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "io-util"] }

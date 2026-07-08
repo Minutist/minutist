@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use tokio::sync::mpsc;
 
 use crate::frame::{Frame, RequestFrame, ResponseChunk, ResponseEnd, ResponseError, ResponseStart};
@@ -49,6 +50,19 @@ const FORWARDED_RESPONSE_HEADERS: &[&str] = &[
     "mcp-session-id",
     "last-event-id",
 ];
+
+/// Request headers forwarded from the relay's `RequestFrame` onto the loopback
+/// HTTP call. Everything else — most importantly `authorization` and any other
+/// hop-by-hop or auth header — is dropped before the request is built.
+///
+/// `RequestFrame::headers` is documented as already excluding the inbound
+/// `authorization` header (the relay strips it before framing the request), but
+/// this allowlist does not rely on that: the relay is a separate, network-facing
+/// service in another repository, so the loopback replay does not trust its
+/// header set unconditionally. This is the request-side mirror of
+/// [`FORWARDED_RESPONSE_HEADERS`].
+const FORWARDED_REQUEST_HEADERS: &[&str] =
+    &["content-type", "accept", "mcp-session-id", "last-event-id"];
 
 /// Where to replay relayed MCP requests: the app's loopback `mcp-server` base
 /// URL plus the internal bearer it expects.
@@ -112,18 +126,51 @@ pub(crate) async fn loopback_replay(
         }
     };
 
-    let mut builder = client.request(method, &url);
-    // Forward the relay's filtered headers verbatim (content-type / accept).
+    // Build the outbound headers as a `HeaderMap` (rather than chained
+    // `RequestBuilder::header()` calls, which APPEND) so the internal bearer can
+    // be set with `insert` — replacing, not adding to, any `authorization` entry
+    // — and so a header outside the allowlist can never reach the loopback call.
+    // `RequestBuilder::header` appending same-name values is exactly how a
+    // relay-supplied `authorization` could otherwise ride alongside ours: two
+    // `Authorization` header lines would go out, and `HeaderMap::get` (used by
+    // `mcp-server`'s bearer check) returns the FIRST one — the untrusted one.
+    let mut headers = HeaderMap::new();
     for (name, value) in &request.headers {
-        builder = builder.header(name.as_str(), value.as_str());
+        if !FORWARDED_REQUEST_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        let (Ok(header_name), Ok(header_value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) else {
+            continue;
+        };
+        headers.insert(header_name, header_value);
     }
-    // Apply the internal bearer LAST so it cannot be shadowed by a forwarded
-    // header. The relay strips the inbound authorization, but assert our own.
-    builder = builder.header(
-        reqwest::header::AUTHORIZATION,
-        target.internal_bearer.header_value(),
-    );
-    builder = builder.body(request.body);
+    let bearer_value = match HeaderValue::from_str(&target.internal_bearer.header_value()) {
+        Ok(v) => v,
+        Err(_) => {
+            // Never plausible in practice (the bearer is app-generated), but
+            // fail the request rather than replay it with no bearer at all.
+            send_error(
+                outbound_tx,
+                request_id,
+                "internal bearer is not a valid header value",
+            )
+            .await;
+            return;
+        }
+    };
+    // `insert` replaces any existing entry for the name — the allowlist above
+    // already excludes `authorization`, but this is the second, independent
+    // guarantee that the internal bearer is the ONLY value ever sent, regardless
+    // of what the relay put in `request.headers`.
+    headers.insert(AUTHORIZATION, bearer_value);
+
+    let builder = client
+        .request(method, &url)
+        .headers(headers)
+        .body(request.body);
 
     let response = match builder.send().await {
         Ok(r) => r,

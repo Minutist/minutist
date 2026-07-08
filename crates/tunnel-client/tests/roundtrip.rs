@@ -284,6 +284,62 @@ async fn relayed_request_reaches_loopback_with_bearer_and_response_streams_back(
     }
 }
 
+/// SECURITY (E2): a relay-supplied `authorization` header inside a `RequestFrame`
+/// must never reach the loopback call in place of, or alongside, the internal
+/// bearer. `RequestFrame::headers` is documented as already excluding it (the
+/// relay strips it before framing), but this forges one anyway — the loopback
+/// replay does not get to assume the relay upheld that contract, since the relay
+/// lives in a separate, network-facing repository.
+#[tokio::test]
+async fn forged_inbound_authorization_cannot_shadow_the_internal_bearer() {
+    let response =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+    let (loopback_origin, loopback_rx) = start_fake_loopback(Some(response)).await;
+
+    let mut headers = sample_headers();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer forged-attacker-token".to_string(),
+    );
+    let request = RequestFrame {
+        request_id: 42,
+        method: "POST".into(),
+        path: "/mcp".into(),
+        headers,
+        body: b"{}".to_vec(),
+    };
+    let (relay_url, relay_rx) = start_fake_relay(
+        Frame::HelloAck(tunnel_client::HelloAck {
+            account_id: "sub-1".into(),
+        }),
+        Some(request),
+    )
+    .await;
+
+    let config = TunnelConfig {
+        relay_url,
+        device_credential: "dev-cred".into(),
+        account_id: "sub-1".into(),
+        loopback: LoopbackTarget::new(loopback_origin, InternalBearer::new(INTERNAL_BEARER)),
+    };
+
+    run_tunnel(config).await.expect("tunnel run");
+
+    let loopback = loopback_rx.await.expect("loopback capture");
+    assert_eq!(
+        loopback.authorization.as_deref(),
+        Some(&*format!("Bearer {INTERNAL_BEARER}")),
+        "the forged inbound authorization must not reach the loopback call, and \
+         the internal bearer must be the one that does"
+    );
+
+    let relay = relay_rx.await.expect("relay capture");
+    assert!(
+        matches!(relay.response_frames.first(), Some(Frame::ResponseStart(s)) if s.request_id == 42 && s.status == 200),
+        "the happy path must still succeed with the internal bearer honoured"
+    );
+}
+
 #[tokio::test]
 async fn hello_err_fails_cleanly() {
     let (relay_url, relay_rx) = start_fake_relay(

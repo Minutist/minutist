@@ -1,13 +1,14 @@
 //! Dial-out, handshake, and the request/response demux loop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::sync::Semaphore;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::frame::{Frame, Hello, HelloErrReason, PROTOCOL_VERSION};
+use crate::frame::{Frame, Hello, HelloErrReason, ResponseError, PROTOCOL_VERSION};
 use crate::loopback::LoopbackTarget;
 
 /// Upper bound on a single WebSocket message, matching the relay's
@@ -24,6 +25,21 @@ const MAX_INFLIGHT_REQUESTS: usize = 32;
 /// bounded channel applies back-pressure onto the per-request tasks when the
 /// socket is slow rather than buffering unboundedly.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 256;
+
+/// Bound on the initial TCP connect to the loopback `mcp-server`. The target is
+/// always `127.0.0.1`, so a healthy connect is near-instant; a stuck connect
+/// (the process wedged, or gone without the socket erroring) is treated the
+/// same as a stalled response.
+const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on one loopback request/response cycle (connect through to the last
+/// response byte). The longest tool call reachable over this tunnel is an
+/// MCP-exposed `agent-tools` read/write (e.g. `resummarise`, `relisten_section`),
+/// which the orchestrator itself budgets to at most 300s; this leaves headroom
+/// above that cap while still bounding an indefinitely stalled loopback response,
+/// which would otherwise hold an inflight permit forever (compounding with the
+/// `MAX_INFLIGHT_REQUESTS` semaphore to eventually starve every replay task).
+const LOOPBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Configuration for one tunnel session.
 #[derive(Clone, Debug)]
@@ -106,6 +122,8 @@ where
     }
 
     let client = reqwest::Client::builder()
+        .connect_timeout(LOOPBACK_CONNECT_TIMEOUT)
+        .timeout(LOOPBACK_REQUEST_TIMEOUT)
         .build()
         .map_err(TunnelError::Client)?;
 
@@ -146,6 +164,33 @@ where
                 Ok(b) => b,
                 Err(error) => {
                     tracing::error!(target: "tunnel-client", %error, "tunnel: outbound frame encode failed; dropping");
+                    // A dropped Response* frame would otherwise strand the
+                    // relay's request forever (it already saw the earlier
+                    // frames and is waiting for ResponseChunk/End). Synthesize
+                    // a terminal ResponseError for that request id instead of
+                    // just dropping the frame, so the relay can fail it.
+                    if let Some(request_id) = frame.request_id() {
+                        match Frame::ResponseError(ResponseError {
+                            request_id,
+                            message: "internal encode failure".to_string(),
+                        })
+                        .encode()
+                        {
+                            Ok(error_bytes) => {
+                                if ws_tx
+                                    .send(Message::Binary(error_bytes.into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::info!(target: "tunnel-client", "tunnel: write failed; writer stopping");
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(target: "tunnel-client", %error, "tunnel: failed to encode the synthesized ResponseError too; request left hanging");
+                            }
+                        }
+                    }
                     continue;
                 }
             };
@@ -250,8 +295,17 @@ where
 }
 
 /// The inbound read loop. Dispatches `Request` frames to bounded per-request
-/// tasks, answers `Ping` with `Pong`, and returns on close. Returns `Ok(())` on
-/// a clean close, `Err` on a transport/decode error.
+/// tasks, answers `Ping` with `Pong`, reaps finished per-request tasks, and
+/// returns on close. Returns `Ok(())` on a clean close, `Err` on a
+/// transport/decode error.
+///
+/// Concurrently selects between the next inbound message and the next
+/// completed entry in `tasks`: without this, a `JoinSet` entry for a finished
+/// per-request task sits in the set until `tasks.shutdown()` runs at session
+/// end, so a long-lived connection accumulates one retained entry per REQUEST
+/// EVER SERVED (not per concurrent request — the semaphore bounds concurrency,
+/// not the set's size). The `if !tasks.is_empty()` guard keeps that branch from
+/// being polled (and trivially resolving to `None`) while the set is empty.
 async fn read_loop<S>(
     ws_rx: &mut S,
     outbound_tx: &mpsc::Sender<Frame>,
@@ -263,7 +317,19 @@ async fn read_loop<S>(
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    while let Some(message) = ws_rx.next().await {
+    loop {
+        let message = tokio::select! {
+            joined = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(join_error)) = joined {
+                    tracing::warn!(target: "tunnel-client", %join_error, "tunnel: a per-request replay task ended abnormally");
+                }
+                continue;
+            }
+            message = ws_rx.next() => message,
+        };
+        let Some(message) = message else {
+            return Ok(());
+        };
         let message = message.map_err(TunnelError::Transport)?;
         match message {
             Message::Binary(bytes) => {
@@ -315,7 +381,6 @@ where
             }
         }
     }
-    Ok(())
 }
 
 /// Spawn a bounded task to replay one request against the loopback server and
@@ -342,7 +407,14 @@ fn spawn_request(
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use futures_util::Stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+    use crate::frame::RequestFrame;
     use crate::loopback::{InternalBearer, LoopbackTarget};
 
     fn config_with(relay_url: &str) -> TunnelConfig {
@@ -380,5 +452,153 @@ mod tests {
             .await
             .expect_err("cleartext remote relay must be refused");
         assert!(matches!(err, TunnelError::Config));
+    }
+
+    #[test]
+    fn encode_failure_synthesizes_a_response_error_with_the_right_request_id() {
+        // Only the device→relay response frames correlate to a request; the
+        // writer task's encode-failure fallback relies on this to know which
+        // request to fail rather than silently dropping the frame (E3a).
+        assert_eq!(
+            Frame::ResponseStart(crate::frame::ResponseStart {
+                request_id: 7,
+                status: 200,
+                headers: Default::default(),
+            })
+            .request_id(),
+            Some(7)
+        );
+        assert_eq!(
+            Frame::ResponseChunk(crate::frame::ResponseChunk {
+                request_id: 8,
+                data: vec![],
+            })
+            .request_id(),
+            Some(8)
+        );
+        assert_eq!(
+            Frame::ResponseEnd(crate::frame::ResponseEnd { request_id: 9 }).request_id(),
+            Some(9)
+        );
+        assert_eq!(
+            Frame::ResponseError(ResponseError {
+                request_id: 10,
+                message: "x".into(),
+            })
+            .request_id(),
+            Some(10)
+        );
+        assert_eq!(Frame::Ping(1).request_id(), None);
+        assert_eq!(Frame::Pong(1).request_id(), None);
+    }
+
+    /// A `Stream` over a `tokio::sync::mpsc` channel, so a test can drive
+    /// `read_loop`'s inbound side with real await points (the producer task
+    /// below sends with real delays between batches) rather than a fixed
+    /// `futures_util::stream::iter`.
+    struct ChannelStream(
+        mpsc::UnboundedReceiver<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    );
+
+    impl Stream for ChannelStream {
+        type Item = Result<Message, tokio_tungstenite::tungstenite::Error>;
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    /// Start a minimal loopback HTTP/1.1 server that replies `200 OK` (empty
+    /// body, `Connection: close`) to every request. Returns its origin.
+    async fn start_fast_fake_loopback() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn get_request(request_id: u64) -> RequestFrame {
+        RequestFrame {
+            request_id,
+            method: "GET".into(),
+            path: "/mcp".into(),
+            headers: Default::default(),
+            body: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_loop_reaps_finished_tasks_instead_of_accumulating_them() {
+        // Without reaping, every completed per-request task's `JoinSet` entry
+        // survives until `tasks.shutdown()` at session end — i.e. the set grows
+        // by one for every request EVER served on a long-lived connection, not
+        // just the concurrently in-flight ones (E1). This drives `read_loop`
+        // with many requests followed by a quiet period (no new inbound
+        // message) long enough for all of them to finish against a fast local
+        // loopback, then asserts the `JoinSet` was drained well before the
+        // session ends, rather than sitting on every completed entry.
+        const REQUESTS: u64 = 50;
+
+        let loopback_origin = start_fast_fake_loopback().await;
+        let loopback = Arc::new(LoopbackTarget::new(
+            loopback_origin,
+            InternalBearer::new("tok"),
+        ));
+        let client = Arc::new(reqwest::Client::new());
+        let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_REQUESTS));
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Frame>(OUTBOUND_CHANNEL_CAPACITY);
+        // Drain outbound response frames so the per-request tasks' sends never
+        // block on a full channel.
+        tokio::spawn(async move { while outbound_rx.recv().await.is_some() {} });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let producer = tokio::spawn(async move {
+            for id in 0..REQUESTS {
+                let bytes = Frame::Request(get_request(id)).encode().expect("encode");
+                let _ = tx.send(Ok(Message::Binary(bytes.into())));
+            }
+            // A quiet period with no new inbound message: `read_loop`'s only
+            // remaining ready branch is draining the `JoinSet`, so by the end
+            // of this sleep every one of the (fast, local) replies has both
+            // completed AND been reaped.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = tx.send(Ok(Message::Close(None)));
+        });
+
+        let mut stream = ChannelStream(rx);
+        let mut tasks = tokio::task::JoinSet::new();
+        let result = read_loop(
+            &mut stream,
+            &outbound_tx,
+            &inflight,
+            &client,
+            &loopback,
+            &mut tasks,
+        )
+        .await;
+        producer.await.expect("producer task");
+
+        assert!(result.is_ok(), "read_loop should end on a clean close");
+        assert!(
+            tasks.len() < REQUESTS as usize,
+            "the JoinSet must not retain every finished task's entry: {} of {REQUESTS} still held",
+            tasks.len()
+        );
     }
 }

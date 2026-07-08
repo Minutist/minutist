@@ -338,6 +338,13 @@ applies per data root, so the daemon must never share a root with another
 process. The post-launch GPU node (adding the ML-runtime crates) is an
 architecture-owner decision at that time.
 
+The `status` subcommand is a read-only filesystem oracle: it reports
+`endpoint_id: null` on a data root with no persisted `sync_node_key` rather
+than generating (and persisting) one just to fill the field, so pointing it at
+an unused root cannot silently mint device state. `print-ticket` mints an
+identity on first run when one is needed — that side effect is the point of
+the command, since a pairing ticket requires an identity to address.
+
 ### `frontend-engineer`
 Owns everything under `ui/src/`. Knowledge expected: React 19, Tiptap +
 ProseMirror, Zustand, generated tauri-specta bindings.

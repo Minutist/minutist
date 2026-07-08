@@ -179,6 +179,20 @@ pub enum FrameError {
 }
 
 impl Frame {
+    /// The [`RequestFrame::request_id`] this frame correlates with, if any.
+    /// `Some` only for the device→relay response frames (`ResponseStart`,
+    /// `ResponseChunk`, `ResponseEnd`, `ResponseError`); `Hello`/`Ping`/`Pong` and
+    /// the relay→device frames carry no request id.
+    pub(crate) fn request_id(&self) -> Option<RequestId> {
+        match self {
+            Frame::ResponseStart(r) => Some(r.request_id),
+            Frame::ResponseChunk(r) => Some(r.request_id),
+            Frame::ResponseEnd(r) => Some(r.request_id),
+            Frame::ResponseError(r) => Some(r.request_id),
+            _ => None,
+        }
+    }
+
     /// Serialise this frame to the bytes of one binary WebSocket message.
     pub fn encode(&self) -> Result<Vec<u8>, FrameError> {
         postcard::to_allocvec(self).map_err(FrameError::Encode)

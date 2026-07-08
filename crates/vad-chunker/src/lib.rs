@@ -283,11 +283,19 @@ pub struct VadChunker {
     smoother: VadSmoother,
     /// Partial-frame remainder: samples not yet forming a complete 480-sample frame.
     sample_buffer: Vec<f32>,
+    /// Reusable scratch buffer for the frame handed to the VAD each call.
+    /// `process_samples` fills it via a cursor into `sample_buffer` rather
+    /// than draining that buffer once per frame, so extracting a complete
+    /// frame never allocates once this buffer is warmed up.
+    frame_scratch: Vec<f32>,
     /// Recording-clock offset (ms) of the next complete frame's first sample.
     next_frame_start_ms: u64,
     /// Pre-roll ring buffer: holds (frame_start_ms, samples) for the last
     /// `prefill_frames` complete frames.
     prefill: VecDeque<(u64, Vec<f32>)>,
+    /// Buffers evicted from `prefill` when it exceeds `prefill_frames + 1`,
+    /// recycled into the next `prefill` entry instead of being reallocated.
+    prefill_spare: Vec<Vec<f32>>,
     prefill_frames: usize,
     /// Maximum segment duration (ms) before a force-split.
     max_segment_ms: u64,
@@ -330,8 +338,10 @@ impl VadChunker {
                 config.hangover_frames,
             ),
             sample_buffer: Vec::new(),
+            frame_scratch: Vec::with_capacity(FRAME_SAMPLES),
             next_frame_start_ms: 0,
             prefill: VecDeque::with_capacity(config.prefill_frames + 1),
+            prefill_spare: Vec::with_capacity(config.prefill_frames + 1),
             prefill_frames: config.prefill_frames,
             max_segment_ms: config.max_segment_ms,
             current_segment: None,
@@ -395,17 +405,39 @@ impl VadChunker {
 
         let mut events = Vec::new();
 
-        // Drain complete 480-sample frames from the buffer.
-        while self.sample_buffer.len() >= FRAME_SAMPLES {
-            let frame: Vec<f32> = self.sample_buffer.drain(..FRAME_SAMPLES).collect();
+        // Extract each complete 480-sample frame via a cursor (`read`) into
+        // `sample_buffer` instead of draining it once per frame: `drain`
+        // shifts the remainder down on every call, which for a batch
+        // containing several complete frames means re-shifting the same
+        // trailing data repeatedly. `sample_buffer` is compacted exactly once
+        // below, after every complete frame in this batch has been consumed.
+        // `frame_scratch` is a persistent field reused as VAD input across
+        // calls, so filling it from the cursor allocates only on warm-up.
+        let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
+        let mut read = 0usize;
+        let mut result = Ok(());
+        while self.sample_buffer.len() - read >= FRAME_SAMPLES {
+            frame_scratch.clear();
+            frame_scratch.extend_from_slice(&self.sample_buffer[read..read + FRAME_SAMPLES]);
+            read += FRAME_SAMPLES;
+
             let frame_start_ms = self.next_frame_start_ms;
             self.next_frame_start_ms += FRAME_MS;
 
-            let frame_events = self.process_frame(&frame, frame_start_ms)?;
-            events.extend(frame_events);
+            match self.process_frame(&frame_scratch, frame_start_ms) {
+                Ok(frame_events) => events.extend(frame_events),
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        self.frame_scratch = frame_scratch;
+        if read > 0 {
+            self.sample_buffer.drain(..read);
         }
 
-        Ok(events)
+        result.map(|()| events)
     }
 
     /// Signal end-of-stream. If a speech segment is currently in progress, it
@@ -489,10 +521,16 @@ impl VadChunker {
         let frame_end_ms = frame_start_ms + FRAME_MS;
 
         // Maintain pre-roll ring buffer before the VAD call so it's available
-        // immediately when onset fires.
-        self.prefill.push_back((frame_start_ms, frame.to_vec()));
+        // immediately when onset fires. Reuses a buffer evicted from the ring
+        // (`prefill_spare`) instead of allocating a fresh Vec every frame.
+        let mut buf = self.prefill_spare.pop().unwrap_or_default();
+        buf.clear();
+        buf.extend_from_slice(frame);
+        self.prefill.push_back((frame_start_ms, buf));
         while self.prefill.len() > self.prefill_frames + 1 {
-            self.prefill.pop_front();
+            if let Some((_, evicted)) = self.prefill.pop_front() {
+                self.prefill_spare.push(evicted);
+            }
         }
 
         // Run Silero VAD.
@@ -1067,6 +1105,61 @@ mod tests {
             count_ends(&events_b),
             "SegmentEnd count must match: one-call vs 240-sample chunks"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5b: the cursor-based frame extraction in `process_samples`
+    // reconstructs bit-identical 480-sample frames regardless of how the
+    // caller chunks the input.
+    // -----------------------------------------------------------------------
+    // Feeding the same audio through wildly different, non-frame-aligned
+    // chunk sizes must produce byte-identical `SegmentEnd.samples` — proving
+    // the reusable `frame_scratch` cursor reassembles exactly the same frames
+    // as a single whole-buffer call, not an off-by-one or partially-stale
+    // reconstruction.
+    #[test]
+    fn test_frame_reconstruction_bitidentical_across_chunk_sizes() {
+        let audio = load_fixture_wav();
+
+        let run = |chunk_size: usize| -> Vec<Vec<f32>> {
+            let mut chunker = test_chunker();
+            let mut events: Vec<VadEvent> = Vec::new();
+            for chunk in audio.chunks(chunk_size) {
+                events.append(&mut process_all(&mut chunker, chunk, 0));
+            }
+            events.extend(chunker.flush_end_of_stream().expect("flush failed"));
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    VadEvent::SegmentEnd { samples, .. } => Some(samples),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // One call (chunk size = whole buffer), a mid-sized odd chunk, and a
+        // tiny odd chunk that never lands on a 480-sample frame boundary.
+        let segments_whole = run(audio.len());
+        let segments_odd = run(7);
+        let segments_tiny = run(37);
+
+        assert!(!segments_whole.is_empty(), "fixture must yield at least one segment");
+        assert_eq!(
+            segments_whole.len(),
+            segments_odd.len(),
+            "segment count must match across chunk sizes"
+        );
+        assert_eq!(
+            segments_whole.len(),
+            segments_tiny.len(),
+            "segment count must match across chunk sizes"
+        );
+        for (i, (whole, odd)) in segments_whole.iter().zip(&segments_odd).enumerate() {
+            assert_eq!(whole, odd, "segment {i} samples differ for chunk size 7");
+        }
+        for (i, (whole, tiny)) in segments_whole.iter().zip(&segments_tiny).enumerate() {
+            assert_eq!(whole, tiny, "segment {i} samples differ for chunk size 37");
+        }
     }
 
     // -----------------------------------------------------------------------

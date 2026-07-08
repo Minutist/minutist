@@ -97,7 +97,6 @@ pub(crate) fn open_loopback() -> Result<LoopbackSource, Error> {
         &device,
         &config,
         channels,
-        in_rate,
         Arc::clone(&paused),
         Arc::clone(&raw_ch),
     )?;

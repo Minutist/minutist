@@ -12,7 +12,6 @@ rubato = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-serde = { workspace = true }
 
 # Windows-only: WASAPI communications-mode mic capture (OS beamforming / AEC /
 # noise-suppression → processed mono), so we never average a raw mic array.

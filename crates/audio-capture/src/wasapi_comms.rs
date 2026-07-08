@@ -58,15 +58,28 @@ pub(crate) fn try_start(
     // thread. The thread signals init success/failure back so the caller can
     // fall back to cpal synchronously before the recording proceeds.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<bool>();
+    // Told to the capture thread once the caller has given up waiting on
+    // `ready_rx` (below): if WASAPI init is still slow-in-progress at that
+    // point, the caller has already fallen back to cpal onto the same shared
+    // `raw_ch`, so the thread must not go on to start streaming into it too.
+    let still_wanted = Arc::new(AtomicBool::new(true));
     let handle = std::thread::Builder::new()
         .name("wasapi-comms-capture".into())
-        .spawn(move || run(paused, stopped, raw_ch, ready_tx))
+        .spawn({
+            let still_wanted = Arc::clone(&still_wanted);
+            move || run(paused, stopped, raw_ch, ready_tx, still_wanted)
+        })
         .ok()?;
 
     match ready_rx.recv_timeout(Duration::from_secs(3)) {
         Ok(true) => Some((handle, COMMS_RATE)),
-        // Init failed (thread already returned) or timed out → fall back to cpal.
-        _ => None,
+        // Init failed (thread already returned) or timed out → fall back to
+        // cpal. Cancel a still-initialising thread so it can't later start
+        // streaming into the ring the cpal fallback now owns.
+        _ => {
+            still_wanted.store(false, Ordering::Relaxed);
+            None
+        }
     }
 }
 
@@ -75,6 +88,7 @@ fn run(
     stopped: Arc<AtomicBool>,
     raw_ch: Arc<DropOldestChannel>,
     ready_tx: std::sync::mpsc::Sender<bool>,
+    still_wanted: Arc<AtomicBool>,
 ) {
     if wasapi::initialize_mta().is_err() {
         let _ = ready_tx.send(false);
@@ -103,7 +117,6 @@ fn run(
 
         let h_event = audio_client.set_get_eventhandle()?;
         let capture_client = audio_client.get_audiocaptureclient()?;
-        audio_client.start_stream()?;
         Ok((audio_client, capture_client, h_event))
     })();
 
@@ -118,6 +131,29 @@ fn run(
             return;
         }
     };
+
+    // The caller may already have given up waiting (its `recv_timeout` in
+    // `try_start` elapsed) and fallen back to a cpal stream feeding the same
+    // `raw_ch`. Starting this stream now would double-feed that ring, so bail
+    // out before touching the hardware.
+    if !still_wanted.load(Ordering::Relaxed) {
+        tracing::warn!(
+            target: "audio-capture",
+            "WASAPI communications-mode init finished after the caller gave up \
+             (already fell back to cpal); discarding this capture path"
+        );
+        let _ = ready_tx.send(false);
+        return;
+    }
+
+    if let Err(e) = audio_client.start_stream() {
+        tracing::warn!(
+            target: "audio-capture",
+            "WASAPI communications-mode start_stream failed ({e}); falling back to cpal"
+        );
+        let _ = ready_tx.send(false);
+        return;
+    }
     tracing::info!(
         target: "audio-capture",
         "mic capture via WASAPI communications mode (OS beamforming/AEC/NS → 16 kHz mono)"
@@ -125,7 +161,10 @@ fn run(
     let _ = ready_tx.send(true);
 
     let mut deque: VecDeque<u8> = VecDeque::new();
-    while !stopped.load(Ordering::Relaxed) {
+    // `still_wanted` is rechecked every iteration (not just once at start-up)
+    // so a cancellation racing in right after this loop begins still stops
+    // the next push, not just the initial `start_stream`.
+    while !stopped.load(Ordering::Relaxed) && still_wanted.load(Ordering::Relaxed) {
         // Wake on the engine event; the timeout bounds how often we re-check
         // `stopped` if no audio arrives.
         if h_event.wait_for_event(100).is_err() {

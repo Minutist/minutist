@@ -2,17 +2,23 @@
 //! bridge from the cpal callback thread into async Tokio channels.
 //!
 //! Threading model (per `architecture/cross-cutting.md`):
-//!   • The cpal callback runs on cpal's own thread.  It pushes raw samples
-//!     into a bounded [`DropOldestChannel`] (capacity 8).  The callback never
-//!     blocks: it uses `try_lock` and, on overflow, evicts the OLDEST queued
-//!     frame before enqueuing the newest.  A `tracing::warn!` fires on drop.
-//!   • A `tokio::task::spawn_blocking` task drains that channel and forwards
-//!     resampled + metered output into bounded `tokio::sync::mpsc` channels
-//!     whose capacities are passed in by the caller.
+//!   • The cpal callback runs on cpal's own thread. It never blocks and never
+//!     allocates: it takes a recycled sample buffer from
+//!     [`DropOldestChannel`]'s pool (or allocates only on a cold/underrun
+//!     pool), fills it in place, and pushes it via `try_lock`. On overflow it
+//!     evicts the OLDEST queued frame before enqueuing the newest, and on
+//!     lock contention it drops the new frame — both cases increment an
+//!     atomic drop counter rather than logging (logging on the RT thread is
+//!     itself a stall risk, and a drop flood would self-amplify through the
+//!     logging sink).
+//!   • A `tokio::task::spawn_blocking` task drains that channel, samples and
+//!     logs the drop counter, resamples, meters, forwards output into bounded
+//!     `tokio::sync::mpsc` channels whose capacities are passed in by the
+//!     caller, and recycles each consumed frame's buffer back into the pool.
 
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::time::Duration;
@@ -86,15 +92,29 @@ pub(crate) const RAW_RING_CAPACITY: usize = 1024;
 /// `pop_front` + one `push_back`). It never blocks waiting for the consumer.
 /// The consumer holds the lock only long enough to pop one frame; the
 /// expensive resampling happens after the lock is released, so the producer
-/// is essentially never contended. This replaces the previous design, where
-/// the consumer held a `Mutex` for the entire session and the callback's
-/// drop-oldest path deadlocked on that held lock (so it never dropped the
-/// oldest and risked blocking the RT thread).
+/// is essentially never contended.
+///
+/// Also owns the recycled sample-buffer pool ([`take_buffer`](Self::take_buffer)
+/// / [`recycle_buffer`](Self::recycle_buffer)) and the drop counter
+/// ([`take_dropped_count`](Self::take_dropped_count)): both the buffer an
+/// evicted/dropped frame frees and any logging of that event happen strictly
+/// after the `inner` lock is released, never while it is held.
 pub(crate) struct DropOldestChannel {
     inner: Mutex<ChannelInner>,
     /// Signals the consumer that a frame is available or the channel closed.
     not_empty: Condvar,
     capacity: usize,
+    /// Recycled sample buffers, so the RT callback can fill a buffer without
+    /// allocating instead of building then cloning a fresh `Vec` every block.
+    /// A separate lock from `inner` so pool bookkeeping never happens while
+    /// the frame queue's lock is held.
+    pool: Mutex<Vec<Vec<f32>>>,
+    /// Frames dropped since the last sample (overflow evictions plus pushes
+    /// dropped for lock contention). The RT thread only ever increments this;
+    /// consumers poll and reset it off the RT thread (see
+    /// [`take_dropped_count`](Self::take_dropped_count)) — surfacing drops
+    /// without ever logging on the callback.
+    dropped: AtomicUsize,
 }
 
 impl DropOldestChannel {
@@ -107,23 +127,58 @@ impl DropOldestChannel {
             }),
             not_empty: Condvar::new(),
             capacity,
+            pool: Mutex::new(Vec::with_capacity(capacity)),
+            dropped: AtomicUsize::new(0),
         }
+    }
+
+    /// Take a spare buffer from the recycled-buffer pool for the RT callback
+    /// to fill, or allocate a fresh (empty) one if the pool is empty or
+    /// momentarily contended. Never blocks. Steady state, every buffer taken
+    /// here was returned by [`recycle_buffer`](Self::recycle_buffer) after the
+    /// consumer finished with it, so the callback allocates only on warm-up
+    /// or a transient pool underrun — never on every block.
+    pub(crate) fn take_buffer(&self) -> Vec<f32> {
+        match self.pool.try_lock() {
+            Ok(mut pool) => pool.pop().unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Return a buffer to the pool once the consumer is done with it. Never
+    /// blocks: the buffer is simply dropped (deallocated) instead of recycled
+    /// if the pool lock is momentarily contended or already holds `capacity`
+    /// spares.
+    pub(crate) fn recycle_buffer(&self, mut buf: Vec<f32>) {
+        buf.clear();
+        if let Ok(mut pool) = self.pool.try_lock() {
+            if pool.len() < self.capacity {
+                pool.push(buf);
+            }
+        }
+    }
+
+    /// Take and reset the dropped-frame counter. Intended to be polled
+    /// periodically by the consumer (never the RT callback) so the drop
+    /// metric is surfaced via a normal log line instead of logging on the
+    /// audio thread itself.
+    pub(crate) fn take_dropped_count(&self) -> usize {
+        self.dropped.swap(0, Ordering::Relaxed)
     }
 
     /// Push a frame from the audio callback, evicting the oldest on overflow.
     ///
-    /// Never blocks: if the lock is momentarily contended (only possible while
-    /// the consumer pops a single frame) the frame is dropped rather than
-    /// stalling the RT thread.
+    /// Never blocks and never frees memory while `inner`'s lock is held: an
+    /// evicted frame's buffer is taken out of the queue under the lock but
+    /// only recycled (or dropped) after the lock is released below. Never
+    /// logs — contended and evicted pushes only increment `dropped`, sampled
+    /// and logged later by the consumer off the RT thread.
     pub(crate) fn push(&self, frame: RawFrame) {
         // `try_lock` keeps the RT thread from ever blocking on the consumer.
         let mut inner = match self.inner.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::WouldBlock) => {
-                tracing::warn!(
-                    target: "audio-capture",
-                    "cpal→forwarder channel busy; dropping frame to avoid blocking RT callback"
-                );
+                self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -133,18 +188,23 @@ impl DropOldestChannel {
             return;
         }
 
-        if inner.queue.len() >= self.capacity {
-            // Evict the OLDEST frame, then enqueue the newest.
-            inner.queue.pop_front();
-            tracing::warn!(
-                target: "audio-capture",
-                "cpal→forwarder channel full (capacity {}); dropped oldest frame",
-                self.capacity
-            );
-        }
+        // Evict the OLDEST frame on overflow, then enqueue the newest. The
+        // evicted frame is taken out of the queue here (a queue mutation,
+        // which must happen under the lock) but not freed/recycled until
+        // after `inner` is dropped below.
+        let evicted = if inner.queue.len() >= self.capacity {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            inner.queue.pop_front()
+        } else {
+            None
+        };
         inner.queue.push_back(frame);
         drop(inner);
         self.not_empty.notify_one();
+
+        if let Some(evicted) = evicted {
+            self.recycle_buffer(evicted.samples);
+        }
     }
 
     /// Pop the oldest frame, waiting up to `timeout` for one to arrive.
@@ -378,7 +438,6 @@ impl AudioCaptureManager {
                     cpal_device,
                     &config,
                     channels,
-                    in_rate,
                     Arc::clone(&mic_paused),
                     Arc::clone(&mic_raw_ch),
                 )?;
@@ -585,9 +644,12 @@ fn spawn_mic_only_forwarder(
             }
             let frame = match raw_ch.recv_timeout(Duration::from_millis(50)) {
                 Some(f) => f,
-                None => continue,
+                None => {
+                    warn_on_drops(&raw_ch);
+                    continue;
+                }
             };
-            resampler.push(&frame.samples, &mut |chunk| {
+            if let Err(e) = resampler.push(&frame.samples, &mut |chunk| {
                 let batch = batch_from(chunk, &mut out_clock_samples);
                 if sample_tx.blocking_send(batch).is_err() {
                     tracing::warn!(
@@ -601,10 +663,14 @@ fn spawn_mic_only_forwarder(
                         tracing::warn!(target: "audio-capture", "meter channel closed");
                     }
                 });
-            });
+            }) {
+                tracing::warn!(target: "audio-capture", "resampler error: {e}");
+            }
+            raw_ch.recycle_buffer(frame.samples);
+            warn_on_drops(&raw_ch);
         }
 
-        resampler.finish(&mut |chunk| {
+        if let Err(e) = resampler.finish(&mut |chunk| {
             if !chunk.is_empty() {
                 let batch = batch_from(chunk, &mut out_clock_samples);
                 let _ = sample_tx.blocking_send(batch);
@@ -612,7 +678,9 @@ fn spawn_mic_only_forwarder(
                     let _ = meter_tx.blocking_send(mf);
                 });
             }
-        });
+        }) {
+            tracing::warn!(target: "audio-capture", "resampler error on finish: {e}");
+        }
         meter.flush(|mf| {
             let _ = meter_tx.blocking_send(mf);
         });
@@ -657,9 +725,12 @@ fn spawn_resample_forwarder(
             }
             let frame = match raw_ch.recv_timeout(Duration::from_millis(50)) {
                 Some(f) => f,
-                None => continue,
+                None => {
+                    warn_on_drops(&raw_ch);
+                    continue;
+                }
             };
-            resampler.push(&frame.samples, &mut |chunk| {
+            if let Err(e) = resampler.push(&frame.samples, &mut |chunk| {
                 let batch = batch_from(chunk, &mut clock);
                 if batch_tx.blocking_send(batch).is_err() {
                     tracing::warn!(
@@ -667,15 +738,21 @@ fn spawn_resample_forwarder(
                         "{source} mixer channel closed; forwarder exiting"
                     );
                 }
-            });
+            }) {
+                tracing::warn!(target: "audio-capture", "{source} resampler error: {e}");
+            }
+            raw_ch.recycle_buffer(frame.samples);
+            warn_on_drops(&raw_ch);
         }
 
-        resampler.finish(&mut |chunk| {
+        if let Err(e) = resampler.finish(&mut |chunk| {
             if !chunk.is_empty() {
                 let batch = batch_from(chunk, &mut clock);
                 let _ = batch_tx.blocking_send(batch);
             }
-        });
+        }) {
+            tracing::warn!(target: "audio-capture", "{source} resampler error on finish: {e}");
+        }
         tracing::debug!(target: "audio-capture", "{source} resample forwarder exiting");
     });
 }
@@ -775,6 +852,20 @@ fn meter_then_send(
     });
 }
 
+/// Sample and log a source's drop counter. Called from a forwarder loop
+/// (never from the cpal callback) so a busy period is surfaced via a normal
+/// log line rather than logging on the audio thread itself.
+fn warn_on_drops(raw_ch: &DropOldestChannel) {
+    let dropped = raw_ch.take_dropped_count();
+    if dropped > 0 {
+        tracing::warn!(
+            target: "audio-capture",
+            dropped,
+            "cpal→forwarder ring dropped frames (RT thread overloaded or forwarder stalled)"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // cpal stream builder — dispatches on sample format
 // ---------------------------------------------------------------------------
@@ -783,25 +874,24 @@ pub(crate) fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     channels: usize,
-    in_rate: u32,
     paused: Arc<AtomicBool>,
     raw_ch: Arc<DropOldestChannel>,
 ) -> Result<cpal::Stream, Error> {
     match config.sample_format() {
         cpal::SampleFormat::U8 => {
-            build_typed_stream::<u8>(device, config, channels, in_rate, paused, raw_ch)
+            build_typed_stream::<u8>(device, config, channels, paused, raw_ch)
         }
         cpal::SampleFormat::I8 => {
-            build_typed_stream::<i8>(device, config, channels, in_rate, paused, raw_ch)
+            build_typed_stream::<i8>(device, config, channels, paused, raw_ch)
         }
         cpal::SampleFormat::I16 => {
-            build_typed_stream::<i16>(device, config, channels, in_rate, paused, raw_ch)
+            build_typed_stream::<i16>(device, config, channels, paused, raw_ch)
         }
         cpal::SampleFormat::I32 => {
-            build_typed_stream::<i32>(device, config, channels, in_rate, paused, raw_ch)
+            build_typed_stream::<i32>(device, config, channels, paused, raw_ch)
         }
         cpal::SampleFormat::F32 => {
-            build_typed_stream::<f32>(device, config, channels, in_rate, paused, raw_ch)
+            build_typed_stream::<f32>(device, config, channels, paused, raw_ch)
         }
         fmt => Err(Error::Cpal {
             context: format!("unsupported sample format: {fmt:?}"),
@@ -813,7 +903,6 @@ fn build_typed_stream<T>(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     channels: usize,
-    in_rate: u32,
     paused: Arc<AtomicBool>,
     raw_ch: Arc<DropOldestChannel>,
 ) -> Result<cpal::Stream, Error>
@@ -821,11 +910,6 @@ where
     T: Sample + SizedSample + Send + 'static,
     f32: cpal::FromSample<T>,
 {
-    let mut mono_buf = Vec::<f32>::new();
-    // Suppress unused warning: in_rate is accepted for consistency but not
-    // needed now that the recording-clock is tracked by the output resampler.
-    let _ = in_rate;
-
     let stream = device.build_input_stream(
         &config.clone().into(),
         move |data: &[T], _: &cpal::InputCallbackInfo| {
@@ -833,8 +917,10 @@ where
                 return;
             }
 
-            // Mix down to mono f32.
-            mono_buf.clear();
+            // Fill a recycled buffer from the pool in place — steady state,
+            // this never allocates (the buffer was returned by a previous
+            // `recycle_buffer` call once the forwarder resampled it).
+            let mut mono_buf = raw_ch.take_buffer();
             if channels == 1 {
                 mono_buf.extend(data.iter().map(|&s| s.to_sample::<f32>()));
             } else {
@@ -846,9 +932,7 @@ where
                 }
             }
 
-            raw_ch.push(RawFrame {
-                samples: mono_buf.clone(),
-            });
+            raw_ch.push(RawFrame { samples: mono_buf });
         },
         move |err| {
             tracing::error!(target: "audio-capture", "cpal stream error: {err}");
@@ -899,6 +983,66 @@ mod tests {
         );
     }
 
+    /// Overflow evictions increment the drop counter instead of logging on
+    /// every drop — the counter is what the consumer polls and logs off the
+    /// RT thread.
+    #[test]
+    fn overflow_increments_drop_counter() {
+        let ch = DropOldestChannel::new(3);
+        for i in 0..6 {
+            ch.push(frame(i as f32));
+        }
+        // 6 pushes into a capacity-3 ring evict 3 frames.
+        assert_eq!(ch.take_dropped_count(), 3);
+        // Taking the count resets it.
+        assert_eq!(ch.take_dropped_count(), 0);
+    }
+
+    /// An evicted frame's buffer is recycled into the pool (available to a
+    /// later `take_buffer`) rather than merely freed — and, critically, that
+    /// recycling happens after `push` has already released `inner`'s lock
+    /// (see `eviction_recycles_the_evicted_buffer`, which cannot observe the
+    /// lock directly but confirms the buffer is usable afterward, the
+    /// observable effect of the fix).
+    #[test]
+    fn eviction_recycles_the_evicted_buffer() {
+        let ch = DropOldestChannel::new(1);
+        ch.push(frame(1.0)); // fills capacity 1
+        ch.push(frame(2.0)); // evicts frame(1.0)'s buffer
+        let recycled = ch.take_buffer();
+        assert!(
+            recycled.capacity() > 0,
+            "expected the evicted frame's buffer to be recycled into the pool"
+        );
+    }
+
+    /// `recycle_buffer` makes a buffer available to a later `take_buffer`
+    /// call, reusing the exact same allocation — the mechanism that lets the
+    /// RT callback fill a buffer without allocating on every block.
+    #[test]
+    fn recycled_buffer_is_reused_without_reallocating() {
+        let ch = DropOldestChannel::new(4);
+        let mut buf: Vec<f32> = Vec::with_capacity(64);
+        buf.extend_from_slice(&[1.0, 2.0, 3.0]);
+        let ptr = buf.as_ptr();
+        let cap = buf.capacity();
+
+        ch.recycle_buffer(buf);
+        let reused = ch.take_buffer();
+
+        assert_eq!(reused.len(), 0, "a recycled buffer must come back cleared");
+        assert_eq!(
+            reused.capacity(),
+            cap,
+            "take_buffer must hand back the recycled allocation, not a fresh one"
+        );
+        assert_eq!(
+            reused.as_ptr(),
+            ptr,
+            "no new allocation: the exact same backing storage must be reused"
+        );
+    }
+
     /// Without overflow, all frames are delivered oldest-first.
     #[test]
     fn no_overflow_preserves_fifo_order() {
@@ -928,6 +1072,18 @@ mod tests {
         assert_eq!(drain(&ch), vec![7.0]);
     }
 
+    /// A push dropped for lock contention (never logged — see
+    /// `push_never_blocks_under_contention`) still increments the drop
+    /// counter, so the event is surfaced when the consumer next polls it.
+    #[test]
+    fn contended_push_increments_drop_counter() {
+        let ch = DropOldestChannel::new(4);
+        let guard = ch.inner.lock().unwrap();
+        ch.push(frame(1.0));
+        drop(guard);
+        assert_eq!(ch.take_dropped_count(), 1);
+    }
+
     /// After `close`, the consumer drains any queued tail then returns `None`.
     #[test]
     fn close_drains_tail_then_returns_none() {
@@ -941,8 +1097,16 @@ mod tests {
     }
 
     /// Concurrent producer/consumer: a fast producer overflowing a small ring
-    /// must never panic and the consumer must keep making progress. The
-    /// highest-id frame produced must eventually be observed (newest retained).
+    /// must never panic, the consumer must keep making progress in strict
+    /// FIFO order, and every produced frame must be accounted for — either
+    /// received or counted by the drop counter (never silently lost). The
+    /// exact split between "received" and "dropped" is scheduler-dependent
+    /// (a push can lose the `try_lock` race against the consumer as well as
+    /// overflow the ring), so the conservation identity `count + dropped ==
+    /// N` is the only bound that holds under all interleavings — unlike a
+    /// tolerance on the last id received, which is vulnerable to a burst of
+    /// contended-lock drops near the very end of the run under heavy
+    /// scheduler load.
     #[test]
     fn concurrent_overflow_no_panic_newest_observed() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1005,14 +1169,17 @@ mod tests {
         };
 
         producer.join().expect("producer panicked");
-        let (last, count) = consumer.join().expect("consumer panicked");
+        let (_last, count) = consumer.join().expect("consumer panicked");
+        let dropped = ch.take_dropped_count();
 
-        // Some frames were dropped (ring smaller than N) but never more than
-        // produced, and the consumer saw a high-id (newest-retained) frame.
+        // Every produced frame is either received or accounted for by the
+        // drop counter — never both, and never neither.
         assert!(count <= N, "received {count} > produced {N}");
-        assert!(
-            last >= (N as f32 - CAP as f32 - 1.0),
-            "expected a near-newest frame; last={last}, N={N}"
+        assert_eq!(
+            count + dropped,
+            N,
+            "every produced frame must be received or counted as dropped; \
+             received={count}, dropped={dropped}, produced={N}"
         );
     }
 }

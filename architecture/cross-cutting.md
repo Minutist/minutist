@@ -31,7 +31,7 @@ that.
 
 | Workload | Where it runs |
 |---|---|
-| Audio capture callback (cpal) | cpal's own thread; pushes frames into a bounded channel. With system-audio capture on (`settings.capture_system_audio`), a SECOND cpal callback (the render-endpoint loopback source) runs on its own thread and pushes into its own bounded ring — both RT callbacks keep the `try_lock`/drop-oldest discipline. |
+| Audio capture callback (cpal) | cpal's own thread; pushes frames into a bounded channel. With system-audio capture on (`settings.capture_system_audio`), a SECOND cpal callback (the render-endpoint loopback source) runs on its own thread and pushes into its own bounded ring — both RT callbacks keep the `try_lock`/drop-oldest discipline, fill a buffer taken from a recycled-buffer pool instead of allocating per block, and never log (see the real-time capture-callback invariant below). |
 | Audio mixer (mic + loopback) | A `spawn`/`spawn_blocking` task draining the two per-source 16 kHz batch channels; SUMS sample-wise, clamps, meters, and forwards the single mixed stream. Only present when system-audio capture is on; mic-only otherwise. Never blocks the RT callbacks (those feed the upstream rings). **Starvation valve:** if one source is idle (e.g. loopback when nothing is playing through the speakers) the mixer must NOT wait to pair samples — past a ~30 ms skew (`mixer::MAX_SKEW_SAMPLES`) it zero-fills the idle source and emits the live one, else the mic is buffered forever (silent transcript + dead meter). The cap also sets the meter/mic-latency cadence on the idle-loopback path (~30 Hz). |
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
@@ -166,6 +166,23 @@ rewrite on stop overwrites the live labels with the offline result. The
 wiring adds no dependency edge (the `orchestrator → diarizer` edge pre-exists)
 and no `common`-level online trait (the live path is a concrete struct;
 the existing `common::Diarizer` trait stays offline-only).
+
+**Real-time capture-callback invariant.** The cpal audio callback — and, on
+Windows, the WASAPI communications-mode capture thread that substitutes for it
+(`components.md` — `audio-capture`) — must never block, allocate, or log.
+`DropOldestChannel` (`crates/audio-capture/src/manager.rs`) carries the
+mechanism for all three: the callback takes a sample buffer from the
+channel's recycled-buffer pool (`take_buffer`) instead of allocating fresh
+storage per block, fills it in place, and pushes it under `try_lock`. On
+overflow the OLDEST queued frame is evicted; on lock contention the new frame
+is dropped instead. Both cases only increment an `AtomicUsize` drop counter —
+an evicted frame's buffer is taken out of the queue under the lock but only
+recycled or freed once the lock is released, and neither path logs. A
+forwarder task (never the callback) polls and resets that counter once per
+drain cycle and logs a warning when it is non-zero, surfacing the drop metric
+without ever running `tracing` on the audio thread: a log call is itself a
+stall risk, and logging every drop during a sustained overflow would
+self-amplify through the logging sink.
 
 **System/call audio capture + echo (AEC is future work).** When
 `settings.capture_system_audio` is on, the render-endpoint loopback is captured

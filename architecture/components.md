@@ -366,7 +366,8 @@ used, not added here.
 `AttachmentId`, `ConversionState`, `AttachmentEntry`,
 `LiveDigestItem`, `LiveDigest`, `LiveAgentMode`,
 `ProcessingLifecycle`, `ProcessingClaim`, `HostRef`,
-`ChatSession`, `ChatMessage`, `ChatRole`),
+`ChatSession`, `ChatMessage`, `ChatRole`, `VoiceprintSuggestion`,
+`SyncStatus`, `TunnelStatus`),
 trait definitions (`AsrBackend`, `Diarizer`,
 `Summariser`, `DocVlm`, `Embedder` — the last is **batch-first** (`embed_batch`
 primary; scalar `embed` default-delegates), and `ModelKind` carries an `Embed`
@@ -2206,11 +2207,17 @@ sidecar is indexed by `(language, segment_index)` and written by `ipc-bridge`'s
   on an absent file.
 
 **Invariant:** `write_transcript` calls `clear_translations` after writing the
-segment array. A full retranscription renumbers segment indices, so stale
-translations would point at the wrong segments; the clear is at the only call
-site that replaces all segments. Re-diarize does NOT call `write_transcript`
-(only `speaker_id`s change, indices/text are unchanged), so translations survive
-re-diarization. No new dependency edge — `persistence` still depends only on
+segment array — the clear lives inside `write_transcript` itself, so every
+caller that replaces the segment array clears stale translations, not only
+retranscription. A full retranscription renumbers segment indices, which is
+the clearest case translations must not survive. `orchestrator`'s
+`finalise_diarization` (shared by the on-stop diarization pass and the
+user-triggered re-diarize; see the `orchestrator` section) also calls
+`write_transcript` unconditionally: diarization rewrites the segment array
+itself — splitting/merging segments at speaker-turn boundaries (issue #0015),
+not just relabelling `speaker_id` — so translations do not survive a
+diarization pass either. A translation must be regenerated after any
+(re-)diarization. No new dependency edge — `persistence` still depends only on
 `common`.
 
 **Voiceprint library — `VoiceprintStore` + `voiceprints.db` (issue #0003, WU2).**
@@ -2631,6 +2638,26 @@ inside the orchestrator — `agent-tools` never reaches `model-registry`. A
 `re_transcribe_with_backend`) so the window-mapping + read-only behaviour are
 covered model-free; the `runner::pcm_window_for_excluding_range` mapping has
 gating unit tests over a synthetic PCM with a known mid-window pause.
+
+**Issue #0023 — `Orchestrator::extract_segment_wav(MeetingId, start_ms,
+end_ms) -> AppResult<Vec<u8>>`.** Backs the transcript pane's per-segment
+"play" control (`ipc-bridge`'s `meetingrecording:` scheme — see that section).
+Read-only and, unlike `transcribe_pcm_window`, runs **no inference**: it
+decodes `audio.opus` (`persistence::read_audio_pcm`), maps the pause-EXCLUDING
+`[start_ms, end_ms)` transcript window onto the pause-INCLUDING PCM via the
+same `runner::pcm_window_for_excluding_range` clamp-across-a-pause rule, and
+returns a self-contained 16 kHz mono PCM16 WAV of exactly that slice — so the
+webview plays the clip start-to-finish with no seeking, keeping the Ogg
+granule-position non-conformance (#0024) and container quirks out of the
+playback path. Caps the requested span before any decode (`MAX_RELISTEN_CLIP_MS`,
+so the pause-window clamp can never amplify a crafted oversized `end_ms` into a
+whole-region WAV), and — mirroring `transcribe_pcm_window`'s W2 guard —
+rejects a meeting that is still recording/finalising (its `audio.opus` is
+mid-write). Bounds concurrent whole-file decodes via a semaphore and caches
+the decoded PCM plus its pause-excluding region table single-entry
+(`relisten_pcm_cache`), so clicking through several segments of one meeting
+decodes `audio.opus` and runs the pause scan once. See `cross-cutting.md` —
+"Recording-audio re-listen serving".
 
 **Phase 9 — rediarize clears `speaker_names` (§4.4).** The shared
 `finalise_diarization` metadata write now also clears
@@ -3116,9 +3143,10 @@ into a `GpuPlan` to resolve the summariser `n_gpu_layers`. No new dependency edg
 
 **Field — `capture_system_audio: bool`.** Whether to capture the system/call
 (loopback) audio alongside the mic and MIX them into one transcribed stream, so
-a Teams-style call captures all participants. `#[serde(default)]`-defaults to
-`false` (opt-in and echo-safe; an older store deserialises to `false`). Added to
-the hand-written `Default` impl (`false`). The orchestrator reads it
+a Teams-style call captures all participants. `#[serde(default = ...)]`-defaults
+to `true` (opt-out — capturing the call audio is the point of a meeting-notes
+app; an older store deserialises to `true`). Added to the hand-written
+`Default` impl (`true`). The orchestrator reads it
 (`current().capture_system_audio`) and passes it into `AudioCaptureManager::start`,
 which opens the loopback source + mixer when on (Windows-only; mic-only fallback
 otherwise — see the `audio-capture` section). No new dependency edge.
@@ -3441,6 +3469,40 @@ whichever was inserted FIRST, i.e. the untrusted one. `run_tunnel` **refuses a
 non-`wss://` relay** (`TunnelError::Config`) before dialing — `ws://` is
 tolerated only for a loopback host, where cleartext never leaves the machine.
 
+### `sync`
+**Crate:** `crates/sync` (WS4-B)
+**Owns:** the device-to-device sync engine: an iroh QUIC transport that
+multiplexes three custom protocols over the crate's ALPNs between a user's own
+paired devices — Yjs notes-update reconciliation (`notes_proto`),
+content-addressed meeting-media transfer via `iroh-blobs` (`blobs`), and
+byte-stamped derived-artifact (`transcript.json` / `summary.md`) reconciliation
+(`artifacts_proto`) — plus the processing-lifecycle `Discovery` exchange
+(`discovery_proto`) and account-mediated peer discovery (`account`).
+
+**Dependency edges:** `common` + `notes-crdt` only (see the `sync` §-marked
+dependency-table footnote above for the full account/edge history), never
+`persistence` — this keeps the crate's lib off the C-heavy graph (libsql /
+audiopus / ogg) so it cross-compiles to `aarch64-linux-android` for the phone
+companion. Part of the connected-tier surface: the crate is an unconditional
+workspace member, but the `app-main -> sync` edge is `connected`-feature-gated
+(the free build wires `disabled_sync()` behind `ipc-bridge`'s `SyncControl`
+trait).
+
+**Public API.** `SyncEngine::start(config, identity)` binds the iroh endpoint
+and starts serving; `start_direct` is the relay-less path used by integration
+tests (`test-support` feature only). Manual pairing goes through `my_ticket()`
+/ `add_peer_from_ticket`; `add_account_peer` is the string-keyed primitive
+account-mediated discovery uses instead. `push_all_to_peer(peer_id)`
+reconciles every locally-held meeting (notes, then media, then a `Discovery`
+dial) to one peer; `discover_with_peer` / `discover_all` run just the
+lifecycle exchange. `subscribe_peer_events` / `subscribe_lifecycle_events` are
+the two bounded broadcast channels a host (the headless daemon, or a future
+desktop driver) reacts to. `shutdown(self)` is the owning, graceful stop.
+
+Wire framing, blob GC/tagging, and the artifact-authority tie-break rule are
+documented in the `sync` §-marked dependency-table footnote above, not
+duplicated here.
+
 ### `rag-retrieval`
 **Crate:** `crates/rag-retrieval` (RAG)
 **Owns:** retrieval-augmented context for the meeting agent on the iGPU tier —
@@ -3589,6 +3651,21 @@ resolves bytes via `persistence::read_note_asset` (whose path-traversal guard it
 relies on). This lives in `ipc-bridge` — not `app-main` — so the `persistence`
 edge stays inside `ipc-bridge` (`app-main` does not depend on `persistence`).
 See `cross-cutting.md` — "Note image assets".
+
+**Issue #0023 — `meetingrecording:` re-listen resolver**
+(`resolve_recording_slice(orchestrator, request_path) -> ResolvedRecordingSlice`,
+plus `MEETING_RECORDING_SCHEME`, and the pure `parse_recording_request` it
+wraps): parses a percent-decoded `/<meeting_id>/<start_ms>-<end_ms>` request
+path (rejecting non-UUID ids, nested segments, and non-integer or inverted
+bounds) and calls `Orchestrator::extract_segment_wav` (see the `orchestrator`
+section) to cut a self-contained WAV of exactly that transcript window.
+`app-main` registers the **asynchronous** URI-scheme protocol
+(`MEETING_RECORDING_SCHEME`, `register_asynchronous_uri_scheme_protocol`) that
+calls it — async because the decode runs on the orchestrator's blocking pool,
+which the synchronous `meetingasset:` handler shape cannot await. A success
+answers `200 audio/wav` (or `206 Partial Content` for a `Range` request); any
+validation/decode failure answers an empty `404` so no detail leaks. See
+`cross-cutting.md` — "Recording-audio re-listen serving".
 
 **Phase 4 — `stop_recording` index upsert (FR-33, in-session visibility).**
 `Orchestrator::stop` finalises the meeting folder but deliberately never touches
@@ -3832,10 +3909,13 @@ in the dependency table above):
 
 `IpcState` gains `event_tx: broadcast::Sender<AppEvent>` — a clone of the
 **same** bus `app-main` constructs once and shares with the `ModelRegistry` and
-the `Orchestrator` (via `with_event_tx`). Emitting `SummaryReady` here is the
-only place `ipc-bridge` produces an event directly; the event forwarder's single
-subscription (via `Orchestrator::subscribe_events`) sees it because the channel
-is shared. The summary crosses the wire as an opaque markdown `String`;
+the `Orchestrator` (via `with_event_tx`). Emitting `SummaryReady` here was the
+first place `ipc-bridge` produced an event directly; the shared `event_tx` is
+now also used by the attachment worker, the translation loop, determinate
+`OperationProgress` emits, and the live-agent driver (see their respective
+sections below). The event forwarder's single subscription (via
+`Orchestrator::subscribe_events`) sees all of them because the channel is
+shared. The summary crosses the wire as an opaque markdown `String`;
 `summarise_meeting` reuses `AppEvent::SummaryReady` (no new event). A
 `summarise_meeting_inner(&dyn Summariser, …)` seam lets the default test suite
 exercise the read → summarise → write → event wiring with a `StubSummariser`,
@@ -3925,29 +4005,18 @@ omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
 `chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
 per-session cancel flags `cancel_chat_turn` raises, P1).
 
-The command ledger is now **53** (P6 21 + the four P9 chat commands = 25; P10's
-`get_mcp_server_info` = 26; the P9 chat review-fix's `cancel_chat_turn` = 27;
-`prewarm_asr` = 28; `save_note_image` = 29; `set_speaker_name` = 30;
-`translate_meeting` + `get_translations` = 32; `get_diagnostic_report` = 33; the
-B6 WU7 CRDT editor binding's `apply_notes_update` + `load_notes_ydoc` = 35; the
-WS4-A S5b tunnel surface's `tunnel_begin_pairing` + `tunnel_poll_pairing` +
-`set_connector_enabled` + `tunnel_status` = 39; #0015 merges `re_transcribe` +
-`rediarize_meeting` into `reprocess` (39 − 2 + 1 = 38); the Attachments WS's
-`add_attachment` + `list_attachments` + `open_attachment` + `remove_attachment`
-= 42; the WS4-B S5 sync surface `sync_status` + `sync_get_my_ticket` +
-`sync_add_peer` + `sync_now` = 46; #0003 WU5 adds `reject_match` +
-`clear_all_voiceprints` = 48; #0003 WU8 adds `list_voiceprints` +
-`merge_voiceprint_identities` + `rename_voiceprint_identity` +
-`delete_voiceprint_identity` + `forget_meeting_voiceprints` = 53). The
-`bindings_builder_output_matches_committed_bindings_ts` test asserts the
-generated TypeScript is byte-identical to the committed `ui/src/ipc/bindings.ts`
-rather than checking a hand-maintained command-name array against the in-memory
-export — the array could (and did) drift silently from the frontend's actual
-command surface since it never compared against the file the app loads.
-Regenerate `bindings.ts` with `make bindings` after any command or
-command-reachable-type change and commit the result.
+The authoritative command list is the `collect_commands!` invocation inside
+`bindings_builder` (`crates/ipc-bridge/src/lib.rs`) — restating a running total
+in prose here is exactly what let it drift silently in the past, so it is not
+repeated. The `bindings_builder_output_matches_committed_bindings_ts` test
+asserts the generated TypeScript is byte-identical to the committed
+`ui/src/ipc/bindings.ts`, rather than checking a hand-maintained command-name
+array against the in-memory export — a hand-maintained array could (and did)
+drift from the frontend's actual command surface since it never compared
+against the file the app loads. Regenerate `bindings.ts` with `make bindings`
+after any command or command-reachable-type change and commit the result.
 
-**Issue #0003 WU8 — identity management commands (53 commands total).**
+**Issue #0003 WU8 — identity management commands.**
 
 - `list_voiceprints() -> Vec<VoiceprintIdentityInfo>` — every enrolled identity
   with per-condition gallery metadata; no embedding bytes (§2.2). Returns all
@@ -4150,6 +4219,34 @@ and passes the resulting `attachments_markdown: &str` into `summarise`. An empty
 manifest (or no Ready entries) passes `""`, producing byte-identical output to the
 no-attachment path. `summarise_meeting_inner` (the `#[cfg(test)]` stub path) passes
 `""` to preserve existing test behaviour.
+
+**Attachments pane (Attachments WS, webview).** `ui/src/state/attachments.ts`
+(`useAttachmentsStore`, zustand) and `ui/src/shell/AttachmentsPane.tsx` are an
+always-available optional column — not mode-gated like the summary/chat panes,
+usable before/during/after recording. The pane accepts drag-and-drop or a
+file-picker (`SUPPORTED_EXTS`, mirroring `doc_convert::supported_exts()`) and
+rejects an unsupported extension, or a file over the 50 MiB limit
+(`doc_convert::MAX_INPUT_BYTES`), inline before the round-trip. Each row shows
+the filename, an extension badge, and a conversion-state affordance (an
+indeterminate bar while `Pending`, a quiet check once `Ready`, an inline
+failure notice with an "Open anyway" fallback on `Failed`).
+
+The store routes every mutation through the `ui/src/ipc/attachments.ts` seam
+(`addAttachment` / `listAttachments` / `openAttachment` / `removeAttachment`,
+wrapping the generated `commands.*`); `attachments.json` on disk stays
+authoritative and the store holds only transient UI state. `read(meetingId)`
+loads the manifest on pane mount / meeting switch; `add` optimistically
+inserts a `Pending` row, de-duplicated against the `attachment_added` event
+(which may race ahead of the command's own return); `remove` optimistically
+drops the row and restores it if the backend call fails. `handleEvent`
+(dispatched from the same `useAppEventBridge` fan-out as the other stores)
+applies `attachment_added` / `attachment_converted` /
+`attachment_conversion_failed` / `attachment_removed`, all gated on the
+loaded `meetingId` so a backgrounded conversion for another meeting never
+clobbers the open pane — the same pattern `chat.ts` and `summary.ts` use.
+`open` calls `openAttachment`, which asks the backend to hand the stored
+original to the host OS default application (see "Opening an original"
+above); no bytes or filesystem path cross back to the webview.
 
 **Live in-meeting agent auto-driver (`ipc-bridge::live_agent`, Phase 9 / WU2b).**
 `spawn_live_agent(handles, meeting_id, shutdown, registry)` wires the held-context
@@ -4381,6 +4478,34 @@ user-overridable). Adds the `tunnel-client` (optional, connected) dependency
 edge; the free build omits it (verified by `cargo build -p minutist
 --no-default-features`).
 
+### `headless` (bin)
+**Crate:** `crates/headless` (WS4-B)
+**Owns:** the user-installed headless server daemon, `minutist-hub` — a SECOND
+workspace binary beside `app-main`: an always-on device-sync hub now, and
+(post-launch) a GPU processing node. It runs on hardware the user owns and
+controls, in its own data root, never shared with a desktop's `{app-data}`; it
+is not a build variant of `app-main` and shares no code path with it.
+
+**Dependency edges:** `common`, `persistence`, `sync`, `settings` — the
+permitted phase-1 set (see the `headless` ‖-marked dependency-table footnote
+above; the post-launch GPU node adds the ML-runtime crates as a separate
+table-update commit). No `tauri::*` / `ipc-bridge` edge: the daemon wires
+`sync::SyncEngine` directly and carries no command/event surface.
+
+**CLI surface** (`clap`). The daemon runs by default
+(`minutist-hub --data-dir <path>`); `print-ticket` prints this device's
+pairing ticket to stdout and exits; `add-peer <ticket>` validates a peer's
+pairing ticket and appends it to `{data_dir}/peers` (re-read on a poll
+interval, so a peer added while the daemon runs is authorised without a
+restart); `status` prints the hub's state as JSON (endpoint id, relay,
+authorised peers, held meetings each with a content digest of their notes) —
+a pure filesystem read with no engine bind, so an automated harness uses it as
+a convergence oracle.
+
+Convergence behaviour (push-on-reconnect, the lifecycle discovery sweep),
+tracing, configuration, and packaging are documented in `cross-cutting.md` —
+"Headless server daemon", not duplicated here.
+
 ## Webview components
 
 The webview is small enough that ownership maps to directories rather
@@ -4389,8 +4514,8 @@ than packages.
 | Component | Lives in | Owns |
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
-| Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Rows are virtualised (`@tanstack/react-virtual`) and keyed by segment `start_ms`: only the rows in the scroll container's visible window (plus a small overscan) are mounted, and identity follows the segment across a splice/reorder rather than sticking to an array position. The per-row component (`TranscriptRow`) is memoised so a live append re-renders only the newly-visible rows. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
-| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, a Connection pane (`ConnectionSettingsPane.tsx`, WS4-A S5b — connector enable toggle, "Pair this device" via the device-code flow that shows the `user_code` and opens the verification URL with `tauri-plugin-opener`, live `Connecting → Online` status, and the paired account; honest that the connector channel transits content to the AI vendor by design, never "private"), and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one Phase-10 read command `get_mcp_server_info`; the Connection pane drives the four WS4-A S5b tunnel commands. Both connected-only panes are `VITE_CONNECTED`-gated (lazy-loaded; dropped from the free bundle). |
+| Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. The live audio meter (`AudioMeter.tsx`) renders at the top of this pane. Rows are virtualised (`@tanstack/react-virtual`) and keyed by segment `start_ms`: only the rows in the scroll container's visible window (plus a small overscan) are mounted, and identity follows the segment across a splice/reorder rather than sticking to an array position. The per-row component (`TranscriptRow`) is memoised so a live append re-renders only the newly-visible rows. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
+| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, a Connection pane (`ConnectionSettingsPane.tsx`, WS4-A S5b — connector enable toggle, "Pair this device" via the device-code flow that shows the `user_code` and opens the verification URL with `tauri-plugin-opener`, live `Connecting → Online` status, and the paired account; honest that the connector channel transits content to the AI vendor by design, never "private"), and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one Phase-10 read command `get_mcp_server_info`; the Connection pane drives the four WS4-A S5b tunnel commands. Both connected-only panes are `VITE_CONNECTED`-gated (lazy-loaded; dropped from the free bundle). |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 
@@ -4839,7 +4964,8 @@ A warm-paper, document-centric **light** theme applied across the webview.
   (`RecordingMasthead.tsx`) bound to the live meeting via
   `useRecordingStore.setTitle` → `set_recording_title` (the live meeting has no
   saved title yet; it is applied at stop). The right cluster is the grouped
-  transport + slim meter + the segmented pane-visibility toggle.
+  transport + the segmented pane-visibility toggle (the audio meter itself
+  renders in the transcript pane, not the top bar).
 - **Margin-anchor marginalia.** `ui/src/editor/anchor-marginalia.ts` is a
   **presentation-only** ProseMirror decoration extension: it renders each
   anchored paragraph's timestamp as a quiet side-note in the sheet's left gutter,

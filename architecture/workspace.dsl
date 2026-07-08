@@ -52,6 +52,10 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
             tags "External" "Optional"
         }
 
+        connectorRelay = softwareSystem "Connected-tier relay (minutist-relay)" "Hosted backend behind mcp.minutist.ai (WSS tunnel relay, dialled outbound by tunnel-client to replay MCP requests against the app's loopback mcp-server) and api.minutist.ai (RFC 8628 device-code pairing API). Server-side only, never shipped; user-overridable for self-hosting." {
+            tags "External" "Optional"
+        }
+
         phoneCompanion = softwareSystem "Phone companion (minutist-mobile)" "Android Capacitor app in the sibling minutist-mobile repo. Bundles the sync-ffi .so and calls its UniFFI surface to join the same paired-device sync mesh as the desktop and the headless hub." {
             tags "External" "Optional"
         }
@@ -70,8 +74,8 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
                 tags "Container" "Frontend"
 
                 editor       = component "Notes editor" "Tiptap WYSIWYG editor with markdown shortcuts. Owns paragraph-anchor timestamps." "Tiptap / @tiptap/react"
-                transcriptUi = component "Transcript pane" "Live-appending transcript view. Per-segment speaker chip with a live colour dot (deterministic speaker_id -> palette slot) when diarization labels are present. Read-only; emits hover/click cross-reference events." "React"
-                meetingShell = component "Meeting shell" "Window chrome, start/stop/pause controls, audio meter, meeting-list view." "React"
+                transcriptUi = component "Transcript pane" "Live-appending transcript view, with the live audio meter rendered above it. Per-segment speaker chip with a live colour dot (deterministic speaker_id -> palette slot) when diarization labels are present. Read-only; emits hover/click cross-reference events." "React"
+                meetingShell = component "Meeting shell" "Window chrome, start/stop/pause controls, meeting-list view." "React"
                 ipcClient    = component "IPC client" "Typed wrapper around Tauri invoke + event APIs. Generated from Rust types via tauri-specta." "TypeScript / tauri-specta"
                 uiState      = component "UI state store" "Zustand store. Holds derived UI state; transient only, no persistence." "Zustand"
             }
@@ -123,9 +127,9 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 election = component "election" "Host-election state machine for the producer gate (WS4-B): claims a claimable meeting (PendingProcessing, or a Claimed past its lease) with audio already synced in, runs the pipeline, and writes Processed — via the ElectionDriver trait. A leaf (common + persistence only): the sync (advertise) and orchestrator (process) collaborators sit behind the trait, so this crate takes no edge to either and the one state machine is reused by both eligible host types. Connected-feature gated; wired into app-main in S4." "Rust crate: crates/election"
 
-                settings = component "settings" "Settings schema, validation, change notifications. Persists via tauri-plugin-store." "Rust crate: crates/settings"
+                settings = component "settings" "Settings schema, validation, change notifications. Persists to a single JSON file at {app-data}/settings.store via serde_json + std::fs; no tauri dependency." "Rust crate: crates/settings"
 
-                docConvert = component "doc-convert" "Converts attached document bytes (PDF, XLSX, PPTX, HTML, EML, ODS, txt/md) to canonical markdown. Pure-Rust in-process; catch_unwind sandboxed; no OCR. Public surface: convert_to_markdown + supported_exts." "Rust crate: crates/doc-convert"
+                docConvert = component "doc-convert" "Converts attached document bytes (PDF, XLSX, PPTX, DOCX, HTML, EML, ODS, CSV/TSV, JSON/YAML/XML, txt/md/log) to canonical markdown; routes images (PNG/JPEG/TIFF) to an injected OCR backend. Pure-Rust in-process; catch_unwind sandboxed. Public surface: convert_to_markdown + supported_exts." "Rust crate: crates/doc-convert"
 
                 ipcBridge = component "ipc-bridge" "Tauri command + event surface. tauri-specta generates the TypeScript bindings consumed by the webview's IPC client. The only crate that knows about Tauri APIs." "Rust crate: crates/ipc-bridge"
 
@@ -169,6 +173,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         mcpClient -> minutist "Reads meetings + messages the internal agent over MCP" "Streamable HTTP / loopback"
         minutist -> irohRelay "Syncs paired devices (NAT traversal / relay fallback; ciphertext only)" "QUIC / HTTPS"
         phoneCompanion -> minutist "Syncs meetings/notes/lifecycle with paired devices" "QUIC (iroh)"
+        minutist -> connectorRelay "Dials the relay tunnel (device pairing + MCP relay) and the account/pairing API (connected tier, opt-in)" "WSS / HTTPS"
 
         // ----------------------------------------------------------------
         // Relationships — Container (Level 2)
@@ -188,6 +193,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core -> minutist.headlessHub "Reconciles notes + media + derived artifacts over iroh QUIC (mutual device sync)"
         minutist.core -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
         minutist.headlessHub -> irohRelay "NAT traversal / relay fallback (ciphertext only)" "QUIC"
+        minutist.core.tunnelClient -> connectorRelay "Dials the relay tunnel outbound (WSS); pairing client posts to the account API" "WSS / HTTPS"
         phoneCompanion -> minutist.syncFfiBridge "Bundles the .so; calls the UniFFI sync surface" "JNI"
         minutist.syncFfiBridge -> phoneCompanion "Pushes lifecycle/peer-arrival events to registered listeners" "JNI callback"
 
@@ -219,9 +225,11 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.orchestrator -> minutist.core.diarizer "On stop: assigns speakers via Diarizer trait (authoritative); during recording: live per-segment labels via OnlineDiarizer (additive)"
         minutist.core.orchestrator -> minutist.core.ipcBridge "Emits transcript / meter / state events"
 
-        // Model lifecycle.
-        minutist.core.asrRuntime  -> minutist.core.modelRegistry "Resolves + loads ASR model"
-        minutist.core.asrParakeet -> minutist.core.modelRegistry "Resolves + loads Parakeet ONNX model"
+        // Model lifecycle. asr-runtime / asr-parakeet depend only on common; all
+        // model-registry resolution lives in the orchestrator (runner::build_diarizer
+        // / init_asr_runtime), which hands the resolved model path to the ASR/diarizer
+        // backend rather than either resolving its own model.
+        minutist.core.orchestrator -> minutist.core.modelRegistry "Resolves model dirs (ensure/list) for ASR + diarizer"
         minutist.core.modelRegistry -> modelHost "Reads / downloads model files"
 
         // FFI boundaries.
@@ -237,14 +245,17 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.notesCrdt   -> minutist.meetingFs "notes.ydoc / notes.json / notes.md + metadata.json I/O"
 
         // Summarisation triggered by user action; orchestrator is bypassed once
-        // the meeting is stopped — summariser reads from persistence directly.
-        minutist.core.summariser  -> minutist.core.persistence "Reads transcript + notes; writes summary.md"
+        // the meeting is stopped. summariser takes transcript/notes as plain
+        // parameters (Summariser::summarise) — it has no persistence edge itself;
+        // ipc-bridge reads via persistence::read_transcript / writes via
+        // persistence::write_summary around the call (see the ipcBridge -> persistence
+        // edge below).
         minutist.core.summariser  -> externalLlm "Optional dispatch" "HTTP"
 
-        // Settings.
-        minutist.core.settings    -> minutist.meetingFs "Persists user preferences" "tauri-plugin-store"
+        // Settings. The settings crate has no tauri dependency; it persists
+        // directly to a JSON file at {app-data}/settings.store via std::fs (the
+        // path is injected by app-main, outside the per-meeting filesystem).
         minutist.core.orchestrator -> minutist.core.settings "Reads runtime config"
-        minutist.core.asrRuntime   -> minutist.core.settings "Reads model selection"
 
         // Shared tool layer (Phase 9). One Tool trait + ToolRegistry, driven by
         // both the chat agent and (Phase 10) the MCP server. Reads meeting

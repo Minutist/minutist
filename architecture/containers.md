@@ -9,7 +9,7 @@
 | **Webview UI** | React 19 + TypeScript + Tiptap, inside a Tauri webview | Per-window | Notes editor, transcript pane, meeting controls, audio meter, meeting-list view. No business logic. |
 | **Rust core** | Tauri 2 main process | Per app instance | All native subsystems — audio, ASR, diarization, summarisation, persistence, settings. Exposes a typed command + event surface to the webview, and (Phase 10, settings-gated/off-by-default) an in-process **Streamable HTTP MCP server** on loopback (`127.0.0.1:{mcp_port}/mcp`, bearer + Host/Origin) projecting the `agent-tools` registry to external agents. |
 | **llama.cpp** | Bundled native lib, Vulkan / Metal / CPU | Loaded per model | ASR (Qwen3-ASR via the mtmd module) and summary-LLM inference. |
-| **sherpa-onnx** | Bundled native lib, ONNX Runtime | Loaded on demand | Diarization (pyannote/segmentation-3.0 segmentation + 3D-Speaker CAM++ speaker embeddings + clustering). |
+| **sherpa-onnx** | Bundled native lib, ONNX Runtime | Loaded on demand | Diarization (pyannote/segmentation-3.0 segmentation + 3D-Speaker CAM++ speaker embeddings + clustering) and the primary ASR engine for English + 24 EU languages (Parakeet TDT, offline transducer). |
 | **libsql index** | SQLite file at `{app-data}/index.db` | Per app instance, persistent | Fast list / search over per-meeting metadata. |
 | **Meeting filesystem** | Per-meeting directories under `{app-data}/meetings/{uuid}/` | Persistent | Authoritative store for audio, transcript, notes, summary, metadata. |
 | **Minutist Server** | Rust headless binary (`minutist-hub`), tokio multi-threaded; systemd unit / OCI container | Always-on, user-installed (optional) | The user's own always-on node: a sync hub other devices converge through, and (post-launch) a GPU processing node. Pairs into the device mesh like a desktop; holds meeting plaintext in its OWN data root. The user owns the hardware, so it sits in the same trust boundary as the desktop — distinct from the hosted relay, which only ever brokers ciphertext. |
@@ -19,14 +19,13 @@
 `llama.cpp` and `sherpa-onnx` ship as separate native dependencies because
 they serve different inference shapes:
 
-- llama.cpp is a single backend that we use for both ASR and the
-  summary LLM (the value of the architectural pivot — one runtime for
-  two workloads).
-- sherpa-onnx is the diarization pipeline. We do not own enough audio /
-  ML engineering capacity to reimplement the pyannote/segmentation-3.0
-  (MIT) segmentation model and the 3D-Speaker CAM++ (Apache-2.0) speaker
-  embeddings plus clustering. It's a hard external dependency at the
-  runtime layer.
+- llama.cpp backs the Qwen3-ASR tiers (the fallback ASR path for languages
+  Parakeet doesn't cover) and the summary LLM — one runtime for two workloads.
+- sherpa-onnx backs the primary ASR engine (Parakeet TDT, English + 24 EU
+  languages) and diarization. We do not own enough audio / ML engineering
+  capacity to reimplement Parakeet TDT, the pyannote/segmentation-3.0 (MIT)
+  segmentation model, or the 3D-Speaker CAM++ (Apache-2.0) speaker embeddings
+  plus clustering. It's a hard external dependency at the runtime layer.
 
 The cost is an extra 50-80 MB of native libs in the bundle and a second
 backend to keep up to date. Worth it.
@@ -40,8 +39,8 @@ mic ─▶ Rust core ─▶ webview              (audio meter; transcript events
        Rust core ─▶ libsql                (metadata index)
        Rust core ◀─ webview               (commands: start/stop, save notes,
                                             run summary, open meeting)
-       Rust core ◀▶ llama.cpp             (ASR + summary inference, FFI)
-       Rust core ◀▶ sherpa-onnx           (diarization inference, FFI)
+       Rust core ◀▶ llama.cpp             (Qwen ASR tiers + summary inference, FFI)
+       Rust core ◀▶ sherpa-onnx           (Parakeet ASR + diarization inference, FFI)
        Rust core ◀▶ Minutist Server       (notes + media sync over iroh QUIC;
                                             converges through the user's own box)
        Rust core ─▶ iroh relay            (NAT traversal / relay fallback;

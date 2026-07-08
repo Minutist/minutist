@@ -298,11 +298,10 @@ impl ToolRegistry {
             Arc::new(tools::SetSpeakerName),
             Arc::new(tools::RenameMeeting),
             Arc::new(tools::ReprocessMeeting),
-            // Record-control writes (#62). All `is_write` with the default
-            // `expose_over_mcp` (`!is_write` → `false`), so they are write-gated
-            // OFF over MCP regardless of `mcp_write_tools` — the recording
-            // lifecycle is never driven over MCP in v1. The internal UI chat
-            // (no MCP gate) can dispatch them.
+            // Record-control writes (#62). All `is_write`, each overriding
+            // `expose_over_mcp` to `true` — write-gated: absent + rejected over
+            // MCP when `mcp_write_tools` is off, exposed + callable when it is
+            // on. The internal UI chat (no MCP gate) can always dispatch them.
             Arc::new(tools::StartRecording),
             Arc::new(tools::StopRecording),
             Arc::new(tools::PauseRecording),

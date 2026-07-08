@@ -264,14 +264,16 @@ ring buffer, VAD chunking. Knowledge expected: `cpal`, Silero VAD, the
 back-pressure model for the live pipeline.
 
 ### `ml-runtime-engineer`
-Owns the four ML-runtime crates: ASR, diarization, summarisation, model
-registry. Knowledge expected: `llama-cpp-2` mtmd and text APIs,
-`sherpa-onnx`, model file formats, ONNX vs GGUF tradeoffs.
+Owns the ML-runtime crates: ASR (`asr-runtime`, `asr-parakeet`),
+diarization (`diarizer`), summarisation (`summariser`), model registry,
+RAG retrieval (`rag-retrieval`, `embedder`), and the chat-agent turn
+engine (`chat-agent`) — see the domain table above for the authoritative
+list. Knowledge expected: `llama-cpp-2` mtmd and text APIs, `sherpa-onnx`,
+model file formats, ONNX vs GGUF tradeoffs.
 
-A single agent can hold this role across all four crates *if* changes
-are sequential. Parallelising within the role requires splitting the
-crates among agents — possible because the crates don't depend on each
-other.
+A single agent can hold this role across these crates *if* changes are
+sequential. Parallelising within the role requires splitting the crates
+among agents — possible because the crates don't depend on each other.
 
 ### `data-engineer`
 Owns persistence, the notes-CRDT leaf, and settings. Knowledge expected:

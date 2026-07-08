@@ -56,6 +56,7 @@ function resetStore() {
     toolActivity: null,
     lastError: null,
     historyTrimmed: false,
+    pendingEvents: [],
   });
 }
 
@@ -379,6 +380,87 @@ describe("useChatStore — actions", () => {
     expect(state.inFlight).toBe(false);
     expect(state.streaming).toBeNull();
     expect(state.lastError).toBe("session busy");
+  });
+
+  // ---------------------------------------------------------------------
+  // G3b — new-session token buffering. `send()` sets `inFlight` and starts
+  // streaming before `sendChatMessage` resolves with the backend-minted
+  // session id; events that race ahead of that resolution must not be
+  // dropped by the per-session scoping guard.
+  // ---------------------------------------------------------------------
+
+  it("buffers chat_token events that arrive for a new session before adoption, then replays them", async () => {
+    useChatStore.setState({ sessionId: null, messages: [] });
+    // Hold `sendChatMessage` open so events can race ahead of adoption.
+    let resolveDispatch!: (id: string) => void;
+    vi.mocked(sendChatMessage).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveDispatch = resolve;
+      }),
+    );
+
+    const sendPromise = useChatStore.getState().send("What was decided?");
+
+    // The dispatch hasn't resolved yet — `sessionId` is still null — but the
+    // backend has already started streaming under the new session id.
+    useChatStore.getState().handleEvent({
+      kind: "chat_token",
+      session_id: "new-session",
+      turn_id: 0,
+      token: "The team",
+    });
+    useChatStore.getState().handleEvent({
+      kind: "chat_token",
+      session_id: "new-session",
+      turn_id: 0,
+      token: " decided X.",
+    });
+    // Not yet applied — the session id has not been adopted.
+    expect(useChatStore.getState().streaming).toBe("");
+
+    resolveDispatch("new-session");
+    await sendPromise;
+
+    const state = useChatStore.getState();
+    expect(state.sessionId).toBe("new-session");
+    // The buffered deltas are replayed in order once the id is adopted.
+    expect(state.streaming).toBe("The team decided X.");
+    expect(state.pendingEvents).toEqual([]);
+  });
+
+  it("drops a buffered event whose session_id does not match the adopted session", async () => {
+    useChatStore.setState({ sessionId: null, messages: [] });
+    let resolveDispatch!: (id: string) => void;
+    vi.mocked(sendChatMessage).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveDispatch = resolve;
+      }),
+    );
+
+    const sendPromise = useChatStore.getState().send("hi");
+    useChatStore.getState().handleEvent({
+      kind: "chat_token",
+      session_id: "some-other-session",
+      turn_id: 0,
+      token: "unrelated",
+    });
+
+    resolveDispatch("new-session");
+    await sendPromise;
+
+    expect(useChatStore.getState().streaming).toBe("");
+  });
+
+  it("does not buffer events when no send is in flight (sessionId null, inFlight false)", () => {
+    useChatStore.setState({ sessionId: null, inFlight: false, streaming: null });
+    useChatStore.getState().handleEvent({
+      kind: "chat_token",
+      session_id: "some-session",
+      turn_id: 0,
+      token: "x",
+    });
+    expect(useChatStore.getState().streaming).toBeNull();
+    expect(useChatStore.getState().pendingEvents).toEqual([]);
   });
 
   it("cancel raises the backend flag and clears the in-flight state (P1)", async () => {

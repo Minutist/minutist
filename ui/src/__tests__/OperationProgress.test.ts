@@ -110,4 +110,65 @@ describe("operation-progress store", () => {
     expect(useOperationProgressStore.getState().operationFor("m1")).toBeNull();
     expect(useOperationProgressStore.getState().operationFor("m2")).not.toBeNull();
   });
+
+  // -------------------------------------------------------------------------
+  // `error_occurred` — the finalise-handshake-abort terminal signal (G3d).
+  // `AppError` carries no `meeting_id`, so this cannot target one row by id;
+  // it clears every `finalise` row instead (at most one can be in flight).
+  // -------------------------------------------------------------------------
+
+  it("error_occurred clears a finalise row (the post-stop handshake aborted)", () => {
+    useOperationProgressStore.setState({
+      operations: {
+        m1: { op: "finalise", fraction: null, label: "Finishing up…" },
+      },
+    });
+
+    useOperationProgressStore.getState().handleEvent({
+      kind: "error_occurred",
+      error: { code: "io", context: "disk full" },
+    });
+
+    expect(useOperationProgressStore.getState().operationFor("m1")).toBeNull();
+  });
+
+  it("error_occurred leaves non-finalise rows untouched", () => {
+    useOperationProgressStore.setState({
+      operations: {
+        m1: { op: "finalise", fraction: null, label: "Finishing up…" },
+        m2: { op: "re_transcribe", fraction: 0.5, label: "Re-transcribing…" },
+      },
+    });
+
+    useOperationProgressStore.getState().handleEvent({
+      kind: "error_occurred",
+      error: { code: "internal", context: "boom" },
+    });
+
+    expect(useOperationProgressStore.getState().operationFor("m1")).toBeNull();
+    expect(useOperationProgressStore.getState().operationFor("m2")).toEqual({
+      op: "re_transcribe",
+      fraction: 0.5,
+      label: "Re-transcribing…",
+    });
+  });
+
+  it("error_occurred is a no-op when nothing is finalising", () => {
+    useOperationProgressStore.setState({
+      operations: {
+        m1: { op: "summarise", fraction: 0.2, label: "Summarising…" },
+      },
+    });
+
+    useOperationProgressStore.getState().handleEvent({
+      kind: "error_occurred",
+      error: { code: "cancelled" },
+    });
+
+    expect(useOperationProgressStore.getState().operationFor("m1")).toEqual({
+      op: "summarise",
+      fraction: 0.2,
+      label: "Summarising…",
+    });
+  });
 });

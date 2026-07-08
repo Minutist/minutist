@@ -1,12 +1,16 @@
 /**
- * Tests for the translated transcript feature (WU4).
+ * Tests for the translated transcript feature (WU4) and its G3c hardening.
  *
  * Covers:
  * - `translate_meeting` command invocation through the translations store.
- * - `get_translations` result populates the store's `translations` Map.
+ * - `get_translations`'s index-keyed result is converted to a `start_ms`-keyed
+ *   map against the segments supplied by the caller.
  * - `showVerbatim` clears the selected language and translations map.
  * - `TranslationReady` event refreshes translations for the active meeting +
  *   language (and ignores events for different languages or meetings).
+ * - `transcript_ready` / `diarization_complete` for the open meeting clear the
+ *   cached translations (a reprocess replaces the segment array the cached
+ *   `start_ms` keys were computed against — G3c).
  * - `translation_ready` clears the operation-progress indicator.
  *
  * Tests mock `../ipc/translations` (the seam module), not the generated
@@ -29,12 +33,28 @@ vi.mock("../ipc/translations", () => ({
   getTranslations: vi.fn().mockResolvedValue(new Map<number, string>()),
 }));
 
+// `handleEvent`'s translation_ready re-fetch sources segments from the active
+// transcript (a non-reactive read); mock it so the test controls the segment
+// array independently of the recording/meetings stores.
+vi.mock("../state/active-transcript", () => ({
+  activeTranscript: vi.fn(),
+}));
+
 import { translateMeeting, getTranslations } from "../ipc/translations";
 import { useTranslationsStore } from "../state/translations";
 import { useOperationProgressStore } from "../state/operation-progress";
-import type { AppEvent } from "../ipc/bindings";
+import { activeTranscript } from "../state/active-transcript";
+import type { AppEvent, Segment } from "../ipc/bindings";
 
 const MEETING_ID = "00000000-0000-0000-0000-000000000001";
+
+/** Two segments at start_ms 0 and 5_000 — the fixture index -> start_ms map. */
+function makeSegments(): Segment[] {
+  return [
+    { start_ms: 0, end_ms: 1_000, text: "first", words: [], shared_speakers: [] },
+    { start_ms: 5_000, end_ms: 6_000, text: "second", words: [], shared_speakers: [] },
+  ];
+}
 
 function resetStores() {
   useTranslationsStore.setState({
@@ -45,6 +65,7 @@ function resetStores() {
     openMeetingId: null,
   });
   useOperationProgressStore.setState({ operations: {} });
+  vi.mocked(activeTranscript).mockReturnValue(makeSegments());
 }
 
 describe("translations store", () => {
@@ -53,7 +74,8 @@ describe("translations store", () => {
     resetStores();
   });
 
-  it("translate() calls translateMeeting then getTranslations and updates store", async () => {
+  it("translate() calls translateMeeting then getTranslations, keying the result by start_ms", async () => {
+    // Backend result is INDEX-keyed (segment 0, segment 1).
     const translatedMap = new Map<number, string>([
       [0, "Hola mundo"],
       [1, "Esta es una prueba"],
@@ -61,15 +83,33 @@ describe("translations store", () => {
     vi.mocked(getTranslations).mockResolvedValueOnce(translatedMap);
 
     useTranslationsStore.setState({ openMeetingId: MEETING_ID });
-    await useTranslationsStore.getState().translate(MEETING_ID, "Spanish");
+    await useTranslationsStore
+      .getState()
+      .translate(MEETING_ID, "Spanish", makeSegments());
 
     expect(translateMeeting).toHaveBeenCalledWith(MEETING_ID, "Spanish");
     expect(getTranslations).toHaveBeenCalledWith(MEETING_ID, "Spanish");
     expect(useTranslationsStore.getState().selectedLanguage).toBe("Spanish");
+    // Converted to the segments' start_ms (0 and 5_000), not the raw index.
     expect(useTranslationsStore.getState().translations.get(0)).toBe(
       "Hola mundo",
     );
+    expect(useTranslationsStore.getState().translations.get(5_000)).toBe(
+      "Esta es una prueba",
+    );
     expect(useTranslationsStore.getState().translateInFlight).toBe(false);
+  });
+
+  it("translate() drops an index that falls outside the supplied segments", async () => {
+    // Index 2 has no corresponding segment in a 2-segment array.
+    const translatedMap = new Map<number, string>([[2, "orphaned"]]);
+    vi.mocked(getTranslations).mockResolvedValueOnce(translatedMap);
+
+    await useTranslationsStore
+      .getState()
+      .translate(MEETING_ID, "Spanish", makeSegments());
+
+    expect(useTranslationsStore.getState().translations.size).toBe(0);
   });
 
   it("loadTranslations() fetches without triggering translateMeeting", async () => {
@@ -78,7 +118,7 @@ describe("translations store", () => {
 
     await useTranslationsStore
       .getState()
-      .loadTranslations(MEETING_ID, "French");
+      .loadTranslations(MEETING_ID, "French", makeSegments());
 
     expect(translateMeeting).not.toHaveBeenCalled();
     expect(getTranslations).toHaveBeenCalledWith(MEETING_ID, "French");
@@ -134,6 +174,9 @@ describe("translations store", () => {
     await Promise.resolve();
 
     expect(getTranslations).toHaveBeenCalledWith(MEETING_ID, "Spanish");
+    expect(useTranslationsStore.getState().translations.get(0)).toBe(
+      "Hola v2",
+    );
   });
 
   it("handleEvent(translation_ready) ignores events for a different language", async () => {
@@ -169,6 +212,51 @@ describe("translations store", () => {
     await Promise.resolve();
 
     expect(getTranslations).not.toHaveBeenCalled();
+  });
+
+  // -------------------------------------------------------------------------
+  // G3c — a reprocess (re-transcribe and/or re-diarize) replaces the open
+  // meeting's segment array; cached translations are keyed against the
+  // segments that produced them and must not survive to be misapplied.
+  // -------------------------------------------------------------------------
+
+  it.each(["transcript_ready", "diarization_complete"] as const)(
+    "handleEvent(%s) clears the translated view for the open meeting",
+    (kind) => {
+      useTranslationsStore.setState({
+        openMeetingId: MEETING_ID,
+        selectedLanguage: "Spanish",
+        translations: new Map([[0, "Hola"]]),
+      });
+
+      const event = (
+        kind === "diarization_complete"
+          ? { kind, meeting_id: MEETING_ID, speaker_count: 2 }
+          : { kind, meeting_id: MEETING_ID }
+      ) as AppEvent;
+      useTranslationsStore.getState().handleEvent(event);
+
+      const state = useTranslationsStore.getState();
+      expect(state.selectedLanguage).toBeNull();
+      expect(state.translations.size).toBe(0);
+    },
+  );
+
+  it("handleEvent(transcript_ready) leaves an unrelated meeting's translations untouched", () => {
+    useTranslationsStore.setState({
+      openMeetingId: MEETING_ID,
+      selectedLanguage: "Spanish",
+      translations: new Map([[0, "Hola"]]),
+    });
+
+    useTranslationsStore.getState().handleEvent({
+      kind: "transcript_ready",
+      meeting_id: "00000000-0000-0000-0000-000000000099",
+    });
+
+    const state = useTranslationsStore.getState();
+    expect(state.selectedLanguage).toBe("Spanish");
+    expect(state.translations.get(0)).toBe("Hola");
   });
 });
 

@@ -1,4 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  useMemo,
+  memo,
+  forwardRef,
+} from "react";
+import type { CSSProperties } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { useCrossRefStore } from "../state/cross-ref";
 import { useActiveTranscript } from "../state/active-transcript";
 import { useMeetingsStore } from "../state/meetings";
@@ -140,6 +150,10 @@ function TranscriptToolbar() {
   const translateInFlight = useTranslationsStore((s) => s.translateInFlight);
   const translate = useTranslationsStore((s) => s.translate);
   const showVerbatim = useTranslationsStore((s) => s.showVerbatim);
+  // The toolbar only renders for a saved, idle meeting (the gate above), so
+  // this is always the restored transcript `translate` needs to key its
+  // result against.
+  const transcript = useActiveTranscript();
 
   // Translation target language. Starts UNSELECTED (a "Translate to…"
   // placeholder) rather than pre-seeded to the alphabetically-first language, so
@@ -214,7 +228,9 @@ function TranscriptToolbar() {
               type="button"
               className="transcript-pane__action"
               disabled={translateDisabled || pickedLanguage === ""}
-              onClick={() => void translate(openMeetingId, pickedLanguage)}
+              onClick={() =>
+                void translate(openMeetingId, pickedLanguage, transcript)
+              }
               title="Translate this transcript into the selected language using the local LLM."
             >
               {translateOpInFlight || translateInFlight
@@ -422,8 +438,229 @@ function StopGlyph() {
   );
 }
 
+/** Props for one virtualised transcript row (see {@link TranscriptRow}). */
+type TranscriptRowProps = {
+  seg: Segment;
+  idx: number;
+  /**
+   * The virtualiser's vertical pixel offset for this row within the list.
+   * A primitive (not a pre-built style object) so the prop is genuinely
+   * stable for `memo`'s shallow comparison; the row derives its own
+   * absolute-positioning `style` from it via `useMemo`.
+   */
+  offsetY: number;
+  highlighted: boolean;
+  speakerChanged: boolean;
+  dotColor: string | undefined;
+  speakerName: string | null;
+  speakerEditable: boolean;
+  onRename: (label: string, name: string) => void;
+  selectedLanguage: string | null;
+  /** The translated text for this row, or `undefined` when none is cached. */
+  translatedText: string | undefined;
+  isPlaying: boolean;
+  onPlay: (idx: number, seg: Segment) => void;
+  onRowClick: (seg: Segment) => void;
+};
+
+/**
+ * One row of the transcript list: timestamp drag handle, speaker chip/dot,
+ * text (verbatim or translated overlay), the multi-speaker marker, and the
+ * per-segment play button.
+ *
+ * Wrapped in `memo`: a live-recording append only adds one new row and never
+ * changes the props of already-rendered ones, so those rows skip
+ * re-rendering; combined with the virtualiser in {@link TranscriptPane}, only
+ * rows in the visible window are mounted at all, so a long transcript's
+ * per-append cost stays bounded instead of scaling with total segment count.
+ * `memo`'s shallow prop comparison only pays off when every prop is
+ * referentially stable across an unrelated parent render, so the row takes
+ * the virtualiser's pixel offset as the primitive `offsetY` and builds its
+ * own absolute-positioning `style` object via `useMemo`, rather than
+ * receiving a pre-built style object from the parent — a fresh object
+ * literal there would be a new reference on every render and defeat the
+ * comparison for every row regardless of its own props.
+ *
+ * `ref` is forwarded to the root `<li>` for the virtualiser's
+ * `measureElement` (rows have variable height — wrapped text, speaker chips,
+ * the multi-speaker marker — so height is measured, not estimated, once
+ * mounted).
+ */
+const TranscriptRow = memo(
+  forwardRef<HTMLLIElement, TranscriptRowProps>(function TranscriptRow(
+    {
+      seg,
+      idx,
+      offsetY,
+      highlighted,
+      speakerChanged,
+      dotColor,
+      speakerName,
+      speakerEditable,
+      onRename,
+      selectedLanguage,
+      translatedText,
+      isPlaying,
+      onPlay,
+      onRowClick,
+    },
+    ref,
+  ) {
+    // Built here (not passed down as a prop) so the object identity stays
+    // stable whenever `offsetY` itself is unchanged — a style object built by
+    // the parent on every render would be a fresh literal each time and
+    // defeat `memo`'s shallow comparison for every row.
+    const style = useMemo<CSSProperties>(
+      () => ({
+        position: "absolute",
+        top: 0,
+        left: 0,
+        width: "100%",
+        transform: `translateY(${offsetY}px)`,
+      }),
+      [offsetY],
+    );
+    return (
+      <li
+        ref={ref}
+        data-index={idx}
+        style={style}
+        className={
+          highlighted
+            ? "transcript-pane__row transcript-pane__row--highlighted"
+            : "transcript-pane__row"
+        }
+        aria-current={highlighted ? "true" : undefined}
+        onClick={() => onRowClick(seg)}
+      >
+        {/*
+          The timestamp is the drag handle (FR-24): only it is `draggable`, so
+          the segment text stays freely selectable for copy. Clicking anywhere
+          on the row still jumps to the linked paragraph (FR-23, the row's
+          onClick).
+        */}
+        <span
+          className="transcript-pane__timestamp tnum"
+          draggable
+          title="Drag into your notes, or click to jump to the linked paragraph"
+          onDragStart={(e) => {
+            if (e.dataTransfer) writeSegmentDrag(e.dataTransfer, seg);
+          }}
+        >
+          {formatTimestamp(seg.start_ms)}
+        </span>
+        <span className="transcript-pane__text">
+          {/*
+            Phase 6/C: a quiet speaker chip at the start of a speaker's run
+            (see `speakerChanged`). It shows the user-set display name when one
+            exists (`speaker_names[label]`), otherwise the diarizer's
+            first-seen label (A / B / …); clicking it renames the speaker. The
+            colour dot's palette slot is resolved by the pure
+            `speakerColorIndex` mapper and passed via `--dot-color` — tokens
+            only, no hard-coded colour in TSX.
+          */}
+          {speakerChanged && (
+            <SpeakerChip
+              label={seg.speaker_id as string}
+              name={speakerName}
+              dotColor={dotColor}
+              editable={speakerEditable}
+              onRename={onRename}
+            />
+          )}
+          {/*
+            Continuation row (same speaker as the row above): the colour dot
+            alone, no repeated label. Decorative — the run's leading chip
+            carries the accessible name.
+          */}
+          {seg.speaker_id != null && !speakerChanged && (
+            <span
+              className="transcript-pane__speaker transcript-pane__speaker--cont"
+              style={{ ["--dot-color" as string]: dotColor }}
+              aria-hidden="true"
+            >
+              <span
+                className="transcript-pane__speaker-dot"
+                aria-hidden="true"
+              />
+            </span>
+          )}
+          {/*
+            #0002: a quiet marker when the diarizer found this segment spans
+            more than one speaker (it is not split). Count only — naming the
+            co-speakers would clash with the display-name overlay on the chip.
+            Guarded for older/un-diarized segments that predate the field (it
+            is omitted from their JSON).
+          */}
+          {(seg.shared_speakers?.length ?? 0) > 0 && (
+            <span
+              className="transcript-pane__multi-speaker"
+              title="This segment overlaps more than one speaker; it was not split."
+            >
+              {(seg.shared_speakers?.length ?? 0) + 1} speakers
+            </span>
+          )}
+          {/*
+            Translation overlay: when a translated view is active, show the
+            translated text instead of `seg.text`. If this segment has no
+            translation yet (partial pass, gap, or a reprocess invalidated the
+            cache), fall back to the verbatim text so the row is never blank.
+            A quiet label identifies translated rows to make the substitution
+            explicit.
+          */}
+          {selectedLanguage !== null ? (
+            <>
+              {translatedText ?? seg.text}
+              {translatedText !== undefined && (
+                <span
+                  className="transcript-pane__translated-label"
+                  aria-label={`Translated to ${selectedLanguage}`}
+                >
+                  {selectedLanguage}
+                </span>
+              )}
+            </>
+          ) : (
+            seg.text
+          )}
+        </span>
+        {/*
+          Per-segment audio re-listen (#0023): a quiet play/stop glyph at the
+          row's right edge, revealed on row hover. Only on a saved, idle
+          meeting (same gate as speaker rename — a finalised `audio.opus` must
+          exist). `stopPropagation` so it does not also trigger the row's
+          jump-to-paragraph click.
+        */}
+        {speakerEditable && (
+          <button
+            type="button"
+            className={
+              isPlaying
+                ? "transcript-pane__play transcript-pane__play--active"
+                : "transcript-pane__play"
+            }
+            aria-label={isPlaying ? "Stop playback" : "Play this segment’s audio"}
+            title={isPlaying ? "Stop" : "Play this segment’s audio"}
+            onClick={(e) => {
+              e.stopPropagation();
+              onPlay(idx, seg);
+            }}
+          >
+            {isPlaying ? <StopGlyph /> : <PlayGlyph />}
+          </button>
+        )}
+      </li>
+    );
+  }),
+);
+
 /**
  * Read-only scrollable transcript view.
+ *
+ * Virtualised (`@tanstack/react-virtual`): only the rows in the visible
+ * window (plus a small overscan) are mounted, so a long transcript's DOM size
+ * and per-append render cost stay bounded instead of scaling with total
+ * segment count.
  *
  * Auto-scrolls to the bottom on new segments unless the user has scrolled
  * up more than 50 px from the bottom (sticky-bottom behaviour).
@@ -492,9 +729,19 @@ export function TranscriptPane() {
   // Monotonic token of the latest play request; guards the async fetch/decode
   // so a superseded click can't start or clear the wrong row.
   const playTokenRef = useRef(0);
-  const [playingIdx, setPlayingIdx] = useState<number | null>(null);
+  const [playingIdx, setPlayingIdxState] = useState<number | null>(null);
+  // Mirrors `playingIdx` for `playSegment`'s toggle check without needing
+  // `playingIdx` in its dependency list — keeping `playSegment` (and so the
+  // `onPlay` prop every `TranscriptRow` receives) referentially stable across
+  // ordinary transcript-append renders, so `memo` actually skips re-rendering
+  // rows whose own props did not change.
+  const playingIdxRef = useRef<number | null>(null);
+  const setPlayingIdx = useCallback((idx: number | null) => {
+    playingIdxRef.current = idx;
+    setPlayingIdxState(idx);
+  }, []);
 
-  function stopCurrentClip() {
+  const stopCurrentClip = useCallback(() => {
     const src = sourceRef.current;
     if (src !== null) {
       src.onended = null;
@@ -505,50 +752,53 @@ export function TranscriptPane() {
       }
       sourceRef.current = null;
     }
-  }
+  }, []);
 
-  async function playSegment(idx: number, seg: Segment) {
-    if (openMeetingId === null) return;
-    // Clicking the row that is already playing stops it (toggle).
-    if (playingIdx === idx) {
-      stopCurrentClip();
-      setPlayingIdx(null);
-      return;
-    }
-    stopCurrentClip();
-    const token = ++playTokenRef.current;
-    setPlayingIdx(idx);
-    try {
-      if (audioCtxRef.current === null) {
-        audioCtxRef.current = new AudioContext();
+  const playSegment = useCallback(
+    async (idx: number, seg: Segment) => {
+      if (openMeetingId === null) return;
+      // Clicking the row that is already playing stops it (toggle).
+      if (playingIdxRef.current === idx) {
+        stopCurrentClip();
+        setPlayingIdx(null);
+        return;
       }
-      const ctx = audioCtxRef.current;
-      if (ctx.state === "suspended") await ctx.resume();
-      const url = convertFileSrc(
-        `${openMeetingId}/${seg.start_ms}-${seg.end_ms}`,
-        MEETING_RECORDING_SCHEME,
-      );
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error(`recording slice HTTP ${resp.status}`);
-      const bytes = await resp.arrayBuffer();
-      if (playTokenRef.current !== token) return; // superseded mid-fetch
-      const buffer = await ctx.decodeAudioData(bytes);
-      if (playTokenRef.current !== token) return; // superseded mid-decode
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      source.onended = () => {
-        if (playTokenRef.current === token) {
-          setPlayingIdx(null);
-          sourceRef.current = null;
+      stopCurrentClip();
+      const token = ++playTokenRef.current;
+      setPlayingIdx(idx);
+      try {
+        if (audioCtxRef.current === null) {
+          audioCtxRef.current = new AudioContext();
         }
-      };
-      source.start();
-      sourceRef.current = source;
-    } catch {
-      if (playTokenRef.current === token) setPlayingIdx(null);
-    }
-  }
+        const ctx = audioCtxRef.current;
+        if (ctx.state === "suspended") await ctx.resume();
+        const url = convertFileSrc(
+          `${openMeetingId}/${seg.start_ms}-${seg.end_ms}`,
+          MEETING_RECORDING_SCHEME,
+        );
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`recording slice HTTP ${resp.status}`);
+        const bytes = await resp.arrayBuffer();
+        if (playTokenRef.current !== token) return; // superseded mid-fetch
+        const buffer = await ctx.decodeAudioData(bytes);
+        if (playTokenRef.current !== token) return; // superseded mid-decode
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.onended = () => {
+          if (playTokenRef.current === token) {
+            setPlayingIdx(null);
+            sourceRef.current = null;
+          }
+        };
+        source.start();
+        sourceRef.current = source;
+      } catch {
+        if (playTokenRef.current === token) setPlayingIdx(null);
+      }
+    },
+    [openMeetingId, stopCurrentClip, setPlayingIdx],
+  );
 
   // Stop playback + release the audio context when the open meeting changes or
   // the pane unmounts, so a clip never outlives the meeting it belongs to.
@@ -565,15 +815,36 @@ export function TranscriptPane() {
   // Track whether the user has scrolled away from the bottom.
   const userScrolledUp = useRef(false);
 
-  // When the transcript grows, scroll to bottom if the user has not
-  // scrolled away.
+  // Virtualises the row list: only rows in the visible window (plus a small
+  // overscan) are mounted. Rows have variable height (wrapped text, speaker
+  // chips), so sizes are MEASURED via `measureElement` on each `TranscriptRow`
+  // (`estimateSize` only seeds the layout before the first measurement).
+  // Keyed by `start_ms` rather than array index — stable across a splice
+  // (live append) or a reorder (a reprocess replacing the segment array), so
+  // React/the virtualiser never misattribute a measured height or DOM node to
+  // the wrong logical segment.
+  const rowVirtualizer = useVirtualizer({
+    count: transcript.length,
+    getScrollElement: () => scrollRef.current,
+    // A single-line row's rendered height (~56px) plus the 0.95rem inter-row
+    // spacing now baked into the row's own bottom padding (~13px at the
+    // 14px root font-size — see `.transcript-pane__row` in TranscriptPane.css).
+    estimateSize: () => 70,
+    overscan: 8,
+    getItemKey: (index) => transcript[index]?.start_ms ?? index,
+  });
+
+  // When the transcript grows, scroll to bottom if the user has not scrolled
+  // away — via the virtualiser's own `scrollToIndex` (it knows the true
+  // scroll-container geometry) rather than setting `scrollTop` directly,
+  // since most rows are unmounted and their heights would otherwise be
+  // unknown to a manual scroll calculation.
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
+    if (transcript.length === 0) return;
     if (!userScrolledUp.current) {
-      el.scrollTop = el.scrollHeight;
+      rowVirtualizer.scrollToIndex(transcript.length - 1, { align: "end" });
     }
-  }, [transcript]);
+  }, [transcript, rowVirtualizer]);
 
   function handleScroll() {
     const el = scrollRef.current;
@@ -581,6 +852,19 @@ export function TranscriptPane() {
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     userScrolledUp.current = distanceFromBottom > 50;
   }
+
+  const handleRowClick = useCallback(
+    (seg: Segment) => clickTranscriptSegment(seg),
+    [clickTranscriptSegment],
+  );
+  const handleRename = useCallback(
+    (label: string, name: string) => void setSpeakerName(label, name),
+    [setSpeakerName],
+  );
+  const handlePlay = useCallback(
+    (idx: number, seg: Segment) => void playSegment(idx, seg),
+    [playSegment],
+  );
 
   return (
     <div className="transcript-pane">
@@ -603,8 +887,16 @@ export function TranscriptPane() {
             Transcript will appear here while you record.
           </p>
         ) : (
-          <ol className="transcript-pane__list">
-            {transcript.map((seg: Segment, idx: number) => {
+          <ol
+            className="transcript-pane__list"
+            style={{
+              position: "relative",
+              height: rowVirtualizer.getTotalSize(),
+            }}
+          >
+            {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+              const idx = virtualRow.index;
+              const seg = transcript[idx];
               const highlighted =
                 highlightedRange !== null &&
                 idx >= highlightedRange.startIndex &&
@@ -622,142 +914,24 @@ export function TranscriptPane() {
                   ? `var(--speaker-${speakerColorIndex(seg.speaker_id)})`
                   : undefined;
               return (
-                <li
-                  key={idx}
-                  className={
-                    highlighted
-                      ? "transcript-pane__row transcript-pane__row--highlighted"
-                      : "transcript-pane__row"
-                  }
-                  aria-current={highlighted ? "true" : undefined}
-                  onClick={() => clickTranscriptSegment(seg)}
-                >
-                  {/*
-                    The timestamp is the drag handle (FR-24): only it is
-                    `draggable`, so the segment text stays freely selectable for
-                    copy. Clicking anywhere on the row still jumps to the linked
-                    paragraph (FR-23, the row's onClick).
-                  */}
-                  <span
-                    className="transcript-pane__timestamp tnum"
-                    draggable
-                    title="Drag into your notes, or click to jump to the linked paragraph"
-                    onDragStart={(e) => {
-                      if (e.dataTransfer) writeSegmentDrag(e.dataTransfer, seg);
-                    }}
-                  >
-                    {formatTimestamp(seg.start_ms)}
-                  </span>
-                  <span className="transcript-pane__text">
-                    {/*
-                    Phase 6/C: a quiet speaker chip at the start of a speaker's
-                    run (see `speakerChanged`). It shows the user-set display
-                    name when one exists (`speaker_names[label]`), otherwise the
-                    diarizer's first-seen label (A / B / …); clicking it renames
-                    the speaker. The colour dot's palette slot is resolved by the
-                    pure `speakerColorIndex` mapper and passed via `--dot-color`
-                    — tokens only, no hard-coded colour in TSX.
-                  */}
-                    {speakerChanged && (
-                      <SpeakerChip
-                        label={seg.speaker_id as string}
-                        name={speakerNames?.[seg.speaker_id as string] ?? null}
-                        dotColor={dotColor}
-                        editable={speakerEditable}
-                        onRename={(label, name) =>
-                          void setSpeakerName(label, name)
-                        }
-                      />
-                    )}
-                    {/*
-                    Continuation row (same speaker as the row above): the colour
-                    dot alone, no repeated label. Decorative — the run's leading
-                    chip carries the accessible name.
-                  */}
-                    {seg.speaker_id != null && !speakerChanged && (
-                      <span
-                        className="transcript-pane__speaker transcript-pane__speaker--cont"
-                        style={{ ["--dot-color" as string]: dotColor }}
-                        aria-hidden="true"
-                      >
-                        <span
-                          className="transcript-pane__speaker-dot"
-                          aria-hidden="true"
-                        />
-                      </span>
-                    )}
-                    {/*
-                    #0002: a quiet marker when the diarizer found this segment
-                    spans more than one speaker (it is not split). Count only —
-                    naming the co-speakers would clash with the display-name
-                    overlay on the chip. Guarded for older/un-diarized segments
-                    that predate the field (it is omitted from their JSON).
-                  */}
-                    {(seg.shared_speakers?.length ?? 0) > 0 && (
-                      <span
-                        className="transcript-pane__multi-speaker"
-                        title="This segment overlaps more than one speaker; it was not split."
-                      >
-                        {(seg.shared_speakers?.length ?? 0) + 1} speakers
-                      </span>
-                    )}
-                    {/*
-                    Translation overlay: when a translated view is active, show
-                    the translated text instead of `seg.text`. If this segment
-                    has no translation yet (partial pass, gap), fall back to the
-                    verbatim text so the row is never blank. A quiet label
-                    identifies translated rows to make the substitution explicit.
-                  */}
-                    {selectedLanguage !== null ? (
-                      <>
-                        {translations.has(idx)
-                          ? translations.get(idx)
-                          : seg.text}
-                        {translations.has(idx) && (
-                          <span
-                            className="transcript-pane__translated-label"
-                            aria-label={`Translated to ${selectedLanguage}`}
-                          >
-                            {selectedLanguage}
-                          </span>
-                        )}
-                      </>
-                    ) : (
-                      seg.text
-                    )}
-                  </span>
-                  {/*
-                    Per-segment audio re-listen (#0023): a quiet play/stop glyph
-                    at the row's right edge, revealed on row hover. Only on a
-                    saved, idle meeting (same gate as speaker rename — a finalised
-                    `audio.opus` must exist). `stopPropagation` so it does not
-                    also trigger the row's jump-to-paragraph click.
-                  */}
-                  {speakerEditable && (
-                    <button
-                      type="button"
-                      className={
-                        playingIdx === idx
-                          ? "transcript-pane__play transcript-pane__play--active"
-                          : "transcript-pane__play"
-                      }
-                      aria-label={
-                        playingIdx === idx
-                          ? "Stop playback"
-                          : "Play this segment’s audio"
-                      }
-                      title={
-                        playingIdx === idx ? "Stop" : "Play this segment’s audio"
-                      }
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void playSegment(idx, seg);
-                      }}
-                    >
-                      {playingIdx === idx ? <StopGlyph /> : <PlayGlyph />}
-                    </button>
-                  )}
-                </li>
+                <TranscriptRow
+                  key={virtualRow.key}
+                  ref={rowVirtualizer.measureElement}
+                  seg={seg}
+                  idx={idx}
+                  offsetY={virtualRow.start}
+                  highlighted={highlighted}
+                  speakerChanged={speakerChanged}
+                  dotColor={dotColor}
+                  speakerName={speakerNames?.[seg.speaker_id as string] ?? null}
+                  speakerEditable={speakerEditable}
+                  onRename={handleRename}
+                  selectedLanguage={selectedLanguage}
+                  translatedText={translations.get(seg.start_ms)}
+                  isPlaying={playingIdx === idx}
+                  onPlay={handlePlay}
+                  onRowClick={handleRowClick}
+                />
               );
             })}
           </ol>

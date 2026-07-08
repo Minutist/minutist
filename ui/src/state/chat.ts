@@ -42,6 +42,14 @@
  * for a backgrounded session never clobbers the open one (the pane shows a
  * single session at a time).
  *
+ * New-session adoption race: `send()` sets `inFlight` and starts streaming
+ * BEFORE `sendChatMessage` resolves with the backend-minted session id, so for
+ * a brand-new session (`sessionId` still `null`) the scoping check above has
+ * nothing to match against yet. Rather than drop those early events, `handleEvent`
+ * buffers them in `pendingEvents` while `sessionId` is `null` and a send is
+ * in flight; `send` replays the buffer (filtered to the adopted id) the
+ * moment it adopts `sessionId`, so no start-of-stream tokens are lost.
+ *
  * The live co-pilot's proactive feed is folded into this same timeline:
  * `live_copilot_message` (scoped by `meeting_id`, not `session_id` — it is the
  * co-pilot speaking unprompted, not a reply to the open session's turn) is
@@ -101,6 +109,16 @@ export type ChatStore = {
    * "history trimmed" affordance; cleared on the next send / session switch.
    */
   historyTrimmed: boolean;
+  /**
+   * Chat/turn events received for a brand-new session (`sessionId` still
+   * `null`) while a `send()` dispatch is in flight — buffered here instead of
+   * dropped, because the per-session scoping guard has no id to match against
+   * until `send` adopts the backend-minted id. Replayed and cleared by `send`
+   * once it adopts `sessionId`; cleared on any session switch since a
+   * buffered event belongs to the session that was open when it arrived, not
+   * whatever is opened next.
+   */
+  pendingEvents: AppEvent[];
 
   /**
    * Scope the chat to a meeting (on open); loads its sessions and, if the
@@ -133,248 +151,14 @@ function userMessage(content: string, turnId: number): ChatMessage {
   return { role: "user", content, tool_calls: [], turn_id: turnId };
 }
 
-export const useChatStore = create<ChatStore>((set, get) => ({
-  meetingId: null,
-  sessionId: null,
-  sessions: [],
-  messages: [],
-  streaming: null,
-  inFlight: false,
-  toolActivity: null,
-  lastError: null,
-  historyTrimmed: false,
-
-  setMeeting: async (meetingId) => {
-    // Switching meetings resets the open session and its messages — chat is
-    // meeting-scoped, so a session for meeting A must not bleed into meeting B.
-    set({
-      meetingId,
-      sessionId: null,
-      sessions: [],
-      messages: [],
-      streaming: null,
-      inFlight: false,
-      toolActivity: null,
-      lastError: null,
-      historyTrimmed: false,
-    });
-    if (meetingId === null) return;
-    await get().loadSessions();
-    // Continue the meeting's live co-pilot session, if one exists, instead of
-    // leaving `sessionId` null — so (re)mounting the chat pane shows the
-    // ongoing co-pilot conversation rather than a blank "new session"
-    // placeholder. At most one session per meeting has `is_live === true`.
-    if (get().meetingId !== meetingId) return; // a later setMeeting won the race
-    const liveSession = get().sessions.find((s) => s.is_live === true);
-    if (liveSession) {
-      await get().openSession(liveSession.id);
-    }
-  },
-
-  loadSessions: async () => {
-    const meetingId = get().meetingId;
-    if (meetingId === null) return;
-    try {
-      const sessions = await listChatSessions(meetingId);
-      set({
-        sessions: Array.isArray(sessions) ? sessions : [],
-        lastError: null,
-      });
-    } catch (err) {
-      set({ lastError: errorMessage(err) });
-    }
-  },
-
-  openSession: async (sessionId) => {
-    const meetingId = get().meetingId;
-    if (meetingId === null) return;
-    try {
-      const session = await getChatSession(meetingId, sessionId);
-      // Guard against a race / a since-deleted session: only apply if the
-      // session still exists and the meeting is still the one we loaded for.
-      if (get().meetingId !== meetingId) return;
-      set({
-        sessionId,
-        messages: session?.messages ?? [],
-        streaming: null,
-        inFlight: false,
-        toolActivity: null,
-        lastError: null,
-        historyTrimmed: false,
-      });
-    } catch (err) {
-      set({ lastError: errorMessage(err) });
-    }
-  },
-
-  newSession: () => {
-    // A fresh session: the next `send` passes `session_id = null`, so the
-    // backend mints a new session and returns its id.
-    set({
-      sessionId: null,
-      messages: [],
-      streaming: null,
-      inFlight: false,
-      toolActivity: null,
-      lastError: null,
-      historyTrimmed: false,
-    });
-  },
-
-  deleteSession: async (sessionId) => {
-    const meetingId = get().meetingId;
-    if (meetingId === null) return;
-    try {
-      await deleteChatSession(meetingId, sessionId);
-      // If the deleted session was open, clear the conversation view.
-      if (get().sessionId === sessionId) {
-        set({
-          sessionId: null,
-          messages: [],
-          streaming: null,
-          inFlight: false,
-          toolActivity: null,
-          historyTrimmed: false,
-        });
-      }
-      set({ lastError: null });
-      await get().loadSessions();
-    } catch (err) {
-      set({ lastError: errorMessage(err) });
-    }
-  },
-
-  send: async (message) => {
-    const { meetingId, sessionId, messages, inFlight } = get();
-    // Single in-flight turn per session (the backend rejects a second send with
-    // `invalid_input { "session busy" }`); guard the UI too.
-    if (inFlight) return;
-    const trimmed = message.trim();
-    if (trimmed === "") return;
-
-    // Optimistically append the user message so it shows immediately, and enter
-    // the in-flight / streaming state. The turn_id is provisional (the backend
-    // owns the authoritative counter); it correlates the live deltas only.
-    const lastTurnId = messages.reduce(
-      (max, m) => (m.turn_id > max ? m.turn_id : max),
-      -1,
-    );
-    const provisionalTurnId = lastTurnId + 1;
-    set({
-      messages: [...messages, userMessage(trimmed, provisionalTurnId)],
-      streaming: "",
-      inFlight: true,
-      toolActivity: null,
-      lastError: null,
-      historyTrimmed: false,
-    });
-
-    try {
-      const newSessionId = await sendChatMessage(meetingId, sessionId, trimmed);
-      // The backend returns the (new or existing) session id; adopt it so the
-      // streamed chat events (keyed on session_id) route to the open session,
-      // and so a follow-up send continues the same session.
-      if (get().meetingId === meetingId) {
-        set({ sessionId: newSessionId });
-      }
-    } catch (err) {
-      // Dispatch failed — leave the in-flight state and surface the error. (On
-      // success, `chat_turn_complete` / `chat_error` clear it.)
-      set({
-        inFlight: false,
-        streaming: null,
-        toolActivity: null,
-        lastError: errorMessage(err),
-      });
-    }
-  },
-
-  cancel: async () => {
-    const { sessionId, meetingId, inFlight } = get();
-    if (!inFlight || sessionId === null) return;
-    try {
-      await cancelChatTurn(sessionId);
-      // Clear the in-flight state IMMEDIATELY so the UI is never permanently
-      // stuck on "Stop" — this is the escape from a dropped terminal event (see
-      // the KNOWN-GAP note above). The backend also ends the turn with a terminal
-      // `chat_turn_complete` carrying the partial reply, but we do not depend on
-      // that event arriving.
-      set({ inFlight: false, streaming: null, toolActivity: null });
-      // Best-effort reconcile: the cancel path persists the (partial) turn on the
-      // backend, so re-read the session from disk to reflect the saved messages —
-      // an `openSession`-style reconcile that does NOT depend on the lossy bus.
-      // Guard against a race: only apply if the session/meeting are still open.
-      if (meetingId !== null) {
-        try {
-          const session = await getChatSession(meetingId, sessionId);
-          if (
-            get().meetingId === meetingId &&
-            get().sessionId === sessionId &&
-            session
-          ) {
-            set({ messages: session.messages });
-          }
-        } catch {
-          // A reconcile read failure is non-fatal — inFlight is already cleared,
-          // so the user is unstuck regardless; the next openSession will reconcile.
-        }
-      }
-    } catch (err) {
-      set({ lastError: errorMessage(err) });
-    }
-  },
-
-  handleEvent: (event) => {
-    // `live_copilot_message` is scoped by MEETING id, not session id (the
-    // event predates the concept of "the open session" — it is the live
-    // co-pilot speaking proactively) — handle it separately from the
-    // session-scoped switch below. Folds the co-pilot's proactive feed into
-    // the chat timeline as one continuous conversation instead of a separate
-    // pane: appended as an assistant message so it renders as an assistant
-    // bubble alongside ordinary chat replies.
-    if (event.kind === "live_copilot_message") {
-      const { meetingId, messages } = get();
-      if (meetingId === null || event.meeting_id !== meetingId) return;
-      const last = messages[messages.length - 1];
-      // Defensive dedupe: skip if the last message is already this exact
-      // assistant reply. In practice this event is emitted only for
-      // transcript-driven turns (not the reply to a user-typed message, which
-      // already arrives via `chat_turn_complete`), so no duplicate occurs.
-      if (last?.role === "assistant" && last.content === event.content) {
-        return;
-      }
-      set({
-        messages: [
-          ...messages,
-          {
-            role: "assistant",
-            content: event.content,
-            tool_calls: [],
-            turn_id: event.turn_id,
-          },
-        ],
-      });
-      return;
-    }
-
-    switch (event.kind) {
-      case "chat_token":
-      case "chat_tool_call":
-      case "chat_tool_result":
-      case "chat_turn_complete":
-      case "chat_error":
-      case "chat_context_trimmed":
-        break;
-      default:
-        return;
-    }
-
-    // Per-session scoping: ignore an event for a session that is not the open
-    // one. A turn streaming for a backgrounded session must not clobber the
-    // open conversation.
-    const openSession = get().sessionId;
-    if (openSession === null || event.session_id !== openSession) return;
-
+export const useChatStore = create<ChatStore>((set, get) => {
+  /**
+   * Apply one already-scoped chat/turn event — the caller has confirmed
+   * `event.session_id` matches the open session (or, for a replayed buffered
+   * event, the session `send` just adopted). Shared by `handleEvent`'s live
+   * path and `send`'s replay of `pendingEvents`.
+   */
+  function applyChatEvent(event: AppEvent): void {
     switch (event.kind) {
       case "chat_token": {
         // Progressive hint: append the delta to the streamed buffer. NEVER
@@ -437,6 +221,288 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         set({ historyTrimmed: true });
         return;
       }
+      default:
+        return;
     }
-  },
-}));
+  }
+
+  return {
+    meetingId: null,
+    sessionId: null,
+    sessions: [],
+    messages: [],
+    streaming: null,
+    inFlight: false,
+    toolActivity: null,
+    lastError: null,
+    historyTrimmed: false,
+    pendingEvents: [],
+
+    setMeeting: async (meetingId) => {
+      // Switching meetings resets the open session and its messages — chat is
+      // meeting-scoped, so a session for meeting A must not bleed into meeting B.
+      set({
+        meetingId,
+        sessionId: null,
+        sessions: [],
+        messages: [],
+        streaming: null,
+        inFlight: false,
+        toolActivity: null,
+        lastError: null,
+        historyTrimmed: false,
+        pendingEvents: [],
+      });
+      if (meetingId === null) return;
+      await get().loadSessions();
+      // Continue the meeting's live co-pilot session, if one exists, instead of
+      // leaving `sessionId` null — so (re)mounting the chat pane shows the
+      // ongoing co-pilot conversation rather than a blank "new session"
+      // placeholder. At most one session per meeting has `is_live === true`.
+      if (get().meetingId !== meetingId) return; // a later setMeeting won the race
+      const liveSession = get().sessions.find((s) => s.is_live === true);
+      if (liveSession) {
+        await get().openSession(liveSession.id);
+      }
+    },
+
+    loadSessions: async () => {
+      const meetingId = get().meetingId;
+      if (meetingId === null) return;
+      try {
+        const sessions = await listChatSessions(meetingId);
+        set({
+          sessions: Array.isArray(sessions) ? sessions : [],
+          lastError: null,
+        });
+      } catch (err) {
+        set({ lastError: errorMessage(err) });
+      }
+    },
+
+    openSession: async (sessionId) => {
+      const meetingId = get().meetingId;
+      if (meetingId === null) return;
+      try {
+        const session = await getChatSession(meetingId, sessionId);
+        // Guard against a race / a since-deleted session: only apply if the
+        // session still exists and the meeting is still the one we loaded for.
+        if (get().meetingId !== meetingId) return;
+        set({
+          sessionId,
+          messages: session?.messages ?? [],
+          streaming: null,
+          inFlight: false,
+          toolActivity: null,
+          lastError: null,
+          historyTrimmed: false,
+          pendingEvents: [],
+        });
+      } catch (err) {
+        set({ lastError: errorMessage(err) });
+      }
+    },
+
+    newSession: () => {
+      // A fresh session: the next `send` passes `session_id = null`, so the
+      // backend mints a new session and returns its id.
+      set({
+        sessionId: null,
+        messages: [],
+        streaming: null,
+        inFlight: false,
+        toolActivity: null,
+        lastError: null,
+        historyTrimmed: false,
+        pendingEvents: [],
+      });
+    },
+
+    deleteSession: async (sessionId) => {
+      const meetingId = get().meetingId;
+      if (meetingId === null) return;
+      try {
+        await deleteChatSession(meetingId, sessionId);
+        // If the deleted session was open, clear the conversation view.
+        if (get().sessionId === sessionId) {
+          set({
+            sessionId: null,
+            messages: [],
+            streaming: null,
+            inFlight: false,
+            toolActivity: null,
+            historyTrimmed: false,
+            pendingEvents: [],
+          });
+        }
+        set({ lastError: null });
+        await get().loadSessions();
+      } catch (err) {
+        set({ lastError: errorMessage(err) });
+      }
+    },
+
+    send: async (message) => {
+      const { meetingId, sessionId, messages, inFlight } = get();
+      // Single in-flight turn per session (the backend rejects a second send with
+      // `invalid_input { "session busy" }`); guard the UI too.
+      if (inFlight) return;
+      const trimmed = message.trim();
+      if (trimmed === "") return;
+
+      // Optimistically append the user message so it shows immediately, and enter
+      // the in-flight / streaming state. The turn_id is provisional (the backend
+      // owns the authoritative counter); it correlates the live deltas only.
+      const lastTurnId = messages.reduce(
+        (max, m) => (m.turn_id > max ? m.turn_id : max),
+        -1,
+      );
+      const provisionalTurnId = lastTurnId + 1;
+      set({
+        messages: [...messages, userMessage(trimmed, provisionalTurnId)],
+        streaming: "",
+        inFlight: true,
+        toolActivity: null,
+        lastError: null,
+        historyTrimmed: false,
+        pendingEvents: [],
+      });
+
+      try {
+        const newSessionId = await sendChatMessage(meetingId, sessionId, trimmed);
+        // The backend returns the (new or existing) session id; adopt it so the
+        // streamed chat events (keyed on session_id) route to the open session,
+        // and so a follow-up send continues the same session.
+        if (get().meetingId === meetingId) {
+          set({ sessionId: newSessionId });
+          // Replay events that arrived for this session while it was still
+          // unadopted (`sessionId` was `null`, so `handleEvent` buffered them
+          // instead of dropping them — see the class doc's "New-session
+          // adoption race" note). Filtered to the adopted id: a buffered event
+          // is virtually certainly this turn's (only one turn is ever in
+          // flight), but a stray non-matching one is dropped rather than
+          // mis-applied.
+          const pending = get().pendingEvents;
+          if (pending.length > 0) {
+            set({ pendingEvents: [] });
+            for (const buffered of pending) {
+              if ("session_id" in buffered && buffered.session_id === newSessionId) {
+                applyChatEvent(buffered);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        // Dispatch failed — leave the in-flight state and surface the error. (On
+        // success, `chat_turn_complete` / `chat_error` clear it.)
+        set({
+          inFlight: false,
+          streaming: null,
+          toolActivity: null,
+          pendingEvents: [],
+          lastError: errorMessage(err),
+        });
+      }
+    },
+
+    cancel: async () => {
+      const { sessionId, meetingId, inFlight } = get();
+      if (!inFlight || sessionId === null) return;
+      try {
+        await cancelChatTurn(sessionId);
+        // Clear the in-flight state IMMEDIATELY so the UI is never permanently
+        // stuck on "Stop" — this is the escape from a dropped terminal event (see
+        // the KNOWN-GAP note above). The backend also ends the turn with a terminal
+        // `chat_turn_complete` carrying the partial reply, but we do not depend on
+        // that event arriving.
+        set({ inFlight: false, streaming: null, toolActivity: null });
+        // Best-effort reconcile: the cancel path persists the (partial) turn on the
+        // backend, so re-read the session from disk to reflect the saved messages —
+        // an `openSession`-style reconcile that does NOT depend on the lossy bus.
+        // Guard against a race: only apply if the session/meeting are still open.
+        if (meetingId !== null) {
+          try {
+            const session = await getChatSession(meetingId, sessionId);
+            if (
+              get().meetingId === meetingId &&
+              get().sessionId === sessionId &&
+              session
+            ) {
+              set({ messages: session.messages });
+            }
+          } catch {
+            // A reconcile read failure is non-fatal — inFlight is already cleared,
+            // so the user is unstuck regardless; the next openSession will reconcile.
+          }
+        }
+      } catch (err) {
+        set({ lastError: errorMessage(err) });
+      }
+    },
+
+    handleEvent: (event) => {
+      // `live_copilot_message` is scoped by MEETING id, not session id (the
+      // event predates the concept of "the open session" — it is the live
+      // co-pilot speaking proactively) — handle it separately from the
+      // session-scoped switch below. Folds the co-pilot's proactive feed into
+      // the chat timeline as one continuous conversation instead of a separate
+      // pane: appended as an assistant message so it renders as an assistant
+      // bubble alongside ordinary chat replies.
+      if (event.kind === "live_copilot_message") {
+        const { meetingId, messages } = get();
+        if (meetingId === null || event.meeting_id !== meetingId) return;
+        const last = messages[messages.length - 1];
+        // Defensive dedupe: skip if the last message is already this exact
+        // assistant reply. In practice this event is emitted only for
+        // transcript-driven turns (not the reply to a user-typed message, which
+        // already arrives via `chat_turn_complete`), so no duplicate occurs.
+        if (last?.role === "assistant" && last.content === event.content) {
+          return;
+        }
+        set({
+          messages: [
+            ...messages,
+            {
+              role: "assistant",
+              content: event.content,
+              tool_calls: [],
+              turn_id: event.turn_id,
+            },
+          ],
+        });
+        return;
+      }
+
+      switch (event.kind) {
+        case "chat_token":
+        case "chat_tool_call":
+        case "chat_tool_result":
+        case "chat_turn_complete":
+        case "chat_error":
+        case "chat_context_trimmed":
+          break;
+        default:
+          return;
+      }
+
+      // Per-session scoping: ignore an event for a session that is not the open
+      // one. A turn streaming for a backgrounded session must not clobber the
+      // open conversation.
+      const openSession = get().sessionId;
+      if (openSession === null) {
+        // No session is adopted yet. If a `send()` is in flight, this is (almost
+        // certainly) that turn's event arriving before the dispatch promise
+        // resolved with the new session id — buffer it for `send` to replay
+        // rather than losing it (see the class doc's "New-session adoption
+        // race" note). With no send in flight, there is nothing to adopt the
+        // event into — drop it.
+        if (get().inFlight) {
+          set((s) => ({ pendingEvents: [...s.pendingEvents, event] }));
+        }
+        return;
+      }
+      if (event.session_id !== openSession) return;
+      applyChatEvent(event);
+    },
+  };
+});

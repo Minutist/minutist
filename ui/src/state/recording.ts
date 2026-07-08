@@ -39,6 +39,43 @@ import type { Theme, SummaryPreset } from "../ipc/bindings";
 
 export type { RecordingState, AudioDevice, AppEvent, Settings, Segment };
 
+/**
+ * Apply `mutate` to the current settings snapshot, publish the result
+ * immediately (every settings toggle should feel instant), persist it via
+ * `commands.updateSettings`, and roll the optimistic write back — restoring
+ * the pre-mutation settings and surfacing the error — if the persist fails,
+ * mirroring `summary.ts`'s `save()` rollback pattern: the store must not
+ * claim a setting the backend rejected.
+ *
+ * A no-op when `settings` has not loaded yet (`refreshSettings` pending):
+ * there is nothing for `mutate` to apply to, and persisting a partial object
+ * would clobber fields the caller never touched. Returns whether the value is
+ * now the persisted one (`false` for both the not-loaded no-op and a failed
+ * persist) so a caller with an additional optimistic field of its own (e.g.
+ * `setSelectedDevice`'s `selectedDeviceId`) can decide whether to roll that
+ * back too.
+ */
+async function updateSetting(
+  get: () => RecordingStore,
+  set: (partial: Partial<RecordingStore>) => void,
+  mutate: (current: Settings) => Settings,
+): Promise<boolean> {
+  const previous = get().settings;
+  if (previous === null) return false;
+  const next = mutate(previous);
+  set({ settings: next, lastError: null });
+  try {
+    unwrap(await commands.updateSettings(next));
+    return true;
+  } catch (err) {
+    set({
+      settings: previous,
+      lastError: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
 export type RecordingStore = {
   state: RecordingState;
   devices: AudioDevice[];
@@ -351,300 +388,109 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   },
 
   setSelectedDevice: async (id) => {
-    // Update local store immediately for UI responsiveness.
+    // Echo the pick into the local UI field immediately, regardless of the
+    // persist outcome below — unlike `settings`, this field has no prior value
+    // worth restoring on failure (the user just made this choice; snapping the
+    // <select> back to the old device on a transient write failure would be
+    // more confusing than leaving their pick visible alongside `lastError`).
     set({ selectedDeviceId: id });
-
-    // Persist via `update_settings` so the choice survives an app restart.
     // The orchestrator falls back to `settings.input_device_id` when the
     // caller passes `device_id = None` (see Orchestrator::start in
-    // crates/orchestrator/src/lib.rs), so persisting is what makes the
-    // device selection sticky.
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object. The next setSelectedDevice
-      // call after settings load will persist.
-      return;
-    }
-    const next: Settings = { ...current, input_device_id: id };
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    // crates/orchestrator/src/lib.rs), so persisting is what makes the device
+    // selection sticky across a restart.
+    await updateSetting(get, set, (current) => ({
+      ...current,
+      input_device_id: id,
+    }));
   },
 
   setDiarizationEnabled: async (enabled) => {
-    // Persist via `update_settings` so the choice survives an app restart, the
-    // same round-trip-through-settings pattern `setSelectedDevice` uses. The
-    // `diarization_enabled` field is modelled as an augmentation of the
-    // generated `Settings` type until the backend JOIN regenerates the bindings
-    // (see `./diarization-settings`); the JSON round-trip carries it losslessly.
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withDiarizationEnabled(current, enabled);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    // The `diarization_enabled` field is modelled as an augmentation of the
+    // generated `Settings` type until the backend JOIN regenerates the
+    // bindings (see `./diarization-settings`); the JSON round-trip carries it
+    // losslessly.
+    await updateSetting(get, set, (current) =>
+      withDiarizationEnabled(current, enabled),
+    );
   },
 
   setGpuAcceleration: async (mode) => {
-    // Persist via `update_settings` so the choice survives an app restart, the
-    // same round-trip-through-settings pattern `setDiarizationEnabled` uses.
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withGpuAcceleration(current, mode);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withGpuAcceleration(current, mode),
+    );
   },
 
   setLiveAgentMode: async (mode) => {
-    // Persist via `update_settings`, the same round-trip pattern as
-    // `setGpuAcceleration`.
-    const current = get().settings;
-    if (current === null) {
-      return;
-    }
-    const next = withLiveAgentMode(current, mode);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) => withLiveAgentMode(current, mode));
   },
 
   setPreloadSummariser: async (enabled) => {
-    // Persist via `update_settings`, the same round-trip pattern as
-    // `setGpuAcceleration`.
-    const current = get().settings;
-    if (current === null) {
-      return;
-    }
-    const next = withPreloadSummariser(current, enabled);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withPreloadSummariser(current, enabled),
+    );
   },
 
   setCaptureSystemAudio: async (enabled) => {
-    // Persist via `update_settings` so the choice survives an app restart, the
-    // same round-trip-through-settings pattern `setDiarizationEnabled` uses.
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withCaptureSystemAudio(current, enabled);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withCaptureSystemAudio(current, enabled),
+    );
   },
 
   setTranscriptionLanguage: async (language) => {
-    // Persist via `update_settings` so the choice survives an app restart, the
-    // same round-trip-through-settings pattern `setTheme` uses. The sentinel
-    // "auto" reaches the store/Rust unchanged (the resolver maps it to None).
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withTranscriptionLanguage(current, language);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    // The sentinel "auto" reaches the store/Rust unchanged (the resolver maps
+    // it to `None`).
+    await updateSetting(get, set, (current) =>
+      withTranscriptionLanguage(current, language),
+    );
   },
 
   setTheme: async (theme) => {
-    // Persist via `update_settings` (same round-trip as `setSelectedDevice`).
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withTheme(current, theme);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) => withTheme(current, theme));
   },
 
   setNotesPaperRules: async (enabled) => {
-    // Persist via `update_settings` (same round-trip as `setGpuAcceleration`).
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withNotesPaperRules(current, enabled);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withNotesPaperRules(current, enabled),
+    );
   },
 
   setOnboardingCompleted: async (completed) => {
-    // Persist via `update_settings` so the gate stays satisfied across restarts,
-    // the same round-trip-through-settings pattern `setDiarizationEnabled` uses.
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withOnboardingCompleted(current, completed);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withOnboardingCompleted(current, completed),
+    );
   },
 
   setSummaryPreset: async (preset) => {
-    // Persist via `update_settings` (same round-trip as `setTheme`).
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withSummaryPreset(current, preset);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) => withSummaryPreset(current, preset));
   },
 
   setSummarySystemPrompt: async (prompt) => {
-    // Persist via `update_settings` (same round-trip as `setSummaryPreset`).
-    const current = get().settings;
-    if (current === null) {
-      return;
-    }
-    const next = withSummarySystemPrompt(current, prompt);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withSummarySystemPrompt(current, prompt),
+    );
   },
 
   setMcpEnabled: async (enabled) => {
-    // Persist via `update_settings` (same round-trip as `setDiarizationEnabled`).
-    const current = get().settings;
-    if (current === null) {
-      return;
-    }
-    const next = withMcpEnabled(current, enabled);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) => withMcpEnabled(current, enabled));
   },
 
   setMcpPort: async (port) => {
-    const current = get().settings;
-    if (current === null) {
-      return;
-    }
-    const next = withMcpPort(current, port);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) => withMcpPort(current, port));
   },
 
   setMcpWriteTools: async (enabled) => {
-    const current = get().settings;
-    if (current === null) {
-      return;
-    }
-    const next = withMcpWriteTools(current, enabled);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withMcpWriteTools(current, enabled),
+    );
   },
 
   setOutputLanguage: async (language) => {
-    // Persist via `update_settings` so the choice survives an app restart, the
-    // same round-trip-through-settings pattern `setTranscriptionLanguage` uses.
     // The sentinel "auto" reaches the store/Rust unchanged (the resolver maps
     // it to the host locale at generation time, or to no instruction when the
     // locale is unmapped). The transcript is never affected.
-    const current = get().settings;
-    if (current === null) {
-      // refreshSettings hasn't completed yet; skip the write to avoid
-      // clobbering with a partial object.
-      return;
-    }
-    const next = withOutputLanguage(current, language);
-    try {
-      const result = await commands.updateSettings(next);
-      unwrap(result);
-      set({ settings: next, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
+    await updateSetting(get, set, (current) =>
+      withOutputLanguage(current, language),
+    );
   },
 
   handleEvent: (event) => {

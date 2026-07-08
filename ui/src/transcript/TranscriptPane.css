@@ -188,9 +188,14 @@
   list-style: none;
   margin: 0;
   padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.95rem;
+  /* Virtualised (`@tanstack/react-virtual`): the virtualiser sets this
+     element's inline `position: relative` + `height`, and each
+     `.transcript-pane__row` is positioned absolutely within it via an inline
+     `transform: translateY(...)` derived from cumulative measured row
+     heights. A flex `gap` here would be inert for these out-of-flow children
+     and excluded from the measured height the virtualiser reads, so the
+     inter-row spacing lives in `.transcript-pane__row`'s own bottom padding
+     instead (see below). */
 }
 
 .transcript-pane__row {
@@ -205,7 +210,12 @@
      timestamp handle only, so the segment text below stays selectable. */
   cursor: pointer;
   border-radius: var(--radius);
-  padding: 0.2rem 0.4rem;
+  /* The extra 0.95rem of bottom padding is the inter-row spacing (see the
+     `.transcript-pane__list` comment above) baked into each row's own box,
+     so the virtualiser's `measureElement` — which reads
+     `getBoundingClientRect()`, i.e. the padding box — captures it and folds
+     it into the cumulative `translateY` offsets. */
+  padding: 0.2rem 0.4rem calc(0.2rem + 0.95rem);
   margin: 0 -0.4rem;
   transition: background 120ms ease, box-shadow 120ms ease;
 }

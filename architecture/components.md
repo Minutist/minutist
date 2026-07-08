@@ -4389,7 +4389,7 @@ than packages.
 | Component | Lives in | Owns |
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
-| Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
+| Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. Rows are virtualised (`@tanstack/react-virtual`) and keyed by segment `start_ms`: only the rows in the scroll container's visible window (plus a small overscan) are mounted, and identity follows the segment across a splice/reorder rather than sticking to an array position. The per-row component (`TranscriptRow`) is memoised so a live append re-renders only the newly-visible rows. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
 | Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, audio meter, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, a Connection pane (`ConnectionSettingsPane.tsx`, WS4-A S5b — connector enable toggle, "Pair this device" via the device-code flow that shows the `user_code` and opens the verification URL with `tauri-plugin-opener`, live `Connecting → Online` status, and the paired account; honest that the connector channel transits content to the AI vendor by design, never "private"), and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one Phase-10 read command `get_mcp_server_info`; the Connection pane drives the four WS4-A S5b tunnel commands. Both connected-only panes are `VITE_CONNECTED`-gated (lazy-loaded; dropped from the free bundle). |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
@@ -4416,8 +4416,10 @@ alongside `RecordingStore.handleEvent` from `useAppEventBridge`. The `Start` but
 in `MeetingControls` is disabled when `isAsrModelReady` is false; `ModelDownloadStatus`
 (`ui/src/shell/`) provides the first-run download flow. `TranscriptPane`
 (`ui/src/transcript/`) renders live segments with `MM:SS.cc` timestamps and
-sticky-bottom auto-scroll. `MainWindow` uses a two-column 50/50 layout (controls
-left, transcript right).
+sticky-bottom auto-scroll — driven by the row virtualiser's `scrollToIndex`
+rather than a manual `scrollTop` write, since most rows are unmounted and a
+manual scroll calculation would not know their heights. `MainWindow` uses a
+two-column 50/50 layout (controls left, transcript right).
 
 **Phase 3 additions (Stream S2 — notes editor).**
 
@@ -4758,9 +4760,17 @@ QA, but that path never reaches the shipped dialog.
   `chat_error` surfaces the error and clears the in-flight state. Every chat
   event is per-session scoped — an event whose `session_id` is not the open
   session is ignored, so a backgrounded session's turn never clobbers the open
-  one. All IPC routes through the `ui/src/ipc/chat.ts` seam (wrapping the
-  shim-aware `commands.*` from `./client`, NOT raw `bindings.ts`), so tests mock
-  the seam.
+  one. **New-session adoption race:** `send()` sets `inFlight` and starts
+  streaming before its dispatch promise resolves with the backend-minted
+  session id, so for a brand-new session (`sessionId` still `null`) an event
+  can arrive before there is an id to scope-check against; rather than drop it,
+  it is buffered in `pendingEvents` and replayed (filtered to the adopted id)
+  the moment `send` adopts `sessionId` — otherwise the start of a new session's
+  reply would be lost. `pendingEvents` is cleared on every session switch
+  (`setMeeting`, `openSession`, `newSession`, `deleteSession`) since a buffered
+  event belongs to whichever session was open when it arrived. All IPC routes
+  through the `ui/src/ipc/chat.ts` seam (wrapping the shim-aware `commands.*`
+  from `./client`, NOT raw `bindings.ts`), so tests mock the seam.
 - **Chat pane (`ui/src/shell/ChatView.tsx` + `.css`).** A workspace column (not
   an overlay) wired into `MainWindow`'s `buildPanes` alongside notes / transcript
   / summary, gated on a concrete `activeMeetingId` (a live recording's meeting or
@@ -4871,22 +4881,42 @@ A warm-paper, document-centric **light** theme applied across the webview.
   segment index. Tests mock this seam module, not the generated bindings. The DEV
   shim supplies no-op stubs for both commands.
 - **`ui/src/state/translations.ts` (Zustand store).** Holds `selectedLanguage`
-  (`null` = verbatim view), `translations: Map<number, string>` (the per-segment
-  cache for the open meeting + language), `translateInFlight` (blocks the Translate
-  button while the backend pass runs), and `openMeetingId` (set by
-  `TranscriptPane` via `setOpenMeeting` so `handleEvent` can guard event-scoped
-  reloads). Actions: `translate(meetingId, language)` — calls `translateMeeting`
-  then `getTranslations` and populates the map; `loadTranslations(meetingId,
-  language)` — reads without re-translating (on-open restore); `showVerbatim()`
-  — clears `selectedLanguage` and drops the map; `setOpenMeeting(id)` — called on
-  meeting open/close to clear stale translations; `reset()` — full reset.
-  `handleEvent` reacts to `translation_ready { meeting_id, language }`: if the
-  event matches the active meeting + `selectedLanguage`, calls `loadTranslations`
-  to refresh the overlay. Dispatched from `useAppEventBridge` alongside the other
-  stores.
+  (`null` = verbatim view), `translations: Map<number, string>` keyed by segment
+  `start_ms` (the per-segment cache for the open meeting + language),
+  `translateInFlight` (blocks the Translate button while the backend pass
+  runs), and `openMeetingId` (set by `TranscriptPane` via `setOpenMeeting` so
+  `handleEvent` can guard event-scoped reloads). Actions: `translate(meetingId,
+  language, segments)` — calls `translateMeeting` then `getTranslations` and
+  converts the backend's segment-INDEX-keyed result (matching
+  `translations.json`'s on-disk shape) into the `start_ms`-keyed map using
+  `segments` (the transcript currently in view — an entry whose index falls
+  outside it is dropped rather than mapped to the wrong row);
+  `loadTranslations(meetingId, language, segments)` — reads without
+  re-translating (on-open restore), same conversion; `showVerbatim()` — clears
+  `selectedLanguage` and drops the map; `setOpenMeeting(id)` — called on meeting
+  open/close to clear stale translations; `reset()` — full reset. `handleEvent`
+  reacts to: `translation_ready { meeting_id, language }` — if the event
+  matches the active meeting + `selectedLanguage`, calls `loadTranslations`
+  (sourcing `segments` from `active-transcript`'s non-reactive
+  `activeTranscript()`) to refresh the overlay; `transcript_ready` /
+  `diarization_complete` for the open meeting — clears `selectedLanguage` and
+  the cache, since either replaces the segment array the cached `start_ms` keys
+  were computed against (a re-diarize rewrites `transcript.json` via
+  `write_transcript` whenever it re-letters speakers or applies the
+  per-speaker-turn split/merge, which also clears `translations.json`
+  server-side — see the `persistence` translations-sidecar invariant).
+  Dispatched from `useAppEventBridge` alongside the other stores.
 - **`ui/src/state/operation-progress.ts` (updated).** `translation_ready` added
   to the terminal-event list so the per-row progress indicator clears when a
-  translate pass finishes.
+  translate pass finishes. `error_occurred` also clears any row whose `op` is
+  `"finalise"`: the post-stop finalise handshake's abort path
+  (`Orchestrator::abort_finalise`) emits `ErrorOccurred` as its terminal
+  signal, but `AppError` carries no `meeting_id` to match a specific row the
+  way the other terminal events do. `finalise` is the one op that can never
+  have more than one row in flight app-wide (only the just-stopped meeting can
+  be finalising), so clearing every `finalise` row is an unambiguous response
+  to "the operation that just errored" without guessing at a meeting id; other
+  ops keep their own meeting-scoped terminal event and are unaffected.
 - **`TranscriptToolbar` (updated in `TranscriptPane.tsx`).** The toolbar gains:
   a `<select>` pre-seeded to the first language in `OUTPUT_LANGUAGES` (re-used
   from `OutputLanguagePicker`); a Translate button (disabled while any op is
@@ -4902,11 +4932,14 @@ A warm-paper, document-centric **light** theme applied across the webview.
   mono) so the substitution is visible at a glance. A one-tap "Show original"
   in the toolbar flips back to the verbatim view.
 - **Test coverage** (`ui/src/__tests__/Translations.test.tsx`): `translate()`
-  invokes `translateMeeting` then `getTranslations` and populates the store;
+  invokes `translateMeeting` then `getTranslations` and populates the store
+  keyed by `start_ms` (dropping an index outside the supplied segments);
   `loadTranslations()` fetches without a new translation pass; `showVerbatim()`
   clears; `setOpenMeeting()` resets on meeting change; `handleEvent` refreshes
   on matching `translation_ready` and ignores events for different languages or
-  meetings; `translation_ready` clears the operation-progress indicator.
+  meetings; `transcript_ready` / `diarization_complete` for the open meeting
+  clear the translated view (and leave an unrelated meeting's untouched);
+  `translation_ready` clears the operation-progress indicator.
 
 ## What lives where — quick reference
 

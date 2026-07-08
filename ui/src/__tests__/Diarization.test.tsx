@@ -528,6 +528,27 @@ describe("diarization_enabled toggle round-trip (Phase 6)", () => {
     expect(readDiarizationEnabled(BASE_SETTINGS)).toBe(false);
     expect(readDiarizationEnabled(null)).toBe(false);
   });
+
+  // G2 — the shared `updateSetting` helper writes optimistically and rolls
+  // the settings snapshot back (surfacing the error) when the persist fails.
+  // Exercised here via `setDiarizationEnabled`; every settings setter in
+  // `recording.ts` routes through the same helper.
+  it("rolls the settings snapshot back and surfaces lastError when the persist fails", async () => {
+    act(() => {
+      useRecordingStore.setState({ settings: BASE_SETTINGS, lastError: null });
+    });
+    vi.mocked(commands.updateSettings).mockReturnValueOnce(
+      Promise.resolve({
+        status: "error" as const,
+        error: { code: "io", context: "disk full" },
+      }),
+    );
+
+    await useRecordingStore.getState().setDiarizationEnabled(true);
+
+    expect(useRecordingStore.getState().settings).toEqual(BASE_SETTINGS);
+    expect(useRecordingStore.getState().lastError).toBeTruthy();
+  });
 });
 
 // ---------------------------------------------------------------------------

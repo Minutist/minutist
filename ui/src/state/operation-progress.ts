@@ -15,6 +15,13 @@
  *   - `summary_unavailable`  → clear (an auto-summarise was deferred/failed).
  *   - `meeting_finalised`    → clear (the finalise drain finished).
  *   - `translation_ready`    → clear (the translate pass finished).
+ *   - `error_occurred`       → clear the `finalise` row (the post-stop
+ *     handshake aborted). `AppError` carries no `meeting_id`, so this cannot
+ *     target a specific row the way the other terminal events do; `finalise`
+ *     is the one op guaranteed to be at most single-flight (only the
+ *     just-stopped meeting can be finalising at a time), so clearing every
+ *     row whose `op` is `"finalise"` is unambiguous. Other ops keep their own
+ *     meeting-scoped terminal event and are unaffected.
  *
  * The store keeps only transient UI state keyed by `MeetingId`; it is never a
  * source of truth the backend owns.
@@ -77,6 +84,28 @@ export const useOperationProgressStore = create<OperationProgressStore>(
             const next = { ...s.operations };
             delete next[meetingId];
             return { operations: next };
+          });
+          break;
+        }
+        // `error_occurred` carries no `meeting_id` (see the module doc), so it
+        // cannot be matched to a row the way the meeting-scoped terminal
+        // events above are. `finalise` is the only op that can never have more
+        // than one row in flight app-wide, so clearing every `finalise` row is
+        // an unambiguous, safe interpretation of "the operation that just
+        // errored" — it clears the spinner left behind by an aborted post-stop
+        // finalise handshake without guessing at a meeting id.
+        case "error_occurred": {
+          set((s) => {
+            const next: Record<MeetingId, MeetingOperation> = {};
+            let changed = false;
+            for (const [meetingId, op] of Object.entries(s.operations)) {
+              if (op.op === "finalise") {
+                changed = true;
+                continue;
+              }
+              next[meetingId] = op;
+            }
+            return changed ? { operations: next } : s;
           });
           break;
         }

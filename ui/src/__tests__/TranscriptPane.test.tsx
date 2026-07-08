@@ -585,6 +585,50 @@ describe("SpeakerChip rename (issue #0001)", () => {
     expect(screen.getByRole("button", { name: "Speaker A" })).toBeInTheDocument();
   });
 
+  // G1 — rows are keyed by segment `start_ms`, not array index, so a row's
+  // identity (and any local component state, e.g. an open rename input)
+  // follows its segment across a splice/reorder instead of sticking to a
+  // position and picking up the wrong segment's data.
+  it("preserves a chip's open rename input across a reorder (keyed by start_ms, not array index)", () => {
+    render(<TranscriptPane />);
+    const chipB = screen.getByRole("button", { name: "Speaker B" });
+    act(() => {
+      fireEvent.click(chipB);
+    });
+    expect(screen.getByRole("textbox")).toBeInTheDocument();
+
+    // Prepend a new, earlier segment: B's ARRAY INDEX shifts from 1 to 2, but
+    // its start_ms (2_000) is unchanged.
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "saved-chip",
+        openMeetingState: {
+          transcript: [
+            {
+              start_ms: -1_000,
+              end_ms: -500,
+              text: "Hello from C.",
+              speaker_id: "C",
+              words: [],
+              shared_speakers: [],
+            },
+            ...makeSpeakerSegments(),
+          ],
+          meta: { speaker_names: {} },
+        } as unknown as MeetingState,
+      });
+    });
+
+    // B's row kept its identity (and open rename input) despite moving to a
+    // new index. An index-keyed row would instead keep the input open at the
+    // OLD index — now A's row — while B silently reverts to a plain button.
+    expect(screen.getByRole("textbox")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Speaker A" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Speaker B" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("renders chips as read-only spans (not buttons) during a live recording", () => {
     act(() => {
       useRecordingStore.setState({

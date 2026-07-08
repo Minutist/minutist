@@ -44,6 +44,14 @@ export function useAppEventBridge(): void {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    // Guards against a mount → unmount → remount race (e.g. React StrictMode's
+    // deliberate double-invoke): if cleanup runs before `listenAppEvents`
+    // resolves, `unlisten` is still `undefined` when the cleanup fires, so the
+    // `unlisten?.()` below is a no-op and the listener that resolves a moment
+    // later is never removed — a leaked duplicate subscription. Once cleanup
+    // has run, unlisten the just-resolved listener immediately instead of
+    // stashing it.
+    let cancelled = false;
 
     listenAppEvents((event) => {
       handleRecordingEvent(event);
@@ -61,6 +69,10 @@ export function useAppEventBridge(): void {
       handleLiveDigestEvent(event);
     })
       .then((fn) => {
+        if (cancelled) {
+          fn();
+          return;
+        }
         unlisten = fn;
       })
       .catch((err: unknown) => {
@@ -68,6 +80,7 @@ export function useAppEventBridge(): void {
       });
 
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   // The handleEvent functions are stable Zustand store references; the dep

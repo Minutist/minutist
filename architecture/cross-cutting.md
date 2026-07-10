@@ -36,17 +36,17 @@ that.
 | VAD inference | Runs inline in the single runner drain loop (`spawn_blocking`), which also drains the sample channel and writes audio — not a dedicated VAD task. |
 | ASR inference | A dedicated `spawn_blocking` task per active model; chunks queued via bounded channel. |
 | Diarization (offline) | One-shot `spawn_blocking` task triggered on stop or user action — the authoritative pass. |
-| Diarization (live, Phase B) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from the runner's drain-loop thread (`spawn_blocking`) at SegmentEnd — gated on the `diarization_enabled` setting AND the embedding model being locally `Available` (no download, no block at start; the heavy `EmbeddingExtractor` load is built on `spawn_blocking` before the runner spawns). Best-effort/additive: any failure degrades to "no label" without affecting recording/transcription. See the live-vs-offline note below. |
+| Diarization (live) | Per-VAD-segment `OnlineDiarizer::assign_segment` driven from the runner's drain-loop thread (`spawn_blocking`) at SegmentEnd — gated on the `diarization_enabled` setting AND the embedding model being locally `Available` (no download, no block at start; the heavy `EmbeddingExtractor` load is built on `spawn_blocking` before the runner spawns). Best-effort/additive: any failure degrades to "no label" without affecting recording/transcription. See the live-vs-offline note below. |
 | Summarisation | One-shot `spawn_blocking` task triggered by user action. |
 | Attachment conversion | A SINGLE long-lived worker task (`tauri::async_runtime::spawn`, same pattern as `spawn_event_forwarder`). Jobs arrive on a **bounded** `tokio::sync::mpsc` channel; the worker processes them one at a time, each on `spawn_blocking`. Best-effort: every error is logged (`target: "ipc-bridge"`); the worker never panics. Back-pressure: `add_attachment` uses `try_send`; a full queue marks the entry `Failed("conversion queue full")` immediately. |
 | Persistence writes | `spawn_blocking` per write op for now; revisit if it shows up in profiling. |
 | Tauri command handlers | Tokio worker threads. Short-lived, dispatch to the above. |
-| Live co-pilot reply drain (U4 A3) | A `tokio::spawn` task per user chat turn when the meeting is live. It drains a bounded `mpsc::Receiver<UserReplyChunk>` (depth 32) and emits `ChatToken`/`ChatTurnComplete`/`ChatError` on the broadcast bus. Terminates on the first terminal chunk (`Done`/`Err`) or channel close. `chat_in_flight` is cleared by this task, not the worker thread (mirroring the non-live path). |
+| Live co-pilot reply drain | A `tokio::spawn` task per user chat turn when the meeting is live. It drains a bounded `mpsc::Receiver<UserReplyChunk>` (depth 32) and emits `ChatToken`/`ChatTurnComplete`/`ChatError` on the broadcast bus. Terminates on the first terminal chunk (`Done`/`Err`) or channel close. `chat_in_flight` is cleared by this task, not the worker thread (mirroring the non-live path). |
 
 Bounded channels everywhere. Unbounded queues are not allowed — they
 hide back-pressure that the live pipeline needs to surface.
 
-**Live co-pilot reply channel (U4 A3).** `UserChatRequest` carries a bounded
+**Live co-pilot reply channel.** `UserChatRequest` carries a bounded
 `reply_tx: mpsc::Sender<UserReplyChunk>` (depth 32). The live worker `try_send`s
 EVERY chunk — `UserReplyChunk::Token` per decoded piece (drop on full; tokens are
 hints, `ChatTurnComplete` is authoritative) and the terminal
@@ -63,25 +63,25 @@ streamed (a `Done` dropped on a full buffer), the drain reconstructs
 
 **One co-pilot surface (unified chat timeline).** The chat panel (`ChatView`) is
 the co-pilot's ONLY visible surface — there is no separate proactive-feed panel.
-Two distinct event families still carry the two turn kinds (the backend routing
-is unchanged from U4), but both now render into the same chronological timeline:
+Two distinct event families carry the two turn kinds, and both render into the
+same chronological timeline:
 - **Transcript-triggered turns** (`LiveCopilotMessage` events, turn kind =
   `Transcript`): the chat store appends these as ASSISTANT-role messages when the
   event's `meeting_id` matches the open meeting.
 - **User-typed turns** (`ChatToken` / `ChatTurnComplete` events, turn kind =
   `UserChat`): stream on `reply_tx` as before. `LiveCopilotMessage` is NOT emitted
-  for user-chat turns (unchanged — it would double-render the reply that already
-  streamed as chat events).
+  for user-chat turns (it would double-render the reply that already streamed as
+  chat events).
 
 `ChatRole::Digest` turns (the raw transcript window fed to the model, persisted
 in the same `is_live` session for engine context) are excluded from the
 rendered timeline — they are model input, not a co-pilot utterance.
 
-**Co-pilot system prompt (U2/U4).** The pinned prefix uses
+**Co-pilot system prompt.** The pinned prefix uses
 `settings.live_agent_system_prompt`, which is the CO-PILOT role (answer the user
-using the meeting so far; stay silent on unremarkable transcript). A store written
-before the U2 cutover holds the retired digest-maintenance prompt and is migrated
-to the co-pilot default on load (`settings::deserialize_live_agent_system_prompt`);
+using the meeting so far; stay silent on unremarkable transcript). A store holding
+the retired digest-maintenance prompt is migrated to the co-pilot default on load
+(`settings::deserialize_live_agent_system_prompt`);
 leaving the digest prompt in place makes the model ask the user to "provide the
 digest and transcript segments" instead of answering.
 
@@ -105,7 +105,7 @@ safety argument at the impl site):
   `MtmdContext` is already `unsafe impl Send + Sync` in `llama-cpp-2`). See
   `cross-cutting.md` — "Held model serves vision".
 
-**Live vs. offline diarization (Phase B).** There are two independent
+**Live vs. offline diarization.** There are two independent
 diarization paths. The offline `SherpaDiarizer` / `common::Diarizer`
 on-stop (and re-diarize) pass is the SOURCE OF TRUTH for the finished
 transcript. The live `OnlineDiarizer` (in `crates/diarizer`,
@@ -127,17 +127,17 @@ that still separates two distinct speakers, maximising single-speaker merging.
 The greedy online path has little margin, so live labels stay provisional — the
 on-stop pass is the safety net.
 
-**Offline over-split prune (issue #63, 2026-06-10).** On long, acoustically-
+**Offline over-split prune (issue #63).** On long, acoustically-
 varied recordings (room coloration + system-audio loopback + a podcast over a
 loudspeaker) the offline pass over-split: one speaker's embeddings drift past the
 single distance `cluster_threshold`, minting extra clusters — the field saw 19 /
 29 speakers where the truth was a handful. A distance threshold alone cannot
 separate "same speaker, drifted" from "different speaker", so the robust fix is a
 **post-cluster prune** in `overlay_speakers`, NOT a higher threshold. The
-shipped `DiarizerConfig::default()` now carries three additional knobs:
+shipped `DiarizerConfig::default()` carries three additional knobs:
 `min_duration_on` / `min_duration_off` (`0.3` / `0.5`, sherpa's own example
-values — previously pinned to `0.0`/disabled — bridging short intra-speaker gaps
-and dropping sub-300 ms turns inside sherpa) and `min_cluster_share` (`0.02`):
+values, bridging short intra-speaker gaps and dropping sub-300 ms turns inside
+sherpa) and `min_cluster_share` (`0.02`):
 after the interval-join, any cluster winning under 2 % of the attributed speech
 DURATION is dropped and its segments reassigned to the nearest surviving cluster
 (mirroring pyannote's production `min_cluster_size` reassignment and the 2026
@@ -153,12 +153,12 @@ table and `crates/diarizer/tests/oversplit_eval.rs` for the gated eval harness.
 The clean-fixture accuracy test still gives 2 / 1 (balanced speakers sit well
 above the 2 % floor).
 
-As of **Phase B** the live path is wired into the orchestrator (see
-`components.md` — `orchestrator` "Phase B — live diarization wiring").
+The live path is wired into the orchestrator (see
+`components.md` — `orchestrator` "live diarization wiring").
 The label is assigned per VAD segment at SegmentEnd on the runner's
 drain-loop thread and rides a parallel `speaker_ids` column
 (`Accumulator` → `FlushPayload` → `emit_segments_proportional` →
-`Segment.speaker_id`). Consequently live labels are now emitted on
+`Segment.speaker_id`). Live labels are emitted on
 `AppEvent::TranscriptSegment` and persisted via `WriterCommand::WriteSegment`
 (into `transcript.json`) DURING recording. The on-stop pass remains
 authoritative: when `diarization_enabled` is true, the whole-transcript
@@ -359,33 +359,30 @@ the regen step.
 
 ## ASR chunking constraint
 
-Phase 0 Spike 1 confirmed that llama.cpp's mtmd audio encoder uses a
+llama.cpp's mtmd audio encoder uses a
 fixed 30 s window. Sub-30 s inputs are silence-padded internally and the
 model hallucinates into the pad. This is binding on every `AsrBackend`
 caller until upstream issue ggml-org/llama.cpp#20914 lands (multi-phase
 streaming work; not in v1's timeframe).
 
-**Verified still binding (2026-06).** A primary-source investigation
-confirmed #20914 (realtime/streaming ASR) has NOT landed — its Phase-1
-APIs are absent from llama.cpp master (the original monolithic PRs were
-rejected; the issue was reopened 2026-06-01) — and the audio encoder
+**Verified still binding.** #20914 (realtime/streaming ASR) has NOT
+landed — its Phase-1 APIs are absent from llama.cpp master (the original
+monolithic PRs were rejected) — and the audio encoder
 window is still a fixed 30 s everywhere. The pinned `llama-cpp-2 =0.1.146`
-already vendors a current llama.cpp (commit `e21cdc11`, build b8783,
-2026-04-13) that includes Qwen3-ASR mtmd audio, so there is no version lag
+vendors a current llama.cpp (commit `e21cdc11`, build b8783) that includes
+Qwen3-ASR mtmd audio, so there is no version lag
 to chase. The silence-preservation and `</asr_text>` early-stop sub-rules
-below remain mandatory. The chunk-*sizing* rule was REVISED on 2026-06-04
-(see below) after a live test contradicted the Phase-0 ≥25 s guidance.
+below remain mandatory.
 
-**Chunk sizing — REVISED 2026-06-04 (supersedes the Phase-0 "≥25 s" rule).**
+**Chunk sizing.**
 The orchestrator must bound each `AsrBackend::transcribe_chunk` call to
-**roughly 5–13 s** of audio, NOT fill the 30 s window. Phase 0 reasoned that
-sub-30 s inputs hallucinate into the internal silence pad, so chunks should be
-shaped to ≥25 s. A live recording (2026-06-04) disproved that for the upper
-end: a ~26 s chunk drove Qwen3-ASR into a greedy-decode **repetition loop**
+**roughly 5–13 s** of audio, NOT fill the 30 s window. Filling toward the 30 s
+window risks a failure mode at the upper end: a ~26 s chunk can drive
+Qwen3-ASR into a greedy-decode **repetition loop**
 (the same failure the silence-preservation rule guards against, but triggered
 by over-long input rather than compaction). Short chunks do NOT hallucinate
 into the pad in practice because the `</asr_text>` early-stop truncates any
-post-transcript continuation. So the binding rule is now an upper bound:
+post-transcript continuation. So the binding rule is an upper bound:
 - **VAD force-splits** any single speech segment at `VadConfig::max_segment_ms`
   (10 s) — see `vad-chunker`.
 - The **batched-VAD accumulator** flushes at `FLUSH_MIN_SECS` (3 s) or after
@@ -397,8 +394,8 @@ misfire — e.g. a spurious language switch (Qwen3-ASR auto-detects language per
 call and has no hint). A prompt-level language hint is the planned mitigation
 (tracked separately), not a chunk-sizing concern.
 
-**Preserve original-timeline silences.** Phase 0 Spike 3 found that
-concatenating VAD-trimmed utterances back-to-back into the batched
+**Preserve original-timeline silences.** Concatenating VAD-trimmed
+utterances back-to-back into the batched
 buffer causes Qwen3-ASR to enter a greedy-decode loop after the first
 few words. Reconstructing the inter-utterance silences via zero-padding
 between segments restored correct output. Qwen3-ASR appears to use
@@ -420,7 +417,7 @@ latency profile is unacceptable.
 
 ## ASR engine routing
 
-There are two ASR backends behind `common::AsrBackend` (Phase 8): `asr-parakeet`
+There are two ASR backends behind `common::AsrBackend`: `asr-parakeet`
 (sherpa-onnx Parakeet TDT v3 — English + 24 EU languages, per-word timestamps,
 CPU) and `asr-runtime` (llama-cpp-2 Qwen3-ASR — 52 languages/dialects, no
 timestamps; 0.6B CPU default + optional 1.7B GPU tier).
@@ -471,7 +468,7 @@ this section must be updated to cover it.
 
 ## Notes paragraph-anchor clock
 
-Phase 3 binding rule (stress-test correction A4). Notes paragraph anchors
+Binding rule (stress-test correction A4). Notes paragraph anchors
 (`data-anchor-ms` on each paragraph, first-keystroke-per-paragraph while
 recording) MUST be stamped from the capture-sample, pause-**excluding**
 recording clock — the same timeline as `Segment::start_ms`. That value is
@@ -480,7 +477,7 @@ emitted throttled (~5 Hz) from the orchestrator runner loop.
 
 Do **not** derive anchors from `Date.now() - started_at_ms`: that wall-clock
 delta is pause-*including* and drifts from the audio/transcript timeline, so
-Phase 4 cross-reference (FR-22/23, anchor → nearest transcript segment) would
+cross-reference (FR-22/23, anchor → nearest transcript segment) would
 resolve to the wrong region. `started_at_ms` remains valid for elapsed-time
 *display* only.
 
@@ -499,16 +496,15 @@ so no persistence change is needed.
 
 Consequence: `audio.opus` is recorded pause-*including* (the encoder pads each
 pause with synthesised silence), while anchors and segment timestamps are
-pause-*excluding*. Phase 4 cross-reference (FR-22/23) operates **entirely on the
+pause-*excluding*. Cross-reference (FR-22/23) operates **entirely on the
 pause-excluding timeline** (`data-anchor-ms` ↔ `Segment::start_ms`), so it needs
 no conversion. The **summariser** relies on the same coincidence (#70): it
 merges anchored note paragraphs with transcript segments by comparing
 `data-anchor-ms` directly against `Segment::start_ms`, no conversion, to weave
 each note in at the time it was written (see `components.md` — `summariser`). Audio-file *seek-to-anchor* (playing the audio at a clicked
 anchor) is the only feature that must bridge the two timelines — it needs a
-pause-offset map (a list of pause intervals) — and it was **deferred out of
-Phase 4** (no audio player shipped this phase). Whatever phase adds audio
-playback owns the pause-offset map.
+pause-offset map (a list of pause intervals) — and remains **deferred**.
+Whatever feature adds this bridging owns the pause-offset map.
 
 **Offline reprocessing must reproduce the pause-excluding timeline.** Because
 `audio.opus` is pause-*including* but `Segment::start_ms` is pause-*excluding*,
@@ -528,7 +524,7 @@ by the pause). Limitation: a ≥ 4 s run of genuinely-silent *input* would be
 misclassified; a persisted pause-interval map (a `common`/schema change) would
 make this exact rather than heuristic — tracked for a later phase.
 
-**Re-diarize re-ASR split must stay on a single clock (#0015 phase 4).** The
+**Re-diarize re-ASR split must stay on a single clock (#0015).** The
 offline re-diarize pass re-ASRs each kept mixed Qwen segment into single-speaker
 sub-clips at its speaker-change boundaries. The two clocks must never be
 compared directly: `SherpaDiarizer::compute_turns` runs over the pause-INCLUDING
@@ -554,7 +550,7 @@ internal `Offline` state under the orchestrator lock (rejecting a concurrent
 offline op with `AppError::InvalidInput`) and release it on every exit path, so
 two offline ops can't race and clobber the SAME meeting's `transcript.json`.
 
-**`reprocess` (#0015 phase 5) takes ONE claim for a re-transcribe + diarize
+**`reprocess` (#0015) takes ONE claim for a re-transcribe + diarize
 pass.** It merges `re_transcribe` and `rediarize` into a single offline op under
 ONE `claim_offline`/`release_offline`, never re-claiming between the two
 sub-steps: it drives their CLAIMED bodies (the post-claim logic, factored out so
@@ -591,7 +587,7 @@ NOT preemptible — it must complete before any start.
 
 ## llama.cpp prefill batching
 
-Phase 0 Spike 2 found that `cparams.n_batch` is a **per-decode hard
+`cparams.n_batch` is a **per-decode hard
 limit**, not just an allocation hint. Feeding a prompt longer than
 `n_batch` tokens in a single `LlamaBatch` trips
 `GGML_ASSERT(n_tokens_all <= cparams.n_batch)` and aborts. The fix is
@@ -616,10 +612,10 @@ on every clean build, on every platform) — there is no system-lib link.
 
 - **Pin policy.** `llama-cpp-2`/`-sys-2` are pinned with `=EXACT` and bumped
   **deliberately**, never floated — the crate does not follow semver
-  meaningfully, so each bump is a separately-verified change. As of 2026-06,
-  `=0.1.146` (published 2026-04-30) is the latest published release and
+  meaningfully, so each bump is a separately-verified change. `=0.1.146`
+  (published 2026-04-30) is the latest published release and
   vendors llama.cpp build b8783 (commit `e21cdc11`, 2026-04-13), which
-  already includes the April-2026 audio wave (Qwen3-ASR / Qwen3-Omni,
+  includes the April-2026 audio wave (Qwen3-ASR / Qwen3-Omni,
   Gemma 4 audio). There is no version lag.
 - **Going past the latest crate requires a fork.** `llama-cpp-sys-2` has no
   `LLAMA_CPP_SRC`/`PATH` override; to ride a newer llama.cpp than the latest
@@ -627,7 +623,7 @@ on every clean build, on every platform) — there is no system-lib link.
   and reconcile FFI drift (it compiles internal `common_chat_*` C++ with no
   stability contract), wired via `[patch.crates-io]`. Reserve this for a
   specific load-bearing upstream fix; it is not warranted now.
-- **Bump/fork verification gotchas (Phase 7 + any future bump).** Re-run the
+- **Bump/fork verification gotchas.** Re-run the
   gated ASR WER + early-stop tests and the orchestrator pipeline test after
   any crate/submodule change (canary for binding/model drift). Known traps
   past b8783: MSVC LTO break (#22186, after commit 6990e2f → set
@@ -646,10 +642,10 @@ Owned by `model-registry`. The contract:
   if absent; verifies hash.
 - **First-run provisioning.** The onboarding wizard's model step offers BOTH
   the ASR model and the summarisation LLM (`gemma-4-e4b-it-q4_k_m`) up front,
-  each as a per-model `ModelDownloadCard` (progress / retry / ready). Previously
-  only the ASR model was provisioned and the LLM lazy-downloaded silently on the
-  first summarise (multi-GB, no progress — read as a broken button). Downloads
-  remain skippable and continue in the background if the user proceeds. If the
+  each as a per-model `ModelDownloadCard` (progress / retry / ready) —
+  provisioning only the ASR model and lazy-downloading the LLM silently on
+  the first summarise would read as a broken button (multi-GB, no progress).
+  Downloads remain skippable and continue in the background if the user proceeds. If the
   LLM was skipped, the Summarise action's in-progress UI distinguishes the
   one-time **model-download phase** (with %) from actual summarisation, so the
   multi-GB wait is not mislabelled "Summarising…". A downloaded-but-not-yet-
@@ -769,10 +765,8 @@ indicator. Producers + determinism:
   total }` as the transcript+notes prompt decodes chunk by chunk; (4) determinate
   **"Writing the summary…"** `Generate { done, max }` per token. The callback is
   throttled to ~5 Hz but always emits on a phase change and at completion. (The
-  `common::Summariser::summarise` signature has been widened twice: #70 changed
-  `notes_markdown: &str` → `notes: &[NoteBlock]`; the Attachments WS added
-  `attachments_markdown: &str` before `system_prompt`. The current four-argument
-  signature is `fn summarise(&self, transcript: &[Segment], notes: &[NoteBlock],
+  `common::Summariser::summarise` signature is
+  `fn summarise(&self, transcript: &[Segment], notes: &[NoteBlock],
   attachments_markdown: &str, system_prompt: &str) -> AppResult<String>`. The
   *progress* method stays concrete on `LlamaSummariser`, which `ipc-bridge` holds.)
   Cleared by `SummaryReady`.
@@ -843,12 +837,11 @@ own lifecycle event pair, distinct from the single-slot operation-progress bus
   `SummaryUnavailable` also clears the per-row operation-progress indicator (a
   failed `run_held_summarise` may leave a stale `summarise` op).
 
-## Agent chat loop (Phase 9)
+## Agent chat loop
 
 The built-in chat agent (`chat-agent` crate, driven by `ipc-bridge`) runs a
 multi-turn, tool-calling loop over the bundled LLM. The decided cross-cutting
-rules (the engine itself lands in the Phase 9 implementation streams; these
-constraints are binding on them):
+rules, binding on the engine:
 
 - **Held model, fresh context per turn.** The `LlamaModel` is loaded once and
   held (an `Arc<dyn Summariser>`/substrate owned by `ipc-bridge`/`app-main`,
@@ -871,18 +864,18 @@ constraints are binding on them):
   re-prompting, not by crashing the turn.
 - **`Summariser: Send + Sync`.** The held handle crosses threads and is referenced
   concurrently by the summary path and the chat `resummarise` tool, so the trait
-  is `Send + Sync` (SP0-verified; see `components.md` — `common`).
+  is `Send + Sync` (see `components.md` — `common`).
 - **`speaker_names` and re-diarization.** `MeetingMeta.speaker_names` maps a
   diarizer label (`A`/`B`/…) to a user-set display name. Because re-diarization
   re-clusters and can re-letter speakers, a `rediarize` pass CLEARS `speaker_names`
   (the old label→name mapping is no longer valid); the `set_speaker_name` tool
   re-establishes names afterward. Names are an overlay applied at read time, never
-  baked into `transcript.json`. The merged `reprocess` (#0015 phase 5) ALWAYS
+  baked into `transcript.json`. The merged `reprocess` (#0015) ALWAYS
   diarizes. When `voiceprint_enrolment_enabled` is ON, a `reprocess` re-identifies
   known speakers from your library: enrolled speakers keep their names across a
-  re-letter (via global gallery centroid matching, WU5), and unenrolled speakers
+  re-letter (via global gallery centroid matching), and unenrolled speakers
   who were named in this meeting are re-identified via ephemeral centroids and a
-  timeline-coherence fallback (WU4 — see below). Where neither the library nor the
+  timeline-coherence fallback (see below). Where neither the library nor the
   ephemeral centroid matches, the user-typed name is still lost — the accept-and-warn
   default is only partially lifted for unenrolled strangers. When the flag is OFF,
   `speaker_names` is cleared unconditionally on every run (zero behaviour change for
@@ -957,8 +950,7 @@ constraints are binding on them):
 - **Held-model lifecycle (C2).** The LLM GGUF is loaded **once**, lazily, on first
   chat/summarise use into `IpcState::summariser`
   (`Arc<OnceCell<Arc<LlamaSummariser>>>`), and shared by both the chat engine (which
-  borrows `&LlamaModel`) and the one-shot `summarise_meeting` path (refactored from
-  its prior per-call GGUF load). GPU placement is resolved **at load time** from
+  borrows `&LlamaModel`) and the one-shot `summarise_meeting` path. GPU placement is resolved **at load time** from
   the VRAM-aware `GpuPlan` (`plan.summariser_gpu`; see "GPU portability");
   toggling the setting takes effect on the next process start. Each turn still
   allocates a fresh `LlamaContext` (clean KV cache).
@@ -967,17 +959,17 @@ constraints are binding on them):
 
 ## Live in-meeting agent (auto-driver)
 
-The live in-meeting agent (Phase 9 / WU2b) runs a digest-refresh loop during
+The live in-meeting agent runs a digest-refresh loop during
 an active recording, driven by incoming `TranscriptSegment` events and gated by
 the `live_agent_min_segments` / `live_agent_min_seconds` cadence settings.
 Attachment and earlier-transcript context is RETRIEVED into the per-refresh tail
 (not pinned in the prefix); the prefix is just the system prompt + digest
 categories. Cross-cutting rules:
 
-- **HELD context, not fresh per turn.** The Phase-9 chat loop ("Agent chat
+- **HELD context, not fresh per turn.** The chat loop ("Agent chat
   loop" above) allocates a **fresh** `LlamaContext` per assistant turn. The live
   agent holds **one** `LlamaContext` for the entire live session on a dedicated
-  single-owned thread (SP-LIVE E2). The small prefix (system prompt + digest
+  single-owned thread. The small prefix (system prompt + digest
   categories) is prefilled ONCE at recording start as the OPEN USER TURN of a Gemma
   chat-template prompt (#0022 — the instruct model needs the turn framing to reply
   with JSON, not continue the transcript). Each refresh then **prunes the KV back to
@@ -988,13 +980,13 @@ categories. Cross-cutting rules:
   prefill cost on every cadence tick, making live operation unusable. `LlamaContext`
   is `!Send`; the dedicated thread owns it exclusively.
 
-  *Implementation (S2a — `chat-agent::live`).* The held-context loop is
+  *Implementation (`chat-agent::live`).* The held-context loop is
   implemented in `crates/chat-agent/src/live.rs` as `LiveSessionBackend` (the
   testable seam) + `LlamaLiveBackend` (the real impl, `!Send`, borrows
   `&LlamaModel` from the shared `summariser` substrate) + `LiveSession<B>`
   (the driver enforcing prefix-once and tail-only discipline).
 
-  *Implementation (S2b — `ipc-bridge::live_agent`).* The auto-driver is in
+  *Implementation (`ipc-bridge::live_agent`).* The auto-driver is in
   `crates/ipc-bridge/src/live_agent.rs`. It owns:
   - A `tauri::async_runtime` task (the async driver) that subscribes to
     `TranscriptSegment` events, accumulates the tail buffer, and evaluates the
@@ -1047,7 +1039,7 @@ categories. Cross-cutting rules:
   flag on receipt, emits one `LiveDigestError` event, and dispatches no further
   turns. The worker also stops after a terminal result.
 
-  *Context eviction policy (U2 v1).* `process_request` estimates the incoming
+  *Context eviction policy.* `process_request` estimates the incoming
   turn cost (`model_prompt.len() / 3 + FRAMING_TOKEN_MARGIN`, a deliberate
   over-estimate so a boundary turn evicts early rather than hitting the hard
   overflow) and calls `session.has_room_for(estimated_tokens, max_gen)` BEFORE
@@ -1079,7 +1071,7 @@ categories. Cross-cutting rules:
   **Deferred — v2 rolling-summary layered budget.** Rather than only keeping
   last-K verbatim turns, v2 would summarise the evicted middle and prepend that
   summary to the recap. The `reset_to_prefix` + recap-header infrastructure is
-  in place; the summarisation call is the deferred piece. Tracked as a later U2
+  in place; the summarisation call is the deferred piece. Tracked as a later
   item.
 
   *KV growth policy.* Between evictions the context GROWS across turns — no
@@ -1136,7 +1128,7 @@ categories. Cross-cutting rules:
   batch. Older/earlier transcript is already resident (prior transcript turns)
   and reachable via the per-turn RAG retrieval applied to every turn.
 
-- **Keep-alive append-turn model (U2).** The live cadence drives
+- **Keep-alive append-turn model.** The live cadence drives
   `LiveSession::converse` (backed by `LlamaLiveBackend::append_turn`) for BOTH
   transcript and user-chat turns. The context GROWS across turns; `prefix_len`
   marks the seeded system prompt. When the context approaches `n_ctx` the
@@ -1152,7 +1144,7 @@ categories. Cross-cutting rules:
   path** and remains available only for the post-meeting
   `LiveSessionBackend::refresh` contract.
 
-- **Two-tier attachment context (U2 awareness).** Attachment content enters the
+- **Two-tier attachment context.** Attachment content enters the
   live co-pilot via two complementary paths:
   - **Awareness tier (pinned in prefix).** At attach time the conversion worker
     generates a 1–3 sentence summary + topic keywords for each attachment via
@@ -1171,13 +1163,13 @@ categories. Cross-cutting rules:
     retrieved each refresh via the existing RAG path (`build_retrieval_block`,
     dense + lexical over `meeting.db`, fused by RRF). Nothing changes here.
   - **Mid-session re-seed is deferred.** An attachment added DURING a live session
-    is not reflected in the prefix until the session restarts. The A1
+    is not reflected in the prefix until the session restarts. The
     dirty-prefix / eviction-rebuild mechanism (which would update the prefix
-    in-place without a full re-seed) is a later U2 item.
+    in-place without a full re-seed) is a later item.
   - The attach-worker → summariser dependency (`rag_handles.ensure_summariser`)
     pre-exists via `rag_handles`; see the dependency table in `components.md`.
 
-- **Small-prefix + retrieve-into-tail constraint (Phase D).** Full attachment
+- **Small-prefix + retrieve-into-tail constraint.** Full attachment
   markdown is NOT pinned in the prefix — pinning a large set costs a one-time
   prefill (~40 s, minutes on an integrated GPU) that would starve ASR and stall
   the recording UI. Instead the prefix carries the system prompt + compact
@@ -1187,7 +1179,7 @@ categories. Cross-cutting rules:
   integrated GPU) keeps the per-refresh prefill small. Subsequent `seed_prefix`
   calls on the same `LiveSession` are no-ops.
 
-- **ASR(CPU) vs LLM(GPU): no contention (SP-LIVE E1 GO).** ASR (`asr-runtime` /
+- **ASR(CPU) vs LLM(GPU): no contention.** ASR (`asr-runtime` /
   `asr-parakeet`) runs on CPU via `sherpa-onnx` or llama.cpp CPU layers. The live
   agent (and the summariser) run on the GPU via Vulkan. These are distinct compute
   resources; there is no hardware contention between a live decode refresh and a
@@ -1252,9 +1244,9 @@ categories. Cross-cutting rules:
   `LiveDigestUpdated` is **not emitted on the live path** (the digest-JSON
   contract is retired for live sessions).
 
-## MCP transport (Phase 10)
+## MCP transport
 
-The `mcp-server` crate exposes the Phase-9 `agent-tools` registry to external
+The `mcp-server` crate exposes the `agent-tools` registry to external
 agents over an in-process **Streamable HTTP** MCP server (`rmcp` 1.7, MCP spec
 revision 2025-11-25). Binding controls:
 
@@ -1315,8 +1307,8 @@ revision 2025-11-25). Binding controls:
   Windows-platform hardening commit. Until then the owner-only guarantee is
   Unix-scoped; the Windows per-user app-data directory is the operative
   control. OS-keychain migration (`keyring` crate) is a separate documented
-  follow-up. The same writer (`write_secret_file`, formerly `write_token_file`)
-  persists the WS4-A S5b **device credential** at `{app-data}/tunnel_device.json`
+  follow-up. The same writer (`write_secret_file`)
+  persists the **device credential** at `{app-data}/tunnel_device.json`
   with the identical 0600 discipline — and the identical Windows-ACL gap; the
   device credential (`mdc_<device_id>.<secret>`, the long-lived relay device
   identity returned once at pairing) is stored alongside its `account_id` /
@@ -1426,8 +1418,8 @@ change.
 ├── logs/                       tracing file appender; owned by `app-main`
 │                               (always at platform root — logging bootstraps
 │                               before settings load)
-├── mcp_token                   MCP bearer token (Phase 10); owned by `app-main`
-├── tunnel_device.json          relay device credential (WS4-A S5b, connected
+├── mcp_token                   MCP bearer token; owned by `app-main`
+├── tunnel_device.json          relay device credential (connected
 │                               build only); owned by `app-main`; 0600
 │
 │   The four entries below are placed at {app-data} by default.
@@ -1454,17 +1446,17 @@ change.
 │   ├── meeting.db                 libsql; owned by `persistence`; per-meeting RAG
 │   │                              chunk/embedding cache (rag_chunk/rag_embedding +
 │   │                              rag_chunk_fts) — derived, rebuildable (re-chunk +
-│   │                              re-embed the attachments/transcript). Phase B
-│   │                              occupies it with RAG tables only; the wider
-│   │                              per-meeting consolidation is planning/DESIGN_meeting_db.md
+│   │                              re-embed the attachments/transcript). It holds
+│   │                              RAG tables only; the wider per-meeting
+│   │                              consolidation is planning/DESIGN_meeting_db.md
 │   ├── assets/                 pasted/dropped note images (content-hash files)
 │   │   └── <sha256>.<ext>
-│   └── chat/{session_id}.json  chat sessions (Phase 9)
+│   └── chat/{session_id}.json  chat sessions
 └── models/                     owned by `model-registry` (and nobody else)
     ├── asr/{model-id}/...      downloaded GGUF + mmproj per manifest entry
     ├── llm/{model-id}/...
     ├── diarize/{model-id}/...
-    └── embed/{model-id}/...    retrieval embedder GGUF (BGE-M3 — RAG Phase B)
+    └── embed/{model-id}/...    retrieval embedder GGUF (BGE-M3)
 ```
 
 The model manifest is **not** written into the cache. It is bundled in the
@@ -1502,7 +1494,7 @@ restart. Moving existing data is the user's responsibility (no automatic
 migration). There is currently no UI for this field; it must be set by editing
 `settings.store` directly.
 
-**`index.db` is a derived, rebuildable cache (binding — Phase 4, A6).** The
+**`index.db` is a derived, rebuildable cache (binding — A6).** The
 per-meeting folders are the **source of truth**; `index.db` (the libsql
 meeting-list index) is a query cache derived from each meeting's
 `metadata.json` / `transcript.json`. `persistence` opens it lazily and
@@ -1533,7 +1525,7 @@ Recovery is best-effort: a synthesis failure is logged and the folder is
 skipped, never aborting the wider reconcile.
 
 **Headless server data root (`headless` / `minutist-hub`).** The headless server
-(WS4-B; see "Headless server daemon") runs over its OWN data root, supplied as an
+(see "Headless server daemon") runs over its OWN data root, supplied as an
 absolute path at startup (`--data-dir`), entirely separate from any desktop's
 `{app-data}`:
 
@@ -1600,14 +1592,11 @@ the check-then-RMW and drops the guard before any later `.await` (the `index.db`
 upsert in `rename_meeting` / `set_meeting_collection` runs after the guard is
 released; the index is a derived cache, reconciled by `rebuild_from_disk`).
 
-Coverage (issue 0025, closed): every `metadata.json` RMW listed above is on this
-single registry via `update_metadata`, so the headline lost-update — a local
+Every `metadata.json` RMW listed above is on this
+single registry via `update_metadata`, so the lost-update hazard — a local
 diarize/reprocess pass racing a remote host's `Claimed`/`Processed` advert and
-reverting `processing` — can no longer occur. `agent-tools` no longer keeps its
-own instance-scoped lock registry; its write tools route through
-`persistence::meeting_ops`, sharing the one lock. The cross-domain edits to
-`orchestrator` and `agent-tools` were made under the agreed proposal in
-`planning/issues/0025-metadata-lock-orchestrator-followup.md`.
+reverting `processing` — cannot occur. `agent-tools`' write tools route through
+`persistence::meeting_ops`, sharing the one lock.
 `MeetingWriter::finalise` writes the initial `metadata.json` blind (not an RMW, no
 prior on-disk state) and is intentionally not gated. The race is
 regression-tested in `crates/persistence/tests/metadata_lock_race.rs`.
@@ -1701,7 +1690,7 @@ assembles the labelled multi-session corpus and calibrates them.
 (§2.4), the genuine 5th percentile sets `T_reject`; the impostor 99th
 percentile sets `T_accept`.
 
-**Assignment policy (WU5 — `orchestrator::matcher`).** Matching a set of fresh
+**Assignment policy (`orchestrator::matcher`).** Matching a set of fresh
 diarizer clusters against the stored gallery is a global assignment problem, not
 independent per-cluster thresholding. The algorithm in `orchestrator::matcher`:
 
@@ -1728,7 +1717,7 @@ Tests ship with the module covering: two-clusters-one-identity global assignment
 margin drop, query-side noise guard, identity-score-is-max-over-gallery-centroids,
 and empty-input guards.
 
-**`apply_voiceprint_matches` wiring (WU5).** After a `reprocess` (user-triggered
+**`apply_voiceprint_matches` wiring.** After a `reprocess` (user-triggered
 or post-stop background pass) completes, `ipc-bridge` calls
 `Orchestrator::apply_voiceprint_matches(meeting_id, store)` when
 `voiceprint_enrolment_enabled` is ON. This method:
@@ -1758,7 +1747,7 @@ or post-stop background pass) completes, `ipc-bridge` calls
 left with cleared names, never propagated. The offline claim is still held by the
 `reprocess` caller, so no concurrent op can clobber the second metadata write.
 
-**Correction path (`reject_match` — WU5).** `Orchestrator::reject_match`
+**Correction path (`reject_match`).** `Orchestrator::reject_match`
 (called by `ipc-bridge::commands::reject_match`) handles the "this isn't them"
 case: (a) it clears `speaker_names[label]` for `meeting_id` (empty-name write),
 and (b) it drops the `(meeting_id, label)` contribution from `identity_id`'s
@@ -1793,7 +1782,7 @@ never silently activate enrolment. When OFF, `speaker_names.clear()` runs as
 before (zero behaviour change for users who have never opted in). When ON, the
 reprocess re-map (§2.6) restores matched names instead of clearing them.
 
-**WU3 enrolment-on-rename flow.** When `voiceprint_enrolment_enabled` is ON and
+**Enrolment-on-rename flow.** When `voiceprint_enrolment_enabled` is ON and
 the user renames a speaker label in the UI, `ipc-bridge::set_speaker_name`
 calls `Orchestrator::enrol_voiceprint(meeting_id, label, name, &VoiceprintStore)`
 after the name write, best-effort (errors are logged and swallowed). The method
@@ -1809,13 +1798,13 @@ the given `display_name + model_id`, the embedding is written via
 the claim is busy, the call returns `Ok(None)` and logs at `debug`; the
 rename itself is never blocked.
 
-**WU3b refinement-on-confirm (§2.9.3).** A confirmed association routes to
+**Refinement-on-confirm (§2.9.3).** A confirmed association routes to
 `VoiceprintStore::refine` instead of `enrol` when an identity already exists
 for the same `display_name + model_id`. "Confirmed" is exactly one of:
-(a) the user typed/assigned the name via the UI rename (the WU3 path);
+(a) the user typed/assigned the name via the UI rename;
 (b) an auto-accept match `sim >= T_accept` with the assignment margin AND the
 meeting is finalised — `apply_voiceprint_matches` refines the matched
-`identity_id` directly; (c) the user accepted an uncertain-band suggestion (WU5).
+`identity_id` directly; (c) the user accepted an uncertain-band suggestion.
 **Unconfirmed/uncertain matches never refine** — this is the primary slow-poison
 defence. For triggers (a)/(c) the rename path resolves the identity via
 `VoiceprintStore::find_identity_by_name_and_model` (a `Some(id)` routes to
@@ -1830,11 +1819,11 @@ reused unchanged: the flag, lock discipline, and clock hazards all apply. The
 contribution's weight (`count` = number of clean windows) is clamped by
 `REFINE_WEIGHT_CAP` inside `VoiceprintStore::refine` to bound a single
 meeting's influence on an established centroid. Because contributions are
-retained (§2.9.1 invariant), a later `reject_match` (WU5) can drop the
+retained (§2.9.1 invariant), a later `reject_match` can drop the
 contribution and recompute — refinement is reversible. `FOLD_GATE` and
 `REFINE_WEIGHT_CAP` remain placeholder constants (WU6 calibrates them).
 
-**WU4 reprocess re-map (§2.6 — ephemeral centroid + timeline-coherence).** The
+**Reprocess re-map (§2.6 — ephemeral centroid + timeline-coherence).** The
 `reprocess` path (re-transcribe → diarize → finalise) clears `speaker_names` in
 `finalise_diarization` unconditionally. When `voiceprint_enrolment_enabled` is ON,
 two additional steps surround this:
@@ -1876,7 +1865,7 @@ the pass (before `run_diarization_blocking` overwrites `transcript.json`).
 `end_ms` are on the **pause-EXCLUDING** clock (recording wall time minus all
 accumulated pause durations at that point). `read_audio_pcm` returns
 **pause-INCLUDING** PCM (raw device samples). `enrol_voiceprint_claimed` uses
-`runner::pcm_window_for_excluding_range` — the same mapper used by Phase 4
+`runner::pcm_window_for_excluding_range` — the same mapper used by
 re-ASR — to convert each clean segment's excluding-clock interval to the
 correct PCM byte range. The W1 clamping decision is inherited: a segment whose
 start falls inside a pause region is silently discarded (returns `None`), not
@@ -1894,19 +1883,19 @@ functions used by both `diarizer` and `persistence`: `unit_normalise`,
 `cosine_unit`, and `weighted_merge`. No new crate edge is introduced — both
 crates already depend on `common`.
 
-**WU7 — prune-veto (§2.5).** A low-share diarizer cluster that would normally
+**Prune-veto (§2.5).** A low-share diarizer cluster that would normally
 be dropped by the share-floor or speaker-count cap is kept when the orchestrator
 determines it matches an enrolled voiceprint. The veto is computed entirely
 OUTSIDE the diarizer (the diarizer must not read the store — no
 `diarizer → persistence` edge is created); the orchestrator computes a verdict
 list and passes it in as `veto_ids: &[i32]`.
 
-**WU9 (issue #0023) — library-informed merge.** Extends the same extractor pass
+**Library-informed merge (issue #0023).** Extends the same extractor pass
 to also detect when ≥2 diarizer clusters both match the same enrolled identity
 and unify them before the prune/cap. The merge is computed in `compute_prune_veto_verdicts`
 alongside the veto; a `merge_map: Vec<(i32, i32)>` (source → canonical pairs) is
 threaded through `diarize_split_merge` → `overlay_speakers`. An empty `merge_map`
-is bit-identical to the pre-WU9 call. Gated on `voiceprint_enrolment_enabled`.
+leaves behaviour bit-identical to a call with no merge. Gated on `voiceprint_enrolment_enabled`.
 
 **Orchestrator flow (inside `run_diarization_blocking`):**
 
@@ -1977,7 +1966,7 @@ library-informed merge are gated on `settings.voiceprint_enrolment_enabled`
 (default `false`). When OFF, `gallery` is never loaded and the extractor is
 never opened; `veto_ids` and `merge_map` are both always `&[]`.
 
-**WU8 — identity management (issue #0003 §2.9.4, §4).** Five new IPC commands
+**Identity management (issue #0003 §2.9.4, §4).** Five new IPC commands
 and two new `VoiceprintStore` methods complete the management surface:
 
 - `VoiceprintStore::rename_identity(id, new_name)` — renames in place; trims
@@ -2101,7 +2090,7 @@ plays that clip start-to-finish (no seeking).
   reprocess reports the recorder as idle, so the control is reachable then; that
   is safe (reprocess never rewrites `audio.opus`).
 
-## Attachments (Attachments WS)
+## Attachments
 
 Meeting attachments extend the `persistence` component and the `ipc-bridge`
 command surface. The design mirrors the note-image `assets/` pattern (content hash,
@@ -2331,7 +2320,7 @@ demonstrated.
   hardware.** `cargo test --workspace` and `npm test` (the `ui/`
   package's `vitest run` script) must pass on a machine with no model
   files, GPU, or microphone. Tests that need a real
-  model, GPU, or native build are **gated behind env vars** (the Phase 2
+  model, GPU, or native build are **gated behind env vars** (the
   `MINUTIST_ASR_MODEL_PATH` pattern) with a no-op skip path. They are run on
   demand either via `scripts/run-tests-windows.ps1` OR directly with
   `make test-integration` (and `-summary`/`-asr`/`-diarize`), which sources a
@@ -2354,7 +2343,7 @@ demonstrated.
   cross-reference interactions assert behaviour, not snapshots.
 
 Two constraints learned from running the gated pipeline tests on native
-hardware (Phase 2 close-out):
+hardware:
 
 - **Tests that drive audio through the runner must feed real speech.** The
   runner always instantiates the real Silero VAD, which rejects synthetic
@@ -2381,7 +2370,7 @@ hardware (Phase 2 close-out):
 
 Owned by `app-main` (it's process-lifetime work). Uses
 `tauri-plugin-updater` against a static HTTPS endpoint serving signed
-artefacts. Introduced in Phase 7; no other crate touches updater logic.
+artefacts. No other crate touches updater logic.
 
 Updater status reaches the webview event-driven on the shared `AppEvent` bus:
 `AppEvent::UpdateAvailable { version, notes }` when a check finds a newer
@@ -2442,7 +2431,7 @@ is a **VRAM-aware runtime** decision driven by the tri-state
 - **`On`** forces full GPU offload; the VRAM clamp for the large ASR tier still
   applies (a no-probe `On` cannot confirm the 1.7B fits, so it falls back to the
   small tier in that case).
-- **`Off`** forces CPU without consulting the probe (the old `false`) — the
+- **`Off`** forces CPU without consulting the probe — the
   runtime escape hatch for weak GPUs / driver trouble.
 
 In a default CPU-only build the setting has no effect (the compile-time ceiling
@@ -2469,8 +2458,7 @@ summariser FIRST** (it stays resident while an ASR model loads when
 `preload_summariser` is on), then budgets ASR against the **remaining** headroom
 and downgrades to the small tier (`effective_prefer_large = false`) when the 1.7B
 would not fit — running the 1.7B model purely on CPU is strictly worse than the
-0.6B CPU default. `On` applies the same VRAM clamp to the large ASR tier, rather
-than trusting a now-removed user flag blindly. The decision base is
+0.6B CPU default. `On` applies the same VRAM clamp to the large ASR tier. The decision base is
 `total_bytes × headroom` (0.90 discrete, 0.50 integrated), **not `free_bytes`**:
 a Vulkan device without `VK_EXT_memory_budget` reports `free == total`, so `free`
 is trusted only to *tighten* the budget when it is a credible smaller number.
@@ -2504,13 +2492,11 @@ to the layer count: the orchestrator's private `gpu_plan()` helper feeds
 `runner::resolve_gpu_layers(plan.asr_gpu)` for the live + offline-re-transcribe +
 re-listen + prewarm ASR sites (and `plan.effective_prefer_large` selects the ASR
 tier via `asr_engine_for_language`), while `ipc-bridge`'s held-summariser load
-feeds `commands::resolve_summariser_gpu_layers(plan.summariser_gpu)`. The two
-`resolve_*_gpu_layers(enabled: bool)` helpers are unchanged — only their argument
-is now the plan boolean instead of the old enum-bool. llama.cpp falls back to CPU
+feeds `commands::resolve_summariser_gpu_layers(plan.summariser_gpu)`. Each
+`resolve_*_gpu_layers(enabled: bool)` helper takes the plan boolean.
+llama.cpp falls back to CPU
 at runtime when no device is present, so a GPU-feature build is still safe on a
-CPU-only machine. (Before this, the placement was a single on/off flag mapped
-straight to the compile-time ceiling; the VRAM-aware plan now lets `Auto` keep
-each model on GPU only when it fits.)
+CPU-only machine.
 
 The features fan out through a single chain so the app binary is the only place
 a backend is chosen: `minutist` (src-tauri) → `ipc-bridge` → {`summariser`,
@@ -2586,12 +2572,12 @@ The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server
 
 **Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper".
 
-**Connected-tier tunnel (`tunnel-client`).** The `connected`-feature gating extends to the app-side relay tunnel (WS4-A): `tunnel-client` is part of the connected surface (the free build has no relay), so `app-main`'s optional edge on it is gated by the same `connected` feature as `mcp-server`, added when the tunnel is wired in WS4-A S5. The crate itself lives in the workspace unconditionally (compiled by the workspace build / `cargo test`) and is simply not pulled into the free binary — the same pattern `mcp-server` followed before Phase 10. The tunnel does **not** add a listening socket: it dials OUTBOUND to the relay (no inbound port), and replays relayed requests against the existing loopback `mcp-server`. The internal `mcp_token` bearer doubles as the relay↔app secret here, applied app-side to the loopback replay only and never sent outbound to the relay (see the "Token storage and file permissions" / "Token lifetime and the connected-relay path" notes above). The tunnel **device credential** secret (`tunnel_device.json`, 0600) is introduced by S5 pairing, not S3b.
+**Connected-tier tunnel (`tunnel-client`).** The `connected`-feature gating extends to the app-side relay tunnel: `tunnel-client` is part of the connected surface (the free build has no relay), so `app-main`'s optional edge on it is gated by the same `connected` feature as `mcp-server`. The crate itself lives in the workspace unconditionally (compiled by the workspace build / `cargo test`) and is simply not pulled into the free binary — the same pattern `mcp-server` follows. The tunnel does **not** add a listening socket: it dials OUTBOUND to the relay (no inbound port), and replays relayed requests against the existing loopback `mcp-server`. The internal `mcp_token` bearer doubles as the relay↔app secret here, applied app-side to the loopback replay only and never sent outbound to the relay (see the "Token storage and file permissions" / "Token lifetime and the connected-relay path" notes above). The tunnel **device credential** secret (`tunnel_device.json`, 0600) is issued at pairing (see above), distinct from the bearer token.
 
 ## Headless server daemon
 
 The `headless` crate is a SECOND workspace binary (`minutist-hub`) beside
-`app-main` — the user-installed headless server (WS4-B): an always-on
+`app-main` — the user-installed headless server: an always-on
 device-sync hub now, a GPU processing node post-launch. It is NOT a Tauri binary
 and NOT a build variant of `app-main`; it is its own `cargo build` target, always
 compiled under `cargo build --workspace` (like `sync`) but never linked by the

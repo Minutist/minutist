@@ -54,11 +54,10 @@ See `cross-cutting.md` — "Build variants".
 
 ‡ `tunnel-client` is an **optional** edge of `app-main`, gated by the same
 `connected` Cargo feature as `mcp-server` (it is part of the connected-tier
-surface — the free build has no relay). The edge is added in WS4-A S5 when the
-tunnel is wired into `app-main`; the S3b crate-add lands the crate in the
-workspace unconditionally (compiled by `cargo test`/workspace build) without the
-`app-main` edge, exactly as `mcp-server` did before Phase 10 wired it. The free
-artifact omits it. See `cross-cutting.md` — "Build variants".
+surface — the free build has no relay). The crate compiles unconditionally as a
+workspace member (`cargo test`/workspace build) without requiring the
+`app-main` edge, the same as `mcp-server`. The free artifact omits it. See
+`cross-cutting.md` — "Build variants".
 
 § `sync` is an **optional** edge of `app-main`, gated by the same `connected`
 Cargo feature as `mcp-server` / `tunnel-client` (it is part of the connected-tier
@@ -77,7 +76,7 @@ DEV-dependency by `sync`'s integration tests. The `ipc-bridge` trait injection
 takes NO `sync` edge — `ipc-bridge` carries the trait + `DisabledSync`
 unconditionally and `app-main` injects the connected implementation. The
 `app-main -> sync` edge (the connected `SyncControl` in `src-tauri/src/sync.rs`
-that holds the `sync` engine) is live as of WS4-B S5 phase 2, gated by the
+that holds the `sync` engine) is gated by the
 `connected` Cargo feature exactly like the `mcp-server` / `tunnel-client` edges;
 the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
 — "Build variants".
@@ -105,31 +104,28 @@ fallback are additive — all feed the one `PeerDirectory`; B4 (desktop wiring,
 layering account-source as primary) and peer eviction (removing a device that
 left the account) are follow-ups, not part of this surface.
 
-`SyncControl` gains `set_enabled(bool)` (issue 0028 follow-up F5): before this,
-`ConnectedSync::new` read `settings.connector_enabled` only ONCE at construction,
-so enabling the connector at RUNTIME (the Settings toggle, which already started
-the relay tunnel via `TunnelControl::set_enabled`) never started the sync engine or
-its election loop — `sync_status` stayed `Disabled` and every engine-backed call
-kept failing even after the toggle. `ipc_bridge::tunnel::set_connector_enabled`
-now calls `state.sync.set_enabled(enabled)` alongside the tunnel's own (best-effort;
-a sync-start failure never fails the command). `DisabledSync::set_enabled` is a
-no-op; `ConnectedSync::set_enabled(true)` requests the SAME idempotent start path
-`new()` uses at launch (`ConnectedSync::request_start`, guarded by an atomic flag so
-construction-time auto-start and a later runtime enable can never double-spawn the
-engine or the election loop). `set_enabled(false)` persists the disabled setting
-(via the tunnel's write of the shared `connector_enabled` field) but does not tear
-down an already-started engine — `SyncEngine` exposes only an owning
-`shutdown(self)`, and the engine `Arc` is shared with the spawned election loop and
-lifecycle subscriber, so a clean stop needs a cancellation path threaded through
-both; tracked as a follow-up, not a regression (before F5 a runtime disable-after-
-enable was not a reachable state at all). No new dependency-table edge: the trait
-lives in `ipc-bridge` (already unconditional) and the implementation in `app-main`
-(already the `sync` edge above).
+`SyncControl` gains `set_enabled(bool)` (issue 0028 follow-up F5), giving the
+Settings toggle a runtime path to start or stop the sync engine (the toggle
+already started the relay tunnel via `TunnelControl::set_enabled`).
+`ipc_bridge::tunnel::set_connector_enabled` calls `state.sync.set_enabled(enabled)`
+alongside the tunnel's own (best-effort; a sync-start failure never fails the
+command). `DisabledSync::set_enabled` is a no-op; `ConnectedSync::set_enabled(true)`
+requests the SAME idempotent start path `new()` uses at launch
+(`ConnectedSync::request_start`, guarded by an atomic flag so construction-time
+auto-start and a later runtime enable can never double-spawn the engine or the
+election loop). `set_enabled(false)` persists the disabled setting (via the
+tunnel's write of the shared `connector_enabled` field) but does not tear down an
+already-started engine — `SyncEngine` exposes only an owning `shutdown(self)`,
+and the engine `Arc` is shared with the spawned election loop and lifecycle
+subscriber, so a clean stop needs a cancellation path threaded through both;
+tracked as a follow-up, not a regression. No new dependency-table edge: the
+trait lives in `ipc-bridge` (already unconditional) and the implementation in
+`app-main` (already the `sync` edge above).
 
 ※ `election` is an **optional** edge of `app-main`, gated by the same `connected`
 Cargo feature as `mcp-server` / `tunnel-client` / `sync` (it is part of the
 connected-tier surface — the free build runs no election loop and never delegates
-or claims processing). The edge is live as of WS4-B producer-gate S4: the
+or claims processing). The
 `DesktopElectionDriver` in `src-tauri/src/sync.rs` (co-located with the connected
 `SyncControl`) implements `election::ElectionDriver`, adapting the leaf's `advertise`
 to the `SyncEngine` discovery exchange and its `process` to `orchestrator::reprocess`
@@ -162,16 +158,12 @@ to whether the crate compiles.) The desktop free (`--no-default-features`) and
 connected `src-tauri` artefacts never link `headless`; it is built and shipped as
 its own binary, so the cleanliness invariant is that the free `src-tauri` build
 is unchanged and takes no edge to it — NOT that the crate is excluded from a
-workspace build. Phase-1 (sync-hub) dependencies are `common`, `persistence`,
+workspace build. The daemon's dependencies are `common`, `persistence`,
 `sync`, `settings`; it takes NO `tauri::*` / `ipc-bridge` edge and wires
-`sync::SyncEngine` into a daemon directly. The crate grows into these edges as
-the daemon's steps land (the scaffold wires `common` + `sync`; `persistence` /
-`settings` join as used) — the table lists the permitted phase-1 set, exactly as
-the `sync` / `tunnel-client` footnotes describe their edges landing after the
-crate-add. The post-launch GPU node adds `orchestrator` + the ML-runtime crates
-(`asr-runtime` / `asr-parakeet` / `diarizer` / `summariser` / `model-registry`)
-as a SEPARATE table-update commit at that time. See `cross-cutting.md` —
-"Headless server daemon".
+`sync::SyncEngine` into a daemon directly. A post-launch GPU processing-node
+role adds `orchestrator` + the ML-runtime crates (`asr-runtime` / `asr-parakeet`
+/ `diarizer` / `summariser` / `model-registry`) as a separate table update at
+that time. See `cross-cutting.md` — "Headless server daemon".
 
 ¶ `sync-ffi` is the Android FFI wrapper over `sync` (phone companion, issue
 0016). It UniFFI-exposes `sync::SyncEngine`'s transport surface to Kotlin and is
@@ -216,14 +208,14 @@ variants".
 
 **WS4-B S5 phase 3 (UI):** `ui/src/state/sync-status.ts` and
 `ui/src/shell/SyncSettingsPane.tsx` are purely internal to the webview layer; they
-add no new Cargo edge and no new public IPC command (the four sync commands were
-added in phase 1). Both are VITE_CONNECTED-gated exactly like the MCP /
+add no new Cargo edge and no new public IPC command (the four sync commands
+already exist). Both are VITE_CONNECTED-gated exactly like the MCP /
 ConnectionSettings panes — tree-shaken from the free bundle at build time.
 
 Third-party deps: `iroh` (the QUIC transport, pinned EXACT), `iroh-tickets` (the
 `EndpointTicket` round-trip for manual device pairing, pinned EXACT alongside the
-iroh 1.0 line), and — from WS4-B S3 — `yrs` (the same workspace pin as
-`persistence`) and `uuid`. WS4-B S4 adds `iroh-blobs` (pinned EXACT `=0.103.0`,
+iroh 1.0 line), `yrs` (the same workspace pin as
+`persistence`), `uuid`, and `iroh-blobs` (pinned EXACT `=0.103.0`,
 `fs-store` feature) for content-addressed media-blob sync: it supplies the BLAKE3
 blob store and the `BlobsProtocol` handler, multiplexed onto the SAME `Endpoint` /
 `Router` under a SECOND ALPN (`iroh_blobs::ALPN`) beside `SYNC_ALPN`. `iroh-blobs`
@@ -248,7 +240,7 @@ see the `persistence` "CRDT notes storage" section, which documents the `ydoc`
 module now living in `notes-crdt`). `uuid` only decodes the fixed 16-byte
 meeting id off the wire back into a `common::MeetingId`.
 
-The media-sync protocol (WS4-B S4) multiplexes onto the same `SYNC_ALPN`: each
+The media-sync protocol multiplexes onto the same `SYNC_ALPN`: each
 bidirectional stream opens with a one-byte stream-kind tag so the accept hook
 dispatches between notes reconciliation and the media-manifest exchange. The two
 sides exchange a manifest of `(relative-path, BLAKE3 hash)` pairs for `audio.opus`
@@ -306,7 +298,7 @@ this path; the `translations.json` reconcile + UI reload signal a received trans
 implies are the consumer read-sync slice (see `planning/DESIGN_artifacts.md` §4).
 
 The `tunnel-client` row's "May depend on" is empty by design: the crate takes
-**no** workspace edge. It is the app-side half of the relay tunnel (WS4-A S3b)
+**no** workspace edge. It is the app-side half of the relay tunnel
 and re-implements the relay's postcard wire frames locally rather than sharing a
 crate (the relay lives in a separate private repo — EXECUTION.md X9), and it
 bridges to the loopback `mcp-server` over HTTP like any external client. The
@@ -331,25 +323,24 @@ used, not added here.
 
 ### Crates that grow across phases
 
-- **`persistence`** appears in Phase 1 as a minimal writer of
-  `audio.opus` + `metadata.json` to a per-meeting folder. Phase 4 grows it
-  to the full surface: the folder readers (incl. the graduated
-  pause-INCLUDING Opus decoder and the `MeetingState` assembler), the libsql
+- **`persistence`** writes `audio.opus` + `metadata.json` to a per-meeting
+  folder and owns the full read/index surface: the folder readers (incl. the
+  pause-including Opus decoder and the `MeetingState` assembler), the libsql
   `index.db` index + forward-only migration runner + `rebuild_from_disk` +
   self-heal `reconcile_orphans`,
-  rename/delete meeting operations, and the `summary.md` path + I/O. As of
-  WS4-B it depends on `common` **and** the `notes-crdt` leaf (the extracted
-  notes-CRDT primitives it re-exports); libsql / tokio remain external crates,
+  rename/delete meeting operations, and the `summary.md` path + I/O. It
+  depends on `common` **and** the `notes-crdt` leaf (the notes-CRDT
+  primitives it re-exports); libsql / tokio remain external crates,
   not workspace components.
-- **`orchestrator`** appears in Phase 1 as a tiny state machine for
-  start / stop / pause with the audio meter and capture lifecycle. The
-  full live pipeline (VAD → ASR → transcript events → diarizer trigger)
-  arrives in Phase 2.
-- **`ipc-bridge`** appears in Phase 1 with start/stop/pause commands,
-  device-list query, audio-meter and state-change events. Grows each
-  phase as new domain surface is added.
-- **`asr-runtime`** and **`vad-chunker`** both first appear in Phase 2 —
-  they're a unit. Phase 1 captures audio but does not transcribe.
+- **`orchestrator`** is the state machine for
+  start / stop / pause with the audio meter and capture lifecycle, driving the
+  full live pipeline (VAD → ASR → transcript events → diarizer trigger).
+- **`ipc-bridge`** exposes start/stop/pause commands,
+  device-list query, audio-meter and state-change events, plus the
+  domain-surface commands catalogued below.
+- **`asr-runtime`** and **`vad-chunker`** are a unit — together they form the
+  transcription pipeline; `audio-capture` alone captures audio but does not
+  transcribe.
 
 ## Rust core components
 
@@ -531,7 +522,7 @@ first digest event arrives (≤ one cadence interval). `MainWindow` reads from
 `useLiveDigestStore` for this gate (no new seam; the store is already populated
 by the existing event-listener path). No new Cargo edge, no new public IPC
 command — all types (`LiveDigest`, `LiveDigestItem`, `LiveDigestUpdated`,
-`LiveDigestError`) were already in `bindings.ts` from WU1.
+`LiveDigestError`) are already in `bindings.ts`.
 
 **Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
 newtype mirroring `MeetingId`); six chat `AppEvent` variants (`ChatToken`,
@@ -578,13 +569,12 @@ cross tauri-specta).
 
 **Persisted shape — what actually shipped (P3).** The shipped wire/persisted
 chat types are the `ChatRole` / `ToolCallRecord` / `ChatMessage` / `ChatSession`
-set described above. The earlier plan-draft names `ChatTurn` / `ChatStopReason`
-/ `ChatSessionHeader` were **not** built: a session persists as a flat
-`Vec<ChatMessage>` (each carrying a monotonic `turn_id`), not a `Vec<ChatTurn>`;
+set described above. A session persists as a flat
+`Vec<ChatMessage>` (each carrying a monotonic `turn_id`);
 turn termination is conveyed by the `AppEvent::ChatTurnComplete` / `ChatError`
-events (and the engine's `TurnOutcome`), not a persisted `ChatStopReason`; and
+events (and the engine's `TurnOutcome`); and
 the session-header fields live inline on `ChatSession` (`id` / `meeting_id` /
-`title` / `created_at` / `updated_at`), not a separate `ChatSessionHeader`. The
+`title` / `created_at` / `updated_at`). The
 on-disk `chat/{session_id}.json` is exactly the `ChatSession` JSON.
 
 **Phase 9 precursor — `Summariser: Send + Sync`.** The summariser trait widens
@@ -651,8 +641,8 @@ lifecycle". See also `architecture/cross-cutting.md` — "Operation progress".
 single process-wide backend. `LlamaBackend::init()` is global (once per
 process), and `asr-runtime`, `summariser`, and `embedder` load GGUF models in the
 same app process, so they MUST share one cell; each enables the feature and delegates
-to this function. (A private `OnceLock` per crate made whichever initialised
-second fail — the record-then-summarise bug fixed in the Phase-7 review pass.)
+to this function. A private `OnceLock` per crate would make whichever
+initialises second fail.
 This adds no workspace dependency edge; `llama-cpp-2` is an external FFI dep.
 
 **Diagnostic report (issue #0014).** `DiagnosticReport { app_version, platform,
@@ -670,9 +660,8 @@ dependency-table edge changes — the type lives in `common`.
 **Phase 4 precursors.** `MeetingListEntry` (meeting-list row, FR-33),
 `NotesDocument { notes_json, notes_markdown }` (the canonical wire-facing
 notes carrier — `String` fields because `serde_json::Value` has no
-`specta::Type`; `ipc-bridge` uses this type directly — the former local
-`NotesDoc` mirror was collapsed into it so only one notes type reaches the TS
-bindings), and
+`specta::Type`; `ipc-bridge` uses this type directly, the only notes type that
+reaches the TS bindings), and
 `MeetingState { meta, transcript, notes }` (the `open_meeting` restore
 payload). Re-transcribe reuses `AppEvent::TranscriptSegment` — no new event.
 The local index uses **libsql** (`default-features=false, features=["core"]`;
@@ -785,7 +774,7 @@ time (`produced_by` / `produced_at`) bound to the bytes, so a relay or hub
 forwarding those bytes multi-hop can never let a stale copy supersede a newer one
 (see the `sync` `artifacts_proto` description).
 
-The desktop **capture-side** write path (WS4-B producer-gate S2) is `ipc-bridge`'s
+The desktop **capture-side** write path is `ipc-bridge`'s
 `stop_recording`: when delegation is enabled it marks the just-finalised meeting
 `PendingProcessing` synchronously (via `persistence::meeting_ops::apply_processing_lifecycle`,
 before returning, so the next discovery exchange advertises the offer) and skips the
@@ -794,7 +783,7 @@ by the `MINUTIST_DELEGATE_PROCESSING` env knob (default OFF; a Settings toggle +
 the productisation follow-up — the env knob is the v1 mechanism, matching
 `MINUTIST_SYNC_TOKEN` / `MINUTIST_ELECTION_*`). No new `ipc-bridge` edge — it already
 owns the `persistence` edge. On a lone device the meeting simply waits as
-`PendingProcessing` until an eligible host runs the election loop (S4); the audio is on
+`PendingProcessing` until an eligible host runs the election loop; the audio is on
 disk regardless. The phone companion (0016) reaches the same state through its own
 capture path.
 
@@ -1093,10 +1082,10 @@ authoritative for the finished transcript.
 
 **Binding pin (confirmed by Phase 0 Spike 4).** `sherpa-rs = 0.6.8`
 (Thewh1teagle, MIT) with the `download-binaries` feature for dev and
-`static` for Phase 7 bundling. The `sherpa_rs::diarize::Diarize` surface
+`static` for the bundled release build. The `sherpa_rs::diarize::Diarize` surface
 covers everything needed; no `bindgen` direct-C wrapper required. The
 k2-fsa-owned alternative crate `sherpa-onnx = 1.13.x` (Apache-2.0)
-should be re-evaluated against `sherpa-rs` before Phase 6 ships.
+should be re-evaluated against `sherpa-rs`.
 
 Cluster IDs returned by the binding are arbitrary `i32`; the impl must
 normalise to first-seen-order labels (`A`, `B`, …) before populating
@@ -1117,27 +1106,23 @@ sample_rate) -> AppResult<Vec<SpeakerTurn>>` (16 kHz guard + empty short-circuit
 `engine.lock().compute()`, mapping each `sherpa_rs::diarize::Segment` to a
 `SpeakerTurn` in ms); `assign_speakers` is the thin compose
 `compute_turns(..).map(|turns| overlay_speakers(&turns, segments, cfg))` (#0015
-phase 4 — the orchestrator's re-ASR split funnel consumes `compute_turns` +
+— the orchestrator's re-ASR split funnel consumes `compute_turns` +
 `overlay_speakers` directly, supplying turns as an explicit param so the stub
 diarizer the default suite injects can still drive it). The segments are
 taken and returned by value because a mixed Parakeet segment is split at the turn
-boundary, which grows the list (#0015 phase 3). It takes RESOLVED model paths and
+boundary, which grows the list (#0015). It takes RESOLVED model paths and
 depends only on `common` (NOT `model-registry`, NOT `persistence`). All
 model-registry resolution lives in the orchestrator's `runner::build_diarizer`,
 which ensures both model dirs and passes the resolved `&Path`s into
 `SherpaDiarizer::open`. Bundled models
 (settings-selectable via `model-registry`): **segmentation =
 pyannote/segmentation-3.0 (MIT)**; **embedding = 3D-Speaker CAM++ zh-en
-16k-common ADVANCED (Apache-2.0, "common" corpus — NOT VoxCeleb)**. (The zh-en
-model replaced the Mandarin-only zh-cn one on 2026-06-05: the zh-cn embedding
-under-separated English voices, over-splitting a single speaker into 3-4; the
-zh-en model opens a usable `cluster_threshold` window — default raised 0.5→0.75.)
-This corrects
-Spike-4's TitaNet, which is VoxCeleb-trained and not cleanly redistributable in
-a paid product; ERes2NetV2 (same license) is the
+16k-common ADVANCED (Apache-2.0, "common" corpus — NOT VoxCeleb)**, chosen over
+the VoxCeleb-trained TitaNet family, which is not cleanly redistributable in a
+paid product; ERes2NetV2 (same license) is the
 swap-in accuracy upgrade. The orchestrator owns the lifecycle: it builds the
 diarizer (resolving both model dirs via `model-registry`), runs the on-stop pass
-(gated on `settings.diarization_enabled`, default **on** as of 2026-06-25 — see
+(gated on `settings.diarization_enabled`, default **on** — see
 `settings`'s `default_diarization_enabled`) and the `rediarize`
 re-pass, and emits `AppEvent::DiarizationComplete` on its shared bus. Ship the
 MIT + Apache NOTICE/attribution (the k2-fsa / HF mirrors don't carry the
@@ -1172,11 +1157,11 @@ A segment that spans two or more surviving clusters above
 `multi_speaker_min_share` is **mixed**: on the Parakeet path (non-empty `words`)
 it is split at the turn boundary into one sub-segment per contiguous same-cluster
 word run — each word assigned to its max-overlap turn, no re-ASR, no audio cut
-(#0015 phase 3); the split GROWS the list, which is why segments are owned
+(#0015); the split GROWS the list, which is why segments are owned
 in/out. The (post-split) surviving `i32` cluster ids relabel to first-seen-order
 `A`/`B`/… across the OUTPUT segments in order, and the function returns the
 owned list, the distinct-label count, AND a cluster→letter map
-`Vec<(i32, String)>` in that SAME first-seen order (#0015 phase 4) — so a caller
+`Vec<(i32, String)>` in that SAME first-seen order (#0015) — so a caller
 re-ASR'ing a sub-clip letters the new segments into the EXISTING scheme rather
 than minting a fresh first-seen pass (which would rename speakers and break
 `MeetingMeta.speaker_names` keying). It also fills `Segment::shared_speakers`
@@ -1184,7 +1169,7 @@ than minting a fresh first-seen pass (which would rename speakers and break
 split): a SURVIVING cluster other than the segment's chosen primary whose overlap
 reaches `DiarizerConfig::multi_speaker_min_share` (default 0.30) of the segment
 duration — and only when the primary is itself that substantial — contributes its
-first-seen label, so a mixed Qwen segment is flagged (not split, pending Phase 4
+first-seen label, so a mixed Qwen segment is flagged (not split, pending
 re-ASR); a split Parakeet sub-segment is resolved per-speaker and carries no
 flag. Restricted to clusters that win some segment (so every shared label matches
 a `speaker_id` shown elsewhere); `0.0` disables. The prune is the
@@ -1197,7 +1182,7 @@ arrives transitively via `sherpa-rs`; no separate `eyre` dep). `sherpa-rs =
 { workspace = true }` is added to `crates/diarizer/Cargo.toml`; `hound` and
 `persistence` (test-only, the over-split eval's audio/transcript decode) are
 dev-dependencies. A pure public function
-`turn_boundaries_within(&Segment, &[SpeakerTurn]) -> Vec<u64>` (#0015 phase 4)
+`turn_boundaries_within(&Segment, &[SpeakerTurn]) -> Vec<u64>` (#0015)
 returns the interior speaker-change cut points strictly inside
 `(seg.start_ms, seg.end_ms)` — the start of each overlapping turn whose `cluster`
 differs from the immediately preceding overlapping turn's, deduped + sorted
@@ -1217,7 +1202,7 @@ a hard boundary) into a single segment — `text` space-joined, `words` concaten
 in order, `[start_ms, end_ms)` unioned, `shared_speakers` the de-duplicated union
 minus the run's own label, `confidence` duration-weighted — so a speaker
 fragmented by the VAD hangover or the 10 s force-split reads as one turn
-(#0015 phase 1). `run_diarization_blocking` calls it after `assign_speakers` and
+(#0015). `run_diarization_blocking` calls it after `assign_speakers` and
 recomputes the distinct-label count from the merged segments. Two private pure
 helpers back the split: `word_turn` (a word's max-overlap cluster, lower-id
 tie-break) and `split_segment_by_words` (regroup a segment's words into maximal
@@ -1225,14 +1210,14 @@ same-cluster runs — a no-turn word joins the preceding run; a leading no-turn
 word seeds with the segment's dominant cluster). Tests: the default suite covers
 `overlay_speakers`
 (interval-join, no-overlap=None, tie-break, first-seen relabel, stale-label
-clearing, and the #0015-phase-4 cluster→letter map matching the baked-in letters /
+clearing, and the #0015 cluster→letter map matching the baked-in letters /
 omitting pruned clusters) AND the prune/cap (tiny-share drop + reassign,
 genuine-speaker keep, segment-count floor, cap-to-largest, never-zero fallback)
-AND the #0015 phase-3
+AND the #0015
 split (`word_turn` max-overlap + tie-break, `split_segment_by_words` runs /
 empty / single-cluster / leading-None / mid-run-None, the overlay split path on
 a mixed Parakeet segment, and the no-split-on-mixed-Qwen case) AND
-`turn_boundaries_within` (#0015 phase 4 — continuous keep-whole, single + multiple
+`turn_boundaries_within` (#0015 — continuous keep-whole, single + multiple
 interior changes, non-overlapping distant turn ignored, edge-flush excluded,
 dedup) AND `overlay_speakers_from_prior` (full-overlap, max-overlap-wins,
 gap→None, label-survival, empty-prior, prior-was-None) with no model; the
@@ -1271,10 +1256,10 @@ FFI-test-isolable (every method crosses into `sherpa_rs_sys`), so the centroid
 update rule and clustering logic could not be exercised model-free — recorded
 here so the reviewer sees the decision.
 
-Phase A delivered the diarizer-crate surface only; **Phase B** now wires
-`OnlineDiarizer` into the orchestrator (see the `orchestrator` "Phase B — live
+`OnlineDiarizer` is wired
+into the orchestrator (see the `orchestrator` "Phase B — live
 diarization wiring" note) WITHOUT adding a dependency edge or a `common`-level
-trait: the `orchestrator → diarizer` edge already exists (granted in Phase 6),
+trait: the `orchestrator → diarizer` edge already exists,
 `OnlineDiarizer` is re-exported from the `diarizer` crate, and the live path stays
 a concrete struct (no second `common` trait — the existing `common::Diarizer`
 trait is offline-only and unchanged). No new crate-dependency edge is introduced —
@@ -1310,9 +1295,8 @@ the single-speaker control, and `InvalidInput` for a non-16 kHz or empty buffer.
     running-mean-of-unit-vectors rule exactly, so voiceprints are comparable
     with online-clusterer centroids via cosine.
 
-The centroid math that was previously duplicated in
-`online/clusterer.rs` (`unit_normalise`, `cosine_unit_vs_centroid`) now
-delegates to `common::voiceprint_math` — ONE proven implementation. The
+`online/clusterer.rs` (`unit_normalise`, `cosine_unit_vs_centroid`)
+delegates to `common::voiceprint_math` — ONE shared implementation. The
 Welford running-mean (`update_centroid`) stays diarizer-private and
 unchanged.
 
@@ -1472,13 +1456,13 @@ remote-backend path and no remote-backend guard. `ipc-bridge` holds the
 concrete `Arc<LlamaSummariser>` and calls
 this method per-segment in a `spawn_blocking` translation loop.
 Env-gated test: `translate_segment_produces_spanish_translation` requires
-`MINUTIST_LLM_MODEL_PATH`; verified 2026-06-12 with Gemma 4 E4B Q4_K_M (~7 s
+`MINUTIST_LLM_MODEL_PATH` (Gemma 4 E4B Q4_K_M, ~7 s
 per segment on CPU). No new dependency edge — `summariser` still depends only
 on `common`.
 
 **Phase 9 — model exposure for the chat engine (D5, the ONLY summariser
 change).** `LlamaSummariser` gains `pub fn model(&self) -> &LlamaModel`, the
-substrate seam the Phase-9 `chat-agent` engine borrows. `summarise()` is
+substrate seam the `chat-agent` engine borrows. `summarise()` is
 unchanged. `ipc-bridge` holds the concrete `Arc<LlamaSummariser>`, lends
 `&LlamaModel` to `chat-agent`'s `LlamaTurnBackend`, and coerces the same handle
 to `Arc<dyn Summariser>` for the `agent-tools` `ToolContext`. The model is
@@ -1620,11 +1604,10 @@ skipping (`Ok(false)`) a meeting not held locally. It uses only primitives
 already owned by this leaf (`update_metadata_if_present` + `merge_processing` +
 a private log-label helper) — never `libsql` or `index.db` — so it belongs here
 rather than in `persistence`. `persistence::meeting_ops::apply_synced_lifecycle_if_present`
-re-exports it (a thin `async` wrapper at the historical call-site path, since
+re-exports it (a thin `async` wrapper, since
 the desktop/hub subscribers `.await` it); `sync-ffi`'s `apply_inbound_lifecycle`
 calls it directly (the phone has no `persistence` edge). This is the SINGLE
-implementation of the merge-and-skip-if-absent logic — previously `sync-ffi`
-carried a hand-mirrored copy of the same body.
+implementation of the merge-and-skip-if-absent logic.
 
 **`notes_lock` — per-meeting `notes.ydoc` write serialisation.** `NotesStore`'s
 three `notes.ydoc` writers (`save`, `apply_update`, `seed_ydoc_if_needed`) each
@@ -1662,22 +1645,21 @@ the C-heavy graph out of this leaf is what lets `sync` (which depends on
 `notes-crdt`, not `persistence`) cross-compile its lib to mobile targets
 (e.g. aarch64-linux-android).
 
-These primitives were extracted from `persistence`, which now depends on
-`notes-crdt` and **re-exports every symbol at its historical `persistence::*`
-paths** (`persistence::{MeetingFolder, NotesStore, NotesData,
+These primitives live in `notes-crdt`; `persistence` depends on it and
+**re-exports every symbol at the `persistence::*` paths its consumers already
+use** (`persistence::{MeetingFolder, NotesStore, NotesData,
 note_blocks_from_json, write_metadata}` and the `persistence::{ydoc, notes,
 folder}` modules). So `persistence`'s consumers — orchestrator, ipc-bridge,
-agent-tools, app-main — are unchanged, and `persistence` stays the sole writer
+agent-tools, app-main — are unaffected, and `persistence` stays the sole writer
 under `{app-data}/meetings/`; it simply delegates the notes-CRDT bodies to the
 leaf. The `notes-crdt` `Error` is a light subset (`Io` / `FolderExists` /
 `Serialise` / `InvalidState` / `MeetingNotFound`) with a `From<notes_crdt::Error>
 for common::AppError`; `persistence::error` keeps the libsql / audiopus variants
 and adds `From<notes_crdt::Error>` so its own `Error` absorbs the leaf's.
 
-The behaviour of the moved code is documented in the `persistence` "CRDT notes
-storage" / "Note image assets" sections below — they describe the same `ydoc` /
-`NotesStore` / `MeetingFolder` surface regardless of which crate now hosts the
-bodies. See `planning/DESIGN_notes-crdt.md`.
+The `persistence` "CRDT notes storage" / "Note image assets" sections below
+describe the same `ydoc` / `NotesStore` / `MeetingFolder` surface hosted by
+`notes-crdt`. See `planning/DESIGN_notes-crdt.md`.
 
 ### `election`
 **Crate:** `crates/election`
@@ -1725,20 +1707,21 @@ a file in the meeting folder before a candidate is claimable; a candidate missin
 audio is skipped (logged at debug) and stays `PendingProcessing` for a host that
 already has it, or for this host once the blob arrives on a later poll.
 
-**Failed `process()` releases the claim (F4a).** On a `process()` error the loop no
-longer leaves the claim `Claimed{self}` to lapse the full (default 30 min) lease —
-that stranded the recorder-busy and audio-not-yet-synced cases for the whole hold
-window with no early reap. It instead releases the claim back to `PendingProcessing`
-via a guarded `update_metadata_if` (only if the on-disk claim is still ours), so the
-very next poll tick — this host's or a peer's — retries immediately, decoupling
-recovery latency from the lease sizing.
+**Failed `process()` releases the claim (F4a).** On a `process()` error the loop
+releases the claim back to `PendingProcessing` via a guarded `update_metadata_if`
+(only if the on-disk claim is still ours) rather than leaving it `Claimed{self}`
+to lapse the full (default 30 min) lease — which would otherwise strand the
+recorder-busy and audio-not-yet-synced cases for the whole hold window with no
+early reap. The very next poll tick — this host's or a peer's — therefore retries
+immediately, decoupling recovery latency from the lease sizing.
 
 **Lease renewals propagate to peers (F4b).** `renewal_loop` takes the driver `Arc`
 and calls `driver.advertise()` after every tick that keeps renewing (a successful
 re-stamp, or a harmless no-write skip), not just on the initial claim and the
-terminal `Processed`. Previously the renewer only re-stamped the LOCAL lease, so a
-peer's copy of the lease never advanced past the original claim-time value and would
-reap + duplicate any job that outlived it, deterministically, with no hub required.
+terminal `Processed`. Advertising only on the initial claim and the terminal
+`Processed` would leave a peer's copy of the lease pinned at the original
+claim-time value, and would reap + duplicate any job that outlived it,
+deterministically, with no hub required.
 
 **Terminal write is merge-aware (M2).** The final `Processed{self}` write
 (`persistence::meeting_ops::apply_own_processing_if_not_superseded`) routes through
@@ -2002,7 +1985,7 @@ on `common`.
     `transcript.json` reads as an empty `Vec` (a zero-segment meeting writes
     no file), not an error.
   - `read_audio_pcm(meeting_dir) -> AppResult<Vec<f32>>` — the **graduated
-    Opus decoder** (previously test-only). Returns the full **pause-INCLUDING**
+    Opus decoder**. Returns the full **pause-INCLUDING**
     16 kHz mono f32 buffer: the silent frames written for pause gaps decode to
     real zero samples, so the buffer's duration equals wall-clock recording
     duration. This is what Phase 6 diarization and Phase 4 re-transcribe
@@ -2016,8 +1999,7 @@ on `common`.
     decoded buffer spans ~4 s (so the synthesised pause silence was not dropped)
     with the injected-pause region decoding to ~zero. Because it exercises the
     real synthesis path, a regression that stops `resume()` writing silent frames
-    fails this test (verified by mutation: the earlier draft pushed the silence
-    through the sample stream and did **not** catch that regression).
+    fails this test.
   - `read_meeting_state(meeting_dir) -> AppResult<MeetingState>` — assembles
     `meta` + `transcript` + optional `notes` (via `NotesStore::load`, mapped to
     `common::NotesDocument`; the opaque `notes.json` value is re-serialised to
@@ -2133,8 +2115,9 @@ on `common`.
   so a caller cannot forget the lock. It is the single guarded `metadata.json`
   RMW entry point — the `orchestrator`'s post-processing writes and `agent-tools`'
   write tools route through it / the `meeting_ops` fns too (issue 0025), so every
-  in-process writer of a meeting's `metadata.json` serialises on ONE lock;
-  `agent-tools` no longer keeps its own per-meeting mutex. See
+  in-process writer of a meeting's `metadata.json` — including `agent-tools`'
+  write tools — serialises on this ONE lock, rather than each keeping its own
+  per-meeting mutex. See
   `cross-cutting.md` — "Per-meeting metadata.json write lock".
 - **Collections store (`collections` module + `collections.json`).** A user-facing
 "folder" grouping meetings — distinct from [`MeetingFolder`] (a single meeting's
@@ -2473,7 +2456,7 @@ depend on `persistence` (the orchestrator sources audio through
   unless `Idle` (`AppError::InvalidInput`), then decodes the pause-INCLUDING PCM
   (`read_audio_pcm`) + reads `transcript.json` (`read_transcript`), runs the
   bundled `SherpaDiarizer::compute_turns(&audio, 16000)`, overlays first-seen
-  speaker labels (`diarizer::overlay_speakers`), and (#0015 phase 4) re-ASRs each
+  speaker labels (`diarizer::overlay_speakers`), and (#0015) re-ASRs each
   kept mixed Qwen segment into single-speaker sub-clips. It rewrites
   `transcript.json` with the overlaid `speaker_id`s (`write_transcript`), updates
   `metadata.json`'s `{ speaker_count, diarizer: Some(ModelDescriptor{..}) }`
@@ -2530,10 +2513,7 @@ depend on `persistence` (the orchestrator sources audio through
   auto-triggered, so it claims the offline slot, applies the timeout above,
   rewrites `transcript.json` + `metadata.json`, refreshes the index row, and emits
   `DiarizationComplete` when done. A slow or hung diarization therefore can never
-  wedge `stop()` or hide the meeting. The flag defaults to **false**. (Previously
-  `stop()` ran this pass INLINE/awaited; a hung 30-min diarization then blocked the
-  whole stop flow and left the meeting unindexed until the next launch — fixed by
-  this decoupling.)
+  wedge `stop()` or hide the meeting. The flag defaults to **false**.
 - **Test seam — `rediarize_with_split_inputs(&MeetingIndex, MeetingId,
   Vec<SpeakerTurn>, Option<Box<dyn AsrBackend + Send>>, DiarizerConfig)`.** A
   `#[cfg(any(test, feature = "test-source"))]`-gated sibling of `rediarize`
@@ -2562,7 +2542,7 @@ encoder, empties `transcript.json`, then runs `re_transcribe_with_backend` with 
 `StubAsrBackend` so the real Silero VAD + offline accumulator + transcript
 rewrite + index-excerpt refresh are exercised in CI without a model. Phase 6
 diarization tests: the **default-suite, model-free** lib tests
-(`tests::diarization`) drive the re-diarize + #0015-phase-4 split inner path via
+(`tests::diarization`) drive the re-diarize + #0015 split inner path via
 `rediarize_with_split_inputs` (synthetic turns + a stub `AsrBackend`):
 `transcript.json` rewrite with `speaker_id`s, the mixed-Qwen-segment split into
 single-speaker sub-clips with correct letters + EXCLUDING-clock `start_ms`, the
@@ -2700,8 +2680,8 @@ true, with the shared `IpcState::voiceprints` store passed through.
   skip) rather than blocking the rename — the rename itself always succeeds.
 - **Clock mapper.** Segment `start_ms`/`end_ms` are on the pause-EXCLUDING
   transcript clock; `read_audio_pcm` returns pause-INCLUDING PCM.
-  `runner::pcm_window_for_excluding_range` (now `pub(crate)`, also used by the
-  #0015-phase-4 re-ASR split and `transcribe_pcm_window`) translates each clean
+  `runner::pcm_window_for_excluding_range` (`pub(crate)`, also used by the
+  #0015 re-ASR split and `transcribe_pcm_window`) translates each clean
   segment to the correct PCM slice. The W1 clamping decision applies: a segment
   spanning a pause is clamped to the kept region that contains its start.
 - **Cleanliness filter (§2.3.1).** Only segments with `speaker_id == label`,
@@ -2729,8 +2709,8 @@ existing identity:
   contribution weight. `refine` applies `REFINE_WEIGHT_CAP` internally; the
   orchestrator passes the raw count.
 
-The spawn_blocking return type was widened from `Option<Voiceprint>` to
-`Option<(Voiceprint, u64)>` (centroid + window count) to carry the count through
+The spawn_blocking return type is `Option<(Voiceprint, u64)>` (centroid + window
+count), carrying the count through
 to the async store call. All other lock-discipline, clock-mapper, and
 cleanliness-filter behaviour is unchanged from WU3.
 
@@ -2742,10 +2722,10 @@ primary slow-poison defence; the gating is in `ipc-bridge` (only `set_speaker_na
 triggers enrolment), not in the orchestrator.
 
 ### `agent-tools`
-**Crate:** `crates/agent-tools` (Phase 9)
+**Crate:** `crates/agent-tools`
 **Owns:** the shared tool layer — one `Tool` trait + one `ToolRegistry`, the
-single place a chat-agent / MCP tool is defined. Both consumers (the Phase-9
-internal chat agent and the Phase-10 MCP server) drive the SAME registry, so the
+single place a chat-agent / MCP tool is defined. Both consumers (the
+internal chat agent and the MCP server) drive the SAME registry, so the
 "internal agent and an external MCP client use the same tools" constraint is
 satisfied by there being exactly one definition site per tool. Edges: `common`,
 `persistence`, `orchestrator`.
@@ -2832,9 +2812,8 @@ before any filesystem access). No new dependency-table edge
 — `agent-tools` already depends on `persistence`. Writes:
 `set_speaker_name`, `rename_meeting` (both MCP-allowlisted — reversible, low
 blast radius), `reprocess_meeting` (internal-only — heavy; re-transcribes then
-re-diarizes under one claim; #0015 merged the former `retranscribe_meeting` +
-`rediarize_meeting`; holding the offline claim via MCP would block the user's
-ability to record).
+re-diarizes under one claim, #0015; holding the offline claim via MCP would
+block the user's ability to record).
 Record-control writes (#62): `start_recording` (optional `device_id`, returns the
 new `MeetingId`), `stop_recording` (returns the finished meeting's id + title +
 duration), `pause_recording`, `resume_recording` — each dispatches to the
@@ -2849,7 +2828,7 @@ loopback). The internal UI chat (no MCP gate) can always drive them.
 delegating to `Orchestrator::set_pending_title` (UI-only — no agent-tool / MCP
 exposure); it names the live meeting before it finalises, capped at 512 chars.
 MCP-only
-(Phase 10, `v1(true)`): `send_to_internal_agent` — forwards one
+(`v1(true)`): `send_to_internal_agent` — forwards one
 message to the internal chat agent over the bridge channel and returns its reply
 (body in `agent-tools`; chat-engine driver in `ipc-bridge::inter_agent`).
 
@@ -2874,7 +2853,7 @@ recording state machine, which serialises lifecycle transitions under its own
 lock and rejects an invalid transition with `InvalidInput`.
 
 ### `chat-agent`
-**Crate:** `crates/chat-agent` (Phase 9)
+**Crate:** `crates/chat-agent`
 **Owns:** the stateless, OpenAI-compatible, tool-calling chat TURN engine over
 the bundled local LLM. It sits ABOVE both `summariser` (the loaded-model
 substrate) and `agent-tools` (the tool descriptors); folding the loop into
@@ -3043,8 +3022,8 @@ is already reused. No new crate or workspace edge is introduced by the U2
 append-turn primitive.
 
 ### `mcp-server`
-**Crate:** `crates/mcp-server` (Phase 10)
-**Owns:** the in-process Streamable HTTP MCP server that exposes the Phase-9
+**Crate:** `crates/mcp-server`
+**Owns:** the in-process Streamable HTTP MCP server that exposes the
 `agent-tools` registry to external agents over loopback. It is a SECOND consumer
 of that registry and adds **no tools of its own** — it projects
 `ToolRegistry::mcp_tool_descriptors_gated(allow_writes)` onto MCP `tools/list`
@@ -3116,8 +3095,8 @@ settings via this crate; nobody else parses the store directly.
 **Phase 3 field — `autosave_interval_secs: u32`.** Notes-editor autosave
 cadence (FR-18/FR-35), `#[serde(default = ...)]` defaulting to 5; an older
 store JSON written before the field existed deserialises to 5. `Settings`
-now carries an explicit `Default` impl (the field's default is non-zero, so
-the derived `Default` no longer suffices).
+carries an explicit `Default` impl (the field's default is non-zero, so
+the derived `Default` would not suffice).
 
 **Phase 5 fields — `summary_system_prompt: String` (FR-28) and
 `llm_model_id: Option<ModelId>` (FR-35).** The summary prompt
@@ -3374,7 +3353,7 @@ owns the download; `ipc-bridge` resolves the mmproj path from the registry at
 
 ### `tunnel-client`
 **Crate:** `crates/tunnel-client`
-**Owns:** the app-side half of the connected-tier relay tunnel (WS4-A S3b): the
+**Owns:** the app-side half of the connected-tier relay tunnel: the
 outbound WSS dial to the hosted relay, the device handshake, and the
 request/response demux loop that replays relayed MCP requests against the app's
 own loopback `mcp-server`.
@@ -3490,7 +3469,7 @@ non-`wss://` relay** (`TunnelError::Config`) before dialing — `ws://` is
 tolerated only for a loopback host, where cleartext never leaves the machine.
 
 ### `sync`
-**Crate:** `crates/sync` (WS4-B)
+**Crate:** `crates/sync`
 **Owns:** the device-to-device sync engine: an iroh QUIC transport that
 multiplexes three custom protocols over the crate's ALPNs between a user's own
 paired devices — Yjs notes-update reconciliation (`notes_proto`),
@@ -3761,11 +3740,11 @@ injects per-pass results; the auto-summarise pass is exercised via a model-free
 
 **Responsive stop — `Finalising` state + `MeetingFinalised` event.** The
 in-session drain/finalise (transcribing the live backlog, writing the meeting
-files) runs on the runner's own thread, but `stop()` used to keep the UI in
-`Stopping` for its whole duration (up to the 30 s drain). `stop()` now, after
+files) runs on the runner's own thread. `stop()`, after
 dispatching the stop command, broadcasts `RecordingState::Finalising` and flips
 to `Idle` only once the runner replies — so the webview stays responsive during
-the drain; the record controls treat `finalising` as busy, gating only a NEW
+the drain (rather than sitting in `Stopping` for its whole duration, up to the
+30 s drain); the record controls treat `finalising` as busy, gating only a NEW
 recording, which the state machine enforces (`Recording|Paused → Stopping →
 Finalising → Idle`, via `transition_finalising`). On completion `stop()` emits
 `AppEvent::MeetingFinalised { meeting_id }` **before** the `Idle` transition (the
@@ -3859,8 +3838,8 @@ no audio. The webview's optimistic `preparing` flag clears on this event.
 - `reprocess(meeting_id) -> ()` — the **only** read/action command that routes
   through the orchestrator (`Orchestrator::reprocess`): an offline re-run of the
   live ASR pipeline FOLLOWED BY re-diarization, under one offline claim (#0015
-  merged the former Phase-4 `re_transcribe` + Phase-6 `rediarize_meeting`
-  commands into this one — see `orchestrator` below). The re-diarize step clears
+  folds `re_transcribe` + `rediarize_meeting` into this one command — see
+  `orchestrator` below). The re-diarize step clears
   `metadata.json`'s `speaker_names`. The shared `IpcState::index` handle is
   passed into the call so the orchestrator refreshes the index row without owning
   an index of its own.
@@ -3951,10 +3930,9 @@ through `Orchestrator` at runtime, so there is no production `model-registry`
 edge in the dependency table above (mirroring `orchestrator`'s test-only
 dev-dependencies).
 
-**Phase 6 — re-diarize (FR-11).** Phase 6 originally added a separate
-`rediarize_meeting(meeting_id) -> ()` command. #0015 merged it (and the Phase-4
-`re_transcribe`) into the single `reprocess` command above: re-diarization is the
-second phase of `Orchestrator::reprocess`, running `SherpaDiarizer` over the
+**Phase 6 — re-diarize (FR-11).** Re-diarization is the
+second phase of `Orchestrator::reprocess` (the single command above, #0015,
+which also handles re-transcribe), running `SherpaDiarizer` over the
 fresh transcript → `transcript.json` rewrite with `speaker_id`s →
 `metadata.json` `{ speaker_count, diarizer }` update + `speaker_names` clear →
 index-row refresh → `AppEvent::DiarizationComplete`. The diarizer is built
@@ -4020,7 +3998,7 @@ handle instead of constructing a fresh `LlamaSummariser` per call. The chat engi
 borrows `&LlamaModel` from the held handle via `LlamaSummariser::model()`; the
 `agent-tools` `ToolContext`'s `resummarise` coerces the same handle to
 `Arc<dyn Summariser>`. `IpcState` also gains `tool_registry: Arc<ToolRegistry>`
-(built once as `ToolRegistry::v1(false)` — the Phase-10 inter-agent bridge tool is
+(built once as `ToolRegistry::v1(false)` — the inter-agent bridge tool is
 omitted), `chat_in_flight: Arc<Mutex<HashSet<ChatSessionId>>>`, and
 `chat_cancel: Arc<Mutex<HashMap<ChatSessionId, chat_agent::CancelFlag>>>` (the
 per-session cancel flags `cancel_chat_turn` raises, P1).
@@ -4111,8 +4089,8 @@ to the orchestrator broadcast and emits `AppEventPayload` (event name
 
 **Specta types (post-P0a):** `common` and `settings` derive `specta::Type`
 directly behind their optional `specta` feature, which `ipc-bridge` enables.
-The Phase 1 mirror layer (`specta_types.rs`) was deleted; commands and events
-use the canonical types. `IpcError` remains a local `specta::Type` mirror of
+Commands and events use these canonical types directly — there is no separate
+mirror layer. `IpcError` remains a local `specta::Type` mirror of
 `AppError` at the boundary (harmless; may be removed in a later cleanup).
 
 **Output-language resolution (`sys-locale` external dependency).** `ipc-bridge`
@@ -4491,7 +4469,7 @@ applies its own internal bearer, D5); the MCP-server boot/enable path calls
 paired+enabled device that launched before the MCP server bound connects as soon
 as it does. The issued device credential + account/device ids are stored at
 `{app-data}/tunnel_device.json` with owner-only `0600` via the shared
-`write_secret_file` (renamed from `write_token_file`; the same helper writes
+`write_secret_file` (the same helper writes
 `mcp_token`), carrying the same Windows-ACL gap noted there. The relay/api URLs
 default to the minutist.ai endpoints (`settings.relay_url` / `relay_api_url`,
 user-overridable). Adds the `tunnel-client` (optional, connected) dependency
@@ -4499,17 +4477,17 @@ edge; the free build omits it (verified by `cargo build -p minutist
 --no-default-features`).
 
 ### `headless` (bin)
-**Crate:** `crates/headless` (WS4-B)
+**Crate:** `crates/headless`
 **Owns:** the user-installed headless server daemon, `minutist-hub` — a SECOND
 workspace binary beside `app-main`: an always-on device-sync hub now, and
 (post-launch) a GPU processing node. It runs on hardware the user owns and
 controls, in its own data root, never shared with a desktop's `{app-data}`; it
 is not a build variant of `app-main` and shares no code path with it.
 
-**Dependency edges:** `common`, `persistence`, `sync`, `settings` — the
-permitted phase-1 set (see the `headless` ‖-marked dependency-table footnote
-above; the post-launch GPU node adds the ML-runtime crates as a separate
-table-update commit). No `tauri::*` / `ipc-bridge` edge: the daemon wires
+**Dependency edges:** `common`, `persistence`, `sync`, `settings` (see the
+`headless` ‖-marked dependency-table footnote
+above; a post-launch GPU processing-node role adds the ML-runtime crates as a
+separate table-update commit). No `tauri::*` / `ipc-bridge` edge: the daemon wires
 `sync::SyncEngine` directly and carries no command/event surface.
 
 **CLI surface** (`clap`). The daemon runs by default
@@ -4535,7 +4513,7 @@ than packages.
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
 | Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. The live audio meter (`AudioMeter.tsx`) renders at the top of this pane. Rows are virtualised (`@tanstack/react-virtual`) and keyed by segment `start_ms`: only the rows in the scroll container's visible window (plus a small overscan) are mounted, and identity follows the segment across a splice/reorder rather than sticking to an array position. The per-row component (`TranscriptRow`) is memoised so a live append re-renders only the newly-visible rows. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
-| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, a Connection pane (`ConnectionSettingsPane.tsx`, WS4-A S5b — connector enable toggle, "Pair this device" via the device-code flow that shows the `user_code` and opens the verification URL with `tauri-plugin-opener`, live `Connecting → Online` status, and the paired account; honest that the connector channel transits content to the AI vendor by design, never "private"), and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one Phase-10 read command `get_mcp_server_info`; the Connection pane drives the four WS4-A S5b tunnel commands. Both connected-only panes are `VITE_CONNECTED`-gated (lazy-loaded; dropped from the free bundle). |
+| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, a Connection pane (`ConnectionSettingsPane.tsx` — connector enable toggle, "Pair this device" via the device-code flow that shows the `user_code` and opens the verification URL with `tauri-plugin-opener`, live `Connecting → Online` status, and the paired account; honest that the connector channel transits content to the AI vendor by design, never "private"), and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one read command `get_mcp_server_info`; the Connection pane drives the four tunnel commands. Both connected-only panes are `VITE_CONNECTED`-gated (lazy-loaded; dropped from the free bundle). |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 
@@ -4636,7 +4614,7 @@ two-column 50/50 layout (controls left, transcript right).
   Group has no `autoSaveId`, so showing/hiding a column re-derives the layout
   from each pane's `defaultSize` — a width the user dragged to is intentionally
   not preserved across a toggle (the squeeze-to-fit model wins over sticky
-  widths). The Phase 2 two-column flex layout is replaced.
+  widths).
 - **`RecordingStore` additions.** Gains `recordingClockMs: number | null`,
   updated by a new `recording_clock` event case and cleared to `null` on any
   transition out of `recording` (idle/stopping/paused). This is the sole
@@ -4701,8 +4679,9 @@ two-column 50/50 layout (controls left, transcript right).
   they read the live `useRecordingStore.transcript`. The notes editor hydrates
   from `openMeetingState.notes` in a **production** effect
   (`editor.commands.setContent(JSON.parse(notes.notes_json))`, keyed on the open
-  meeting's notes; clears to empty when the open meeting has no notes) — no
-  longer gated behind the DEV shim, which now only seeds when no meeting is open.
+  meeting's notes; clears to empty when the open meeting has no notes),
+  independent of the DEV shim, which seeds sample content only when no meeting
+  is open.
   Audio restore is **not** wired this phase: a saved meeting opens with its notes
   + transcript + working cross-reference, but a full audio player (and the
   pause-offset seek map from `cross-cutting.md` "Notes paragraph-anchor clock")
@@ -4732,12 +4711,11 @@ two-column 50/50 layout (controls left, transcript right).
   `open_meeting`, `rename_meeting`, `delete_meeting`, `reprocess`). These
   commands are generated into `bindings.ts` (the `ipc-bridge`/orchestrator JOIN
   added them and regenerated), so `client.ts` routes them uniformly through
-  `callCommand` like every other command — the earlier "pending generation"
-  raw-`TAURI_INVOKE` shim path was collapsed once the bindings regenerated. The
+  `callCommand` like every other command. The
   DEV shim (`dev-shim.ts`) supplies sample meetings + an opened-meeting payload
   so the list and an open meeting render under `vite dev`. `reprocess`
   reuses `AppEvent::TranscriptSegment` + `AppEvent::DiarizationComplete` (#0015
-  merged the former `re_transcribe` + `rediarize_meeting` seams).
+  folds the `re_transcribe` + `rediarize_meeting` seams into one).
 
 **Phase 5 additions (Stream S4 — summary view).**
 
@@ -4752,9 +4730,8 @@ two-column 50/50 layout (controls left, transcript right).
   summary mid-recording — and a finished meeting **defaults to notes + summary,
   with the transcript hidden** (the summary is what you reach for after a
   meeting). The meeting it summarises is the open meeting else the live
-  recording's `meeting_id`. The meeting-list row's Summarise action (renamed
-  from the Phase-4 "Re-summarise" stub button) also runs the real summariser
-  through the summary store.
+  recording's `meeting_id`. The meeting-list row's Summarise action also runs
+  the real summariser through the summary store.
 - **Summary store (`ui/src/state/summary.ts`).** Transient UI state only
   (`summaryMarkdown`, `summarising`, `meetingId`, `lastError`) routed through the
   `ui/src/ipc/summary.ts` seam; `summary.md` on disk is authoritative. Its
@@ -4768,12 +4745,9 @@ two-column 50/50 layout (controls left, transcript right).
   `meetings.ts`) over the shim-aware `commands` from `./client` — NOT raw
   `./bindings` — for the three Phase-5 commands: `summarise_meeting(meeting_id)
   -> ()`, `get_summary(meeting_id) -> Option<String>`, and
-  `save_summary(meeting_id, summary_markdown) -> ()`. These commands are added
-  to `ipc-bridge` by the Phase-5 backend JOIN (Stream S5), which regenerates
-  `bindings.ts`. Until that regeneration lands, `client.ts` routes them through a
-  shim-aware `callPendingCommand` raw-`invoke` path (the same approach the
-  Phase-4 meeting commands used before Stream C regenerated the bindings); once
-  regenerated they fold into `callCommand` like every other command. The DEV
+  `save_summary(meeting_id, summary_markdown) -> ()`. These commands are
+  generated into `bindings.ts`, so `client.ts` routes them through
+  `callCommand` like every other command. The DEV
   shim (`dev-shim.ts`) supplies a sample `summary.md` + a `summary_ready`
   fan-out so the view renders and updates under `vite dev`. The summary crosses
   the wire as an opaque markdown `String`; `summarise_meeting` reuses
@@ -4787,7 +4761,7 @@ two-column 50/50 layout (controls left, transcript right).
   already present on `Segment` in `bindings.ts` — no regen). The chip is hidden
   entirely when `speaker_id` is `null`/absent (un-diarized). Editorial Ink:
   `--accent-tint` background, `--rule` hairline, `--stone` ink — tokens only.
-  As of Phase B (live diarization wiring) `speaker_id` can now be populated
+  `speaker_id` can be populated
   during recording by the additive `OnlineDiarizer` (see the `orchestrator`
   "Phase B — live diarization wiring" note), so the chip renders for live
   segments too — no UI change is needed for that (live-label UI consumption is
@@ -4829,7 +4803,7 @@ two-column 50/50 layout (controls left, transcript right).
   sites and tests need no change. It gates the orchestrator's on-stop
   diarization pass; re-diarize is independent of it.
 - **Reprocess action + IPC seam (`ui/src/ipc/meetings.ts::reprocess` +
-  `TranscriptPane.tsx` toolbar action).** #0015 merged the former re-transcribe +
+  `TranscriptPane.tsx` toolbar action).** #0015 folds the re-transcribe +
   re-diarize UI actions into one Reprocess control. `reprocess(meeting_id)` calls
   the generated `reprocess` command, which is present on the generated `commands`
   surface and routes through `callCommand` in `ui/src/ipc/client.ts` like every
@@ -5021,8 +4995,7 @@ A warm-paper, document-centric **light** theme applied across the webview.
 **Translation UI — translated transcript as derived view (WU4).**
 
 - **`ui/src/ipc/translations.ts` (IPC seam).** Wraps `commands.translateMeeting`
-  and `commands.getTranslations` (both added to `client.ts`'s delegating surface
-  in WU3). `getTranslations` normalises the JSON-wire `Record<string, string>`
+  and `commands.getTranslations`. `getTranslations` normalises the JSON-wire `Record<string, string>`
   (JSON object keys are always strings) into a `Map<number, string>` keyed by
   segment index. Tests mock this seam module, not the generated bindings. The DEV
   shim supplies no-op stubs for both commands.

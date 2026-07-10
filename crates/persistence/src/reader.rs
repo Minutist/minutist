@@ -8,7 +8,7 @@
 //! be unit-tested without a tokio reactor.
 //!
 //! All four readers take an explicit `meeting_dir` (the `{root}/{uuid}/`
-//! path), so a caller that already holds a [`crate::MeetingFolder`] passes
+//! path), so a caller that already holds a `notes_crdt::MeetingFolder` passes
 //! `folder.path()` and a caller that resolved the path some other way (e.g.
 //! the index, or `rebuild_from_disk`) passes it directly.
 //!
@@ -30,10 +30,10 @@ use audiopus::{Channels, SampleRate};
 use minutist_common::{
     AppResult, MeetingMeta, MeetingState, NoteBlock, NotesDocument, Segment,
 };
+use notes_crdt::{note_blocks_from_json, NotesStore};
 use ogg::PacketReader;
 
 use crate::error::Error;
-use crate::notes::{note_blocks_from_json, NotesStore};
 
 /// Maximum number of mono samples a single Opus packet can decode to at any
 /// supported frame size (120 ms at 48 kHz = 5760). 16 kHz frames are far

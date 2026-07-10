@@ -7,8 +7,9 @@ authors.workspace = true
 
 # Phase 9: the shared tool layer. One `Tool` trait + one `ToolRegistry`; the
 # single place a chat-agent / MCP tool is defined. Edges: common, persistence,
-# orchestrator, rag-retrieval (for `rrf_fuse` in `retrieve_chunks`)
-# (NO summariser edge — `resummarise` drives an
+# notes-crdt (`get_notes` reads `NotesStore` directly — the leaf, not through
+# `persistence`'s C-heavy graph), orchestrator, rag-retrieval (for `rrf_fuse` in
+# `retrieve_chunks`) (NO summariser edge — `resummarise` drives an
 # `Arc<dyn Summariser>` held in `ToolContext`; NO model-registry edge —
 # `relisten_section` resolves its ASR backend through
 # `Orchestrator::transcribe_pcm_window`).
@@ -16,6 +17,7 @@ authors.workspace = true
 [dependencies]
 minutist-common = { path = "../common" }
 persistence = { path = "../persistence" }
+notes-crdt = { path = "../notes-crdt" }
 orchestrator = { path = "../orchestrator" }
 rag-retrieval = { path = "../rag-retrieval" }
 async-trait = { workspace = true }

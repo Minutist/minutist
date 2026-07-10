@@ -308,7 +308,7 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
         .collect();
 
     let meetings_root = data_dir.join("meetings");
-    let mut meetings: Vec<MeetingStatus> = persistence::folder::list_meeting_ids(&meetings_root)
+    let mut meetings: Vec<MeetingStatus> = notes_crdt::folder::list_meeting_ids(&meetings_root)
         .into_iter()
         .map(|id| {
             let digest = meeting_digest(&meetings_root, id);
@@ -333,10 +333,10 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
 /// across devices that have converged on the same content (the raw CRDT encoding
 /// differs by client history; the projection does not). `None` if no `notes.ydoc`.
 fn meeting_digest(meetings_root: &Path, meeting: MeetingId) -> Option<String> {
-    let state = persistence::NotesStore::read_ydoc_state(meetings_root, meeting).ok()??;
-    let doc = persistence::ydoc::new_ydoc();
-    persistence::ydoc::apply_update_v1(&doc, &state).ok()?;
-    let json = persistence::ydoc::ydoc_to_json(&doc);
+    let state = notes_crdt::NotesStore::read_ydoc_state(meetings_root, meeting).ok()??;
+    let doc = notes_crdt::ydoc::new_ydoc();
+    notes_crdt::ydoc::apply_update_v1(&doc, &state).ok()?;
+    let json = notes_crdt::ydoc::ydoc_to_json(&doc);
     let bytes = serde_json::to_vec(&json).ok()?;
     Some(format!("{:x}", sha2::Sha256::digest(&bytes)))
 }
@@ -668,19 +668,19 @@ mod tests {
     fn status_helpers_list_and_digest_meetings() {
         let base = tempfile::tempdir().expect("tempdir");
         let root = base.path();
-        assert!(persistence::folder::list_meeting_ids(root).is_empty());
+        assert!(notes_crdt::folder::list_meeting_ids(root).is_empty());
 
         // A meeting with notes: listed, with a deterministic digest.
         let m = MeetingId(uuid::Uuid::new_v4());
-        persistence::MeetingFolder::ensure(root, m).expect("ensure folder");
+        notes_crdt::MeetingFolder::ensure(root, m).expect("ensure folder");
         let json = serde_json::json!({
             "type": "doc",
             "content": [{ "type": "paragraph",
                 "content": [{ "type": "text", "text": "status helper test" }] }]
         });
-        persistence::NotesStore::save(root, m, &json, "status helper test").expect("save notes");
+        notes_crdt::NotesStore::save(root, m, &json, "status helper test").expect("save notes");
 
-        assert_eq!(persistence::folder::list_meeting_ids(root), vec![m]);
+        assert_eq!(notes_crdt::folder::list_meeting_ids(root), vec![m]);
         let d1 = meeting_digest(root, m).expect("digest present");
         let d2 = meeting_digest(root, m).expect("digest present again");
         assert_eq!(d1, d2, "digest is deterministic for unchanged content");
@@ -688,7 +688,7 @@ mod tests {
 
         // A meeting folder with no notes.ydoc → no digest.
         let empty = MeetingId(uuid::Uuid::new_v4());
-        persistence::MeetingFolder::ensure(root, empty).expect("ensure empty");
+        notes_crdt::MeetingFolder::ensure(root, empty).expect("ensure empty");
         assert_eq!(meeting_digest(root, empty), None);
     }
 

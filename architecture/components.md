@@ -33,19 +33,19 @@ appears in:
 | `model-registry` | 2 | `common`, `settings` |
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
-| `agent-tools` | 9 | `common`, `persistence`, `orchestrator`, `rag-retrieval` |
+| `agent-tools` | 9 | `common`, `persistence`, `notes-crdt`, `orchestrator`, `rag-retrieval` |
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
 | `sync` | WS4-B | `common`, `notes-crdt` |
 | `sync-ffi` | WS4-B (phone) | `common`, `sync`, `notes-crdt` ¶ |
-| `election` | WS4-B (producer-gate) | `common`, `persistence` |
+| `election` | WS4-B (producer-gate) | `common`, `persistence`, `notes-crdt` |
 | `doc-convert` | Attachments WS | `common` |
 | `rag-retrieval` | RAG | `common` |
 | `embedder` | RAG | `common`, `llama-cpp-2` |
-| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert`, `embedder`, `rag-retrieval` |
+| `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `notes-crdt`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert`, `embedder`, `rag-retrieval` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※ |
-| `headless` (bin) | WS4-B | `common`, `persistence`, `sync`, `settings` ‖ |
+| `headless` (bin) | WS4-B | `common`, `persistence`, `notes-crdt`, `sync`, `settings` ‖ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
 Cargo feature (default ON). The free artifact is built with
@@ -734,6 +734,26 @@ dependency-table edge**.
 The `cos > 0.999` centroid-aligns-with-sample-mean discipline from
 `diarizer::online::clusterer` is retargeted at this module via unit tests in
 `voiceprint_math::tests`.
+
+**`fs` module — shared atomic-write primitive.** A new `pub mod fs` in
+`common` exposes one function:
+
+- `write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()>` — writes `bytes`
+  to a sibling temp file in `path`'s parent directory, `fsync`s it, then
+  renames it over `path`. The rename is the sole commit point, so a crash
+  before it leaves the previous `path` untouched and a crash after it leaves
+  `path` fully written. The temp file's name carries a random suffix so two
+  concurrent writers targeting the same `path` never share a temp file. The
+  temp file is removed on any error so no `.tmp` residue is left behind.
+
+`persistence` (`assets`, `attachments`, `chat`, `collections`, `summary`,
+`transcript`, `translations`, `metadata`), `notes-crdt` (`metadata`, `notes`),
+and `settings` (`store::JsonFileStore`) all write through this one
+implementation rather than each carrying its own tmp-file + fsync + rename
+copy. Because all three crates already depend on `common`, hosting the helper
+here adds **no new dependency-table edge**. `crates/sync` keeps its own
+separate atomic-write copy in `sync/src/blobs.rs` (out of scope — that crate's
+domain is not touched here).
 
 **Captured-but-unprocessed meeting lifecycle + processing-host election
 (WS4-B — issue 0016 / 0020).** `MeetingMeta` gains

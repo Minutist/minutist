@@ -14,14 +14,16 @@ authors.workspace = true
 # `Orchestrator` reprocess — sit behind `ElectionDriver`, so the ONE state machine
 # is reused by both eligible host types (desktop-with-GPU + the future GPU node)
 # and is unit-testable with a mock driver. Deps: `common` (lifecycle types),
-# `persistence` (the guarded metadata RMW + the meeting-id scan, both re-exported
-# from the `notes-crdt` leaf), `chrono` (lease timing), `async-trait` (the driver
-# trait), `tokio` (the loop + lease renewal), `tracing`. NOT `sync` / `orchestrator`
-# / `tauri` / `iroh`. See `planning/DESIGN_producer-gate.md`.
+# `persistence` (the guarded metadata RMW), `notes-crdt` (the meeting-id scan +
+# `MeetingFolder`, read directly rather than through `persistence`'s re-export),
+# `chrono` (lease timing), `async-trait` (the driver trait), `tokio` (the loop +
+# lease renewal), `tracing`. NOT `sync` / `orchestrator` / `tauri` / `iroh`.
+# See `planning/DESIGN_producer-gate.md`.
 
 [dependencies]
 minutist-common = { path = "../common" }
 persistence = { path = "../persistence" }
+notes-crdt = { path = "../notes-crdt" }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }

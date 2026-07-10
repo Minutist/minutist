@@ -63,25 +63,12 @@ impl SettingsStore for JsonFileStore {
     }
 
     fn save(&self, settings: &Settings) -> Result<(), Error> {
-        use std::io::Write;
-
         // Create parent directories if they don't exist.
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(settings)?;
-        // Write atomically: write to a temp file alongside the target, fsync
-        // it so the bytes are durable before the rename links them in under
-        // the real name, then rename. Without the fsync, the OS is free to
-        // reorder or delay the tmp file's writeback past a crash, so the
-        // rename could hand the real name to a file the crash never actually
-        // persisted; the fsync closes that gap.
-        let tmp_path = self.path.with_extension("store.tmp");
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(content.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&tmp_path, &self.path)?;
-        Ok(())
+        minutist_common::fs::write_atomic(&self.path, content.as_bytes())
+            .map_err(|e| Error::Io(std::io::Error::other(e)))
     }
 }

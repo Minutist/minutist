@@ -75,13 +75,13 @@
 //!
 //! All commands return `Result<T, IpcError>`.
 //!
-//! `save_notes` / `load_notes` route **directly** to `persistence::NotesStore`
+//! `save_notes` / `load_notes` route **directly** to `notes_crdt::NotesStore`
 //! against `IpcState::meetings_dir`, bypassing the orchestrator: notes I/O is
 //! independent of the live recording pipeline and may run concurrently with an
 //! active recording.
 //!
 //! The CRDT editor binding (B6 WU7, `planning/DESIGN_notes-crdt.md` §8) adds two
-//! more notes commands on the same direct `persistence::NotesStore` route:
+//! more notes commands on the same direct `notes_crdt::NotesStore` route:
 //! `apply_notes_update` (merge an editor-produced lib0-v1 Yjs update onto the
 //! authoritative `notes.ydoc`, then re-derive `notes.json` / `notes.md`) and
 //! `load_notes_ydoc` (read the stored doc as a v1 state update for the editor to
@@ -90,7 +90,7 @@
 //! rebuilds the doc from JSON (kept for back-compat / non-collab callers). The
 //! binary update crosses the wire as `Vec<u8>` (`number[]`), matching
 //! `save_note_image`. The on-disk durable blob stays v2; only the editor
-//! interchange is v1 (the two must not be crossed — see `persistence::ydoc`).
+//! interchange is v1 (the two must not be crossed — see `notes_crdt::ydoc`).
 //!
 //! The Phase-4 read/action commands route directly to `persistence`
 //! (`list_meetings` / `rename_meeting` / `delete_meeting` via the shared
@@ -953,7 +953,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
 
         let bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
         let filename = persistence::save_note_asset(root, id, &bytes, "png").expect("save");
@@ -971,7 +971,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
 
         let bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
         let filename = persistence::save_note_asset(root, id, &bytes, "png").expect("save");
@@ -1048,7 +1048,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
 
         // Malformed (not <uuid>/<file>) → InvalidInput.
         for bad in ["", "/", "/only-one-segment", "/not-a-uuid/file.png"] {

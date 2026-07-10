@@ -558,7 +558,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
 
         // Save an original whose ext `doc_convert` cannot convert so the
         // conversion errors and the worker records Failed.
@@ -655,7 +655,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
         let attachment_id = seed_pending(root, id, "txt");
 
         // A dropped receiver → try_send fails Closed.
@@ -684,7 +684,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
         let attachment_id = seed_pending(root, id, "txt");
 
         // Capacity-1 channel, pre-filled so the next try_send is Full.
@@ -709,7 +709,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
 
         // One Pending row (must requeue) + one Ready row (must NOT).
         let pending_id = seed_pending(root, id, "txt");
@@ -759,7 +759,7 @@ mod tests {
         let tempdir = tempfile::TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let id = MeetingId::new();
-        persistence::MeetingFolder::create(root, id).expect("folder");
+        notes_crdt::MeetingFolder::create(root, id).expect("folder");
 
         // A convertible original (plain text → markdown succeeds).
         let bytes = b"hello reference material".to_vec();

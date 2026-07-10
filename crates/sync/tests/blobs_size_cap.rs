@@ -11,7 +11,7 @@ use std::path::Path;
 
 use iroh::EndpointAddr;
 use minutist_common::MeetingId;
-use persistence::MeetingFolder;
+use notes_crdt::MeetingFolder;
 use sync::identity::DeviceIdentity;
 use sync::SyncEngine;
 

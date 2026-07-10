@@ -30,7 +30,6 @@
 //! interruption.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 
 use minutist_common::AppResult;
@@ -91,7 +90,6 @@ pub fn merge_translations(
     translations: &HashMap<usize, String>,
 ) -> AppResult<()> {
     let path = translations_path(meeting_dir);
-    let tmp_path = meeting_dir.join("translations.json.tmp");
 
     // Read existing map (absent = empty).
     let mut raw: TranslationsMap = match std::fs::read_to_string(&path) {
@@ -108,22 +106,7 @@ pub fn merge_translations(
 
     // Atomic write.
     let json = serde_json::to_vec_pretty(&raw).map_err(Error::Serialise)?;
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&json)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
+    minutist_common::fs::write_atomic(&path, &json)?;
 
     tracing::debug!(
         target: "persistence",

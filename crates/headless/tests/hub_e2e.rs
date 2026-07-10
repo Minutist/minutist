@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use iroh::{EndpointAddr, RelayUrl};
 use minutist_common::{HostRef, MeetingId, ProcessingLifecycle};
-use persistence::NotesStore;
+use notes_crdt::NotesStore;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use uuid::Uuid;
 
@@ -33,9 +33,9 @@ fn projected(root: &std::path::Path, meeting: MeetingId) -> serde_json::Value {
     let v1 = NotesStore::read_ydoc_state(root, meeting)
         .expect("read ydoc state")
         .expect("meeting has a notes.ydoc");
-    let doc = persistence::ydoc::new_ydoc();
-    persistence::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
-    persistence::ydoc::ydoc_to_json(&doc)
+    let doc = notes_crdt::ydoc::new_ydoc();
+    notes_crdt::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
+    notes_crdt::ydoc::ydoc_to_json(&doc)
 }
 
 /// Spawn the real minutist-hub daemon for a test: collapsed sub-second timers and
@@ -203,8 +203,8 @@ async fn notes_converge_through_a_running_hub() {
         "content": [{ "type": "paragraph",
             "content": [{ "type": "text", "text": "hello through the hub" }] }]
     });
-    persistence::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting folder");
-    persistence::MeetingFolder::ensure(dir_b.path(), meeting).expect("ensure B meeting folder");
+    notes_crdt::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting folder");
+    notes_crdt::MeetingFolder::ensure(dir_b.path(), meeting).expect("ensure B meeting folder");
     NotesStore::save(dir_a.path(), meeting, &json, "hello through the hub").expect("seed A");
 
     // A pushes the note to the hub; B pulls it back (retry until all three home).
@@ -319,7 +319,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     let meeting_x = MeetingId(Uuid::new_v4());
     let jx = serde_json::json!({"type":"doc","content":[{"type":"paragraph",
         "content":[{"type":"text","text":"deposited by A while B was away"}]}]});
-    persistence::MeetingFolder::ensure(dir_a.path(), meeting_x).expect("ensure A/X");
+    notes_crdt::MeetingFolder::ensure(dir_a.path(), meeting_x).expect("ensure A/X");
     NotesStore::save(
         dir_a.path(),
         meeting_x,
@@ -335,7 +335,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     let meeting_y = MeetingId(Uuid::new_v4());
     let jy = serde_json::json!({"type":"doc","content":[{"type":"paragraph",
         "content":[{"type":"text","text":"B's own meeting"}]}]});
-    persistence::MeetingFolder::ensure(dir_b.path(), meeting_y).expect("ensure B/Y");
+    notes_crdt::MeetingFolder::ensure(dir_b.path(), meeting_y).expect("ensure B/Y");
     NotesStore::save(dir_b.path(), meeting_y, &jy, "B's own meeting").expect("seed B/Y");
     sync_with_retry(&engine_b, &hub_addr, meeting_y, "B->hub Y").await;
 
@@ -424,7 +424,7 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
     let meeting = MeetingId(Uuid::new_v4());
     let jx = serde_json::json!({"type":"doc","content":[{"type":"paragraph",
         "content":[{"type":"text","text":"processed by A"}]}]});
-    persistence::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting");
+    notes_crdt::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting");
     NotesStore::save(dir_a.path(), meeting, &jx, "processed by A").expect("seed A");
     let processed = ProcessingLifecycle::Processed {
         processed_by: HostRef("endpoint-a".into()),

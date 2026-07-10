@@ -28,7 +28,8 @@ use std::time::Duration;
 
 use iroh::{EndpointAddr, RelayUrl};
 use minutist_common::MeetingId;
-use persistence::{save_note_asset, MeetingFolder};
+use notes_crdt::MeetingFolder;
+use persistence::save_note_asset;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 
 #[tokio::test]

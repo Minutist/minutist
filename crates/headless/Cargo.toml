@@ -28,8 +28,13 @@ path = "src/main.rs"
 minutist-common = { path = "../common" }
 sync = { path = "../sync" }
 # Used directly by the `status` subcommand to project a meeting's notes.ydoc to a
-# content digest (NotesStore::read_ydoc_state + ydoc::{apply_update_v1,ydoc_to_json}).
-# Within the permitted phase-1 edge set (common/persistence/sync/settings).
+# content digest (NotesStore::read_ydoc_state + ydoc::{apply_update_v1,ydoc_to_json})
+# and to scan meeting-folder ids (folder::list_meeting_ids) — read from the leaf
+# directly rather than through `persistence`'s re-export.
+notes-crdt = { path = "../notes-crdt" }
+# Used directly by the `status` subcommand for `read_metadata`, and by the daemon
+# for `meeting_ops::apply_processing_lifecycle`. Within the permitted phase-1 edge
+# set (common/persistence/sync/settings).
 persistence = { path = "../persistence" }
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["signal"] }
@@ -54,6 +59,7 @@ tempfile = "3"
 # crates they touch are restated here.
 sync = { path = "../sync" }
 persistence = { path = "../persistence" }
+notes-crdt = { path = "../notes-crdt" }
 minutist-common = { path = "../common" }
 iroh = "=1.0.0"
 uuid = { workspace = true }

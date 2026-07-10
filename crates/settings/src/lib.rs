@@ -1723,15 +1723,20 @@ mod tests {
     fn json_file_store_save_leaves_no_tmp_file() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("settings.store");
-        let tmp_path = path.with_extension("store.tmp");
 
         let store = JsonFileStore::new(path.clone());
         store.save(&Settings::default()).expect("save");
 
         assert!(path.exists(), "the target file must exist after save");
+        let residue: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
         assert!(
-            !tmp_path.exists(),
-            "the fsync'd tmp file must be renamed away, not left behind"
+            residue.is_empty(),
+            "the fsync'd tmp file must be renamed away, not left behind, found: {residue:?}"
         );
         assert_eq!(store.load().expect("reload"), Settings::default());
     }

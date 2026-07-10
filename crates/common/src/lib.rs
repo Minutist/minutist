@@ -28,6 +28,13 @@ pub mod llama_backend;
 /// `persistence → diarizer` edge. Both crates already depend on `common`.
 pub mod voiceprint_math;
 
+/// The shared atomic-file-write primitive ([`fs::write_atomic`]).
+///
+/// Every crate that persists JSON or binary blobs to disk (`persistence`,
+/// `notes-crdt`, `settings`) writes through this one implementation rather
+/// than each re-deriving the tmp-file + fsync + rename discipline.
+pub mod fs;
+
 // ---------------------------------------------------------------------------
 // Identifiers
 // ---------------------------------------------------------------------------
@@ -88,7 +95,7 @@ impl Default for ChatSessionId {
 /// Stable identifier for a collection — a user-facing "folder" that groups
 /// meetings. UUIDv4. Mirrors [`MeetingId`].
 ///
-/// Distinct from `persistence::MeetingFolder`, which is a single meeting's
+/// Distinct from `notes_crdt::MeetingFolder`, which is a single meeting's
 /// on-disk directory. A meeting belongs to at most one collection
 /// ([`MeetingMeta::collection_id`]); the collection's definition (name, order)
 /// lives in `{app-data}/collections.json` (owned by `persistence`).
@@ -653,7 +660,7 @@ pub struct MeetingListEntry {
 /// collections are a flat list ordered by `position`. The authoritative
 /// definitions live in `{app-data}/collections.json` (owned by `persistence`);
 /// `index.db` carries only a derived `collection_id` column on each meeting row
-/// for fast filtered listing. Distinct from `persistence::MeetingFolder`, which
+/// for fast filtered listing. Distinct from `notes_crdt::MeetingFolder`, which
 /// is a single meeting's on-disk directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]

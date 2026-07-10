@@ -1,14 +1,11 @@
 //! `metadata.json` write helpers.
 //!
-//! The public atomic writer keyed on the meeting **directory**
-//! ([`write_metadata`]) lives in the leaf `notes-crdt` crate and is re-exported
-//! from `persistence` at its historical path. This module retains only the
-//! crate-private path-keyed form used by [`crate::MeetingWriter::open`] and
-//! [`crate::MeetingWriter::finalise`], which already hold the resolved
-//! `metadata.json` path. Both share the one atomic implementation in
-//! `notes_crdt::metadata`.
-//!
-//! [`write_metadata`]: crate::write_metadata
+//! The public atomic writer keyed on the meeting **directory** —
+//! `notes_crdt::write_metadata` — lives in the leaf `notes-crdt` crate. This
+//! module retains only the crate-private path-keyed form used by
+//! [`crate::MeetingWriter::open`] and [`crate::MeetingWriter::finalise`], which
+//! already hold the resolved `metadata.json` path. Both share the one atomic
+//! implementation in `notes_crdt::metadata`.
 
 use std::path::Path;
 

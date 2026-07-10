@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use iroh::{EndpointAddr, RelayUrl};
 use minutist_common::MeetingId;
-use persistence::NotesStore;
+use notes_crdt::NotesStore;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use uuid::Uuid;
 
@@ -34,9 +34,9 @@ fn projected(root: &std::path::Path, meeting: MeetingId) -> serde_json::Value {
     let v1 = NotesStore::read_ydoc_state(root, meeting)
         .expect("read ydoc state")
         .expect("meeting has a notes.ydoc");
-    let doc = persistence::ydoc::new_ydoc();
-    persistence::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
-    persistence::ydoc::ydoc_to_json(&doc)
+    let doc = notes_crdt::ydoc::new_ydoc();
+    notes_crdt::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
+    notes_crdt::ydoc::ydoc_to_json(&doc)
 }
 
 #[tokio::test]
@@ -98,7 +98,7 @@ async fn notes_converge_through_the_deployed_relay() {
         "content": [{ "type": "paragraph",
             "content": [{ "type": "text", "text": "hello over the relay" }] }]
     });
-    persistence::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting folder");
+    notes_crdt::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting folder");
     NotesStore::save(dir_a.path(), meeting, &json, "hello over the relay").expect("seed A");
 
     // Address B by RELAY ONLY — no direct IPs — so the dial is brokered by the

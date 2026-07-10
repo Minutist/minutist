@@ -23,6 +23,10 @@ async-trait = { workspace = true }
 minutist-common = { path = "../common", features = ["specta"] }
 orchestrator = { path = "../orchestrator" }
 persistence = { path = "../persistence" }
+# The notes commands (`save_notes` / `load_notes` / `apply_notes_update` /
+# `load_notes_ydoc`) route directly to `NotesStore`, read from the leaf rather
+# than through `persistence`'s re-export.
+notes-crdt = { path = "../notes-crdt" }
 doc-convert = { path = "../doc-convert" }
 summariser = { path = "../summariser" }
 agent-tools = { path = "../agent-tools" }

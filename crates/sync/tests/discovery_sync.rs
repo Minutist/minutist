@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use iroh::EndpointAddr;
 use minutist_common::{HostRef, MeetingId, ProcessingLifecycle};
-use persistence::MeetingFolder;
+use notes_crdt::MeetingFolder;
 use sync::identity::DeviceIdentity;
 use sync::SyncEngine;
 use tokio::time::timeout;

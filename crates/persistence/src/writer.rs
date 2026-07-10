@@ -3,9 +3,9 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use minutist_common::{AppResult, AudioFormat, MeetingId, MeetingMeta, Segment};
+use notes_crdt::MeetingFolder;
 
 use crate::error::Error;
-use crate::folder::MeetingFolder;
 use crate::metadata::{write_initial_metadata_if_absent, write_metadata_to_path};
 use crate::opus_encoder::OggOpusEncoder;
 use crate::transcript::TranscriptWriter;

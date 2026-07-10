@@ -17,7 +17,7 @@ use std::path::Path;
 
 use iroh::EndpointAddr;
 use minutist_common::MeetingId;
-use persistence::{MeetingFolder, NotesData, NotesStore};
+use notes_crdt::{MeetingFolder, NotesData, NotesStore};
 use serde_json::{json, Value};
 use sync::identity::DeviceIdentity;
 use sync::{SyncConfig, SyncEngine};
@@ -191,7 +191,7 @@ async fn bidirectional_edits_converge_to_same_state() {
 /// duplicate. Keeping the mutation on the hydrated doc is what makes the
 /// bidirectional merge a true CRDT merge.
 fn edit_append_paragraph(root: &Path, id: MeetingId, text: &str) {
-    use persistence::ydoc;
+    use notes_crdt::ydoc;
     use yrs::updates::encoder::Encode;
     use yrs::{ReadTxn, Transact, XmlElementPrelim, XmlFragment, XmlTextPrelim};
 

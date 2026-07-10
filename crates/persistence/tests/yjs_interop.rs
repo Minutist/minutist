@@ -45,7 +45,7 @@
 //! is value-semantic rather than representation-sensitive.  Functionally this is
 //! harmless: JavaScript reads `12400.0` from `notes.json` identically to `12400`.
 
-use persistence::ydoc::{apply_update_v1, new_ydoc, ydoc_to_json};
+use notes_crdt::ydoc::{apply_update_v1, new_ydoc, ydoc_to_json};
 use serde_json::Value;
 
 /// Raw lib0 v1 bytes from the real JavaScript yjs library.

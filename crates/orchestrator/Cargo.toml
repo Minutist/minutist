@@ -45,6 +45,9 @@ tracing-subscriber = { workspace = true }
 audio-capture = { path = "../audio-capture", features = ["test-source"] }
 model-registry = { path = "../model-registry" }
 persistence = { path = "../persistence" }
+# Test-only: `tests.rs` seeds `metadata.json` directly via `notes_crdt::write_metadata`
+# rather than through `persistence`'s re-export. Not a production edge.
+notes-crdt = { path = "../notes-crdt" }
 settings = { path = "../settings" }
 sha2 = { workspace = true }
 audiopus = { workspace = true }

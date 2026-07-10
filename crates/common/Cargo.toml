@@ -27,3 +27,4 @@ llama-backend = ["dep:llama-cpp-2"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = "3"

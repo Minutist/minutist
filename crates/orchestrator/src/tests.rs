@@ -621,7 +621,7 @@ mod diarization {
         {
             let mut meta = persistence::read_metadata(&meeting_dir).expect("read metadata");
             meta.speaker_names.insert("A".to_string(), "Alice".to_string());
-            persistence::write_metadata(&meeting_dir, &meta).expect("seed speaker_names");
+            notes_crdt::write_metadata(&meeting_dir, &meta).expect("seed speaker_names");
         }
 
         let index = MeetingIndex::open(":memory:").await.expect("open index");

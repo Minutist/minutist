@@ -425,7 +425,7 @@ impl Tool for GetNotes {
         let id = resolve_meeting(ctx, &args)?;
         let root = ctx.meetings_dir.clone();
         // NotesStore::load takes (root, meeting_id) and returns Option.
-        let notes = spawn_blocking_io(move || persistence::NotesStore::load(&root, id)).await?;
+        let notes = spawn_blocking_io(move || notes_crdt::NotesStore::load(&root, id)).await?;
         let data = match notes {
             Some(n) => {
                 json!({ "markdown": n.markdown, "json": n.json })

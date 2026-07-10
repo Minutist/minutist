@@ -15,8 +15,8 @@
 //! # Opacity guarantee
 //!
 //! These are sibling files; `notes.json` is untouched by this module (the
-//! editor stores the returned filename into the document, which `NotesStore`
-//! then round-trips verbatim — see [`crate::NotesStore`]). The Rust side never
+//! editor stores the returned filename into the document, which
+//! `notes_crdt::NotesStore` then round-trips verbatim). The Rust side never
 //! parses the document to find image references.
 //!
 //! # Path-traversal guard
@@ -81,7 +81,7 @@ pub fn save_note_asset(
         return Ok(filename);
     }
 
-    write_atomic(&dir, &target, bytes)?;
+    minutist_common::fs::write_atomic(&target, bytes)?;
 
     tracing::info!(
         target: "persistence",
@@ -138,51 +138,10 @@ fn is_safe_asset_filename(filename: &str) -> bool {
     }
 }
 
-/// Write `bytes` to `target` atomically via a sibling temp file in `dir`, then
-/// rename into place. Mirrors `notes::write_atomic` but is local so the assets
-/// module is self-contained.
-fn write_atomic(dir: &Path, target: &Path, bytes: &[u8]) -> AppResult<()> {
-    use std::io::Write;
-
-    // Unique-enough temp name in the same directory (so the rename stays on one
-    // filesystem). The target filename is the content hash, so two concurrent
-    // writes of the SAME bytes race onto byte-identical temp content and the
-    // rename is idempotent; suffix with a nonce to avoid a shared temp name.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "asset".to_string());
-    let tmp_path = dir.join(format!("{file_name}.{nonce}.tmp"));
-
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, target) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::folder::MeetingFolder;
+    use notes_crdt::MeetingFolder;
     use tempfile::TempDir;
 
     fn make_meeting() -> (TempDir, std::path::PathBuf, MeetingId) {

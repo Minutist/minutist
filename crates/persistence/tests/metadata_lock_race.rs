@@ -28,7 +28,8 @@ use std::path::Path;
 use minutist_common::{
     AudioFormat, HostRef, MeetingId, MeetingMeta, ProcessingClaim, ProcessingLifecycle,
 };
-use persistence::{read_metadata, write_metadata, MeetingFolder};
+use notes_crdt::{write_metadata, MeetingFolder};
+use persistence::read_metadata;
 use tempfile::TempDir;
 
 /// Seed a meeting folder with a full `metadata.json` (no speaker names,

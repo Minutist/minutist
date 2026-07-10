@@ -319,7 +319,7 @@ fn test_pause_resume_gap_granule() {
 
 #[test]
 fn test_folder_uuid_collision() {
-    use crate::folder::MeetingFolder;
+    use notes_crdt::MeetingFolder;
 
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();
@@ -383,7 +383,7 @@ fn make_segment(start_ms: u64, end_ms: u64, text: &str) -> Segment {
 /// with matching fields.
 #[test]
 fn test_transcript_writer_append_flush() {
-    use crate::folder::MeetingFolder;
+    use notes_crdt::MeetingFolder;
 
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();
@@ -415,7 +415,7 @@ fn test_transcript_writer_append_flush() {
 /// append 2, flush → file has 2; append 1 more, flush → file has 3 (not 5).
 #[test]
 fn test_transcript_writer_flush_idempotent() {
-    use crate::folder::MeetingFolder;
+    use notes_crdt::MeetingFolder;
 
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();
@@ -593,13 +593,13 @@ fn write_synthetic_meeting(
     notes_md: Option<&str>,
 ) -> MeetingId {
     let id = MeetingId::new();
-    let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
+    let folder = notes_crdt::MeetingFolder::create(root, id).expect("create folder");
 
     let mut meta = dummy_meta(id, 5_000);
     meta.title = title.to_string();
     meta.started_at = started_at.to_string();
     meta.speaker_count = 2;
-    crate::write_metadata(folder.path(), &meta).expect("write metadata");
+    notes_crdt::write_metadata(folder.path(), &meta).expect("write metadata");
 
     if !segments.is_empty() {
         let mut tw = TranscriptWriter::open(&folder).expect("open transcript");
@@ -610,7 +610,7 @@ fn write_synthetic_meeting(
     }
 
     if let (Some(j), Some(m)) = (notes_json, notes_md) {
-        crate::notes::NotesStore::save(root, id, j, m).expect("save notes");
+        notes_crdt::NotesStore::save(root, id, j, m).expect("save notes");
     }
 
     id
@@ -1108,10 +1108,10 @@ fn test_read_meeting_state_seeds_legacy_notes_and_flips_format() {
     let root = tempdir.path();
 
     let id = MeetingId::new();
-    let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
+    let folder = notes_crdt::MeetingFolder::create(root, id).expect("create folder");
     let mut meta = dummy_meta(id, 5_000);
     meta.notes_format = 0;
-    crate::write_metadata(folder.path(), &meta).expect("write metadata");
+    notes_crdt::write_metadata(folder.path(), &meta).expect("write metadata");
 
     let notes_json = serde_json::json!({
         "type": "doc",
@@ -1154,10 +1154,10 @@ fn test_read_meeting_state_seed_is_noop_when_no_notes() {
     let root = tempdir.path();
 
     let id = MeetingId::new();
-    let folder = crate::folder::MeetingFolder::create(root, id).expect("create folder");
+    let folder = notes_crdt::MeetingFolder::create(root, id).expect("create folder");
     let mut meta = dummy_meta(id, 5_000);
     meta.notes_format = 0;
-    crate::write_metadata(folder.path(), &meta).expect("write metadata");
+    notes_crdt::write_metadata(folder.path(), &meta).expect("write metadata");
 
     let folder_dir = root.join(id.0.to_string());
     let state = reader::read_meeting_state(&folder_dir).expect("read state");
@@ -1171,7 +1171,7 @@ fn test_read_meeting_state_seed_is_noop_when_no_notes() {
 fn test_read_transcript_absent_is_empty() {
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();
-    let folder = crate::folder::MeetingFolder::create(tempdir.path(), id).expect("folder");
+    let folder = notes_crdt::MeetingFolder::create(tempdir.path(), id).expect("folder");
     // No transcript.json written.
     let segs = reader::read_transcript(folder.path()).expect("read transcript");
     assert!(segs.is_empty(), "absent transcript.json must read as empty Vec");
@@ -1185,7 +1185,7 @@ fn test_read_transcript_absent_is_empty() {
 fn test_summary_write_read_round_trip() {
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();
-    let folder = crate::folder::MeetingFolder::create(tempdir.path(), id).expect("folder");
+    let folder = notes_crdt::MeetingFolder::create(tempdir.path(), id).expect("folder");
 
     // Absent summary first.
     assert!(
@@ -1232,7 +1232,7 @@ fn test_write_metadata_round_trip_leaves_siblings_untouched() {
     let tempdir = TempDir::new().expect("tempdir");
     let root = tempdir.path();
     let id = MeetingId::new();
-    let folder = crate::folder::MeetingFolder::create(root, id).expect("folder");
+    let folder = notes_crdt::MeetingFolder::create(root, id).expect("folder");
 
     // Lay down sibling files alongside metadata.json. Their byte contents are
     // captured so we can prove write_metadata leaves them untouched.
@@ -1251,7 +1251,7 @@ fn test_write_metadata_round_trip_leaves_siblings_untouched() {
     let mut meta = dummy_meta(id, 5_000);
     meta.speaker_count = 0;
     meta.diarizer = None;
-    crate::write_metadata(folder.path(), &meta).expect("initial write");
+    notes_crdt::write_metadata(folder.path(), &meta).expect("initial write");
 
     // The Phase-6 orchestrator overlay: bump speaker_count and stamp the
     // diarizer descriptor, then atomically rewrite metadata.json.
@@ -1261,7 +1261,7 @@ fn test_write_metadata_round_trip_leaves_siblings_untouched() {
         quantisation: None,
         version: "3.0".to_string(),
     });
-    crate::write_metadata(folder.path(), &meta).expect("diarization update write");
+    notes_crdt::write_metadata(folder.path(), &meta).expect("diarization update write");
 
     // read_metadata reflects the updated fields.
     let back = reader::read_metadata(folder.path()).expect("read metadata");

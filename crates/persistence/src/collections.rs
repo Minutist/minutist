@@ -1,7 +1,7 @@
 //! Collection ("folder") definitions store + operations.
 //!
 //! A *collection* is a user-facing "folder" that groups meetings (UI label:
-//! "Folders"). It is **distinct** from [`crate::MeetingFolder`], which is a
+//! "Folders"). It is **distinct** from `notes_crdt::MeetingFolder`, which is a
 //! single meeting's on-disk directory.
 //!
 //! # Where the data lives
@@ -19,7 +19,6 @@
 //! Writes are atomic (tmp + fsync + rename), matching the other persistence
 //! writers, so a crash mid-write never leaves a truncated `collections.json`.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use minutist_common::{AppResult, Collection, CollectionId};
@@ -140,38 +139,16 @@ pub async fn delete_collection(
     Ok(())
 }
 
-/// Atomically write `collections` to `path`: serialise, write to a sibling
-/// `*.tmp` in the same directory, fsync, then rename into place. On any error
-/// the tmp file is removed so no residue is left behind. Mirrors
-/// `metadata::write_metadata_atomic`.
+/// Atomically write `collections` to `path`: serialise, then write through
+/// [`minutist_common::fs::write_atomic`].
 fn write_collections_atomic(path: &Path, collections: &[Collection]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or(Error::InvalidState("collections path has no parent"))?;
     std::fs::create_dir_all(parent).map_err(Error::Io)?;
-    let tmp_path = parent.join("collections.json.tmp");
 
     let json = serde_json::to_vec_pretty(collections).map_err(Error::Serialise)?;
-
-    let write_result = (|| -> std::result::Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&json)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    Ok(())
+    minutist_common::fs::write_atomic(path, &json).map_err(|e| Error::Io(std::io::Error::other(e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -181,9 +158,8 @@ fn write_collections_atomic(path: &Path, collections: &[Collection]) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::folder::MeetingFolder;
-    use crate::write_metadata;
     use minutist_common::{AudioFormat, MeetingId, MeetingMeta};
+    use notes_crdt::{write_metadata, MeetingFolder};
     use tempfile::TempDir;
 
     fn meta_in(root: &Path, collection_id: Option<CollectionId>) -> MeetingId {

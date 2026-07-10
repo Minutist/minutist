@@ -14,8 +14,9 @@
 //!
 //! The two collaborators the loop must not depend on directly — the `sync`
 //! `SyncEngine` (to advertise) and the `orchestrator` (to reprocess) — sit behind
-//! [`ElectionDriver`]. So this crate is a leaf (`common` + `persistence` only), the
-//! ONE state machine is reused by both eligible host types, and the contention
+//! [`ElectionDriver`]. So this crate is a leaf (`common` + `persistence` +
+//! `notes-crdt` only), the ONE state machine is reused by both eligible host
+//! types, and the contention
 //! paths are unit-testable with a mock driver (otherwise untestable until a second
 //! GPU host exists).
 //!
@@ -223,7 +224,7 @@ fn audio_present(meetings_root: &Path, id: MeetingId) -> bool {
 /// Blocking `std::fs` work (the directory scan + a `metadata.json` read + an
 /// `audio.opus` stat per meeting); callers run this on `spawn_blocking`.
 fn scan_candidates(meetings_root: &Path, now: DateTime<Utc>) -> Vec<MeetingId> {
-    persistence::folder::list_meeting_ids(meetings_root)
+    notes_crdt::folder::list_meeting_ids(meetings_root)
         .into_iter()
         .filter(|id| {
             let Some(state) = read_processing(meetings_root, *id) else {
@@ -762,7 +763,7 @@ mod tests {
     }
 
     async fn seed(root: &Path, id: MeetingId, state: ProcessingLifecycle) {
-        persistence::MeetingFolder::ensure(root, id).expect("ensure");
+        notes_crdt::MeetingFolder::ensure(root, id).expect("ensure");
         apply_processing_lifecycle(root, id, state).await.expect("seed state");
     }
 
@@ -972,14 +973,14 @@ mod tests {
         let now = Utc::now();
 
         let no_audio = MeetingId::new();
-        persistence::MeetingFolder::ensure(root, no_audio).expect("ensure");
+        notes_crdt::MeetingFolder::ensure(root, no_audio).expect("ensure");
         update_metadata(root, no_audio, |m| {
             m.processing = ProcessingLifecycle::PendingProcessing;
         })
         .expect("seed no-audio pending");
 
         let with_audio = MeetingId::new();
-        persistence::MeetingFolder::ensure(root, with_audio).expect("ensure");
+        notes_crdt::MeetingFolder::ensure(root, with_audio).expect("ensure");
         update_metadata(root, with_audio, |m| {
             m.processing = ProcessingLifecycle::PendingProcessing;
         })

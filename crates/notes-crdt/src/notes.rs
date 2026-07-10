@@ -43,6 +43,7 @@
 
 use std::path::{Path, PathBuf};
 
+use minutist_common::fs::write_atomic;
 use minutist_common::{AppResult, MeetingId, NoteBlock};
 
 use crate::error::Error;
@@ -418,52 +419,6 @@ impl NotesStore {
 
         Ok(true)
     }
-}
-
-/// Write `bytes` to `path` atomically: write to a sibling temp file, fsync,
-/// then rename into place. The temp file shares `path`'s parent so the rename
-/// stays on one filesystem (a cross-device rename would fail).
-///
-/// On the success path no temp file remains (the rename consumes it). If the
-/// rename fails the temp file is removed on a best-effort basis so no `.tmp`
-/// residue is left behind.
-fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    use std::io::Write;
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| minutist_common::AppError::Internal {
-            context: format!("notes path has no parent: {}", path.display()),
-        })?;
-
-    // Temp filename derived from the target so concurrent saves of different
-    // files (notes.json vs notes.md) don't collide on a shared temp name.
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "notes".to_string());
-    let tmp_path = parent.join(format!("{file_name}.tmp"));
-
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        // Best-effort cleanup so a failed write leaves no residue.
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-
-    Ok(())
 }
 
 /// Project a Tiptap `notes.json` document into the note paragraphs the

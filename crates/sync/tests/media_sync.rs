@@ -13,7 +13,8 @@ use std::path::Path;
 
 use iroh::EndpointAddr;
 use minutist_common::MeetingId;
-use persistence::{save_note_asset, MeetingFolder};
+use notes_crdt::MeetingFolder;
+use persistence::save_note_asset;
 use sync::identity::DeviceIdentity;
 use sync::SyncEngine;
 

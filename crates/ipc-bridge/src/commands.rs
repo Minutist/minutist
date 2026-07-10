@@ -39,7 +39,8 @@ use minutist_common::{
     MeetingListEntry, MeetingMeta, MeetingState, ModelId, ModelStatus, NotesDocument, OperationKind,
     RecordingState, Summariser, VoiceprintIdentityId,
 };
-use persistence::{collections, meeting_ops, ChatStore, NotesStore};
+use notes_crdt::NotesStore;
+use persistence::{collections, meeting_ops, ChatStore};
 use settings::Settings;
 use summariser::{LlamaSummariser, SummariseProgress, SummariserConfig};
 use tauri::State;
@@ -662,7 +663,7 @@ pub async fn update_settings(
 
 /// Persist a meeting's notes (`notes.json` + `notes.md`).
 ///
-/// Routes **directly** to `persistence::NotesStore` against
+/// Routes **directly** to `notes_crdt::NotesStore` against
 /// `IpcState::meetings_dir` — notes I/O is independent of the live recording
 /// pipeline (see `architecture/components.md`, `persistence` "Phase 3 surface
 /// growth — notes"), so the orchestrator is not involved. The blocking
@@ -691,7 +692,7 @@ pub async fn save_notes(
 
 /// Load a meeting's persisted notes, or `None` when no notes have been saved.
 ///
-/// Routes directly to `persistence::NotesStore`; the loaded opaque
+/// Routes directly to `notes_crdt::NotesStore`; the loaded opaque
 /// `serde_json::Value` is re-serialised back to a `String` for the wire (see
 /// [`NotesDocument`]).
 #[tauri::command]
@@ -719,7 +720,7 @@ pub async fn load_notes(
 /// history that the JSON-rebuild `save_notes` discards. `update` is a lib0 **v1**
 /// update (the format the JS `yjs` library emits); the wire type is `Vec<u8>`,
 /// exported as `number[]` (matching `save_note_image`'s `bytes` — no base64
-/// hop). Routes directly to `persistence::NotesStore::apply_update` on
+/// hop). Routes directly to `notes_crdt::NotesStore::apply_update` on
 /// `spawn_blocking`, mirroring `save_notes`.
 #[tauri::command]
 #[specta::specta]
@@ -748,8 +749,8 @@ pub async fn apply_notes_update(
 /// exported as `number[] | null`. The stored blob is v2 (durable); persistence
 /// re-encodes it as v1 because the JS `yjs` library only accepts v1 over
 /// `applyUpdate` (the v1/v2 hops must not be crossed — see
-/// `persistence::ydoc`). Routes directly to
-/// `persistence::NotesStore::read_ydoc_state` on `spawn_blocking`.
+/// `notes_crdt::ydoc`). Routes directly to
+/// `notes_crdt::NotesStore::read_ydoc_state` on `spawn_blocking`.
 #[tauri::command]
 #[specta::specta]
 pub async fn load_notes_ydoc(
@@ -1294,7 +1295,7 @@ pub async fn delete_meeting(
 // Collections ("folders") — list / create / rename / delete + meeting filing.
 //
 // A collection is a user-facing folder that groups meetings (UI label:
-// "Folders"); distinct from the per-meeting on-disk `persistence::MeetingFolder`.
+// "Folders"); distinct from the per-meeting on-disk `notes_crdt::MeetingFolder`.
 // Definitions live in `{app-data}/collections.json` (authoritative); membership
 // is on each meeting's `metadata.json` with a derived `collection_id` mirror in
 // the index for filtered listing. The app-data root is derived from the index
@@ -3533,7 +3534,8 @@ pub async fn forget_meeting_voiceprints(
 mod tests {
     use super::*;
     use minutist_common::{MeetingId, NoteBlock};
-    use persistence::{MeetingFolder, MeetingIndex};
+    use notes_crdt::MeetingFolder;
+    use persistence::MeetingIndex;
     use tempfile::TempDir;
 
     /// `save_notes` → `load_notes` round-trip through a tempdir `meetings_dir`,
@@ -4197,7 +4199,7 @@ mod tests {
         let mut meta = persistence::read_metadata(&dir).expect("read metadata");
         meta.speaker_names
             .insert("A".to_string(), "Alice".to_string());
-        persistence::write_metadata(&dir, &meta).expect("write metadata");
+        notes_crdt::write_metadata(&dir, &meta).expect("write metadata");
 
         let stub = StubSummariser::new("ok");
         summarise_meeting_inner(root, meeting_id, &stub, "p").expect("summarise");
@@ -4480,7 +4482,7 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir");
         let root = tempdir.path();
         let meeting_id = MeetingId::new();
-        let folder = persistence::MeetingFolder::create(root, meeting_id).expect("folder");
+        let folder = notes_crdt::MeetingFolder::create(root, meeting_id).expect("folder");
 
         // Write a 3-segment transcript.
         let segments = vec![
@@ -5087,7 +5089,7 @@ mod tests {
         let mid = MeetingId::new();
 
         // Create the meeting folder so ChatStore::load_or_create_live can write.
-        persistence::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
+        notes_crdt::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
 
         // Fake worker: reads one request and sends Token + Done.
         let (user_tx, user_rx) =
@@ -5182,7 +5184,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let meetings_dir = tmp.path().to_path_buf();
         let mid = MeetingId::new();
-        persistence::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
+        notes_crdt::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
 
         // Drop the receiver immediately — the worker is gone.
         let (user_tx, _rx) =
@@ -5267,7 +5269,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let meetings_dir = tmp.path().to_path_buf();
         let mid = MeetingId::new();
-        persistence::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
+        notes_crdt::MeetingFolder::create(&meetings_dir, mid).expect("create meeting folder");
 
         let (user_tx, user_rx) =
             tokio::sync::mpsc::channel::<crate::live_agent::UserChatRequest>(4);

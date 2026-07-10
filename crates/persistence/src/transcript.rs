@@ -16,13 +16,12 @@
 //! records audio with no ASR model present, so zero-segment finalise must
 //! succeed.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use minutist_common::{AppResult, Segment};
+use notes_crdt::MeetingFolder;
 
 use crate::error::Error;
-use crate::folder::MeetingFolder;
 
 /// Rewrite `transcript.json` in `meeting_dir` from `segments`.
 ///
@@ -73,26 +72,9 @@ fn write_transcript_inner(meeting_dir: &Path, segments: &[Segment]) -> Result<()
         return Ok(());
     }
 
-    let tmp_path = meeting_dir.join("transcript.json.tmp");
     let json = serde_json::to_vec_pretty(segments).map_err(Error::Serialise)?;
-
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&json)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, &path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
+    minutist_common::fs::write_atomic(&path, &json)
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
 
     tracing::info!(
         target: "persistence",
@@ -170,36 +152,16 @@ impl TranscriptWriter {
 
     // ----- Private helpers -----
 
-    /// Serialise `self.buffer` and atomically overwrite `self.path`.
-    ///
-    /// Writes to a sibling `transcript.json.tmp`, `fsync`s it, then renames it
-    /// into place — the same pattern as [`write_transcript_inner`] — so a crash
-    /// mid-write leaves the previous `transcript.json` intact rather than
-    /// truncated or half-written.
+    /// Serialise `self.buffer` and atomically overwrite `self.path` — the same
+    /// underlying write [`write_transcript_inner`] uses, so a crash mid-write
+    /// leaves the previous `transcript.json` intact rather than truncated or
+    /// half-written.
     fn write_to_disk(&self) -> AppResult<()> {
         let json = serde_json::to_vec_pretty(&self.buffer)
             .map_err(Error::Serialise)
             .map_err(minutist_common::AppError::from)?;
 
-        let tmp_path = self.path.with_extension("json.tmp");
-
-        let write_result = (|| -> Result<(), std::io::Error> {
-            let mut file = std::fs::File::create(&tmp_path)?;
-            file.write_all(&json)?;
-            file.flush()?;
-            file.sync_all()?;
-            Ok(())
-        })();
-
-        if let Err(e) = write_result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(minutist_common::AppError::from(Error::Io(e)));
-        }
-
-        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(minutist_common::AppError::from(Error::Io(e)));
-        }
+        minutist_common::fs::write_atomic(&self.path, &json)?;
 
         tracing::debug!(
             target: "persistence",
@@ -233,13 +195,18 @@ mod tests {
     /// A write that fails between the temp-file write and the rename must
     /// leave the previous `transcript.json` untouched.
     ///
-    /// Simulates the failure by occupying `write_to_disk`'s `.tmp` target with
-    /// a directory before the second flush, so the temp-file open fails and
-    /// the rename that would replace `transcript.json` never runs — exercising
-    /// exactly the ordering the atomic write depends on: the destination path
-    /// is only ever touched by the final `rename`, never by the write itself.
+    /// Simulates the failure by making the meeting folder read-only before the
+    /// second flush, so `write_to_disk`'s temp-file create fails (regardless of
+    /// its randomised name) and the rename that would replace `transcript.json`
+    /// never runs — exercising exactly the ordering the atomic write depends
+    /// on: the destination path is only ever touched by the final `rename`,
+    /// never by the write itself. Unix-only: Windows directory permissions
+    /// don't gate file creation the same way.
     #[test]
+    #[cfg(unix)]
     fn write_to_disk_failure_before_rename_preserves_prior_content() {
+        use std::os::unix::fs::PermissionsExt;
+
         let tempdir = TempDir::new().expect("tempdir");
         let id = MeetingId::new();
         let folder = MeetingFolder::create(tempdir.path(), id).expect("create folder");
@@ -251,16 +218,23 @@ mod tests {
         let path = folder.path().join("transcript.json");
         let old_json = std::fs::read_to_string(&path).expect("read prior content");
 
-        // Occupy the tmp path with a directory so `File::create` in
-        // `write_to_disk` fails before any rename is attempted.
-        let tmp_path = path.with_extension("json.tmp");
-        std::fs::create_dir(&tmp_path).expect("seed a directory at the tmp path");
+        // Make the meeting folder read-only so `File::create` for the temp file
+        // fails before any rename is attempted, whatever name it is given.
+        let mut perms = std::fs::metadata(folder.path())
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o500); // read + execute, no write
+        std::fs::set_permissions(folder.path(), perms.clone()).expect("set readonly");
 
         tw.append(seg(200, 300, "new")).expect("append new");
         let result = tw.flush();
+
+        perms.set_mode(0o700);
+        std::fs::set_permissions(folder.path(), perms).expect("restore writable");
+
         assert!(
             result.is_err(),
-            "flush must surface the tmp-file-open failure rather than silently succeeding"
+            "flush must surface the tmp-file-create failure rather than silently succeeding"
         );
 
         let content_after_failure =

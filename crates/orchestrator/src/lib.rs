@@ -1956,7 +1956,7 @@ impl Orchestrator {
     /// speaker-labelled, possibly split segment list plus the distinct speaker
     /// count; the refreshed transcript replaces `transcript.json`
     /// (`persistence::write_transcript`), `metadata.json` is updated
-    /// (`persistence::write_metadata`, setting `speaker_count` + the `diarizer`
+    /// (`notes_crdt::write_metadata`, setting `speaker_count` + the `diarizer`
     /// [`ModelDescriptor`]), the supplied [`MeetingIndex`] row's `speaker_count`
     /// is refreshed (`upsert`), and `AppEvent::DiarizationComplete` is emitted on
     /// the shared bus.
@@ -2458,7 +2458,7 @@ impl Orchestrator {
     /// Shared by [`Self::rediarize_inner`] and the on-stop pass. Rewrites
     /// `transcript.json` (with the overlaid `speaker_id`s) and updates
     /// `metadata.json`'s `{ speaker_count, diarizer }` via
-    /// `persistence::write_metadata`, keeping `persistence` the sole writer under
+    /// `notes_crdt::write_metadata`, keeping `persistence` the sole writer under
     /// `meetings/{uuid}/` (the diarizer never touches disk), then emits
     /// `AppEvent::DiarizationComplete` on the shared `event_tx`. The blocking
     /// `std::fs` writes run on `spawn_blocking`.

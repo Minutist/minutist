@@ -95,7 +95,7 @@ async fn seed_meeting(
     speaker_names: BTreeMap<String, String>,
 ) -> MeetingId {
     let id = MeetingId::new();
-    persistence::MeetingFolder::create(meetings_dir, id).expect("folder");
+    notes_crdt::MeetingFolder::create(meetings_dir, id).expect("folder");
     let dir = meetings_dir.join(id.0.to_string());
 
     let meta = MeetingMeta {
@@ -120,7 +120,7 @@ async fn seed_meeting(
         collection_id: None,
         app_version: "0.0.0".to_string(),
     };
-    persistence::write_metadata(&dir, &meta).expect("write metadata");
+    notes_crdt::write_metadata(&dir, &meta).expect("write metadata");
     if !segments.is_empty() {
         persistence::write_transcript(&dir, &segments).expect("write transcript");
     }
@@ -685,7 +685,7 @@ async fn get_notes_round_trips_saved_notes() {
     let reg = ToolRegistry::v1(false);
     let id = seed_meeting(&root, &ctx.index, "M", vec![], BTreeMap::new()).await;
     let doc = serde_json::json!({ "type": "doc", "content": [] });
-    persistence::NotesStore::save(&root, id, &doc, "# Notes\n").expect("save notes");
+    notes_crdt::NotesStore::save(&root, id, &doc, "# Notes\n").expect("save notes");
 
     let out = reg
         .dispatch(

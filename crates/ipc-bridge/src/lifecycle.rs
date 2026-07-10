@@ -114,7 +114,7 @@ mod tests {
 
         // A meeting we hold (placeholder seeded → processing = Local).
         let present = MeetingId::new();
-        persistence::MeetingFolder::ensure(&root, present).expect("seed present meeting");
+        notes_crdt::MeetingFolder::ensure(&root, present).expect("seed present meeting");
 
         let (tx, rx) = broadcast::channel(16);
         let handle = tokio::spawn(run_lifecycle_subscriber(rx, root.clone()));

@@ -1,7 +1,7 @@
 //! `ChatStore` — reader/writer for a meeting's chat sessions (Phase 9).
 //!
 //! Stores each session as `{root}/{meeting_id}/chat/{session_id}.json`, one
-//! file per session, mirroring [`crate::NotesStore`]'s standalone, stateless,
+//! file per session, mirroring `notes_crdt::NotesStore`'s standalone, stateless,
 //! atomic-write shape. `ChatStore` holds no open file handle; every call
 //! resolves paths from the `(root, meeting_id[, session_id])` it is given.
 //!
@@ -24,13 +24,14 @@
 
 use std::path::{Path, PathBuf};
 
+use minutist_common::fs::write_atomic;
 use minutist_common::{AppResult, ChatSession, ChatSessionId, MeetingId};
 
 use crate::error::Error;
 
 /// Standalone, stateless store for a meeting's chat sessions.
 ///
-/// Like [`crate::NotesStore`], `ChatStore` holds no state; every call resolves
+/// Like `notes_crdt::NotesStore`, `ChatStore` holds no state; every call resolves
 /// `{root}/{meeting_id}/chat/{session_id}.json` from its arguments.
 pub struct ChatStore;
 
@@ -191,41 +192,6 @@ impl ChatStore {
     }
 }
 
-/// Write `bytes` to `path` atomically: write to a sibling temp file, fsync,
-/// then rename into place. Mirrors `notes::write_atomic` (the same discipline);
-/// kept private to this module so the chat store is self-contained.
-fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
-    use std::io::Write;
-
-    let parent = path.parent().ok_or_else(|| minutist_common::AppError::Internal {
-        context: format!("chat session path has no parent: {}", path.display()),
-    })?;
-
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "session".to_string());
-    let tmp_path = parent.join(format!("{file_name}.tmp"));
-
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -233,8 +199,8 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::folder::MeetingFolder;
     use minutist_common::{ChatMessage, ChatRole, ToolCallRecord};
+    use notes_crdt::MeetingFolder;
     use tempfile::TempDir;
 
     fn make_meeting() -> (TempDir, PathBuf, MeetingId) {

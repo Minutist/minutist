@@ -326,10 +326,9 @@ mod tests {
     use minutist_common::{
         AudioFormat, HostRef, MeetingId, MeetingMeta, ProcessingClaim, ProcessingLifecycle,
     };
+    use notes_crdt::{write_metadata, MeetingFolder};
     use tempfile::TempDir;
 
-    use crate::folder::MeetingFolder;
-    use crate::write_metadata;
     use crate::reader::read_metadata;
 
     fn write_meta_with_no_names(root: &std::path::Path) -> MeetingId {

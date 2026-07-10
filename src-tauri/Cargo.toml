@@ -89,3 +89,6 @@ tempfile = "3"
 # production code reaches `persistence` through `ipc-bridge`, never directly, so
 # this dev-dependency adds no runtime edge to the dependency table.
 persistence = { path = "../crates/persistence" }
+# Same test-only rationale as `persistence` above: `sync.rs`'s tests read
+# `NotesStore` / `MeetingFolder` / `ydoc` directly from the leaf.
+notes-crdt = { path = "../crates/notes-crdt" }

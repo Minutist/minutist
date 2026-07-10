@@ -19,7 +19,6 @@
 //!   `persistence::MeetingWriter::finalise` (which already holds the resolved
 //!   `metadata.json` path) can write through the same path.
 
-use std::io::Write;
 use std::path::Path;
 
 use minutist_common::{AppResult, MeetingId, MeetingMeta};
@@ -50,40 +49,16 @@ pub fn write_metadata(meeting_dir: &Path, meta: &MeetingMeta) -> AppResult<()> {
     Ok(())
 }
 
-/// The shared atomic implementation: serialise `meta`, write to a sibling
-/// `*.tmp` in the same directory, fsync, then rename into place. On any error
-/// the tmp file is removed so no residue is left behind.
+/// The shared atomic implementation: serialise `meta` and write it through
+/// [`minutist_common::fs::write_atomic`].
 ///
 /// Exposed (rather than crate-private) so `persistence::MeetingWriter::finalise`
 /// can write through this same atomic path while holding the resolved file path
 /// directly.
 pub fn write_metadata_atomic(path: &Path, meta: &MeetingMeta) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or(Error::InvalidState("metadata path has no parent"))?;
-    let tmp_path = parent.join("metadata.json.tmp");
-
     let json = serde_json::to_vec_pretty(meta).map_err(Error::Serialise)?;
-
-    let write_result = (|| -> std::result::Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(&json)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e));
-    }
-
-    Ok(())
+    minutist_common::fs::write_atomic(path, &json)
+        .map_err(|e| Error::Io(std::io::Error::other(e)))
 }
 
 /// Read and deserialise `metadata.json` from a meeting folder (`{root}/{uuid}/`).

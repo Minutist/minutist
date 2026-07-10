@@ -10,7 +10,7 @@
 //!
 //! - [`MeetingWriter`] (Phase 1/2): `audio.opus`, `metadata.json`,
 //!   `transcript.json` while a recording is in flight.
-//! - [`NotesStore`] (Phase 3): standalone reader/writer for the opaque
+//! - `notes_crdt::NotesStore` (Phase 3): standalone reader/writer for the opaque
 //!   `notes.json` + `notes.md`, independent of [`MeetingWriter`].
 //! - [`summary`] (Phase 4): `summary.md` write/read I/O (the producer lands in
 //!   Phase 5; the path + I/O seam is here).
@@ -71,13 +71,12 @@ pub mod voiceprints;
 pub mod voiceprints_migrations;
 pub mod writer;
 
-// The notes-CRDT primitives moved to the leaf `notes-crdt` crate. Re-export the
-// modules (and their public items below) at their historical `persistence::*`
-// paths so callers — orchestrator, ipc-bridge, agent-tools, app-main, the sync
-// crate's dev-tests, the `yjs_interop` test — are unchanged. `persistence`
-// remains the sole writer under `{app-data}/meetings/`; it simply delegates the
-// notes-CRDT bodies to the leaf.
-pub use notes_crdt::{folder, notes, ydoc};
+// The notes-CRDT primitives (`folder`, `notes`, `ydoc` and their public items —
+// `MeetingFolder`, `NotesStore`, `NotesData`, `write_metadata`, `metadata_lock`,
+// `note_blocks_from_json`) live in the leaf `notes-crdt` crate; every consumer
+// imports them from `notes_crdt::*` directly. `persistence` remains the sole
+// writer under `{app-data}/meetings/` — it depends on `notes-crdt` for its own
+// implementation but no longer re-exports these symbols at its own paths.
 
 // Public re-exports for the crate's primary surface.
 pub use assets::{read_note_asset, save_note_asset};
@@ -92,10 +91,6 @@ pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;
 pub use index::MeetingIndex;
 pub use rag::{meeting_db_path, NewChunk, RagStore, RetrievedChunk};
-// Moved to `notes-crdt`; re-exported at the historical `persistence::*` paths.
-pub use notes_crdt::{
-    metadata_lock, note_blocks_from_json, write_metadata, MeetingFolder, NotesData, NotesStore,
-};
 pub use reader::{
     read_audio_pcm, read_meeting_state, read_metadata, read_note_blocks, read_transcript,
 };

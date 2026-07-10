@@ -624,7 +624,8 @@ mod tests {
 
     use super::*;
     use minutist_common::MeetingId;
-    use persistence::{save_note_asset, MeetingFolder, NotesStore};
+    use notes_crdt::{MeetingFolder, NotesStore};
+    use persistence::save_note_asset;
     use settings::{JsonFileStore, SettingsHandle};
 
     /// How long to wait for a freshly-built `ConnectedSync`'s background engine
@@ -749,15 +750,15 @@ mod tests {
     }
 
     /// Project a meeting's authoritative `notes.ydoc` to ProseMirror JSON via
-    /// public `persistence` APIs, so two devices' converged state can be compared
+    /// public `notes_crdt` APIs, so two devices' converged state can be compared
     /// independent of v1 encoding details (mirrors `relay_live.rs::projected`).
     fn projected(root: &Path, meeting: MeetingId) -> serde_json::Value {
         let v1 = NotesStore::read_ydoc_state(root, meeting)
             .expect("read ydoc state")
             .expect("meeting has a notes.ydoc");
-        let doc = persistence::ydoc::new_ydoc();
-        persistence::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
-        persistence::ydoc::ydoc_to_json(&doc)
+        let doc = notes_crdt::ydoc::new_ydoc();
+        notes_crdt::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
+        notes_crdt::ydoc::ydoc_to_json(&doc)
     }
 
     /// Drain a receiver and report whether a `SyncReady` for `meeting` was seen.

@@ -106,44 +106,6 @@ fn is_safe_filename(filename: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Atomic write helper (mirrors assets.rs `write_atomic`)
-// ---------------------------------------------------------------------------
-
-/// Write `bytes` to `target` atomically via a sibling temp file in the same
-/// directory, fsync, then rename into place.
-fn write_atomic(dir: &Path, target: &Path, bytes: &[u8]) -> AppResult<()> {
-    use std::io::Write;
-
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "attachment".to_string());
-    let tmp_path = dir.join(format!("{file_name}.{nonce}.tmp"));
-
-    let write_result = (|| -> Result<(), std::io::Error> {
-        let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.flush()?;
-        file.sync_all()?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, target) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(Error::Io(e).into());
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // File I/O
 // ---------------------------------------------------------------------------
 
@@ -179,7 +141,7 @@ pub fn save_attachment_original(
         return Ok(hash);
     }
 
-    write_atomic(&dir, &target, bytes)?;
+    minutist_common::fs::write_atomic(&target, bytes)?;
 
     tracing::info!(
         target: "persistence",
@@ -245,7 +207,7 @@ pub fn save_attachment_markdown(
 
     let filename = format!("{hash}.md");
     let target = dir.join(&filename);
-    write_atomic(&dir, &target, md.as_bytes())?;
+    minutist_common::fs::write_atomic(&target, md.as_bytes())?;
 
     tracing::info!(
         target: "persistence",
@@ -540,12 +502,11 @@ fn write_manifest_unlocked(
     meeting_id: MeetingId,
     entries: &[AttachmentEntry],
 ) -> AppResult<()> {
-    let dir = attachments_dir(root, meeting_id);
     let path = manifest_path(root, meeting_id);
     let bytes = serde_json::to_vec_pretty(entries)
         .map_err(Error::Serialise)
         .map_err(AppError::from)?;
-    write_atomic(&dir, &path, &bytes)
+    minutist_common::fs::write_atomic(&path, &bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -555,8 +516,8 @@ fn write_manifest_unlocked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::folder::MeetingFolder;
     use minutist_common::AttachmentId;
+    use notes_crdt::MeetingFolder;
     use tempfile::TempDir;
 
     fn make_meeting() -> (TempDir, PathBuf, MeetingId) {

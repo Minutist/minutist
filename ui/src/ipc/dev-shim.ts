@@ -28,7 +28,7 @@ import type {
   Result,
   Settings,
   Segment,
-  IpcError,
+  AppError,
   MeetingId,
   MeetingMeta,
   McpServerInfo,
@@ -353,7 +353,7 @@ const devMeetingCollection = new Map<string, CollectionId | null>([
   ["dev-meeting-0003", "dev-collection-0002"],
 ]);
 
-function ok<T>(data: T): Result<T, IpcError> {
+function ok<T>(data: T): Result<T, AppError> {
   return { status: "ok", data };
 }
 
@@ -390,25 +390,25 @@ function devMeetingState(meetingId: MeetingId): MeetingState {
 
 /** A `commands`-shaped object backed entirely by in-memory sample data. */
 export const devCommands = {
-  async listDevices(): Promise<Result<AudioDevice[], IpcError>> {
+  async listDevices(): Promise<Result<AudioDevice[], AppError>> {
     return ok(DEV_DEVICES);
   },
   async startRecording(
     _deviceId: string | null,
-  ): Promise<Result<MeetingId, IpcError>> {
+  ): Promise<Result<MeetingId, AppError>> {
     return ok(DEV_MEETING_ID);
   },
-  async prewarmAsr(): Promise<Result<null, IpcError>> {
+  async prewarmAsr(): Promise<Result<null, AppError>> {
     // No-op in the dev shim: there is no real ASR model to warm.
     return ok(null);
   },
-  async pauseRecording(): Promise<Result<null, IpcError>> {
+  async pauseRecording(): Promise<Result<null, AppError>> {
     return ok(null);
   },
-  async resumeRecording(): Promise<Result<null, IpcError>> {
+  async resumeRecording(): Promise<Result<null, AppError>> {
     return ok(null);
   },
-  async stopRecording(): Promise<Result<MeetingMeta, IpcError>> {
+  async stopRecording(): Promise<Result<MeetingMeta, AppError>> {
     return ok({
       uuid: DEV_MEETING_ID,
       title: "Launch sync — Tuesday",
@@ -424,31 +424,31 @@ export const devCommands = {
       app_version: "0.0.0-dev",
     });
   },
-  async getRecordingState(): Promise<Result<RecordingState, IpcError>> {
+  async getRecordingState(): Promise<Result<RecordingState, AppError>> {
     return ok(DEV_STATE);
   },
-  async getSettings(): Promise<Result<Settings, IpcError>> {
+  async getSettings(): Promise<Result<Settings, AppError>> {
     return ok(DEV_SETTINGS);
   },
-  async updateSettings(_settings: Settings): Promise<Result<null, IpcError>> {
+  async updateSettings(_settings: Settings): Promise<Result<null, AppError>> {
     return ok(null);
   },
-  async listModels(): Promise<Result<ModelStatus[], IpcError>> {
+  async listModels(): Promise<Result<ModelStatus[], AppError>> {
     return ok(DEV_MODELS);
   },
-  async ensureModel(_modelId: string): Promise<Result<null, IpcError>> {
+  async ensureModel(_modelId: string): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async saveNotes(
     _meetingId: MeetingId,
     _notesJson: string,
     _notesMarkdown: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async loadNotes(
     _meetingId: MeetingId,
-  ): Promise<Result<NotesDocument | null, IpcError>> {
+  ): Promise<Result<NotesDocument | null, AppError>> {
     return ok({ notes_json: DEV_NOTES_JSON, notes_markdown: DEV_NOTES_MD });
   },
   // CRDT editor binding (B6 WU7): no backend in a `vite dev` browser, so the
@@ -458,12 +458,12 @@ export const devCommands = {
     _meetingId: MeetingId,
     _update: number[],
     _notesMarkdown: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async loadNotesYdoc(
     _meetingId: MeetingId,
-  ): Promise<Result<number[] | null, IpcError>> {
+  ): Promise<Result<number[] | null, AppError>> {
     return ok(null);
   },
   // No backend in a `vite dev` browser; return a plausible content-hash-style
@@ -473,11 +473,11 @@ export const devCommands = {
     _meetingId: MeetingId,
     _bytes: number[],
     ext: string,
-  ): Promise<Result<string, IpcError>> {
+  ): Promise<Result<string, AppError>> {
     return ok(`devassetstub.${ext}`);
   },
   // --- Phase 4 meeting-list + open surface (FR-33) ------------------------
-  async listMeetings(): Promise<Result<MeetingListEntry[], IpcError>> {
+  async listMeetings(): Promise<Result<MeetingListEntry[], AppError>> {
     // Overlay the (mutable) folder membership so moving a meeting between
     // folders is reflected on the next list refresh under `vite dev`.
     return ok(
@@ -489,37 +489,37 @@ export const devCommands = {
   },
   async openMeeting(
     meetingId: MeetingId,
-  ): Promise<Result<MeetingState, IpcError>> {
+  ): Promise<Result<MeetingState, AppError>> {
     return ok(devMeetingState(meetingId));
   },
   async renameMeeting(
     _meetingId: MeetingId,
     _title: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async setSpeakerName(
     _meetingId: MeetingId,
     label: string,
     name: string,
-  ): Promise<Result<Record<string, string>, IpcError>> {
+  ): Promise<Result<Record<string, string>, AppError>> {
     return ok(name.trim() ? { [label]: name.trim() } : {});
   },
-  async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+  async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async setRecordingTitle(
     _meetingId: MeetingId,
     _title: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     // No backend in the shim; the masthead input echoes locally via the store.
     return ok(null);
   },
   // --- Collections ("folders") --------------------------------------------
-  async listCollections(): Promise<Result<Collection[], IpcError>> {
+  async listCollections(): Promise<Result<Collection[], AppError>> {
     return ok([...devCollections].sort((a, b) => a.position - b.position));
   },
-  async createCollection(name: string): Promise<Result<Collection, IpcError>> {
+  async createCollection(name: string): Promise<Result<Collection, AppError>> {
     const position = devCollections.reduce(
       (max, c) => Math.max(max, c.position + 1),
       0,
@@ -535,7 +535,7 @@ export const devCommands = {
   async renameCollection(
     collectionId: CollectionId,
     name: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     devCollections = devCollections.map((c) =>
       c.id === collectionId ? { ...c, name: name.trim() } : c,
     );
@@ -543,7 +543,7 @@ export const devCommands = {
   },
   async deleteCollection(
     collectionId: CollectionId,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     devCollections = devCollections.filter((c) => c.id !== collectionId);
     for (const [mid, cid] of devMeetingCollection) {
       if (cid === collectionId) devMeetingCollection.set(mid, null);
@@ -553,7 +553,7 @@ export const devCommands = {
   async setMeetingCollection(
     meetingId: MeetingId,
     collectionId: CollectionId | null,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     devMeetingCollection.set(meetingId, collectionId);
     return ok(null);
   },
@@ -562,7 +562,7 @@ export const devCommands = {
   // notifies the live event stream with `diarization_complete` (the terminal
   // event the merged op emits) so the meetings store re-reads that meeting's
   // transcript and the operation-progress indicator clears.
-  async reprocess(meetingId: MeetingId): Promise<Result<null, IpcError>> {
+  async reprocess(meetingId: MeetingId): Promise<Result<null, AppError>> {
     devDiarizationListeners.forEach((cb) =>
       cb({
         kind: "diarization_complete",
@@ -575,7 +575,7 @@ export const devCommands = {
   // --- Phase 5 summary surface (FR-30) ------------------------------------
   // (`re_summarise` was removed in Phase 5; the row Summarise action uses
   // `summarise_meeting` below.)
-  async summariseMeeting(meetingId: MeetingId): Promise<Result<null, IpcError>> {
+  async summariseMeeting(meetingId: MeetingId): Promise<Result<null, AppError>> {
     // Seed a summary for this meeting so a follow-up `getSummary` returns
     // content, and notify the live event stream so the store re-reads it (the
     // real backend emits `AppEvent::SummaryReady`).
@@ -587,13 +587,13 @@ export const devCommands = {
   },
   async getSummary(
     meetingId: MeetingId,
-  ): Promise<Result<string | null, IpcError>> {
+  ): Promise<Result<string | null, AppError>> {
     return ok(devSummaries.get(meetingId) ?? null);
   },
   async saveSummary(
     meetingId: MeetingId,
     summaryMarkdown: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     devSummaries.set(meetingId, summaryMarkdown);
     return ok(null);
   },
@@ -606,7 +606,7 @@ export const devCommands = {
     bytes: number[],
     ext: string,
     originalFilename: string,
-  ): Promise<Result<AttachmentEntry, IpcError>> {
+  ): Promise<Result<AttachmentEntry, AppError>> {
     const entry: AttachmentEntry = {
       id: `dev-att-${Math.random().toString(36).slice(2, 10)}` as AttachmentId,
       hash: Math.random().toString(36).slice(2),
@@ -639,19 +639,19 @@ export const devCommands = {
   },
   async listAttachments(
     meetingId: MeetingId,
-  ): Promise<Result<AttachmentEntry[], IpcError>> {
+  ): Promise<Result<AttachmentEntry[], AppError>> {
     return ok(devAttachments.get(meetingId) ?? []);
   },
   async openAttachment(
     _meetingId: MeetingId,
     _attachmentId: AttachmentId,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async removeAttachment(
     meetingId: MeetingId,
     attachmentId: AttachmentId,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     const list = (devAttachments.get(meetingId) ?? []).filter(
       (a) => a.id !== attachmentId,
     );
@@ -676,37 +676,37 @@ export const devCommands = {
     _meetingId: MeetingId | null,
     sessionId: ChatSessionId | null,
     message: string,
-  ): Promise<Result<ChatSessionId, IpcError>> {
+  ): Promise<Result<ChatSessionId, AppError>> {
     const id = sessionId ?? DEV_CHAT_SESSION_ID;
     startDevChatTurn(id, message);
     return ok(id);
   },
   async cancelChatTurn(
     _sessionId: ChatSessionId,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async getChatSession(
     _meetingId: MeetingId,
     sessionId: ChatSessionId,
-  ): Promise<Result<ChatSession | null, IpcError>> {
+  ): Promise<Result<ChatSession | null, AppError>> {
     return ok(devChatSession(sessionId));
   },
   async listChatSessions(
     _meetingId: MeetingId,
-  ): Promise<Result<ChatSession[], IpcError>> {
+  ): Promise<Result<ChatSession[], AppError>> {
     return ok([devChatSession(DEV_CHAT_SESSION_ID)]);
   },
   async deleteChatSession(
     _meetingId: MeetingId,
     _sessionId: ChatSessionId,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
   // Phase 10: a sample live MCP endpoint so the MCP pane renders the URL +
   // (masked) token under `vite dev`. The token is a placeholder, not a real
   // secret.
-  async getMcpServerInfo(): Promise<Result<McpServerInfo | null, IpcError>> {
+  async getMcpServerInfo(): Promise<Result<McpServerInfo | null, AppError>> {
     return ok({
       url: "http://127.0.0.1:8765/mcp",
       token: "dev0000000000000000000000000000000000000000000000000000000000cafe",
@@ -717,18 +717,18 @@ export const devCommands = {
   async translateMeeting(
     _meetingId: MeetingId,
     _targetLanguage: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
   async getTranslations(
     _meetingId: MeetingId,
     _targetLanguage: string,
-  ): Promise<Result<Record<number, string>, IpcError>> {
+  ): Promise<Result<Record<number, string>, AppError>> {
     return ok({});
   },
   // Issue #0014: a sample redacted report for visual QA of the "Report a
   // problem" surfaces under `vite dev`.
-  async getDiagnosticReport(): Promise<Result<DiagnosticReport, IpcError>> {
+  async getDiagnosticReport(): Promise<Result<DiagnosticReport, AppError>> {
     return ok({
       app_version: "0.0.0",
       platform: "dev / x86_64 / connected",
@@ -742,16 +742,16 @@ export const devCommands = {
   // `syncGetMyTicket` returns a plausible-shaped placeholder; the other commands
   // are no-ops. `syncStatus` returns `idle` (not `disabled`) so the Sync pane
   // shows a live state under `vite dev`.
-  async syncStatus(): Promise<Result<SyncStatus, IpcError>> {
+  async syncStatus(): Promise<Result<SyncStatus, AppError>> {
     return ok({ kind: "idle" });
   },
-  async syncGetMyTicket(): Promise<Result<string, IpcError>> {
+  async syncGetMyTicket(): Promise<Result<string, AppError>> {
     return ok("dev-ticket:AAAA-1111-BBBB-2222-CCCC-3333-DDDD-4444");
   },
-  async syncAddPeer(_ticket: string): Promise<Result<null, IpcError>> {
+  async syncAddPeer(_ticket: string): Promise<Result<null, AppError>> {
     return ok(null);
   },
-  async syncNow(_meetingId: MeetingId): Promise<Result<null, IpcError>> {
+  async syncNow(_meetingId: MeetingId): Promise<Result<null, AppError>> {
     return ok(null);
   },
   // Issue #0003 voiceprint correction / erasure paths. No-ops in the dev shim:
@@ -761,10 +761,10 @@ export const devCommands = {
     _label: string,
     _identityId: VoiceprintIdentityId,
     _modelId: string,
-  ): Promise<Result<null, IpcError>> {
+  ): Promise<Result<null, AppError>> {
     return ok(null);
   },
-  async clearAllVoiceprints(): Promise<Result<null, IpcError>> {
+  async clearAllVoiceprints(): Promise<Result<null, AppError>> {
     return ok(null);
   },
 };

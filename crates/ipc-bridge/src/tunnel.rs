@@ -23,12 +23,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use minutist_common::TunnelStatus;
+use minutist_common::{AppError, AppResult, TunnelStatus};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State;
 
-use crate::{IpcError, IpcState};
+use crate::IpcState;
 
 /// The codes + URL to show the user when a pairing begins. Returned by
 /// [`tunnel_begin_pairing`]. The webview displays `user_code` and opens
@@ -71,7 +71,7 @@ pub trait TunnelControl: Send + Sync {
     /// Begin a device-code pairing: request a code from the account-service and
     /// return the prompt to show the user. The implementation moves the status to
     /// `Pairing` and emits the change.
-    async fn begin_pairing(&self) -> Result<PairingPrompt, IpcError>;
+    async fn begin_pairing(&self) -> AppResult<PairingPrompt>;
 
     /// Poll the in-progress pairing once. Returns the current status: `Pairing`
     /// while the user has not approved, `Online`/`Connecting` once the credential
@@ -80,12 +80,12 @@ pub trait TunnelControl: Send + Sync {
     /// status + a log; a fresh `begin_pairing` restarts it). On a successful
     /// authorisation the implementation stores the credential securely and starts
     /// the tunnel lifecycle.
-    async fn poll_pairing(&self) -> Result<TunnelStatus, IpcError>;
+    async fn poll_pairing(&self) -> AppResult<TunnelStatus>;
 
     /// Enable or disable the connector. Enabling with a stored credential starts
     /// the tunnel lifecycle; disabling stops it cleanly. Persists the choice via
     /// settings. Returns the resulting snapshot.
-    async fn set_enabled(&self, enabled: bool) -> Result<TunnelSnapshot, IpcError>;
+    async fn set_enabled(&self, enabled: bool) -> AppResult<TunnelSnapshot>;
 
     /// The current snapshot (enabled flag + live status + paired account).
     async fn snapshot(&self) -> TunnelSnapshot;
@@ -98,17 +98,17 @@ pub struct DisabledTunnel;
 
 #[async_trait]
 impl TunnelControl for DisabledTunnel {
-    async fn begin_pairing(&self) -> Result<PairingPrompt, IpcError> {
-        Err(IpcError::Unsupported {
+    async fn begin_pairing(&self) -> AppResult<PairingPrompt> {
+        Err(AppError::Unsupported {
             context: "device pairing is only available in the connected build".to_string(),
         })
     }
 
-    async fn poll_pairing(&self) -> Result<TunnelStatus, IpcError> {
+    async fn poll_pairing(&self) -> AppResult<TunnelStatus> {
         Ok(TunnelStatus::Disconnected)
     }
 
-    async fn set_enabled(&self, _enabled: bool) -> Result<TunnelSnapshot, IpcError> {
+    async fn set_enabled(&self, _enabled: bool) -> AppResult<TunnelSnapshot> {
         Ok(TunnelSnapshot {
             enabled: false,
             status: TunnelStatus::Disconnected,
@@ -145,7 +145,7 @@ pub fn disabled_tunnel() -> Arc<dyn TunnelControl> {
 /// never invoked there.
 #[tauri::command]
 #[specta::specta]
-pub async fn tunnel_begin_pairing(state: State<'_, IpcState>) -> Result<PairingPrompt, IpcError> {
+pub async fn tunnel_begin_pairing(state: State<'_, IpcState>) -> AppResult<PairingPrompt> {
     state.tunnel.begin_pairing().await
 }
 
@@ -155,7 +155,7 @@ pub async fn tunnel_begin_pairing(state: State<'_, IpcState>) -> Result<PairingP
 /// declined/expired pairing).
 #[tauri::command]
 #[specta::specta]
-pub async fn tunnel_poll_pairing(state: State<'_, IpcState>) -> Result<TunnelStatus, IpcError> {
+pub async fn tunnel_poll_pairing(state: State<'_, IpcState>) -> AppResult<TunnelStatus> {
     state.tunnel.poll_pairing().await
 }
 
@@ -174,7 +174,7 @@ pub async fn tunnel_poll_pairing(state: State<'_, IpcState>) -> Result<TunnelSta
 pub async fn set_connector_enabled(
     state: State<'_, IpcState>,
     enabled: bool,
-) -> Result<TunnelSnapshot, IpcError> {
+) -> AppResult<TunnelSnapshot> {
     let snapshot = state.tunnel.set_enabled(enabled).await?;
     if let Err(e) = state.sync.set_enabled(enabled).await {
         tracing::warn!(
@@ -191,7 +191,7 @@ pub async fn set_connector_enabled(
 /// the live tunnel status, and the paired account (if any).
 #[tauri::command]
 #[specta::specta]
-pub async fn tunnel_status(state: State<'_, IpcState>) -> Result<TunnelSnapshot, IpcError> {
+pub async fn tunnel_status(state: State<'_, IpcState>) -> AppResult<TunnelSnapshot> {
     Ok(state.tunnel.snapshot().await)
 }
 
@@ -204,7 +204,7 @@ mod tests {
         let t = DisabledTunnel;
         assert!(matches!(
             t.begin_pairing().await,
-            Err(IpcError::Unsupported { .. })
+            Err(AppError::Unsupported { .. })
         ));
         assert_eq!(t.poll_pairing().await.unwrap(), TunnelStatus::Disconnected);
         let snap = t.snapshot().await;

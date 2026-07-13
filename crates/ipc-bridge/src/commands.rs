@@ -11,8 +11,9 @@
 //! invariant that `ipc-bridge` depends only on `orchestrator + settings +
 //! common`.
 //!
-//! All commands return `Result<T, IpcError>`.  The `?` operator on
-//! `AppResult<T>` automatically converts via `IpcError::from(AppError)`.
+//! All commands return `AppResult<T>` (`Result<T, AppError>`). The `?`
+//! operator converts a per-crate `Error` at the crate boundary via
+//! `From<Error> for AppError`.
 //!
 //! ## Specta types
 //!
@@ -53,7 +54,7 @@ use crate::chat::{
 use crate::chat_runtime::ChatHandles;
 use crate::live_agent::{UserChatRequest, UserReplyChunk};
 use crate::output_language::resolve_output_language;
-use crate::{error::IpcError, IpcState};
+use crate::IpcState;
 
 /// Append an output-language instruction to a system prompt when
 /// `settings.output_language` resolves to a concrete language name.
@@ -118,12 +119,11 @@ pub(crate) fn resolve_llm_model_id(settings: &Settings) -> ModelId {
 /// `audio-capture`.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_devices(state: State<'_, IpcState>) -> Result<Vec<AudioDevice>, IpcError> {
+pub async fn list_devices(state: State<'_, IpcState>) -> AppResult<Vec<AudioDevice>> {
     state
         .orchestrator
         .list_devices()
         .await
-        .map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -141,12 +141,11 @@ pub async fn list_devices(state: State<'_, IpcState>) -> Result<Vec<AudioDevice>
 pub async fn start_recording(
     device_id: Option<String>,
     state: State<'_, IpcState>,
-) -> Result<MeetingId, IpcError> {
+) -> AppResult<MeetingId> {
     state
         .orchestrator
         .start(device_id)
         .await
-        .map_err(IpcError::from)
 }
 
 /// Pre-load the routed ASR model so the first record is not a cold ~29 s load
@@ -161,7 +160,7 @@ pub async fn start_recording(
 /// the lazy worker-init path remains the fallback, so prewarm is best-effort.
 #[tauri::command]
 #[specta::specta]
-pub async fn prewarm_asr(state: State<'_, IpcState>) -> Result<(), IpcError> {
+pub async fn prewarm_asr(state: State<'_, IpcState>) -> AppResult<()> {
     state.orchestrator.prewarm_asr().await;
     Ok(())
 }
@@ -169,15 +168,15 @@ pub async fn prewarm_asr(state: State<'_, IpcState>) -> Result<(), IpcError> {
 /// Pause the current recording.
 #[tauri::command]
 #[specta::specta]
-pub async fn pause_recording(state: State<'_, IpcState>) -> Result<(), IpcError> {
-    state.orchestrator.pause().await.map_err(IpcError::from)
+pub async fn pause_recording(state: State<'_, IpcState>) -> AppResult<()> {
+    state.orchestrator.pause().await
 }
 
 /// Resume after a pause.
 #[tauri::command]
 #[specta::specta]
-pub async fn resume_recording(state: State<'_, IpcState>) -> Result<(), IpcError> {
-    state.orchestrator.resume().await.map_err(IpcError::from)
+pub async fn resume_recording(state: State<'_, IpcState>) -> AppResult<()> {
+    state.orchestrator.resume().await
 }
 
 /// Set the meeting title for the LIVE recording (the active meeting has no
@@ -192,19 +191,18 @@ pub async fn set_recording_title(
     meeting_id: MeetingId,
     title: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     const MAX_TITLE_LEN: usize = 512;
     let title = title.trim().to_string();
     if title.chars().count() > MAX_TITLE_LEN {
-        return Err(IpcError::from(AppError::InvalidInput {
+        return Err(AppError::InvalidInput {
             context: format!("meeting title too long (max {MAX_TITLE_LEN} characters)"),
-        }));
+        });
     }
     state
         .orchestrator
         .set_pending_title(meeting_id, title)
         .await
-        .map_err(IpcError::from)
 }
 
 /// Stop the current recording and finalise the meeting.
@@ -229,8 +227,8 @@ pub async fn set_recording_title(
 /// a successful stop into an error.
 #[tauri::command]
 #[specta::specta]
-pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, IpcError> {
-    let meta = state.orchestrator.stop().await.map_err(IpcError::from)?;
+pub async fn stop_recording(state: State<'_, IpcState>) -> AppResult<MeetingMeta> {
+    let meta = state.orchestrator.stop().await?;
 
     // Build the meeting-list row for the freshly-stopped meeting. The excerpt is
     // the first transcript segment (if any), read on a blocking thread.
@@ -387,10 +385,10 @@ pub async fn stop_recording(state: State<'_, IpcState>) -> Result<MeetingMeta, I
                             }
                             Ok(())
                         }
-                        // Map the held-summarise `IpcError` back to `AppError` for
-                        // the shared per-pass error logging; the markdown result is
-                        // discarded (the summary is persisted + `SummaryReady`
-                        // emitted inside `run_held_summarise`).
+                        // The markdown result is discarded here (the summary is
+                        // persisted + `SummaryReady` emitted inside
+                        // `run_held_summarise`); only the `AppError` feeds the
+                        // shared per-pass error logging.
                         //
                         // Unlike reprocess, this pass does NOT take the
                         // orchestrator's offline claim, so it cannot self-skip
@@ -581,7 +579,7 @@ fn meeting_list_entry_for_meta(meetings_dir: &Path, meta: &MeetingMeta) -> Meeti
 /// Return a snapshot of the current recording state.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_recording_state(state: State<'_, IpcState>) -> Result<RecordingState, IpcError> {
+pub async fn get_recording_state(state: State<'_, IpcState>) -> AppResult<RecordingState> {
     Ok(state.orchestrator.state().await)
 }
 
@@ -595,7 +593,7 @@ pub async fn get_recording_state(state: State<'_, IpcState>) -> Result<Recording
 /// so that `ipc-bridge` does not need a direct `model-registry` dependency.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_models(state: State<'_, IpcState>) -> Result<Vec<ModelStatus>, IpcError> {
+pub async fn list_models(state: State<'_, IpcState>) -> AppResult<Vec<ModelStatus>> {
     Ok(state.orchestrator.list_models())
 }
 
@@ -609,12 +607,11 @@ pub async fn list_models(state: State<'_, IpcState>) -> Result<Vec<ModelStatus>,
 /// invariant that `ipc-bridge` does not depend directly on `model-registry`.
 #[tauri::command]
 #[specta::specta]
-pub async fn ensure_model(model_id: ModelId, state: State<'_, IpcState>) -> Result<(), IpcError> {
+pub async fn ensure_model(model_id: ModelId, state: State<'_, IpcState>) -> AppResult<()> {
     state
         .orchestrator
         .ensure_model(&model_id)
         .await
-        .map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +621,7 @@ pub async fn ensure_model(model_id: ModelId, state: State<'_, IpcState>) -> Resu
 /// Return the current application settings.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_settings(state: State<'_, IpcState>) -> Result<Settings, IpcError> {
+pub async fn get_settings(state: State<'_, IpcState>) -> AppResult<Settings> {
     Ok(state.settings.current())
 }
 
@@ -636,12 +633,11 @@ pub async fn get_settings(state: State<'_, IpcState>) -> Result<Settings, IpcErr
 pub async fn update_settings(
     settings: Settings,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     state
         .settings
         .update(|s| *s = settings)
         .await
-        .map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +674,7 @@ pub async fn save_notes(
     notes_json: String,
     notes_markdown: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || {
         save_notes_inner(&meetings_dir, meeting_id, &notes_json, &notes_markdown)
@@ -687,7 +683,6 @@ pub async fn save_notes(
     .map_err(|e| AppError::Internal {
         context: format!("save_notes task join failed: {e}"),
     })?
-    .map_err(IpcError::from)
 }
 
 /// Load a meeting's persisted notes, or `None` when no notes have been saved.
@@ -700,14 +695,13 @@ pub async fn save_notes(
 pub async fn load_notes(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<Option<NotesDocument>, IpcError> {
+) -> AppResult<Option<NotesDocument>> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || load_notes_inner(&meetings_dir, meeting_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("load_notes task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// Apply an incremental Yjs update from the editor's local `Y.Doc` (the
@@ -729,7 +723,7 @@ pub async fn apply_notes_update(
     update: Vec<u8>,
     notes_markdown: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || {
         NotesStore::apply_update(&meetings_dir, meeting_id, &update, &notes_markdown)
@@ -738,7 +732,6 @@ pub async fn apply_notes_update(
     .map_err(|e| AppError::Internal {
         context: format!("apply_notes_update task join failed: {e}"),
     })?
-    .map_err(IpcError::from)
 }
 
 /// Read the meeting's current `notes.ydoc` state as a lib0 **v1** update for the
@@ -756,14 +749,13 @@ pub async fn apply_notes_update(
 pub async fn load_notes_ydoc(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<Option<Vec<u8>>, IpcError> {
+) -> AppResult<Option<Vec<u8>>> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || NotesStore::read_ydoc_state(&meetings_dir, meeting_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("load_notes_ydoc task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -839,7 +831,7 @@ pub async fn save_note_image(
     bytes: Vec<u8>,
     ext: String,
     state: State<'_, IpcState>,
-) -> Result<String, IpcError> {
+) -> AppResult<String> {
     let ext = normalise_image_ext(&ext)?;
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || {
@@ -849,7 +841,6 @@ pub async fn save_note_image(
     .map_err(|e| AppError::Internal {
         context: format!("save_note_image task join failed: {e}"),
     })?
-    .map_err(IpcError::from)
 }
 
 /// Validate + normalise a note-image extension to a lower-cased, dot-less form
@@ -946,7 +937,7 @@ pub async fn add_attachment(
     ext: String,
     original_filename: String,
     state: State<'_, IpcState>,
-) -> Result<AttachmentEntry, IpcError> {
+) -> AppResult<AttachmentEntry> {
     let ext = normalise_attachment_ext(&ext)?;
     check_attachment_limits(&original_filename, bytes.len())?;
     let byte_len = bytes.len() as u64;
@@ -1011,14 +1002,13 @@ pub async fn add_attachment(
 pub async fn list_attachments(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<Vec<AttachmentEntry>, IpcError> {
+) -> AppResult<Vec<AttachmentEntry>> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || persistence::read_manifest(&meetings_dir, meeting_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("list_attachments task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// Open an attachment original in the HOST OS default application.
@@ -1039,7 +1029,7 @@ pub async fn open_attachment(
     attachment_id: AttachmentId,
     app: tauri::AppHandle,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let meetings_dir = state.meetings_dir.clone();
     let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, AppError> {
         let manifest = persistence::read_manifest(&meetings_dir, meeting_id)?;
@@ -1078,7 +1068,7 @@ pub async fn remove_attachment(
     meeting_id: MeetingId,
     attachment_id: AttachmentId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let meetings_dir = state.meetings_dir.clone();
     let dir = meetings_dir.clone();
     // remove_manifest_entry returns the removed entry plus whether its content hash
@@ -1090,8 +1080,7 @@ pub async fn remove_attachment(
     .await
     .map_err(|e| AppError::Internal {
         context: format!("remove_attachment task join failed: {e}"),
-    })?
-    .map_err(IpcError::from)?;
+    })??;
 
     // RAG (best-effort): once the source content is fully gone (hash orphaned), drop
     // its retrieval chunks so a removed attachment can no longer surface in retrieval.
@@ -1119,7 +1108,7 @@ pub async fn remove_attachment(
 /// is async (libsql/tokio); the future is awaited here, never `block_on`'d.
 #[tauri::command]
 #[specta::specta]
-pub async fn list_meetings(state: State<'_, IpcState>) -> Result<Vec<MeetingListEntry>, IpcError> {
+pub async fn list_meetings(state: State<'_, IpcState>) -> AppResult<Vec<MeetingListEntry>> {
     // Self-heal: index any meeting present on disk but missing from the cache
     // (e.g. the process killed between finalise and the stop-time upsert) so it
     // can never stay hidden until the next startup `rebuild_from_disk`. Cheap
@@ -1131,7 +1120,7 @@ pub async fn list_meetings(state: State<'_, IpcState>) -> Result<Vec<MeetingList
             "meeting-list self-heal reconcile failed: {e}; listing cached rows as-is"
         );
     }
-    state.index.list_meetings().await.map_err(IpcError::from)
+    state.index.list_meetings().await
 }
 
 /// Open a meeting, returning its full restorable [`MeetingState`]
@@ -1146,14 +1135,13 @@ pub async fn list_meetings(state: State<'_, IpcState>) -> Result<Vec<MeetingList
 pub async fn open_meeting(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<MeetingState, IpcError> {
+) -> AppResult<MeetingState> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || open_meeting_inner(&meetings_dir, meeting_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("open_meeting task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// Rename a meeting: updates `metadata.json` (authoritative) then the index row.
@@ -1167,10 +1155,9 @@ pub async fn rename_meeting(
     meeting_id: MeetingId,
     title: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     meeting_ops::rename_meeting(&state.meetings_dir, &state.index, meeting_id, &title)
         .await
-        .map_err(IpcError::from)
 }
 
 /// Set a speaker's display name on a saved meeting.
@@ -1191,17 +1178,16 @@ pub async fn set_speaker_name(
     label: String,
     name: String,
     state: State<'_, IpcState>,
-) -> Result<std::collections::BTreeMap<String, String>, IpcError> {
+) -> AppResult<std::collections::BTreeMap<String, String>> {
     const MAX_SPEAKER_NAME_LEN: usize = 512;
     let name = name.trim().to_string();
     if label.chars().count() > MAX_SPEAKER_NAME_LEN || name.chars().count() > MAX_SPEAKER_NAME_LEN {
-        return Err(IpcError::from(minutist_common::AppError::InvalidInput {
+        return Err(minutist_common::AppError::InvalidInput {
             context: format!("speaker label/name too long (max {MAX_SPEAKER_NAME_LEN} characters)"),
-        }));
+        });
     }
     let result = meeting_ops::set_speaker_name(&state.meetings_dir, meeting_id, &label, &name)
-        .await
-        .map_err(IpcError::from)?;
+        .await?;
 
     // Best-effort voiceprint enrolment: gate on the settings flag and a live
     // VoiceprintStore. Errors are logged and swallowed so a rename never fails
@@ -1262,10 +1248,9 @@ pub async fn set_speaker_name(
 pub async fn delete_meeting(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     meeting_ops::delete_meeting(&state.meetings_dir, &state.index, meeting_id)
-        .await
-        .map_err(IpcError::from)?;
+        .await?;
 
     // Purge voiceprint contributions derived from this meeting's audio.
     if let Some(store) = state.voiceprints.as_ref().as_ref() {
@@ -1316,12 +1301,12 @@ fn app_data_root(state: &IpcState) -> &Path {
 const MAX_COLLECTION_NAME_LEN: usize = 128;
 
 /// Validate + normalise a collection name: trim, reject empty / over-long.
-fn normalise_collection_name(name: String) -> Result<String, IpcError> {
+fn normalise_collection_name(name: String) -> AppResult<String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.chars().count() > MAX_COLLECTION_NAME_LEN {
-        return Err(IpcError::from(AppError::InvalidInput {
+        return Err(AppError::InvalidInput {
             context: format!("collection name must be 1..={MAX_COLLECTION_NAME_LEN} characters"),
-        }));
+        });
     }
     Ok(name)
 }
@@ -1330,14 +1315,13 @@ fn normalise_collection_name(name: String) -> Result<String, IpcError> {
 /// `collections.json` (blocking file I/O on `spawn_blocking`).
 #[tauri::command]
 #[specta::specta]
-pub async fn list_collections(state: State<'_, IpcState>) -> Result<Vec<Collection>, IpcError> {
+pub async fn list_collections(state: State<'_, IpcState>) -> AppResult<Vec<Collection>> {
     let root = app_data_root(&state).to_path_buf();
     tokio::task::spawn_blocking(move || collections::CollectionStore::load(&root))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("list_collections task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// Create a collection named `name`; returns the created [`Collection`].
@@ -1346,7 +1330,7 @@ pub async fn list_collections(state: State<'_, IpcState>) -> Result<Vec<Collecti
 pub async fn create_collection(
     name: String,
     state: State<'_, IpcState>,
-) -> Result<Collection, IpcError> {
+) -> AppResult<Collection> {
     let name = normalise_collection_name(name)?;
     let root = app_data_root(&state).to_path_buf();
     tokio::task::spawn_blocking(move || collections::CollectionStore::create(&root, &name))
@@ -1354,7 +1338,6 @@ pub async fn create_collection(
         .map_err(|e| AppError::Internal {
             context: format!("create_collection task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// Rename the collection `collection_id` to `name`.
@@ -1364,7 +1347,7 @@ pub async fn rename_collection(
     collection_id: CollectionId,
     name: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let name = normalise_collection_name(name)?;
     let root = app_data_root(&state).to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -1374,7 +1357,6 @@ pub async fn rename_collection(
     .map_err(|e| AppError::Internal {
         context: format!("rename_collection task join failed: {e}"),
     })?
-    .map_err(IpcError::from)
 }
 
 /// Delete a collection: clears the membership of every meeting filed under it
@@ -1384,11 +1366,10 @@ pub async fn rename_collection(
 pub async fn delete_collection(
     collection_id: CollectionId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let root = app_data_root(&state).to_path_buf();
     collections::delete_collection(&root, &state.meetings_dir, &state.index, collection_id)
         .await
-        .map_err(IpcError::from)
 }
 
 /// File a meeting into a collection (`Some(id)`) or unfile it (`None`). Updates
@@ -1399,7 +1380,7 @@ pub async fn set_meeting_collection(
     meeting_id: MeetingId,
     collection_id: Option<CollectionId>,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     meeting_ops::set_meeting_collection(
         &state.meetings_dir,
         &state.index,
@@ -1407,7 +1388,6 @@ pub async fn set_meeting_collection(
         collection_id,
     )
     .await
-    .map_err(IpcError::from)
 }
 
 /// Reprocess a meeting offline (FR-33 + FR-11 action): re-transcribe THEN
@@ -1433,12 +1413,11 @@ pub async fn set_meeting_collection(
 /// the orchestrator refreshes the index row without owning one.
 #[tauri::command]
 #[specta::specta]
-pub async fn reprocess(meeting_id: MeetingId, state: State<'_, IpcState>) -> Result<(), IpcError> {
+pub async fn reprocess(meeting_id: MeetingId, state: State<'_, IpcState>) -> AppResult<()> {
     state
         .orchestrator
         .reprocess(&state.index, meeting_id)
-        .await
-        .map_err(IpcError::from)?;
+        .await?;
 
     // After a completed reprocess the diariser has re-lettered speakers, so
     // speaker_names was cleared by finalise_diarization. If voiceprint
@@ -1509,7 +1488,7 @@ pub async fn reprocess(meeting_id: MeetingId, state: State<'_, IpcState>) -> Res
 pub async fn summarise_meeting(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     // The whole summarise body (held-model resolve → summarise-with-progress →
     // index refresh → `SummaryReady`) is extracted into [`run_held_summarise`] so
     // BOTH this user-triggered command and the post-stop auto-summarise chain
@@ -1540,7 +1519,7 @@ pub async fn summarise_meeting(
 pub async fn run_held_summarise(
     handles: &ChatHandles,
     meeting_id: MeetingId,
-) -> Result<String, IpcError> {
+) -> AppResult<String> {
     let current = handles.settings.current();
     let event_tx = &handles.event_tx;
 
@@ -1623,8 +1602,7 @@ pub async fn run_held_summarise(
     .await
     .map_err(|e| AppError::Internal {
         context: format!("summarise_meeting task join failed: {e}"),
-    })?
-    .map_err(IpcError::from)?;
+    })??;
 
     // Live-test UX T6: refresh the meeting-list index row so its excerpt becomes
     // the summary blurb now that `summary.md` exists (the persistence excerpt
@@ -1833,14 +1811,13 @@ fn emit_summarise_op(
 pub async fn get_summary(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<Option<String>, IpcError> {
+) -> AppResult<Option<String>> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || get_summary_inner(&meetings_dir, meeting_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("get_summary task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// Persist an edited summary back to `summary.md` (FR-30).
@@ -1853,7 +1830,7 @@ pub async fn save_summary(
     meeting_id: MeetingId,
     summary_markdown: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || {
         save_summary_inner(&meetings_dir, meeting_id, &summary_markdown)
@@ -1862,7 +1839,6 @@ pub async fn save_summary(
     .map_err(|e| AppError::Internal {
         context: format!("save_summary task join failed: {e}"),
     })?
-    .map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -2416,7 +2392,7 @@ pub async fn send_chat_message(
     session_id: Option<ChatSessionId>,
     message: String,
     state: State<'_, IpcState>,
-) -> Result<ChatSessionId, IpcError> {
+) -> AppResult<ChatSessionId> {
     if message.trim().is_empty() {
         return Err(AppError::InvalidInput {
             context: "chat message must not be empty".into(),
@@ -2452,8 +2428,7 @@ pub async fn send_chat_message(
                 Arc::clone(&state.chat_in_flight),
                 Arc::clone(&state.chat_cancel),
             )
-            .await
-            .map_err(IpcError::from);
+            .await;
         }
     }
     // --- End live routing ---
@@ -2649,7 +2624,7 @@ pub async fn send_chat_message(
 pub async fn cancel_chat_turn(
     session_id: ChatSessionId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     if let Some(flag) = state
         .chat_cancel
         .lock()
@@ -2678,7 +2653,7 @@ pub async fn cancel_chat_turn(
 #[specta::specta]
 pub async fn get_mcp_server_info(
     state: State<'_, IpcState>,
-) -> Result<Option<crate::McpServerInfo>, IpcError> {
+) -> AppResult<Option<crate::McpServerInfo>> {
     Ok(state.mcp_info.lock().expect("mcp_info poisoned").clone())
 }
 
@@ -2745,7 +2720,7 @@ pub async fn translate_meeting(
     meeting_id: MeetingId,
     target_language: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     // Validate target_language against the supported set.
     if !SUPPORTED_TRANSLATION_LANGUAGES.contains(&target_language.as_str()) {
         return Err(AppError::InvalidInput {
@@ -2803,11 +2778,11 @@ pub async fn translate_meeting(
             })
             .await
             .map_err(|e| {
-                IpcError::from(AppError::Internal {
+                AppError::Internal {
                     context: format!("translate_meeting task join failed: {e}"),
-                })
+                }
             })
-            .and_then(|r| r.map_err(IpcError::from))
+            .and_then(|r| r)
         }
         Err(e) => Err(e),
     };
@@ -2936,7 +2911,7 @@ pub async fn get_translations(
     meeting_id: MeetingId,
     target_language: String,
     state: State<'_, IpcState>,
-) -> Result<HashMap<usize, String>, IpcError> {
+) -> AppResult<HashMap<usize, String>> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || {
         let meeting_dir = meetings_dir.join(meeting_id.0.to_string());
@@ -2947,7 +2922,6 @@ pub async fn get_translations(
     .map_err(|e| AppError::Internal {
         context: format!("get_translations task join failed: {e}"),
     })?
-    .map_err(IpcError::from)
 }
 
 /// Get one chat session for a meeting, or `None` when it does not exist.
@@ -2957,14 +2931,13 @@ pub async fn get_chat_session(
     meeting_id: MeetingId,
     session_id: ChatSessionId,
     state: State<'_, IpcState>,
-) -> Result<Option<ChatSession>, IpcError> {
+) -> AppResult<Option<ChatSession>> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || ChatStore::load(&meetings_dir, meeting_id, session_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("get_chat_session task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// List all chat sessions for a meeting, most-recently-updated first.
@@ -2973,14 +2946,13 @@ pub async fn get_chat_session(
 pub async fn list_chat_sessions(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<Vec<ChatSession>, IpcError> {
+) -> AppResult<Vec<ChatSession>> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || ChatStore::list(&meetings_dir, meeting_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("list_chat_sessions task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 /// Delete one chat session for a meeting (idempotent).
@@ -2990,14 +2962,13 @@ pub async fn delete_chat_session(
     meeting_id: MeetingId,
     session_id: ChatSessionId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     let meetings_dir = state.meetings_dir.clone();
     tokio::task::spawn_blocking(move || ChatStore::delete(&meetings_dir, meeting_id, session_id))
         .await
         .map_err(|e| AppError::Internal {
             context: format!("delete_chat_session task join failed: {e}"),
         })?
-        .map_err(IpcError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -3020,7 +2991,7 @@ pub(crate) async fn load_or_new_session(
     meetings_dir: &std::path::Path,
     meeting_id: Option<MeetingId>,
     session_id: Option<ChatSessionId>,
-) -> Result<ChatSession, IpcError> {
+) -> AppResult<ChatSession> {
     let now = chrono::Utc::now().to_rfc3339();
 
     if let (Some(mid), Some(sid)) = (meeting_id, session_id) {
@@ -3029,8 +3000,7 @@ pub(crate) async fn load_or_new_session(
             .await
             .map_err(|e| AppError::Internal {
                 context: format!("load_or_new_session task join failed: {e}"),
-            })?
-            .map_err(IpcError::from)?;
+            })??;
         if let Some(session) = existing {
             return Ok(session);
         }
@@ -3043,8 +3013,7 @@ pub(crate) async fn load_or_new_session(
                 .await
                 .map_err(|e| AppError::Internal {
                     context: format!("load_or_new_session live lookup task join failed: {e}"),
-                })?
-                .map_err(IpcError::from)?;
+                })??;
             if let Some(session) = live {
                 return Ok(session);
             }
@@ -3325,13 +3294,12 @@ pub async fn reject_match(
     identity_id: VoiceprintIdentityId,
     model_id: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     if let Some(store) = state.voiceprints.as_ref().as_ref() {
         state
             .orchestrator
             .reject_match(meeting_id, label, identity_id, &model_id, store)
-            .await
-            .map_err(IpcError::from)?;
+            .await?;
     }
     Ok(())
 }
@@ -3346,9 +3314,9 @@ pub async fn reject_match(
 /// Always succeeds on an already-empty library (idempotent).
 #[tauri::command]
 #[specta::specta]
-pub async fn clear_all_voiceprints(state: State<'_, IpcState>) -> Result<(), IpcError> {
+pub async fn clear_all_voiceprints(state: State<'_, IpcState>) -> AppResult<()> {
     if let Some(store) = state.voiceprints.as_ref().as_ref() {
-        store.clear_all().await.map_err(IpcError::from)?;
+        store.clear_all().await?;
         tracing::info!(target: "ipc-bridge", "voiceprint library cleared by user");
     }
     Ok(())
@@ -3389,12 +3357,12 @@ pub struct VoiceprintIdentityInfo {
 #[specta::specta]
 pub async fn list_voiceprints(
     state: State<'_, IpcState>,
-) -> Result<Vec<VoiceprintIdentityInfo>, IpcError> {
+) -> AppResult<Vec<VoiceprintIdentityInfo>> {
     let Some(store) = state.voiceprints.as_ref().as_ref() else {
         return Ok(Vec::new());
     };
 
-    let identities = store.identities_with_gallery().await.map_err(IpcError::from)?;
+    let identities = store.identities_with_gallery().await?;
 
     Ok(identities
         .into_iter()
@@ -3430,12 +3398,11 @@ pub async fn merge_voiceprint_identities(
     keep_id: VoiceprintIdentityId,
     merged_id: VoiceprintIdentityId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     if let Some(store) = state.voiceprints.as_ref().as_ref() {
         store
             .merge_identities(keep_id, merged_id)
-            .await
-            .map_err(IpcError::from)?;
+            .await?;
         tracing::info!(
             target: "ipc-bridge",
             keep_id = %keep_id.0,
@@ -3456,12 +3423,11 @@ pub async fn rename_voiceprint_identity(
     identity_id: VoiceprintIdentityId,
     new_name: String,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     if let Some(store) = state.voiceprints.as_ref().as_ref() {
         store
             .rename_identity(identity_id, &new_name)
-            .await
-            .map_err(IpcError::from)?;
+            .await?;
         tracing::info!(
             target: "ipc-bridge",
             identity_id = %identity_id.0,
@@ -3482,12 +3448,11 @@ pub async fn rename_voiceprint_identity(
 pub async fn delete_voiceprint_identity(
     identity_id: VoiceprintIdentityId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     if let Some(store) = state.voiceprints.as_ref().as_ref() {
         store
             .delete_identity(identity_id)
-            .await
-            .map_err(IpcError::from)?;
+            .await?;
         tracing::info!(
             target: "ipc-bridge",
             identity_id = %identity_id.0,
@@ -3511,12 +3476,11 @@ pub async fn delete_voiceprint_identity(
 pub async fn forget_meeting_voiceprints(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
-) -> Result<(), IpcError> {
+) -> AppResult<()> {
     if let Some(store) = state.voiceprints.as_ref().as_ref() {
         store
             .forget_meeting(meeting_id)
-            .await
-            .map_err(IpcError::from)?;
+            .await?;
         tracing::info!(
             target: "ipc-bridge",
             meeting_id = %meeting_id.0,

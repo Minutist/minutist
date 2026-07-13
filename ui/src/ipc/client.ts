@@ -6,7 +6,7 @@
  * injection point.
  */
 import { events, commands as generatedCommands } from "./bindings";
-import type { AppEventPayload, IpcError, Result } from "./bindings";
+import type { AppError, AppEventPayload, Result } from "./bindings";
 import type { AppEvent } from "./app-event";
 import { shouldUseDevShim } from "./dev-shim-guard";
 
@@ -207,7 +207,7 @@ export const commands: Commands = {
 // Re-export types that callers commonly need. `AppEvent` is the generated
 // event union (re-exported via `./app-event`, which is the webview's single
 // import site for the event type).
-export type { AppEventPayload, AppEvent, IpcError, Result };
+export type { AppEventPayload, AppEvent, AppError, Result };
 
 // ---------------------------------------------------------------------------
 // Typed listen helper
@@ -248,12 +248,12 @@ export async function listenAppEvents(
 // ---------------------------------------------------------------------------
 
 /**
- * Unwrap a `Result<T, IpcError>` to `T`, throwing on error.
+ * Unwrap a `Result<T, AppError>` to `T`, throwing on error.
  *
  * Use this when calling code has a try/catch and does not need to inspect
  * the error variant — it just wants the success value or an exception.
  */
-export function unwrap<T>(result: Result<T, IpcError>): T {
+export function unwrap<T>(result: Result<T, AppError>): T {
   if (result.status === "ok") {
     return result.data;
   }
@@ -261,9 +261,9 @@ export function unwrap<T>(result: Result<T, IpcError>): T {
 }
 
 /**
- * Extract a human-readable message from an `IpcError` discriminated union.
+ * Extract a human-readable message from an `AppError` discriminated union.
  */
-export function ipcErrorMessage(err: IpcError): string {
+export function ipcErrorMessage(err: AppError): string {
   switch (err.code) {
     case "io":
       return `IO error: ${err.context}`;
@@ -287,15 +287,15 @@ export function ipcErrorMessage(err: IpcError): string {
 }
 
 /**
- * Typed error class wrapping an `IpcError` payload.
+ * Typed error class wrapping an `AppError` payload.
  *
  * Thrown by `unwrap()` on error results. Callers that need to inspect the
  * error variant can switch on `error.ipcError.code`.
  */
 export class IpcCallError extends Error {
-  readonly ipcError: IpcError;
+  readonly ipcError: AppError;
 
-  constructor(ipcError: IpcError) {
+  constructor(ipcError: AppError) {
     super(ipcErrorMessage(ipcError));
     this.name = "IpcCallError";
     this.ipcError = ipcError;

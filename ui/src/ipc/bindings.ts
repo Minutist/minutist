@@ -13,7 +13,7 @@ export const commands = {
  * dependency table honest: it depends on `orchestrator`, not directly on
  * `audio-capture`.
  */
-async listDevices() : Promise<Result<AudioDevice[], IpcError>> {
+async listDevices() : Promise<Result<AudioDevice[], AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_devices") };
 } catch (e) {
@@ -29,7 +29,7 @@ async listDevices() : Promise<Result<AudioDevice[], IpcError>> {
  * 
  * Returns the new `MeetingId` on success.
  */
-async startRecording(deviceId: string | null) : Promise<Result<MeetingId, IpcError>> {
+async startRecording(deviceId: string | null) : Promise<Result<MeetingId, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("start_recording", { deviceId }) };
 } catch (e) {
@@ -49,7 +49,7 @@ async startRecording(deviceId: string | null) : Promise<Result<MeetingId, IpcErr
  * is ready before the user presses Start. Returns `()` even on a build failure —
  * the lazy worker-init path remains the fallback, so prewarm is best-effort.
  */
-async prewarmAsr() : Promise<Result<null, IpcError>> {
+async prewarmAsr() : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("prewarm_asr") };
 } catch (e) {
@@ -60,7 +60,7 @@ async prewarmAsr() : Promise<Result<null, IpcError>> {
 /**
  * Pause the current recording.
  */
-async pauseRecording() : Promise<Result<null, IpcError>> {
+async pauseRecording() : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pause_recording") };
 } catch (e) {
@@ -71,7 +71,7 @@ async pauseRecording() : Promise<Result<null, IpcError>> {
 /**
  * Resume after a pause.
  */
-async resumeRecording() : Promise<Result<null, IpcError>> {
+async resumeRecording() : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("resume_recording") };
 } catch (e) {
@@ -87,7 +87,7 @@ async resumeRecording() : Promise<Result<null, IpcError>> {
  * currently recording/paused. Trimmed + capped so the UI cannot persist an
  * unbounded value (mirrors the speaker-name / collection-name caps).
  */
-async setRecordingTitle(meetingId: MeetingId, title: string) : Promise<Result<null, IpcError>> {
+async setRecordingTitle(meetingId: MeetingId, title: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_recording_title", { meetingId, title }) };
 } catch (e) {
@@ -117,7 +117,7 @@ async setRecordingTitle(meetingId: MeetingId, title: string) : Promise<Result<nu
  * startup `rebuild_from_disk` will reconcile, so a failed upsert must not turn
  * a successful stop into an error.
  */
-async stopRecording() : Promise<Result<MeetingMeta, IpcError>> {
+async stopRecording() : Promise<Result<MeetingMeta, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_recording") };
 } catch (e) {
@@ -128,7 +128,7 @@ async stopRecording() : Promise<Result<MeetingMeta, IpcError>> {
 /**
  * Return a snapshot of the current recording state.
  */
-async getRecordingState() : Promise<Result<RecordingState, IpcError>> {
+async getRecordingState() : Promise<Result<RecordingState, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_recording_state") };
 } catch (e) {
@@ -139,7 +139,7 @@ async getRecordingState() : Promise<Result<RecordingState, IpcError>> {
 /**
  * Return the current application settings.
  */
-async getSettings() : Promise<Result<Settings, IpcError>> {
+async getSettings() : Promise<Result<Settings, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_settings") };
 } catch (e) {
@@ -152,7 +152,7 @@ async getSettings() : Promise<Result<Settings, IpcError>> {
  * 
  * Broadcasts the change to all `SettingsHandle` subscribers.
  */
-async updateSettings(settings: Settings) : Promise<Result<null, IpcError>> {
+async updateSettings(settings: Settings) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("update_settings", { settings }) };
 } catch (e) {
@@ -166,7 +166,7 @@ async updateSettings(settings: Settings) : Promise<Result<null, IpcError>> {
  * Routes through `Orchestrator::list_models`, which wraps `ModelRegistry::list_models`
  * so that `ipc-bridge` does not need a direct `model-registry` dependency.
  */
-async listModels() : Promise<Result<ModelStatus[], IpcError>> {
+async listModels() : Promise<Result<ModelStatus[], AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_models") };
 } catch (e) {
@@ -184,7 +184,7 @@ async listModels() : Promise<Result<ModelStatus[], IpcError>> {
  * Routes through `Orchestrator::ensure_model`, preserving the dependency-table
  * invariant that `ipc-bridge` does not depend directly on `model-registry`.
  */
-async ensureModel(modelId: ModelId) : Promise<Result<null, IpcError>> {
+async ensureModel(modelId: ModelId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("ensure_model", { modelId }) };
 } catch (e) {
@@ -195,7 +195,7 @@ async ensureModel(modelId: ModelId) : Promise<Result<null, IpcError>> {
 /**
  * Persist a meeting's notes (`notes.json` + `notes.md`).
  * 
- * Routes **directly** to `persistence::NotesStore` against
+ * Routes **directly** to `notes_crdt::NotesStore` against
  * `IpcState::meetings_dir` — notes I/O is independent of the live recording
  * pipeline (see `architecture/components.md`, `persistence` "Phase 3 surface
  * growth — notes"), so the orchestrator is not involved. The blocking
@@ -204,7 +204,7 @@ async ensureModel(modelId: ModelId) : Promise<Result<null, IpcError>> {
  * `notes_json` is parsed from a `String` into a `serde_json::Value`; an
  * invalid JSON string is rejected as `AppError::InvalidInput`.
  */
-async saveNotes(meetingId: MeetingId, notesJson: string, notesMarkdown: string) : Promise<Result<null, IpcError>> {
+async saveNotes(meetingId: MeetingId, notesJson: string, notesMarkdown: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_notes", { meetingId, notesJson, notesMarkdown }) };
 } catch (e) {
@@ -215,11 +215,11 @@ async saveNotes(meetingId: MeetingId, notesJson: string, notesMarkdown: string) 
 /**
  * Load a meeting's persisted notes, or `None` when no notes have been saved.
  * 
- * Routes directly to `persistence::NotesStore`; the loaded opaque
+ * Routes directly to `notes_crdt::NotesStore`; the loaded opaque
  * `serde_json::Value` is re-serialised back to a `String` for the wire (see
  * [`NotesDocument`]).
  */
-async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDocument | null, IpcError>> {
+async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDocument | null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("load_notes", { meetingId }) };
 } catch (e) {
@@ -238,10 +238,10 @@ async loadNotes(meetingId: MeetingId) : Promise<Result<NotesDocument | null, Ipc
  * history that the JSON-rebuild `save_notes` discards. `update` is a lib0 **v1**
  * update (the format the JS `yjs` library emits); the wire type is `Vec<u8>`,
  * exported as `number[]` (matching `save_note_image`'s `bytes` — no base64
- * hop). Routes directly to `persistence::NotesStore::apply_update` on
+ * hop). Routes directly to `notes_crdt::NotesStore::apply_update` on
  * `spawn_blocking`, mirroring `save_notes`.
  */
-async applyNotesUpdate(meetingId: MeetingId, update: number[], notesMarkdown: string) : Promise<Result<null, IpcError>> {
+async applyNotesUpdate(meetingId: MeetingId, update: number[], notesMarkdown: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("apply_notes_update", { meetingId, update, notesMarkdown }) };
 } catch (e) {
@@ -258,10 +258,10 @@ async applyNotesUpdate(meetingId: MeetingId, update: number[], notesMarkdown: st
  * exported as `number[] | null`. The stored blob is v2 (durable); persistence
  * re-encodes it as v1 because the JS `yjs` library only accepts v1 over
  * `applyUpdate` (the v1/v2 hops must not be crossed — see
- * `persistence::ydoc`). Routes directly to
- * `persistence::NotesStore::read_ydoc_state` on `spawn_blocking`.
+ * `notes_crdt::ydoc`). Routes directly to
+ * `notes_crdt::NotesStore::read_ydoc_state` on `spawn_blocking`.
  */
-async loadNotesYdoc(meetingId: MeetingId) : Promise<Result<number[] | null, IpcError>> {
+async loadNotesYdoc(meetingId: MeetingId) : Promise<Result<number[] | null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("load_notes_ydoc", { meetingId }) };
 } catch (e) {
@@ -287,7 +287,7 @@ async loadNotesYdoc(meetingId: MeetingId) : Promise<Result<number[] | null, IpcE
  * notes still resolve. The webview turns the filename into a working
  * `meetingasset:` URL at render time via `convertFileSrc`.
  */
-async saveNoteImage(meetingId: MeetingId, bytes: number[], ext: string) : Promise<Result<string, IpcError>> {
+async saveNoteImage(meetingId: MeetingId, bytes: number[], ext: string) : Promise<Result<string, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_note_image", { meetingId, bytes, ext }) };
 } catch (e) {
@@ -310,7 +310,7 @@ async saveNoteImage(meetingId: MeetingId, bytes: number[], ext: string) : Promis
  * shared bounded worker; if its queue is full the row is marked `Failed`
  * (back-pressure surfaced) rather than blocking this command.
  */
-async addAttachment(meetingId: MeetingId, bytes: number[], ext: string, originalFilename: string) : Promise<Result<AttachmentEntry, IpcError>> {
+async addAttachment(meetingId: MeetingId, bytes: number[], ext: string, originalFilename: string) : Promise<Result<AttachmentEntry, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("add_attachment", { meetingId, bytes, ext, originalFilename }) };
 } catch (e) {
@@ -324,7 +324,7 @@ async addAttachment(meetingId: MeetingId, bytes: number[], ext: string, original
  * Routes directly to `persistence::read_manifest` on `spawn_blocking`. An
  * absent manifest is an empty list.
  */
-async listAttachments(meetingId: MeetingId) : Promise<Result<AttachmentEntry[], IpcError>> {
+async listAttachments(meetingId: MeetingId) : Promise<Result<AttachmentEntry[], AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_attachments", { meetingId }) };
 } catch (e) {
@@ -345,7 +345,7 @@ async listAttachments(meetingId: MeetingId) : Promise<Result<AttachmentEntry[], 
  * 
  * An absent attachment id is `AppError::InvalidInput`.
  */
-async openAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise<Result<null, IpcError>> {
+async openAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_attachment", { meetingId, attachmentId }) };
 } catch (e) {
@@ -362,7 +362,7 @@ async openAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise
  * [`AppEvent::AttachmentRemoved`]. Idempotent: removing an absent id is a no-op
  * that still emits (the webview drops the row either way).
  */
-async removeAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise<Result<null, IpcError>> {
+async removeAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remove_attachment", { meetingId, attachmentId }) };
 } catch (e) {
@@ -377,7 +377,7 @@ async removeAttachment(meetingId: MeetingId, attachmentId: AttachmentId) : Promi
  * — a cheap projection that never loads a meeting's full transcript. The index
  * is async (libsql/tokio); the future is awaited here, never `block_on`'d.
  */
-async listMeetings() : Promise<Result<MeetingListEntry[], IpcError>> {
+async listMeetings() : Promise<Result<MeetingListEntry[], AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_meetings") };
 } catch (e) {
@@ -394,7 +394,7 @@ async listMeetings() : Promise<Result<MeetingListEntry[], IpcError>> {
  * run on `spawn_blocking` per the threading model — the index is not consulted
  * (the folder is authoritative for the full state).
  */
-async openMeeting(meetingId: MeetingId) : Promise<Result<MeetingState, IpcError>> {
+async openMeeting(meetingId: MeetingId) : Promise<Result<MeetingState, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_meeting", { meetingId }) };
 } catch (e) {
@@ -409,7 +409,7 @@ async openMeeting(meetingId: MeetingId) : Promise<Result<MeetingState, IpcError>
  * folder and the index consistent (see `architecture/components.md`,
  * `persistence` "Phase 4 surface growth — meeting ops").
  */
-async renameMeeting(meetingId: MeetingId, title: string) : Promise<Result<null, IpcError>> {
+async renameMeeting(meetingId: MeetingId, title: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("rename_meeting", { meetingId, title }) };
 } catch (e) {
@@ -430,7 +430,7 @@ async renameMeeting(meetingId: MeetingId, title: string) : Promise<Result<null, 
  * the UI cannot persist an unbounded value (mirrors the `set_speaker_name`
  * chat tool's bound).
  */
-async setSpeakerName(meetingId: MeetingId, label: string, name: string) : Promise<Result<Partial<{ [key in string]: string }>, IpcError>> {
+async setSpeakerName(meetingId: MeetingId, label: string, name: string) : Promise<Result<Partial<{ [key in string]: string }>, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_speaker_name", { meetingId, label, name }) };
 } catch (e) {
@@ -450,7 +450,7 @@ async setSpeakerName(meetingId: MeetingId, label: string, name: string) : Promis
  * 
  * Routes to `persistence::meeting_ops::delete_meeting`.
  */
-async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_meeting", { meetingId }) };
 } catch (e) {
@@ -462,7 +462,7 @@ async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
  * List all collections (folders), ordered by position. Reads the authoritative
  * `collections.json` (blocking file I/O on `spawn_blocking`).
  */
-async listCollections() : Promise<Result<Collection[], IpcError>> {
+async listCollections() : Promise<Result<Collection[], AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_collections") };
 } catch (e) {
@@ -473,7 +473,7 @@ async listCollections() : Promise<Result<Collection[], IpcError>> {
 /**
  * Create a collection named `name`; returns the created [`Collection`].
  */
-async createCollection(name: string) : Promise<Result<Collection, IpcError>> {
+async createCollection(name: string) : Promise<Result<Collection, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("create_collection", { name }) };
 } catch (e) {
@@ -484,7 +484,7 @@ async createCollection(name: string) : Promise<Result<Collection, IpcError>> {
 /**
  * Rename the collection `collection_id` to `name`.
  */
-async renameCollection(collectionId: CollectionId, name: string) : Promise<Result<null, IpcError>> {
+async renameCollection(collectionId: CollectionId, name: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("rename_collection", { collectionId, name }) };
 } catch (e) {
@@ -496,7 +496,7 @@ async renameCollection(collectionId: CollectionId, name: string) : Promise<Resul
  * Delete a collection: clears the membership of every meeting filed under it
  * (those meetings become unfiled), then removes the definition.
  */
-async deleteCollection(collectionId: CollectionId) : Promise<Result<null, IpcError>> {
+async deleteCollection(collectionId: CollectionId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_collection", { collectionId }) };
 } catch (e) {
@@ -508,7 +508,7 @@ async deleteCollection(collectionId: CollectionId) : Promise<Result<null, IpcErr
  * File a meeting into a collection (`Some(id)`) or unfile it (`None`). Updates
  * `metadata.json` (authoritative) then the index row's derived mirror.
  */
-async setMeetingCollection(meetingId: MeetingId, collectionId: CollectionId | null) : Promise<Result<null, IpcError>> {
+async setMeetingCollection(meetingId: MeetingId, collectionId: CollectionId | null) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_meeting_collection", { meetingId, collectionId }) };
 } catch (e) {
@@ -539,7 +539,7 @@ async setMeetingCollection(meetingId: MeetingId, collectionId: CollectionId | nu
  * orchestrator. The shared `IpcState::index` handle is passed into the call so
  * the orchestrator refreshes the index row without owning one.
  */
-async reprocess(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+async reprocess(meetingId: MeetingId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("reprocess", { meetingId }) };
 } catch (e) {
@@ -571,7 +571,7 @@ async reprocess(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
  * (it may download); only the synchronous summariser work runs on
  * `spawn_blocking`.
  */
-async summariseMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+async summariseMeeting(meetingId: MeetingId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("summarise_meeting", { meetingId }) };
 } catch (e) {
@@ -585,7 +585,7 @@ async summariseMeeting(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
  * Routes directly to `persistence::read_summary` (a blocking `std::fs` read on
  * `spawn_blocking`).
  */
-async getSummary(meetingId: MeetingId) : Promise<Result<string | null, IpcError>> {
+async getSummary(meetingId: MeetingId) : Promise<Result<string | null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_summary", { meetingId }) };
 } catch (e) {
@@ -599,7 +599,7 @@ async getSummary(meetingId: MeetingId) : Promise<Result<string | null, IpcError>
  * Routes directly to `persistence::write_summary` (atomic tmp+rename) on
  * `spawn_blocking`.
  */
-async saveSummary(meetingId: MeetingId, summaryMarkdown: string) : Promise<Result<null, IpcError>> {
+async saveSummary(meetingId: MeetingId, summaryMarkdown: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("save_summary", { meetingId, summaryMarkdown }) };
 } catch (e) {
@@ -626,7 +626,7 @@ async saveSummary(meetingId: MeetingId, summaryMarkdown: string) : Promise<Resul
  * is still running is rejected with `InvalidInput { "session busy" }`
  * (§6 — single in-flight turn per session).
  */
-async sendChatMessage(meetingId: MeetingId | null, sessionId: ChatSessionId | null, message: string) : Promise<Result<ChatSessionId, IpcError>> {
+async sendChatMessage(meetingId: MeetingId | null, sessionId: ChatSessionId | null, message: string) : Promise<Result<ChatSessionId, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("send_chat_message", { meetingId, sessionId, message }) };
 } catch (e) {
@@ -645,7 +645,7 @@ async sendChatMessage(meetingId: MeetingId | null, sessionId: ChatSessionId | nu
  * flag) is a no-op success — the UI can call this freely to clear a stuck
  * "Sending…" state.
  */
-async cancelChatTurn(sessionId: ChatSessionId) : Promise<Result<null, IpcError>> {
+async cancelChatTurn(sessionId: ChatSessionId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("cancel_chat_turn", { sessionId }) };
 } catch (e) {
@@ -656,7 +656,7 @@ async cancelChatTurn(sessionId: ChatSessionId) : Promise<Result<null, IpcError>>
 /**
  * Get one chat session for a meeting, or `None` when it does not exist.
  */
-async getChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<Result<ChatSession | null, IpcError>> {
+async getChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<Result<ChatSession | null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_chat_session", { meetingId, sessionId }) };
 } catch (e) {
@@ -667,7 +667,7 @@ async getChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<R
 /**
  * List all chat sessions for a meeting, most-recently-updated first.
  */
-async listChatSessions(meetingId: MeetingId) : Promise<Result<ChatSession[], IpcError>> {
+async listChatSessions(meetingId: MeetingId) : Promise<Result<ChatSession[], AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_chat_sessions", { meetingId }) };
 } catch (e) {
@@ -678,7 +678,7 @@ async listChatSessions(meetingId: MeetingId) : Promise<Result<ChatSession[], Ipc
 /**
  * Delete one chat session for a meeting (idempotent).
  */
-async deleteChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<Result<null, IpcError>> {
+async deleteChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_chat_session", { meetingId, sessionId }) };
 } catch (e) {
@@ -701,7 +701,7 @@ async deleteChatSession(meetingId: MeetingId, sessionId: ChatSessionId) : Promis
  * port / write-tools changes are also restart-required for v1). The pane copy
  * states this; it does NOT offer a live regenerate control (C2).
  */
-async getMcpServerInfo() : Promise<Result<McpServerInfo | null, IpcError>> {
+async getMcpServerInfo() : Promise<Result<McpServerInfo | null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_mcp_server_info") };
 } catch (e) {
@@ -740,7 +740,7 @@ async getMcpServerInfo() : Promise<Result<McpServerInfo | null, IpcError>> {
  * - `AppError::InvalidInput` when translation is already in-flight for this
  * `(meeting_id, target_language)` pair.
  */
-async translateMeeting(meetingId: MeetingId, targetLanguage: string) : Promise<Result<null, IpcError>> {
+async translateMeeting(meetingId: MeetingId, targetLanguage: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("translate_meeting", { meetingId, targetLanguage }) };
 } catch (e) {
@@ -757,7 +757,7 @@ async translateMeeting(meetingId: MeetingId, targetLanguage: string) : Promise<R
  * on meeting open and on `TranslationReady` to populate the translated-view
  * overlay.
  */
-async getTranslations(meetingId: MeetingId, targetLanguage: string) : Promise<Result<Partial<{ [key in number]: string }>, IpcError>> {
+async getTranslations(meetingId: MeetingId, targetLanguage: string) : Promise<Result<Partial<{ [key in number]: string }>, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_translations", { meetingId, targetLanguage }) };
 } catch (e) {
@@ -785,7 +785,7 @@ async getTranslations(meetingId: MeetingId, targetLanguage: string) : Promise<Re
  * results in a no-op contribution drop (the gallery lookup returns no rows
  * for that model).
  */
-async rejectMatch(meetingId: MeetingId, label: string, identityId: VoiceprintIdentityId, modelId: string) : Promise<Result<null, IpcError>> {
+async rejectMatch(meetingId: MeetingId, label: string, identityId: VoiceprintIdentityId, modelId: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("reject_match", { meetingId, label, identityId, modelId }) };
 } catch (e) {
@@ -803,7 +803,7 @@ async rejectMatch(meetingId: MeetingId, label: string, identityId: VoiceprintIde
  * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
  * Always succeeds on an already-empty library (idempotent).
  */
-async clearAllVoiceprints() : Promise<Result<null, IpcError>> {
+async clearAllVoiceprints() : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("clear_all_voiceprints") };
 } catch (e) {
@@ -818,7 +818,7 @@ async clearAllVoiceprints() : Promise<Result<null, IpcError>> {
  * can display and delete identities from previous models). Silently returns an
  * empty list when the `VoiceprintStore` is not open (degraded-to-off).
  */
-async listVoiceprints() : Promise<Result<VoiceprintIdentityInfo[], IpcError>> {
+async listVoiceprints() : Promise<Result<VoiceprintIdentityInfo[], AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_voiceprints") };
 } catch (e) {
@@ -837,7 +837,7 @@ async listVoiceprints() : Promise<Result<VoiceprintIdentityInfo[], IpcError>> {
  * 
  * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
  */
-async mergeVoiceprintIdentities(keepId: VoiceprintIdentityId, mergedId: VoiceprintIdentityId) : Promise<Result<null, IpcError>> {
+async mergeVoiceprintIdentities(keepId: VoiceprintIdentityId, mergedId: VoiceprintIdentityId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("merge_voiceprint_identities", { keepId, mergedId }) };
 } catch (e) {
@@ -851,7 +851,7 @@ async mergeVoiceprintIdentities(keepId: VoiceprintIdentityId, mergedId: Voicepri
  * The new name is trimmed of whitespace; passing a blank name is an error.
  * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
  */
-async renameVoiceprintIdentity(identityId: VoiceprintIdentityId, newName: string) : Promise<Result<null, IpcError>> {
+async renameVoiceprintIdentity(identityId: VoiceprintIdentityId, newName: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("rename_voiceprint_identity", { identityId, newName }) };
 } catch (e) {
@@ -867,7 +867,7 @@ async renameVoiceprintIdentity(identityId: VoiceprintIdentityId, newName: string
  * 
  * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
  */
-async deleteVoiceprintIdentity(identityId: VoiceprintIdentityId) : Promise<Result<null, IpcError>> {
+async deleteVoiceprintIdentity(identityId: VoiceprintIdentityId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_voiceprint_identity", { identityId }) };
 } catch (e) {
@@ -886,7 +886,7 @@ async deleteVoiceprintIdentity(identityId: VoiceprintIdentityId) : Promise<Resul
  * 
  * Silently succeeds when the `VoiceprintStore` is not open (degraded-to-off).
  */
-async forgetMeetingVoiceprints(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+async forgetMeetingVoiceprints(meetingId: MeetingId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("forget_meeting_voiceprints", { meetingId }) };
 } catch (e) {
@@ -903,7 +903,7 @@ async forgetMeetingVoiceprints(meetingId: MeetingId) : Promise<Result<null, IpcE
  * runs on `spawn_blocking` alongside the other blocking file I/O rather than
  * on the async command thread.
  */
-async getDiagnosticReport() : Promise<Result<DiagnosticReport, IpcError>> {
+async getDiagnosticReport() : Promise<Result<DiagnosticReport, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_diagnostic_report") };
 } catch (e) {
@@ -920,7 +920,7 @@ async getDiagnosticReport() : Promise<Result<DiagnosticReport, IpcError>> {
  * error — the Connection pane is absent from that bundle, so the command is
  * never invoked there.
  */
-async tunnelBeginPairing() : Promise<Result<PairingPrompt, IpcError>> {
+async tunnelBeginPairing() : Promise<Result<PairingPrompt, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("tunnel_begin_pairing") };
 } catch (e) {
@@ -934,7 +934,7 @@ async tunnelBeginPairing() : Promise<Result<PairingPrompt, IpcError>> {
  * `Pairing` (reaching `Connecting`/`Online` on success, or `Disconnected` on a
  * declined/expired pairing).
  */
-async tunnelPollPairing() : Promise<Result<TunnelStatus, IpcError>> {
+async tunnelPollPairing() : Promise<Result<TunnelStatus, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("tunnel_poll_pairing") };
 } catch (e) {
@@ -954,7 +954,7 @@ async tunnelPollPairing() : Promise<Result<TunnelStatus, IpcError>> {
  * command: a start failure is logged and reflected in a later `sync_status`
  * read, exactly like the tunnel's own asynchronous connect.
  */
-async setConnectorEnabled(enabled: boolean) : Promise<Result<TunnelSnapshot, IpcError>> {
+async setConnectorEnabled(enabled: boolean) : Promise<Result<TunnelSnapshot, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_connector_enabled", { enabled }) };
 } catch (e) {
@@ -966,7 +966,7 @@ async setConnectorEnabled(enabled: boolean) : Promise<Result<TunnelSnapshot, Ipc
  * The connector snapshot for the Settings → Connection pane: the enabled flag,
  * the live tunnel status, and the paired account (if any).
  */
-async tunnelStatus() : Promise<Result<TunnelSnapshot, IpcError>> {
+async tunnelStatus() : Promise<Result<TunnelSnapshot, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("tunnel_status") };
 } catch (e) {
@@ -977,7 +977,7 @@ async tunnelStatus() : Promise<Result<TunnelSnapshot, IpcError>> {
 /**
  * The sync engine's current live status for the Settings → Sync pane.
  */
-async syncStatus() : Promise<Result<SyncStatus, IpcError>> {
+async syncStatus() : Promise<Result<SyncStatus, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_status") };
 } catch (e) {
@@ -993,7 +993,7 @@ async syncStatus() : Promise<Result<SyncStatus, IpcError>> {
  * error — the Sync pane is absent from that bundle, so the command is never
  * invoked there.
  */
-async syncGetMyTicket() : Promise<Result<string, IpcError>> {
+async syncGetMyTicket() : Promise<Result<string, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_get_my_ticket") };
 } catch (e) {
@@ -1005,7 +1005,7 @@ async syncGetMyTicket() : Promise<Result<string, IpcError>> {
  * Register a peer device from its shareable ticket (produced by
  * [`sync_get_my_ticket`] on the other device).
  */
-async syncAddPeer(ticket: string) : Promise<Result<null, IpcError>> {
+async syncAddPeer(ticket: string) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_add_peer", { ticket }) };
 } catch (e) {
@@ -1017,7 +1017,7 @@ async syncAddPeer(ticket: string) : Promise<Result<null, IpcError>> {
  * Trigger a notes sync for one meeting with the paired peers. Progress and
  * completion arrive on the event bus (`AppEvent::SyncProgress` / `SyncReady`).
  */
-async syncNow(meetingId: MeetingId) : Promise<Result<null, IpcError>> {
+async syncNow(meetingId: MeetingId) : Promise<Result<null, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_now", { meetingId }) };
 } catch (e) {
@@ -1547,7 +1547,7 @@ export type ChatSessionId = string
  * collections are a flat list ordered by `position`. The authoritative
  * definitions live in `{app-data}/collections.json` (owned by `persistence`);
  * `index.db` carries only a derived `collection_id` column on each meeting row
- * for fast filtered listing. Distinct from `persistence::MeetingFolder`, which
+ * for fast filtered listing. Distinct from `notes_crdt::MeetingFolder`, which
  * is a single meeting's on-disk directory.
  */
 export type Collection = { id: CollectionId; name: string; 
@@ -1559,7 +1559,7 @@ position: number }
  * Stable identifier for a collection — a user-facing "folder" that groups
  * meetings. UUIDv4. Mirrors [`MeetingId`].
  * 
- * Distinct from `persistence::MeetingFolder`, which is a single meeting's
+ * Distinct from `notes_crdt::MeetingFolder`, which is a single meeting's
  * on-disk directory. A meeting belongs to at most one collection
  * ([`MeetingMeta::collection_id`]); the collection's definition (name, order)
  * lives in `{app-data}/collections.json` (owned by `persistence`).
@@ -1662,14 +1662,6 @@ export type GpuAcceleration =
  * from/to its `iroh::EndpointId` at the wire boundary. Mirrors [`ModelId`].
  */
 export type HostRef = string
-/**
- * Error type returned from every Tauri command in `ipc-bridge`.
- * 
- * Carries the same discriminants as `common::AppError` and serialises to the
- * same JSON shape (`{"code": "...", ...}`), so the TypeScript binding is
- * stable even though the derive lives here rather than in `common`.
- */
-export type IpcError = { code: "io"; context: string } | { code: "model_load"; model_id: string; context: string } | { code: "model_not_found"; model_id: string } | { code: "model_download"; context: string } | { code: "inference"; backend: string; context: string } | { code: "invalid_input"; context: string } | { code: "cancelled" } | { code: "unsupported"; context: string } | { code: "internal"; context: string }
 /**
  * Whether the live in-meeting agent runs during an active recording.
  * 

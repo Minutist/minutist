@@ -3595,7 +3595,7 @@ TypeScript types consumed by the webview.
 free of Tauri imports — this is what makes the core testable without a
 running Tauri app.
 
-**Phase 1 command surface (8 commands, all `async fn` returning `Result<T, IpcError>`):**
+**Phase 1 command surface (8 commands, all `async fn` returning `AppResult<T>`):**
 `list_devices`, `start_recording`, `pause_recording`, `resume_recording`,
 `stop_recording`, `get_recording_state`, `get_settings`, `update_settings`.
 
@@ -4090,8 +4090,9 @@ to the orchestrator broadcast and emits `AppEventPayload` (event name
 **Specta types (post-P0a):** `common` and `settings` derive `specta::Type`
 directly behind their optional `specta` feature, which `ipc-bridge` enables.
 Commands and events use these canonical types directly — there is no separate
-mirror layer. `IpcError` remains a local `specta::Type` mirror of
-`AppError` at the boundary (harmless; may be removed in a later cleanup).
+mirror layer. Every command returns `AppResult<T>` (`Result<T, AppError>`)
+directly; `AppError`'s `specta::Type` derive generates the single TypeScript
+error union shared by the command surface and `AppEvent::ErrorOccurred`.
 
 **Output-language resolution (`sys-locale` external dependency).** `ipc-bridge`
 adds `sys-locale = "0.3"` as a direct external dependency (not a workspace

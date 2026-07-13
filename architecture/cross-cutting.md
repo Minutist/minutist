@@ -207,14 +207,13 @@ Two layers:
    `common::AppError` that carries a stable code + display string.
    `From` impls live in the source crate.
 
-The webview never sees a per-crate error shape. At the Tauri command
-surface, `AppError` is re-encoded into `ipc-bridge`'s `IpcError` — a
-hand-mirrored enum carrying the same discriminants and the same serde
-shape (`{"code": "...", ...}`). `IpcError` exists because `common` has
-no `specta` dependency by design, so `AppError` cannot derive
-`specta::Type`; the derive lives on `IpcError` in `ipc-bridge` instead.
-The webview literally receives `IpcError`, which mirrors `AppError`, so
-the TypeScript binding stays stable as internal error enums churn.
+The webview never sees a per-crate error shape. Tauri commands return
+`AppResult<T>` (`Result<T, AppError>`) directly — there is no separate
+command-surface error type. `AppError` derives `specta::Type` behind
+`common`'s optional `specta` feature, which `ipc-bridge` enables, so
+`tauri-specta` generates a single TypeScript error union from `AppError`
+itself, used by both the command surface and `AppEvent::ErrorOccurred` on
+the event bus.
 
 Panics: never as control flow. A panic inside a `spawn_blocking` task
 must abort the parent orchestrator task and surface as a recoverable
@@ -2669,7 +2668,8 @@ to it as follows:
   (libsql's WAL locking is the backstop, not a substitute for the discipline).
   See `containers.md` — "Process model".
 - **Error boundary.** Uses `common::AppError` (or a daemon-local `thiserror` type
-  converting to it) — never `IpcError` / `tauri-specta` shapes.
+  converting to it) — never a Tauri command return type (the daemon has no Tauri
+  command surface).
 - **Trust position.** It holds meeting plaintext, but on the user's own hardware,
   so it sits in the same trust boundary as the desktop (the free-build D4 network
   claim is about Minutist-operated servers seeing content; this is the user's own

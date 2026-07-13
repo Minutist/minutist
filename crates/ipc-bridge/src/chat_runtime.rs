@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use embedder::Bgem3Embedder;
-use minutist_common::{AppEvent, Embedder};
+use minutist_common::{AppEvent, AppResult, Embedder};
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use settings::SettingsHandle;
@@ -18,7 +18,6 @@ use summariser::LlamaSummariser;
 use tokio::sync::{broadcast, OnceCell};
 
 use crate::commands;
-use crate::error::IpcError;
 
 /// The handles a chat turn needs, cloneable (all `Arc` / `PathBuf` /
 /// `broadcast::Sender` / `SettingsHandle`). The `summariser` `OnceCell` is the
@@ -45,7 +44,7 @@ impl ChatHandles {
     /// the bundled default; the directory is resolved (downloaded + verified when
     /// absent) via `Orchestrator::ensure_model_path`; the GGUF is opened on
     /// `spawn_blocking`. Subsequent calls return the cached `Arc`.
-    pub async fn ensure_summariser(&self) -> Result<Arc<LlamaSummariser>, IpcError> {
+    pub async fn ensure_summariser(&self) -> AppResult<Arc<LlamaSummariser>> {
         let handle = self
             .summariser
             .get_or_try_init(|| async {
@@ -74,8 +73,7 @@ impl ChatHandles {
                 );
                 Ok::<_, minutist_common::AppError>(Arc::new(summariser))
             })
-            .await
-            .map_err(IpcError::from)?;
+            .await?;
         Ok(Arc::clone(handle))
     }
 
@@ -85,7 +83,7 @@ impl ChatHandles {
     /// (downloaded + verified when absent) via `Orchestrator::ensure_model_path`,
     /// then opened on `spawn_blocking`. Shared with `IpcState` so the model loads
     /// once and serves both the RAG write path and the `retrieve_chunks` tool.
-    pub async fn ensure_embedder(&self) -> Result<Arc<dyn Embedder>, IpcError> {
+    pub async fn ensure_embedder(&self) -> AppResult<Arc<dyn Embedder>> {
         let handle = self
             .embedder
             .get_or_try_init(|| async {
@@ -113,8 +111,7 @@ impl ChatHandles {
                 );
                 Ok::<_, minutist_common::AppError>(Arc::new(embedder) as Arc<dyn Embedder>)
             })
-            .await
-            .map_err(IpcError::from)?;
+            .await?;
         Ok(Arc::clone(handle))
     }
 

@@ -25,9 +25,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use minutist_common::{MeetingId, SyncStatus};
+use minutist_common::{AppError, AppResult, MeetingId, SyncStatus};
 
-use crate::{IpcError, IpcState};
+use crate::IpcState;
 use tauri::State;
 
 /// The control surface `app-main` injects so the IPC commands can drive the sync
@@ -47,16 +47,16 @@ pub trait SyncControl: Send + Sync {
     /// another of their devices so it can dial this one. Carries this device's
     /// public addressing only — not its secret key. The peer feeds it to
     /// [`Self::add_peer`].
-    async fn my_ticket(&self) -> Result<String, IpcError>;
+    async fn my_ticket(&self) -> AppResult<String>;
 
     /// Register a peer device from the ticket it produced via [`Self::my_ticket`].
     /// After this, the two devices can sync notes with each other.
-    async fn add_peer(&self, ticket: String) -> Result<(), IpcError>;
+    async fn add_peer(&self, ticket: String) -> AppResult<()>;
 
     /// Trigger a notes sync for one meeting with the paired peers. Progress and
     /// completion arrive on the event bus (`SyncProgress` / `SyncReady`), not the
     /// return value; an error here means the sync could not be started.
-    async fn sync_now(&self, meeting_id: MeetingId) -> Result<(), IpcError>;
+    async fn sync_now(&self, meeting_id: MeetingId) -> AppResult<()>;
 
     /// Best-effort: unpin `meeting_id`'s media + derived-artifact blobs from the
     /// local blob store (so the bytes become GC-eligible) after its folder has
@@ -64,7 +64,7 @@ pub trait SyncControl: Send + Sync {
     /// free build, or a connected build whose sync engine has not started, is a
     /// no-op — [`DisabledSync`] never errors here, since the meeting is gone
     /// either way and there is nothing more this call could accomplish.
-    async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<(), IpcError>;
+    async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> AppResult<()>;
 
     /// Enable or disable the connector's sync engine (and, transitively, the
     /// producer-gate election loop it starts once bound). Called from
@@ -84,7 +84,7 @@ pub trait SyncControl: Send + Sync {
     /// Never errors: a start failure is logged and reflected in
     /// [`Self::status`], mirroring how [`Self::my_ticket`] et al. surface a
     /// still-starting or failed engine.
-    async fn set_enabled(&self, enabled: bool) -> Result<(), IpcError>;
+    async fn set_enabled(&self, enabled: bool) -> AppResult<()>;
 }
 
 /// The no-op sync control used by the free build and by a connected build with
@@ -103,32 +103,32 @@ impl SyncControl for DisabledSync {
         SyncStatus::Disabled
     }
 
-    async fn my_ticket(&self) -> Result<String, IpcError> {
-        Err(IpcError::Unsupported {
+    async fn my_ticket(&self) -> AppResult<String> {
+        Err(AppError::Unsupported {
             context: SYNC_UNAVAILABLE.to_string(),
         })
     }
 
-    async fn add_peer(&self, _ticket: String) -> Result<(), IpcError> {
-        Err(IpcError::Unsupported {
+    async fn add_peer(&self, _ticket: String) -> AppResult<()> {
+        Err(AppError::Unsupported {
             context: SYNC_UNAVAILABLE.to_string(),
         })
     }
 
-    async fn sync_now(&self, _meeting_id: MeetingId) -> Result<(), IpcError> {
-        Err(IpcError::Unsupported {
+    async fn sync_now(&self, _meeting_id: MeetingId) -> AppResult<()> {
+        Err(AppError::Unsupported {
             context: SYNC_UNAVAILABLE.to_string(),
         })
     }
 
-    async fn delete_meeting_blobs(&self, _meeting_id: MeetingId) -> Result<(), IpcError> {
+    async fn delete_meeting_blobs(&self, _meeting_id: MeetingId) -> AppResult<()> {
         // No blob store in this build — nothing to unpin. Never an error: the
         // meeting folder is already gone by the time this is called, so a free
         // build has genuinely finished the deletion.
         Ok(())
     }
 
-    async fn set_enabled(&self, _enabled: bool) -> Result<(), IpcError> {
+    async fn set_enabled(&self, _enabled: bool) -> AppResult<()> {
         // No engine in this build — nothing to start or stop.
         Ok(())
     }
@@ -148,7 +148,7 @@ pub fn disabled_sync() -> Arc<dyn SyncControl> {
 /// The sync engine's current live status for the Settings → Sync pane.
 #[tauri::command]
 #[specta::specta]
-pub async fn sync_status(state: State<'_, IpcState>) -> Result<SyncStatus, IpcError> {
+pub async fn sync_status(state: State<'_, IpcState>) -> AppResult<SyncStatus> {
     Ok(state.sync.status().await)
 }
 
@@ -160,7 +160,7 @@ pub async fn sync_status(state: State<'_, IpcState>) -> Result<SyncStatus, IpcEr
 /// invoked there.
 #[tauri::command]
 #[specta::specta]
-pub async fn sync_get_my_ticket(state: State<'_, IpcState>) -> Result<String, IpcError> {
+pub async fn sync_get_my_ticket(state: State<'_, IpcState>) -> AppResult<String> {
     state.sync.my_ticket().await
 }
 
@@ -168,7 +168,7 @@ pub async fn sync_get_my_ticket(state: State<'_, IpcState>) -> Result<String, Ip
 /// [`sync_get_my_ticket`] on the other device).
 #[tauri::command]
 #[specta::specta]
-pub async fn sync_add_peer(state: State<'_, IpcState>, ticket: String) -> Result<(), IpcError> {
+pub async fn sync_add_peer(state: State<'_, IpcState>, ticket: String) -> AppResult<()> {
     state.sync.add_peer(ticket).await
 }
 
@@ -176,7 +176,7 @@ pub async fn sync_add_peer(state: State<'_, IpcState>, ticket: String) -> Result
 /// completion arrive on the event bus (`AppEvent::SyncProgress` / `SyncReady`).
 #[tauri::command]
 #[specta::specta]
-pub async fn sync_now(state: State<'_, IpcState>, meeting_id: MeetingId) -> Result<(), IpcError> {
+pub async fn sync_now(state: State<'_, IpcState>, meeting_id: MeetingId) -> AppResult<()> {
     state.sync.sync_now(meeting_id).await
 }
 
@@ -190,15 +190,15 @@ mod tests {
         assert_eq!(s.status().await, SyncStatus::Disabled);
         assert!(matches!(
             s.my_ticket().await,
-            Err(IpcError::Unsupported { .. })
+            Err(AppError::Unsupported { .. })
         ));
         assert!(matches!(
             s.add_peer("ticket".to_string()).await,
-            Err(IpcError::Unsupported { .. })
+            Err(AppError::Unsupported { .. })
         ));
         assert!(matches!(
             s.sync_now(MeetingId::new()).await,
-            Err(IpcError::Unsupported { .. })
+            Err(AppError::Unsupported { .. })
         ));
         assert!(s.delete_meeting_blobs(MeetingId::new()).await.is_ok());
         assert!(s.set_enabled(true).await.is_ok());

@@ -73,7 +73,7 @@
 //! is loaded once and shared by both the chat engine (which borrows
 //! `&LlamaModel`) and `summarise_meeting` (Phase 9 — C2).
 //!
-//! All commands return `Result<T, IpcError>`.
+//! All commands return `AppResult<T>`.
 //!
 //! `save_notes` / `load_notes` route **directly** to `notes_crdt::NotesStore`
 //! against `IpcState::meetings_dir`, bypassing the orchestrator: notes I/O is
@@ -154,7 +154,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_tools::ToolRegistry;
-use minutist_common::AppEvent;
+use minutist_common::{AppEvent, AppResult};
 use orchestrator::Orchestrator;
 use settings::SettingsHandle;
 use tauri_specta::{collect_commands, collect_events, Builder};
@@ -166,7 +166,7 @@ pub use attachments::{
 };
 pub use chat_runtime::ChatHandles;
 pub use commands::run_held_summarise;
-pub use error::{Error, IpcError};
+pub use error::Error;
 pub use events::{spawn_event_forwarder, AppEventPayload};
 pub use inter_agent::spawn_inter_agent_driver;
 pub use lifecycle::spawn_lifecycle_subscriber;
@@ -366,13 +366,13 @@ impl IpcState {
     /// for the load logic. This wrapper exists so the UI `summarise` / chat paths
     /// can call it directly off `IpcState` without first materialising a
     /// [`ChatHandles`]; both routes share the SAME lazily-loaded model `Arc`.
-    pub async fn ensure_summariser(&self) -> Result<Arc<LlamaSummariser>, IpcError> {
+    pub async fn ensure_summariser(&self) -> AppResult<Arc<LlamaSummariser>> {
         self.chat_handles().ensure_summariser().await
     }
 
     /// Resolve the held BGE-M3 embedder (RAG), loading it once on first use.
     /// Shares the same `Arc<OnceCell>` as the write path, so it loads once.
-    pub async fn ensure_embedder(&self) -> Result<Arc<dyn minutist_common::Embedder>, IpcError> {
+    pub async fn ensure_embedder(&self) -> AppResult<Arc<dyn minutist_common::Embedder>> {
         self.chat_handles().ensure_embedder().await
     }
 

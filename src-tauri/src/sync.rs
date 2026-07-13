@@ -50,8 +50,8 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use election::{Capability, ElectionConfig, ElectionDriver};
-use ipc_bridge::{ChatHandles, IpcError, SyncControl};
-use minutist_common::{AppEvent, AppResult, HostRef, MeetingId, SyncStatus};
+use ipc_bridge::{ChatHandles, SyncControl};
+use minutist_common::{AppError, AppEvent, AppResult, HostRef, MeetingId, SyncStatus};
 use settings::SettingsHandle;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use tokio::sync::broadcast;
@@ -318,14 +318,14 @@ impl ConnectedSync {
     /// The bound engine, or an `Unsupported` error when the connector is disabled
     /// and a `Internal` ("still starting") error while the background bind has not
     /// yet completed. Callers use this for every engine-backed operation.
-    async fn engine(&self) -> Result<Arc<SyncEngine>, IpcError> {
+    async fn engine(&self) -> AppResult<Arc<SyncEngine>> {
         let rt = self.runtime.lock().await;
         match (&rt.engine, &rt.status) {
             (Some(engine), _) => Ok(Arc::clone(engine)),
-            (None, SyncStatus::Disabled) => Err(IpcError::Unsupported {
+            (None, SyncStatus::Disabled) => Err(AppError::Unsupported {
                 context: "sync is disabled (enable the connector)".to_string(),
             }),
-            (None, _) => Err(IpcError::Internal {
+            (None, _) => Err(AppError::Internal {
                 context: "the sync engine is still starting".to_string(),
             }),
         }
@@ -338,11 +338,11 @@ impl SyncControl for ConnectedSync {
         self.runtime.lock().await.status.clone()
     }
 
-    async fn my_ticket(&self) -> Result<String, IpcError> {
+    async fn my_ticket(&self) -> AppResult<String> {
         Ok(self.engine().await?.my_ticket())
     }
 
-    async fn add_peer(&self, ticket: String) -> Result<(), IpcError> {
+    async fn add_peer(&self, ticket: String) -> AppResult<()> {
         let engine = self.engine().await?;
         let peer = engine
             .add_peer_from_ticket(&ticket)
@@ -351,7 +351,7 @@ impl SyncControl for ConnectedSync {
         Ok(())
     }
 
-    async fn sync_now(&self, meeting_id: MeetingId) -> Result<(), IpcError> {
+    async fn sync_now(&self, meeting_id: MeetingId) -> AppResult<()> {
         let engine = self.engine().await?;
         let peers = engine.peer_ids();
         if peers.is_empty() {
@@ -438,12 +438,12 @@ impl SyncControl for ConnectedSync {
                 let _ = self.event_tx.send(AppEvent::SyncError {
                     context: message.clone(),
                 });
-                Err(IpcError::Internal { context: message })
+                Err(AppError::Internal { context: message })
             }
         }
     }
 
-    async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<(), IpcError> {
+    async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> AppResult<()> {
         // Best-effort, and never fails the caller: the meeting folder is already
         // gone by the time `delete_meeting` calls this, so a disabled connector or
         // a not-yet-started engine has nothing left to do.
@@ -463,7 +463,7 @@ impl SyncControl for ConnectedSync {
         Ok(())
     }
 
-    async fn set_enabled(&self, enabled: bool) -> Result<(), IpcError> {
+    async fn set_enabled(&self, enabled: bool) -> AppResult<()> {
         // F5: request the engine start when the connector is turned on at
         // runtime. `request_start` is idempotent (an atomic-guarded one-shot),
         // so this is safe whether the engine is already running, already

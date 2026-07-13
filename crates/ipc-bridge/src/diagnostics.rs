@@ -20,10 +20,10 @@
 
 use std::path::Path;
 
-use minutist_common::DiagnosticReport;
+use minutist_common::{AppError, AppResult, DiagnosticReport};
 use tauri::State;
 
-use crate::{error::IpcError, IpcState};
+use crate::IpcState;
 
 /// How many trailing log lines to attach when there is no crash file.
 const LOG_TAIL_LINES: usize = 200;
@@ -199,7 +199,7 @@ fn gpu_string(gpu_acceleration: minutist_common::GpuAcceleration) -> String {
 #[specta::specta]
 pub async fn get_diagnostic_report(
     state: State<'_, IpcState>,
-) -> Result<DiagnosticReport, IpcError> {
+) -> AppResult<DiagnosticReport> {
     let logs_dir = state.logs_dir.clone();
     let app_version = state.app_version.clone();
     let platform = state.platform.clone();
@@ -233,7 +233,7 @@ pub async fn get_diagnostic_report(
         }
     })
     .await
-    .map_err(|e| IpcError::Internal {
+    .map_err(|e| AppError::Internal {
         context: format!("diagnostic report assembly task failed: {e}"),
     })?;
 

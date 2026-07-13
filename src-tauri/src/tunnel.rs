@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ipc_bridge::{McpServerInfo, PairingPrompt, TunnelControl, TunnelSnapshot};
-use minutist_common::{AppEvent, TunnelStatus};
+use minutist_common::{AppError, AppEvent, AppResult, TunnelStatus};
 use serde::{Deserialize, Serialize};
 use settings::SettingsHandle;
 use tokio::sync::broadcast;
@@ -369,7 +369,7 @@ impl ConnectedTunnel {
 
 #[async_trait]
 impl TunnelControl for ConnectedTunnel {
-    async fn begin_pairing(&self) -> Result<PairingPrompt, ipc_bridge::IpcError> {
+    async fn begin_pairing(&self) -> AppResult<PairingPrompt> {
         let client = self.pairing_client().map_err(map_pairing_err)?;
         let start = client
             .start(Some(PAIRING_LABEL))
@@ -392,7 +392,7 @@ impl TunnelControl for ConnectedTunnel {
         Ok(prompt)
     }
 
-    async fn poll_pairing(&self) -> Result<TunnelStatus, ipc_bridge::IpcError> {
+    async fn poll_pairing(&self) -> AppResult<TunnelStatus> {
         let device_code = {
             let rt = self.runtime.lock().expect("tunnel runtime poisoned");
             match &rt.pairing {
@@ -428,7 +428,7 @@ impl TunnelControl for ConnectedTunnel {
                 };
                 if let Err(e) = credential.store(&self.app_data_dir) {
                     tracing::error!(target: "app-main", "tunnel: failed to persist the device credential: {e}");
-                    return Err(ipc_bridge::IpcError::Io {
+                    return Err(AppError::Io {
                         context: "failed to store the device credential".to_string(),
                     });
                 }
@@ -459,7 +459,7 @@ impl TunnelControl for ConnectedTunnel {
         }
     }
 
-    async fn set_enabled(&self, enabled: bool) -> Result<TunnelSnapshot, ipc_bridge::IpcError> {
+    async fn set_enabled(&self, enabled: bool) -> AppResult<TunnelSnapshot> {
         // Persist the choice.
         let _ = self
             .settings
@@ -513,27 +513,27 @@ fn origin_of(url: &str) -> String {
 
 /// Map a `tunnel-client` pairing error to the IPC command error. The mapping is
 /// coarse — pairing errors carry no oracle — and never includes the credential.
-fn map_pairing_err(e: PairingError) -> ipc_bridge::IpcError {
+fn map_pairing_err(e: PairingError) -> AppError {
     match e {
-        PairingError::Config => ipc_bridge::IpcError::InvalidInput {
+        PairingError::Config => AppError::InvalidInput {
             context: "the relay api URL must be https:// (or a loopback http://)".to_string(),
         },
-        PairingError::Transport(_) => ipc_bridge::IpcError::Io {
+        PairingError::Transport(_) => AppError::Io {
             context: "could not reach the account service".to_string(),
         },
-        PairingError::Status { status } => ipc_bridge::IpcError::Internal {
+        PairingError::Status { status } => AppError::Internal {
             context: format!("the account service returned status {status}"),
         },
-        PairingError::Decode(_) => ipc_bridge::IpcError::Internal {
+        PairingError::Decode(_) => AppError::Internal {
             context: "the account service returned an unexpected response".to_string(),
         },
-        PairingError::Expired => ipc_bridge::IpcError::InvalidInput {
+        PairingError::Expired => AppError::InvalidInput {
             context: "the pairing code expired; start pairing again".to_string(),
         },
-        PairingError::AccessDenied => ipc_bridge::IpcError::InvalidInput {
+        PairingError::AccessDenied => AppError::InvalidInput {
             context: "pairing was declined".to_string(),
         },
-        PairingError::MalformedAuthorisation => ipc_bridge::IpcError::Internal {
+        PairingError::MalformedAuthorisation => AppError::Internal {
             context: "the account service returned a malformed authorisation".to_string(),
         },
     }
@@ -593,7 +593,7 @@ mod tests {
         assert!(StoredCredential::load(dir.path()).is_none());
     }
 
-    fn map(e: PairingError) -> ipc_bridge::IpcError {
+    fn map(e: PairingError) -> AppError {
         map_pairing_err(e)
     }
 
@@ -601,15 +601,15 @@ mod tests {
     fn pairing_errors_map_without_leaking() {
         assert!(matches!(
             map(PairingError::Expired),
-            ipc_bridge::IpcError::InvalidInput { .. }
+            AppError::InvalidInput { .. }
         ));
         assert!(matches!(
             map(PairingError::AccessDenied),
-            ipc_bridge::IpcError::InvalidInput { .. }
+            AppError::InvalidInput { .. }
         ));
         assert!(matches!(
             map(PairingError::Status { status: 500 }),
-            ipc_bridge::IpcError::Internal { .. }
+            AppError::Internal { .. }
         ));
     }
 }

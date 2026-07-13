@@ -28,10 +28,11 @@ import { useAutosave, activeMeetingId } from "./useAutosave";
 import { useNotesCollab } from "./useNotesCollab";
 import { buildClipboardPayload } from "./clipboard";
 import { handleSegmentDrop } from "./transcript-dnd";
-import { handleImagePaste, handleImageDrop } from "./image-paste";
+import { handleAttachmentPaste, handleAttachmentDrop } from "./attachment-drop";
 import { scrollToNearestAnchor } from "./scroll-to-anchor";
 import { shouldUseDevShim } from "../ipc/dev-shim-guard";
 import { loadNotes } from "../ipc/notes";
+import { openAttachmentById } from "../ipc/attachments";
 import { readNotesPaperRules } from "../state/notes-paper-settings";
 import "./Editor.css";
 
@@ -151,9 +152,25 @@ export function Editor() {
       // computation against the active transcript (live or saved meeting).
       onHoverAnchor: (anchorMs, nextAnchorMs) =>
         hoverNotesAnchor(anchorMs, nextAnchorMs, activeTranscript()),
-      // Resolve a stored portable image ref → a `meetingasset:` URL at render
-      // time. Read lazily so it tracks the open/recording meeting.
+      // Resolve a stored portable image/attachment ref → a `meetingasset:` /
+      // `attachment:` URL at render time. Read lazily so it tracks the
+      // open/recording meeting.
       meetingIdSource: currentMeetingId,
+      // Expand a non-image AttachmentRef: open it in the host OS default
+      // application via the same affordance the attachments pane uses. The
+      // meeting id is read lazily (not closed over) so it tracks the
+      // currently open/recording meeting at click time, not editor-construction
+      // time.
+      onOpenAttachment: (attachmentId) => {
+        const meetingId = currentMeetingId();
+        if (meetingId === null) return;
+        void openAttachmentById(meetingId, attachmentId).catch(() => {
+          // Best-effort: the attachments pane already surfaces IPC errors via
+          // its own store; a click-to-open failure here has nowhere better to
+          // report to (no notes-editor error surface exists), so it is
+          // swallowed rather than throwing into the DOM event handler.
+        });
+      },
     }),
     editorProps: {
       attributes: {
@@ -162,19 +179,19 @@ export function Editor() {
       },
       // Override copy/cut to write a Word-friendly HTML payload; handle drops of
       // a transcript segment (FR-24) by inserting a transcript-chip node, and
-      // paste/drop of image FILES by saving them to the meeting folder and
-      // inserting a portable image node.
+      // paste/drop of FILES (any type, #0038) by registering each as a meeting
+      // attachment and inserting an inline AttachmentRef node.
       handleDOMEvents: {
         copy: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
         cut: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
-        // Image paste: only intercept when the clipboard carries image files
-        // and no text payload (returns false otherwise, so text / markdown
-        // paste flows through the existing tiptap-markdown handling untouched).
+        // File paste: only intercept when the clipboard carries files and no
+        // text payload (returns false otherwise, so text / markdown paste
+        // flows through the existing tiptap-markdown handling untouched).
         paste: (_view, event) => {
           const current = editorRef.current;
           if (!current) return false;
           const clipboardEvent = event as ClipboardEvent;
-          const handled = handleImagePaste(
+          const handled = handleAttachmentPaste(
             current,
             clipboardEvent,
             currentMeetingId,
@@ -187,10 +204,10 @@ export function Editor() {
           if (!current) return false;
           const dragEvent = event as DragEvent;
           // Transcript-segment drop takes precedence (it carries our private
-          // MIME type); an image-file drop is handled only when that misses.
+          // MIME type); a file drop is handled only when that misses.
           let handled = handleSegmentDrop(current, dragEvent);
           if (!handled) {
-            handled = handleImageDrop(current, dragEvent, currentMeetingId);
+            handled = handleAttachmentDrop(current, dragEvent, currentMeetingId);
           }
           if (handled) dragEvent.preventDefault();
           return handled;

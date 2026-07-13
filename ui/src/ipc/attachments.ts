@@ -29,6 +29,17 @@ import type { AttachmentEntry, AttachmentId, MeetingId } from "./bindings";
 export const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 
 /**
+ * The custom URI scheme the `app-main` protocol handler serves attachment
+ * originals on (#0038 — the notes editor's inline `AttachmentRef` node).
+ *
+ * Mirrors `ipc_bridge::ATTACHMENT_SCHEME`. Used with
+ * `convertFileSrc(<meetingId>/<filename>, ATTACHMENT_SCHEME)` so the rendered
+ * URL is correct per-platform while the STORED node ref stays a portable
+ * `(attachmentId, filename)` pair — never a URL.
+ */
+export const ATTACHMENT_SCHEME = "attachment";
+
+/**
  * Persist an attachment `File` for `meetingId`, returning the new manifest entry
  * (in the `Pending` conversion state). Rejects (via the thrown IPC error) when
  * the backend refuses the extension or the write fails.
@@ -83,4 +94,21 @@ export async function removeAttachment(
   attachmentId: AttachmentId,
 ): Promise<void> {
   unwrap(await commands.removeAttachment(meetingId, attachmentId));
+}
+
+/**
+ * Open an attachment original in the host OS default application, given only
+ * its id (not the full manifest row).
+ *
+ * Used by the notes editor's `AttachmentRef` node view (#0038) for the
+ * non-image "expand" click, which only carries the portable
+ * `(attachmentId, filename)` ref stored in `notes.json` — not the pane's full
+ * `AttachmentEntry`. Delegates to the same `open_attachment` command as
+ * {@link openAttachment}.
+ */
+export async function openAttachmentById(
+  meetingId: MeetingId,
+  attachmentId: AttachmentId,
+): Promise<void> {
+  unwrap(await commands.openAttachment(meetingId, attachmentId));
 }

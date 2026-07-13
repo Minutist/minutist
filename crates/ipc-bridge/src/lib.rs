@@ -705,6 +705,112 @@ fn content_type_for(filename: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// Attachment asset serving — the `attachment:` URI scheme resolver
+// ---------------------------------------------------------------------------
+
+/// The custom URI scheme name used to serve attachment original bytes to the
+/// webview (an inline thumbnail/expand for an `AttachmentRef` note node, #0038).
+///
+/// Mirrors [`MEETING_ASSET_SCHEME`]: `app-main` registers a protocol handler
+/// under this name; the frontend turns a stored portable
+/// `(attachment id, filename)` ref into a working URL via
+/// `convertFileSrc(<meeting_id>/<filename>, ATTACHMENT_SCHEME)`.
+pub const ATTACHMENT_SCHEME: &str = "attachment";
+
+/// A resolved attachment asset: its bytes plus the MIME content type to serve.
+pub struct ResolvedAttachmentAsset {
+    /// The attachment original's bytes.
+    pub bytes: Vec<u8>,
+    /// The `Content-Type` for the response, inferred from the extension.
+    pub content_type: &'static str,
+}
+
+/// Resolve an `attachment:` request path to the attachment original's bytes +
+/// content type.
+///
+/// The request path is `/<meeting_id>/<filename>` (URL path component, as
+/// produced by `convertFileSrc(<meeting_id>/<filename>, ATTACHMENT_SCHEME)`,
+/// where `filename` is the attachment's content-addressed `<hash>.<ext>` on-disk
+/// name). Exactly mirrors [`resolve_note_asset`]'s parsing:
+///
+/// 1. Percent-decodes the path — `convertFileSrc` encodes the separating `/` as
+///    `%2F` (one path segment), and `request.uri().path()` is not pre-decoded,
+///    so this MUST decode before splitting (the D1 bug this mirrors: decoding
+///    after splitting silently drops the meeting-id/filename separation).
+/// 2. Splits into exactly `meeting_id` + `filename` (no nested segments).
+/// 3. Parses `meeting_id` as a UUID.
+/// 4. Reads the bytes via `persistence::read_attachment_original`, which applies
+///    its own path-traversal guard on `filename` (separator / `..` rejected).
+/// 5. Infers the `Content-Type` from the filename extension.
+///
+/// Lives here (not in `app-main`) so the `persistence` dependency edge stays
+/// inside `ipc-bridge`. Returns `AppError::InvalidInput` for a malformed
+/// path/id, and surfaces the `persistence` error otherwise; the handler maps
+/// any error to a 404/empty response, so no detail leaks to the webview.
+pub fn resolve_attachment_asset(
+    meetings_dir: &std::path::Path,
+    request_path: &str,
+) -> Result<ResolvedAttachmentAsset, minutist_common::AppError> {
+    use minutist_common::{AppError, MeetingId};
+
+    let decoded = percent_decode_path(request_path);
+    let trimmed = decoded.trim_start_matches('/');
+    let mut parts = trimmed.splitn(2, '/');
+    let (id_str, filename) = match (parts.next(), parts.next()) {
+        (Some(id), Some(file)) if !id.is_empty() && !file.is_empty() => (id, file),
+        _ => {
+            return Err(AppError::InvalidInput {
+                context: format!("malformed attachment path: {request_path:?}"),
+            })
+        }
+    };
+    // `filename` must be a single segment — no further '/'.
+    if filename.contains('/') {
+        return Err(AppError::InvalidInput {
+            context: format!("attachment path has nested segments: {request_path:?}"),
+        });
+    }
+
+    let uuid = uuid::Uuid::parse_str(id_str).map_err(|_| AppError::InvalidInput {
+        context: format!("attachment path has a non-UUID meeting id: {id_str:?}"),
+    })?;
+    let meeting_id = MeetingId(uuid);
+
+    // `read_attachment_original` applies the path-traversal guard on `filename`.
+    let bytes = persistence::read_attachment_original(meetings_dir, meeting_id, filename)?;
+    let content_type = content_type_for_attachment(filename);
+
+    Ok(ResolvedAttachmentAsset {
+        bytes,
+        content_type,
+    })
+}
+
+/// Infer the `Content-Type` for a served attachment original from its filename
+/// extension.
+///
+/// Only the image extensions matter for correct in-editor rendering (the
+/// `AttachmentRef` node's thumbnail); every other supported attachment type
+/// (`pdf`, `docx`, `xlsx`, …) serves as `application/octet-stream` — the
+/// non-image expand affordance does not render the bytes inline, so a precise
+/// MIME type is not load-bearing there.
+fn content_type_for_attachment(filename: &str) -> &'static str {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Recording-audio re-listen serving — the `meetingrecording:` URI scheme
 // ---------------------------------------------------------------------------
 
@@ -1084,6 +1190,84 @@ mod tests {
         assert_eq!(content_type_for("a.webp"), "image/webp");
         assert_eq!(content_type_for("a.bin"), "application/octet-stream");
         assert_eq!(content_type_for("noext"), "application/octet-stream");
+    }
+
+    // -----------------------------------------------------------------------
+    // Attachment asset resolver (`attachment:` scheme, #0038). No Tauri runtime
+    // needed — drives `resolve_attachment_asset` against a tempdir meetings
+    // root, mirroring the `resolve_note_asset` tests above.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_attachment_asset_serves_saved_original_with_content_type() {
+        use minutist_common::MeetingId;
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+
+        let bytes = b"%PDF-1.4 fake".to_vec();
+        let hash = persistence::save_attachment_original(root, id, &bytes, "pdf").expect("save");
+        let filename = format!("{hash}.pdf");
+
+        let path = format!("/{}/{}", id.0, filename);
+        let resolved = resolve_attachment_asset(root, &path).expect("resolve");
+        assert_eq!(resolved.bytes, bytes);
+        assert_eq!(resolved.content_type, "application/pdf");
+    }
+
+    #[test]
+    fn resolve_attachment_asset_decodes_percent_encoded_separator() {
+        use minutist_common::MeetingId;
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+
+        let bytes = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let hash = persistence::save_attachment_original(root, id, &bytes, "png").expect("save");
+        let filename = format!("{hash}.png");
+
+        // `convertFileSrc` percent-encodes the whole "<id>/<filename>" string,
+        // so the separating '/' arrives as "%2F" (one path segment) and
+        // `request.uri().path()` is not pre-decoded — this is the realistic
+        // shape of a real `attachment:` request (the D1 bug this mirrors: a
+        // decode-after-split would silently mis-parse this).
+        let path = format!("/{}%2F{}", id.0, filename);
+        let resolved =
+            resolve_attachment_asset(root, &path).expect("resolve encoded path");
+        assert_eq!(resolved.bytes, bytes);
+        assert_eq!(resolved.content_type, "image/png");
+    }
+
+    #[test]
+    fn resolve_attachment_asset_rejects_malformed_and_traversal_paths() {
+        use minutist_common::{AppError, MeetingId};
+        let tempdir = tempfile::TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = MeetingId::new();
+
+        // Malformed (not <uuid>/<file>) → InvalidInput.
+        for bad in ["", "/", "/only-one-segment", "/not-a-uuid/file.pdf"] {
+            assert!(
+                matches!(
+                    resolve_attachment_asset(root, bad),
+                    Err(AppError::InvalidInput { .. })
+                ),
+                "path {bad:?} should be rejected as InvalidInput"
+            );
+        }
+
+        // Valid UUID but traversal filename → rejected by persistence guard
+        // (InvalidInput), and a nested path → rejected here.
+        let traversal = format!("/{}/../../etc/passwd", id.0);
+        assert!(resolve_attachment_asset(root, &traversal).is_err());
+        let nested = format!("/{}/sub/dir.pdf", id.0);
+        assert!(
+            matches!(
+                resolve_attachment_asset(root, &nested),
+                Err(AppError::InvalidInput { .. })
+            ),
+            "nested path should be rejected"
+        );
     }
 
     // -----------------------------------------------------------------------

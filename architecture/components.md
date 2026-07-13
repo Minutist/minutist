@@ -1866,9 +1866,10 @@ is the **authoritative** notes document; `notes.json` and `notes.md` are
 - A round-trip test suite covers `JSON → yrs → JSON` (and the durable
   `JSON → yrs → v2 blob → yrs → JSON` hop) over the full editor schema —
   StarterKit blocks + marks, Link, lists, blockquote, code block, headings, the
-  ParagraphAnchor `data-anchor-ms` attr, the TranscriptChip atom, NoteImage, and
-  Table(+row/header/cell). It is the CRDT analogue of the `NotesStore` opacity
-  test.
+  ParagraphAnchor `data-anchor-ms` attr, the TranscriptChip atom, NoteImage, the
+  AttachmentRef atom (#0038 — its portable `attachmentId`/`filename`/`ext`
+  attrs), and Table(+row/header/cell). It is the CRDT analogue of the
+  `NotesStore` opacity test.
 
 **Note image assets (`assets` module).** Images pasted/dropped into the notes
 editor are stored as **separate files** under `{root}/{meeting_id}/assets/`,
@@ -3651,6 +3652,20 @@ relies on). This lives in `ipc-bridge` — not `app-main` — so the `persistenc
 edge stays inside `ipc-bridge` (`app-main` does not depend on `persistence`).
 See `cross-cutting.md` — "Note image assets".
 
+**#0038 — `attachment:` asset resolver** (`resolve_attachment_asset(meetings_dir,
+request_path) -> ResolvedAttachmentAsset`, plus `ATTACHMENT_SCHEME`): mirrors the
+`meetingasset:` resolver exactly for the notes editor's inline `AttachmentRef`
+node. It percent-decodes then splits the request path `/<meeting_id>/<filename>`
+into a `Uuid` + filename (the same decode-before-split the note-asset resolver
+does, since `convertFileSrc` encodes the separator as `%2F`), and serves the
+attachment original's bytes via `persistence::read_attachment_original` (relying
+on its path-traversal guard); the content type is inferred from the extension
+(images + `pdf`, else `application/octet-stream`). `app-main` registers it as a
+**synchronous** URI-scheme protocol beside `meetingasset:`; any
+validation/read failure answers an empty `404`. Lives in `ipc-bridge` (not
+`app-main`) for the same reason as `resolve_note_asset` — the `persistence` edge
+stays inside `ipc-bridge`. See `cross-cutting.md` — "Note image assets".
+
 **Issue #0023 — `meetingrecording:` re-listen resolver**
 (`resolve_recording_slice(orchestrator, request_path) -> ResolvedRecordingSlice`,
 plus `MEETING_RECORDING_SCHEME`, and the pure `parse_recording_request` it
@@ -4170,10 +4185,12 @@ navigation. `open_attachment` runs server-side: it resolves the stored original'
 absolute path (`attachments/<hash>.<ext>`, a real content-addressed file) and
 calls `app.opener().open_path`. Because the open uses the opener Rust API rather
 than a JS-invoked command, no opener capability scope is required and no filesystem
-path crosses the IPC boundary; no temp file is written. There is no attachment
-custom-URI scheme — note images keep the separate `meetingasset:` scheme for
-inline `<img>` display, but attachments are opened on the host, not fetched by the
-webview.
+path crosses the IPC boundary; no temp file is written. "Open" is a host
+hand-off, distinct from **inline display**: the notes editor's `AttachmentRef`
+node (#0038) renders an image thumbnail in the webview via the `attachment:`
+custom-URI scheme (`resolve_attachment_asset`, above), while non-image
+`AttachmentRef` cards reuse this host-open path on click. Note images keep the
+parallel `meetingasset:` scheme.
 
 **Bounded conversion worker (binding).** `IpcState` gains
 `attachment_convert_tx: tokio::sync::mpsc::Sender<ConvertJob>` (bounded — no
@@ -4700,6 +4717,28 @@ two-column 50/50 layout (controls left, transcript right).
   guarantee) and exports via tiptap-markdown's node `serialize` hook as a fenced
   ```transcript quotation carrying the metadata + segment text (FR-25). The
   transcript pane rows are the drag source.
+- **AttachmentRef node + note-drop attach (`ui/src/editor/attachment-ref.ts` +
+  `attachment-drop.ts`, #0038).** A file dropped or pasted into the notes editor
+  — ANY type — is registered as a normal meeting **attachment** (the
+  `add_attachment` pipeline: manifest row → attachments pane → doc-convert
+  markdown fed to the summariser) via the attachments store's `add` action (so
+  the pane reflects it), and an inline `AttachmentRef` atom block node is left in
+  the notes body. The editor's `paste`/`drop` handlers (`attachment-drop.ts`)
+  own this path for all NEW drops (they take over from the former image-only
+  note-asset path); the transcript-segment drop still takes precedence. The node
+  carries a **portable** ref (`attachmentId` + on-disk `filename` +
+  `originalFilename`/`ext`/`byteLen`) — never a URL — mirroring `NoteImage`'s
+  portability contract, and its node view resolves the display URL at render
+  time via `convertFileSrc(<meetingId>/<filename>, "attachment")`
+  (the `attachment:` scheme; see the `ipc-bridge` resolver). An image-extension
+  ref renders as a CSS-capped `<img>` thumbnail (click → an in-app lightbox
+  overlay); any other type renders as a file-type card (icon + name + size;
+  click → opens the attachment in the OS default app via the attachments store's
+  existing open affordance). It round-trips through `notes.json` / the CRDT the
+  same generic way `TranscriptChip`/`NoteImage` do (structure-preserving walk).
+  `NoteImage` is **unchanged** and still renders images already embedded as
+  note-assets in existing meetings (back-compat — old meetings are not migrated;
+  the two node types coexist).
 - **New stores (`ui/src/state/`).** `MeetingsStore` (`meetings.ts`) holds the
   meeting-list rows + the open-meeting state and routes through the
   `ui/src/ipc/meetings.ts` seam; `CrossRefStore` (`cross-ref.ts`) holds the

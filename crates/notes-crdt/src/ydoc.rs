@@ -437,9 +437,9 @@ mod tests {
     /// The full Tiptap editor schema in one document: StarterKit blocks +
     /// marks, Link (a mark with attrs), lists, blockquote, code block, headings,
     /// the ParagraphAnchor `data-anchor-ms` attr, the TranscriptChip atom, the
-    /// NoteImage node, and a Table with header/row/cell. The CRDT round-trip
-    /// must preserve all of it, including the custom node types (the analogue of
-    /// the opacity guarantee).
+    /// NoteImage node, the AttachmentRef atom (#0038), and a Table with
+    /// header/row/cell. The CRDT round-trip must preserve all of it, including
+    /// the custom node types (the analogue of the opacity guarantee).
     fn full_schema_doc() -> Value {
         json!({
             "type": "doc",
@@ -495,6 +495,13 @@ mod tests {
                 // NoteImage: references a content-hash asset by bare filename.
                 { "type": "noteImage",
                   "attrs": { "src": "deadbeef.png", "alt": "a diagram", "title": null } },
+                // AttachmentRef (#0038): an atom/leaf block node carrying a
+                // portable reference (attachment id + filename + mime metadata)
+                // to a meeting attachment — no bytes embedded.
+                { "type": "attachmentRef",
+                  "attrs": { "attachmentId": "att-1", "filename": "deadbeef.pdf",
+                             "originalFilename": "report.pdf", "ext": "pdf",
+                             "byteLen": 4200 } },
                 // Table with a header row and a body row.
                 { "type": "table", "content": [
                     { "type": "tableRow", "content": [

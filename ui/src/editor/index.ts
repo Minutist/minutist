@@ -14,11 +14,13 @@ export { TranscriptChip, CHIP_NODE_NAME } from "./transcript-chip";
 export type { TranscriptChipAttrs } from "./transcript-chip";
 export { NoteImage, resolveImageSrc } from "./note-image";
 export type { MeetingIdSource } from "./note-image";
+export { AttachmentRef, ATTACHMENT_REF_NODE_NAME, isImageExt } from "./attachment-ref";
+export type { AttachmentRefAttrs } from "./attachment-ref";
 export {
-  handleImagePaste,
-  handleImageDrop,
-  imageFilesFromDataTransfer,
-} from "./image-paste";
+  handleAttachmentPaste,
+  handleAttachmentDrop,
+  filesFromDataTransfer,
+} from "./attachment-drop";
 export { NotesHoverBridge } from "./hover-bridge";
 export type { HoverAnchorReporter } from "./hover-bridge";
 export {

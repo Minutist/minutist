@@ -696,6 +696,15 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
         // an empty 404 (no detail leaks). See architecture/cross-cutting.md —
         // "Note image assets".
         .register_uri_scheme_protocol(ipc_bridge::MEETING_ASSET_SCHEME, serve_note_asset)
+        // Attachment asset protocol (`attachment:`, #0038). Serves the ORIGINAL
+        // bytes of a meeting attachment to the webview for the notes editor's
+        // inline `AttachmentRef` thumbnail/expand — a file dropped/pasted into
+        // notes is stored as a normal attachment (single storage; the note holds
+        // only a portable reference), and this protocol is how that reference
+        // resolves to renderable bytes. Mirrors `meetingasset:` exactly: parsing
+        // + the path-traversal guard live in `ipc_bridge::resolve_attachment_asset`
+        // (which owns the `persistence` edge); any failure → an empty 404.
+        .register_uri_scheme_protocol(ipc_bridge::ATTACHMENT_SCHEME, serve_attachment)
         // Recording-audio re-listen protocol (`meetingrecording:`). Serves a WAV
         // of a single transcript window's audio for the transcript "play segment"
         // affordance (#0023). ASYNCHRONOUS: the decode + pause-aware window
@@ -1489,6 +1498,53 @@ fn serve_note_asset(
                 target: "app-main",
                 path = %request.uri().path(),
                 "meetingasset request rejected: {e}"
+            );
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Vec::new())
+                .unwrap_or_else(|_| Response::new(Vec::new()))
+        }
+    }
+}
+
+/// Handle an `attachment:` URI-scheme request: serve a meeting attachment
+/// original's bytes for the notes editor's inline `AttachmentRef` node (#0038).
+///
+/// The request URI path is `/<meeting_id>/<filename>` (as produced by
+/// `convertFileSrc(<meeting_id>/<filename>, "attachment")` on the frontend,
+/// where `filename` is the attachment's content-addressed `<hash>.<ext>`
+/// on-disk name). Mirrors [`serve_note_asset`] exactly: all parsing +
+/// validation + the path-traversal guard live in
+/// `ipc_bridge::resolve_attachment_asset`; this handler only shapes the HTTP
+/// response — a `200` with the inferred `Content-Type` on success, or an empty
+/// `404` on ANY failure so no detail leaks to the webview.
+fn serve_attachment(
+    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::{header, Response, StatusCode};
+
+    let meetings_dir = {
+        let state = ctx.app_handle().state::<IpcState>();
+        state.meetings_dir.clone()
+    };
+
+    match ipc_bridge::resolve_attachment_asset(&meetings_dir, request.uri().path()) {
+        Ok(asset) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, asset.content_type)
+            // Content-addressed filename, so it is safe to cache aggressively.
+            .header(
+                header::CACHE_CONTROL,
+                "private, max-age=31536000, immutable",
+            )
+            .body(asset.bytes)
+            .unwrap_or_else(|_| Response::new(Vec::new())),
+        Err(e) => {
+            tracing::debug!(
+                target: "app-main",
+                path = %request.uri().path(),
+                "attachment request rejected: {e}"
             );
             Response::builder()
                 .status(StatusCode::NOT_FOUND)

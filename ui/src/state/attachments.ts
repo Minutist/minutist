@@ -43,8 +43,13 @@ export type AttachmentsStore = {
 
   /** Load the persisted manifest for a meeting (on open / pane mount). */
   read: (meetingId: MeetingId) => Promise<void>;
-  /** Add an attachment file; inserts the `Pending` row on success. */
-  add: (meetingId: MeetingId, file: File, ext: string) => Promise<void>;
+  /**
+   * Add an attachment file; inserts the `Pending` row on success. Returns the
+   * new manifest entry, or `null` on failure (the failure is also recorded on
+   * `lastError`) — e.g. the notes editor's attachment-drop handler (#0038)
+   * needs the entry's id/hash/ext to build its inline `AttachmentRef` node.
+   */
+  add: (meetingId: MeetingId, file: File, ext: string) => Promise<AttachmentEntry | null>;
   /** Open an attachment original in the OS default application. */
   open: (meetingId: MeetingId, entry: AttachmentEntry) => Promise<void>;
   /** Remove an attachment (optimistically drops the row). */
@@ -102,8 +107,10 @@ export const useAttachmentsStore = create<AttachmentsStore>((set, get) => ({
           attachments: exists ? s.attachments : [...s.attachments, entry],
         };
       });
+      return entry;
     } catch (err) {
       set((s) => ({ adding: s.adding - 1, lastError: errorMessage(err) }));
+      return null;
     }
   },
 

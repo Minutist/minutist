@@ -2041,6 +2041,23 @@ The content-hash filename means identical pastes dedupe to one file.
   whole meeting folder, so `assets/` (and its images) are deleted with the
   meeting — no separate asset cleanup path is required.
 
+- **Attachment assets — the parallel `attachment:` scheme (#0038).** A file
+  dropped/pasted into the notes editor is stored as a normal **attachment**
+  (single storage, under `attachments/`), not a note-asset; the notes editor's
+  `AttachmentRef` node references it and serves the inline thumbnail/original
+  through the `attachment:` scheme, which **mirrors `meetingasset:` exactly**:
+  the same `convertFileSrc("<meeting_id>/<filename>", "attachment")` request
+  shape, the same synchronous protocol-handler registration in `app-main`, the
+  same percent-decode-before-split and `Uuid` + single-filename parse, and the
+  same empty-**404**-on-any-failure. Parse + read live in
+  `ipc_bridge::resolve_attachment_asset`, which delegates the read (and its
+  path-traversal guard) to `persistence::read_attachment_original` — so, as with
+  note images, the protocol exposes only `{meetings_dir}/<uuid>/attachments/
+  <filename>`, never the whole filesystem. The stored node ref is portable
+  (`attachmentId` + on-disk `filename` + mime metadata), never a URL. The
+  pre-existing `NoteImage` node + `meetingasset:` scheme are unchanged and still
+  render images embedded in existing meetings (back-compat).
+
 ## Recording-audio re-listen serving (`meetingrecording:`)
 
 The transcript "play segment" affordance (#0023) plays the audio under a single
@@ -2146,9 +2163,12 @@ capability system gates only JS-invoked commands, not the Rust manager API). The
 originals are real files (content-addressed `attachments/<hash>.<ext>`), so no
 temp file is written.
 
-There is no custom URI scheme for attachments: opening is a host hand-off, not a
-webview fetch. (Note images still use the separate `meetingasset:` scheme for
-inline `<img>` display — a different need.)
+"Open" is a host hand-off, not a webview fetch, so it uses no custom URI scheme.
+Inline **display** of an attachment inside the notes editor (the `AttachmentRef`
+node's thumbnail, #0038) is a separate need served by the `attachment:` scheme
+(see "Note image assets" above) — the two are complementary: `attachment:`
+renders the image thumbnail in the webview, while "Open" launches the OS default
+app for the full file. (Note images use the parallel `meetingasset:` scheme.)
 
 ### Attachments — parser sandboxing (binding)
 

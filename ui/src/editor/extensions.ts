@@ -21,10 +21,16 @@
  *   - TranscriptChip — first-class block node for a dragged-in transcript
  *     segment (FR-24/25; see ./transcript-chip). Survives notes.json round-trip
  *     and exports to markdown as a fenced quotation.
- *   - NoteImage — pasted/dropped images stored as FILES in the meeting folder
- *     (see ./note-image). The node's `src` is a PORTABLE filename ref in
- *     notes.json; a node view converts it to a `meetingasset:` URL at display
- *     time, so the meeting folder stays copyable across machines.
+ *   - NoteImage — renders images already embedded as note-assets in EXISTING
+ *     meetings (see ./note-image), back-compat only: no NEW drop/paste creates
+ *     this node any more (#0038 moved that path onto AttachmentRef below). The
+ *     node's `src` is a PORTABLE filename ref in notes.json; a node view
+ *     converts it to a `meetingasset:` URL at display time.
+ *   - AttachmentRef — a file dropped/pasted into notes (ANY type, #0038) is
+ *     registered as a full meeting attachment (manifest, pane, summariser
+ *     markdown) and this node is the inline reference left in the notes body
+ *     (see ./attachment-ref): an image thumbnail, or a file-type card for
+ *     everything else, both expanding on click.
  *   - NotesHoverBridge — presentation-only plugin reporting the hovered
  *     paragraph's `data-anchor-ms` (FR-22 read side; see ./hover-bridge); adds
  *     no attrs and dispatches no transactions, so it cannot affect anchoring.
@@ -48,6 +54,7 @@ import { NotesHoverBridge } from "./hover-bridge";
 import type { HoverAnchorReporter } from "./hover-bridge";
 import { NoteImage } from "./note-image";
 import type { MeetingIdSource } from "./note-image";
+import { AttachmentRef } from "./attachment-ref";
 import { NOTES_FRAGMENT } from "./notes-collab";
 
 export type BuildExtensionsOptions = {
@@ -71,6 +78,12 @@ export type BuildExtensionsOptions = {
    * no-op (`null`) when omitted; bare refs then render as-is (unresolved).
    */
   meetingIdSource?: MeetingIdSource;
+  /**
+   * Expand a non-image `AttachmentRef` (opens it in the host OS default
+   * application, via the attachments store's existing open affordance).
+   * Defaults to a no-op when omitted (e.g. editor unit tests).
+   */
+  onOpenAttachment?: (attachmentId: string) => void;
   /**
    * The per-meeting Yjs document the editor binds to via
    * `@tiptap/extension-collaboration` (B6 WU7). When supplied, the document
@@ -133,9 +146,16 @@ export function buildEditorExtensions(
     }),
     // First-class dragged-in transcript segment (FR-24/25).
     TranscriptChip,
-    // Pasted/dropped note images, stored as files + referenced portably.
+    // Back-compat rendering only for note-images already embedded in existing
+    // meetings; no new drop/paste creates this node (see AttachmentRef below).
     NoteImage.configure({
       meetingIdSource: options.meetingIdSource ?? (() => null),
+    }),
+    // A file dropped/pasted into notes becomes an attachment; this is the
+    // inline reference (thumbnail or file-card) left in the notes body.
+    AttachmentRef.configure({
+      meetingIdSource: options.meetingIdSource ?? (() => null),
+      onOpenAttachment: options.onOpenAttachment ?? (() => {}),
     }),
     // FR-22 read side: reports the hovered paragraph's anchor. Presentation-only
     // (no doc mutation), so it cannot affect ParagraphAnchor's stamping.

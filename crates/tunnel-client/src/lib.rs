@@ -30,6 +30,7 @@
 //! response bodies are never logged; only `request_id`, method, path, and status
 //! are traced.
 
+mod account;
 mod frame;
 mod lifecycle;
 mod loopback;
@@ -37,6 +38,7 @@ mod pairing;
 mod reconnect;
 mod run;
 
+pub use account::{AccountDirectoryClient, AccountDirectoryError, DeviceEndpointEntry};
 pub use frame::{
     Frame, FrameError, Hello, HelloAck, HelloErr, HelloErrReason, RequestFrame, RequestId,
     ResponseChunk, ResponseEnd, ResponseError, ResponseStart, PROTOCOL_VERSION,

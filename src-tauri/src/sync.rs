@@ -53,9 +53,13 @@ use election::{Capability, ElectionConfig, ElectionDriver};
 use ipc_bridge::{ChatHandles, SyncControl};
 use minutist_common::{AppError, AppEvent, AppResult, HostRef, MeetingId, SyncStatus};
 use settings::SettingsHandle;
-use sync::{DeviceIdentity, SyncConfig, SyncEngine};
+use sync::{
+    run_account_refresh_loop, AccountEndpoint, AccountEndpointSource, DeviceIdentity, SyncConfig,
+    SyncEngine,
+};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 /// The environment variable carrying the self-hosted relay's access token. Takes
 /// precedence over the settings value so a deployment / test can inject one
@@ -74,6 +78,11 @@ const MY_TICKET_FILE: &str = "my_ticket";
 /// covers the already-present peers).
 const PEERS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How often the account-refresh loop (B4) re-fetches the account's device
+/// directory to discover newly-registered peers. Coarser than the peers-file
+/// poll — account membership changes rarely, and each tick is a relay round-trip.
+const ACCOUNT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The mutable runtime state, guarded by one async mutex held only briefly. A
 /// `sync_now` clones the engine `Arc` out under the lock and runs the per-peer
 /// notes + media reconciliation without holding it, re-locking only to flip the
@@ -84,6 +93,13 @@ struct Runtime {
     /// connector is disabled or before the background bind completes.
     engine: Option<Arc<SyncEngine>>,
     status: SyncStatus,
+    /// The shared cancellation token for the current bind's background loops —
+    /// the peers-file poll and (when account-paired) the account-refresh loop.
+    /// Notifying it stops both; it is re-created per bind and a prior token is
+    /// notified before a re-bind so neither loop leaks across binds (issue 0029
+    /// item 1, scoped to these two desktop-owned loops; the engine-internal +
+    /// election-loop teardown is the broader item).
+    stop: Option<Arc<Notify>>,
 }
 
 /// The collaborators the producer-gate election loop needs, passed in from
@@ -149,6 +165,7 @@ impl ConnectedSync {
             runtime: Arc::new(Mutex::new(Runtime {
                 engine: None,
                 status: SyncStatus::Disabled,
+                stop: None,
             })),
             election,
             settings,
@@ -240,6 +257,13 @@ impl ConnectedSync {
             Ok(engine) => {
                 let engine = Arc::new(engine);
 
+                // One cancellation token shared by this bind's background loops
+                // (the peers-file poll and, when account-paired, the account-
+                // refresh loop). Stored in `Runtime` below; a prior bind's token
+                // is notified before we replace it, so neither loop leaks across
+                // binds (issue 0029 item 1, scoped to these desktop loops).
+                let stop = Arc::new(Notify::new());
+
                 // Peers-file pairing (shared with the headless hub via
                 // `sync::peers`). The engine's `PeerDirectory` is in-memory and
                 // forgets peers on exit; the `{app-data}/peers` file gives the
@@ -260,14 +284,69 @@ impl ConnectedSync {
                 {
                     let engine = Arc::clone(&engine);
                     let root = app_data_base.clone();
+                    let stop = Arc::clone(&stop);
                     tauri::async_runtime::spawn(async move {
                         let mut poll = tokio::time::interval(PEERS_POLL_INTERVAL);
                         poll.tick().await; // immediate first tick — the bind load already ran.
                         loop {
-                            poll.tick().await;
-                            sync::peers::reload_into(&engine, &root, &mut seen);
+                            tokio::select! {
+                                _ = stop.notified() => break,
+                                _ = poll.tick() => {
+                                    sync::peers::reload_into(&engine, &root, &mut seen);
+                                }
+                            }
                         }
                     });
+                }
+
+                // Account-mediated peer discovery (B4): when the device is
+                // account-paired, publish this device's endpoint to the account
+                // directory and add every other account device's endpoint as a
+                // peer, refreshing on an interval. Additive to peers-file pairing
+                // (the account source is primary when signed-in; the peers file
+                // stays a local fallback). Shares `stop` with the peers poll so a
+                // re-bind cancels both together.
+                if let Some(cred) = crate::tunnel::load_device_credential(&app_data_base) {
+                    let settings = self.settings.current();
+                    match tunnel_client::AccountDirectoryClient::new(
+                        settings.relay_api_url,
+                        cred.device_credential,
+                    ) {
+                        Ok(client) => {
+                            let source: Arc<dyn AccountEndpointSource> =
+                                Arc::new(AccountDirectorySource { client });
+                            let self_endpoint = AccountEndpoint {
+                                device_id: cred.device_id,
+                                endpoint_id: engine.endpoint_id().to_string(),
+                                relay_url: settings.relay_url,
+                            };
+                            let add_engine = Arc::clone(&engine);
+                            let stop = Arc::clone(&stop);
+                            tauri::async_runtime::spawn(run_account_refresh_loop(
+                                source,
+                                self_endpoint,
+                                ACCOUNT_REFRESH_INTERVAL,
+                                stop,
+                                move |ep| {
+                                    if let Err(e) =
+                                        add_engine.add_account_peer(&ep.endpoint_id, &ep.relay_url)
+                                    {
+                                        tracing::warn!(
+                                            target: "app-main",
+                                            error = %e,
+                                            "sync: account peer add rejected"
+                                        );
+                                    }
+                                },
+                            ));
+                            tracing::info!(target: "app-main", "sync: account-refresh loop started");
+                        }
+                        Err(e) => tracing::warn!(
+                            target: "app-main",
+                            error = %e,
+                            "sync: account-directory client not built; skipping account discovery"
+                        ),
+                    }
                 }
 
                 // Persist the processing-lifecycle states the engine surfaces from
@@ -317,6 +396,11 @@ impl ConnectedSync {
                 }
 
                 let mut rt = self.runtime.lock().await;
+                // Stop a prior bind's loops before adopting this bind's token, so
+                // a re-bind never leaves the old peers-poll / account loop running.
+                if let Some(prev) = rt.stop.replace(Arc::clone(&stop)) {
+                    prev.notify_waiters();
+                }
                 rt.engine = Some(engine);
                 rt.status = SyncStatus::Idle;
                 tracing::info!(target: "app-main", "sync engine started");
@@ -545,6 +629,43 @@ fn resolve_relay_token(_settings: &SettingsHandle) -> Option<String> {
     match std::env::var(RELAY_TOKEN_ENV) {
         Ok(token) if !token.is_empty() => Some(token),
         _ => None,
+    }
+}
+
+/// Adapts the `tunnel-client` account-directory HTTP client onto the
+/// [`AccountEndpointSource`] trait `sync` consumes (B4). The adapter lives here
+/// in `app-main` — the assembler that already depends on both crates — so
+/// `tunnel-client` stays a near-leaf with no `sync` dependency edge, and `sync`
+/// keeps its account seam behind a trait rather than an HTTP client.
+struct AccountDirectorySource {
+    client: tunnel_client::AccountDirectoryClient,
+}
+
+#[async_trait]
+impl AccountEndpointSource for AccountDirectorySource {
+    async fn list_endpoints(&self) -> AppResult<Vec<AccountEndpoint>> {
+        let devices = self.client.list_devices().await.map_err(|e| {
+            minutist_common::AppError::Internal {
+                context: format!("account directory list: {e}"),
+            }
+        })?;
+        Ok(devices
+            .into_iter()
+            .map(|d| AccountEndpoint {
+                device_id: d.device_id,
+                endpoint_id: d.endpoint_id,
+                relay_url: d.relay_url,
+            })
+            .collect())
+    }
+
+    async fn register_self(&self, endpoint: &AccountEndpoint) -> AppResult<()> {
+        self.client
+            .register_self_endpoint(&endpoint.endpoint_id, &endpoint.relay_url)
+            .await
+            .map_err(|e| minutist_common::AppError::Internal {
+                context: format!("account directory register-self: {e}"),
+            })
     }
 }
 

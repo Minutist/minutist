@@ -289,7 +289,7 @@ pub fn next_interval(current: Duration) -> Duration {
 /// Whether `url` is an acceptable account-service base URL: `https://` for any
 /// host, or `http://` only for a loopback host (test/dev). Mirrors the tunnel
 /// `relay_scheme_is_acceptable` check.
-fn api_scheme_is_acceptable(url: &str) -> bool {
+pub(crate) fn api_scheme_is_acceptable(url: &str) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };

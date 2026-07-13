@@ -97,6 +97,26 @@ impl StoredCredential {
     }
 }
 
+/// This device's account credential, as the B4 account-refresh wiring in
+/// `sync.rs` needs it: the `mdc_` bearer for the account-directory client and the
+/// account-service `device_id` for the self-endpoint registration. Returns `None`
+/// when the device is not account-paired (no credential file) — the caller then
+/// skips the account-discovery loop (local peers-file pairing still works).
+pub(crate) struct DeviceCredentialParts {
+    pub device_credential: String,
+    pub device_id: String,
+}
+
+/// Load the stored device credential for the account-directory client. The
+/// `tunnel_device.json` file is the single source of the `mdc_` credential; this
+/// is the one accessor `sync.rs` uses so the credential type stays private here.
+pub(crate) fn load_device_credential(app_data_dir: &Path) -> Option<DeviceCredentialParts> {
+    StoredCredential::load(app_data_dir).map(|c| DeviceCredentialParts {
+        device_credential: c.device_credential,
+        device_id: c.device_id,
+    })
+}
+
 /// The in-progress pairing session between `begin_pairing` and a terminal poll.
 struct PairingSession {
     device_code: String,

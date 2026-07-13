@@ -100,9 +100,16 @@ peers-file poll. `SyncEngine::add_account_peer(endpoint_id: &str, relay_url:
 closure and `sync-ffi`'s wrapper call: parses both, builds the same `id + relay`
 `EndpointAddr` shape `push_all_to`/`peer_relay_addr` already dial with, and
 registers it via `add_peer`. Account-source and manual pairing / the file-source
-fallback are additive — all feed the one `PeerDirectory`; B4 (desktop wiring,
-layering account-source as primary) and peer eviction (removing a device that
-left the account) are follow-ups, not part of this surface.
+fallback are additive — all feed the one `PeerDirectory`. B4 (desktop wiring)
+is now implemented: `tunnel-client` gains a raw `AccountDirectoryClient`
+(`GET /v1/account/devices`, `PUT /v1/account/devices/self/endpoint`, bearer-
+authed with the device's `mdc_` credential, its own `DeviceEndpointEntry` DTO)
+that keeps `tunnel-client` a near-leaf — it takes **no** `sync` edge; `app-main`
+(the assembler) wraps it in an `AccountEndpointSource` adapter and, in
+`ConnectedSync::start_engine`, spawns `run_account_refresh_loop` when the device
+is account-paired (credential present), wired onto the SAME `stop` token as the
+local peers-file poll so a re-bind cancels both. Peer eviction (removing a device
+that left the account) remains a follow-up.
 
 `SyncControl` gains `set_enabled(bool)` (issue 0028 follow-up F5), giving the
 Settings toggle a runtime path to start or stop the sync engine (the toggle
@@ -3395,7 +3402,12 @@ owns the download; `ipc-bridge` resolves the mmproj path from the registry at
 **Owns:** the app-side half of the connected-tier relay tunnel: the
 outbound WSS dial to the hosted relay, the device handshake, and the
 request/response demux loop that replays relayed MCP requests against the app's
-own loopback `mcp-server`.
+own loopback `mcp-server`. Also owns the **account device-directory HTTP client**
+(`AccountDirectoryClient`, WS4-B B4): a thin `reqwest` client for `GET
+/v1/account/devices` and `PUT /v1/account/devices/self/endpoint`, bearer-authed
+with the device's `mdc_` credential, returning its own `DeviceEndpointEntry` DTO.
+It stays here (rather than in `sync`) so the crate keeps no `sync` edge; `app-main`
+adapts it onto `sync::AccountEndpointSource`.
 
 **Dependency edges:** none in the workspace (see the dependency-table note). The
 crate is a near-leaf consumer of third-party crates only. It is part of the

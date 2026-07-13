@@ -231,6 +231,12 @@ fn add_peer(data_dir: &Path, ticket: &str) -> AppResult<()> {
         // A malformed ticket is bad operator input; keep the InvalidInput variant
         // (the parse guard in `sync::peers::append` surfaces it as `Protocol`).
         Err(sync::Error::Protocol(msg)) => Err(AppError::InvalidInput { context: msg }),
+        // Keep the Io variant + the peers-file path so an operator sees WHICH
+        // write failed; the blanket `From` would flatten this to `Internal` and
+        // drop the path.
+        Err(sync::Error::Io(e)) => Err(AppError::Io {
+            context: format!("writing peers file {}: {e}", path.display()),
+        }),
         Err(e) => Err(AppError::from(e)),
     }
 }

@@ -95,10 +95,14 @@ struct Runtime {
     status: SyncStatus,
     /// The shared cancellation token for the current bind's background loops —
     /// the peers-file poll and (when account-paired) the account-refresh loop.
-    /// Notifying it stops both; it is re-created per bind and a prior token is
-    /// notified before a re-bind so neither loop leaks across binds (issue 0029
-    /// item 1, scoped to these two desktop-owned loops; the engine-internal +
-    /// election-loop teardown is the broader item).
+    /// Both `select!` on it; it is re-created per bind and the prior token is
+    /// `notify_waiters()`-ed before a re-bind. This wires the shared-cancel STEP
+    /// toward issue 0029 item 1 — NOT a close: the `set_enabled(false)` re-bind
+    /// teardown path is still unbuilt, and this `Notify` cancel is non-latching
+    /// (a cancel fired mid-loop-body, between `select!` iterations, is missed).
+    /// Correct for every path today (re-bind is unreachable — `start_requested`
+    /// binds once — and shutdown drops both tasks); switch to a latching
+    /// `tokio_util::sync::CancellationToken` when the re-bind teardown path lands.
     stop: Option<Arc<Notify>>,
 }
 
@@ -260,8 +264,9 @@ impl ConnectedSync {
                 // One cancellation token shared by this bind's background loops
                 // (the peers-file poll and, when account-paired, the account-
                 // refresh loop). Stored in `Runtime` below; a prior bind's token
-                // is notified before we replace it, so neither loop leaks across
-                // binds (issue 0029 item 1, scoped to these desktop loops).
+                // is notified before we replace it. A STEP toward issue 0029
+                // item 1, not a close — see the `Runtime::stop` doc for the
+                // non-latching / re-bind caveat.
                 let stop = Arc::new(Notify::new());
 
                 // Peers-file pairing (shared with the headless hub via

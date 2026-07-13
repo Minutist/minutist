@@ -581,6 +581,25 @@ mod tests {
     }
 
     #[test]
+    fn externally_seeded_credential_loads_as_paired() {
+        // The autonomous e2e harness (roadmap 2.11, scripts/sync-e2e-harness.py)
+        // seeds this file directly from WSL instead of running the device-code
+        // flow, so the on-disk JSON shape is a contract with that harness. This
+        // pins it: a file carrying only the three documented keys — written
+        // without a `store()` round-trip — must load as paired. Renaming a
+        // `StoredCredential` field fails this test, forcing the harness to change
+        // in lockstep rather than silently seeding an unreadable credential.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let seeded =
+            r#"{"device_credential":"mdc_seed.secret","account_id":"acct-e2e","device_id":"desktop-e2e"}"#;
+        std::fs::write(StoredCredential::path(dir.path()), seeded).expect("write");
+        let loaded = StoredCredential::load(dir.path()).expect("seeded credential must load");
+        assert_eq!(loaded.device_credential, "mdc_seed.secret");
+        assert_eq!(loaded.account_id, "acct-e2e");
+        assert_eq!(loaded.device_id, "desktop-e2e");
+    }
+
+    #[test]
     fn missing_credential_is_none() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         assert!(StoredCredential::load(dir.path()).is_none());

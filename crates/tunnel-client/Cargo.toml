@@ -45,3 +45,7 @@ tokio-tungstenite = { workspace = true, features = ["handshake"] }
 # WS4-A S4 live-smoke driver only (examples/dial.rs): logging for the standalone
 # tunnel dialer. Not used by the library.
 tracing-subscriber = { workspace = true }
+# Account-directory client tests (B4) stand up a mock account-service to pin the
+# GET/PUT wire contract; serde_json builds the response bodies + asserts the PUT body.
+wiremock = "0.6"
+serde_json = { workspace = true }

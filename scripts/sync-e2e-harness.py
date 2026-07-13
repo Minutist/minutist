@@ -216,6 +216,13 @@ def cmd_seed(args: argparse.Namespace) -> int:
         cred = mint_credential(
             args.api_base, args.account_id, _require_secret(), label=args.device_id
         )
+        # Immediate credential-liveness check: the freshly minted device is not
+        # yet in /v1/account/devices (no endpoint registered), so probe the
+        # credential directly. A minted-but-dead credential is a hard failure.
+        live = mint_liveness_ok(args.api_base, cred.device_credential)
+        print(f"liveness ({args.api_base}/relay-authz): {'PASS' if live else 'FAIL'}")
+        if not live:
+            sys.exit("minted credential failed the /relay-authz liveness probe")
     path = seed_credential(Path(args.app_data), cred)
     kind = "mock" if args.mock else "minted"
     print(f"seeded {kind} credential (device_id={cred.device_id}) → {path}")

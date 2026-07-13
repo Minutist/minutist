@@ -48,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # The account-service origin (Cloudflare-fronted; origin = telie compose stack).
@@ -171,6 +172,41 @@ def mint_liveness_ok(api_base: str, device_credential: str) -> bool:
     return resp.is_success
 
 
+def read_seeded_credential(app_data: Path) -> str:
+    """Read the `mdc_` credential back from a seeded `tunnel_device.json` — the
+    directory poll authenticates as the desktop device itself."""
+    path = app_data / CREDENTIAL_FILE
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data["device_credential"]
+
+
+def meeting_artifact_present(app_data: Path, uuid: str, artifact: str) -> bool:
+    """Whether a synced meeting's artifact has landed under
+    `{app-data}/meetings/{uuid}/{artifact}` (e.g. `audio.opus`, `transcript.json`,
+    `notes.ydoc`). The desktop meetings root is `{app-data}/meetings`
+    (SyncConfig::meetings_root), readable from WSL over the drvfs mount."""
+    return (app_data / "meetings" / uuid / artifact).is_file()
+
+
+def _poll_until(predicate, timeout_s: float, interval_s: float, label: str) -> bool:
+    """Poll `predicate()` until it is truthy or `timeout_s` elapses. Prints one
+    progress line per attempt. Returns whether it succeeded within the deadline."""
+    deadline = time.monotonic() + timeout_s
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if predicate():
+                print(f"{label}: satisfied after {attempt} attempt(s)")
+                return True
+        except Exception as e:  # transient (503 / connect) — keep polling
+            print(f"{label}: attempt {attempt} error: {e}", file=sys.stderr)
+        if time.monotonic() >= deadline:
+            print(f"{label}: TIMEOUT after {timeout_s:.0f}s ({attempt} attempts)", file=sys.stderr)
+            return False
+        time.sleep(interval_s)
+
+
 def seed_credential(app_data: Path, cred: Credential) -> Path:
     """Write the credential so the app boots paired. Returns the file path.
 
@@ -238,6 +274,37 @@ def cmd_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_wait_devices(args: argparse.Namespace) -> int:
+    """Poll the account directory until at least `--min` devices have registered
+    an endpoint. Authenticates with the seeded desktop credential. This is the
+    directory-count assertion of the full run: each peer appears only once its app
+    has booted and run B4's register_self."""
+    credential = read_seeded_credential(Path(args.app_data))
+    api_base = args.api_base
+
+    def enough() -> bool:
+        n = len(registered_devices(api_base, credential))
+        print(f"account devices registered: {n}/{args.min}")
+        return n >= args.min
+
+    ok = _poll_until(enough, args.timeout, args.interval, "wait-devices")
+    return 0 if ok else 1
+
+
+def cmd_wait_meeting(args: argparse.Namespace) -> int:
+    """Poll until a synced meeting's artifact lands under
+    `{app-data}/meetings/{uuid}/{artifact}` — the sync-completion assertion (a
+    meeting produced on the peer has replicated to this device)."""
+    app_data = Path(args.app_data)
+    ok = _poll_until(
+        lambda: meeting_artifact_present(app_data, args.uuid, args.artifact),
+        args.timeout,
+        args.interval,
+        f"wait-meeting {args.uuid}/{args.artifact}",
+    )
+    return 0 if ok else 1
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     """Verify seed + JSON contract without a Windows build or the network."""
     import tempfile
@@ -260,12 +327,23 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     minted = _credential_from_mint(sample)
     assert minted.device_credential == "mdc_dev-xyz.secret"
     assert minted.device_id == "dev-xyz"
-    # A minted credential seeds to the identical on-disk contract.
+    # A minted credential seeds to the identical on-disk contract, and the
+    # credential reads back for the directory poll.
     with tempfile.TemporaryDirectory() as d:
-        loaded = json.loads(seed_credential(Path(d), minted).read_text(encoding="utf-8"))
+        app_data = Path(d)
+        loaded = json.loads(seed_credential(app_data, minted).read_text(encoding="utf-8"))
         assert set(loaded) == {"device_credential", "account_id", "device_id"}, loaded
+        assert read_seeded_credential(app_data) == minted.device_credential
 
-    print("selftest OK: seed + mint-response mapping match the StoredCredential contract")
+        # Sync-completion predicate: absent before the artifact lands, present after.
+        uuid = "11111111-1111-1111-1111-111111111111"
+        assert not meeting_artifact_present(app_data, uuid, "audio.opus")
+        mtg = app_data / "meetings" / uuid
+        mtg.mkdir(parents=True)
+        (mtg / "audio.opus").write_bytes(b"stub")
+        assert meeting_artifact_present(app_data, uuid, "audio.opus")
+
+    print("selftest OK: seed + mint mapping + directory/sync-completion predicates")
     return 0
 
 
@@ -295,6 +373,19 @@ def main(argv: list[str] | None = None) -> int:
 
     p_launch = sub.add_parser("launch", help="launch the Windows exe with the relay token")
     p_launch.set_defaults(func=cmd_launch)
+
+    p_wd = sub.add_parser("wait-devices", help="poll the account directory until --min devices register")
+    p_wd.add_argument("--min", type=int, default=2, help="required registered-device count")
+    p_wd.add_argument("--timeout", type=float, default=120.0)
+    p_wd.add_argument("--interval", type=float, default=5.0)
+    p_wd.set_defaults(func=cmd_wait_devices)
+
+    p_wm = sub.add_parser("wait-meeting", help="poll until a synced meeting artifact lands")
+    p_wm.add_argument("--uuid", required=True, help="the meeting UUID expected to sync in")
+    p_wm.add_argument("--artifact", default="audio.opus", help="artifact filename under meetings/<uuid>/")
+    p_wm.add_argument("--timeout", type=float, default=180.0)
+    p_wm.add_argument("--interval", type=float, default=5.0)
+    p_wm.set_defaults(func=cmd_wait_meeting)
 
     p_self = sub.add_parser("selftest", help="offline seed/contract self-test")
     p_self.set_defaults(func=cmd_selftest)

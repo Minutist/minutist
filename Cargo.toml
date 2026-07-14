@@ -204,7 +204,7 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 # calamine: XLSX / ODS spreadsheet reader (pure Rust). The `dates` feature adds
 # `ExcelDateTime::as_datetime()` so date cells render as ISO text rather than the
 # raw serial number that `ExcelDateTime`'s Display emits.
-calamine = { version = "0.35", features = ["dates"] }
+calamine = { version = "0.36", features = ["dates"] }
 # csv: RFC-4180 CSV reader (pure Rust). Rendered as a markdown table, like the
 # spreadsheet formats.
 csv = "1"
@@ -221,7 +221,10 @@ mail-parser = "0.11"
 # crashing and de-duplicates running headers/footers. See planning issue 0019.
 pdf_oxide = "0.3"
 # quick-xml: SAX-style XML reader used for the PPTX OOXML slide walk.
-quick-xml = "0.40"
+# Pinned >=0.41: earlier releases carry RUSTSEC-2026-0194/-0195 (quadratic
+# duplicate-attribute scan + unbounded NsReader namespace allocation), reachable
+# here when parsing untrusted meeting attachments.
+quick-xml = "0.41"
 # zip: ZIP container reader used for PPTX / XLSX / ODS archives.
 # The 8.x line is the latest stable (9.x is pre-release at Gate-A).
 zip = "8.6"

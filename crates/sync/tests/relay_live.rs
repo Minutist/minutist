@@ -107,15 +107,17 @@ async fn notes_converge_through_the_relay() {
         engine_b.endpoint_id()
     );
 
-    // Mutual pairing: each device adds the other's ticket. Sync requires it —
-    // B's accept side rejects an inbound connection from a peer it has not paired,
-    // so A must be in B's directory for the dial below to be served.
-    engine_a
-        .add_peer_from_ticket(&engine_b.my_ticket())
-        .expect("A pairs B");
-    engine_b
-        .add_peer_from_ticket(&engine_a.my_ticket())
-        .expect("B pairs A");
+    // Mutual pairing — RELAY-ONLY (id + relay url, NO direct addrs). This is what
+    // makes the test a genuine relay-data-plane proof: `my_ticket()` carries direct
+    // socket addrs, so ticket-pairing would let the two engines holepunch directly
+    // on localhost and converge EVEN IF THE RELAY WERE DOWN (the false positive an
+    // earlier pass hit). Pairing by id+relay only — the account-directory addressing
+    // shape — means a broken relay is no route at all, so the 30s guard below fires.
+    // (Pairing is also the authorisation: B's accept side rejects an inbound
+    // connection from a peer it has not paired.)
+    let relay: RelayUrl = relay_url.parse().expect("relay url parses");
+    engine_a.add_peer(EndpointAddr::new(engine_b.endpoint_id()).with_relay_url(relay.clone()));
+    engine_b.add_peer(EndpointAddr::new(engine_a.endpoint_id()).with_relay_url(relay.clone()));
 
     // Let both endpoints home to the relay.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -136,7 +138,6 @@ async fn notes_converge_through_the_relay() {
     // that is expected and does not undermine the addressing proof — the point
     // is that the peer is reachable and dialable from relay-only address
     // information, the account-directory addressing shape.)
-    let relay: RelayUrl = relay_url.parse().expect("relay url parses");
     let b_relay_only = EndpointAddr::new(engine_b.endpoint_id()).with_relay_url(relay);
 
     // A dials B through the relay and reconciles the meeting (30s guard so a relay

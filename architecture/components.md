@@ -273,7 +273,10 @@ rooted at its own data directory (single-writer per root):
 
 - **Headless hub (`minutist-hub`)** roots it at `--data-dir`, pairs via the
   one-shot `print-ticket` / `add-peer` CLI subcommands, and re-reads the file on a
-  poll so an `add-peer` made while it runs is honoured without a restart.
+  poll so an `add-peer` made while it runs is honoured without a restart. The
+  one-shot `create-meeting --title <t>` subcommand originates a meeting in the
+  hub's data dir (for the hands-off 2-device sync-completion e2e), which the
+  running hub then pushes to paired peers.
 - **Desktop app (`ConnectedSync` in `app-main`)** roots it at the app-data base
   (beside `sync_node_key`). On each engine bind it loads the file, writes its own
   ticket to `{app-data}/my_ticket`, and polls the file (`PEERS_POLL_INTERVAL`) so

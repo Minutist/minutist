@@ -8,8 +8,11 @@
 //! deployed relay (`sync.minutist.ai`), addressed relay-only so the path is
 //! genuinely brokered.
 //!
-//! GATED: skips unless `MINUTIST_SYNC_TOKEN` is set, so a normal `cargo test` and
-//! CI never touch the network. Run:
+//! GATED (the live-relay tests): they skip unless `MINUTIST_SYNC_TOKEN` is set, so a
+//! normal `cargo test` and CI never touch the network. The one exception is
+//! `create_meeting_seeds_a_meeting_folder_with_notes` — a local, ungated one-shot that
+//! invokes the built binary's `create-meeting` and asserts the on-disk meeting + its
+//! status digest; it needs no network and always runs. Run the gated set with:
 //!
 //! ```sh
 //! MINUTIST_SYNC_TOKEN=<relay-access-token> \
@@ -23,6 +26,7 @@ use std::time::Duration;
 use iroh::{EndpointAddr, RelayUrl};
 use minutist_common::{HostRef, MeetingId, ProcessingLifecycle};
 use notes_crdt::NotesStore;
+use sha2::Digest;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use uuid::Uuid;
 
@@ -465,4 +469,102 @@ async fn wait_for_processing(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     false
+}
+
+/// `create-meeting` subcommand test: originate a meeting in a data directory,
+/// verify the meeting folder and notes.ydoc are created, and confirm the
+/// `status` command reports the meeting with a non-empty digest.
+#[test]
+fn create_meeting_seeds_a_meeting_folder_with_notes() {
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = data_dir.path();
+
+    // Run `minutist-hub --data-dir <dir> create-meeting --title "Test Meeting"`
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"))
+        .args([
+            "--data-dir",
+            dir.to_str().expect("utf8 data dir"),
+            "create-meeting",
+            "--title",
+            "Test Meeting",
+        ])
+        .output()
+        .expect("run create-meeting");
+
+    assert!(
+        output.status.success(),
+        "create-meeting must exit cleanly; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The command prints the UUID to stdout.
+    let uuid_str = String::from_utf8(output.stdout)
+        .expect("parse stdout as utf8")
+        .trim()
+        .to_string();
+    let meeting_id = MeetingId(
+        uuid::Uuid::parse_str(&uuid_str).expect("parse UUID from create-meeting output"),
+    );
+
+    // Verify the meeting folder exists.
+    let meetings_root = dir.join("meetings");
+    let meeting_dir = meetings_root.join(meeting_id.0.to_string());
+    assert!(meeting_dir.exists(), "meeting folder must be created");
+
+    // Verify metadata.json exists (created by MeetingFolder::ensure).
+    let metadata_path = meeting_dir.join("metadata.json");
+    assert!(metadata_path.exists(), "metadata.json must be created");
+
+    // Verify notes.ydoc exists (created by NotesStore::save).
+    let notes_path = meeting_dir.join("notes.ydoc");
+    assert!(notes_path.exists(), "notes.ydoc must be created");
+
+    // Verify the notes have content by projecting to JSON and checking digest.
+    let v1 = NotesStore::read_ydoc_state(&meetings_root, meeting_id)
+        .expect("read ydoc state")
+        .expect("meeting has a notes.ydoc");
+    let doc = notes_crdt::ydoc::new_ydoc();
+    notes_crdt::ydoc::apply_update_v1(&doc, &v1).expect("apply v1 state");
+    let json = notes_crdt::ydoc::ydoc_to_json(&doc);
+    let bytes = serde_json::to_vec(&json).expect("serialize json");
+    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    assert!(!digest.is_empty(), "digest must be non-empty");
+    assert_eq!(digest.len(), 64, "sha256 hex digest must be 64 chars");
+
+    // Verify `status` reports the meeting with the same digest.
+    let status_output = std::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"))
+        .args([
+            "--data-dir",
+            dir.to_str().expect("utf8 data dir"),
+            "--relay-url",
+            "wss://relay.example.invalid",
+            "status",
+        ])
+        .output()
+        .expect("run status");
+
+    assert!(
+        status_output.status.success(),
+        "status must exit cleanly"
+    );
+
+    let status_json: serde_json::Value = serde_json::from_slice(&status_output.stdout)
+        .expect("parse status json");
+    let meetings_arr = status_json["meetings"]
+        .as_array()
+        .expect("status must have meetings array");
+    let created_meeting = meetings_arr
+        .iter()
+        .find(|m| m["id"] == uuid_str)
+        .expect("created meeting must be listed in status");
+
+    assert_eq!(
+        created_meeting["ydoc_present"], true,
+        "status must report ydoc_present=true"
+    );
+    assert_eq!(
+        created_meeting["digest"].as_str().expect("digest must be string"),
+        digest,
+        "status digest must match the projected digest"
+    );
 }

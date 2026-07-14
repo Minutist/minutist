@@ -1,24 +1,36 @@
-//! Gated live end-to-end check: two devices converge THROUGH a real, running
-//! `minutist-hub` daemon — the parked-peer model the hub deployment relies on.
+//! End-to-end check: two devices converge THROUGH a real, running `minutist-hub`
+//! daemon — the parked-peer model the hub deployment relies on.
 //!
 //! Spawns the actual `minutist-hub` binary as the always-on middle peer, pairs two
 //! `SyncEngine`s (A and B) with it via the relay, seeds a note on A and pushes it
 //! to the hub, then has B pull it from the hub. B converging proves the hub
-//! authorises paired peers, holds the merged CRDT, and serves it back — over the
-//! deployed relay (`sync.minutist.ai`), addressed relay-only so the path is
-//! genuinely brokered.
+//! authorises paired peers, holds the merged CRDT, and serves it back over a
+//! relay, addressed relay-only so the path is genuinely brokered.
 //!
-//! GATED (the live-relay tests): they skip unless `MINUTIST_SYNC_TOKEN` is set, so a
-//! normal `cargo test` and CI never touch the network. The one exception is
-//! `create_meeting_seeds_a_meeting_folder_with_notes` — a local, ungated one-shot that
-//! invokes the built binary's `create-meeting` and asserts the on-disk meeting + its
-//! status digest; it needs no network and always runs. Run the gated set with:
+//! `notes_converge_through_a_running_hub` is LOCAL-BY-DEFAULT: a plain
+//! `cargo test` spins an in-process iroh test relay
+//! (`iroh::test_utils::run_relay_server`) and runs ungated, with no live
+//! dependency. The spawned `minutist-hub` binary is told to trust that relay's
+//! self-signed certificate via `MINUTIST_HUB_INSECURE_RELAY_TLS` (see
+//! `bind_sync_engine` in `src/main.rs`, compiled only under this crate's
+//! `test-support` feature — never in a production build). Live-on-demand: when
+//! both `MINUTIST_SYNC_TOKEN` and `MINUTIST_SYNC_RELAY` are set, it instead runs
+//! against the deployed relay, the real smoke-test path:
 //!
 //! ```sh
 //! MINUTIST_SYNC_TOKEN=<relay-access-token> \
+//! MINUTIST_SYNC_RELAY=https://sync.minutist.ai \
 //!   cargo test -p headless --test hub_e2e -- --nocapture
 //! ```
-//! `MINUTIST_SYNC_RELAY` overrides the relay URL (default `DEFAULT_RELAY_URL`).
+//!
+//! The other two hub_e2e cases (`hub_pushes_a_meeting_to_an_arriving_peer`,
+//! `hub_records_a_peers_processing_lifecycle_via_discovery`) remain GATED: they
+//! skip unless `MINUTIST_SYNC_TOKEN` is set, so a normal `cargo test` and CI
+//! never touch the network for them.
+//!
+//! `create_meeting_seeds_a_meeting_folder_with_notes` is a local, ungated
+//! one-shot that invokes the built binary's `create-meeting` and asserts the
+//! on-disk meeting + its status digest; it needs no network and always runs.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -45,20 +57,26 @@ fn projected(root: &std::path::Path, meeting: MeetingId) -> serde_json::Value {
 /// Spawn the real minutist-hub daemon for a test: collapsed sub-second timers and
 /// piped stderr drained in the background, returning the child plus a signal that
 /// fires once the daemon logs its readiness marker. `kill_on_drop` cleans up.
+///
+/// `token` is `None` for the local in-process test relay (which needs none);
+/// `insecure_relay_tls` sets `MINUTIST_HUB_INSECURE_RELAY_TLS` so the daemon
+/// trusts that relay's self-signed certificate instead of verifying it — the
+/// `test-support`-gated escape hatch in `src/main.rs`'s `bind_sync_engine`.
 fn spawn_hub(
     hub_dir: &std::path::Path,
     relay_url: &str,
-    token: &str,
+    token: Option<&str>,
+    insecure_relay_tls: bool,
 ) -> (tokio::process::Child, tokio::sync::oneshot::Receiver<()>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"))
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"));
+    command
         .args([
             "--data-dir",
             hub_dir.to_str().expect("utf8 hub dir"),
             "--relay-url",
             relay_url,
         ])
-        .env("MINUTIST_SYNC_TOKEN", token)
         .env("RUST_LOG", "hub=info,iroh=error,iroh_relay=error")
         // Collapse the hub's timers so reconnect/push/discovery scenarios run
         // sub-second.
@@ -67,9 +85,14 @@ fn spawn_hub(
         .env("MINUTIST_HUB_DISCOVERY_MS", "500")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn minutist-hub");
+        .kill_on_drop(true);
+    if let Some(token) = token {
+        command.env("MINUTIST_SYNC_TOKEN", token);
+    }
+    if insecure_relay_tls {
+        command.env("MINUTIST_HUB_INSECURE_RELAY_TLS", "1");
+    }
+    let mut child = command.spawn().expect("spawn minutist-hub");
     let stderr = child.stderr.take().expect("hub stderr piped");
     let (tx, rx) = tokio::sync::oneshot::channel();
     // Drain stderr (so the daemon never blocks on a full pipe) and fire once ready.
@@ -143,16 +166,34 @@ fn status_digest(
 
 #[tokio::test]
 async fn notes_converge_through_a_running_hub() {
-    let token = match std::env::var("MINUTIST_SYNC_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
+    // Resolve the relay: live (deployed) only when BOTH env vars are set;
+    // otherwise spin an in-process local relay so the test runs ungated with no
+    // live dependency. `_relay_guard` is bound in this, the function's FIRST
+    // `let`, so it drops LAST (Rust drops locals in reverse declaration order),
+    // keeping the local relay alive for the whole test. `insecure` marks the
+    // local path, where both the in-process engines and the spawned hub daemon
+    // must trust the local relay's self-signed certificate instead of
+    // verifying it.
+    let live_token = std::env::var("MINUTIST_SYNC_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let live_relay = std::env::var("MINUTIST_SYNC_RELAY")
+        .ok()
+        .filter(|r| !r.is_empty());
+    let (relay_url, token, insecure, _relay_guard) = match (live_token, live_relay) {
+        (Some(token), Some(relay_url)) => {
+            eprintln!("hub_e2e: using LIVE relay {relay_url}");
+            (relay_url, Some(token), false, None)
+        }
         _ => {
-            eprintln!("SKIP hub_e2e: set MINUTIST_SYNC_TOKEN to run the live hub test");
-            return;
+            let (_relay_map, relay_url, guard) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("spawn local test relay");
+            let relay_url = relay_url.to_string();
+            eprintln!("hub_e2e: using LOCAL relay {relay_url}");
+            (relay_url, None, true, Some(guard))
         }
     };
-    let relay_url = std::env::var("MINUTIST_SYNC_RELAY")
-        .unwrap_or_else(|_| SyncConfig::DEFAULT_RELAY_URL.into());
-    eprintln!("hub_e2e: using relay {relay_url}");
 
     let hub_dir = tempfile::TempDir::new().expect("hub tempdir");
     let dir_a = tempfile::TempDir::new().expect("tempdir a");
@@ -166,17 +207,30 @@ async fn notes_converge_through_a_running_hub() {
 
     let cfg = |dir: &std::path::Path| SyncConfig {
         relay_url: relay_url.clone(),
-        relay_auth_token: Some(token.clone()),
+        relay_auth_token: token.clone(),
         meetings_root: dir.to_path_buf(),
     };
     let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
-    let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a)
-        .await
-        .expect("engine A binds");
-    let engine_b = SyncEngine::start(cfg(dir_b.path()), id_b)
-        .await
-        .expect("engine B binds");
+    // `start_insecure` trusts the local relay's self-signed certificate instead
+    // of verifying it; the live path verifies normally via `start`.
+    let (engine_a, engine_b) = if insecure {
+        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a)
+            .await
+            .expect("engine A binds");
+        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b)
+            .await
+            .expect("engine B binds");
+        (a, b)
+    } else {
+        let a = SyncEngine::start(cfg(dir_a.path()), id_a)
+            .await
+            .expect("engine A binds");
+        let b = SyncEngine::start(cfg(dir_b.path()), id_b)
+            .await
+            .expect("engine B binds");
+        (a, b)
+    };
 
     // The hub must authorise A and B on startup — write their tickets to its peers
     // file before launching it (the daemon loads the file as it comes up).
@@ -187,8 +241,10 @@ async fn notes_converge_through_a_running_hub() {
     .expect("write hub peers file");
 
     // Launch the real daemon (collapsed timers; readiness via its stderr marker).
-    // It reloads `hub_id` and the peers; kill_on_drop cleans up on panic.
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, &token);
+    // It reloads `hub_id` and the peers; kill_on_drop cleans up on panic. On the
+    // local path it is told (via `insecure`) to trust the relay's self-signed
+    // certificate the same way the in-process engines above do.
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, token.as_deref(), insecure);
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")
@@ -306,7 +362,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     )
     .expect("write hub peers");
 
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, &token);
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false);
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")
@@ -412,7 +468,7 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
     )
     .expect("write hub peers");
 
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, &token);
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false);
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")

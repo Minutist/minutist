@@ -38,16 +38,24 @@
 //! with another process.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use iroh_tickets::endpoint::EndpointTicket;
 use minutist_common::{AppError, AppResult, MeetingId, ProcessingLifecycle};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use sync::{DeviceIdentity, SyncConfig, SyncEngine};
+use sync::{
+    run_account_refresh_loop, AccountEndpoint, AccountEndpointSource, DeviceIdentity, SyncConfig,
+    SyncEngine,
+};
 use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::Notify;
 
 /// Default shutdown drain window; override `MINUTIST_HUB_SHUTDOWN_GRACE_MS`.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -66,6 +74,92 @@ const PEER_PUSH_DEBOUNCE: Duration = Duration::from_secs(15);
 /// (advertised before the meeting's folder had synced in) is eventually
 /// re-applied; override `MINUTIST_HUB_DISCOVERY_MS`.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Interval between account-directory refreshes (fetch peer list + re-register
+/// endpoint). Same as the desktop's B4 wiring in `src-tauri/src/sync.rs`.
+const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The default account API base URL. Overridable via `--relay-api-url`.
+const DEFAULT_API_URL: &str = "https://api.minutist.ai";
+
+/// The filename under `{data-dir}` that holds the seeded device credential.
+/// Written by an operator (or the e2e harness) — the hub never runs the
+/// interactive device-code flow.
+const CREDENTIAL_FILE: &str = "tunnel_device.json";
+
+/// The persisted device credential for account-mediated peer discovery
+/// (`{data-dir}/tunnel_device.json`). Seeded by the operator; the headless
+/// daemon reads it on startup but never writes it (no interactive pairing).
+///
+/// The three-field JSON shape is a contract with the seeding harness: the same
+/// file the desktop's `app-main` writes on successful pairing. A headless instance
+/// is seeded directly from the operator tooling rather than running the
+/// device-code flow.
+///
+/// `device_credential` is the long-lived `mdc_` bearer — never logged.
+#[derive(Debug, Deserialize, PartialEq)]
+struct StoredCredential {
+    device_credential: String,
+    account_id: String,
+    device_id: String,
+}
+
+impl StoredCredential {
+    /// Load the stored credential, or `None` when absent / unreadable / corrupt.
+    /// A missing file is the normal unauthenticated case; a corrupt file is
+    /// treated the same way (the operator can re-seed). Both paths leave the hub
+    /// running with peers-file pairing only — no panic, no startup failure.
+    fn load(data_dir: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(data_dir.join(CREDENTIAL_FILE)).ok()?;
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(c) if !c.device_credential.is_empty() => Some(c),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    target: "hub",
+                    error = %e,
+                    "tunnel_device.json is corrupt; skipping account-mediated discovery"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Adapts `tunnel_client::AccountDirectoryClient` onto `sync::AccountEndpointSource`.
+///
+/// `tunnel-client` stays a near-leaf (no `sync` edge); `headless` is the
+/// assembler that depends on both and bridges them. This adapter mirrors the
+/// `AccountDirectorySource` in `app-main`'s `src-tauri/src/sync.rs`.
+struct AccountDirectorySource {
+    client: tunnel_client::AccountDirectoryClient,
+}
+
+#[async_trait]
+impl AccountEndpointSource for AccountDirectorySource {
+    async fn list_endpoints(&self) -> AppResult<Vec<AccountEndpoint>> {
+        let devices = self.client.list_devices().await.map_err(|e| AppError::Internal {
+            context: format!("account directory list: {e}"),
+        })?;
+        Ok(devices
+            .into_iter()
+            .map(|d| AccountEndpoint {
+                device_id: d.device_id,
+                endpoint_id: d.endpoint_id,
+                relay_url: d.relay_url,
+            })
+            .collect())
+    }
+
+    async fn register_self(&self, endpoint: &AccountEndpoint) -> AppResult<()> {
+        self.client
+            .register_self_endpoint(&endpoint.endpoint_id, &endpoint.relay_url)
+            .await
+            .map_err(|e| AppError::Internal {
+                context: format!("account directory register-self: {e}"),
+            })
+    }
+}
 
 /// A timing default overridable via an env var (milliseconds), so a test mode can
 /// collapse the hub's timers to sub-second without touching production defaults.
@@ -107,6 +201,13 @@ struct Cli {
     #[arg(long, env = "MINUTIST_SYNC_TOKEN")]
     relay_token: Option<String>,
 
+    /// The account API base URL for account-mediated peer discovery.
+    /// Used to publish this device's endpoint and to fetch the account's other
+    /// device endpoints (`GET /v1/account/devices`). Only active when a seeded
+    /// device credential is present at `{data-dir}/tunnel_device.json`.
+    #[arg(long, default_value = DEFAULT_API_URL)]
+    relay_api_url: String,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -132,7 +233,7 @@ async fn main() -> AppResult<()> {
     let data_dir = resolve_data_dir(&cli.data_dir)?;
 
     match cli.command {
-        None => run_daemon(&data_dir, cli.relay_url, cli.relay_token).await,
+        None => run_daemon(&data_dir, cli.relay_url, cli.relay_token, cli.relay_api_url).await,
         Some(Command::PrintTicket) => print_ticket(&data_dir, cli.relay_url, cli.relay_token).await,
         Some(Command::AddPeer { ticket }) => add_peer(&data_dir, &ticket),
         Some(Command::Status) => print_status(&data_dir, cli.relay_url),
@@ -145,6 +246,7 @@ async fn run_daemon(
     data_dir: &Path,
     relay_url: String,
     relay_token: Option<String>,
+    api_url: String,
 ) -> AppResult<()> {
     // Hold the tracing-appender worker guard for the whole process lifetime so the
     // non-blocking file writer is flushed on exit.
@@ -159,7 +261,8 @@ async fn run_daemon(
         "minutist-hub starting"
     );
 
-    let engine = start_engine(data_dir, relay_url, relay_token).await?;
+    let (engine, account_args) =
+        start_engine(data_dir, relay_url, relay_token, api_url).await?;
 
     tracing::info!(target: "hub", endpoint_id = %engine.endpoint_id(), "sync engine started");
     // Log the pairing ticket so an operator can pair a desktop with this hub
@@ -171,10 +274,12 @@ async fn run_daemon(
     // it simply retries.
     tracing::info!(target: "hub", "minutist-hub ready");
 
-    // Authorise paired peers from the `peers` file, then keep re-reading it so an
-    // `add-peer` made while the daemon runs is picked up without a restart.
+    // Authorise paired peers from the `peers` file and (if seeded) from the account
+    // directory; keep re-reading the peers file so an `add-peer` made while the
+    // daemon runs is picked up without a restart. Both discovery mechanisms stop
+    // on the daemon's shutdown signal inside serve_until_shutdown.
     let mut seen: HashSet<String> = HashSet::new();
-    serve_until_shutdown(&engine, data_dir, &mut seen).await;
+    serve_until_shutdown(&engine, data_dir, &mut seen, account_args).await;
 
     tracing::info!(target: "hub", "shutdown signal received; draining in-flight sync");
     // Bound the drain: a systemd `stop` must see the process exit promptly. If the
@@ -204,7 +309,9 @@ async fn print_ticket(
     relay_url: String,
     relay_token: Option<String>,
 ) -> AppResult<()> {
-    let engine = start_engine(data_dir, relay_url, relay_token).await?;
+    // `print-ticket` never runs the account-refresh loop; pass a dummy api_url.
+    let (engine, _account_args) =
+        start_engine(data_dir, relay_url, relay_token, DEFAULT_API_URL.to_string()).await?;
     let ticket = engine.my_ticket();
     // Command output (the purpose of this subcommand), not logging — println is
     // the right channel here, distinct from the daemon's tracing.
@@ -332,12 +439,36 @@ fn meeting_digest(meetings_root: &Path, meeting: MeetingId) -> Option<String> {
     Some(format!("{:x}", sha2::Sha256::digest(&bytes)))
 }
 
+/// Arguments for the account-refresh loop, built by `start_engine` when a seeded
+/// device credential is present. Consumed by `serve_until_shutdown` as a third
+/// select! arm alongside the peers-file poll and the discovery sweep.
+struct AccountRefreshArgs {
+    source: Arc<dyn AccountEndpointSource>,
+    self_endpoint: AccountEndpoint,
+    /// Shared with `serve_until_shutdown`'s shutdown arm so the loop observes the
+    /// daemon's single shutdown signal.
+    ///
+    /// TODO(0029 item 1): migrate this `Arc<Notify>` stop to
+    /// `tokio_util::sync::CancellationToken` together with the desktop B4 loop
+    /// (`src-tauri/src/sync.rs`) and the `sync-ffi` consumer — all three must
+    /// move at once so the API change is atomic.
+    stop: Arc<Notify>,
+}
+
 /// Build and start the sync engine for `data_dir` against the given relay.
+///
+/// When a seeded device credential is present at
+/// `{data_dir}/tunnel_device.json`, also prepares the `AccountRefreshArgs`
+/// needed by the account-mediated peer-discovery loop. If the credential is
+/// absent or the account-directory client cannot be built, logs at `info` and
+/// returns `None` — the daemon falls back to peers-file pairing only, with no
+/// startup failure.
 async fn start_engine(
     data_dir: &Path,
     relay_url: String,
     relay_token: Option<String>,
-) -> AppResult<SyncEngine> {
+    api_url: String,
+) -> AppResult<(SyncEngine, Option<AccountRefreshArgs>)> {
     // Device identity (0600 ed25519 key) at the data root, generated on first run
     // and reloaded thereafter — the stable identity peers pair against.
     let identity = DeviceIdentity::load_or_generate(data_dir)?;
@@ -349,7 +480,7 @@ async fn start_engine(
     })?;
 
     let mut config = SyncConfig::new(meetings_root);
-    config.relay_url = relay_url;
+    config.relay_url = relay_url.clone();
     if let Some(token) = relay_token {
         config = config.with_relay_auth_token(token);
     }
@@ -357,7 +488,58 @@ async fn start_engine(
     // Binding opens the QUIC socket and spawns the inbound accept loop; the relay
     // is dialled lazily, so the engine starts even if the relay is momentarily
     // unreachable.
-    Ok(SyncEngine::start(config, identity).await?)
+    let engine = SyncEngine::start(config, identity).await?;
+
+    // Account-mediated peer discovery (5.5b / B4): when a seeded device credential
+    // is present, build the account-directory source so serve_until_shutdown can run
+    // the refresh loop as a third select! arm alongside the peers-file poll and the
+    // discovery sweep. When absent, the daemon falls back to peers-file pairing only.
+    let account_args = match StoredCredential::load(data_dir) {
+        None => {
+            tracing::info!(
+                target: "hub",
+                "no device credential found; account-mediated peer discovery disabled \
+                 (seed {CREDENTIAL_FILE} to enable)"
+            );
+            None
+        }
+        Some(cred) => {
+            match tunnel_client::AccountDirectoryClient::new(&api_url, cred.device_credential) {
+                Err(e) => {
+                    tracing::warn!(
+                        target: "hub",
+                        error = %e,
+                        api_url = %api_url,
+                        "account-directory client not built; skipping account discovery"
+                    );
+                    None
+                }
+                Ok(client) => {
+                    let source: Arc<dyn AccountEndpointSource> =
+                        Arc::new(AccountDirectorySource { client });
+                    let self_endpoint = AccountEndpoint {
+                        device_id: cred.device_id,
+                        endpoint_id: engine.endpoint_id().to_string(),
+                        relay_url,
+                    };
+                    tracing::info!(
+                        target: "hub",
+                        account_id = %cred.account_id,
+                        device_id = %self_endpoint.device_id,
+                        endpoint_id = %self_endpoint.endpoint_id,
+                        "account credential loaded; account-refresh loop will start"
+                    );
+                    Some(AccountRefreshArgs {
+                        source,
+                        self_endpoint,
+                        stop: Arc::new(Notify::new()),
+                    })
+                }
+            }
+        }
+    };
+
+    Ok((engine, account_args))
 }
 
 /// Serve until `SIGTERM` / `SIGINT`. The peers file is re-read on a fixed interval
@@ -369,13 +551,25 @@ async fn start_engine(
 /// periodic discovery sweep re-advertises so a lifecycle state a consumer dropped
 /// or skipped is re-applied (the recovery driver).
 ///
+/// When `account_args` is `Some`, the account-refresh loop runs as a THIRD select!
+/// arm alongside the peers-file poll and the discovery sweep. Both discovery
+/// mechanisms (peers-file + account-directory) are additive — they feed the same
+/// `PeerDirectory` — and both stop on this function's shutdown signal. The loop is
+/// NOT detached: running it inline here means it cannot outlive this function and
+/// cannot race `engine.shutdown()` after this returns.
+///
 /// The lifecycle-event CONSUMER runs in a dedicated spawned task
 /// ([`apply_lifecycle_events`]), NOT in this select loop: the loop awaits the
 /// emitters (`discover_all` and the `push_all_to` ride-along both emit into the
 /// same broadcast), so draining in the same loop would let a sweep larger than the
 /// channel cap self-lag while the loop is parked on the sweep producing it — a
 /// separate drain keeps up concurrently.
-async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut HashSet<String>) {
+async fn serve_until_shutdown(
+    engine: &SyncEngine,
+    data_dir: &Path,
+    seen: &mut HashSet<String>,
+    account_args: Option<AccountRefreshArgs>,
+) {
     let mut poll = tokio::time::interval(dur_or_env("MINUTIST_HUB_POLL_MS", PEER_POLL_INTERVAL));
     let debounce = dur_or_env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", PEER_PUSH_DEBOUNCE);
     let mut discovery_poll =
@@ -399,9 +593,51 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
+    // Account-refresh loop: runs as a third select! arm when account credentials are
+    // present, so it shares the daemon's single shutdown signal and cannot outlive
+    // this function. When absent, resolves to `std::future::pending()` — that arm
+    // never fires but also never breaks the select.
+    //
+    // Pinned once, like `shutdown`, so the arm persists across loop iterations
+    // without recreating the future on each pass.
+    let account_stop = account_args.as_ref().map(|a| Arc::clone(&a.stop));
+    let account_refresh: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
+        match account_args {
+            Some(args) => Box::pin(run_account_refresh_loop(
+                args.source,
+                args.self_endpoint,
+                ACCOUNT_REFRESH_INTERVAL,
+                args.stop,
+                move |ep| {
+                    if let Err(e) = engine.add_account_peer(&ep.endpoint_id, &ep.relay_url) {
+                        tracing::warn!(
+                            target: "hub",
+                            error = %e,
+                            "account peer add rejected"
+                        );
+                    }
+                },
+            )),
+            None => Box::pin(std::future::pending()),
+        };
+    tokio::pin!(account_refresh);
+
     'serve: loop {
         tokio::select! {
-            _ = &mut shutdown => break 'serve,
+            _ = &mut shutdown => {
+                // Notify the account-refresh loop's own stop handle so it exits its
+                // internal select cleanly rather than being dropped mid-await. The
+                // outer select arm drop handles it regardless, but an explicit notify
+                // is cleaner and matches the desktop's pattern.
+                if let Some(stop) = &account_stop {
+                    stop.notify_one();
+                }
+                break 'serve;
+            }
+            // Third arm: account-mediated peer discovery. Runs alongside the peers-file
+            // poll. Both feed the same PeerDirectory. This arm fires only when the loop
+            // exits (stop notified); under normal operation it parks here.
+            _ = &mut account_refresh => {}
             _ = poll.tick() => { sync::peers::reload_into(engine, data_dir, seen); },
             _ = discovery_poll.tick() => {
                 // Recovery sweep: re-discover every known peer so a lifecycle state
@@ -409,7 +645,12 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
                 // it was advertised) is re-applied. Raced against shutdown, like the
                 // push arm. (The first, immediate tick is a no-op before peers load.)
                 tokio::select! {
-                    _ = &mut shutdown => break 'serve,
+                    _ = &mut shutdown => {
+                        if let Some(stop) = &account_stop {
+                            stop.notify_one();
+                        }
+                        break 'serve;
+                    }
                     result = engine.discover_all() => match result {
                         Ok(n) => tracing::debug!(target: "hub", peers = n, "periodic discovery swept peers"),
                         Err(e) => tracing::warn!(target: "hub", error = %e, "periodic discovery failed"),
@@ -444,7 +685,12 @@ async fn serve_until_shutdown(engine: &SyncEngine, data_dir: &Path, seen: &mut H
                     // notes writes are atomic and media is content-addressed, so an
                     // abandoned push is safe and idempotent on the next reconcile).
                     tokio::select! {
-                        _ = &mut shutdown => break 'serve,
+                        _ = &mut shutdown => {
+                            if let Some(stop) = &account_stop {
+                                stop.notify_one();
+                            }
+                            break 'serve;
+                        }
                         result = engine.push_all_to_peer(&peer) => match result {
                             Ok(n) => tracing::info!(target: "hub", peer = %peer, meetings = n, "pushed meetings to arrived peer"),
                             Err(e) => tracing::warn!(target: "hub", peer = %peer, error = %e, "push to arrived peer failed"),
@@ -656,5 +902,54 @@ mod tests {
             Some(identity.endpoint_id().to_string().as_str()),
             "status must report the pre-existing identity"
         );
+    }
+
+    #[test]
+    fn stored_credential_load_returns_none_when_file_is_absent() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let result = StoredCredential::load(base.path());
+        assert_eq!(result, None, "missing file returns None");
+    }
+
+    #[test]
+    fn stored_credential_load_parses_present_valid_json() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let cred_path = base.path().join(CREDENTIAL_FILE);
+        let json = serde_json::json!({
+            "device_credential": "mdc_test_credential",
+            "account_id": "acct_12345",
+            "device_id": "dev_67890"
+        });
+        std::fs::write(&cred_path, serde_json::to_string(&json).expect("serialize")).expect("write");
+
+        let result = StoredCredential::load(base.path()).expect("load credential");
+        assert_eq!(result.device_credential, "mdc_test_credential");
+        assert_eq!(result.account_id, "acct_12345");
+        assert_eq!(result.device_id, "dev_67890");
+    }
+
+    #[test]
+    fn stored_credential_load_returns_none_when_device_credential_is_empty() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let cred_path = base.path().join(CREDENTIAL_FILE);
+        let json = serde_json::json!({
+            "device_credential": "",
+            "account_id": "acct_12345",
+            "device_id": "dev_67890"
+        });
+        std::fs::write(&cred_path, serde_json::to_string(&json).expect("serialize")).expect("write");
+
+        let result = StoredCredential::load(base.path());
+        assert_eq!(result, None, "empty device_credential returns None");
+    }
+
+    #[test]
+    fn stored_credential_load_returns_none_when_json_is_corrupt() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let cred_path = base.path().join(CREDENTIAL_FILE);
+        std::fs::write(&cred_path, "not valid json {").expect("write");
+
+        let result = StoredCredential::load(base.path());
+        assert_eq!(result, None, "corrupt JSON returns None");
     }
 }

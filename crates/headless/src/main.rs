@@ -482,6 +482,36 @@ struct AccountRefreshArgs {
     stop: Arc<Notify>,
 }
 
+/// Binds the sync engine, trusting the relay's TLS certificate unconditionally
+/// when `MINUTIST_HUB_INSECURE_RELAY_TLS` is set instead of verifying it against
+/// the system CA roots.
+///
+/// Exists solely for `hub_e2e`'s in-process test relay
+/// (`iroh::test_utils::run_relay_server`), whose self-signed certificate no CA
+/// recognises. Gated behind `test-support`: this whole function — env var
+/// included — compiles only in a test build, so the escape hatch cannot exist
+/// in a shipped binary regardless of the environment it runs in.
+#[cfg(feature = "test-support")]
+async fn bind_sync_engine(
+    config: SyncConfig,
+    identity: DeviceIdentity,
+) -> sync::Result<SyncEngine> {
+    if std::env::var_os("MINUTIST_HUB_INSECURE_RELAY_TLS").is_some() {
+        SyncEngine::start_insecure(config, identity).await
+    } else {
+        SyncEngine::start(config, identity).await
+    }
+}
+
+/// The production path: always verifies the relay's TLS certificate.
+#[cfg(not(feature = "test-support"))]
+async fn bind_sync_engine(
+    config: SyncConfig,
+    identity: DeviceIdentity,
+) -> sync::Result<SyncEngine> {
+    SyncEngine::start(config, identity).await
+}
+
 /// Build and start the sync engine for `data_dir` against the given relay.
 ///
 /// When a seeded device credential is present at
@@ -515,7 +545,7 @@ async fn start_engine(
     // Binding opens the QUIC socket and spawns the inbound accept loop; the relay
     // is dialled lazily, so the engine starts even if the relay is momentarily
     // unreachable.
-    let engine = SyncEngine::start(config, identity).await?;
+    let engine = bind_sync_engine(config, identity).await?;
 
     // Account-mediated peer discovery (5.5b / B4): when a seeded device credential
     // is present, build the account-directory source so serve_until_shutdown can run

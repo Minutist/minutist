@@ -1,23 +1,24 @@
-//! Live end-to-end check against the DEPLOYED relay (`sync.minutist.ai`).
+//! Relay-only convergence: two `SyncEngine`s connect through a relay — dialled
+//! by relay URL alone, no direct socket address — and reconcile a note.
 //!
-//! Two `SyncEngine`s bind with `RelayMode::Custom(sync.minutist.ai)` carrying the
-//! relay access token, then one dials the other **addressed by relay URL only**
-//! (no direct socket addresses) so the connection must be brokered by the relay
-//! rather than going direct over loopback. A note seeded on A is reconciled to B
-//! over that relay-routed connection. Passing proves, against the real
-//! deployment: relay reachability, the shared-token `AccessControl`, and the
-//! notes-sync protocol — the things the in-process tests (which use
-//! `RelayMode::Disabled`) cannot exercise.
+//! Local-by-default: a normal `cargo test` spins an in-process iroh test relay
+//! (`iroh::test_utils::run_relay_server`, `AllowAll` access — no token needed)
+//! and runs ungated, with no network dependency. This proves the relay-only
+//! DATA flow (the account-directory addressing shape) without touching
+//! anything deployed.
 //!
-//! GATED: skips unless `MINUTIST_SYNC_TOKEN` is set, so a normal `cargo test`
-//! and CI never touch the network. Run:
+//! Live-on-demand: when both `MINUTIST_SYNC_TOKEN` and `MINUTIST_SYNC_RELAY`
+//! are set, the test instead runs against the deployed relay
+//! (`sync.minutist.ai` by convention), carrying the token through
+//! `RelayConfig::with_auth_token`. That is the smoke path for validating the
+//! real deployment; it is never required for a plain `cargo test` or CI. Run
+//! it with:
 //!
 //! ```sh
 //! MINUTIST_SYNC_TOKEN=<relay-access-token> \
+//! MINUTIST_SYNC_RELAY=https://sync.minutist.ai \
 //!   cargo test -p sync --features test-support --test relay_live -- --nocapture
 //! ```
-//! `MINUTIST_SYNC_RELAY` overrides the relay URL (default the crate's
-//! `DEFAULT_RELAY_URL`).
 
 use std::time::Duration;
 
@@ -40,17 +41,32 @@ fn projected(root: &std::path::Path, meeting: MeetingId) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn notes_converge_through_the_deployed_relay() {
-    let token = match std::env::var("MINUTIST_SYNC_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
+async fn notes_converge_through_the_relay() {
+    // Resolve the relay: live (deployed) only when BOTH env vars are set;
+    // otherwise spin an in-process local relay so the test runs ungated with no
+    // live dependency. `_relay_guard` is declared here (before the engines) so
+    // it drops LAST, keeping the local relay alive for the whole test; it is
+    // `None` on the live path, where nothing local needs to stay alive.
+    let live_token = std::env::var("MINUTIST_SYNC_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let live_relay = std::env::var("MINUTIST_SYNC_RELAY")
+        .ok()
+        .filter(|r| !r.is_empty());
+    let (relay_url, token, insecure, _relay_guard) = match (live_token, live_relay) {
+        (Some(token), Some(relay_url)) => {
+            eprintln!("relay_live: using LIVE relay {relay_url}");
+            (relay_url, Some(token), false, None)
+        }
         _ => {
-            eprintln!("SKIP relay_live: set MINUTIST_SYNC_TOKEN to run the live relay test");
-            return;
+            let (_relay_map, relay_url, guard) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("spawn local test relay");
+            let relay_url = relay_url.to_string();
+            eprintln!("relay_live: using LOCAL relay {relay_url}");
+            (relay_url, None, true, Some(guard))
         }
     };
-    let relay_url = std::env::var("MINUTIST_SYNC_RELAY")
-        .unwrap_or_else(|_| SyncConfig::DEFAULT_RELAY_URL.into());
-    eprintln!("relay_live: using relay {relay_url}");
 
     let dir_a = tempfile::TempDir::new().expect("tempdir a");
     let dir_b = tempfile::TempDir::new().expect("tempdir b");
@@ -59,19 +75,32 @@ async fn notes_converge_through_the_deployed_relay() {
 
     let cfg = |dir: &std::path::Path| SyncConfig {
         relay_url: relay_url.clone(),
-        relay_auth_token: Some(token.clone()),
-        // Live test conflates the device-key base and the meetings root onto one
+        relay_auth_token: token.clone(),
+        // The test conflates the device-key base and the meetings root onto one
         // temp dir: the key and the per-meeting folders both sit directly under
         // it. Production keeps them distinct (base vs `base/meetings`).
         meetings_root: dir.to_path_buf(),
     };
 
-    let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a)
-        .await
-        .expect("engine A binds");
-    let engine_b = SyncEngine::start(cfg(dir_b.path()), id_b)
-        .await
-        .expect("engine B binds");
+    // `start_insecure` trusts the local relay's self-signed certificate instead
+    // of verifying it; the live path verifies normally via `start`.
+    let (engine_a, engine_b) = if insecure {
+        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a)
+            .await
+            .expect("engine A binds");
+        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b)
+            .await
+            .expect("engine B binds");
+        (a, b)
+    } else {
+        let a = SyncEngine::start(cfg(dir_a.path()), id_a)
+            .await
+            .expect("engine A binds");
+        let b = SyncEngine::start(cfg(dir_b.path()), id_b)
+            .await
+            .expect("engine B binds");
+        (a, b)
+    };
     eprintln!(
         "relay_live: A={} B={}",
         engine_a.endpoint_id(),
@@ -88,7 +117,7 @@ async fn notes_converge_through_the_deployed_relay() {
         .add_peer_from_ticket(&engine_a.my_ticket())
         .expect("B pairs A");
 
-    // Let both endpoints home to the relay (the token-gated relay handshake).
+    // Let both endpoints home to the relay.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Seed a note on A only.
@@ -101,8 +130,12 @@ async fn notes_converge_through_the_deployed_relay() {
     notes_crdt::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting folder");
     NotesStore::save(dir_a.path(), meeting, &json, "hello over the relay").expect("seed A");
 
-    // Address B by RELAY ONLY — no direct IPs — so the dial is brokered by the
-    // deployed relay rather than connecting directly over loopback.
+    // Address B by RELAY ONLY — no direct IPs — so the dial must be brokered by
+    // the relay rather than connecting directly. (On localhost iroh may still
+    // upgrade the brokered connection to a direct path once it discovers one;
+    // that is expected and does not undermine the addressing proof — the point
+    // is that the peer is reachable and dialable from relay-only address
+    // information, the account-directory addressing shape.)
     let relay: RelayUrl = relay_url.parse().expect("relay url parses");
     let b_relay_only = EndpointAddr::new(engine_b.endpoint_id()).with_relay_url(relay);
 

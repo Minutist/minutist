@@ -61,16 +61,38 @@ sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[features]
+# Compiles `bind_sync_engine`'s `MINUTIST_HUB_INSECURE_RELAY_TLS` escape hatch
+# (main.rs), which trusts hub_e2e's in-process test relay's self-signed
+# certificate instead of verifying it. NOT enabled in the production build —
+# forced on below ONLY for `cargo test -p headless`, via the self-dependency
+# trick `sync` itself uses (a package's own targets share one feature set
+# within a single `cargo test` invocation, so listing `headless` as its own
+# dev-dependency with the feature on forces it onto the `minutist-hub` bin
+# target that `hub_e2e` spawns, with no `--features` flag needed). Cargo prints
+# a harmless "ignoring invalid dependency `headless`" warning for this
+# self-reference (this package has no `[lib]`, so the dependency edge itself is
+# unusable) but still unifies the feature onto the bin target — verified
+# empirically: a `#[cfg(feature = "test-support")]` compile-time probe fires
+# under `cargo test -p headless` and not under `cargo build -p headless`.
+test-support = ["sync/test-support"]
+
 [dev-dependencies]
+headless = { path = ".", features = ["test-support"] }
 tempfile = "3"
-# The gated hub_e2e integration test spawns the built binary and drives two
+# The hub_e2e integration test spawns the built binary and drives two
 # SyncEngines through it. Integration tests don't inherit [dependencies], so the
-# crates they touch are restated here.
-sync = { path = "../sync" }
+# crates they touch are restated here. `test-support` exposes
+# `SyncEngine::start_insecure`, used directly by the test's own in-process
+# engines (the spawned `minutist-hub` binary gets it via `[features]` above).
+sync = { path = "../sync", features = ["test-support"] }
 persistence = { path = "../persistence" }
 notes-crdt = { path = "../notes-crdt" }
 minutist-common = { path = "../common" }
-iroh = "=1.0.0"
+# `test-utils` exposes `iroh::test_utils::run_relay_server`, the in-process relay
+# `hub_e2e` spins for its local-by-default runs (AllowAll access, no token). Same
+# exact pin as `[dependencies]`.
+iroh = { version = "=1.0.0", features = ["test-utils"] }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 # The ungated create-meeting test digests the notes ydoc to compare A/B status.

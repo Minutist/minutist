@@ -293,6 +293,64 @@ impl SyncEngine {
         self.endpoint.bound_sockets()
     }
 
+    /// Build the endpoint exactly as [`Self::start`], but trusting the relay's
+    /// TLS certificate unconditionally instead of verifying it against the
+    /// system's CA roots.
+    ///
+    /// Exists solely for `iroh::test_utils::run_relay_server`'s in-process test
+    /// relay, whose certificate is self-signed and unknown to any CA — the same
+    /// `CaTlsConfig::insecure_skip_verify` iroh's own relay test suite uses
+    /// against that relay. The production relay client (via [`Self::start`])
+    /// always verifies the real relay's certificate; this path is gated behind
+    /// `test-support` and never reachable from the production build.
+    #[cfg(feature = "test-support")]
+    pub async fn start_insecure(config: SyncConfig, identity: DeviceIdentity) -> Result<Self> {
+        let relay_mode = Self::relay_mode(&config)?;
+        let peers = PeerDirectory::new();
+        let meetings_root = config.meetings_root.clone();
+        let blobs = BlobStore::open(&meetings_root).await?;
+
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(identity.secret_key())
+            .relay_mode(relay_mode)
+            .ca_tls_config(iroh_relay::tls::CaTlsConfig::insecure_skip_verify())
+            .alpns(vec![SYNC_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
+            .address_lookup(peers.lookup())
+            .bind()
+            .await
+            .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;
+
+        tracing::info!(
+            target: "sync",
+            endpoint_id = %endpoint.id(),
+            relay = %config.relay_url,
+            "sync endpoint bound (insecure relay TLS — test relay only)"
+        );
+
+        let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
+        let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
+        let router = Self::build_router(
+            &endpoint,
+            &blobs,
+            &peers,
+            &meetings_root,
+            peer_events.clone(),
+            PeerArrivalTracker::new(),
+            lifecycle_events.clone(),
+        );
+
+        Ok(Self {
+            endpoint,
+            router,
+            peers,
+            blobs,
+            meetings_root,
+            relay_url: config.relay_url,
+            peer_events,
+            lifecycle_events,
+        })
+    }
+
     /// The configured relay as a [`RelayMode::Custom`], carrying the access token
     /// when [`SyncConfig::relay_auth_token`] is set.
     ///

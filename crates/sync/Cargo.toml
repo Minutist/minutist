@@ -58,6 +58,13 @@ iroh-tickets = "=1.0.0"
 # `iroh` in the tree so `Endpoint`/`Connection`/`EndpointId` unify across the
 # `.accept()`/`connect()`/`downloader()` boundary. Pinned EXACT alongside `iroh`.
 iroh-blobs = { version = "=0.103.0", features = ["fs-store"] }
+# Optional, pulled only under `test-support`. Names `iroh_relay::tls::CaTlsConfig`
+# for `SyncEngine::start_insecure`, which trusts the in-process test relay's
+# self-signed certificate (`iroh::test_utils::run_relay_server`) instead of
+# verifying against the system CA roots. Already a transitive dependency of
+# `iroh` at the same version; this only names the type directly for the
+# test-only constructor, and adds nothing to the production dependency graph.
+iroh-relay = { version = "=1.0.0", optional = true }
 # yrs — the Yjs CRDT port. `notes-crdt` owns the authoritative `notes.ydoc` and
 # its projections; `sync` uses yrs only for the wire-level reconciliation math on
 # lib0-v1 update bytes (`encode_state_vector_from_update_v1` / `diff_updates_v1`),
@@ -80,9 +87,11 @@ futures-util = { workspace = true }
 
 [features]
 # Exposes the relay-less direct-connection path (`SyncEngine::start_direct` +
-# `bound_sockets`) for integration tests and local bring-up. NOT enabled in the
-# production build, whose sync surface always pins the relay.
-test-support = []
+# `bound_sockets`) and the insecure-relay-TLS path (`SyncEngine::start_insecure`,
+# needing `dep:iroh-relay`) for integration tests and local bring-up. NOT
+# enabled in the production build, whose sync surface always pins the relay and
+# verifies its certificate.
+test-support = ["dep:iroh-relay"]
 
 [dev-dependencies]
 # Self-dependency with `test-support` on so `cargo test -p sync` builds the
@@ -96,3 +105,9 @@ sync = { path = ".", features = ["test-support"] }
 persistence = { path = "../persistence" }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `test-utils` exposes `iroh::test_utils::run_relay_server`, an in-process relay
+# (AllowAll access, no token required) that lets `relay_live` prove the relay-only
+# addressing path without the deployed `sync.minutist.ai` relay. Dev-only: the
+# production build never links this feature. Same exact pin as `[dependencies]`
+# so the two `iroh` builds in a test binary are the same crate.
+iroh = { version = "=1.0.0", features = ["test-utils"] }

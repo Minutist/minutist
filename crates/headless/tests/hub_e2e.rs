@@ -234,6 +234,17 @@ async fn notes_converge_through_a_running_hub() {
 
     // The hub must authorise A and B on startup — write their tickets to its peers
     // file before launching it (the daemon loads the file as it comes up).
+    //
+    // These are FULL tickets (`my_ticket()` carries direct socket addrs), so the hub
+    // learns A/B's direct addrs. This test's relay-requirement rests on the hub NEVER
+    // pulling note content — it only serves inbound A/B→hub connections (relay-only
+    // from A/B's side, added below) and pushes its OWN meetings; it never dials A/B to
+    // fetch notes. If a future change makes the hub reconcile missing meetings by
+    // DIALING peers, harden these to relay-only tickets
+    // (`EndpointTicket::new(EndpointAddr::new(id).with_relay_url(relay))`), or the hub
+    // could fetch over a direct localhost path with the relay down — a false positive.
+    // relay_live is the structurally relay-only proof (both ends withhold direct
+    // addrs); this test's role is the local-relay + hub-binary integration.
     std::fs::write(
         hub_dir.path().join("peers"),
         format!("{}\n{}\n", engine_a.my_ticket(), engine_b.my_ticket()),

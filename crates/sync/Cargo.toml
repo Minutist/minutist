@@ -58,12 +58,15 @@ iroh-tickets = "=1.0.0"
 # `iroh` in the tree so `Endpoint`/`Connection`/`EndpointId` unify across the
 # `.accept()`/`connect()`/`downloader()` boundary. Pinned EXACT alongside `iroh`.
 iroh-blobs = { version = "=0.103.0", features = ["fs-store"] }
-# Optional, pulled only under `test-support`. Names `iroh_relay::tls::CaTlsConfig`
-# for `SyncEngine::start_insecure`, which trusts the in-process test relay's
+# Optional, enabled only under `test-support`, so `SyncEngine::start_insecure` can
+# name `iroh_relay::tls::CaTlsConfig` to trust the in-process test relay's
 # self-signed certificate (`iroh::test_utils::run_relay_server`) instead of
-# verifying against the system CA roots. Already a transitive dependency of
-# `iroh` at the same version; this only names the type directly for the
-# test-only constructor, and adds nothing to the production dependency graph.
+# verifying against the system CA roots. `iroh-relay` is ALREADY a transitive
+# dependency of `iroh` at the same version and is linked into the production binary
+# regardless — so this adds no new crate; it only lets this crate NAME the type for
+# the test-only constructor. The production safety guarantee is therefore the
+# cfg-gate on the sole `insecure_skip_verify` call site (`start_insecure` is
+# `#[cfg(feature = "test-support")]`), NOT the crate's absence.
 iroh-relay = { version = "=1.0.0", optional = true }
 # yrs — the Yjs CRDT port. `notes-crdt` owns the authoritative `notes.ydoc` and
 # its projections; `sync` uses yrs only for the wire-level reconciliation math on

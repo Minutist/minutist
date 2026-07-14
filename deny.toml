@@ -68,9 +68,12 @@ license-files = [{ path = "LICENSE-APACHE", hash = 0x1f9c0e71 }]
 
 [advisories]
 # Deny crates with known security vulnerabilities in the RustSec database.
-# Unmaintained advisories for transitive dependencies that have no safe upgrade
-# path are ignored below rather than failing CI.  All entries below are
-# unmaintained (not vulnerability) advisories verified 2026-06-12.
+# Advisories for transitive dependencies with no safe upgrade path are ignored
+# below rather than failing CI.  Most entries are unmaintained (not
+# vulnerability) advisories; the exceptions are individually justified inline
+# (a dev-only dependency, or a risk accepted for a local-first single-user
+# desktop app).  Each ignore states its reachability so a red cargo-deny is
+# never used to mask a genuinely reachable runtime vulnerability.
 version = 2
 ignore = [
     # gtk-rs GTK3 — transitive via Tauri/libappindicator.  Archived upstream;
@@ -103,6 +106,32 @@ ignore = [
     # heapless 0.8 dropped atomic-polyfill but postcard 1.1 pins heapless 0.7, so
     # there is no safe upgrade path from our side.
     "RUSTSEC-2023-0089",  # atomic-polyfill
+    # lopdf stack overflow on deeply-nested PDF objects — DEV-ONLY.
+    # `cargo tree -e no-dev -i lopdf` is empty: lopdf is reachable only via
+    # printpdf, a [dev-dependencies] of doc-convert, and is not in the shipped
+    # binary (the runtime PDF path is pdf_oxide).  Not an exploitable surface.
+    "RUSTSEC-2026-0187",  # lopdf
+    # ttf-parser — author-declared unmaintained (not a vulnerability), no safe
+    # upgrade.  Runtime-reachable via pdf_oxide -> doc-convert (attachments), so
+    # unlike the entries above it is not dev-only; tracked for a skrifa
+    # migration.  Ignored on the same basis as the other unmaintained crates.
+    "RUSTSEC-2026-0192",  # ttf-parser
+    # quick-xml <0.41 — quadratic duplicate-attribute scan (-0194) and unbounded
+    # NsReader namespace-declaration allocation (-0195), both DoS.  Every
+    # RUNTIME path is closed by upgrading its requirer to a quick-xml-0.41
+    # release, not by ignoring a reachable version:
+    #   - doc-convert's direct OOXML walk -> workspace pin raised to 0.41.
+    #   - calamine (XLSX/ODS attachments) -> bumped 0.35 -> 0.36 (pulls 0.41).
+    #   - pdf_oxide / office_oxide (PDF/office attachments) -> 0.3.74 / 0.1.6.
+    #   - plist -> tauri-utils -> tauri runtime -> bumped plist 1.9 -> 1.10
+    #     (pulls 0.41).
+    # After those, `cargo tree -e no-dev,no-build -i quick-xml@0.36.2` is empty:
+    # the only quick-xml <0.41 left is 0.36.2, pulled solely by docx-rs, a
+    # [dev-dependencies] of doc-convert (a test-fixture .docx writer) — not in
+    # the shipped binary.  Drop these two ignores when docx-rs ships a release
+    # on quick-xml >=0.41 (none exists yet).
+    "RUSTSEC-2026-0194",  # quick-xml 0.36.2 (dev-only, docx-rs fixture writer)
+    "RUSTSEC-2026-0195",  # quick-xml 0.36.2 (dev-only, docx-rs fixture writer)
 ]
 
 [sources]

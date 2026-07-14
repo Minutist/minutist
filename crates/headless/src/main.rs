@@ -225,6 +225,14 @@ enum Command {
     /// Print the hub's state as JSON (endpoint id, relay, authorised peers, held
     /// meetings + a content digest of each). A read-only oracle for tests.
     Status,
+    /// Originate a new meeting in the hub's data directory and print its UUID to
+    /// stdout. Used by the e2e harness to seed a meeting on device-A so the hub
+    /// can push it to device-B.
+    CreateMeeting {
+        /// Human-readable title for the new meeting.
+        #[arg(long)]
+        title: String,
+    },
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -237,6 +245,7 @@ async fn main() -> AppResult<()> {
         Some(Command::PrintTicket) => print_ticket(&data_dir, cli.relay_url, cli.relay_token).await,
         Some(Command::AddPeer { ticket }) => add_peer(&data_dir, &ticket),
         Some(Command::Status) => print_status(&data_dir, cli.relay_url),
+        Some(Command::CreateMeeting { title }) => create_meeting(&data_dir, &title),
     }
 }
 
@@ -346,6 +355,24 @@ fn add_peer(data_dir: &Path, ticket: &str) -> AppResult<()> {
         }),
         Err(e) => Err(AppError::from(e)),
     }
+}
+
+/// Originate a new meeting in `{data_dir}/meetings/`: create the folder,
+/// seed placeholder metadata, write the first `notes.ydoc`, and print the
+/// meeting UUID to stdout. The UUID is the only output — suitable for capture
+/// by a harness driver. No daemon interaction; purely a filesystem write.
+fn create_meeting(data_dir: &Path, title: &str) -> AppResult<()> {
+    let meetings_root = data_dir.join("meetings");
+    let id = minutist_common::MeetingId::new();
+    notes_crdt::MeetingFolder::ensure(&meetings_root, id)?;
+    let notes_json = serde_json::json!({
+        "type": "doc",
+        "content": [{"type": "paragraph", "content": [{"type": "text", "text": title}]}]
+    });
+    notes_crdt::NotesStore::save(&meetings_root, id, &notes_json, title)?;
+    // Command output (the UUID captured by the e2e runner), not logging.
+    println!("{}", id.0);
+    Ok(())
 }
 
 /// JSON shape printed by the `status` subcommand.

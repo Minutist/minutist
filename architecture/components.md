@@ -106,10 +106,17 @@ is now implemented: `tunnel-client` gains a raw `AccountDirectoryClient`
 authed with the device's `mdc_` credential, its own `DeviceEndpointEntry` DTO)
 that keeps `tunnel-client` a near-leaf — it takes **no** `sync` edge; `app-main`
 (the assembler) wraps it in an `AccountEndpointSource` adapter and, in
-`ConnectedSync::start_engine`, spawns `run_account_refresh_loop` when the device
-is account-paired (credential present), wired onto the SAME `stop` token as the
-local peers-file poll so a re-bind cancels both. Peer eviction (removing a device
-that left the account) remains a follow-up.
+`ConnectedSync::start_engine`, constructs a `SyncEngineRefreshSink` and spawns
+`run_account_refresh_loop_v2` (the v2 interface — see the account-refresh-loop v2
+entry below) when the device is account-paired (credential present), on a single
+latching `CancellationToken` shared with the local peers-file poll — the desktop
+close of issue 0029 item 1's shared-cancel (one latching token, so a mid-loop
+cancel can't be missed). The engine binds once (`start_requested` is a one-shot
+latch), so the re-bind `cancel()` is not a live path today; it is the correct
+primitive for when the deferred `set_enabled` re-bind/TEARDOWN path lands (which
+must also AWAIT both tasks' exit). The desktop owns the failed-dial
+`BackoffPolicy` values via `SyncConfig::with_backoff_policy`. Failed-dial
+suppression (backoff) and account-reconcile removal ride the loop.
 
 `SyncControl` gains `set_enabled(bool)` (issue 0028 follow-up F5), giving the
 Settings toggle a runtime path to start or stop the sync engine (the toggle
@@ -3579,8 +3586,8 @@ desktop driver) reacts to. `shutdown(self)` is the owning, graceful stop.
 points during the expand-migrate-contract migration off the closure-based
 signature (`planning/DESIGN_account-refresh-loop-v2.md`):
 `run_account_refresh_loop` (transitional/legacy — the `Arc<Notify>` + `add_peer`
-closure form, retained unchanged until desktop/phone migrate; headless drives the
-v2 loop over `SyncEngineRefreshSink`) and
+closure form, now unused by any Rust consumer and due for deletion; desktop +
+headless both drive the v2 loop over `SyncEngineRefreshSink`) and
 `run_account_refresh_loop_v2(source, self_endpoint, interval, cancel:
 tokio_util::sync::CancellationToken, sink: Arc<dyn RefreshSink>)`. `RefreshSink`
 is the one consumer-provided object the v2 loop drives — `upsert_account_peer`

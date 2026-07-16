@@ -67,6 +67,9 @@ tauri-plugin-updater = { workspace = true }
 tauri-specta = { workspace = true }
 specta-typescript = { workspace = true }
 tokio = { workspace = true }
+# tokio_util::sync::CancellationToken — the shared cancel for the peers-poll and
+# account-refresh-loop v2 (issue 0029 item 1). Matches the `sync` crate's pin.
+tokio-util = "0.7"
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

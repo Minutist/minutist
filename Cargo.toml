@@ -227,7 +227,11 @@ pdf_oxide = "0.3"
 quick-xml = "0.41"
 # zip: ZIP container reader used for PPTX / XLSX / ODS archives.
 # The 8.x line is the latest stable (9.x is pre-release at Gate-A).
-zip = "8.6"
+# default-features disabled: OOXML/ODF containers are DEFLATE- or store-encoded,
+# so only `deflate` is needed. Dropping the default codecs also drops the bzip2
+# codec, whose `bzip2-1.0.6` licence is otherwise the sole reason bzip2 enters
+# the tree (calamine/office_oxide already pull zip with `deflate` only).
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # pulldown-cmark: CommonMark parser; normalises all converter output.
 pulldown-cmark = "0.13"
 # pulldown-cmark-to-cmark: re-serialises the AST back to canonical markdown.
@@ -242,7 +246,11 @@ pdfium-render = { version = "0.9", features = ["image_025"] }
 # image: image decoding / encoding. Used by doc-convert to re-encode image
 # attachments (png/jpg/jpeg/tiff) to PNG for the VLM, and by the doc-vlm spike
 # for bitmap fixtures.
-image = "0.25"
+# default-features disabled: only the formats doc-convert decodes (png/jpeg/tiff)
+# plus bmp (a test fixture) are enabled. This drops the AVIF *encoder* (ravif ->
+# rav1e), which doc-convert never uses — it only ENCODES PNG — and which pulls
+# libfuzzer-sys (NCSA licence) into the tree.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp"] }
 
 [profile.dev]
 # Keep backtraces (file:line) but drop variable-level DWARF. Full debug info was

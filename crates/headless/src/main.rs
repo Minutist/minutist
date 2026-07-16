@@ -51,11 +51,11 @@ use minutist_common::{AppError, AppResult, MeetingId, ProcessingLifecycle};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sync::{
-    run_account_refresh_loop, AccountEndpoint, AccountEndpointSource, DeviceIdentity, SyncConfig,
-    SyncEngine,
+    run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, DeviceIdentity,
+    RefreshSink, SyncConfig, SyncEngine, SyncEngineRefreshSink,
 };
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 /// Default shutdown drain window; override `MINUTIST_HUB_SHUTDOWN_GRACE_MS`.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -272,6 +272,11 @@ async fn run_daemon(
 
     let (engine, account_args) =
         start_engine(data_dir, relay_url, relay_token, api_url).await?;
+    // Shared with the account-refresh loop's `SyncEngineRefreshSink`, which needs an
+    // owned `Arc<SyncEngine>`. Sole ownership is reclaimed below for the consuming
+    // `SyncEngine::shutdown(self)` once `serve_until_shutdown` returns and drops the
+    // sink.
+    let engine = Arc::new(engine);
 
     tracing::info!(target: "hub", endpoint_id = %engine.endpoint_id(), "sync engine started");
     // Log the pairing ticket so an operator can pair a desktop with this hub
@@ -288,7 +293,7 @@ async fn run_daemon(
     // daemon runs is picked up without a restart. Both discovery mechanisms stop
     // on the daemon's shutdown signal inside serve_until_shutdown.
     let mut seen: HashSet<String> = HashSet::new();
-    serve_until_shutdown(&engine, data_dir, &mut seen, account_args).await;
+    serve_until_shutdown(Arc::clone(&engine), data_dir, &mut seen, account_args).await;
 
     tracing::info!(target: "hub", "shutdown signal received; draining in-flight sync");
     // Bound the drain: a systemd `stop` must see the process exit promptly. If the
@@ -296,6 +301,21 @@ async fn run_daemon(
     // log it and exit anyway — returning from `main` drops the runtime, which
     // aborts any lingering tasks.
     let grace = dur_or_env("MINUTIST_HUB_SHUTDOWN_GRACE_MS", SHUTDOWN_GRACE);
+    // Reclaim sole ownership for the consuming `shutdown(self)`. The only other clone
+    // lived in the refresh-loop future, dropped when `serve_until_shutdown` returned,
+    // so this is `Some` in practice; a lingering clone would mean a task still holds
+    // the engine, so skip the graceful drain (returning drops the runtime and aborts
+    // it anyway).
+    let engine = match Arc::into_inner(engine) {
+        Some(engine) => engine,
+        None => {
+            tracing::warn!(
+                target: "hub",
+                "sync engine still referenced at shutdown; skipping graceful drain"
+            );
+            return Ok(());
+        }
+    };
     match tokio::time::timeout(grace, engine.shutdown()).await {
         Ok(Ok(())) => tracing::info!(target: "hub", "minutist-hub stopped"),
         Ok(Err(e)) => {
@@ -467,19 +487,12 @@ fn meeting_digest(meetings_root: &Path, meeting: MeetingId) -> Option<String> {
 }
 
 /// Arguments for the account-refresh loop, built by `start_engine` when a seeded
-/// device credential is present. Consumed by `serve_until_shutdown` as a third
-/// select! arm alongside the peers-file poll and the discovery sweep.
+/// device credential is present. Consumed by `serve_until_shutdown`, which drives
+/// [`run_account_refresh_loop_v2`] as a third select! arm alongside the peers-file
+/// poll and the discovery sweep, cancelling it on the daemon's shutdown signal.
 struct AccountRefreshArgs {
     source: Arc<dyn AccountEndpointSource>,
     self_endpoint: AccountEndpoint,
-    /// Shared with `serve_until_shutdown`'s shutdown arm so the loop observes the
-    /// daemon's single shutdown signal.
-    ///
-    /// TODO(0029 item 1): migrate this `Arc<Notify>` stop to
-    /// `tokio_util::sync::CancellationToken` together with the desktop B4 loop
-    /// (`src-tauri/src/sync.rs`) and the `sync-ffi` consumer — all three must
-    /// move at once so the API change is atomic.
-    stop: Arc<Notify>,
 }
 
 /// Binds the sync engine, trusting the relay's TLS certificate unconditionally
@@ -589,7 +602,6 @@ async fn start_engine(
                     Some(AccountRefreshArgs {
                         source,
                         self_endpoint,
-                        stop: Arc::new(Notify::new()),
                     })
                 }
             }
@@ -622,7 +634,7 @@ async fn start_engine(
 /// channel cap self-lag while the loop is parked on the sweep producing it — a
 /// separate drain keeps up concurrently.
 async fn serve_until_shutdown(
-    engine: &SyncEngine,
+    engine: Arc<SyncEngine>,
     data_dir: &Path,
     seen: &mut HashSet<String>,
     account_args: Option<AccountRefreshArgs>,
@@ -650,64 +662,48 @@ async fn serve_until_shutdown(
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
-    // Account-refresh loop: runs as a third select! arm when account credentials are
-    // present, so it shares the daemon's single shutdown signal and cannot outlive
-    // this function. When absent, resolves to `std::future::pending()` — that arm
-    // never fires but also never breaks the select.
+    // Account-refresh loop v2: runs as a third select! arm when account credentials
+    // are present, driving `run_account_refresh_loop_v2` over the production
+    // `SyncEngineRefreshSink` (which shares the engine, so its dial-suppression and
+    // source-aware removal act on the same `PeerDirectory` the other arms feed). Its
+    // `CancellationToken` is cancelled after the serve loop breaks so the loop shares
+    // the daemon's single shutdown signal; when absent, the arm resolves to
+    // `std::future::pending()` and the token has no waiter.
     //
     // Pinned once, like `shutdown`, so the arm persists across loop iterations
     // without recreating the future on each pass.
-    let account_stop = account_args.as_ref().map(|a| Arc::clone(&a.stop));
-    let account_refresh: Pin<Box<dyn Future<Output = ()> + Send + '_>> =
-        match account_args {
-            Some(args) => Box::pin(run_account_refresh_loop(
+    let account_cancel = CancellationToken::new();
+    let account_refresh: Pin<Box<dyn Future<Output = ()> + Send>> = match account_args {
+        Some(args) => {
+            let sink: Arc<dyn RefreshSink> =
+                Arc::new(SyncEngineRefreshSink::new(Arc::clone(&engine)));
+            Box::pin(run_account_refresh_loop_v2(
                 args.source,
                 args.self_endpoint,
                 ACCOUNT_REFRESH_INTERVAL,
-                args.stop,
-                move |ep| {
-                    if let Err(e) = engine.add_account_peer(&ep.endpoint_id, &ep.relay_url) {
-                        tracing::warn!(
-                            target: "hub",
-                            error = %e,
-                            "account peer add rejected"
-                        );
-                    }
-                },
-            )),
-            None => Box::pin(std::future::pending()),
-        };
+                account_cancel.clone(),
+                sink,
+            ))
+        }
+        None => Box::pin(std::future::pending()),
+    };
     tokio::pin!(account_refresh);
 
     'serve: loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                // Notify the account-refresh loop's own stop handle so it exits its
-                // internal select cleanly rather than being dropped mid-await. The
-                // outer select arm drop handles it regardless, but an explicit notify
-                // is cleaner and matches the desktop's pattern.
-                if let Some(stop) = &account_stop {
-                    stop.notify_one();
-                }
-                break 'serve;
-            }
+            _ = &mut shutdown => break 'serve,
             // Third arm: account-mediated peer discovery. Runs alongside the peers-file
             // poll. Both feed the same PeerDirectory. This arm fires only when the loop
-            // exits (stop notified); under normal operation it parks here.
+            // exits (on cancel); under normal operation it parks here.
             _ = &mut account_refresh => {}
-            _ = poll.tick() => { sync::peers::reload_into(engine, data_dir, seen); },
+            _ = poll.tick() => { sync::peers::reload_into(&engine, data_dir, seen); },
             _ = discovery_poll.tick() => {
                 // Recovery sweep: re-discover every known peer so a lifecycle state
                 // a consumer dropped (Lagged) or skipped (a meeting not present when
                 // it was advertised) is re-applied. Raced against shutdown, like the
                 // push arm. (The first, immediate tick is a no-op before peers load.)
                 tokio::select! {
-                    _ = &mut shutdown => {
-                        if let Some(stop) = &account_stop {
-                            stop.notify_one();
-                        }
-                        break 'serve;
-                    }
+                    _ = &mut shutdown => break 'serve,
                     result = engine.discover_all() => match result {
                         Ok(n) => tracing::debug!(target: "hub", peers = n, "periodic discovery swept peers"),
                         Err(e) => tracing::warn!(target: "hub", error = %e, "periodic discovery failed"),
@@ -742,12 +738,7 @@ async fn serve_until_shutdown(
                     // notes writes are atomic and media is content-addressed, so an
                     // abandoned push is safe and idempotent on the next reconcile).
                     tokio::select! {
-                        _ = &mut shutdown => {
-                            if let Some(stop) = &account_stop {
-                                stop.notify_one();
-                            }
-                            break 'serve;
-                        }
+                        _ = &mut shutdown => break 'serve,
                         result = engine.push_all_to_peer(&peer) => match result {
                             Ok(n) => tracing::info!(target: "hub", peer = %peer, meetings = n, "pushed meetings to arrived peer"),
                             Err(e) => tracing::warn!(target: "hub", peer = %peer, error = %e, "push to arrived peer failed"),
@@ -758,6 +749,11 @@ async fn serve_until_shutdown(
         }
     }
 
+    // Cancel the account-refresh loop (latching `CancellationToken`): every shutdown
+    // path breaks to here, and the pinned `account_refresh` future is dropped on
+    // return regardless, so this only makes the loop's own exit explicit. A no-op
+    // when no loop was started (the token has no waiter).
+    account_cancel.cancel();
     // The engine's lifecycle sender outlives this fn (shutdown is graceful, not a
     // drop), so the drain task won't observe `Closed` on its own — abort it.
     lifecycle_task.abort();

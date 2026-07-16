@@ -3577,7 +3577,8 @@ desktop driver) reacts to. `shutdown(self)` is the owning, graceful stop.
 points during the expand-migrate-contract migration off the closure-based
 signature (`planning/DESIGN_account-refresh-loop-v2.md`):
 `run_account_refresh_loop` (transitional/legacy — the `Arc<Notify>` + `add_peer`
-closure form, retained unchanged until desktop/headless/phone migrate) and
+closure form, retained unchanged until desktop/phone migrate; headless drives the
+v2 loop over `SyncEngineRefreshSink`) and
 `run_account_refresh_loop_v2(source, self_endpoint, interval, cancel:
 tokio_util::sync::CancellationToken, sink: Arc<dyn RefreshSink>)`. `RefreshSink`
 is the one consumer-provided object the v2 loop drives — `upsert_account_peer`

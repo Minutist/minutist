@@ -47,6 +47,9 @@ notes-crdt = { path = "../notes-crdt" }
 persistence = { path = "../persistence" }
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["signal"] }
+# `CancellationToken` for the account-refresh loop v2 (`run_account_refresh_loop_v2`
+# takes one, cancelled on shutdown). Same "0.7" line as `sync`, which owns the loop.
+tokio-util = "0.7"
 tracing = { workspace = true }
 # `json` adds the opt-in structured tracing formatter (MINUTIST_HUB_LOG_JSON=1).
 tracing-subscriber = { workspace = true, features = ["json"] }

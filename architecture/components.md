@@ -274,9 +274,13 @@ back to the relay).
 The `PeerDirectory` the engine holds is **in-memory** and process-scoped — the
 engine persists no peer list itself. Durable pairing is the `sync::peers` module:
 a shared `{root}/peers` file (one ticket per line; blank lines and `#`-comments
-ignored) with `append` (validate + dedup) and `reload_into` (authorise every
-not-yet-applied ticket against the bound engine). Both frontends use it, each
-rooted at its own data directory (single-writer per root):
+ignored) with `append` (validate + dedup), `remove` (drop an exact ticket line,
+atomic rewrite preserving comments/other peers — the file side of an explicit,
+consumer-driven unpair, so a removed device is not re-authorised on the next
+reload; the failed-dial path suppresses with backoff rather than removing), and
+`reload_into` (authorise every not-yet-applied ticket against the bound engine).
+Both frontends use it, each rooted at its own data directory (single-writer per
+root):
 
 - **Headless hub (`minutist-hub`)** roots it at `--data-dir`, pairs via the
   one-shot `print-ticket` / `add-peer` CLI subcommands, and re-reads the file on a

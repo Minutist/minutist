@@ -216,15 +216,17 @@ push in `DesktopElectionDriver`. `add_account_peer(endpoint_id: String, relay_ur
 String) -> Result<(), SyncFfiError>` wraps `SyncEngine::add_account_peer` (the B2
 account-peer-source seam, above) for the phone's own list→add loop over the
 account service's device directory — strings only, no `iroh` type crosses the
-boundary, additive to `pair` (both feed the same peer directory). Two further
-string-keyed reads back that loop's reconcile + backoff-awareness (the phone
-drives its own TS loop, not the Rust `RefreshSink` one, but its dials flow
-through the same engine, so the same backoff registry applies):
-`is_suppressed(endpoint_id: String) -> Result<bool, SyncFfiError>` (skip
-re-adding a still-suppressed peer) and `remove_account_peer(endpoint_id: String)
--> Result<bool, SyncFfiError>` (reconcile a departed account peer, source-aware).
-NOT `mark`/`clear` — dial outcomes feed the backoff engine-internally via
-`on_dial_outcome`, never phone-driven. The wrapper owns its tokio
+boundary, additive to `pair` (both feed the same peer directory). One further
+string-keyed read backs that loop's reconcile:
+`remove_account_peer(endpoint_id: String) -> Result<bool, SyncFfiError>`
+(reconcile a departed account peer, source-aware). The phone drives its own TS
+`listDevices -> addAccountPeer` loop and ALWAYS upserts — `add_account_peer` is a
+pure upsert (no dial), so gating the add on suppression would permanently drop a
+suppressed→left→rejoined peer. Suppression is engine-internal at the dial
+(`on_dial_outcome`) and only gates the Rust loop's first-contact dial-kick
+(`RefreshSink::is_suppressed`, in-crate); the phone has no dial-kick, so
+`is_suppressed` has no phone/FFI consumer and is not exported. NOT `mark`/`clear`
+either — dial outcomes are never phone-driven. The wrapper owns its tokio
 runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS
 threads so a re-entrant foreign callback never `block_on`s from within the
 runtime. No `tauri::*` / `ipc-bridge` imports. See `cross-cutting.md` — "Build

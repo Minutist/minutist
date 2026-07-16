@@ -315,16 +315,6 @@ impl FfiSyncEngine {
         Ok(self.engine()?.add_account_peer(&endpoint_id, &relay_url)?)
     }
 
-    /// Whether `endpoint_id` is currently dial-suppressed (failed-dial
-    /// backoff). The phone's own TS account-refresh loop consults this before
-    /// re-adding a peer, mirroring [`crate::account::RefreshSink::is_suppressed`]'s
-    /// role in the Rust loop — the phone drives its own `listDevices ->
-    /// addAccountPeer` loop rather than the Rust one, but its dials flow
-    /// through this same engine, so the SAME backoff registry applies.
-    pub fn is_suppressed(&self, endpoint_id: String) -> Result<bool, SyncFfiError> {
-        Ok(self.engine()?.is_suppressed(&endpoint_id))
-    }
-
     /// Remove an account-sourced peer no longer present in the account's
     /// device list (reconcile — it left the account). Source-aware: a no-op
     /// (returns `false`) if `endpoint_id` was paired any other way (e.g.

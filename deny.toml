@@ -24,6 +24,27 @@
 #   MIT-0         MIT No Attribution — public-domain-equivalent (dunce).
 #   Unlicense     Public-domain dedication — permissive, acceptable.
 
+# Throwaway spike crates (spikes/*) are excluded from the crate graph: they are
+# scratch experiments that never ship (CLAUDE.local.md), so their dependencies
+# should not gate CI on advisories or licences.  This is FORWARD-LOOKING hygiene,
+# not a current fix: today it is a no-op for all four legs (removing this list
+# still passes), because the crates unique to the spikes — e.g. pdfium-render via
+# spike-doc-vlm — carry clean (MIT/Apache) licences and no active advisory.  The
+# licence rejections that were cleared came from the zip/image feature trims, not
+# from this exclusion.  Crates a real application crate also depends on are
+# unaffected — exclude only removes a crate and the dependencies unique to it.
+# Latent caveat (accepted per policy): a future spike dep with a GPL/denied
+# licence or a live advisory will NOT gate CI while it is spike-only.  If a spike
+# is ever promoted to a real crate, remove it from this list so its dependencies
+# re-enter the graph and are audited.
+exclude = [
+    "spike-asr",
+    "spike-llm",
+    "spike-vad-loop",
+    "spike-diarize",
+    "spike-doc-vlm",
+]
+
 [graph]
 # Resolve the full workspace to catch every crate's licence, but only check
 # the crates that actually make it into a build (no [dev-dependencies]-only
@@ -149,3 +170,16 @@ allow-git = [
 # from the Tauri/hyper/reqwest/sherpa-rs stack.  Erroring on every duplicate
 # would generate noise without actionable remediation.
 multiple-versions = "warn"
+
+# Backstop for the RUSTSEC-2026-0194/-0195 advisory ignores above.  Those
+# ignores are ID-scoped, not path-scoped, so they silently cover ANY quick-xml
+# <0.41 in the tree — they actually rest on the invariant "the only quick-xml
+# <0.41 is the dev-only docx-rs fixture writer".  This ban enforces exactly that
+# invariant: quick-xml <0.41 is denied unless its direct wrapper is docx-rs, so
+# any dependency that reintroduces a runtime (or any non-docx-rs) quick-xml <0.41
+# fails the bans leg — which the advisory ignore cannot catch.  Drop this ban
+# together with the two advisory ignores when docx-rs ships on quick-xml >=0.41.
+[[bans.deny]]
+name = "quick-xml"
+version = "<0.41"
+wrappers = ["docx-rs"]

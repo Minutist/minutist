@@ -216,8 +216,15 @@ push in `DesktopElectionDriver`. `add_account_peer(endpoint_id: String, relay_ur
 String) -> Result<(), SyncFfiError>` wraps `SyncEngine::add_account_peer` (the B2
 account-peer-source seam, above) for the phone's own list→add loop over the
 account service's device directory — strings only, no `iroh` type crosses the
-boundary, additive to `pair` (both feed the same peer directory). The wrapper
-owns its tokio
+boundary, additive to `pair` (both feed the same peer directory). Two further
+string-keyed reads back that loop's reconcile + backoff-awareness (the phone
+drives its own TS loop, not the Rust `RefreshSink` one, but its dials flow
+through the same engine, so the same backoff registry applies):
+`is_suppressed(endpoint_id: String) -> Result<bool, SyncFfiError>` (skip
+re-adding a still-suppressed peer) and `remove_account_peer(endpoint_id: String)
+-> Result<bool, SyncFfiError>` (reconcile a departed account peer, source-aware).
+NOT `mark`/`clear` — dial outcomes feed the backoff engine-internally via
+`on_dial_outcome`, never phone-driven. The wrapper owns its tokio
 runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS
 threads so a re-entrant foreign callback never `block_on`s from within the
 runtime. No `tauri::*` / `ipc-bridge` imports. See `cross-cutting.md` — "Build
@@ -3561,6 +3568,35 @@ dial) to one peer; `discover_with_peer` / `discover_all` run just the
 lifecycle exchange. `subscribe_peer_events` / `subscribe_lifecycle_events` are
 the two bounded broadcast channels a host (the headless daemon, or a future
 desktop driver) reacts to. `shutdown(self)` is the owning, graceful stop.
+
+**Account-refresh loop (v2 interface).** `account` carries two loop entry
+points during the expand-migrate-contract migration off the closure-based
+signature (`planning/DESIGN_account-refresh-loop-v2.md`):
+`run_account_refresh_loop` (transitional/legacy — the `Arc<Notify>` + `add_peer`
+closure form, retained unchanged until desktop/headless/phone migrate) and
+`run_account_refresh_loop_v2(source, self_endpoint, interval, cancel:
+tokio_util::sync::CancellationToken, sink: Arc<dyn RefreshSink>)`. `RefreshSink`
+is the one consumer-provided object the v2 loop drives — `upsert_account_peer`
+(was-new) / `remove_account_peer` (source-aware reconcile) / `is_suppressed`
+(failed-dial backoff gate) / `on_new_peer` (first-contact dial-kick, cancellable)
+/ `account_peer_ids` (reconcile-seed on restart) — so a future capability is a
+trait-method addition, not a signature change. `SyncEngineRefreshSink::new(engine)`
+is the production impl wrapping a live engine. `PeerSource::{Account, Manual}`
+tags each `PeerDirectory` entry so account-reconcile removal only evicts
+account-sourced peers; `add_peer` tags `Manual`, `add_account_peer` /
+`upsert_account_peer` tag `Account`. The engine grows four string-keyed reads/
+writes for the sink and `sync-ffi`: `upsert_account_peer(id, relay) -> bool`,
+`remove_account_peer(id) -> bool`, `is_suppressed(id) -> bool`,
+`account_peer_ids() -> Vec<String>`. `BackoffPolicy { max_fails, base, cap }` +
+`BackoffRegistry` (in `backoff`) hold the failed-dial eviction seam: the engine
+`dial` site feeds every outcome (`on_dial_outcome`, engine-internal), so all
+consumers' dials — including the phone's, which flow through the same engine —
+participate; the policy VALUES are consumer-owned via
+`SyncConfig::backoff_policy` / `with_backoff_policy`. The `CancellationToken`
+seam is the sole new workspace dependency edge (`crates/sync -> tokio-util`, for
+`tokio_util::sync::CancellationToken` — the same leaf `mcp-server` already
+carries); it does not change the crate-to-crate dependency table (`common` +
+`notes-crdt`).
 
 Wire framing, blob GC/tagging, and the artifact-authority tie-break rule are
 documented in the `sync` §-marked dependency-table footnote above, not

@@ -31,6 +31,7 @@
 pub mod account;
 pub mod address_lookup;
 pub mod artifacts_proto;
+pub mod backoff;
 pub mod blobs;
 pub mod discovery_proto;
 pub mod endpoint;
@@ -43,8 +44,13 @@ pub(crate) mod timeouts;
 
 use std::path::PathBuf;
 
-pub use account::{peers_to_add, run_account_refresh_loop, AccountEndpoint, AccountEndpointSource};
-pub use endpoint::SyncEngine;
+pub use account::{
+    peers_to_add, run_account_refresh_loop, run_account_refresh_loop_v2, AccountEndpoint,
+    AccountEndpointSource, RefreshSink,
+};
+pub use address_lookup::PeerSource;
+pub use backoff::{BackoffPolicy, BackoffRegistry};
+pub use endpoint::{SyncEngine, SyncEngineRefreshSink};
 pub use identity::DeviceIdentity;
 
 /// Errors raised by the sync crate. Converted to [`minutist_common::AppError`] at
@@ -103,6 +109,11 @@ pub struct SyncConfig {
     /// `persistence`. The device key is persisted at the app-data BASE
     /// (see [`identity`]), which the caller loads separately.
     pub meetings_root: PathBuf,
+
+    /// The failed-dial backoff policy (threshold + exponential window) the
+    /// [`SyncEngine`]'s [`BackoffRegistry`] applies to every dial. Carries no
+    /// secret, so it is not redacted in [`Self`]'s hand-written `Debug`.
+    pub backoff_policy: BackoffPolicy,
 }
 
 impl std::fmt::Debug for SyncConfig {
@@ -113,6 +124,7 @@ impl std::fmt::Debug for SyncConfig {
             .field("relay_url", &self.relay_url)
             .field("relay_auth_token", &redacted)
             .field("meetings_root", &self.meetings_root)
+            .field("backoff_policy", &self.backoff_policy)
             .finish()
     }
 }
@@ -130,12 +142,21 @@ impl SyncConfig {
             relay_url: Self::DEFAULT_RELAY_URL.to_string(),
             relay_auth_token: None,
             meetings_root,
+            backoff_policy: BackoffPolicy::default(),
         }
     }
 
     /// Set the relay access token presented to the self-hosted relay.
     pub fn with_relay_auth_token(mut self, token: impl Into<String>) -> Self {
         self.relay_auth_token = Some(token.into());
+        self
+    }
+
+    /// Override the failed-dial backoff policy. The consumer (desktop/headless)
+    /// owns the actual threshold/window values; [`BackoffPolicy::default`] is a
+    /// placeholder.
+    pub fn with_backoff_policy(mut self, policy: BackoffPolicy) -> Self {
+        self.backoff_policy = policy;
         self
     }
 }

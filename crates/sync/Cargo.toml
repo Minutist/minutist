@@ -35,6 +35,14 @@ async-trait = { workspace = true }
 # path. The `yrs` pin matches transitively, so the on-the-wire encoding agrees.
 notes-crdt = { path = "../notes-crdt" }
 tokio = { workspace = true }
+# tokio_util::sync::CancellationToken — the account-refresh loop v2's cancel
+# seam (`account::run_account_refresh_loop_v2`), latching so a cancel raised
+# before the loop next polls is never missed (unlike `Notify::notify_waiters`,
+# the transitional `run_account_refresh_loop`'s stop signal). `mcp-server`
+# already carries this leaf crate for the same primitive; no new major version
+# enters the tree. `CancellationToken` needs no extra feature beyond the
+# default `sync` one.
+tokio-util = "0.7"
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

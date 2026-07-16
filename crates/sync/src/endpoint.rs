@@ -47,7 +47,11 @@ use iroh_tickets::endpoint::EndpointTicket;
 use minutist_common::{MeetingId, ProcessingLifecycle};
 use tokio::sync::broadcast;
 
-use crate::address_lookup::PeerDirectory;
+use crate::account::{AccountEndpoint, RefreshSink};
+use crate::address_lookup::{PeerDirectory, PeerSource};
+#[cfg(feature = "test-support")]
+use crate::backoff::BackoffPolicy;
+use crate::backoff::BackoffRegistry;
 use crate::blobs::BlobStore;
 use crate::identity::DeviceIdentity;
 use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
@@ -61,6 +65,11 @@ pub struct SyncEngine {
     endpoint: Endpoint,
     router: Router,
     peers: PeerDirectory,
+    /// Failed-dial tracking for every peer this device dials, regardless of
+    /// source ([`Self::dial`] feeds every outcome). Backs [`Self::is_suppressed`]
+    /// and the account-refresh loop's dial-suppression check
+    /// ([`SyncEngineRefreshSink::is_suppressed`]).
+    backoff: BackoffRegistry,
     /// The content-addressed media-blob store for this device. Held here so the
     /// initiator side ([`Self::sync_media`]) can import/export/download, and kept
     /// alive for the lifetime of the router (the [`iroh_blobs::BlobsProtocol`]
@@ -201,6 +210,7 @@ impl SyncEngine {
             endpoint,
             router,
             peers,
+            backoff: BackoffRegistry::new(config.backoff_policy),
             blobs,
             meetings_root,
             relay_url: config.relay_url,
@@ -276,6 +286,7 @@ impl SyncEngine {
             endpoint,
             router,
             peers,
+            backoff: BackoffRegistry::new(BackoffPolicy::default()),
             blobs,
             meetings_root,
             // The relay-less test path never addresses a peer relay-only, so it has
@@ -343,6 +354,7 @@ impl SyncEngine {
             endpoint,
             router,
             peers,
+            backoff: BackoffRegistry::new(config.backoff_policy),
             blobs,
             meetings_root,
             relay_url: config.relay_url,
@@ -381,12 +393,13 @@ impl SyncEngine {
         self.endpoint.addr()
     }
 
-    /// Register a peer learned out-of-band from the account service so the
-    /// endpoint can resolve and dial it. The [`PeerDirectory`] is shared with the
-    /// bound endpoint, so a peer added after binding is picked up on the next
-    /// dial.
+    /// Register a peer learned out-of-band (manually — a ticket, a peers file,
+    /// or the relay-less direct test path) so the endpoint can resolve and dial
+    /// it. Tagged [`PeerSource::Manual`]. The [`PeerDirectory`] is shared with
+    /// the bound endpoint, so a peer added after binding is picked up on the
+    /// next dial.
     pub fn add_peer(&self, addr: EndpointAddr) {
-        self.peers.add(addr);
+        self.peers.add(addr, PeerSource::Manual);
     }
 
     /// Register a peer learned from the account service ([`crate::account`]),
@@ -394,17 +407,61 @@ impl SyncEngine {
     /// primitive [`crate::account::run_account_refresh_loop`]'s `add_peer`
     /// closure calls, and what `sync-ffi` wraps for the phone. Parses both,
     /// builds the same `id + relay` [`EndpointAddr`] shape [`Self::push_all_to`]
-    /// dials with, and registers it via [`Self::add_peer`]. No `iroh` type in
-    /// the signature, so a caller off the FFI boundary never needs one.
+    /// dials with, and registers it tagged [`PeerSource::Account`] (directly,
+    /// not via [`Self::add_peer`] — that tags [`PeerSource::Manual`]). No `iroh`
+    /// type in the signature, so a caller off the FFI boundary never needs one.
     pub fn add_account_peer(&self, endpoint_id: &str, relay_url: &str) -> Result<()> {
+        let addr = Self::account_peer_addr(endpoint_id, relay_url)?;
+        self.peers.add(addr, PeerSource::Account);
+        Ok(())
+    }
+
+    /// Upsert a peer learned from the account service, tagged
+    /// [`PeerSource::Account`], returning whether it was newly added. The
+    /// [`crate::account::RefreshSink`]-facing counterpart of
+    /// [`Self::add_account_peer`] (which discards the was-new bool): the loop
+    /// needs it to decide whether to first-contact-dial the peer.
+    pub fn upsert_account_peer(&self, endpoint_id: &str, relay_url: &str) -> Result<bool> {
+        let addr = Self::account_peer_addr(endpoint_id, relay_url)?;
+        Ok(self.peers.add(addr, PeerSource::Account))
+    }
+
+    /// Parse an account-service `(endpoint_id, relay_url)` pair into the
+    /// `id + relay` [`EndpointAddr`] shape [`Self::push_all_to`] dials with.
+    /// Shared by [`Self::add_account_peer`] and [`Self::upsert_account_peer`].
+    fn account_peer_addr(endpoint_id: &str, relay_url: &str) -> Result<EndpointAddr> {
         let id: EndpointId = endpoint_id.parse().map_err(|e| {
             Error::Protocol(format!("parsing account endpoint id {endpoint_id:?}: {e}"))
         })?;
         let relay: RelayUrl = relay_url.parse().map_err(|e| {
             Error::Endpoint(format!("parsing account relay url {relay_url:?}: {e}"))
         })?;
-        self.add_peer(EndpointAddr::new(id).with_relay_url(relay));
-        Ok(())
+        Ok(EndpointAddr::new(id).with_relay_url(relay))
+    }
+
+    /// Remove an `Account`-sourced peer no longer present in the account's
+    /// device list (reconcile — it left the account). Source-aware: a no-op
+    /// (returns `false`) if `endpoint_id` is absent or was registered any other
+    /// way (e.g. [`Self::add_peer_from_ticket`]).
+    pub fn remove_account_peer(&self, endpoint_id: &str) -> Result<bool> {
+        let id: EndpointId = endpoint_id
+            .parse()
+            .map_err(|e| Error::Protocol(format!("parsing account endpoint id {endpoint_id:?}: {e}")))?;
+        Ok(self.peers.remove(id, PeerSource::Account))
+    }
+
+    /// Whether `endpoint_id` is currently dial-suppressed (failed-dial
+    /// backoff). Delegates to [`BackoffRegistry::is_suppressed`], fed by every
+    /// [`Self::dial`] outcome.
+    pub fn is_suppressed(&self, endpoint_id: &str) -> bool {
+        self.backoff.is_suppressed(endpoint_id)
+    }
+
+    /// The hex ids of every `Account`-sourced peer currently registered. Seeds
+    /// [`crate::account::run_account_refresh_loop_v2`]'s reconcile-removal state
+    /// on (re)start.
+    pub fn account_peer_ids(&self) -> Vec<String> {
+        self.peers.account_peer_ids()
     }
 
     /// This device's shareable ticket: its [`EndpointAddr`] (id + current
@@ -589,10 +646,18 @@ impl SyncEngine {
     /// public API rather than widening it with an iroh-typed return. See
     /// [`Self::connect`] for the test-only public seam.
     async fn dial(&self, peer: impl Into<EndpointAddr>) -> Result<Connection> {
-        self.endpoint
-            .connect(peer, SYNC_ALPN)
+        let addr: EndpointAddr = peer.into();
+        let id_hex = addr.id.to_string();
+        let result = self
+            .endpoint
+            .connect(addr, SYNC_ALPN)
             .await
-            .map_err(|e| Error::Endpoint(format!("dialling peer on sync alpn: {e}")))
+            .map_err(|e| Error::Endpoint(format!("dialling peer on sync alpn: {e}")));
+        // Universal write side: every dial this device makes — desktop,
+        // headless, and the phone's syncs (which flow through this same engine
+        // dial) — feeds the backoff registry, regardless of the peer's source.
+        self.backoff.on_dial_outcome(&id_hex, result.is_ok());
+        result
     }
 
     /// Test-only public seam wrapping [`Self::dial`] (mirrors [`Self::import_media`]
@@ -828,6 +893,82 @@ impl SyncEngine {
             .shutdown()
             .await
             .map_err(|e| Error::Endpoint(format!("shutting down sync router: {e}")))
+    }
+}
+
+/// The production [`RefreshSink`], wrapping a live [`SyncEngine`] so a consumer
+/// driving [`crate::account::run_account_refresh_loop_v2`] just constructs this
+/// rather than hand-rolling the trait: `upsert`/`remove`/`is_suppressed`/
+/// `account_peer_ids` delegate straight to the matching engine method, and
+/// `on_new_peer` first-contact-dials the peer via [`SyncEngine::discover_with_peer`]
+/// (a full discovery exchange, so the meeting list + lifecycle also travel on
+/// the same dial — a plain connect would only prove reachability).
+pub struct SyncEngineRefreshSink {
+    engine: Arc<SyncEngine>,
+}
+
+impl SyncEngineRefreshSink {
+    /// Wrap `engine`. The engine must outlive the refresh loop driven with this
+    /// sink.
+    pub fn new(engine: Arc<SyncEngine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait::async_trait]
+impl RefreshSink for SyncEngineRefreshSink {
+    fn upsert_account_peer(&self, ep: &AccountEndpoint) -> bool {
+        self.engine
+            .upsert_account_peer(&ep.endpoint_id, &ep.relay_url)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "sync",
+                    endpoint_id = %ep.endpoint_id,
+                    error = %e,
+                    "upserting an account peer failed; treating as not-new"
+                );
+                false
+            })
+    }
+
+    fn remove_account_peer(&self, endpoint_id: &str) {
+        if let Err(e) = self.engine.remove_account_peer(endpoint_id) {
+            tracing::warn!(
+                target: "sync",
+                endpoint_id,
+                error = %e,
+                "removing an account peer failed"
+            );
+        }
+    }
+
+    fn is_suppressed(&self, endpoint_id: &str) -> bool {
+        self.engine.is_suppressed(endpoint_id)
+    }
+
+    async fn on_new_peer(&self, endpoint_id: &str) {
+        // Second guard (the loop already skips a suppressed peer before calling):
+        // honour the trait contract for any future caller that invokes this
+        // without the loop's is_suppressed gate, so a backed-off peer is never
+        // instant-dialled.
+        if self.engine.is_suppressed(endpoint_id) {
+            return;
+        }
+        // A first-contact dial that fails just waits for the next poll tick —
+        // logged at debug, not warn, since a freshly-joined peer being briefly
+        // unreachable is the expected common case, not an anomaly.
+        if let Err(e) = self.engine.discover_with_peer(endpoint_id).await {
+            tracing::debug!(
+                target: "sync",
+                endpoint_id,
+                error = %e,
+                "first-contact dial-kick failed; will retry on the next poll tick"
+            );
+        }
+    }
+
+    fn account_peer_ids(&self) -> Vec<String> {
+        self.engine.account_peer_ids()
     }
 }
 

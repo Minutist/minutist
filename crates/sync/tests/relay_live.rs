@@ -80,6 +80,7 @@ async fn notes_converge_through_the_relay() {
         // temp dir: the key and the per-meeting folders both sit directly under
         // it. Production keeps them distinct (base vs `base/meetings`).
         meetings_root: dir.to_path_buf(),
+        backoff_policy: Default::default(),
     };
 
     // `start_insecure` trusts the local relay's self-signed certificate instead

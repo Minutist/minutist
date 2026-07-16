@@ -209,6 +209,7 @@ async fn notes_converge_through_a_running_hub() {
         relay_url: relay_url.clone(),
         relay_auth_token: token.clone(),
         meetings_root: dir.to_path_buf(),
+        backoff_policy: Default::default(),
     };
     let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
@@ -353,6 +354,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
         relay_url: relay_url.clone(),
         relay_auth_token: Some(token.clone()),
         meetings_root: dir.to_path_buf(),
+        backoff_policy: Default::default(),
     };
     let engine_a = SyncEngine::start(
         cfg(dir_a.path()),
@@ -465,6 +467,7 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
         relay_url: relay_url.clone(),
         relay_auth_token: Some(token.clone()),
         meetings_root: dir.to_path_buf(),
+        backoff_policy: Default::default(),
     };
     let engine_a = SyncEngine::start(
         cfg(dir_a.path()),

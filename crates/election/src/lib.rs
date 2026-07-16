@@ -998,6 +998,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adopts_and_processes_a_synced_in_meeting_once_audio_is_present() {
+        // Roadmap 2.9 — the positive adopt-path counterpart to
+        // `scan_candidates_skips_a_pending_meeting_missing_audio`. The phone owns
+        // the AAC→Opus transcode, so a meeting adopted via sync arrives already as
+        // `audio.opus`; the desktop never sees AAC. Drive the real
+        // `run_election_loop` end-to-end: the meeting whose `audio.opus` has synced
+        // in is admitted by the F4c audio gate, claimed, and processed through to
+        // `Processed`, while a sibling still missing its audio is left
+        // `PendingProcessing` — proving the audio gate (not the claim) is what
+        // admits an adopted meeting into processing.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+
+        // Adopted: PendingProcessing with `audio.opus` present (synced in).
+        let adopted = MeetingId::new();
+        seed(root, adopted, ProcessingLifecycle::PendingProcessing).await;
+        std::fs::write(root.join(adopted.0.to_string()).join("audio.opus"), b"opus")
+            .expect("write audio.opus");
+
+        // Not yet synced: PendingProcessing, no `audio.opus` on disk.
+        let awaiting_audio = MeetingId::new();
+        seed(root, awaiting_audio, ProcessingLifecycle::PendingProcessing).await;
+
+        let mock = Arc::new(MockDriver { host: "m".into(), ..Default::default() });
+        let driver: Arc<dyn ElectionDriver> = mock.clone();
+        let handle = tokio::spawn(run_election_loop(
+            cfg(),
+            driver,
+            root.to_path_buf(),
+            Capability::Eligible,
+        ));
+
+        // Wait (bounded) for the adopted meeting to reach `Processed`. The loop
+        // polls every 10 ms (see `cfg()`), so this resolves in a few ticks.
+        let mut processed = false;
+        for _ in 0..500 {
+            if matches!(
+                read_processing(root, adopted),
+                Some(ProcessingLifecycle::Processed { .. })
+            ) {
+                processed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        assert!(processed, "the adopted (audio-present) meeting must be processed");
+
+        // Processed by us, exactly once; the audio-less sibling is untouched.
+        assert_eq!(
+            read_processing(root, adopted),
+            Some(ProcessingLifecycle::Processed {
+                processed_by: host("m"),
+                at: read_processed_at(root, adopted),
+            })
+        );
+        assert_eq!(mock.processes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_processing(root, awaiting_audio),
+            Some(ProcessingLifecycle::PendingProcessing),
+            "a candidate whose audio has not synced in must stay PendingProcessing"
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_write_does_not_regress_a_converged_lower_processed() {
         // M2: while our process() is running, simulate a peer's stronger state
         // (a lower-HostRef Processed, converged via the lifecycle subscriber's

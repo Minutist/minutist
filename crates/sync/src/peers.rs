@@ -78,6 +78,66 @@ pub fn append(root: &Path, ticket: &str) -> Result<AppendOutcome> {
     Ok(AppendOutcome::Added)
 }
 
+/// Outcome of [`remove`]: whether a matching ticket line was dropped or the
+/// ticket was not in the file (a missing file counts as [`RemoveOutcome::NotPresent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    Removed,
+    NotPresent,
+}
+
+/// Remove `ticket` from `{root}/peers`, the inverse of [`append`]. Every line
+/// whose trimmed content equals `ticket` is dropped; all other lines — including
+/// `#`-comments, blank lines, and other peers — are preserved verbatim, and the
+/// rewrite is atomic (temp-file + rename via the shared [`minutist_common::fs::write_atomic`]),
+/// so a crash never leaves the peers file truncated. A missing file or an absent
+/// ticket yields [`RemoveOutcome::NotPresent`] without writing.
+///
+/// This is the file side of an EXPLICIT, consumer-driven unpair (a Settings
+/// "remove device" action): dropping a peer's ticket here — together with
+/// removing it from the engine's in-memory `PeerDirectory` — un-pairs it durably,
+/// so the next [`reload_into`] does not re-authorise it. It is NOT the failed-dial
+/// path: a transiently-offline paired device is suppressed with backoff (the
+/// engine's unreachable registry) and re-dialled when it returns, never silently
+/// unpaired. Account-sourced peers never live in this file, so they are untouched
+/// here (their removal is the engine's account-reconcile).
+pub fn remove(root: &Path, ticket: &str) -> Result<RemoveOutcome> {
+    let ticket = ticket.trim();
+    let path = peers_path(root);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RemoveOutcome::NotPresent),
+        Err(e) => return Err(Error::Io(e)),
+    };
+
+    let mut removed = false;
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            if line.trim() == ticket {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if !removed {
+        return Ok(RemoveOutcome::NotPresent);
+    }
+
+    // Preserve a single trailing newline when content remains; an emptied file is
+    // written empty (it reads back as no peers, same as an absent file).
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    minutist_common::fs::write_atomic(&path, out.as_bytes())
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    Ok(RemoveOutcome::Removed)
+}
+
 /// Read the peers file and authorise every ticket not already applied this run
 /// (tracked in `seen`, so a repeated poll neither re-adds nor re-warns). A
 /// malformed line is logged and skipped (and marked seen). Returns the number of
@@ -150,6 +210,78 @@ mod tests {
             AppendOutcome::AlreadyPresent
         );
         assert_eq!(read_peer_tickets(dir.path()), vec![ticket]);
+    }
+
+    #[test]
+    fn remove_drops_only_the_named_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = sample_ticket();
+        let b = sample_ticket();
+        append(dir.path(), &a).unwrap();
+        append(dir.path(), &b).unwrap();
+        assert_eq!(remove(dir.path(), &a).unwrap(), RemoveOutcome::Removed);
+        assert_eq!(read_peer_tickets(dir.path()), vec![b]);
+    }
+
+    #[test]
+    fn remove_absent_ticket_is_not_present_and_leaves_the_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = sample_ticket();
+        append(dir.path(), &a).unwrap();
+        assert_eq!(
+            remove(dir.path(), &sample_ticket()).unwrap(),
+            RemoveOutcome::NotPresent
+        );
+        assert_eq!(read_peer_tickets(dir.path()), vec![a]);
+    }
+
+    #[test]
+    fn remove_on_missing_file_is_not_present() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            remove(dir.path(), &sample_ticket()).unwrap(),
+            RemoveOutcome::NotPresent
+        );
+    }
+
+    #[test]
+    fn remove_preserves_comments_blank_lines_and_other_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = sample_ticket();
+        let b = sample_ticket();
+        std::fs::write(peers_path(dir.path()), format!("# header\n{a}\n\n{b}\n")).unwrap();
+        assert_eq!(remove(dir.path(), &a).unwrap(), RemoveOutcome::Removed);
+        // The other peer still parses out; the comment survives in the raw file.
+        assert_eq!(read_peer_tickets(dir.path()), vec![b.clone()]);
+        let raw = std::fs::read_to_string(peers_path(dir.path())).unwrap();
+        assert!(raw.contains("# header"), "comment must be preserved: {raw:?}");
+        assert!(!raw.contains(&a), "removed ticket must be gone: {raw:?}");
+    }
+
+    #[test]
+    fn remove_last_ticket_leaves_an_empty_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = sample_ticket();
+        append(dir.path(), &a).unwrap();
+        assert_eq!(remove(dir.path(), &a).unwrap(), RemoveOutcome::Removed);
+        assert!(read_peer_tickets(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn remove_leaves_no_tmp_residue() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = sample_ticket();
+        let b = sample_ticket();
+        append(dir.path(), &a).unwrap();
+        append(dir.path(), &b).unwrap();
+        remove(dir.path(), &a).unwrap();
+        let residue: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(residue.is_empty(), "expected no .tmp residue, found: {residue:?}");
     }
 
     /// A valid `EndpointTicket` string built from a freshly generated key — enough

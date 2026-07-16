@@ -54,12 +54,12 @@ use ipc_bridge::{ChatHandles, SyncControl};
 use minutist_common::{AppError, AppEvent, AppResult, HostRef, MeetingId, SyncStatus};
 use settings::SettingsHandle;
 use sync::{
-    run_account_refresh_loop, AccountEndpoint, AccountEndpointSource, DeviceIdentity, SyncConfig,
-    SyncEngine,
+    run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, BackoffPolicy,
+    DeviceIdentity, RefreshSink, SyncConfig, SyncEngine, SyncEngineRefreshSink,
 };
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 /// The environment variable carrying the self-hosted relay's access token. Takes
 /// precedence over the settings value so a deployment / test can inject one
@@ -94,16 +94,19 @@ struct Runtime {
     engine: Option<Arc<SyncEngine>>,
     status: SyncStatus,
     /// The shared cancellation token for the current bind's background loops —
-    /// the peers-file poll and (when account-paired) the account-refresh loop.
-    /// Both `select!` on it; it is re-created per bind and the prior token is
-    /// `notify_waiters()`-ed before a re-bind. This wires the shared-cancel STEP
-    /// toward issue 0029 item 1 — NOT a close: the `set_enabled(false)` re-bind
-    /// teardown path is still unbuilt, and this `Notify` cancel is non-latching
-    /// (a cancel fired mid-loop-body, between `select!` iterations, is missed).
-    /// Correct for every path today (re-bind is unreachable — `start_requested`
-    /// binds once — and shutdown drops both tasks); switch to a latching
-    /// `tokio_util::sync::CancellationToken` when the re-bind teardown path lands.
-    stop: Option<Arc<Notify>>,
+    /// the peers-file poll and (when account-paired) the account-refresh loop v2.
+    /// Both `select!` on `cancelled()`. It is the single shared token that closes
+    /// issue 0029 item 1's shared-cancel on the desktop, and being latching, a
+    /// cancel fired mid-loop-body (between `select!` iterations) is not missed.
+    ///
+    /// The `replace()` below `cancel()`s a prior token before adopting the new
+    /// one, but that path is NOT reachable today: `start_requested` is a one-shot
+    /// latch, so the engine binds exactly once and `replace()` always sees `None`
+    /// — `prev.cancel()` never fires on a live loop. `cancel()` is the correct
+    /// primitive for WHEN the deferred `set_enabled(false)` re-bind/teardown path
+    /// lands (which also needs to AWAIT both tasks' exit — see that follow-up);
+    /// today only shutdown (dropping the tasks) stops the loops.
+    stop: Option<CancellationToken>,
 }
 
 /// The collaborators the producer-gate election loop needs, passed in from
@@ -256,6 +259,16 @@ impl ConnectedSync {
         if let Some(token) = relay_token {
             config = config.with_relay_auth_token(token);
         }
+        // Failed-dial backoff policy (2.7). The desktop consumer owns these
+        // values; they match the crate placeholder for now — initial estimates,
+        // to tune once we have field data on real dial-failure patterns: 3
+        // consecutive failed dials before a peer is suppressed, then exponential
+        // backoff from 30 s doubling up to a 1 h cap.
+        config = config.with_backoff_policy(BackoffPolicy {
+            max_fails: 3,
+            base: std::time::Duration::from_secs(30),
+            cap: std::time::Duration::from_secs(3600),
+        });
 
         match SyncEngine::start(config, identity).await {
             Ok(engine) => {
@@ -263,11 +276,11 @@ impl ConnectedSync {
 
                 // One cancellation token shared by this bind's background loops
                 // (the peers-file poll and, when account-paired, the account-
-                // refresh loop). Stored in `Runtime` below; a prior bind's token
-                // is notified before we replace it. A STEP toward issue 0029
-                // item 1, not a close — see the `Runtime::stop` doc for the
-                // non-latching / re-bind caveat.
-                let stop = Arc::new(Notify::new());
+                // refresh loop v2). Stored in `Runtime` below; a prior bind's
+                // token is `cancel()`-led before we replace it. The single shared
+                // token that closes issue 0029 item 1 on the desktop; latching, so
+                // a mid-loop cancel is never missed.
+                let stop = CancellationToken::new();
 
                 // Peers-file pairing (shared with the headless hub via
                 // `sync::peers`). The engine's `PeerDirectory` is in-memory and
@@ -289,13 +302,13 @@ impl ConnectedSync {
                 {
                     let engine = Arc::clone(&engine);
                     let root = app_data_base.clone();
-                    let stop = Arc::clone(&stop);
+                    let stop = stop.clone();
                     tauri::async_runtime::spawn(async move {
                         let mut poll = tokio::time::interval(PEERS_POLL_INTERVAL);
                         poll.tick().await; // immediate first tick — the bind load already ran.
                         loop {
                             tokio::select! {
-                                _ = stop.notified() => break,
+                                _ = stop.cancelled() => break,
                                 _ = poll.tick() => {
                                     sync::peers::reload_into(&engine, &root, &mut seen);
                                 }
@@ -325,24 +338,18 @@ impl ConnectedSync {
                                 endpoint_id: engine.endpoint_id().to_string(),
                                 relay_url: settings.relay_url,
                             };
-                            let add_engine = Arc::clone(&engine);
-                            let stop = Arc::clone(&stop);
-                            tauri::async_runtime::spawn(run_account_refresh_loop(
+                            // The engine-backed sink: upsert/remove/is_suppressed/
+                            // account_peer_ids delegate to the engine, and
+                            // on_new_peer first-contact-dials a genuinely-new peer.
+                            let sink: Arc<dyn RefreshSink> =
+                                Arc::new(SyncEngineRefreshSink::new(Arc::clone(&engine)));
+                            let stop = stop.clone();
+                            tauri::async_runtime::spawn(run_account_refresh_loop_v2(
                                 source,
                                 self_endpoint,
                                 ACCOUNT_REFRESH_INTERVAL,
                                 stop,
-                                move |ep| {
-                                    if let Err(e) =
-                                        add_engine.add_account_peer(&ep.endpoint_id, &ep.relay_url)
-                                    {
-                                        tracing::warn!(
-                                            target: "app-main",
-                                            error = %e,
-                                            "sync: account peer add rejected"
-                                        );
-                                    }
-                                },
+                                sink,
                             ));
                             tracing::info!(target: "app-main", "sync: account-refresh loop started");
                         }
@@ -403,8 +410,8 @@ impl ConnectedSync {
                 let mut rt = self.runtime.lock().await;
                 // Stop a prior bind's loops before adopting this bind's token, so
                 // a re-bind never leaves the old peers-poll / account loop running.
-                if let Some(prev) = rt.stop.replace(Arc::clone(&stop)) {
-                    prev.notify_waiters();
+                if let Some(prev) = rt.stop.replace(stop) {
+                    prev.cancel();
                 }
                 rt.engine = Some(engine);
                 rt.status = SyncStatus::Idle;

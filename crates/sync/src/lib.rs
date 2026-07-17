@@ -45,8 +45,7 @@ pub(crate) mod timeouts;
 use std::path::PathBuf;
 
 pub use account::{
-    peers_to_add, run_account_refresh_loop, run_account_refresh_loop_v2, AccountEndpoint,
-    AccountEndpointSource, RefreshSink,
+    peers_to_add, run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, RefreshSink,
 };
 pub use address_lookup::PeerSource;
 pub use backoff::{BackoffPolicy, BackoffRegistry};

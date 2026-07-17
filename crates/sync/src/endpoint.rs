@@ -404,8 +404,9 @@ impl SyncEngine {
 
     /// Register a peer learned from the account service ([`crate::account`]),
     /// addressed by its hex endpoint id and relay URL — the string-keyed
-    /// primitive [`crate::account::run_account_refresh_loop`]'s `add_peer`
-    /// closure calls, and what `sync-ffi` wraps for the phone. Parses both,
+    /// primitive `sync-ffi` wraps for the phone's own account-directory loop
+    /// (the in-workspace Rust consumers upsert via [`Self::upsert_account_peer`],
+    /// which the account-refresh loop's [`RefreshSink`] drives). Parses both,
     /// builds the same `id + relay` [`EndpointAddr`] shape [`Self::push_all_to`]
     /// dials with, and registers it tagged [`PeerSource::Account`] (directly,
     /// not via [`Self::add_peer`] — that tags [`PeerSource::Manual`]). No `iroh`
@@ -903,6 +904,15 @@ impl SyncEngine {
 /// `on_new_peer` first-contact-dials the peer via [`SyncEngine::discover_with_peer`]
 /// (a full discovery exchange, so the meeting list + lifecycle also travel on
 /// the same dial — a plain connect would only prove reachability).
+///
+/// **Engine-`Arc` ownership contract.** This sink holds a strong [`Arc<SyncEngine>`],
+/// as does the account-refresh loop future it is passed to. A consumer that reclaims
+/// sole ownership at shutdown for a graceful drain (`Arc::into_inner` → owning
+/// `shutdown(self)`) MUST first `await` the loop future's exit — a signal-only
+/// cancel is not enough. No `RefreshSink` method may move this `Arc` into a task
+/// that outlives the loop future, or the reclaim silently finds >1 strong ref and
+/// skips the graceful path. `on_new_peer` borrows `&self` for exactly one awaited
+/// `discover_with_peer`, so it detaches no `Arc`.
 pub struct SyncEngineRefreshSink {
     engine: Arc<SyncEngine>,
 }

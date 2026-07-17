@@ -87,19 +87,20 @@ ticket pairing: `account::AccountEndpointSource` is a trait `sync` defines and
 the consumer implements — the account-service HTTP fetcher bound to the device's
 credential — so `sync` gains **no** new dependency-table edge (no HTTP/account
 crate; the trait is the boundary, exactly as `election::ElectionDriver` keeps
-`election` off `sync`/`orchestrator`). `account::run_account_refresh_loop` takes
-the injected source, registers this device's endpoint, then on each tick fetches
-the account's endpoint list and calls a caller-supplied `add_peer` closure for
-every entry `account::peers_to_add` selects (self filtered, de-duplicated by
-endpoint id) — `add_peer` is a closure rather than a direct `SyncEngine` call so
-the loop is unit-testable without a live engine. The loop takes its `stop:
-Arc<tokio::sync::Notify>` as a parameter rather than creating one, so the spawner
-(app-main, B4) can wire it onto the same cancellation token as the local
+`election` off `sync`/`orchestrator`). `account::run_account_refresh_loop_v2`
+takes the injected source, registers this device's endpoint, then on each tick
+fetches the account's endpoint list and, for every entry `account::peers_to_add`
+selects (self filtered, de-duplicated by endpoint id), drives a caller-supplied
+`RefreshSink` (upsert / source-aware remove / suppression check / first-contact
+dial-kick) rather than a direct `SyncEngine` call, so the loop is unit-testable
+against a mock sink. The loop takes a latching `cancel:
+tokio_util::sync::CancellationToken` as a parameter rather than creating one, so
+the spawner (app-main / headless) can wire it onto the same token as the local
 peers-file poll. `SyncEngine::add_account_peer(endpoint_id: &str, relay_url:
-&str) -> Result<()>` is the string-keyed primitive both the loop's `add_peer`
-closure and `sync-ffi`'s wrapper call: parses both, builds the same `id + relay`
-`EndpointAddr` shape `push_all_to`/`peer_relay_addr` already dial with, and
-registers it via `add_peer`. Account-source and manual pairing / the file-source
+&str) -> Result<()>` (and the was-new `upsert_account_peer`) is the string-keyed
+primitive the production `SyncEngineRefreshSink` and `sync-ffi`'s wrapper call:
+parses both, builds the same `id + relay` `EndpointAddr` shape
+`push_all_to`/`peer_relay_addr` already dial with, and registers it `Account`-tagged. Account-source and manual pairing / the file-source
 fallback are additive — all feed the one `PeerDirectory`. B4 (desktop wiring)
 is now implemented: `tunnel-client` gains a raw `AccountDirectoryClient`
 (`GET /v1/account/devices`, `PUT /v1/account/devices/self/endpoint`, bearer-
@@ -3582,14 +3583,10 @@ lifecycle exchange. `subscribe_peer_events` / `subscribe_lifecycle_events` are
 the two bounded broadcast channels a host (the headless daemon, or a future
 desktop driver) reacts to. `shutdown(self)` is the owning, graceful stop.
 
-**Account-refresh loop (v2 interface).** `account` carries two loop entry
-points during the expand-migrate-contract migration off the closure-based
-signature (`planning/DESIGN_account-refresh-loop-v2.md`):
-`run_account_refresh_loop` (transitional/legacy — the `Arc<Notify>` + `add_peer`
-closure form, now unused by any Rust consumer and due for deletion; desktop +
-headless both drive the v2 loop over `SyncEngineRefreshSink`) and
+**Account-refresh loop.** `account` carries
 `run_account_refresh_loop_v2(source, self_endpoint, interval, cancel:
-tokio_util::sync::CancellationToken, sink: Arc<dyn RefreshSink>)`. `RefreshSink`
+tokio_util::sync::CancellationToken, sink: Arc<dyn RefreshSink>)`
+(`planning/DESIGN_account-refresh-loop-v2.md`). `RefreshSink`
 is the one consumer-provided object the v2 loop drives — `upsert_account_peer`
 (was-new) / `remove_account_peer` (source-aware reconcile) / `is_suppressed`
 (failed-dial backoff gate) / `on_new_peer` (first-contact dial-kick, cancellable)

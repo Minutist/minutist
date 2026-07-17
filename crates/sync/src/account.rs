@@ -14,19 +14,16 @@
 //! only the trait, the pure reconciliation logic, and the loop that drives it —
 //! mirroring the `election` crate's collaborator-behind-a-trait seam.
 //!
-//! Two loop entry points coexist: [`run_account_refresh_loop`] is the
-//! transitional/legacy entry, retained unchanged until every consumer (desktop
-//! B4, headless B4, phone) migrates; [`run_account_refresh_loop_v2`] is the
-//! current one, built once around [`RefreshSink`] so each new capability
-//! (cancellation, source-aware removal, dial-suppression, first-contact dial-kick)
-//! is a trait-method addition rather than another signature change.
+//! [`run_account_refresh_loop_v2`] drives the loop, built once around
+//! [`RefreshSink`] so each new capability (cancellation, source-aware removal,
+//! dial-suppression, first-contact dial-kick) is a trait-method addition rather
+//! than a signature change.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use minutist_common::AppResult;
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 /// One device's account-published endpoint: the address another of the
@@ -67,69 +64,6 @@ pub fn peers_to_add(list: &[AccountEndpoint], own_endpoint_id: &str) -> Vec<Acco
         .filter(|ep| seen.insert(ep.endpoint_id.clone()))
         .cloned()
         .collect()
-}
-
-/// Run the account-peer-discovery loop until `stop` is notified.
-///
-/// On start, registers `self_endpoint` with `source` (best-effort: a failure is
-/// logged at `warn` and does NOT abort the loop — a device that cannot reach the
-/// account service yet should still try to discover and dial the peers it can).
-/// Then, on every `interval` tick, fetches the account's endpoint list and calls
-/// `add_peer` for each of [`peers_to_add`]. A `list_endpoints` failure is logged
-/// at `warn` and retried on the next tick; it never kills the loop.
-///
-/// The caller MUST supply `stop` (a fresh, not-yet-notified [`Notify`]) and MUST
-/// hold a handle to notify it when this loop should end — this loop never
-/// creates its own stop handle, so the spawner controls the cancellation seam
-/// (the desktop wires it onto the same shared token as the local peers-file poll,
-/// so a sync engine re-bind cannot leak this task — `DESIGN_account-peer-source.md`
-/// "Design-review refinements").
-///
-/// `add_peer` is a plain closure (not a `SyncEngine` method) so the loop is
-/// testable without a live engine: production wires it to
-/// `SyncEngine::add_account_peer`; a test records calls instead.
-pub async fn run_account_refresh_loop(
-    source: Arc<dyn AccountEndpointSource>,
-    self_endpoint: AccountEndpoint,
-    interval: Duration,
-    stop: Arc<Notify>,
-    mut add_peer: impl FnMut(&AccountEndpoint) + Send,
-) {
-    if let Err(e) = source.register_self(&self_endpoint).await {
-        tracing::warn!(
-            target: "sync",
-            error = %e,
-            "registering this device's endpoint with the account service failed; continuing unregistered"
-        );
-    }
-
-    let mut ticker = tokio::time::interval(interval);
-    // Restore the full `interval` spacing after a slow/hung `list_endpoints` rather
-    // than firing a catch-up burst of ticks with no inter-fetch delay (the default
-    // `Burst`), so a stalled account service can never provoke a fetch burst on
-    // recovery. Matches the election loop's sleep-after-work spacing.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = stop.notified() => return,
-            _ = ticker.tick() => {
-                match source.list_endpoints().await {
-                    Ok(list) => {
-                        for peer in peers_to_add(&list, &self_endpoint.endpoint_id) {
-                            add_peer(&peer);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "sync",
-                            error = %e,
-                            "fetching the account's endpoint list failed; retrying next tick"
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// The consumer-provided sink [`run_account_refresh_loop_v2`] drives — the one
@@ -173,8 +107,8 @@ pub trait RefreshSink: Send + Sync {
 /// Run the account-peer-discovery loop until `cancel` is cancelled.
 ///
 /// On start, registers `self_endpoint` with `source` (best-effort: a failure is
-/// logged at `warn` and does NOT abort the loop, mirroring
-/// [`run_account_refresh_loop`]). The reconcile-removal state is then seeded from
+/// logged at `warn` and does NOT abort the loop). The reconcile-removal state is
+/// then seeded from
 /// `sink.account_peer_ids()` — not empty — so a peer that left the account while
 /// this loop was not running (a live `set_enabled(false -> true)` restart, not a
 /// full process restart) is still removed on the loop's first tick rather than
@@ -254,6 +188,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
+    use tokio::sync::Notify;
     use tokio::time::timeout;
 
     fn ep(device: &str, endpoint: &str) -> AccountEndpoint {
@@ -295,7 +230,7 @@ mod tests {
         assert!(peers_to_add(&[], "self-ep").is_empty());
     }
 
-    // ----- run_account_refresh_loop -----
+    // ----- shared AccountEndpointSource mock -----
 
     struct MockSource {
         list: Vec<AccountEndpoint>,
@@ -321,140 +256,6 @@ mod tests {
             self.register_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn refresh_loop_registers_adds_non_self_peers_and_tolerates_a_fetch_error() {
-        let source = Arc::new(MockSource {
-            list: vec![
-                ep("me", "self-ep"),
-                ep("peer", "peer-ep"),
-                ep("peer-dup", "peer-ep"), // duplicate endpoint id
-            ],
-            register_calls: AtomicUsize::new(0),
-            list_calls: AtomicUsize::new(0),
-            fail_next_list: AtomicBool::new(true), // the first tick's fetch fails
-        });
-        let self_endpoint = ep("me", "self-ep");
-        let stop = Arc::new(Notify::new());
-        let added: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let added_cl = Arc::clone(&added);
-        let stop_cl = Arc::clone(&stop);
-        let source_cl = Arc::clone(&source);
-        let handle = tokio::spawn(run_account_refresh_loop(
-            source_cl,
-            self_endpoint,
-            Duration::from_millis(5),
-            stop_cl,
-            move |peer: &AccountEndpoint| {
-                added_cl.lock().unwrap().push(peer.endpoint_id.clone());
-            },
-        ));
-
-        // Let several ticks elapse (the first fails, tolerated; later ones
-        // succeed), then stop the loop.
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        stop.notify_one();
-        timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("loop must exit promptly after stop is notified")
-            .expect("loop task must not panic");
-
-        assert_eq!(
-            source.register_calls.load(Ordering::SeqCst),
-            1,
-            "register_self is called exactly once, at start"
-        );
-        assert!(
-            source.list_calls.load(Ordering::SeqCst) >= 2,
-            "at least the failing first tick and one successful later tick must have fetched"
-        );
-        let added = added.lock().unwrap();
-        assert!(
-            !added.is_empty(),
-            "a successful tick must have added the non-self peer at least once"
-        );
-        assert!(
-            added.iter().all(|id| id == "peer-ep"),
-            "only the de-duplicated non-self endpoint id is ever added, got {added:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_loop_logs_register_self_failure_but_still_runs() {
-        struct FailingRegister {
-            list: Vec<AccountEndpoint>,
-        }
-        #[async_trait::async_trait]
-        impl AccountEndpointSource for FailingRegister {
-            async fn list_endpoints(&self) -> AppResult<Vec<AccountEndpoint>> {
-                Ok(self.list.clone())
-            }
-            async fn register_self(&self, _endpoint: &AccountEndpoint) -> AppResult<()> {
-                Err(minutist_common::AppError::Internal {
-                    context: "mock register_self failure".to_string(),
-                })
-            }
-        }
-
-        let source = Arc::new(FailingRegister {
-            list: vec![ep("me", "self-ep"), ep("peer", "peer-ep")],
-        });
-        let self_endpoint = ep("me", "self-ep");
-        let stop = Arc::new(Notify::new());
-        let added: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let added_cl = Arc::clone(&added);
-        let stop_cl = Arc::clone(&stop);
-        let handle = tokio::spawn(run_account_refresh_loop(
-            source,
-            self_endpoint,
-            Duration::from_millis(5),
-            stop_cl,
-            move |peer: &AccountEndpoint| {
-                added_cl.lock().unwrap().push(peer.endpoint_id.clone());
-            },
-        ));
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        stop.notify_one();
-        timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("loop must exit promptly after stop is notified")
-            .expect("loop task must not panic");
-
-        assert!(
-            !added.lock().unwrap().is_empty(),
-            "the loop must still reconcile peers despite a register_self failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresh_loop_stops_promptly_on_notify_before_any_tick() {
-        let source = Arc::new(MockSource {
-            list: vec![],
-            register_calls: AtomicUsize::new(0),
-            list_calls: AtomicUsize::new(0),
-            fail_next_list: AtomicBool::new(false),
-        });
-        let self_endpoint = ep("me", "self-ep");
-        let stop = Arc::new(Notify::new());
-
-        let stop_cl = Arc::clone(&stop);
-        let handle = tokio::spawn(run_account_refresh_loop(
-            source,
-            self_endpoint,
-            Duration::from_secs(3600), // long enough that a tick never fires first
-            stop_cl,
-            |_peer: &AccountEndpoint| {},
-        ));
-
-        stop.notify_one();
-        timeout(Duration::from_secs(1), handle)
-            .await
-            .expect("loop must exit promptly on stop even before the first tick")
-            .expect("loop task must not panic");
     }
 
     // ----- run_account_refresh_loop_v2 -----

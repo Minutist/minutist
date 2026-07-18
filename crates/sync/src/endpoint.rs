@@ -723,10 +723,26 @@ impl SyncEngine {
         Ok(ids)
     }
 
-    /// Run a discovery exchange with EVERY known peer, relay-addressed (id + the
-    /// configured relay) — the hub's recovery sweep. Mirrors [`Self::push_all_to`]'s
-    /// addressing (a hub reaches its peers through the relay). A per-peer failure is
-    /// logged and skipped; returns how many peers were discovered without error.
+    /// The known peers this sweep should dial: every registered id EXCEPT those in
+    /// failed-dial backoff ([`BackoffRegistry::is_suppressed`]). A suppressed peer is
+    /// skipped without dialling so a stale/unreachable peer does not burn the
+    /// per-dial timeout on every sweep (0029 item 6); its backoff window elapsing is
+    /// the retry — once `retry_after` passes it re-appears here and is dialled again
+    /// (a success then clears the suppression, a failure re-extends it).
+    fn peers_to_dial(&self) -> Vec<EndpointId> {
+        self.peers
+            .ids()
+            .into_iter()
+            .filter(|id| !self.backoff.is_suppressed(&id.to_string()))
+            .collect()
+    }
+
+    /// Run a discovery exchange with every known peer NOT in failed-dial backoff,
+    /// relay-addressed (id + the configured relay) — the hub's recovery sweep.
+    /// Mirrors [`Self::push_all_to`]'s addressing (a hub reaches its peers through
+    /// the relay). A dial-suppressed peer is skipped without dialling (see
+    /// [`Self::peers_to_dial`]); a per-peer failure is logged and skipped; returns
+    /// how many peers were discovered without error.
     ///
     /// This is the scheduled (periodic) re-advertisement that re-applies a
     /// lifecycle state a consumer dropped (broadcast
@@ -742,9 +758,12 @@ impl SyncEngine {
             ))
         })?;
         // `self.peers.ids()` (not the string-keyed `Self::peer_ids`) — this is
-        // internal engine addressing, not the FFI-facing surface.
-        let peers = self.peers.ids();
-        tracing::debug!(target: "sync", count = peers.len(), "sweeping peers for discovery");
+        // internal engine addressing, not the FFI-facing surface. Peers in
+        // failed-dial backoff are filtered out by `peers_to_dial`.
+        let all = self.peers.ids().len();
+        let peers = self.peers_to_dial();
+        let skipped = all - peers.len();
+        tracing::debug!(target: "sync", count = peers.len(), skipped, "sweeping peers for discovery");
         let mut discovered = 0usize;
         for peer in peers {
             let addr = EndpointAddr::new(peer).with_relay_url(relay.clone());
@@ -1395,6 +1414,41 @@ mod tests {
             engine.add_account_peer(&other.to_string(), "not a url"),
             Err(Error::Endpoint(_))
         ));
+
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn peers_to_dial_excludes_dial_suppressed_peers() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
+        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        let reachable = iroh::SecretKey::generate().public();
+        let stale = iroh::SecretKey::generate().public();
+        engine.add_peer(EndpointAddr::new(reachable));
+        engine.add_peer(EndpointAddr::new(stale));
+
+        // Both are dialled before either is suppressed.
+        assert_eq!(engine.peers_to_dial().len(), 2);
+
+        // Drive `stale` past the failure threshold (default `max_fails`) so it is
+        // suppressed; the sweep must then skip it while still dialling `reachable`.
+        for _ in 0..crate::backoff::BackoffPolicy::default().max_fails {
+            engine.backoff.on_dial_outcome(&stale.to_string(), false);
+        }
+        let to_dial = engine.peers_to_dial();
+        assert_eq!(to_dial, vec![reachable], "only the un-suppressed peer is dialled");
+        assert!(
+            !to_dial.contains(&stale),
+            "a dial-suppressed peer must be excluded from the sweep"
+        );
+
+        // A success clears suppression → `stale` re-enters the dial set.
+        engine.backoff.on_dial_outcome(&stale.to_string(), true);
+        assert_eq!(engine.peers_to_dial().len(), 2);
 
         engine.shutdown().await.expect("shutdown");
     }

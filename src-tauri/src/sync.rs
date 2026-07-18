@@ -745,7 +745,20 @@ impl ElectionDriver for DesktopElectionDriver {
         // Push the derived artifacts to every peer BEFORE the loop advertises
         // `Processed`, so a consumer never learns `Processed` without the outputs
         // being retrievable (DESIGN_producer-gate.md §6.7). Best-effort per peer.
+        // A peer in failed-dial backoff is skipped without dialling: a
+        // stale/unreachable peer would otherwise burn the per-dial timeout on
+        // every push, the same cost the discovery sweep avoids (0029 item 6).
+        // Skipping is safe for the producer gate — `advertise` (discover_all)
+        // skips the same suppressed peer, so it never learns `Processed` without
+        // the artifacts being retrievable (DESIGN_producer-gate.md §6.7). The
+        // skipped meeting's artifacts are not re-pushed by this path (it fires
+        // once per forward `Processed`); they converge when the peer reconnects
+        // and pulls, via the `discover_all` backstop, once its backoff clears.
         for peer in self.engine.peer_ids() {
+            if self.engine.is_suppressed(&peer) {
+                tracing::debug!(target: "app-main", peer = %peer, "election: skipping artifact push to a dial-suppressed peer");
+                continue;
+            }
             if let Err(e) = self.engine.sync_artifacts_to_peer(&peer, meeting_id).await {
                 tracing::warn!(target: "app-main", peer = %peer, error = %e, "election: pushing artifacts to a peer failed");
             }

@@ -3606,7 +3606,10 @@ participate; the policy VALUES are consumer-owned via
 `SyncConfig::backoff_policy` / `with_backoff_policy`. The recovery sweep
 (`discover_all`) skips suppressed peers (`peers_to_dial` filters on
 `is_suppressed`), so a stale peer costs no per-sweep dial timeout; the window
-elapsing is the retry. The `CancellationToken`
+elapsing is the retry. The desktop election `push_artifacts` path (`app-main`)
+applies the same skip — it consults `SyncEngine::is_suppressed(id)` before
+`sync_artifacts_to_peer`, so a suppressed peer does not burn the per-dial timeout
+on each `Processed` push either. The `CancellationToken`
 seam is the sole new workspace dependency edge (`crates/sync -> tokio-util`, for
 `tokio_util::sync::CancellationToken` — the same leaf `mcp-server` already
 carries); it does not change the crate-to-crate dependency table (`common` +

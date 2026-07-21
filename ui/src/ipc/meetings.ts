@@ -68,6 +68,16 @@ export async function deleteMeeting(meetingId: MeetingId): Promise<void> {
 }
 
 /**
+ * Open a meeting's on-disk directory in the host OS file explorer (themed
+ * context menus, #0034 — meeting-list "Open storage folder" entry). The
+ * backend resolves the path server-side and hands it to the platform opener;
+ * no filesystem path crosses the IPC boundary.
+ */
+export async function openMeetingFolder(meetingId: MeetingId): Promise<void> {
+  unwrap(await commands.openMeetingFolder(meetingId));
+}
+
+/**
  * Reprocess a meeting offline (#0015): re-transcribe THEN re-diarize under one
  * offline claim. Merges the former `reTranscribe` (FR-33) + `rediarize` (FR-11)
  * seams into a single command.

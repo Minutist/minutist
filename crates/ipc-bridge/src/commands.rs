@@ -1276,6 +1276,47 @@ pub async fn delete_meeting(
     Ok(())
 }
 
+/// Open a meeting's on-disk directory (`{meetings_dir}/{uuid}/`) in the host
+/// OS file explorer.
+///
+/// Mirrors [`open_attachment`]'s host hand-off: the path is resolved
+/// server-side from `meeting_id` alone (never crosses the IPC boundary) and
+/// handed to `tauri-plugin-opener`'s Rust API, so no opener capability scope
+/// is required. The existence check runs on `spawn_blocking`; an absent
+/// directory is `AppError::InvalidInput` rather than a silent no-op, since
+/// calling the opener on a missing path would surface as a confusing OS-level
+/// error instead of an app-level one.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_meeting_folder(
+    meeting_id: MeetingId,
+    app: tauri::AppHandle,
+    state: State<'_, IpcState>,
+) -> AppResult<()> {
+    let meetings_dir = state.meetings_dir.clone();
+    let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, AppError> {
+        let dir = meetings_dir.join(meeting_id.0.to_string());
+        if !dir.is_dir() {
+            return Err(AppError::InvalidInput {
+                context: format!("meeting {meeting_id:?} has no on-disk directory"),
+            });
+        }
+        Ok(dir)
+    })
+    .await
+    .map_err(|e| AppError::Internal {
+        context: format!("open_meeting_folder task join failed: {e}"),
+    })??;
+
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(path.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|e| AppError::Internal {
+            context: format!("opening the meeting folder in the host file explorer failed: {e}"),
+        })?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Collections ("folders") — list / create / rename / delete + meeting filing.
 //

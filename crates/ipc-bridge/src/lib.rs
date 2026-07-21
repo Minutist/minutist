@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (47 total)
+//! ## Commands (52 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -33,6 +33,7 @@
 //! | `rename_meeting` | `()` | 4 |
 //! | `set_speaker_name` | `()` | transcript speaker rename |
 //! | `delete_meeting` | `()` | 4 |
+//! | `open_meeting_folder` | `()` | themed context menus (#0034) |
 //! | `reprocess` | `()` | 4/6 (re-transcribe + re-diarize, #0015) |
 //! | `summarise_meeting` | `()` | 5 |
 //! | `get_summary` | `Option<String>` | 5 |
@@ -1002,6 +1003,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::rename_meeting,
             commands::set_speaker_name,
             commands::delete_meeting,
+            commands::open_meeting_folder,
             commands::list_collections,
             commands::create_collection,
             commands::rename_collection,

@@ -96,6 +96,11 @@ export const commands: Commands = {
   setSpeakerName: (meetingId, label, name) =>
     callCommand("setSpeakerName", [meetingId, label, name]),
   deleteMeeting: (meetingId) => callCommand("deleteMeeting", [meetingId]),
+  // Themed context menus (#0034) — meeting-list "Open storage folder" entry.
+  // Resolves the on-disk directory server-side and hands it to the host OS
+  // file explorer via `tauri-plugin-opener`; the DEV shim no-ops it.
+  openMeetingFolder: (meetingId) =>
+    callCommand("openMeetingFolder", [meetingId]),
   // #0015 — the offline reprocess (re-transcribe + re-diarize under one claim)
   // merges the former `reTranscribe` + `rediarizeMeeting` commands into one.
   reprocess: (meetingId) => callCommand("reprocess", [meetingId]),

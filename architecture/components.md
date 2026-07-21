@@ -3937,6 +3937,14 @@ no audio. The webview's optimistic `preparing` flag clears on this event.
   `delete_meeting(meeting_id) -> ()` — route to
   `persistence::meeting_ops::{rename_meeting, delete_meeting}`, which keep the
   on-disk folder and the index row consistent.
+- `open_meeting_folder(meeting_id) -> ()` (themed context menus, #0034) —
+  meeting-list "Open storage folder" entry. Resolves
+  `meetings_dir.join(meeting_id.0.to_string())` server-side (same derivation as
+  `attachments_dir` / `assets_dir` in `persistence`) and hands the path to
+  `app.opener().open_path` (`tauri-plugin-opener`'s Rust API), mirroring
+  `open_attachment`'s host hand-off: no filesystem path crosses the IPC
+  boundary and no opener capability scope is needed. `AppError::InvalidInput`
+  if the directory does not exist (checked on `spawn_blocking`).
 - `set_speaker_name(meeting_id, label, name) -> speaker_names map` — routes to
   `persistence::meeting_ops::set_speaker_name`; maps a diarizer label to a
   display name in `metadata.json` (empty `name` clears it), returning the

@@ -20,6 +20,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Windows-dep skew guard (issue 0040). `wmi` (via netwatch <- iroh) declares
+# `windows` and `windows-core` with independent `>=0.59,<0.63` ranges, so the
+# resolver can pin them to different pre-1.0 minors (e.g. windows 0.62 +
+# windows-core 0.61). That breaks the Windows build but is invisible to a Linux
+# compile, and the Windows/macOS CI legs are billing-blocked — so it once
+# regressed silently. `wmi`/`netwatch` are pure-Rust bindings that typecheck for
+# the MSVC target on a Linux host (no linker needed), so cross-checking them here
+# catches a lock re-mismatch on the free Linux gate. Scoped to these two: crates
+# further up the chain pull `ring`, whose cc-based build needs the MSVC
+# toolchain and cannot cross-check from Linux.
+echo "==> windows-dep skew guard: cross-check wmi/netwatch (x86_64-pc-windows-msvc)"
+rustup target add x86_64-pc-windows-msvc
+cargo check --locked --target x86_64-pc-windows-msvc -p wmi -p netwatch
+
 echo "==> cargo test --workspace --locked"
 cargo test --workspace --locked
 

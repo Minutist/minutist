@@ -23,6 +23,9 @@ import type { Collection, CollectionId } from "../state/collections";
 import { CollectionsSidebar } from "./CollectionsSidebar";
 import { OperationIndicator } from "./OperationIndicator";
 import { writeMeetingDrag } from "./meeting-dnd";
+import { ContextMenu } from "./ContextMenu";
+import type { ContextMenuEntry } from "./ContextMenu";
+import { openMeetingFolder } from "../ipc/meetings";
 import "./MeetingList.css";
 
 /** Format an RFC3339 start timestamp as a quiet, readable date. */
@@ -134,6 +137,7 @@ function MeetingRow(props: MeetingRowProps) {
   const { meeting } = props;
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(meeting.title);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   // A meeting that was never named (empty title in metadata) would otherwise
   // render an invisible, zero-height heading — the row loses its anchor and
@@ -151,6 +155,48 @@ function MeetingRow(props: MeetingRowProps) {
     }
   }
 
+  // Enters inline-rename mode. Shared by the row's Rename button and its
+  // context-menu entry so both paths land in the exact same edit state.
+  function startRename() {
+    setDraftTitle(meeting.title);
+    setRenaming(true);
+  }
+
+  // Right-click menu entries reuse the same handlers/callbacks the row's own
+  // buttons and `MoveMenu` already call — no business logic is duplicated
+  // here, only the entry list itself.
+  const moveItems = [
+    {
+      label: "Unfiled",
+      current: !meeting.collection_id,
+      onSelect: () => props.onMove(null),
+    },
+    ...props.collections.map((c) => ({
+      label: c.name,
+      current: meeting.collection_id === c.id,
+      onSelect: () => props.onMove(c.id),
+    })),
+  ];
+  const menuEntries: ContextMenuEntry[] = [
+    { label: "Open", onSelect: props.onOpen },
+    { label: "Rename", onSelect: startRename },
+    { label: "Delete", onSelect: props.onDelete, danger: true },
+    {
+      kind: "submenu",
+      label: "Move to…",
+      items: moveItems,
+      emptyLabel: "No folders yet",
+    },
+    {
+      label: "Open storage folder",
+      onSelect: () => {
+        void openMeetingFolder(meeting.id).catch((err) => {
+          console.error("open_meeting_folder failed", err);
+        });
+      },
+    },
+  ];
+
   return (
     <li
       className="meeting-list__row"
@@ -160,6 +206,14 @@ function MeetingRow(props: MeetingRowProps) {
       draggable={!renaming}
       onDragStart={(e) => {
         if (e.dataTransfer) writeMeetingDrag(e.dataTransfer, meeting.id);
+      }}
+      onContextMenu={(e) => {
+        // Keep the native menu on text-editing controls (the inline rename
+        // input) so cut/copy/paste still work there; only this row's own
+        // surface gets the themed menu (per-surface suppression, not global).
+        if ((e.target as HTMLElement).closest("input, textarea")) return;
+        e.preventDefault();
+        setMenu({ x: e.clientX, y: e.clientY });
       }}
     >
       {/* Double-click anywhere in the meeting's text opens it (the row's
@@ -239,10 +293,7 @@ function MeetingRow(props: MeetingRowProps) {
         <button
           type="button"
           className="meeting-list__action"
-          onClick={() => {
-            setDraftTitle(meeting.title);
-            setRenaming(true);
-          }}
+          onClick={startRename}
         >
           Rename
         </button>
@@ -254,6 +305,15 @@ function MeetingRow(props: MeetingRowProps) {
           Delete
         </button>
       </div>
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          entries={menuEntries}
+          onClose={() => setMenu(null)}
+        />
+      )}
     </li>
   );
 }

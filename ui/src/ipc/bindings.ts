@@ -459,6 +459,26 @@ async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, AppError>> {
 }
 },
 /**
+ * Open a meeting's on-disk directory (`{meetings_dir}/{uuid}/`) in the host
+ * OS file explorer.
+ * 
+ * Mirrors [`open_attachment`]'s host hand-off: the path is resolved
+ * server-side from `meeting_id` alone (never crosses the IPC boundary) and
+ * handed to `tauri-plugin-opener`'s Rust API, so no opener capability scope
+ * is required. The existence check runs on `spawn_blocking`; an absent
+ * directory is `AppError::InvalidInput` rather than a silent no-op, since
+ * calling the opener on a missing path would surface as a confusing OS-level
+ * error instead of an app-level one.
+ */
+async openMeetingFolder(meetingId: MeetingId) : Promise<Result<null, AppError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_meeting_folder", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * List all collections (folders), ordered by position. Reads the authoritative
  * `collections.json` (blocking file I/O on `spawn_blocking`).
  */

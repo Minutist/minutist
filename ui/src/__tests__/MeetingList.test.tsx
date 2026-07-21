@@ -27,6 +27,7 @@ vi.mock("../ipc/meetings", () => ({
   renameMeeting: vi.fn().mockResolvedValue(undefined),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
   reprocess: vi.fn().mockResolvedValue(undefined),
+  openMeetingFolder: vi.fn().mockResolvedValue(undefined),
 }));
 
 // The Phase-5 row Summarise action routes through the summary store, which
@@ -206,5 +207,87 @@ describe("MeetingList view (FR-33)", () => {
         screen.getByText(/No meetings yet/i),
       ).toBeInTheDocument(),
     );
+  });
+});
+
+describe("MeetingList row context menu (#0034 meeting-list slice)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(meetingsIpc.listMeetings).mockResolvedValue(sampleMeetings);
+  });
+
+  function getRow(title: string): HTMLElement {
+    const row = screen.getByText(title).closest("li");
+    if (!row) throw new Error(`no <li> ancestor for "${title}"`);
+    return row;
+  }
+
+  it("right-click on a row opens the themed menu and suppresses the native menu", async () => {
+    await renderList();
+    const row = getRow("Launch sync — Tuesday");
+
+    // fireEvent.dispatchEvent returns false when preventDefault() was called
+    // on a cancelable event — i.e. the native WebView2 menu was suppressed.
+    const notCancelled = fireEvent.contextMenu(row, { clientX: 120, clientY: 80 });
+    expect(notCancelled).toBe(false);
+
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "Open storage folder" }),
+    ).toBeInTheDocument();
+    // The existing row actions are surfaced as menu entries too.
+    expect(screen.getByRole("menuitem", { name: "Open" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+  });
+
+  it('"Open storage folder" invokes open_meeting_folder with the row\'s meeting id', async () => {
+    await renderList();
+    fireEvent.contextMenu(getRow("Quick standup"), { clientX: 50, clientY: 50 });
+
+    act(() => {
+      fireEvent.click(screen.getByRole("menuitem", { name: "Open storage folder" }));
+    });
+
+    await waitFor(() =>
+      expect(meetingsIpc.openMeetingFolder).toHaveBeenCalledWith("meeting-0002"),
+    );
+    // Choosing an entry dismisses the menu.
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("dismisses on outside click", async () => {
+    await renderList();
+    fireEvent.contextMenu(getRow("Quick standup"), { clientX: 50, clientY: 50 });
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.click(screen.getByLabelText("Close menu"));
+    });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("dismisses on Escape", async () => {
+    await renderList();
+    fireEvent.contextMenu(getRow("Quick standup"), { clientX: 50, clientY: 50 });
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+
+    act(() => {
+      fireEvent.keyDown(document, { key: "Escape" });
+    });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("does not suppress the native menu on the inline-rename input", async () => {
+    await renderList();
+    const renameButtons = screen.getAllByRole("button", { name: "Rename" });
+    act(() => {
+      fireEvent.click(renameButtons[0]);
+    });
+    const input = screen.getByLabelText("Meeting title");
+
+    const notCancelled = fireEvent.contextMenu(input, { clientX: 10, clientY: 10 });
+    expect(notCancelled).toBe(true);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 });

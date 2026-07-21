@@ -1,0 +1,107 @@
+/*
+ * Editorial Ink — themed context menu (issue #0034).
+ *
+ * A small floating menu, styled to match `MeetingList.css`'s "Move to…"
+ * popover (same sheet surface, hairline edge, restrained radius). All values
+ * come from `styles/theme.css` — no hard-coded colour / radius / type.
+ */
+
+.context-menu__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: default;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 41;
+  min-width: 11rem;
+  max-height: 20rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sheet);
+  padding: 0.25rem;
+  animation: context-menu-in 120ms var(--reveal-ease);
+}
+
+@keyframes context-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .context-menu {
+    animation: none;
+  }
+}
+
+.context-menu__item {
+  appearance: none;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-family: var(--font-text);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.context-menu__item:hover,
+.context-menu__item:focus-visible {
+  background: var(--accent-tint);
+  color: var(--ink);
+  outline: none;
+}
+
+.context-menu__item:disabled {
+  color: var(--stone-faint);
+  cursor: default;
+}
+
+.context-menu__item--danger {
+  color: var(--accent);
+}
+
+.context-menu__item--danger:hover,
+.context-menu__item--danger:focus-visible {
+  background: var(--accent);
+  color: var(--sheet);
+}
+
+.context-menu__submenu-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.context-menu__submenu {
+  display: flex;
+  flex-direction: column;
+  margin: 0.15rem 0 0.15rem 0.75rem;
+  padding-left: 0.4rem;
+  border-left: 1px solid var(--rule-strong);
+}
+
+.context-menu__empty {
+  font-family: var(--font-text);
+  font-size: 0.8rem;
+  font-style: italic;
+  color: var(--stone);
+  padding: 0.35rem 0.6rem;
+}

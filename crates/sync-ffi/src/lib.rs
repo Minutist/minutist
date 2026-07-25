@@ -260,6 +260,10 @@ impl FfiSyncEngine {
         meetings_root: String,
         app_data_dir: String,
     ) -> Result<Arc<Self>, SyncFfiError> {
+        // Route iroh's relay/handshake/net_report tracing to logcat on Android
+        // (no-op on host builds). Idempotent; safe to call on every `start`.
+        init_ffi_tracing();
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -533,6 +537,41 @@ where
 // meeting folder, on the C-free notes-crdt primitives. Factored as free fns so
 // they are testable against a tempdir root without a started `FfiSyncEngine`.
 // ---------------------------------------------------------------------------
+
+/// Install a `tracing` subscriber routing this crate's (and iroh's) output to
+/// Android logcat, so the phone's relay-actor / handshake / `net_report` lines
+/// are visible during diagnosis — the `.so` otherwise installs no subscriber and
+/// drops all `tracing` output. Idempotent (a `Once` guards it against every
+/// `start`) and Android-only; on the host it compiles to a no-op (the
+/// desktop/headless consumers install their own subscriber).
+#[cfg(target_os = "android")]
+fn init_ffi_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        // Verbose on the relay/transport path under investigation, quiet
+        // elsewhere; `RUST_LOG` overrides when the host sets one.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("info,sync=debug,iroh=debug,iroh_relay=debug")
+        });
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(paranoid_android::AndroidLogMakeWriter::new(
+                        "minutist.sync".to_owned(),
+                    )),
+            )
+            .try_init();
+    });
+}
+
+/// Host builds install no subscriber here (consumers own theirs) — no-op.
+#[cfg(not(target_os = "android"))]
+fn init_ffi_tracing() {}
 
 /// The `started_at_ms` of either [`FfiMeeting`] variant (for list ordering).
 fn started_at_ms_of(m: &FfiMeeting) -> i64 {

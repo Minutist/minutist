@@ -64,6 +64,18 @@ chrono = { workspace = true }
 # Build the captured note's ProseMirror doc + parse `transcript.json` off disk.
 serde_json = { workspace = true }
 
+# Android-only: route this crate's (and iroh's) `tracing` output to logcat. The
+# `.so` otherwise installs no subscriber, so ALL relay-actor / handshake /
+# net_report tracing is dropped on the phone (issue 0040 field-test — the phone
+# is the only genuinely-external relay client, and its homing failure is only
+# visible in its iroh logs). Target-gated so the host/desktop workspace build
+# never pulls these; the desktop/headless consumers install their own subscriber.
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+# tracing-subscriber MakeWriter that writes to Android logcat (liblog via the
+# NDK, linked by the mobile cross-compile). Android-only.
+paranoid-android = "0.2"
+
 [dev-dependencies]
 # Tempdir meetings-root for the data-layer projection / save tests.
 tempfile = "3"

@@ -44,7 +44,7 @@
 //! update exchange) and its media (`audio.opus` + assets, as content-addressed
 //! blobs) — and emits these as it runs.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -219,8 +219,8 @@ impl ConnectedSync {
             tracing::error!(target: "app-main", "sync: request_start could not upgrade self_ref");
             return;
         };
-        let relay_token = resolve_relay_token(&self.settings);
         let app_data_base = self.app_data_base.clone();
+        let relay_token = resolve_relay_token(&app_data_base, &self.settings);
         let meetings_dir = self.meetings_dir.clone();
         tauri::async_runtime::spawn(async move {
             this.start_engine(app_data_base, meetings_dir, relay_token)
@@ -634,14 +634,27 @@ impl SyncControl for ConnectedSync {
 }
 
 /// Resolve the relay access token: `MINUTIST_SYNC_TOKEN` if set and non-empty,
-/// otherwise none. (The token is not yet a persisted setting; the env var is the
-/// injection point for deployments/tests. Settings precedence lands with the
-/// account-service token issuance.)
-fn resolve_relay_token(_settings: &SettingsHandle) -> Option<String> {
+/// else the paired device's `mdc_` credential, else none.
+///
+/// The env var stays the override for deployments/tests (e.g. the headless hub,
+/// launched with `MINUTIST_SYNC_TOKEN=<its mdc_>`). A GUI desktop has no such env,
+/// so it resolves the token from its loaded device credential — the same `mdc_`
+/// the flipped relay validates via `/relay-authz`. Without this fallback the
+/// desktop presents no relay token and the relay 401s every connection (0043).
+/// Mirrors the phone (`capacitor.ts`: `getStoredCredential() ?? RELAY_AUTH_TOKEN`).
+fn resolve_relay_token(app_data_base: &Path, _settings: &SettingsHandle) -> Option<String> {
     match std::env::var(RELAY_TOKEN_ENV) {
         Ok(token) if !token.is_empty() => Some(token),
-        _ => None,
+        _ => credential_relay_token(app_data_base),
     }
+}
+
+/// The relay token derived from the paired device's stored credential: the
+/// `mdc_` device credential if a `tunnel_device.json` is present, else none.
+/// Factored out of [`resolve_relay_token`] so the credential-fallback path is
+/// testable without touching the process-global `MINUTIST_SYNC_TOKEN` env.
+fn credential_relay_token(app_data_base: &Path) -> Option<String> {
+    crate::tunnel::load_device_credential(app_data_base).map(|cred| cred.device_credential)
 }
 
 /// Adapts the `tunnel-client` account-directory HTTP client onto the
@@ -850,6 +863,31 @@ mod tests {
             super::capability_from_gpu(false),
             Capability::ParkSyncOnly
         ));
+    }
+
+    /// The relay-token credential fallback (0043): a paired desktop with no
+    /// `MINUTIST_SYNC_TOKEN` env resolves its relay token from the seeded
+    /// `tunnel_device.json` `mdc_` credential; an unpaired dir yields `None`.
+    #[test]
+    fn credential_relay_token_reads_the_seeded_mdc() {
+        // Unpaired: no credential file -> None.
+        let empty = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(super::credential_relay_token(empty.path()), None);
+
+        // Paired: a seeded tunnel_device.json -> its `device_credential`.
+        let paired = tempfile::TempDir::new().expect("tempdir");
+        let mdc = "mdc_deadbeef.cafef00d";
+        std::fs::write(
+            paired.path().join("tunnel_device.json"),
+            format!(
+                r#"{{"device_credential":"{mdc}","account_id":"acct-test","device_id":"deadbeef"}}"#
+            ),
+        )
+        .expect("write credential");
+        assert_eq!(
+            super::credential_relay_token(paired.path()).as_deref(),
+            Some(mdc)
+        );
     }
 
     /// A handle to a built `ConnectedSync` plus its event receiver and the temp

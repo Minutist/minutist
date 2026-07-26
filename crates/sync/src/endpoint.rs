@@ -162,6 +162,21 @@ impl PeerArrivalTracker {
     }
 }
 
+/// A DNS resolver pointed at a public nameserver (Cloudflare `1.1.1.1`) over UDP,
+/// for Android only — its in-app iroh (hickory) resolver has no system
+/// nameservers to read, so the default resolver fails every lookup (see the note
+/// at the [`SyncEngine::start`] call site). Compiled on every target so the host
+/// build type-checks the `iroh::dns` API even though only the Android build calls
+/// it.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn android_public_dns_resolver() -> iroh::dns::DnsResolver {
+    iroh::dns::DnsResolver::with_nameserver(
+        "1.1.1.1:53"
+            .parse()
+            .expect("hardcoded public nameserver socket addr is valid"),
+    )
+}
+
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
     /// configured relay (with the access token when set), registering the
@@ -176,11 +191,23 @@ impl SyncEngine {
         let meetings_root = config.meetings_root.clone();
         let blobs = BlobStore::open(&meetings_root).await?;
 
-        let endpoint = Endpoint::builder(presets::N0)
+        let builder = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key())
             .relay_mode(relay_mode)
             .alpns(vec![SYNC_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
-            .address_lookup(peers.lookup())
+            .address_lookup(peers.lookup());
+        // On Android, iroh's default (system-config) DNS resolver has NO
+        // nameservers: `/etc/resolv.conf` is absent and the netlink route socket
+        // it would fall back to is SELinux-denied for untrusted apps. So every
+        // lookup fails — the relay hostname never resolves and the endpoint never
+        // homes (found via the sync-ffi logcat bridge: 32 "Resolve failed" lines,
+        // 0 relay contact). Point the resolver at a public nameserver directly
+        // over UDP, which needs no system config. Non-Android keeps iroh's system
+        // resolver so the device's DNS (VPN / private DNS / corporate /
+        // split-horizon) is honoured.
+        #[cfg(target_os = "android")]
+        let builder = builder.dns_resolver(android_public_dns_resolver());
+        let endpoint = builder
             .bind()
             .await
             .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;

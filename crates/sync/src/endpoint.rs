@@ -162,19 +162,29 @@ impl PeerArrivalTracker {
     }
 }
 
-/// A DNS resolver pointed at a public nameserver (Cloudflare `1.1.1.1`) over UDP,
-/// for Android only — its in-app iroh (hickory) resolver has no system
-/// nameservers to read, so the default resolver fails every lookup (see the note
-/// at the [`SyncEngine::start`] call site). Compiled on every target so the host
-/// build type-checks the `iroh::dns` API even though only the Android build calls
-/// it.
+/// A DNS resolver using DNS-over-HTTPS (`:443`) to Cloudflare, for Android only —
+/// its in-app iroh (hickory) resolver has no system nameservers to read, so the
+/// default resolver fails every lookup (see the note at the [`SyncEngine::start`]
+/// call site). DoH over `:443` rather than plain UDP `:53` because mobile carriers
+/// hijack/block external `:53` (Telstra does — confirmed in the 5.4 field test),
+/// whereas `:443` is universally reachable, so a phone on cellular still resolves.
+/// Compiled on every target so the host build type-checks the `iroh::dns` API even
+/// though only the Android build calls it.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn android_public_dns_resolver() -> iroh::dns::DnsResolver {
-    iroh::dns::DnsResolver::with_nameserver(
-        "1.1.1.1:53"
-            .parse()
-            .expect("hardcoded public nameserver socket addr is valid"),
-    )
+    use iroh::dns::DnsProtocol;
+    // Cloudflare 1.1.1.1 / 1.0.0.1 DoH endpoints (their certs carry the IPs as
+    // SANs, so the IP doubles as the TLS server name — no hostname to resolve).
+    iroh::dns::DnsResolver::builder()
+        .with_nameserver(
+            "1.1.1.1:443".parse().expect("valid DoH nameserver socket addr"),
+            DnsProtocol::Https,
+        )
+        .with_nameserver(
+            "1.0.0.1:443".parse().expect("valid DoH nameserver socket addr"),
+            DnsProtocol::Https,
+        )
+        .build()
 }
 
 impl SyncEngine {
@@ -201,8 +211,9 @@ impl SyncEngine {
         // it would fall back to is SELinux-denied for untrusted apps. So every
         // lookup fails — the relay hostname never resolves and the endpoint never
         // homes (found via the sync-ffi logcat bridge: 32 "Resolve failed" lines,
-        // 0 relay contact). Point the resolver at a public nameserver directly
-        // over UDP, which needs no system config. Non-Android keeps iroh's system
+        // 0 relay contact). Point the resolver at a public nameserver over DoH
+        // (:443, cellular-carrier-proof — plain :53 is hijacked on Telstra), which
+        // needs no system config. Non-Android keeps iroh's system
         // resolver so the device's DNS (VPN / private DNS / corporate /
         // split-horizon) is honoured.
         #[cfg(target_os = "android")]

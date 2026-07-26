@@ -698,15 +698,16 @@ async fn serve_until_shutdown(
             _ = &mut account_refresh => {}
             _ = poll.tick() => { sync::peers::reload_into(&engine, data_dir, seen); },
             _ = discovery_poll.tick() => {
-                // Recovery sweep: re-discover every known peer so a lifecycle state
-                // a consumer dropped (Lagged) or skipped (a meeting not present when
-                // it was advertised) is re-applied. Raced against shutdown, like the
-                // push arm. (The first, immediate tick is a no-op before peers load.)
+                // Replica sweep: re-discover every known peer (re-applying a lifecycle
+                // a consumer dropped [Lagged] or skipped) AND pull every meeting the
+                // hub still lacks — the periodic backfill so a sometimes-online peer
+                // converges through the hub. Raced against shutdown, like the push arm.
+                // (The first, immediate tick is a no-op before peers load.)
                 tokio::select! {
                     _ = &mut shutdown => break 'serve,
-                    result = engine.discover_all() => match result {
-                        Ok(n) => tracing::debug!(target: "hub", peers = n, "periodic discovery swept peers"),
-                        Err(e) => tracing::warn!(target: "hub", error = %e, "periodic discovery failed"),
+                    result = engine.adopt_all() => match result {
+                        Ok(n) => tracing::debug!(target: "hub", adopted = n, "periodic replica sweep"),
+                        Err(e) => tracing::warn!(target: "hub", error = %e, "periodic replica sweep failed"),
                     },
                 }
             }
@@ -742,6 +743,18 @@ async fn serve_until_shutdown(
                         result = engine.push_all_to_peer(&peer) => match result {
                             Ok(n) => tracing::info!(target: "hub", peer = %peer, meetings = n, "pushed meetings to arrived peer"),
                             Err(e) => tracing::warn!(target: "hub", peer = %peer, error = %e, "push to arrived peer failed"),
+                        },
+                    }
+                    // ...and PULL: adopt every meeting the arrived peer has that the
+                    // hub lacks (notes+media+artifacts) so the hub mirrors the
+                    // account's meetings — the backfill direction (a hub that comes
+                    // up after a device recorded must pull that device's history).
+                    // Raced against shutdown like the push.
+                    tokio::select! {
+                        _ = &mut shutdown => break 'serve,
+                        result = engine.adopt_from_peer(&peer) => match result {
+                            Ok(n) => tracing::info!(target: "hub", peer = %peer, adopted = n, "adopted meetings from arrived peer"),
+                            Err(e) => tracing::warn!(target: "hub", peer = %peer, error = %e, "adopt from arrived peer failed"),
                         },
                     }
                 }

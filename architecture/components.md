@@ -3579,7 +3579,13 @@ tests (`test-support` feature only). Manual pairing goes through `my_ticket()`
 account-mediated discovery uses instead. `push_all_to_peer(peer_id)`
 reconciles every locally-held meeting (notes, then media, then a `Discovery`
 dial) to one peer; `discover_with_peer` / `discover_all` run just the
-lifecycle exchange. `subscribe_peer_events` / `subscribe_lifecycle_events` are
+lifecycle exchange. The reverse (PULL) direction is `adopt_from_peer(peer_id)` /
+`adopt_all()`: discover a peer's meeting list, then pull every meeting THIS device
+lacks (notes+media+artifacts) — the hub's sync-replica backfill, so a
+sometimes-online device converges through the hub. Adopt is pull-only + the
+consumer lifecycle-apply path; the hub runs no producer/election loop, so an
+adopted meeting is never claimed for processing. `subscribe_peer_events` /
+`subscribe_lifecycle_events` are
 the two bounded broadcast channels a host (the headless daemon, or a future
 desktop driver) reacts to. `shutdown(self)` is the owning, graceful stop.
 

@@ -815,6 +815,57 @@ impl SyncEngine {
         Ok(discovered)
     }
 
+    /// Adopt from `peer_id` as a sync REPLICA: discover the peer's meeting list
+    /// (which also applies the peer's lifecycle via
+    /// [`Self::subscribe_lifecycle_events`], the same as [`Self::discover_with`]),
+    /// then pull every meeting THIS device lacks — notes, media, and artifacts —
+    /// from that peer. Returns how many meetings were newly adopted.
+    ///
+    /// Replica semantics: the caller (the hub) runs no producer/election loop, so
+    /// an adopted meeting is never claimed for processing or host-elected — its
+    /// lifecycle is applied as-received. Notes are the anchor (they ensure the
+    /// folder and carry the doc); media/artifacts ride best-effort. A per-meeting
+    /// pull failure is logged and skipped so one bad meeting doesn't abort the set.
+    pub async fn adopt_from_peer(&self, peer_id: &str) -> Result<usize> {
+        let theirs = self.discover_with_peer(peer_id).await?;
+        let mine = discovery_proto::list_meeting_ids(&self.meetings_root);
+        let mut adopted = 0usize;
+        for meeting_id in theirs {
+            if mine.contains(&meeting_id) {
+                continue;
+            }
+            if let Err(e) = self.sync_notes_to_peer(peer_id, meeting_id).await {
+                tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: notes pull failed; skipping meeting");
+                continue;
+            }
+            if let Err(e) = self.sync_media_to_peer(peer_id, meeting_id).await {
+                tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: media pull failed (notes adopted)");
+            }
+            if let Err(e) = self.sync_artifacts_to_peer(peer_id, meeting_id).await {
+                tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: artifacts pull failed (notes adopted)");
+            }
+            adopted += 1;
+        }
+        Ok(adopted)
+    }
+
+    /// Adopt from every known peer NOT in failed-dial backoff — the hub's periodic
+    /// replica sweep. Per-peer [`Self::adopt_from_peer`], relay-addressed like
+    /// [`Self::discover_all`]. A per-peer failure is logged and skipped; returns
+    /// the total meetings newly adopted across all peers this sweep.
+    pub async fn adopt_all(&self) -> Result<usize> {
+        let mut adopted = 0usize;
+        for peer in self.peers_to_dial() {
+            match self.adopt_from_peer(&peer.to_string()).await {
+                Ok(n) => adopted += n,
+                Err(e) => {
+                    tracing::warn!(target: "sync", peer = %peer, error = %e, "adopt sweep: peer discovery failed")
+                }
+            }
+        }
+        Ok(adopted)
+    }
+
     /// Reconcile one meeting's media (`audio.opus` + note assets) with `peer`:
     /// dial it on the [`SYNC_ALPN`] and run the initiator side of the
     /// media-manifest protocol ([`media_proto::initiate_media_sync`]) against this

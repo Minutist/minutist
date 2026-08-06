@@ -237,8 +237,20 @@ suppressed→left→rejoined peer. Suppression is engine-internal at the dial
 either — dial outcomes are never phone-driven. The wrapper owns its tokio
 runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS
 threads so a re-entrant foreign callback never `block_on`s from within the
-runtime. No `tauri::*` / `ipc-bridge` imports. See `cross-cutting.md` — "Build
-variants".
+runtime. The wrapper's `start(...)` takes `dns_servers: Vec<String>` — the active
+network's own resolver IPs, which the mobile layer snapshots from
+`ConnectivityManager` (`LinkProperties.getDnsServers()`) — and threads them into
+`SyncConfig::dns_servers`. On Android iroh's default (system-config) resolver reads
+no nameservers (`/etc/resolv.conf` absent; the netlink route-socket fallback is
+SELinux-denied for untrusted apps), so `SyncEngine::start` points the in-app
+resolver at those injected IPs over UDP:53 (`android_dns_resolver`), honouring the
+device's real DNS (self-hosted / split-horizon / VPN MagicDNS) rather than a
+hardcoded public resolver a network may block; an empty list falls back to
+Cloudflare DoH over `:443` as a cellular safety net. The snapshot is taken at bind
+time — a transport change (wifi↔cellular / VPN up-down) is handled by the mobile
+layer restarting the engine with fresh resolvers, not a live resolver swap.
+Non-Android ignores `dns_servers` and keeps iroh's system resolver. No `tauri::*` /
+`ipc-bridge` imports. See `cross-cutting.md` — "Build variants".
 
 **WS4-B S5 phase 3 (UI):** `ui/src/state/sync-status.ts` and
 `ui/src/shell/SyncSettingsPane.tsx` are purely internal to the webview layer; they

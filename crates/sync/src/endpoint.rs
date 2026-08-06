@@ -162,19 +162,51 @@ impl PeerArrivalTracker {
     }
 }
 
-/// A DNS resolver using DNS-over-HTTPS (`:443`) to Cloudflare, for Android only —
-/// its in-app iroh (hickory) resolver has no system nameservers to read, so the
-/// default resolver fails every lookup (see the note at the [`SyncEngine::start`]
-/// call site). DoH over `:443` rather than plain UDP `:53` because mobile carriers
-/// hijack/block external `:53` (Telstra does — confirmed in the 5.4 field test),
-/// whereas `:443` is universally reachable, so a phone on cellular still resolves.
+/// The DNS resolver for Android, where iroh's default (system-config) resolver
+/// has no nameservers to read — `/etc/resolv.conf` is absent and the netlink route
+/// socket it falls back to is SELinux-denied for untrusted apps — so every lookup
+/// fails and the relay hostname never resolves (see the note at the
+/// [`SyncEngine::start`] call site).
+///
+/// Resolves via the `dns_servers` the caller injected (`SyncConfig::dns_servers` —
+/// a snapshot of the active network's own resolvers) over UDP:53, so resolution
+/// honours the device's real DNS: self-hosted / split-horizon, or the VPN's
+/// MagicDNS. A network's own resolver is always reachable from that network,
+/// unlike a hardcoded public one (a self-hosted network may block outbound
+/// `1.1.1.1`; a mobile carrier may hijack external `:53`).
+///
+/// Falls back to Cloudflare DoH over `:443` only when no usable nameserver was
+/// injected — a cellular safety net (DoH `:443` survives carrier `:53` hijacking).
+///
 /// Compiled on every target so the host build type-checks the `iroh::dns` API even
 /// though only the Android build calls it.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn android_public_dns_resolver() -> iroh::dns::DnsResolver {
+fn android_dns_resolver(dns_servers: &[String]) -> iroh::dns::DnsResolver {
     use iroh::dns::DnsProtocol;
-    // Cloudflare 1.1.1.1 / 1.0.0.1 DoH endpoints (their certs carry the IPs as
-    // SANs, so the IP doubles as the TLS server name — no hostname to resolve).
+    use std::net::{IpAddr, SocketAddr};
+
+    let mut builder = iroh::dns::DnsResolver::builder();
+    let mut added = 0usize;
+    for server in dns_servers {
+        match server.parse::<IpAddr>() {
+            Ok(ip) => {
+                builder = builder.with_nameserver(SocketAddr::new(ip, 53), DnsProtocol::Udp);
+                added += 1;
+            }
+            Err(e) => {
+                tracing::warn!(nameserver = %server, error = %e, "skipping unparseable injected DNS nameserver");
+            }
+        }
+    }
+    if added > 0 {
+        return builder.build();
+    }
+
+    // No usable injected nameserver → Cloudflare 1.1.1.1 / 1.0.0.1 DoH fallback
+    // (their certs carry the IPs as SANs, so the IP doubles as the TLS server name
+    // — no hostname to resolve). Cellular safety net only; a network that blocks
+    // outbound 1.1.1.1 must inject its own resolvers above.
+    tracing::info!("no usable injected DNS nameserver; falling back to public DoH resolver");
     iroh::dns::DnsResolver::builder()
         .with_nameserver(
             "1.1.1.1:443".parse().expect("valid DoH nameserver socket addr"),
@@ -211,13 +243,13 @@ impl SyncEngine {
         // it would fall back to is SELinux-denied for untrusted apps. So every
         // lookup fails — the relay hostname never resolves and the endpoint never
         // homes (found via the sync-ffi logcat bridge: 32 "Resolve failed" lines,
-        // 0 relay contact). Point the resolver at a public nameserver over DoH
-        // (:443, cellular-carrier-proof — plain :53 is hijacked on Telstra), which
-        // needs no system config. Non-Android keeps iroh's system
+        // 0 relay contact). Resolve via the active network's own resolvers, which
+        // the caller injected into `config.dns_servers` (empty → public DoH
+        // fallback; see [`android_dns_resolver`]). Non-Android keeps iroh's system
         // resolver so the device's DNS (VPN / private DNS / corporate /
         // split-horizon) is honoured.
         #[cfg(target_os = "android")]
-        let builder = builder.dns_resolver(android_public_dns_resolver());
+        let builder = builder.dns_resolver(android_dns_resolver(&config.dns_servers));
         let endpoint = builder
             .bind()
             .await
@@ -1349,6 +1381,25 @@ mod tests {
         let config = SyncConfig::new(std::env::temp_dir()).with_relay_auth_token("secret");
         let mode = SyncEngine::relay_mode(&config).expect("relay url must parse");
         assert!(matches!(mode, RelayMode::Custom(_)));
+    }
+
+    // `android_dns_resolver` builds an opaque resolver, so these guard only that
+    // the nameserver-parse loop and the empty-list DoH fallback never panic —
+    // across injected IPv4/IPv6, unparseable entries, a mix, and an empty list.
+    #[test]
+    fn android_dns_resolver_builds_for_all_nameserver_shapes() {
+        let cases: &[&[&str]] = &[
+            &[],                                        // empty → DoH fallback
+            &["192.168.0.1"],                           // IPv4 (self-hosted)
+            &["192.168.0.1", "100.100.100.100"],        // IPv4 + Tailscale MagicDNS
+            &["2606:4700:4700::1111"],                  // IPv6
+            &["not-an-ip"],                             // all unparseable → fallback
+            &["not-an-ip", "1.0.0.1"],                  // mix → keeps the valid one
+        ];
+        for case in cases {
+            let servers: Vec<String> = case.iter().map(|s| s.to_string()).collect();
+            let _ = android_dns_resolver(&servers);
+        }
     }
 
     #[test]

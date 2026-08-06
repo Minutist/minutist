@@ -113,6 +113,21 @@ pub struct SyncConfig {
     /// [`SyncEngine`]'s [`BackoffRegistry`] applies to every dial. Carries no
     /// secret, so it is not redacted in [`Self`]'s hand-written `Debug`.
     pub backoff_policy: BackoffPolicy,
+
+    /// DNS nameserver IPs the in-app resolver queries over UDP:53, injected by
+    /// the caller. Only consulted on Android, where iroh's default (system-config)
+    /// resolver has no nameservers — `/etc/resolv.conf` is absent and the netlink
+    /// route socket it falls back to is SELinux-denied for untrusted apps — so
+    /// every lookup fails and the relay hostname never resolves. The mobile layer
+    /// snapshots the ACTIVE network's resolvers (`ConnectivityManager` /
+    /// `LinkProperties.getDnsServers()`) and passes them here so resolution
+    /// honours the device's real DNS (self-hosted / split-horizon / VPN MagicDNS),
+    /// rather than a hardcoded public resolver that a network may block. Empty
+    /// (the default, and every non-Android caller) falls back to a public DoH
+    /// resolver as a cellular safety net; non-Android ignores this and keeps
+    /// iroh's system resolver. Carries no secret, so it is not redacted in
+    /// [`Self`]'s hand-written `Debug`.
+    pub dns_servers: Vec<String>,
 }
 
 impl std::fmt::Debug for SyncConfig {
@@ -124,6 +139,7 @@ impl std::fmt::Debug for SyncConfig {
             .field("relay_auth_token", &redacted)
             .field("meetings_root", &self.meetings_root)
             .field("backoff_policy", &self.backoff_policy)
+            .field("dns_servers", &self.dns_servers)
             .finish()
     }
 }
@@ -142,6 +158,7 @@ impl SyncConfig {
             relay_auth_token: None,
             meetings_root,
             backoff_policy: BackoffPolicy::default(),
+            dns_servers: Vec::new(),
         }
     }
 

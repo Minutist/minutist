@@ -51,6 +51,7 @@ async fn adopt_pulls_lacked_meetings_and_skips_held() {
         relay_auth_token: None,
         meetings_root: dir.to_path_buf(),
         backoff_policy: Default::default(),
+        dns_servers: Vec::new(),
     };
     let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a)
         .await

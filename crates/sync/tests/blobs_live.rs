@@ -58,7 +58,7 @@ async fn media_converges_through_the_deployed_relay() {
         // it. Production keeps them distinct (base vs `base/meetings`).
         meetings_root: dir.to_path_buf(),
         backoff_policy: Default::default(),
-        dns_servers: Vec::new(),
+        relay_ips: Vec::new(),
     };
 
     let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a)

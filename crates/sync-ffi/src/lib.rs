@@ -259,7 +259,7 @@ impl FfiSyncEngine {
         relay_auth_token: Option<String>,
         meetings_root: String,
         app_data_dir: String,
-        dns_servers: Vec<String>,
+        relay_ips: Vec<String>,
     ) -> Result<Arc<Self>, SyncFfiError> {
         // Route iroh's relay/handshake/net_report tracing to logcat on Android
         // (no-op on host builds). Idempotent; safe to call on every `start`.
@@ -279,7 +279,7 @@ impl FfiSyncEngine {
             relay_auth_token,
             meetings_root: meetings_root.clone(),
             backoff_policy: Default::default(),
-            dns_servers,
+            relay_ips,
         };
         let engine = rt.block_on(SyncEngine::start(config, identity))?;
 

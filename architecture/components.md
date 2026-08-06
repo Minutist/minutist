@@ -237,19 +237,24 @@ suppressed→left→rejoined peer. Suppression is engine-internal at the dial
 either — dial outcomes are never phone-driven. The wrapper owns its tokio
 runtime (`SyncEngine` holds none); event subscriptions drain on dedicated OS
 threads so a re-entrant foreign callback never `block_on`s from within the
-runtime. The wrapper's `start(...)` takes `dns_servers: Vec<String>` — the active
-network's own resolver IPs, which the mobile layer snapshots from
-`ConnectivityManager` (`LinkProperties.getDnsServers()`) — and threads them into
-`SyncConfig::dns_servers`. On Android iroh's default (system-config) resolver reads
-no nameservers (`/etc/resolv.conf` absent; the netlink route-socket fallback is
-SELinux-denied for untrusted apps), so `SyncEngine::start` points the in-app
-resolver at those injected IPs over UDP:53 (`android_dns_resolver`), honouring the
-device's real DNS (self-hosted / split-horizon / VPN MagicDNS) rather than a
-hardcoded public resolver a network may block; an empty list falls back to
-Cloudflare DoH over `:443` as a cellular safety net. The snapshot is taken at bind
-time — a transport change (wifi↔cellular / VPN up-down) is handled by the mobile
-layer restarting the engine with fresh resolvers, not a live resolver swap.
-Non-Android ignores `dns_servers` and keeps iroh's system resolver. No `tauri::*` /
+runtime. The wrapper's `start(...)` takes `relay_ips: Vec<String>` — the relay
+host's IPs, which the mobile layer PRE-RESOLVES through the OS resolver
+(`InetAddress.getAllByName`, which honours the active network's DNS including a
+full-tunnel VPN) — and threads them into `SyncConfig::relay_ips`. On Android iroh's
+default (system-config) resolver reads no nameservers (`/etc/resolv.conf` absent;
+the netlink route-socket fallback is SELinux-denied for untrusted apps), and
+injecting nameservers to query doesn't survive a full-tunnel VPN (Tailscale
+MagicDNS intercepts the app's raw UDP:53 to any resolver). So `SyncEngine::start`
+serves the relay from those pre-resolved IPs via a static `iroh::dns::Resolver`
+(`StaticRelayResolver`, keyed on the host parsed from `SyncConfig::relay_url`) — no
+in-app DNS at all, and iroh connects to the IP with the relay hostname preserved as
+the TLS SNI so the hostname cert still verifies. The relay is the only hostname
+iroh resolves; the static resolver serves nothing for any other host, so a residual
+pkarr `dns.iroh.link` lookup finds nothing locally rather than hitting the network.
+An empty `relay_ips` falls back to Cloudflare DoH over `:443` (cellular safety net).
+The IPs are resolved at bind time — a transport change (wifi↔cellular / VPN
+up-down) is handled by the mobile layer restarting the engine, not a live swap.
+Non-Android ignores `relay_ips` and keeps iroh's system resolver. No `tauri::*` /
 `ipc-bridge` imports. See `cross-cutting.md` — "Build variants".
 
 **WS4-B S5 phase 3 (UI):** `ui/src/state/sync-status.ts` and

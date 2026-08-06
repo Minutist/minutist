@@ -33,7 +33,9 @@
 //! initiator side for one meeting.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -162,51 +164,105 @@ impl PeerArrivalTracker {
     }
 }
 
-/// The DNS resolver for Android, where iroh's default (system-config) resolver
-/// has no nameservers to read — `/etc/resolv.conf` is absent and the netlink route
-/// socket it falls back to is SELinux-denied for untrusted apps — so every lookup
-/// fails and the relay hostname never resolves (see the note at the
+/// A static [`iroh::dns::Resolver`] that answers only for the relay host, from IPs
+/// the caller pre-resolved. iroh connects to the returned IP with the relay
+/// hostname preserved as the TLS SNI, so the relay's hostname cert still verifies.
+#[derive(Debug, Clone)]
+struct StaticRelayResolver {
+    /// The relay host these IPs resolve, lowercased and without a trailing dot.
+    host: String,
+    v4: Vec<std::net::Ipv4Addr>,
+    v6: Vec<std::net::Ipv6Addr>,
+}
+
+impl StaticRelayResolver {
+    fn matches(&self, host: &str) -> bool {
+        host.trim_end_matches('.').eq_ignore_ascii_case(&self.host)
+    }
+}
+
+impl iroh::dns::Resolver for StaticRelayResolver {
+    fn lookup_ipv4(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<iroh::dns::BoxIter<std::net::Ipv4Addr>, iroh::dns::DnsError>> + Send>>
+    {
+        let addrs: Vec<_> = if self.matches(&host) { self.v4.clone() } else { Vec::new() };
+        Box::pin(async move { Ok(Box::new(addrs.into_iter()) as iroh::dns::BoxIter<_>) })
+    }
+
+    fn lookup_ipv6(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<iroh::dns::BoxIter<std::net::Ipv6Addr>, iroh::dns::DnsError>> + Send>>
+    {
+        let addrs: Vec<_> = if self.matches(&host) { self.v6.clone() } else { Vec::new() };
+        Box::pin(async move { Ok(Box::new(addrs.into_iter()) as iroh::dns::BoxIter<_>) })
+    }
+
+    fn lookup_txt(
+        &self,
+        _host: String,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<iroh::dns::BoxIter<iroh::dns::TxtRecordData>, iroh::dns::DnsError>> + Send>>
+    {
+        // Addressing is account-directory based, not pkarr/TXT discovery, so serve
+        // no TXT records — a pkarr lookup simply finds nothing rather than erroring.
+        Box::pin(async move { Ok(Box::new(std::iter::empty()) as iroh::dns::BoxIter<_>) })
+    }
+
+    fn clear_cache(&self) {}
+
+    fn reset(&self) -> Box<dyn iroh::dns::Resolver> {
+        Box::new(self.clone())
+    }
+}
+
+/// The DNS resolver for Android, where iroh's default (system-config) resolver has
+/// no nameservers to read — `/etc/resolv.conf` is absent and the netlink route
+/// socket it falls back to is SELinux-denied for untrusted apps — so every in-app
+/// lookup fails and the relay never resolves (see the note at the
 /// [`SyncEngine::start`] call site).
 ///
-/// Resolves via the `dns_servers` the caller injected (`SyncConfig::dns_servers` —
-/// a snapshot of the active network's own resolvers) over UDP:53, so resolution
-/// honours the device's real DNS: self-hosted / split-horizon, or the VPN's
-/// MagicDNS. A network's own resolver is always reachable from that network,
-/// unlike a hardcoded public one (a self-hosted network may block outbound
-/// `1.1.1.1`; a mobile carrier may hijack external `:53`).
+/// Injecting nameservers to query does not survive a full-tunnel VPN (Tailscale
+/// MagicDNS intercepts the app's raw UDP:53 to any resolver), so the caller instead
+/// resolves the relay host through the OS resolver (which honours the VPN) and
+/// passes the IPs as `relay_ips`. A [`StaticRelayResolver`] then serves them for the
+/// relay host with no in-app DNS at all.
 ///
-/// Falls back to Cloudflare DoH over `:443` only when no usable nameserver was
-/// injected — a cellular safety net (DoH `:443` survives carrier `:53` hijacking).
+/// Falls back to Cloudflare DoH over `:443` only when no usable IP was injected — a
+/// cellular safety net (its certs carry the IPs as SANs, so the IP doubles as the
+/// TLS server name; DoH `:443` also survives carrier `:53` hijacking).
 ///
 /// Compiled on every target so the host build type-checks the `iroh::dns` API even
 /// though only the Android build calls it.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
-fn android_dns_resolver(dns_servers: &[String]) -> iroh::dns::DnsResolver {
+fn android_relay_resolver(relay_host: &str, relay_ips: &[String]) -> iroh::dns::DnsResolver {
     use iroh::dns::DnsProtocol;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::IpAddr;
 
-    let mut builder = iroh::dns::DnsResolver::builder();
-    let mut added = 0usize;
-    for server in dns_servers {
-        match server.parse::<IpAddr>() {
-            Ok(ip) => {
-                builder = builder.with_nameserver(SocketAddr::new(ip, 53), DnsProtocol::Udp);
-                added += 1;
-            }
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
+    for ip in relay_ips {
+        match ip.parse::<IpAddr>() {
+            Ok(IpAddr::V4(a)) => v4.push(a),
+            Ok(IpAddr::V6(a)) => v6.push(a),
             Err(e) => {
-                tracing::warn!(nameserver = %server, error = %e, "skipping unparseable injected DNS nameserver");
+                tracing::warn!(ip = %ip, error = %e, "skipping unparseable injected relay IP");
             }
         }
     }
-    if added > 0 {
-        return builder.build();
+    if !v4.is_empty() || !v6.is_empty() {
+        return iroh::dns::DnsResolver::custom(StaticRelayResolver {
+            host: relay_host.trim_end_matches('.').to_ascii_lowercase(),
+            v4,
+            v6,
+        });
     }
 
-    // No usable injected nameserver → Cloudflare 1.1.1.1 / 1.0.0.1 DoH fallback
-    // (their certs carry the IPs as SANs, so the IP doubles as the TLS server name
-    // — no hostname to resolve). Cellular safety net only; a network that blocks
-    // outbound 1.1.1.1 must inject its own resolvers above.
-    tracing::info!("no usable injected DNS nameserver; falling back to public DoH resolver");
+    // No usable injected relay IP → Cloudflare 1.1.1.1 / 1.0.0.1 DoH fallback.
+    // Cellular safety net only; a network that blocks outbound 1.1.1.1 (or a
+    // full-tunnel VPN) must inject the pre-resolved relay IPs above.
+    tracing::info!("no usable injected relay IP; falling back to public DoH resolver");
     iroh::dns::DnsResolver::builder()
         .with_nameserver(
             "1.1.1.1:443".parse().expect("valid DoH nameserver socket addr"),
@@ -241,15 +297,24 @@ impl SyncEngine {
         // On Android, iroh's default (system-config) DNS resolver has NO
         // nameservers: `/etc/resolv.conf` is absent and the netlink route socket
         // it would fall back to is SELinux-denied for untrusted apps. So every
-        // lookup fails — the relay hostname never resolves and the endpoint never
-        // homes (found via the sync-ffi logcat bridge: 32 "Resolve failed" lines,
-        // 0 relay contact). Resolve via the active network's own resolvers, which
-        // the caller injected into `config.dns_servers` (empty → public DoH
-        // fallback; see [`android_dns_resolver`]). Non-Android keeps iroh's system
-        // resolver so the device's DNS (VPN / private DNS / corporate /
-        // split-horizon) is honoured.
+        // in-app lookup fails — the relay never resolves and the endpoint never
+        // homes. Serve the relay from the caller's pre-resolved IPs
+        // (`config.relay_ips`) via a static resolver keyed on the relay host
+        // (empty → public DoH fallback; see [`android_relay_resolver`]). The relay
+        // is the only hostname iroh resolves, and a static resolver survives a
+        // full-tunnel VPN that would intercept a raw DNS query. Non-Android keeps
+        // iroh's system resolver so the device's DNS (VPN / private DNS / corporate
+        // / split-horizon) is honoured.
         #[cfg(target_os = "android")]
-        let builder = builder.dns_resolver(android_dns_resolver(&config.dns_servers));
+        let builder = {
+            let relay_host = config
+                .relay_url
+                .parse::<RelayUrl>()
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_default();
+            builder.dns_resolver(android_relay_resolver(&relay_host, &config.relay_ips))
+        };
         let endpoint = builder
             .bind()
             .await
@@ -1383,23 +1448,52 @@ mod tests {
         assert!(matches!(mode, RelayMode::Custom(_)));
     }
 
-    // `android_dns_resolver` builds an opaque resolver, so these guard only that
-    // the nameserver-parse loop and the empty-list DoH fallback never panic —
-    // across injected IPv4/IPv6, unparseable entries, a mix, and an empty list.
+    // `android_relay_resolver` builds an opaque resolver, so this guards only that
+    // the IP-parse split and the empty-list DoH fallback never panic — across
+    // injected IPv4/IPv6, unparseable entries, a mix, and an empty list.
     #[test]
-    fn android_dns_resolver_builds_for_all_nameserver_shapes() {
+    fn android_relay_resolver_builds_for_all_ip_shapes() {
         let cases: &[&[&str]] = &[
             &[],                                        // empty → DoH fallback
-            &["192.168.0.1"],                           // IPv4 (self-hosted)
-            &["192.168.0.1", "100.100.100.100"],        // IPv4 + Tailscale MagicDNS
-            &["2606:4700:4700::1111"],                  // IPv6
+            &["220.233.46.218"],                        // IPv4
+            &["220.233.46.218", "104.16.0.1"],          // multiple IPv4 (CF-proxied)
+            &["2606:4700::6810:1"],                     // IPv6
             &["not-an-ip"],                             // all unparseable → fallback
-            &["not-an-ip", "1.0.0.1"],                  // mix → keeps the valid one
+            &["not-an-ip", "220.233.46.218"],           // mix → keeps the valid one
         ];
         for case in cases {
-            let servers: Vec<String> = case.iter().map(|s| s.to_string()).collect();
-            let _ = android_dns_resolver(&servers);
+            let ips: Vec<String> = case.iter().map(|s| s.to_string()).collect();
+            let _ = android_relay_resolver("sync.minutist.ai", &ips);
         }
+    }
+
+    // The static resolver serves the seeded IPs for the relay host only, matches
+    // the host case-insensitively and ignoring a trailing dot, splits v4/v6 across
+    // the two lookups, and serves nothing for any other host (so a pkarr lookup
+    // finds nothing rather than hitting the network).
+    #[tokio::test]
+    async fn static_relay_resolver_serves_only_the_relay_host() {
+        use iroh::dns::Resolver;
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let r = StaticRelayResolver {
+            host: "sync.minutist.ai".to_string(),
+            v4: vec![Ipv4Addr::new(220, 233, 46, 218)],
+            v6: vec![Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0x6810, 0x1)],
+        };
+
+        // Relay host (with a trailing dot + odd case) → the seeded v4.
+        let v4: Vec<_> = r.lookup_ipv4("SYNC.minutist.ai.".to_string()).await.unwrap().collect();
+        assert_eq!(v4, vec![Ipv4Addr::new(220, 233, 46, 218)]);
+        // The v6 lookup returns the seeded v6, not the v4.
+        let v6: Vec<_> = r.lookup_ipv6("sync.minutist.ai".to_string()).await.unwrap().collect();
+        assert_eq!(v6, vec![Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0x6810, 0x1)]);
+        // A different host (e.g. a pkarr `dns.iroh.link` lookup) → nothing.
+        let other: Vec<_> = r.lookup_ipv4("dns.iroh.link".to_string()).await.unwrap().collect();
+        assert!(other.is_empty());
+        // No TXT records are ever served.
+        let txt = r.lookup_txt("sync.minutist.ai".to_string()).await.unwrap().count();
+        assert_eq!(txt, 0);
     }
 
     #[test]

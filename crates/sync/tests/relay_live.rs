@@ -81,7 +81,7 @@ async fn notes_converge_through_the_relay() {
         // it. Production keeps them distinct (base vs `base/meetings`).
         meetings_root: dir.to_path_buf(),
         backoff_policy: Default::default(),
-        dns_servers: Vec::new(),
+        relay_ips: Vec::new(),
     };
 
     // `start_insecure` trusts the local relay's self-signed certificate instead

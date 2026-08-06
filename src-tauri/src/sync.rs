@@ -336,7 +336,11 @@ impl ConnectedSync {
                             let self_endpoint = AccountEndpoint {
                                 device_id: cred.device_id,
                                 endpoint_id: engine.endpoint_id().to_string(),
-                                relay_url: settings.relay_url,
+                                // The engine homes on SyncConfig::DEFAULT_RELAY_URL, not
+                                // settings.relay_url (the connector tunnel's WSS
+                                // endpoint, a separate setting) — advertising the
+                                // latter here told peers to dial the wrong relay.
+                                relay_url: SyncConfig::DEFAULT_RELAY_URL.to_string(),
                             };
                             // The engine-backed sink: upsert/remove/is_suppressed/
                             // account_peer_ids delegate to the engine, and

@@ -1317,7 +1317,12 @@ revision 2025-11-25). Binding controls:
   test override) and otherwise falls back to the loaded `tunnel_device.json`
   credential, so a GUI desktop with no env variable still authenticates to the
   flipped relay (`/relay-authz`) from its paired credential — mirroring the
-  phone's `getStoredCredential() ?? RELAY_AUTH_TOKEN` (0043).
+  phone's `getStoredCredential() ?? RELAY_AUTH_TOKEN` (0043). The
+  account-directory `AccountEndpoint` it advertises to other paired devices
+  carries `SyncConfig::DEFAULT_RELAY_URL` (the sync relay it actually homes
+  on), not `settings.relay_url` — that setting is the separate connector
+  tunnel's WSS rendezvous URL and was previously advertised by mistake (0045),
+  which pointed peers at the wrong host to dial the desktop.
 
   **Token lifetime and the connected-relay path.** The token is stable across
   restarts: `app-main` reads the existing file on start and reuses it so that

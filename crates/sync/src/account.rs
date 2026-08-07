@@ -169,10 +169,27 @@ pub async fn run_account_refresh_loop_v2(
                 for ep in &peers {
                     let was_new = sink.upsert_account_peer(ep);
                     if was_new && !sink.is_suppressed(&ep.endpoint_id) {
-                        tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            _ = sink.on_new_peer(&ep.endpoint_id) => {}
-                        }
+                        // SPAWN the first-contact dial rather than awaiting it in
+                        // line: a dead or slow peer (e.g. a backgrounded phone whose
+                        // dial runs the full timeout) must not block the dial-kick of
+                        // the other peers in this pass. Awaiting serially let one
+                        // unreachable peer at the front of the account list starve a
+                        // live one behind it. Each spawned dial races the loop's
+                        // cancel token, preserving on_new_peer's "runs under the
+                        // loop's cancel scope, dropped on cancel" contract. It is
+                        // fire-and-forget: a first-contact dial is best-effort (it
+                        // warms the path; a failure just retries on the next poll
+                        // tick), and the was_new gate kicks it once per peer, so the
+                        // spawns are bounded.
+                        let sink = Arc::clone(&sink);
+                        let cancel = cancel.clone();
+                        let endpoint_id = ep.endpoint_id.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = cancel.cancelled() => {}
+                                _ = sink.on_new_peer(&endpoint_id) => {}
+                            }
+                        });
                     }
                 }
 

@@ -93,7 +93,12 @@ fetches the account's endpoint list and, for every entry `account::peers_to_add`
 selects (self filtered, de-duplicated by endpoint id), drives a caller-supplied
 `RefreshSink` (upsert / source-aware remove / suppression check / first-contact
 dial-kick) rather than a direct `SyncEngine` call, so the loop is unit-testable
-against a mock sink. The loop takes a latching `cancel:
+against a mock sink. Each new peer's first-contact dial-kick (`on_new_peer`) is
+SPAWNED (racing the loop's cancel token), not awaited in line, so a dead or slow
+peer at the front of the account list — e.g. a backgrounded phone whose dial runs
+the full timeout — cannot starve the dial-kick of the live peers behind it; the
+recovery sweep (`SyncEngine::adopt_all`) dials its peers concurrently
+(`join_all`) for the same reason. The loop takes a latching `cancel:
 tokio_util::sync::CancellationToken` as a parameter rather than creating one, so
 the spawner (app-main / headless) can wire it onto the same token as the local
 peers-file poll. `SyncEngine::add_account_peer(endpoint_id: &str, relay_url:

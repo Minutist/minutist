@@ -951,16 +951,24 @@ impl SyncEngine {
     /// [`Self::discover_all`]. A per-peer failure is logged and skipped; returns
     /// the total meetings newly adopted across all peers this sweep.
     pub async fn adopt_all(&self) -> Result<usize> {
-        let mut adopted = 0usize;
-        for peer in self.peers_to_dial() {
-            match self.adopt_from_peer(&peer.to_string()).await {
-                Ok(n) => adopted += n,
-                Err(e) => {
-                    tracing::warn!(target: "sync", peer = %peer, error = %e, "adopt sweep: peer discovery failed")
+        // Adopt from every peer CONCURRENTLY: a dead or slow peer (e.g. a
+        // backgrounded phone whose dial runs the full timeout) must not delay the
+        // sweep for the peers behind it — serialising the sweep let one unreachable
+        // peer starve the rest. Each future borrows `&self`; a per-peer failure is
+        // logged and contributes zero to the total.
+        let counts = futures_util::future::join_all(self.peers_to_dial().into_iter().map(
+            |peer| async move {
+                match self.adopt_from_peer(&peer.to_string()).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(target: "sync", peer = %peer, error = %e, "adopt sweep: peer discovery failed");
+                        0
+                    }
                 }
-            }
-        }
-        Ok(adopted)
+            },
+        ))
+        .await;
+        Ok(counts.into_iter().sum())
     }
 
     /// Reconcile one meeting's media (`audio.opus` + note assets) with `peer`:

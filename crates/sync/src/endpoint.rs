@@ -275,6 +275,21 @@ fn android_relay_resolver(relay_host: &str, relay_ips: &[String]) -> iroh::dns::
         .build()
 }
 
+/// Whether a held meeting is materialised enough for [`SyncEngine::adopt_from_peer`]
+/// to skip re-syncing it: its authoritative notes CRDT (`notes.ydoc`), `metadata.json`,
+/// and `audio.opus` are all present. A held-but-incomplete meeting — any of the three
+/// missing (e.g. audio pulled but the notes pull failed on a prior sweep, or vice
+/// versa) — fails this and is re-attempted, so adopt self-heals rather than stranding
+/// it on folder existence alone. `audio.opus` stands in for media completeness; a
+/// meeting genuinely without audio simply re-syncs each sweep — a cheap idempotent
+/// manifest exchange, not a blob transfer.
+fn meeting_is_materialised(meetings_root: &Path, meeting_id: MeetingId) -> bool {
+    let dir = meetings_root.join(meeting_id.0.to_string());
+    dir.join("notes.ydoc").is_file()
+        && dir.join("metadata.json").is_file()
+        && dir.join("audio.opus").is_file()
+}
+
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
     /// configured relay (with the access token when set), registering the
@@ -928,7 +943,17 @@ impl SyncEngine {
         let mine = discovery_proto::list_meeting_ids(&self.meetings_root);
         let mut adopted = 0usize;
         for meeting_id in theirs {
-            if mine.contains(&meeting_id) {
+            // Skip a meeting only when it is already FULLY materialised locally —
+            // NOT on mere folder existence. sync_notes creates the folder before
+            // media and artifacts run, so a meeting whose notes landed but whose
+            // media/artifacts pull FAILED (or vice versa) would, under a
+            // folder-existence check, be treated as "held" and skipped on every
+            // later sweep, stranded half-synced forever. Re-attempt an incomplete
+            // held meeting; notes/media/artifacts sync is idempotent + manifest-
+            // diffed, so re-running a complete one would be a cheap no-op (which the
+            // completeness skip avoids anyway).
+            let held = mine.contains(&meeting_id);
+            if held && meeting_is_materialised(&self.meetings_root, meeting_id) {
                 continue;
             }
             if let Err(e) = self.sync_notes_to_peer(peer_id, meeting_id).await {
@@ -936,12 +961,17 @@ impl SyncEngine {
                 continue;
             }
             if let Err(e) = self.sync_media_to_peer(peer_id, meeting_id).await {
-                tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: media pull failed (notes adopted)");
+                tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: media pull failed");
             }
             if let Err(e) = self.sync_artifacts_to_peer(peer_id, meeting_id).await {
-                tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: artifacts pull failed (notes adopted)");
+                tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: artifacts pull failed");
             }
-            adopted += 1;
+            // Count only genuinely-new adoptions: re-completing a held-but-incomplete
+            // meeting is not a new adoption, so the return stays "meetings newly
+            // adopted this pass".
+            if !held {
+                adopted += 1;
+            }
         }
         Ok(adopted)
     }
@@ -1502,6 +1532,42 @@ mod tests {
         // No TXT records are ever served.
         let txt = r.lookup_txt("sync.minutist.ai".to_string()).await.unwrap().count();
         assert_eq!(txt, 0);
+    }
+
+    // adopt_from_peer skips a held meeting ONLY if fully materialised; a held-but-
+    // incomplete meeting must be re-attempted. This guards both stranding shapes:
+    // audio-without-notes (the field-test 41-stuck-dirs case) and notes-without-audio
+    // (media pull failed after notes landed).
+    #[test]
+    fn meeting_is_materialised_requires_notes_metadata_and_audio() {
+        use std::fs;
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let mk = |id: MeetingId| {
+            let dir = root.path().join(id.0.to_string());
+            fs::create_dir_all(&dir).expect("mk meeting dir");
+            dir
+        };
+
+        // Absent dir → not materialised.
+        assert!(!meeting_is_materialised(root.path(), MeetingId(uuid::Uuid::new_v4())));
+
+        // Audio only (media landed, notes/metadata did not) → not materialised.
+        let a = MeetingId(uuid::Uuid::new_v4());
+        let da = mk(a);
+        fs::write(da.join("audio.opus"), b"x").expect("w");
+        assert!(!meeting_is_materialised(root.path(), a));
+        fs::write(da.join("notes.ydoc"), b"x").expect("w"); // + notes, still no metadata
+        assert!(!meeting_is_materialised(root.path(), a));
+        fs::write(da.join("metadata.json"), b"{}").expect("w"); // all three
+        assert!(meeting_is_materialised(root.path(), a));
+
+        // Notes + metadata but NO audio (media pull failed) → not materialised, so
+        // adopt re-attempts the media.
+        let b = MeetingId(uuid::Uuid::new_v4());
+        let db = mk(b);
+        fs::write(db.join("notes.ydoc"), b"x").expect("w");
+        fs::write(db.join("metadata.json"), b"{}").expect("w");
+        assert!(!meeting_is_materialised(root.path(), b));
     }
 
     #[test]

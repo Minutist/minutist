@@ -3603,8 +3603,12 @@ reconciles every locally-held meeting (notes, then media, then a `Discovery`
 dial) to one peer; `discover_with_peer` / `discover_all` run just the
 lifecycle exchange. The reverse (PULL) direction is `adopt_from_peer(peer_id)` /
 `adopt_all()`: discover a peer's meeting list, then pull every meeting THIS device
-lacks (notes+media+artifacts) — the hub's sync-replica backfill, so a
-sometimes-online device converges through the hub. Adopt is pull-only + the
+lacks OR holds only incompletely (notes+media+artifacts) — the hub's sync-replica
+backfill, so a sometimes-online device converges through the hub. A held meeting is
+skipped only when FULLY materialised (its `notes.ydoc` + `metadata.json` +
+`audio.opus` all present); a half-synced meeting (e.g. audio pulled but its notes
+pull failed on a prior sweep, or vice versa) is re-attempted rather than stranded on
+folder existence alone, so adopt self-heals across sweeps. Adopt is pull-only + the
 consumer lifecycle-apply path; the hub runs no producer/election loop, so an
 adopted meeting is never claimed for processing. `subscribe_peer_events` /
 `subscribe_lifecycle_events` are

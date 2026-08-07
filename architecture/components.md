@@ -470,6 +470,14 @@ summariser — anchored ones carry the `data-anchor-ms` recording-clock
 timestamp; `Summariser::summarise` takes `&[NoteBlock]` (not flat markdown) so
 notes weave into the transcript at their time.
 
+`SUPPORTED_AUDIO_EXTS: &[&str]` + `resolve_audio_path(&Path) -> Option<PathBuf>`
+(0047/0048) — a meeting's audio file is `audio.<ext>` where `ext` is the
+recording device's container (desktop: opus; phone: m4a, no hardware Opus
+encoder); `metadata.json`'s `AudioFormat::codec` is the authoritative codec
+label, the extension is only how the file is found on disk. `sync` (media
+import + manifest path-safety) and `persistence` (decode dispatch) both
+resolve against this single list so the two surfaces can't drift apart.
+
 **Attachments — shared types (Attachments WS).** Three new vocabulary types and
 four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the
 single `collect_events![AppEventPayload]` registration — no second registration.

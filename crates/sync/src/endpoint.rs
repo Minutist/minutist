@@ -941,7 +941,10 @@ impl SyncEngine {
     pub async fn adopt_from_peer(&self, peer_id: &str) -> Result<usize> {
         let theirs = self.discover_with_peer(peer_id).await?;
         let mine = discovery_proto::list_meeting_ids(&self.meetings_root);
+        let discovered = theirs.len();
         let mut adopted = 0usize;
+        let mut recompleted = 0usize;
+        let mut skipped_complete = 0usize;
         for meeting_id in theirs {
             // Skip a meeting only when it is already FULLY materialised locally —
             // NOT on mere folder existence. sync_notes creates the folder before
@@ -954,6 +957,7 @@ impl SyncEngine {
             // completeness skip avoids anyway).
             let held = mine.contains(&meeting_id);
             if held && meeting_is_materialised(&self.meetings_root, meeting_id) {
+                skipped_complete += 1;
                 continue;
             }
             if let Err(e) = self.sync_notes_to_peer(peer_id, meeting_id).await {
@@ -966,13 +970,27 @@ impl SyncEngine {
             if let Err(e) = self.sync_artifacts_to_peer(peer_id, meeting_id).await {
                 tracing::warn!(target: "sync", peer = peer_id, meeting_id = %meeting_id.0, error = %e, "adopt: artifacts pull failed");
             }
-            // Count only genuinely-new adoptions: re-completing a held-but-incomplete
-            // meeting is not a new adoption, so the return stays "meetings newly
+            // Count genuinely-new adoptions separately from re-completions of a
+            // held-but-incomplete meeting, so the return stays "meetings newly
             // adopted this pass".
-            if !held {
+            if held {
+                recompleted += 1;
+            } else {
                 adopted += 1;
             }
         }
+        // One summary line per peer so an adopt pass is observable without per-meeting
+        // spam: how many the peer advertised, how many were newly adopted vs
+        // re-completed (half-synced meetings finished) vs skipped as already-complete.
+        tracing::debug!(
+            target: "sync",
+            peer = peer_id,
+            discovered,
+            adopted,
+            recompleted,
+            skipped_complete,
+            "adopt: pass complete for peer"
+        );
         Ok(adopted)
     }
 

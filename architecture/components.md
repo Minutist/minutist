@@ -3608,8 +3608,10 @@ backfill, so a sometimes-online device converges through the hub. A held meeting
 skipped only when FULLY materialised (its `notes.ydoc` + `metadata.json` +
 `audio.opus` all present); a half-synced meeting (e.g. audio pulled but its notes
 pull failed on a prior sweep, or vice versa) is re-attempted rather than stranded on
-folder existence alone, so adopt self-heals across sweeps. Adopt is pull-only + the
-consumer lifecycle-apply path; the hub runs no producer/election loop, so an
+folder existence alone, so adopt self-heals across sweeps. Each pass logs one
+per-peer summary (`discovered` / `adopted` / `recompleted` / `skipped_complete`) at
+debug, so a sweep's decision is observable without per-meeting spam. Adopt is
+pull-only + the consumer lifecycle-apply path; the hub runs no producer/election loop, so an
 adopted meeting is never claimed for processing. `subscribe_peer_events` /
 `subscribe_lifecycle_events` are
 the two bounded broadcast channels a host (the headless daemon, or a future

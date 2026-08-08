@@ -163,8 +163,11 @@ fn timeout_helpers_clamp_to_documented_bounds() {
     assert_eq!(crate::diarize_timeout(0), Duration::from_secs(120));
     assert_eq!(crate::diarize_timeout(300_000), Duration::from_secs(300));
     assert_eq!(crate::diarize_timeout(3_600_000), Duration::from_secs(600));
-    // re-transcribe: ~3× real-time, floor 300 s, cap 1800 s.
-    assert_eq!(crate::retranscribe_timeout(0), Duration::from_secs(300));
+    // re-transcribe: ~3× real-time, floor 300 s, cap 1800 s. `0` is "duration
+    // unknown" (an unauthoritative metadata placeholder, not a real
+    // zero-length recording), so it gets the CAP, not the floor — an unknown
+    // duration must not be assumed to be the shortest possible one.
+    assert_eq!(crate::retranscribe_timeout(0), Duration::from_secs(1800));
     assert_eq!(crate::retranscribe_timeout(300_000), Duration::from_secs(900));
     assert_eq!(crate::retranscribe_timeout(3_600_000), Duration::from_secs(1800));
     // relisten (S2): ~3× the WINDOW length, floor 60 s, cap 300 s.

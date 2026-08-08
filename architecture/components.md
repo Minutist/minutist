@@ -2538,8 +2538,11 @@ the meeting-list excerpt reflects the new first segment, then emits
 `AppEvent::TranscriptReady { meeting_id }` so the webview re-reads the transcript
 (mirroring `DiarizationComplete`). The ASR run is wrapped
 in a length-relative timeout (`retranscribe_timeout`: ≈3× real-time, floored 5
-min / capped 30 min — generous, since ASR is slower than diarization), so a
-wedged run cannot hold the offline claim forever. Unlike the live path's
+min / capped 30 min — generous, since ASR is slower than diarization; an
+unknown (`0`) duration sizes to the 30-min cap, not the 5-min floor, so a
+meeting whose real metadata hasn't synced in yet is not silently assumed to
+be the shortest possible case), so a wedged run cannot hold the offline claim
+forever. Unlike the live path's
 best-effort skip when no model is present, an explicit user-triggered
 re-transcribe with no available model is an error (`AppError::ModelLoad`). The
 orchestrator does not own a `MeetingIndex`; the index handle is passed in by

@@ -4151,9 +4151,25 @@ fn diarize_timeout(recording_duration_ms: u64) -> Duration {
 /// capped at 30 min. Deliberately generous so a legitimate long re-transcribe is
 /// not cut short; the bound exists so a wedged ASR run cannot hold the offline
 /// claim (and block the next recording) forever.
+///
+/// `0` is treated as "duration unknown," not "zero-length recording" — a real
+/// recording is never exactly 0 ms, but `metadata.json`'s `duration_ms` reads
+/// `0` for a meeting still carrying the unauthoritative inbound-sync
+/// placeholder (`notes_crdt::MeetingFolder::ensure`'s seed, never overwritten
+/// because the meeting's notes-sync exchange hasn't completed — a real gap,
+/// tracked separately). Assuming the floor for an unknown duration silently
+/// sizes the budget for the *shortest* possible recording instead of a
+/// generic unknown one, guaranteeing a timeout on any real meeting long
+/// enough to need the cap — this hit exactly that case in the field
+/// (issue 0051 follow-up: a phone recording stuck in an endless
+/// claim→decode→timeout→release loop, forever, because its duration was
+/// unknown, not because it was actually short).
 fn retranscribe_timeout(recording_duration_ms: u64) -> Duration {
     const FLOOR_SECS: u64 = 300; // 5 min
     const CAP_SECS: u64 = 1800; // 30 min
+    if recording_duration_ms == 0 {
+        return Duration::from_secs(CAP_SECS);
+    }
     let secs = (recording_duration_ms / 1000 * 3).clamp(FLOOR_SECS, CAP_SECS);
     Duration::from_secs(secs)
 }

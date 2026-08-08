@@ -147,7 +147,7 @@ pub fn read_audio_pcm(meeting_dir: &Path) -> AppResult<Vec<f32>> {
                         target: "persistence",
                         path = %path.display(),
                         opus_error = %opus_err,
-                        "audio.opus failed Ogg/Opus decode but succeeded as AAC — a pre-0047 mislabelled phone recording (issue 0051)"
+                        "audio.opus failed Ogg/Opus decode but succeeded as AAC — a pre-0047 mislabelled phone recording (issue 0051); its pause-timeline parity with wall-clock is not guaranteed (issue 0050)"
                     );
                     Ok(pcm)
                 }

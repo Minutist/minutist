@@ -389,6 +389,31 @@ pub struct AudioFormat {
     pub bitrate_kbps: Option<u32>,
 }
 
+/// Audio-container extensions a meeting's audio file may use, in resolution
+/// priority order (checked in this order by [`resolve_audio_path`]). Each
+/// device records in whatever container its platform supports — the desktop
+/// writes Opus, the phone AAC-in-MP4 (no hardware Opus encoder) — and
+/// `metadata.json`'s [`AudioFormat::codec`] is the authoritative codec label;
+/// the extension is only how the file is found on disk.
+///
+/// This is the shared contract `sync` (import, manifest path-safety —
+/// tracked as 0048) and `persistence` (decode — 0047) are being migrated
+/// onto so the two can't drift apart; as of this commit neither has been
+/// wired to it yet — `sync` still hardcodes a single `AUDIO_REL` literal and
+/// `persistence::read_audio_pcm` still decodes Ogg/Opus only.
+pub const SUPPORTED_AUDIO_EXTS: &[&str] = &["opus", "m4a"];
+
+/// Resolve a meeting folder's actual audio file — the single `audio.<ext>`
+/// present, `ext` drawn from [`SUPPORTED_AUDIO_EXTS`] in order — or `None` if
+/// the meeting has no audio file (a notes-only meeting, or one still
+/// mid-recording under a different working name).
+pub fn resolve_audio_path(meeting_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    SUPPORTED_AUDIO_EXTS.iter().find_map(|ext| {
+        let path = meeting_dir.join(format!("audio.{ext}"));
+        path.is_file().then_some(path)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Model registry
 // ---------------------------------------------------------------------------
@@ -2040,6 +2065,27 @@ pub trait Embedder: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_audio_path_finds_opus_then_m4a_in_priority_order() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_audio_path(dir.path()).is_none());
+
+        std::fs::write(dir.path().join("audio.m4a"), b"aac bytes").unwrap();
+        assert_eq!(
+            resolve_audio_path(dir.path()).unwrap(),
+            dir.path().join("audio.m4a")
+        );
+
+        // opus is earlier in SUPPORTED_AUDIO_EXTS, so it wins if both exist —
+        // a meeting has exactly one audio file in practice, but the resolver's
+        // order must still be deterministic if that invariant is ever violated.
+        std::fs::write(dir.path().join("audio.opus"), b"opus bytes").unwrap();
+        assert_eq!(
+            resolve_audio_path(dir.path()).unwrap(),
+            dir.path().join("audio.opus")
+        );
+    }
 
     #[test]
     fn diagnostic_report_serde_shape_and_no_meeting_field() {

@@ -1835,14 +1835,17 @@ const AAC_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/aac_sine_440hz_2s.m
 fn test_aac_m4a_decode_resamples_to_16k_mono() {
     let pcm = reader::decode_aac_m4a_for_test(AAC_FIXTURE).expect("decode aac fixture");
 
-    // Source is 44.1 kHz mono, 2.0 s → resampled to 16 kHz mono should be
-    // ~32000 samples. Generous ±10% for encoder priming/trailing frames and
-    // the FFT resampler's fixed-chunk zero-padded tail.
+    // Source is 44.1 kHz mono, 2.0 s → resampled to 16 kHz mono is ~32000
+    // samples plus the untrimmed AAC encoder priming delay (see
+    // decode_aac_m4a's doc comment — symphonia's isomp4/aac combination
+    // doesn't implement gapless trimming): ~1024-2112 source samples is
+    // ~371-766 samples at 16 kHz, so the tolerance below is exactly that
+    // known, tracked residual (issue 0050) — not a vague fudge factor.
     let expected = 2.0 * SAMPLE_RATE_16K as f64;
     let got = pcm.len() as f64;
     assert!(
-        (got - expected).abs() < expected * 0.1,
-        "expected ~{expected} samples at 16 kHz for a 2 s clip, got {got}"
+        (got - expected) < 1000.0 && (got - expected) > -100.0,
+        "expected ~{expected} samples at 16 kHz for a 2 s clip (+ up to ~800 for the untrimmed AAC priming delay), got {got}"
     );
 
     // A real sine tone decodes to a non-silent, non-clipped signal — not an

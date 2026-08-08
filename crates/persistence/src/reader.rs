@@ -102,13 +102,40 @@ pub(crate) fn read_transcript_inner(meeting_dir: &Path) -> Result<Vec<Segment>, 
 /// for phone recordings is a separate, unscoped follow-up if it matters in
 /// practice.
 pub fn read_audio_pcm(meeting_dir: &Path) -> AppResult<Vec<f32>> {
-    let path = minutist_common::resolve_audio_path(meeting_dir)
-        .ok_or(Error::InvalidState("meeting has no audio file"))?;
+    let not_found = || {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no resolvable audio file in {}", meeting_dir.display()),
+        ))
+    };
+    let path = minutist_common::resolve_audio_path(meeting_dir).ok_or_else(not_found)?;
     let data = std::fs::read(&path).map_err(Error::Io)?;
+    // `Error::Io` here (not `Error::InvalidState`/`AppError::InvalidInput`) is
+    // deliberate: `ipc-bridge::run_post_stop_passes` matches `InvalidInput` as
+    // "recorder busy, try again later" and downgrades the failure to an info
+    // log. A missing or unresolvable audio file is a real failure that must
+    // stay at `AppError::Io`'s severity, matching what a literal missing
+    // `audio.opus` produced before this function resolved the path itself.
     match path.extension().and_then(|e| e.to_str()) {
         Some("opus") => decode_opus_ogg(&data).map_err(|e| Error::AudioDecode(e).into()),
-        Some("m4a") => decode_aac_m4a(&data).map_err(|e| Error::AudioDecode(e).into()),
-        _ => Err(Error::InvalidState("meeting's audio file has an unsupported extension").into()),
+        Some("m4a") => {
+            // A phone-recorded meeting's decoded duration has no guaranteed
+            // relationship to wall-clock (see this fn's doc comment) — flag it
+            // so a diarization/re-listen/voiceprint quality report for a
+            // phone meeting can be traced back to this, not treated as
+            // unexplained.
+            tracing::warn!(
+                target: "persistence",
+                path = %path.display(),
+                "decoding a phone-recorded .m4a meeting — pause-timeline parity with wall-clock is not guaranteed (0047 follow-up: issue 0050)"
+            );
+            decode_aac_m4a(data).map_err(|e| Error::AudioDecode(e).into())
+        }
+        _ => Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported audio file extension: {}", path.display()),
+        ))
+        .into()),
     }
 }
 
@@ -296,6 +323,15 @@ fn parse_opus_head_pre_skip(head: &[u8]) -> u64 {
 /// resample glue is duplicated here rather than sharing an instance.
 const RESAMPLE_CHUNK_IN: usize = 1024;
 
+/// A native sample rate outside this range cannot be a real recording (typical
+/// audio is 8 kHz–192 kHz); reject it before it reaches rubato, whose
+/// `FftFixedIn` sizes an internal FFT buffer from the input/output rate ratio
+/// — an untrusted, corrupted, or bit-flipped rate field could otherwise
+/// demand a multi-gigabyte allocation and abort the process instead of
+/// failing the decode.
+const MAX_PLAUSIBLE_SAMPLE_RATE_HZ: u32 = 192_000;
+const MIN_PLAUSIBLE_SAMPLE_RATE_HZ: u32 = 1_000;
+
 /// Decode an AAC-in-MP4 (`.m4a`) byte buffer into a 16 kHz mono f32 PCM
 /// vector: probe the container, decode every packet on the first audio
 /// track, downmix to mono, then resample from the track's native rate to
@@ -303,8 +339,13 @@ const RESAMPLE_CHUNK_IN: usize = 1024;
 ///
 /// Unlike [`decode_opus_ogg`], there is no pre-skip/pause-padding contract
 /// here — see [`read_audio_pcm`]'s doc comment for what that means for a
-/// phone-recorded meeting's decoded duration.
-fn decode_aac_m4a(data: &[u8]) -> Result<Vec<f32>, String> {
+/// phone-recorded meeting's decoded duration. There is also no encoder
+/// priming-delay trim (the AAC equivalent of Opus's `pre_skip`): symphonia
+/// 0.6's `isomp4`/`aac` combination does not implement gapless trimming (its
+/// own docs list both as `Gapless: No`), so every decoded `.m4a` carries a
+/// small (~1024–2112 sample, i.e. tens of ms) leading offset versus the
+/// source recording. Tracked alongside the pause-timeline gap (issue 0050).
+fn decode_aac_m4a(data: Vec<u8>) -> Result<Vec<f32>, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::probe::Hint;
@@ -312,7 +353,7 @@ fn decode_aac_m4a(data: &[u8]) -> Result<Vec<f32>, String> {
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let cursor = std::io::Cursor::new(data.to_vec());
+    let cursor = std::io::Cursor::new(data);
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
     let mut hint = Hint::new();
@@ -335,6 +376,11 @@ fn decode_aac_m4a(data: &[u8]) -> Result<Vec<f32>, String> {
     let native_rate = audio_params
         .sample_rate
         .ok_or_else(|| "track has no sample rate".to_string())?;
+    if !(MIN_PLAUSIBLE_SAMPLE_RATE_HZ..=MAX_PLAUSIBLE_SAMPLE_RATE_HZ).contains(&native_rate) {
+        return Err(format!(
+            "implausible sample rate {native_rate} Hz (expected {MIN_PLAUSIBLE_SAMPLE_RATE_HZ}-{MAX_PLAUSIBLE_SAMPLE_RATE_HZ})"
+        ));
+    }
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
@@ -342,6 +388,8 @@ fn decode_aac_m4a(data: &[u8]) -> Result<Vec<f32>, String> {
 
     let mut mono = Vec::<f32>::new();
     let mut interleaved = Vec::<f32>::new();
+    let mut packets_seen = 0u32;
+    let mut packets_failed = 0u32;
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
@@ -351,19 +399,43 @@ fn decode_aac_m4a(data: &[u8]) -> Result<Vec<f32>, String> {
         if packet.track_id != track_id {
             continue;
         }
+        packets_seen += 1;
         let audio_buf = match decoder.decode(&packet) {
             Ok(buf) => buf,
             // A single malformed packet does not invalidate the whole file —
-            // skip it and keep decoding, mirroring symphonia's own examples.
-            Err(SymphoniaError::DecodeError(_)) => continue,
+            // skip it and keep decoding, mirroring symphonia's own examples —
+            // but count it: if EVERY packet fails this way, that's a corrupt
+            // file, not a legitimately silent/empty one (below).
+            Err(SymphoniaError::DecodeError(_)) => {
+                packets_failed += 1;
+                continue;
+            }
             Err(e) => return Err(format!("decoding packet: {e}")),
         };
-        let channels = audio_buf.spec().channels().count().max(1);
-        interleaved.resize(audio_buf.samples_interleaved(), 0.0f32);
+        let channels = audio_buf.spec().channels().count();
+        let n = audio_buf.samples_interleaved();
+        if channels == 0 || n == 0 {
+            packets_failed += 1;
+            continue;
+        }
+        interleaved.resize(n, 0.0f32);
         audio_buf.copy_to_slice_interleaved(&mut interleaved);
         for frame in interleaved.chunks(channels) {
             mono.push(frame.iter().sum::<f32>() / channels as f32);
         }
+    }
+    if packets_seen > 0 && packets_failed == packets_seen {
+        return Err(format!(
+            "every packet on the audio track failed to decode ({packets_failed}/{packets_seen}) — container probed but the encoded audio is corrupt"
+        ));
+    }
+    if packets_failed > 0 {
+        tracing::warn!(
+            target: "persistence",
+            packets_failed,
+            packets_seen,
+            "some AAC packets failed to decode and were skipped"
+        );
     }
 
     if native_rate == SAMPLE_RATE_OUT_HZ as u32 {
@@ -375,7 +447,11 @@ fn decode_aac_m4a(data: &[u8]) -> Result<Vec<f32>, String> {
 
 /// Resample a whole mono f32 buffer from `native_rate` to 16 kHz via rubato's
 /// `FftFixedIn`, processing in fixed-size chunks (the resampler requires a
-/// consistent input block size) and zero-padding the final partial chunk.
+/// consistent input block size). The final partial chunk is zero-padded to
+/// feed the resampler, then the corresponding tail of the OUTPUT — the
+/// portion attributable to that padding, computed from the same rate ratio —
+/// is trimmed, so the padding never surfaces as fabricated trailing silence
+/// or FFT edge-effect ringing in the returned buffer.
 fn resample_mono_to_16k(input: &[f32], native_rate: u32) -> Result<Vec<f32>, String> {
     use rubato::{FftFixedIn, Resampler};
 
@@ -388,13 +464,16 @@ fn resample_mono_to_16k(input: &[f32], native_rate: u32) -> Result<Vec<f32>, Str
     )
     .map_err(|e| format!("resampler init: {e}"))?;
 
-    let mut out = Vec::with_capacity(input.len() * SAMPLE_RATE_OUT_HZ as usize / native_rate.max(1) as usize);
-    let mut chunks = input.chunks(RESAMPLE_CHUNK_IN).peekable();
-    while let Some(chunk) = chunks.next() {
+    let mut out = Vec::with_capacity(
+        (input.len() as u64 * SAMPLE_RATE_OUT_HZ / native_rate.max(1) as u64) as usize,
+    );
+    for chunk in input.chunks(RESAMPLE_CHUNK_IN) {
         let block = if chunk.len() == RESAMPLE_CHUNK_IN {
             chunk.to_vec()
         } else {
-            // Final partial chunk: zero-pad to the resampler's fixed input size.
+            // Final partial chunk: zero-pad to the resampler's fixed input
+            // size; the padded portion's corresponding output tail is
+            // trimmed below.
             let mut padded = chunk.to_vec();
             padded.resize(RESAMPLE_CHUNK_IN, 0.0);
             padded
@@ -404,6 +483,14 @@ fn resample_mono_to_16k(input: &[f32], native_rate: u32) -> Result<Vec<f32>, Str
             .map_err(|e| format!("resampling: {e}"))?;
         out.extend_from_slice(&result[0]);
     }
+
+    // Exact expected output length for `input.len()` real samples at this
+    // rate ratio; anything beyond it in `out` is an artefact of the last
+    // chunk's zero-padding.
+    let expected_len =
+        (input.len() as u64 * SAMPLE_RATE_OUT_HZ as u64).div_ceil(native_rate.max(1) as u64)
+            as usize;
+    out.truncate(expected_len.min(out.len()));
     Ok(out)
 }
 
@@ -414,7 +501,7 @@ pub(crate) fn decode_opus_ogg_for_test(data: &[u8]) -> Result<Vec<f32>, String> 
 
 #[cfg(test)]
 pub(crate) fn decode_aac_m4a_for_test(data: &[u8]) -> Result<Vec<f32>, String> {
-    decode_aac_m4a(data)
+    decode_aac_m4a(data.to_vec())
 }
 
 #[cfg(test)]

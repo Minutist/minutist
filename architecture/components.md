@@ -2498,8 +2498,14 @@ offline re-run of transcription for a previously-recorded meeting (FR-33). It
 refuses unless the recorder is `Idle` (returns `AppError::InvalidInput`) — an
 offline re-transcribe must not contend with the live pipeline for the ASR model.
 It decodes the meeting's audio (`.opus` pause-INCLUDING; a synced `.m4a`
-phone recording has no such guarantee — see `read_audio_pcm`'s doc comment,
-0047) to 16 kHz mono PCM via `persistence::reader::read_audio_pcm`, then
+phone recording has no such guarantee, and its pause-timeline alignment with
+transcript offsets is not either — see `read_audio_pcm`'s doc comment and
+issue 0050) to 16 kHz mono PCM via `persistence::reader::read_audio_pcm`,
+which deliberately surfaces a missing/unresolvable audio file as
+`AppError::Io`, not `AppError::InvalidInput` — the latter is what this
+function's own "recorder busy" refusal above returns, and `ipc-bridge`'s
+post-stop pass runner matches on it to downgrade a failure to an info-level
+skip; a real missing audio file must not collide with that. Then
 **reuses the live runner's batched-VAD
 machinery**: the same `VadChunker` + `Accumulator` (zero-padded, `MAX_GAP_MS`-capped
 silence preservation) + the same `FLUSH_MIN_SECS` size-trigger + the same

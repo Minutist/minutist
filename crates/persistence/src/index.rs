@@ -498,9 +498,8 @@ fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> 
 /// container), or the app's own opus default if the folder has recording
 /// data (a transcript) but no audio file. Mirrors the placeholder
 /// `audio_format` [`notes_crdt::MeetingFolder::ensure`] seeds for an inbound
-/// sync folder (0047: derived from the actual file, not hardcoded, so an
-/// orphan-recovered synced meeting's codec label can't lie the way the
-/// original `audio.opus`-only hardcode did).
+/// sync folder — derived from the actual file present, so the synthesised
+/// label matches the bytes on disk.
 fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error> {
     let segments = reader::read_transcript_inner(folder).unwrap_or_default();
     let started_at = recovered_started_at(folder);

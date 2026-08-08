@@ -35,19 +35,30 @@ pub enum PeerSource {
     Manual,
 }
 
+/// The tracked state of one directory peer: how it was learned, and the exact
+/// [`EndpointAddr`] currently registered for it (so [`PeerDirectory::add`] can
+/// detect a changed address and apply replace — not union — semantics).
+#[derive(Debug, Clone)]
+struct Entry {
+    source: PeerSource,
+    addr: EndpointAddr,
+}
+
 /// Holds peers learned out-of-band so the endpoint can resolve and dial them.
 ///
 /// The wrapped [`MemoryLookup`] resolves addresses for the endpoint but exposes
-/// no way to enumerate the ids it holds, so a parallel `id -> source` map is kept
+/// no way to enumerate the ids it holds, so a parallel `id -> Entry` map is kept
 /// alongside it: [`Self::ids`] iterates the registered peers to sync against
 /// each, and the [`PeerSource`] tag lets [`Self::remove`] stay source-aware (an
 /// account-reconcile removal must never evict a manually-paired peer, and vice
-/// versa). Both the lookup and the map are internally shared and cheap to clone,
-/// so an entry added through any clone is visible to all of them.
+/// versa). The tracked [`EndpointAddr`] gives [`Self::add`] replace semantics
+/// over [`MemoryLookup`]'s merge (see there). Both the lookup and the map are
+/// internally shared and cheap to clone, so an entry added through any clone is
+/// visible to all of them.
 #[derive(Debug, Clone, Default)]
 pub struct PeerDirectory {
     lookup: MemoryLookup,
-    entries: Arc<Mutex<BTreeMap<EndpointId, PeerSource>>>,
+    entries: Arc<Mutex<BTreeMap<EndpointId, Entry>>>,
 }
 
 impl PeerDirectory {
@@ -64,16 +75,35 @@ impl PeerDirectory {
     /// same `EndpointId`. Returns whether the id was newly added (`true`) or
     /// already present (`false`), so a caller can distinguish a genuinely new
     /// peer from a re-advertised one (e.g. to gate a first-contact dial).
+    ///
+    /// **Replace, not union.** [`MemoryLookup::add_endpoint_info`] *merges* the
+    /// address set for an already-known id — it never drops an address. So a
+    /// peer whose advertised addrs change between polls (direct addrs first
+    /// appearing after an initial relay-only entry; a new ephemeral UDP port
+    /// after the peer restarts) would otherwise accumulate every address it has
+    /// ever advertised, including dead ones. Those stale entries are extra
+    /// dial candidates iroh probes and abandons, aggravating the path churn
+    /// that starves its per-remote actor. To get replace semantics we clear the
+    /// lookup entry first when the address actually changed, so the registered
+    /// set is exactly the latest advertised one. An unchanged re-advert is a
+    /// no-op on the lookup (no needless churn every poll tick).
     pub fn add(&self, addr: EndpointAddr, source: PeerSource) -> bool {
-        let was_new = self
-            .entries
-            .lock()
-            .expect("peer directory entries poisoned")
-            .insert(addr.id, source)
-            .is_none();
-        // `EndpointAddr` converts into `EndpointInfo` via `From`, which is what
-        // `add_endpoint_info` accepts.
-        self.lookup.add_endpoint_info(addr);
+        let id = addr.id;
+        let mut entries = self.entries.lock().expect("peer directory entries poisoned");
+        let changed = match entries.get(&id) {
+            Some(existing) => existing.addr != addr || existing.source != source,
+            None => true,
+        };
+        let was_new = !entries.contains_key(&id);
+        if changed {
+            if !was_new {
+                self.lookup.remove_endpoint_info(id);
+            }
+            // `EndpointAddr` converts into `EndpointInfo` via `From`, which is
+            // what `add_endpoint_info` accepts.
+            self.lookup.add_endpoint_info(addr.clone());
+            entries.insert(id, Entry { source, addr });
+        }
         was_new
     }
 
@@ -90,7 +120,7 @@ impl PeerDirectory {
             .lock()
             .expect("peer directory entries poisoned");
         match entries.get(&id) {
-            Some(tag) if *tag == source => {
+            Some(entry) if entry.source == source => {
                 entries.remove(&id);
                 drop(entries);
                 self.lookup.remove_endpoint_info(id);
@@ -121,7 +151,7 @@ impl PeerDirectory {
             .lock()
             .expect("peer directory entries poisoned")
             .iter()
-            .filter(|(_, source)| **source == PeerSource::Account)
+            .filter(|(_, entry)| entry.source == PeerSource::Account)
             .map(|(id, _)| id.to_string())
             .collect()
     }
@@ -131,5 +161,51 @@ impl PeerDirectory {
     /// registered copy.
     pub(crate) fn lookup(&self) -> MemoryLookup {
         self.lookup.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn id() -> EndpointId {
+        iroh::SecretKey::generate().public()
+    }
+
+    #[test]
+    fn add_reports_new_once_then_tracks_address_changes_and_removes_by_source() {
+        let dir = PeerDirectory::new();
+        let peer = id();
+        let relay: iroh::RelayUrl = "https://relay.example/".parse().unwrap();
+
+        // First advert (relay-only) is genuinely new.
+        let relay_only = EndpointAddr::new(peer).with_relay_url(relay.clone());
+        assert!(dir.add(relay_only.clone(), PeerSource::Account), "first add is new");
+        // Identical re-advert is not new and is a lookup no-op.
+        assert!(!dir.add(relay_only, PeerSource::Account), "same addr re-add is not new");
+
+        // A later advert that gains a direct addr is not "new" (same id) but the
+        // tracked address is updated in place (replace, not union).
+        let sock: SocketAddr = "100.82.58.55:41641".parse().unwrap();
+        let with_direct = EndpointAddr::new(peer)
+            .with_relay_url(relay)
+            .with_ip_addr(sock);
+        assert!(
+            !dir.add(with_direct.clone(), PeerSource::Account),
+            "changed addr re-add is not new"
+        );
+        assert_eq!(
+            dir.entries.lock().unwrap().get(&peer).unwrap().addr,
+            with_direct,
+            "the tracked addr reflects the latest advert"
+        );
+        assert_eq!(dir.ids(), vec![peer]);
+        assert_eq!(dir.account_peer_ids(), vec![peer.to_string()]);
+
+        // Source-aware remove: a mismatched source is a no-op; the matching one evicts.
+        assert!(!dir.remove(peer, PeerSource::Manual), "wrong source is a no-op");
+        assert!(dir.remove(peer, PeerSource::Account), "matching source removes");
+        assert!(dir.ids().is_empty());
     }
 }

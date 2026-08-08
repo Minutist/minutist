@@ -129,7 +129,12 @@ latch), so the re-bind `cancel()` is not a live path today; it is the correct
 primitive for when the deferred `set_enabled` re-bind/TEARDOWN path lands (which
 must also AWAIT both tasks' exit). The desktop owns the failed-dial
 `BackoffPolicy` values via `SyncConfig::with_backoff_policy`. Failed-dial
-suppression (backoff) and account-reconcile removal ride the loop.
+suppression (backoff) and account-reconcile removal ride the loop. The
+`PeerDirectory` applies **replace, not union**, semantics when a known peer
+re-adverts a changed address set (iroh's `MemoryLookup` merges addresses and
+never drops one): it clears the lookup entry before re-adding so a peer's stale
+directs — an initial relay-only entry, or an old ephemeral port after a restart
+— do not linger as dead dial candidates that aggravate iroh path churn.
 
 `SyncControl` gains `set_enabled(bool)` (issue 0028 follow-up F5), giving the
 Settings toggle a runtime path to start or stop the sync engine (the toggle

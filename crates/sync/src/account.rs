@@ -36,6 +36,11 @@ pub struct AccountEndpoint {
     pub endpoint_id: String,
     /// The relay URL the device is reachable through.
     pub relay_url: String,
+    /// The device's published direct socket addresses ("ip:port"), so a
+    /// same-tailnet/LAN peer dials it without the relay or any DNS (0049).
+    /// Empty when the device published none (off-network / older client) — the
+    /// peer then reaches it relay-only, as before.
+    pub direct_addrs: Vec<String>,
 }
 
 /// The injected account-service HTTP seam. `crates/sync` depends on this trait
@@ -213,6 +218,7 @@ mod tests {
             device_id: device.to_string(),
             endpoint_id: endpoint.to_string(),
             relay_url: "https://sync.example/relay".to_string(),
+            direct_addrs: Vec::new(),
         }
     }
 

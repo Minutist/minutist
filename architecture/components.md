@@ -102,13 +102,20 @@ recovery sweep (`SyncEngine::adopt_all`) dials its peers concurrently
 tokio_util::sync::CancellationToken` as a parameter rather than creating one, so
 the spawner (app-main / headless) can wire it onto the same token as the local
 peers-file poll. `SyncEngine::add_account_peer(endpoint_id: &str, relay_url:
-&str) -> Result<()>` (and the was-new `upsert_account_peer`) is the string-keyed
-primitive the production `SyncEngineRefreshSink` and `sync-ffi`'s wrapper call:
-parses both, builds the same `id + relay` `EndpointAddr` shape
-`push_all_to`/`peer_relay_addr` already dial with, and registers it `Account`-tagged. Account-source and manual pairing / the file-source
-fallback are additive — all feed the one `PeerDirectory`. B4 (desktop wiring)
+&str, direct_addrs: &[String]) -> Result<()>` (and the was-new
+`upsert_account_peer`) is the string-keyed primitive the production
+`SyncEngineRefreshSink` and `sync-ffi`'s wrapper call: parses the id + relay +
+each direct socket addr (unparseable directs skipped), builds the `id + relay +
+directs` `EndpointAddr` shape `push_all_to`/`peer_relay_addr` already dial with,
+and registers it `Account`-tagged. The direct addrs (0049) let a same-tailnet/LAN
+peer dial directly — no relay, no DNS — with the relay as the off-network
+fallback; `SyncEngine::publishable_direct_addrs()` filters this device's own set
+for publishing (drops loopback/link-local/docker-bridge). Account-source and
+manual pairing / the file-source fallback are additive — all feed the one
+`PeerDirectory`. B4 (desktop wiring)
 is now implemented: `tunnel-client` gains a raw `AccountDirectoryClient`
-(`GET /v1/account/devices`, `PUT /v1/account/devices/self/endpoint`, bearer-
+(`GET /v1/account/devices`, `PUT /v1/account/devices/self/endpoint` — both
+carrying a device's `direct_addrs`, bearer-
 authed with the device's `mdc_` credential, its own `DeviceEndpointEntry` DTO)
 that keeps `tunnel-client` a near-leaf — it takes **no** `sync` edge; `app-main`
 (the assembler) wraps it in an `AccountEndpointSource` adapter and, in

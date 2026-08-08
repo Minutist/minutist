@@ -341,6 +341,9 @@ impl ConnectedSync {
                                 // endpoint, a separate setting) — advertising the
                                 // latter here told peers to dial the wrong relay.
                                 relay_url: SyncConfig::DEFAULT_RELAY_URL.to_string(),
+                                // Filtered direct addrs (0049) so a same-tailnet/
+                                // LAN peer dials this device directly, no relay/DNS.
+                                direct_addrs: engine.publishable_direct_addrs(),
                             };
                             // The engine-backed sink: upsert/remove/is_suppressed/
                             // account_peer_ids delegate to the engine, and
@@ -684,13 +687,18 @@ impl AccountEndpointSource for AccountDirectorySource {
                 device_id: d.device_id,
                 endpoint_id: d.endpoint_id,
                 relay_url: d.relay_url,
+                direct_addrs: d.direct_addrs,
             })
             .collect())
     }
 
     async fn register_self(&self, endpoint: &AccountEndpoint) -> AppResult<()> {
         self.client
-            .register_self_endpoint(&endpoint.endpoint_id, &endpoint.relay_url)
+            .register_self_endpoint(
+                &endpoint.endpoint_id,
+                &endpoint.relay_url,
+                &endpoint.direct_addrs,
+            )
             .await
             .map_err(|e| minutist_common::AppError::Internal {
                 context: format!("account directory register-self: {e}"),

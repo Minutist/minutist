@@ -290,6 +290,45 @@ fn meeting_is_materialised(meetings_root: &Path, meeting_id: MeetingId) -> bool 
         && dir.join("audio.opus").is_file()
 }
 
+/// Whether a bound direct socket address is worth publishing to the account
+/// directory for a peer to dial (0049).
+///
+/// Keeps addresses a peer on the same tailnet or LAN can plausibly reach —
+/// Tailscale CGNAT (100.64.0.0/10), ordinary private LAN ranges (10/8,
+/// 192.168/16), and global/public addresses. Drops what no off-host peer can
+/// route to: loopback, link-local, unspecified, multicast/broadcast, and the
+/// docker-bridge range 172.16.0.0/12 (a container host otherwise advertises
+/// ~10 unreachable bridge addrs).
+///
+/// Heuristic tradeoff: a genuine 172.16/12 LAN would be dropped — accepted on a
+/// docker-heavy host where that range is otherwise garbage; refine via
+/// default-route interface detection if it ever bites. iroh treats direct
+/// addrs opportunistically and falls back to the relay, so an over-filtered set
+/// costs a relay hop, never connectivity.
+fn is_publishable_direct_addr(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            if ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+            {
+                return false;
+            }
+            // docker-bridge range 172.16.0.0/12 (172.16.x – 172.31.x).
+            let o = ip.octets();
+            !(o[0] == 172 && (16..=31).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(ip) => {
+            // fe80::/10 unicast link-local — `Ipv6Addr::is_unicast_link_local`
+            // is unstable, so match the prefix directly.
+            let is_link_local = (ip.segments()[0] & 0xffc0) == 0xfe80;
+            !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_link_local)
+        }
+    }
+}
+
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
     /// configured relay (with the access token when set), registering the
@@ -543,6 +582,23 @@ impl SyncEngine {
         self.endpoint.addr()
     }
 
+    /// This device's plausibly-reachable direct socket addresses ("ip:port"),
+    /// for publishing to the account directory so a same-tailnet/LAN peer can
+    /// dial this device directly — no relay, no DNS (0049).
+    ///
+    /// Filters the endpoint's raw direct-addr set via
+    /// [`is_publishable_direct_addr`] so a peer does not burn dial attempts on
+    /// addresses it can never route to (loopback, link-local, and the
+    /// docker-bridge range a container host otherwise advertises). Order is the
+    /// `EndpointAddr`'s (a sorted `BTreeSet`), deduplicated for free.
+    pub fn publishable_direct_addrs(&self) -> Vec<String> {
+        self.endpoint_addr()
+            .ip_addrs()
+            .filter(|addr| is_publishable_direct_addr(addr))
+            .map(|addr| addr.to_string())
+            .collect()
+    }
+
     /// Register a peer learned out-of-band (manually — a ticket, a peers file,
     /// or the relay-less direct test path) so the endpoint can resolve and dial
     /// it. Tagged [`PeerSource::Manual`]. The [`PeerDirectory`] is shared with
@@ -557,12 +613,23 @@ impl SyncEngine {
     /// primitive `sync-ffi` wraps for the phone's own account-directory loop
     /// (the in-workspace Rust consumers upsert via [`Self::upsert_account_peer`],
     /// which the account-refresh loop's [`RefreshSink`] drives). Parses both,
-    /// builds the same `id + relay` [`EndpointAddr`] shape [`Self::push_all_to`]
-    /// dials with, and registers it tagged [`PeerSource::Account`] (directly,
-    /// not via [`Self::add_peer`] — that tags [`PeerSource::Manual`]). No `iroh`
-    /// type in the signature, so a caller off the FFI boundary never needs one.
-    pub fn add_account_peer(&self, endpoint_id: &str, relay_url: &str) -> Result<()> {
-        let addr = Self::account_peer_addr(endpoint_id, relay_url)?;
+    /// builds the same `id + relay + directs` [`EndpointAddr`] shape
+    /// [`Self::push_all_to`] dials with, and registers it tagged
+    /// [`PeerSource::Account`] (directly, not via [`Self::add_peer`] — that tags
+    /// [`PeerSource::Manual`]). No `iroh` type in the signature, so a caller off
+    /// the FFI boundary never needs one.
+    ///
+    /// `direct_addrs` are the peer's published direct socket addresses
+    /// ("ip:port"); each is parsed to a [`std::net::SocketAddr`] and
+    /// unparseable entries are skipped. When present, iroh dials them directly
+    /// (no relay, no DNS) and falls back to the relay if they are unreachable.
+    pub fn add_account_peer(
+        &self,
+        endpoint_id: &str,
+        relay_url: &str,
+        direct_addrs: &[String],
+    ) -> Result<()> {
+        let addr = Self::account_peer_addr(endpoint_id, relay_url, direct_addrs)?;
         self.peers.add(addr, PeerSource::Account);
         Ok(())
     }
@@ -572,22 +639,48 @@ impl SyncEngine {
     /// [`crate::account::RefreshSink`]-facing counterpart of
     /// [`Self::add_account_peer`] (which discards the was-new bool): the loop
     /// needs it to decide whether to first-contact-dial the peer.
-    pub fn upsert_account_peer(&self, endpoint_id: &str, relay_url: &str) -> Result<bool> {
-        let addr = Self::account_peer_addr(endpoint_id, relay_url)?;
+    pub fn upsert_account_peer(
+        &self,
+        endpoint_id: &str,
+        relay_url: &str,
+        direct_addrs: &[String],
+    ) -> Result<bool> {
+        let addr = Self::account_peer_addr(endpoint_id, relay_url, direct_addrs)?;
         Ok(self.peers.add(addr, PeerSource::Account))
     }
 
-    /// Parse an account-service `(endpoint_id, relay_url)` pair into the
-    /// `id + relay` [`EndpointAddr`] shape [`Self::push_all_to`] dials with.
-    /// Shared by [`Self::add_account_peer`] and [`Self::upsert_account_peer`].
-    fn account_peer_addr(endpoint_id: &str, relay_url: &str) -> Result<EndpointAddr> {
+    /// Parse an account-service `(endpoint_id, relay_url, direct_addrs)` tuple
+    /// into the `id + relay + directs` [`EndpointAddr`] shape
+    /// [`Self::push_all_to`] dials with. Shared by [`Self::add_account_peer`]
+    /// and [`Self::upsert_account_peer`]. Each direct addr is parsed to a
+    /// [`std::net::SocketAddr`]; unparseable entries are skipped rather than
+    /// failing the whole registration (a bad direct addr must not block the
+    /// relay-routed fallback).
+    fn account_peer_addr(
+        endpoint_id: &str,
+        relay_url: &str,
+        direct_addrs: &[String],
+    ) -> Result<EndpointAddr> {
         let id: EndpointId = endpoint_id.parse().map_err(|e| {
             Error::Protocol(format!("parsing account endpoint id {endpoint_id:?}: {e}"))
         })?;
         let relay: RelayUrl = relay_url.parse().map_err(|e| {
             Error::Endpoint(format!("parsing account relay url {relay_url:?}: {e}"))
         })?;
-        Ok(EndpointAddr::new(id).with_relay_url(relay))
+        let mut addr = EndpointAddr::new(id).with_relay_url(relay);
+        for raw in direct_addrs {
+            match raw.parse::<std::net::SocketAddr>() {
+                Ok(sock) => addr = addr.with_ip_addr(sock),
+                Err(e) => tracing::debug!(
+                    target: "sync",
+                    endpoint_id,
+                    addr = %raw,
+                    error = %e,
+                    "skipping an unparseable account direct addr"
+                ),
+            }
+        }
+        Ok(addr)
     }
 
     /// Remove an `Account`-sourced peer no longer present in the account's
@@ -1190,7 +1283,7 @@ impl SyncEngineRefreshSink {
 impl RefreshSink for SyncEngineRefreshSink {
     fn upsert_account_peer(&self, ep: &AccountEndpoint) -> bool {
         self.engine
-            .upsert_account_peer(&ep.endpoint_id, &ep.relay_url)
+            .upsert_account_peer(&ep.endpoint_id, &ep.relay_url, &ep.direct_addrs)
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     target: "sync",
@@ -1704,11 +1797,56 @@ mod tests {
 
         let other = iroh::SecretKey::generate().public();
         engine
-            .add_account_peer(&other.to_string(), "https://sync.example/relay")
+            .add_account_peer(&other.to_string(), "https://sync.example/relay", &[])
             .expect("add account peer");
 
         assert_eq!(engine.peer_ids(), vec![other.to_string()]);
         engine.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn add_account_peer_accepts_direct_addrs_and_skips_unparseable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
+        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        let other = iroh::SecretKey::generate().public();
+        // A good direct addr and an unparseable one — the peer still registers
+        // (the bad addr is skipped, never fails the whole registration).
+        engine
+            .add_account_peer(
+                &other.to_string(),
+                "https://sync.example/relay",
+                &["100.82.58.55:41641".to_string(), "not-an-addr".to_string()],
+            )
+            .expect("add account peer with direct addrs");
+
+        assert_eq!(engine.peer_ids(), vec![other.to_string()]);
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    #[test]
+    fn publishable_direct_addr_filter_keeps_reachable_drops_garbage() {
+        let keep = |s: &str| is_publishable_direct_addr(&s.parse().unwrap());
+        // Tailscale CGNAT, private LAN, and public are published.
+        assert!(keep("100.82.58.55:41641"), "tailscale CGNAT");
+        assert!(keep("192.168.0.9:41641"), "private LAN");
+        assert!(keep("10.1.2.3:41641"), "private LAN 10/8");
+        assert!(keep("203.0.113.7:41641"), "public");
+        // Loopback, link-local, and docker-bridge are dropped.
+        assert!(!keep("127.0.0.1:41641"), "loopback");
+        assert!(!keep("169.254.1.1:41641"), "link-local");
+        assert!(!keep("172.17.0.1:41641"), "docker bridge");
+        assert!(!keep("172.31.255.1:41641"), "docker bridge top of range");
+        // A 172.x outside the docker range is a normal public/LAN addr — kept.
+        assert!(keep("172.15.0.1:41641"), "172.15 is below the docker range");
+        assert!(keep("172.32.0.1:41641"), "172.32 is above the docker range");
+        // IPv6: global kept, loopback/link-local dropped.
+        assert!(keep("[2001:db8::1]:41641"), "global v6");
+        assert!(!keep("[::1]:41641"), "v6 loopback");
+        assert!(!keep("[fe80::1]:41641"), "v6 link-local");
     }
 
     #[tokio::test]
@@ -1720,7 +1858,7 @@ mod tests {
             .expect("engine");
 
         assert!(matches!(
-            engine.add_account_peer("not-hex", "https://sync.example/relay"),
+            engine.add_account_peer("not-hex", "https://sync.example/relay", &[]),
             Err(Error::Protocol(_))
         ));
 
@@ -1737,7 +1875,7 @@ mod tests {
 
         let other = iroh::SecretKey::generate().public();
         assert!(matches!(
-            engine.add_account_peer(&other.to_string(), "not a url"),
+            engine.add_account_peer(&other.to_string(), "not a url", &[]),
             Err(Error::Endpoint(_))
         ));
 

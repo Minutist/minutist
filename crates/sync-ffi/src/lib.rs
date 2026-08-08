@@ -309,16 +309,36 @@ impl FfiSyncEngine {
     }
 
     /// Register a peer learned from the account service (the phone's own
-    /// list→add loop over `GET /v1/account/devices`, `TODO(B2)`), addressed by
-    /// its hex endpoint id and relay URL. Wraps
-    /// [`sync::SyncEngine::add_account_peer`]; no `iroh` type crosses the
-    /// boundary. Additive to [`Self::pair`] — both feed the same peer directory.
+    /// list→add loop over `GET /v1/account/devices`), addressed by its hex
+    /// endpoint id, relay URL, and published direct socket addresses
+    /// ("ip:port"). Wraps [`sync::SyncEngine::add_account_peer`]; no `iroh` type
+    /// crosses the boundary. Additive to [`Self::pair`] — both feed the same
+    /// peer directory.
+    ///
+    /// `direct_addrs` lets a same-tailnet/LAN peer dial this device directly
+    /// (no relay, no DNS — the crux of 0049 on Android, where the relay
+    /// hostname does not resolve in-process under a full-tunnel VPN). Pass an
+    /// empty list for relay-only addressing. Unparseable entries are skipped.
     pub fn add_account_peer(
         &self,
         endpoint_id: String,
         relay_url: String,
+        direct_addrs: Vec<String>,
     ) -> Result<(), SyncFfiError> {
-        Ok(self.engine()?.add_account_peer(&endpoint_id, &relay_url)?)
+        Ok(self
+            .engine()?
+            .add_account_peer(&endpoint_id, &relay_url, &direct_addrs)?)
+    }
+
+    /// This device's own publishable direct socket addresses ("ip:port"), for
+    /// the caller to POST to the account directory when it self-registers
+    /// (0049). On the phone, register-self is driven from TypeScript via the
+    /// account client (not the Rust engine), so this getter exposes the
+    /// engine's filtered direct-addr set — same filter the desktop/hub applies
+    /// (drops loopback/link-local/docker-bridge). Wraps
+    /// [`sync::SyncEngine::publishable_direct_addrs`].
+    pub fn own_direct_addrs(&self) -> Result<Vec<String>, SyncFfiError> {
+        Ok(self.engine()?.publishable_direct_addrs())
     }
 
     /// Remove an account-sourced peer no longer present in the account's

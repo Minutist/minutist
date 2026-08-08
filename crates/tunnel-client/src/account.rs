@@ -25,6 +25,11 @@ pub struct DeviceEndpointEntry {
     pub device_id: String,
     pub endpoint_id: String,
     pub relay_url: String,
+    /// The device's published direct socket addresses ("ip:port"), for a
+    /// same-network peer to dial without the relay (0049). Absent/older entries
+    /// decode to an empty vec.
+    #[serde(default)]
+    pub direct_addrs: Vec<String>,
 }
 
 /// A device-directory request failure. `thiserror`-derived so it crosses the
@@ -59,6 +64,7 @@ pub enum AccountDirectoryError {
 struct RegisterEndpointRequest<'a> {
     endpoint_id: &'a str,
     relay_url: &'a str,
+    direct_addrs: &'a [String],
 }
 
 /// HTTP client for the account device-directory, bound to one device's bearer
@@ -134,11 +140,15 @@ impl AccountDirectoryClient {
 
     /// `PUT /v1/account/devices/self/endpoint` — publish this device's endpoint
     /// (idempotent upsert; the device is identified by the credential, not the
-    /// body). Success is `204 No Content` with an empty body.
+    /// body). `direct_addrs` are this device's published direct socket addresses
+    /// ("ip:port") for same-network peers to dial without the relay (0049);
+    /// empty is valid (relay-only). Success is `204 No Content` with an empty
+    /// body.
     pub async fn register_self_endpoint(
         &self,
         endpoint_id: &str,
         relay_url: &str,
+        direct_addrs: &[String],
     ) -> Result<(), AccountDirectoryError> {
         let resp = self
             .http
@@ -147,6 +157,7 @@ impl AccountDirectoryClient {
             .json(&RegisterEndpointRequest {
                 endpoint_id,
                 relay_url,
+                direct_addrs,
             })
             .send()
             .await
@@ -227,7 +238,7 @@ mod tests {
             .and(path("/v1/account/devices"))
             .and(header("authorization", "Bearer mdc_test.secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"device_id": "dev-a", "endpoint_id": "ep-a", "relay_url": "https://sync.example/r"},
+                {"device_id": "dev-a", "endpoint_id": "ep-a", "relay_url": "https://sync.example/r", "direct_addrs": ["100.82.58.55:41641", "192.168.0.9:41641"]},
                 {"device_id": "dev-b", "endpoint_id": "ep-b", "relay_url": "https://sync.example/r"}
             ])))
             .expect(1)
@@ -238,7 +249,14 @@ mod tests {
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].device_id, "dev-a");
         assert_eq!(devices[0].endpoint_id, "ep-a");
+        assert_eq!(
+            devices[0].direct_addrs,
+            vec!["100.82.58.55:41641".to_string(), "192.168.0.9:41641".to_string()]
+        );
         assert_eq!(devices[1].relay_url, "https://sync.example/r");
+        // An entry that omits direct_addrs decodes to an empty vec (older
+        // client / relay-only device).
+        assert!(devices[1].direct_addrs.is_empty());
     }
 
     #[tokio::test]
@@ -249,7 +267,8 @@ mod tests {
             .and(header("authorization", "Bearer mdc_test.secret"))
             .and(body_json(serde_json::json!({
                 "endpoint_id": "ep-self",
-                "relay_url": "https://sync.example/r"
+                "relay_url": "https://sync.example/r",
+                "direct_addrs": ["100.82.58.55:41641"]
             })))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
@@ -257,7 +276,11 @@ mod tests {
             .await;
 
         client_for(&server)
-            .register_self_endpoint("ep-self", "https://sync.example/r")
+            .register_self_endpoint(
+                "ep-self",
+                "https://sync.example/r",
+                &["100.82.58.55:41641".to_string()],
+            )
             .await
             .unwrap();
     }

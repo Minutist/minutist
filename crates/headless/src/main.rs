@@ -147,13 +147,18 @@ impl AccountEndpointSource for AccountDirectorySource {
                 device_id: d.device_id,
                 endpoint_id: d.endpoint_id,
                 relay_url: d.relay_url,
+                direct_addrs: d.direct_addrs,
             })
             .collect())
     }
 
     async fn register_self(&self, endpoint: &AccountEndpoint) -> AppResult<()> {
         self.client
-            .register_self_endpoint(&endpoint.endpoint_id, &endpoint.relay_url)
+            .register_self_endpoint(
+                &endpoint.endpoint_id,
+                &endpoint.relay_url,
+                &endpoint.direct_addrs,
+            )
             .await
             .map_err(|e| AppError::Internal {
                 context: format!("account directory register-self: {e}"),
@@ -591,6 +596,7 @@ async fn start_engine(
                         device_id: cred.device_id,
                         endpoint_id: engine.endpoint_id().to_string(),
                         relay_url,
+                        direct_addrs: engine.publishable_direct_addrs(),
                     };
                     tracing::info!(
                         target: "hub",

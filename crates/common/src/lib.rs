@@ -394,9 +394,13 @@ pub struct AudioFormat {
 /// device records in whatever container its platform supports — the desktop
 /// writes Opus, the phone AAC-in-MP4 (no hardware Opus encoder) — and
 /// `metadata.json`'s [`AudioFormat::codec`] is the authoritative codec label;
-/// the extension is only how the file is found on disk. `sync` (import,
-/// manifest path-safety) and `persistence` (decode) both consult this single
-/// list so the two can never drift apart (0047/0048).
+/// the extension is only how the file is found on disk.
+///
+/// This is the shared contract `sync` (import, manifest path-safety —
+/// tracked as 0048) and `persistence` (decode — 0047) are being migrated
+/// onto so the two can't drift apart; as of this commit neither has been
+/// wired to it yet — `sync` still hardcodes a single `AUDIO_REL` literal and
+/// `persistence::read_audio_pcm` still decodes Ogg/Opus only.
 pub const SUPPORTED_AUDIO_EXTS: &[&str] = &["opus", "m4a"];
 
 /// Resolve a meeting folder's actual audio file — the single `audio.<ext>`

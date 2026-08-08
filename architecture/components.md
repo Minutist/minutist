@@ -441,7 +441,10 @@ used, not added here.
 
 - **`persistence`** writes `audio.opus` + `metadata.json` to a per-meeting
   folder and owns the full read/index surface: the folder readers (incl. the
-  pause-including Opus decoder and the `MeetingState` assembler), the libsql
+  audio decoder — pause-including Opus for the desktop's own recordings, AAC
+  via `symphonia` for a synced phone `.m4a` recording, resolved by extension
+  per `minutist_common::resolve_audio_path`, 0047 — and the `MeetingState`
+  assembler), the libsql
   `index.db` index + forward-only migration runner + `rebuild_from_disk` +
   self-heal `reconcile_orphans`,
   rename/delete meeting operations, and the `summary.md` path + I/O. It
@@ -496,9 +499,9 @@ device's container (desktop: opus; phone: m4a, no hardware Opus encoder);
 `metadata.json`'s `AudioFormat::codec` is the authoritative codec label, the
 extension is only how the file is found on disk. This is the shared contract
 `sync` (media import + manifest path-safety, issue 0048) and `persistence`
-(decode dispatch, issue 0047) are migrating onto so the two surfaces can't
-drift apart — landed here first since 0048 needs the resolver's exact
-signature; neither consumer is wired to it yet.
+(decode dispatch, issue 0047) resolve against so the two surfaces can't
+drift apart. `persistence::read_audio_pcm` is wired to it (0047); `sync` is
+not yet, pending 0048.
 
 **Attachments — shared types (Attachments WS).** Three new vocabulary types and
 four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the
@@ -2494,8 +2497,10 @@ unchanged.
 offline re-run of transcription for a previously-recorded meeting (FR-33). It
 refuses unless the recorder is `Idle` (returns `AppError::InvalidInput`) — an
 offline re-transcribe must not contend with the live pipeline for the ASR model.
-It decodes the meeting's `audio.opus` to the pause-INCLUDING 16 kHz mono PCM via
-`persistence::reader::read_audio_pcm`, then **reuses the live runner's batched-VAD
+It decodes the meeting's audio (`.opus` pause-INCLUDING; a synced `.m4a`
+phone recording has no such guarantee — see `read_audio_pcm`'s doc comment,
+0047) to 16 kHz mono PCM via `persistence::reader::read_audio_pcm`, then
+**reuses the live runner's batched-VAD
 machinery**: the same `VadChunker` + `Accumulator` (zero-padded, `MAX_GAP_MS`-capped
 silence preservation) + the same `FLUSH_MIN_SECS` size-trigger + the same
 proportional re-split (`emit_segments_proportional`) and the same `AsrRuntime`

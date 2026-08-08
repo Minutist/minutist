@@ -18,8 +18,8 @@ pub enum Error {
     #[error("invalid state: {0}")]
     InvalidState(&'static str),
 
-    #[error("Opus decode error: {0}")]
-    OpusDecode(String),
+    #[error("audio decode error: {0}")]
+    AudioDecode(String),
 
     #[error("index database error: {0}")]
     Index(#[from] libsql::Error),
@@ -71,8 +71,8 @@ impl From<Error> for AppError {
             Error::InvalidState(msg) => AppError::InvalidInput {
                 context: msg.to_string(),
             },
-            Error::OpusDecode(msg) => AppError::Internal {
-                context: format!("opus decode: {msg}"),
+            Error::AudioDecode(msg) => AppError::Internal {
+                context: format!("audio decode: {msg}"),
             },
             Error::Index(inner) => AppError::Internal {
                 context: format!("index database: {inner}"),

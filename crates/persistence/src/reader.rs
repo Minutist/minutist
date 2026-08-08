@@ -85,17 +85,31 @@ pub(crate) fn read_transcript_inner(meeting_dir: &Path) -> Result<Vec<Segment>, 
     Ok(segments)
 }
 
-/// Decode `audio.opus` from a meeting folder into a pause-INCLUDING 16 kHz
-/// mono f32 PCM buffer.
+/// Decode a meeting's audio file into a 16 kHz mono f32 PCM buffer.
 ///
-/// The buffer contains the silent frames written for pause gaps, so its
-/// duration equals wall-clock recording duration (the same timeline as the
-/// raw `audio.opus` stream). Phase 6 diarization and Phase 4 re-transcribe
-/// consume this buffer.
+/// Resolves the file via [`minutist_common::resolve_audio_path`] (0047/0048)
+/// and dispatches on its extension rather than a hardcoded name or a
+/// self-reported codec label: `.opus` decodes via the Ogg/Opus path below,
+/// `.m4a` via [`decode_aac_m4a`]. The desktop's own recordings are always
+/// `.opus` and their decode is pause-INCLUDING (the encoder pads every pause
+/// gap with silence, so the buffer's duration equals wall-clock recording
+/// duration — Phase 6 diarization and Phase 4 re-transcribe depend on this).
+/// A synced phone `.m4a` recording carries no such guarantee: the phone's
+/// recorder may simply stop encoding across a pause rather than padding it,
+/// so an `.m4a` meeting's decoded duration may be shorter than wall-clock.
+/// That is a known limitation, not a bug in this function — getting phone
+/// recordings transcribable at all is 0047's scope; pause-timeline parity
+/// for phone recordings is a separate, unscoped follow-up if it matters in
+/// practice.
 pub fn read_audio_pcm(meeting_dir: &Path) -> AppResult<Vec<f32>> {
-    let path = meeting_dir.join("audio.opus");
+    let path = minutist_common::resolve_audio_path(meeting_dir)
+        .ok_or(Error::InvalidState("meeting has no audio file"))?;
     let data = std::fs::read(&path).map_err(Error::Io)?;
-    decode_opus_ogg(&data).map_err(|e| Error::OpusDecode(e).into())
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("opus") => decode_opus_ogg(&data).map_err(|e| Error::AudioDecode(e).into()),
+        Some("m4a") => decode_aac_m4a(&data).map_err(|e| Error::AudioDecode(e).into()),
+        _ => Err(Error::InvalidState("meeting's audio file has an unsupported extension").into()),
+    }
 }
 
 /// Assemble the full restorable [`MeetingState`] for a meeting: metadata +
@@ -275,9 +289,132 @@ fn parse_opus_head_pre_skip(head: &[u8]) -> u64 {
     pre_skip_48k * SAMPLE_RATE_OUT_HZ / OPUS_INTERNAL_RATE_HZ
 }
 
+/// Input block size fed to rubato's FFT resampler in one call, matching
+/// `audio-capture::resample`'s tested value. This is an independent one-shot
+/// (not streaming) use — the two crates decode from different starting
+/// points (a live device stream vs. a whole file already in memory) — so the
+/// resample glue is duplicated here rather than sharing an instance.
+const RESAMPLE_CHUNK_IN: usize = 1024;
+
+/// Decode an AAC-in-MP4 (`.m4a`) byte buffer into a 16 kHz mono f32 PCM
+/// vector: probe the container, decode every packet on the first audio
+/// track, downmix to mono, then resample from the track's native rate to
+/// 16 kHz if it differs.
+///
+/// Unlike [`decode_opus_ogg`], there is no pre-skip/pause-padding contract
+/// here — see [`read_audio_pcm`]'s doc comment for what that means for a
+/// phone-recorded meeting's decoded duration.
+fn decode_aac_m4a(data: &[u8]) -> Result<Vec<f32>, String> {
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
+
+    let mut hint = Hint::new();
+    hint.with_extension("m4a");
+
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+        .map_err(|e| format!("probing container: {e}"))?;
+
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| "no audio track in container".to_string())?;
+    let track_id = track.id;
+    let audio_params = track
+        .codec_params
+        .as_ref()
+        .and_then(|p| p.audio())
+        .ok_or_else(|| "track has no audio codec parameters".to_string())?
+        .clone();
+    let native_rate = audio_params
+        .sample_rate
+        .ok_or_else(|| "track has no sample rate".to_string())?;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+        .map_err(|e| format!("decoder init: {e}"))?;
+
+    let mut mono = Vec::<f32>::new();
+    let mut interleaved = Vec::<f32>::new();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(e) => return Err(format!("reading packet: {e}")),
+        };
+        if packet.track_id != track_id {
+            continue;
+        }
+        let audio_buf = match decoder.decode(&packet) {
+            Ok(buf) => buf,
+            // A single malformed packet does not invalidate the whole file —
+            // skip it and keep decoding, mirroring symphonia's own examples.
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(e) => return Err(format!("decoding packet: {e}")),
+        };
+        let channels = audio_buf.spec().channels().count().max(1);
+        interleaved.resize(audio_buf.samples_interleaved(), 0.0f32);
+        audio_buf.copy_to_slice_interleaved(&mut interleaved);
+        for frame in interleaved.chunks(channels) {
+            mono.push(frame.iter().sum::<f32>() / channels as f32);
+        }
+    }
+
+    if native_rate == SAMPLE_RATE_OUT_HZ as u32 {
+        Ok(mono)
+    } else {
+        resample_mono_to_16k(&mono, native_rate)
+    }
+}
+
+/// Resample a whole mono f32 buffer from `native_rate` to 16 kHz via rubato's
+/// `FftFixedIn`, processing in fixed-size chunks (the resampler requires a
+/// consistent input block size) and zero-padding the final partial chunk.
+fn resample_mono_to_16k(input: &[f32], native_rate: u32) -> Result<Vec<f32>, String> {
+    use rubato::{FftFixedIn, Resampler};
+
+    let mut resampler = FftFixedIn::<f32>::new(
+        native_rate as usize,
+        SAMPLE_RATE_OUT_HZ as usize,
+        RESAMPLE_CHUNK_IN,
+        1,
+        1,
+    )
+    .map_err(|e| format!("resampler init: {e}"))?;
+
+    let mut out = Vec::with_capacity(input.len() * SAMPLE_RATE_OUT_HZ as usize / native_rate.max(1) as usize);
+    let mut chunks = input.chunks(RESAMPLE_CHUNK_IN).peekable();
+    while let Some(chunk) = chunks.next() {
+        let block = if chunk.len() == RESAMPLE_CHUNK_IN {
+            chunk.to_vec()
+        } else {
+            // Final partial chunk: zero-pad to the resampler's fixed input size.
+            let mut padded = chunk.to_vec();
+            padded.resize(RESAMPLE_CHUNK_IN, 0.0);
+            padded
+        };
+        let result = resampler
+            .process(&[&block[..]], None)
+            .map_err(|e| format!("resampling: {e}"))?;
+        out.extend_from_slice(&result[0]);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub(crate) fn decode_opus_ogg_for_test(data: &[u8]) -> Result<Vec<f32>, String> {
     decode_opus_ogg(data)
+}
+
+#[cfg(test)]
+pub(crate) fn decode_aac_m4a_for_test(data: &[u8]) -> Result<Vec<f32>, String> {
+    decode_aac_m4a(data)
 }
 
 #[cfg(test)]

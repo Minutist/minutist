@@ -329,6 +329,26 @@ fn is_publishable_direct_addr(addr: &std::net::SocketAddr) -> bool {
     }
 }
 
+/// Whether `addr` is a Tailscale CGNAT address (100.64.0.0/10) — the marker that
+/// this device is on a tailnet mesh (see [`SyncEngine::publishable_direct_addrs`]).
+fn is_cgnat_v4(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            let o = ip.octets();
+            o[0] == 100 && (64..=127).contains(&o[1])
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+/// Whether `addr` is an RFC1918 private-LAN address (10/8, 172.16/12, 192.168/16).
+fn is_rfc1918_v4(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_private(),
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
     /// configured relay (with the access token when set), registering the
@@ -591,10 +611,30 @@ impl SyncEngine {
     /// addresses it can never route to (loopback, link-local, and the
     /// docker-bridge range a container host otherwise advertises). Order is the
     /// `EndpointAddr`'s (a sorted `BTreeSet`), deduplicated for free.
+    ///
+    /// **Tailnet-present rule:** if this device has a Tailscale CGNAT
+    /// (100.64.0.0/10) address, it is on a tailnet mesh, so the RFC1918
+    /// private-LAN addresses are also dropped from the published set. A peer
+    /// that can reach this device is then either on the same tailnet (dials the
+    /// stable 100.x directly) or off-network (uses the relay). A published LAN
+    /// address is otherwise a phantom dial candidate for a peer on a different
+    /// L2 — or one whose full-tunnel VPN captures LAN traffic (the phone case):
+    /// iroh probes it, abandons it, and re-probes, and that sustained path churn
+    /// starves iroh's per-remote actor (a bounded inbox it does not drain while
+    /// awaiting path work), dropping the QUIC handshake datagrams so the stream
+    /// never opens. Tradeoff: two devices sharing an L2 where one is NOT on the
+    /// tailnet lose the direct-LAN path and fall back to the relay — acceptable
+    /// for a Tailscale user, and reversible if a same-LAN-no-tailnet case matters.
     pub fn publishable_direct_addrs(&self) -> Vec<String> {
-        self.endpoint_addr()
+        let kept: Vec<std::net::SocketAddr> = self
+            .endpoint_addr()
             .ip_addrs()
             .filter(|addr| is_publishable_direct_addr(addr))
+            .copied()
+            .collect();
+        let has_cgnat = kept.iter().any(is_cgnat_v4);
+        kept.into_iter()
+            .filter(|addr| !(has_cgnat && is_rfc1918_v4(addr)))
             .map(|addr| addr.to_string())
             .collect()
     }
@@ -1847,6 +1887,21 @@ mod tests {
         assert!(keep("[2001:db8::1]:41641"), "global v6");
         assert!(!keep("[::1]:41641"), "v6 loopback");
         assert!(!keep("[fe80::1]:41641"), "v6 link-local");
+    }
+
+    #[test]
+    fn cgnat_and_rfc1918_classifiers() {
+        let a = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert!(is_cgnat_v4(&a("100.64.0.1:1")));
+        assert!(is_cgnat_v4(&a("100.127.255.255:1")));
+        assert!(!is_cgnat_v4(&a("100.63.0.1:1")), "just below CGNAT");
+        assert!(!is_cgnat_v4(&a("100.128.0.1:1")), "just above CGNAT");
+        assert!(!is_cgnat_v4(&a("203.0.113.1:1")), "public");
+        assert!(is_rfc1918_v4(&a("10.0.0.1:1")));
+        assert!(is_rfc1918_v4(&a("192.168.0.9:1")));
+        assert!(is_rfc1918_v4(&a("172.16.0.1:1")));
+        assert!(!is_rfc1918_v4(&a("100.82.58.55:1")), "CGNAT is not RFC1918");
+        assert!(!is_rfc1918_v4(&a("203.0.113.1:1")), "public is not RFC1918");
     }
 
     #[tokio::test]

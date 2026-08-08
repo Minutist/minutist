@@ -110,7 +110,10 @@ directs` `EndpointAddr` shape `push_all_to`/`peer_relay_addr` already dial with,
 and registers it `Account`-tagged. The direct addrs (0049) let a same-tailnet/LAN
 peer dial directly — no relay, no DNS — with the relay as the off-network
 fallback; `SyncEngine::publishable_direct_addrs()` filters this device's own set
-for publishing (drops loopback/link-local/docker-bridge). Account-source and
+for publishing (drops loopback/link-local/docker-bridge; and, when the device
+has a Tailscale CGNAT 100.64/10 address, also drops RFC1918 private-LAN addrs so
+a tailnet peer dials the stable 100.x and a phantom cross-L2 LAN candidate can't
+sustain the iroh path churn that starves the per-remote actor). Account-source and
 manual pairing / the file-source fallback are additive — all feed the one
 `PeerDirectory`. B4 (desktop wiring)
 is now implemented: `tunnel-client` gains a raw `AccountDirectoryClient`

@@ -101,6 +101,18 @@ pub(crate) fn read_transcript_inner(meeting_dir: &Path) -> Result<Vec<Segment>, 
 /// recordings transcribable at all is 0047's scope; pause-timeline parity
 /// for phone recordings is a separate, unscoped follow-up if it matters in
 /// practice.
+///
+/// **Legacy fallback (issue 0051).** A recording made before phoneapp's
+/// honest-format fix stored AAC bytes under the literal name `audio.opus`
+/// (the mislabelling 0047 fixes on the write side going forward) — that
+/// backlog already exists on disk and synced across devices, so it needs
+/// rescuing without a filename migration (which has cross-device/sync-manifest
+/// implications this function has no business triggering). If the resolved
+/// `.opus` file fails Ogg/Opus decode, this retries it as AAC before giving
+/// up. This does not weaken extension-first dispatch as the primary signal —
+/// it only engages after the primary decoder has already failed, and
+/// [`decode_aac_m4a`] does its own container probe, so genuinely-corrupt
+/// data fails cleanly on both attempts rather than being masked.
 pub fn read_audio_pcm(meeting_dir: &Path) -> AppResult<Vec<f32>> {
     let not_found = || {
         Error::Io(std::io::Error::new(
@@ -117,7 +129,34 @@ pub fn read_audio_pcm(meeting_dir: &Path) -> AppResult<Vec<f32>> {
     // stay at `AppError::Io`'s severity, matching what a literal missing
     // `audio.opus` produced before this function resolved the path itself.
     match path.extension().and_then(|e| e.to_str()) {
-        Some("opus") => decode_opus_ogg(&data).map_err(|e| Error::AudioDecode(e).into()),
+        Some("opus") => match decode_opus_ogg(&data) {
+            Ok(pcm) => Ok(pcm),
+            // Legacy fallback (issue 0051): recordings made before phoneapp's
+            // honest-format fix stored AAC bytes under the literal name
+            // `audio.opus` (the bug 0047 exists to fix, on the write side).
+            // Extension-first dispatch is still correct going forward — this
+            // is a one-way "did the primary decoder actually fail" recovery,
+            // not a case of trusting a self-reported label over the
+            // extension. `decode_aac_m4a` does its own container probe, so
+            // it fails cleanly (a distinct error) on data that is genuinely
+            // not MP4 either — this never masks a real corrupt-Opus file as
+            // success.
+            Err(opus_err) => match decode_aac_m4a(data) {
+                Ok(pcm) => {
+                    tracing::warn!(
+                        target: "persistence",
+                        path = %path.display(),
+                        opus_error = %opus_err,
+                        "audio.opus failed Ogg/Opus decode but succeeded as AAC — a pre-0047 mislabelled phone recording (issue 0051); its pause-timeline parity with wall-clock is not guaranteed (issue 0050)"
+                    );
+                    Ok(pcm)
+                }
+                Err(aac_err) => Err(Error::AudioDecode(format!(
+                    "opus decode failed ({opus_err}); AAC fallback also failed ({aac_err})"
+                ))
+                .into()),
+            },
+        },
         Some("m4a") => {
             // A phone-recorded meeting's decoded duration has no guaranteed
             // relationship to wall-clock (see this fn's doc comment) — flag it

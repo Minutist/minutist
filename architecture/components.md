@@ -443,8 +443,10 @@ used, not added here.
   folder and owns the full read/index surface: the folder readers (incl. the
   audio decoder — pause-including Opus for the desktop's own recordings, AAC
   via `symphonia` for a synced phone `.m4a` recording, resolved by extension
-  per `minutist_common::resolve_audio_path`, 0047 — and the `MeetingState`
-  assembler), the libsql
+  per `minutist_common::resolve_audio_path`, 0047 (falling back to the AAC
+  decoder on an Opus-decode failure for a `.opus` path, rescuing the
+  pre-0047 mislabelled backlog without a migration, 0051) — and the
+  `MeetingState` assembler), the libsql
   `index.db` index + forward-only migration runner + `rebuild_from_disk` +
   self-heal `reconcile_orphans`,
   rename/delete meeting operations, and the `summary.md` path + I/O. It

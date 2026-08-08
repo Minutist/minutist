@@ -1888,4 +1888,37 @@ fn test_read_audio_pcm_errors_cleanly_when_no_audio_file_present() {
     assert!(result.is_err(), "no audio file present must be an error, not a panic");
 }
 
+/// A pre-0047 phone recording: AAC bytes stored under the literal name
+/// `audio.opus` (the mislabelling 0047 fixes going forward). `read_audio_pcm`
+/// must still decode it — extension-first dispatch fails, but the AAC
+/// fallback rescues the existing backlog (issue 0051) without a migration.
+#[test]
+fn test_read_audio_pcm_falls_back_to_aac_for_legacy_mislabelled_opus() {
+    let root = TempDir::new().unwrap();
+    let meeting_dir = root.path().join("33333333-3333-3333-3333-333333333333");
+    std::fs::create_dir_all(&meeting_dir).unwrap();
+    std::fs::write(meeting_dir.join("audio.opus"), AAC_FIXTURE).unwrap();
+
+    let pcm = reader::read_audio_pcm(&meeting_dir)
+        .expect("read_audio_pcm must fall back to AAC for a mislabelled audio.opus");
+    assert!(!pcm.is_empty(), "decoded pcm buffer is empty");
+}
+
+/// Genuinely corrupt data under `audio.opus` (neither valid Opus nor valid
+/// AAC) must still fail — the fallback rescues real mislabelled files, it
+/// does not turn every decode failure into a silent success.
+#[test]
+fn test_read_audio_pcm_still_errors_on_genuinely_corrupt_opus() {
+    let root = TempDir::new().unwrap();
+    let meeting_dir = root.path().join("44444444-4444-4444-4444-444444444444");
+    std::fs::create_dir_all(&meeting_dir).unwrap();
+    std::fs::write(meeting_dir.join("audio.opus"), b"neither opus nor mp4").unwrap();
+
+    let result = reader::read_audio_pcm(&meeting_dir);
+    assert!(
+        result.is_err(),
+        "genuinely corrupt data must not be rescued by the AAC fallback"
+    );
+}
+
 const SAMPLE_RATE_16K: u32 = 16_000;

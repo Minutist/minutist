@@ -1011,7 +1011,7 @@ impl Orchestrator {
         .map_err(|e| AppError::Internal {
             context: format!("re_transcribe metadata read join failed: {e}"),
         })??;
-        let budget = retranscribe_timeout(duration_ms);
+        let budget = retranscribe_timeout(recording_duration_for_budget(duration_ms));
 
         let segments: Vec<Segment> = match tokio::time::timeout(
             budget,
@@ -2301,7 +2301,7 @@ impl Orchestrator {
         // `transcribe_chunk` re-ASR passes of the split, so a split-heavy meeting
         // is not cut off mid-split. Sized like `retranscribe_timeout` (ASR is the
         // slow part once the split runs) rather than the diarize-only budget.
-        let budget = retranscribe_timeout(duration_ms);
+        let budget = retranscribe_timeout(recording_duration_for_budget(duration_ms));
 
         // Live-test UX T4(c): the sherpa diarization compute is one opaque FFI
         // call with no progress callback, so emit a single INDETERMINATE
@@ -4152,26 +4152,37 @@ fn diarize_timeout(recording_duration_ms: u64) -> Duration {
 /// not cut short; the bound exists so a wedged ASR run cannot hold the offline
 /// claim (and block the next recording) forever.
 ///
-/// `0` is treated as "duration unknown," not "zero-length recording" — a real
-/// recording is never exactly 0 ms, but `metadata.json`'s `duration_ms` reads
-/// `0` for a meeting still carrying the unauthoritative inbound-sync
-/// placeholder (`notes_crdt::MeetingFolder::ensure`'s seed, never overwritten
-/// because the meeting's notes-sync exchange hasn't completed — a real gap,
-/// tracked separately). Assuming the floor for an unknown duration silently
-/// sizes the budget for the *shortest* possible recording instead of a
-/// generic unknown one, guaranteeing a timeout on any real meeting long
-/// enough to need the cap — this hit exactly that case in the field
-/// (issue 0051 follow-up: a phone recording stuck in an endless
-/// claim→decode→timeout→release loop, forever, because its duration was
-/// unknown, not because it was actually short).
-fn retranscribe_timeout(recording_duration_ms: u64) -> Duration {
+/// `None` (duration unknown, e.g. a meeting whose authoritative metadata
+/// hasn't synced in yet — see [`recording_duration_for_budget`]) sizes to the
+/// cap, not the floor: an unknown duration must not be assumed to be the
+/// shortest possible one, which would guarantee a timeout on any real
+/// recording long enough to need it. The tradeoff: `claim_offline`'s single
+/// global slot means this also grants the full cap to a genuinely tiny or
+/// corrupt recording whose duration reads as unknown for an unrelated reason
+/// (e.g. a crash-recovered meeting with no transcript segments to derive a
+/// duration from) — accepted because that case is rare and fails fast rather
+/// than hangs, while an unbounded starvation loop on a real long recording is
+/// neither rare nor self-limiting.
+fn retranscribe_timeout(recording_duration_ms: Option<u64>) -> Duration {
     const FLOOR_SECS: u64 = 300; // 5 min
     const CAP_SECS: u64 = 1800; // 30 min
-    if recording_duration_ms == 0 {
+    let Some(recording_duration_ms) = recording_duration_ms else {
         return Duration::from_secs(CAP_SECS);
-    }
+    };
     let secs = (recording_duration_ms / 1000 * 3).clamp(FLOOR_SECS, CAP_SECS);
     Duration::from_secs(secs)
+}
+
+/// Translate a meeting's stored `duration_ms` into the `Option<u64>`
+/// [`retranscribe_timeout`] expects: `0` is never a real recording's
+/// duration, only [`notes_crdt::MeetingFolder::ensure`]'s placeholder or a
+/// crash-recovery synthesis with no transcript segments to derive one from —
+/// both mean "unknown," not "zero-length." This translation lives at the call
+/// site (not inside `retranscribe_timeout` itself) so the special case is
+/// visible in the type signature callers pass through, not a hidden sentinel
+/// buried in a shared helper.
+fn recording_duration_for_budget(duration_ms: u64) -> Option<u64> {
+    (duration_ms != 0).then_some(duration_ms)
 }
 
 /// Length-relative timeout budget for a single `relisten_section` window (S2).

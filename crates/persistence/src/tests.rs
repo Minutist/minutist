@@ -1811,3 +1811,81 @@ async fn test_delete_meeting_removes_folder_and_index() {
         .await
         .expect("delete idempotent");
 }
+
+// ---------------------------------------------------------------------------
+// Test 11: AAC-in-MP4 decode (0047 — the phone's recording format)
+// ---------------------------------------------------------------------------
+
+/// `fixtures/aac_sine_440hz_2s.m4a`: a real ffmpeg-encoded AAC-LC file (mono,
+/// 44.1 kHz source, 2.0 s 440 Hz sine), generated with:
+///
+/// ```sh
+/// ffmpeg -f lavfi -i "sine=frequency=440:duration=2:sample_rate=44100" \
+///   -ac 1 -c:a aac -b:a 64k aac_sine_440hz_2s.m4a
+/// ```
+///
+/// A real encoder's output, not a hand-rolled container — this is what
+/// actually exercises the probe → demux → decode → resample path, unlike a
+/// synthetic buffer we don't have an AAC encoder to produce in-process (the
+/// opus round-trip tests above can synthesize their own fixture because this
+/// crate already owns an Opus *encoder*; it owns no AAC encoder).
+const AAC_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/aac_sine_440hz_2s.m4a");
+
+#[test]
+fn test_aac_m4a_decode_resamples_to_16k_mono() {
+    let pcm = reader::decode_aac_m4a_for_test(AAC_FIXTURE).expect("decode aac fixture");
+
+    // Source is 44.1 kHz mono, 2.0 s → resampled to 16 kHz mono is ~32000
+    // samples plus the untrimmed AAC encoder priming delay (see
+    // decode_aac_m4a's doc comment — symphonia's isomp4/aac combination
+    // doesn't implement gapless trimming): ~1024-2112 source samples is
+    // ~371-766 samples at 16 kHz, so the tolerance below is exactly that
+    // known, tracked residual (issue 0050) — not a vague fudge factor.
+    let expected = 2.0 * SAMPLE_RATE_16K as f64;
+    let got = pcm.len() as f64;
+    assert!(
+        (got - expected) < 1000.0 && (got - expected) > -100.0,
+        "expected ~{expected} samples at 16 kHz for a 2 s clip (+ up to ~800 for the untrimmed AAC priming delay), got {got}"
+    );
+
+    // A real sine tone decodes to a non-silent, non-clipped signal — not an
+    // all-zero buffer (which a probe/decode no-op could otherwise produce
+    // silently) and not saturated at ±1.0 throughout (which would indicate
+    // the decoder or downmix is wrong, not just quiet).
+    let peak = pcm.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+    assert!(peak > 0.05, "decoded buffer looks silent, peak={peak}");
+    assert!(peak <= 1.0 + 1e-3, "decoded buffer clips, peak={peak}");
+}
+
+#[test]
+fn test_aac_m4a_decode_rejects_garbage_without_panicking() {
+    let result = reader::decode_aac_m4a_for_test(b"not an mp4 container");
+    assert!(result.is_err(), "garbage input must not decode successfully");
+}
+
+/// `read_audio_pcm` resolves and dispatches by extension — an `audio.m4a`
+/// meeting decodes via the AAC path with no other configuration, proving the
+/// full resolve → dispatch → decode chain, not just `decode_aac_m4a` in
+/// isolation.
+#[test]
+fn test_read_audio_pcm_dispatches_to_aac_for_m4a_meeting() {
+    let root = TempDir::new().unwrap();
+    let meeting_dir = root.path().join("11111111-1111-1111-1111-111111111111");
+    std::fs::create_dir_all(&meeting_dir).unwrap();
+    std::fs::write(meeting_dir.join("audio.m4a"), AAC_FIXTURE).unwrap();
+
+    let pcm = reader::read_audio_pcm(&meeting_dir).expect("read_audio_pcm on an m4a meeting");
+    assert!(!pcm.is_empty(), "decoded pcm buffer is empty");
+}
+
+#[test]
+fn test_read_audio_pcm_errors_cleanly_when_no_audio_file_present() {
+    let root = TempDir::new().unwrap();
+    let meeting_dir = root.path().join("22222222-2222-2222-2222-222222222222");
+    std::fs::create_dir_all(&meeting_dir).unwrap();
+
+    let result = reader::read_audio_pcm(&meeting_dir);
+    assert!(result.is_err(), "no audio file present must be an error, not a panic");
+}
+
+const SAMPLE_RATE_16K: u32 = 16_000;

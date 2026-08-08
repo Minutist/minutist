@@ -397,10 +397,10 @@ pub struct AudioFormat {
 /// the extension is only how the file is found on disk.
 ///
 /// This is the shared contract `sync` (import, manifest path-safety —
-/// tracked as 0048) and `persistence` (decode — 0047) are being migrated
-/// onto so the two can't drift apart; as of this commit neither has been
-/// wired to it yet — `sync` still hardcodes a single `AUDIO_REL` literal and
-/// `persistence::read_audio_pcm` still decodes Ogg/Opus only.
+/// tracked as 0048) and `persistence` (decode — 0047) resolve against so the
+/// two can't drift apart. `persistence::read_audio_pcm` is wired to it as of
+/// 0047; `sync` is not yet — it still hardcodes a single `AUDIO_REL` literal
+/// pending 0048.
 pub const SUPPORTED_AUDIO_EXTS: &[&str] = &["opus", "m4a"];
 
 /// Resolve a meeting folder's actual audio file — the single `audio.<ext>`

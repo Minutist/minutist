@@ -22,6 +22,13 @@ audiopus = { workspace = true }
 chrono = { workspace = true }
 libsql = { workspace = true }
 ogg = { workspace = true }
+symphonia = { workspace = true }
+# Batch (not streaming) resample of a decoded AAC track's native rate to the
+# workspace's fixed 16 kHz mono PCM shape (0047). Already a workspace dep
+# (audio-capture uses it for the live-capture path); this is an independent
+# one-shot use, not a shared instance — the two crates decode from different
+# starting points (a live device stream vs. a whole file already in memory).
+rubato = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Content-addressed note image asset filenames (SHA-256 of the bytes), so

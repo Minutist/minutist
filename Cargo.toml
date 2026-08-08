@@ -66,6 +66,14 @@ tracing-appender = "0.2"
 audiopus = "0.3.0-rc.0"
 ogg = "0.9"
 
+# AAC-in-MP4 decoder (0047): the phone records AAC (no hardware Opus
+# encoder), so `persistence` needs a second decode path alongside the
+# audiopus/ogg one above. Pure Rust (no new C dependency, unlike audiopus).
+# Trimmed to exactly the demuxer (isomp4) + codec (aac) this needs — the
+# crate's default features pull in several codecs/containers persistence
+# does not use (flac, vorbis, mkv, wav, ...).
+symphonia = { version = "0.6", default-features = false, features = ["aac", "isomp4"] }
+
 # Tauri 2.x — pinned to Handy's verified versions.
 tauri = { version = "2.10", features = [] }
 tauri-build = "2.4"

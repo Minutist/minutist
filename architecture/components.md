@@ -529,7 +529,10 @@ runs after a meeting's `notes.ydoc` merges an inbound update) and projects it ov
 `metadata.json`, leaving the per-peer/local fields (`processing` — synced by the
 discovery exchange + `merge_processing`; `collection_id`; `notes_format`;
 `app_version`) untouched. Requires every captured meeting to carry a `notes.ydoc`
-(even notes-less), so the map has a transport.
+(even notes-less), so the map has a transport. Write seams: capture goes through
+`initialise_notes_with_meta` (writes `notes.ydoc` + projections + seeds the map in
+one write, tolerating notes-less capture); a later metadata edit through
+`edit_meta_ydoc` (load → granular `set_*` → save `notes.ydoc`, under `notes_lock`).
 
 **Attachments — shared types (Attachments WS).** Three new vocabulary types and
 four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the

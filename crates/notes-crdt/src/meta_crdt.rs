@@ -32,6 +32,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use minutist_common::fs::write_atomic;
 use minutist_common::{AppResult, AudioFormat, MeetingId, MeetingMeta, ModelDescriptor};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -253,6 +254,91 @@ pub fn project_ydoc_meta_into_metadata(meetings_root: &Path, id: MeetingId) -> A
     Ok(applied)
 }
 
+// --- disk helpers (load / mutate / save the meta map on notes.ydoc) ----------
+
+/// Load `{meetings_root}/{id}/notes.ydoc` (or a fresh doc if absent/undecodable),
+/// apply `mutate` to its meta map, and write the doc back atomically under the
+/// meeting's [`crate::notes_lock`]. Creates a `notes.ydoc` for a meeting that has
+/// none — the universal-`notes.ydoc` requirement: every meeting carries one so the
+/// meta map has a sync transport, even a notes-less recording.
+///
+/// Writes ONLY `notes.ydoc`; the `notes.json` / `notes.md` projections are
+/// unaffected by the meta map (they derive from the prosemirror fragment) and
+/// self-heal from `notes.ydoc` on the next open. The meeting folder must already
+/// exist (an edit site is always past capture/ensure).
+///
+/// Call from an authoritative edit site (rename, speaker-name, a processing-host
+/// derived-field write) after the corresponding `metadata.json` RMW, with `mutate`
+/// using the granular `set_*` setters so the edit converges per-field. Decoding a
+/// fresh doc is a per-call new client id, which yrs merges correctly.
+pub fn edit_meta_ydoc<F>(meetings_root: &Path, id: MeetingId, mutate: F) -> AppResult<()>
+where
+    F: FnOnce(&Doc),
+{
+    let ydoc_path = meetings_root.join(id.0.to_string()).join("notes.ydoc");
+    let lock = crate::notes_lock(id);
+    let _guard = lock.lock().expect("notes lock poisoned");
+    let doc = match std::fs::read(&ydoc_path) {
+        Ok(bytes) => crate::ydoc::decode_ydoc(&bytes).unwrap_or_else(|_| crate::ydoc::new_ydoc()),
+        Err(_) => crate::ydoc::new_ydoc(),
+    };
+    mutate(&doc);
+    let bytes = crate::ydoc::encode_ydoc(&doc);
+    write_atomic(&ydoc_path, &bytes)
+}
+
+/// Capture-time initialisation of a meeting's `notes.ydoc` WITH its authored
+/// metadata map, in one write. Builds the doc from the optional initial notes
+/// JSON (an empty doc when `None` — a notes-less recording still gets a
+/// `notes.ydoc` so its meta map syncs), seeds the meta map from `meta`
+/// ([`write_descriptive`]), and writes `notes.ydoc` + the derived `notes.json` /
+/// `notes.md` projections atomically under [`crate::notes_lock`].
+///
+/// Refuses (Err) if `notes.ydoc` already exists — capture is the first writer; a
+/// later editor edit goes through `NotesStore::apply_update`, and a later metadata
+/// edit through [`edit_meta_ydoc`]. This is the capture-side counterpart to
+/// `NotesStore::save`, differing only in that it also seeds the meta map and
+/// tolerates `None` notes (so every captured meeting carries a `notes.ydoc`).
+pub fn initialise_notes_with_meta(
+    meetings_root: &Path,
+    id: MeetingId,
+    notes_json: Option<&serde_json::Value>,
+    notes_md: &str,
+    meta: &MeetingMeta,
+) -> AppResult<()> {
+    let folder = meetings_root.join(id.0.to_string());
+    let ydoc_path = folder.join("notes.ydoc");
+    let json_path = folder.join("notes.json");
+    let md_path = folder.join("notes.md");
+
+    let lock = crate::notes_lock(id);
+    let _guard = lock.lock().expect("notes lock poisoned");
+    if ydoc_path.exists() {
+        return Err(minutist_common::AppError::InvalidInput {
+            context: "notes.ydoc already exists; use apply_update / edit_meta_ydoc".to_string(),
+        });
+    }
+
+    let doc = match notes_json {
+        Some(json) => crate::ydoc::json_to_ydoc(json),
+        None => crate::ydoc::new_ydoc(),
+    };
+    write_descriptive(&doc, meta);
+
+    let ydoc_bytes = crate::ydoc::encode_ydoc(&doc);
+    let derived_json = crate::ydoc::ydoc_to_json(&doc);
+    let json_bytes = serde_json::to_vec_pretty(&derived_json).map_err(|e| {
+        minutist_common::AppError::Internal {
+            context: format!("serialise notes.json: {e}"),
+        }
+    })?;
+
+    write_atomic(&ydoc_path, &ydoc_bytes)?;
+    write_atomic(&json_path, &json_bytes)?;
+    write_atomic(&md_path, notes_md.as_bytes())?;
+    Ok(())
+}
+
 // --- small yrs helpers -------------------------------------------------------
 
 /// Insert `value` (a serde-serialisable field) as a JSON-string map entry, or
@@ -395,6 +481,45 @@ mod tests {
         assert_eq!(dst.processing, placeholder_processing);
         assert_eq!(dst.notes_format, 0);
         assert_eq!(dst.app_version, "");
+    }
+
+    #[test]
+    fn initialise_then_project_replaces_placeholder_on_disk() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let src = base_meta();
+        let id = src.uuid;
+        let folder = root.join(id.0.to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+
+        // Origin: capture writes notes.ydoc WITH the real meta (notes-less path).
+        initialise_notes_with_meta(root, id, None, "", &src).unwrap();
+        assert!(
+            folder.join("notes.ydoc").is_file(),
+            "a notes-less capture still gets a notes.ydoc so the meta map syncs"
+        );
+
+        // Receiver: the wrong placeholder metadata.json (arrival time, claimed).
+        let placeholder = placeholder_meta(id);
+        crate::metadata::write_metadata(&folder, &placeholder).unwrap();
+
+        // Project the (synced) notes.ydoc meta over the placeholder metadata.json.
+        assert!(project_ydoc_meta_into_metadata(root, id).unwrap());
+        let out = crate::metadata::read_metadata(&folder).unwrap();
+        assert_eq!(out.started_at, "2026-08-01T09:00:00Z", "real capture time adopted");
+        assert_eq!(out.duration_ms, 3_600_000);
+        assert_eq!(out.title, "Original");
+        assert_eq!(out.audio_format.codec, "aac");
+        // The per-peer processing state is NOT clobbered by the projection.
+        assert_eq!(out.processing, placeholder.processing);
+
+        // A later metadata edit converges: rename on the ydoc, re-project.
+        edit_meta_ydoc(root, id, |doc| set_title(doc, "Renamed")).unwrap();
+        assert!(project_ydoc_meta_into_metadata(root, id).unwrap());
+        assert_eq!(crate::metadata::read_metadata(&folder).unwrap().title, "Renamed");
+
+        // Refuses to re-initialise over an existing notes.ydoc.
+        assert!(initialise_notes_with_meta(root, id, None, "", &src).is_err());
     }
 
     #[test]

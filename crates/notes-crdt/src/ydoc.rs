@@ -109,6 +109,19 @@ pub fn ydoc_to_json(doc: &Doc) -> Value {
     Value::Object(obj)
 }
 
+/// Whether the doc's [`PROSEMIRROR_FRAGMENT`] holds any content.
+///
+/// Distinguishes a document with real notes from one that exists ONLY to carry
+/// the descriptive-metadata map (`meta_crdt`, the universal-`notes.ydoc` case for
+/// a notes-less recording): the latter has an empty prosemirror fragment, so a
+/// `notes.ydoc`-exists check would wrongly report "has notes". Consumers that
+/// surface a has-notes signal must use this, not file existence.
+pub fn has_notes_content(doc: &Doc) -> bool {
+    let fragment = doc.get_or_insert_xml_fragment(PROSEMIRROR_FRAGMENT);
+    let txn = doc.transact();
+    fragment.len(&txn) > 0
+}
+
 /// Encode a Yjs [`Doc`]'s whole state as the durable lib0 v2 blob written to
 /// `notes.ydoc`.
 pub fn encode_ydoc(doc: &Doc) -> Vec<u8> {

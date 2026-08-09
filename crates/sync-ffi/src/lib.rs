@@ -685,18 +685,29 @@ fn save_captured_to(
             })?;
         }
 
-        if !notes_text.is_empty() {
-            // A minimal ProseMirror doc wrapping the raw note text; `NotesStore::save`
-            // builds the authoritative `notes.ydoc` + derived projections from it.
-            let doc = serde_json::json!({
+        // Create the meeting's `notes.ydoc` seeded with the authored metadata map
+        // (0052) so the descriptive fields converge across devices. Universal: a
+        // notes-less recording still gets a `notes.ydoc` (empty prosemirror) so the
+        // map has a sync transport. When note text is present it becomes the
+        // initial prosemirror content in the same doc.
+        let notes_json = if notes_text.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!({
                 "type": "doc",
                 "content": [{
                     "type": "paragraph",
                     "content": [{ "type": "text", "text": notes_text }],
                 }],
-            });
-            NotesStore::save(meetings_root, id, &doc, notes_text)?;
-        }
+            }))
+        };
+        notes_crdt::meta_crdt::initialise_notes_with_meta(
+            meetings_root,
+            id,
+            notes_json.as_ref(),
+            notes_text,
+            &meta,
+        )?;
         Ok(())
     })();
 
@@ -707,6 +718,18 @@ fn save_captured_to(
 
     tracing::info!(target: "sync-ffi", meeting_id = %id.0, "captured meeting saved");
     Ok(id.0.to_string())
+}
+
+/// Whether a meeting folder has real note content — a non-empty prosemirror
+/// document, not merely a `notes.ydoc` that exists to carry the descriptive
+/// metadata map (0052: every meeting has a `notes.ydoc`, so file existence no
+/// longer implies notes). Absent/undecodable `notes.ydoc` → no notes.
+fn folder_has_notes_content(folder: &Path) -> bool {
+    std::fs::read(folder.join("notes.ydoc"))
+        .ok()
+        .and_then(|bytes| notes_crdt::ydoc::decode_ydoc(&bytes).ok())
+        .map(|doc| notes_crdt::ydoc::has_notes_content(&doc))
+        .unwrap_or(false)
 }
 
 /// Sniff a captured audio file's real format from its container magic: returns
@@ -886,7 +909,7 @@ fn project_meeting(meetings_root: &Path, id: MeetingId) -> Option<FfiMeeting> {
                 started_at_ms,
                 duration_ms: meta.duration_ms as i64,
                 has_audio: minutist_common::resolve_audio_path(&folder).is_some(),
-                has_notes: folder.join("notes.ydoc").exists(),
+                has_notes: folder_has_notes_content(&folder),
                 processing,
                 claimed_by,
             })

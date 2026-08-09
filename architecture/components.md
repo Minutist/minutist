@@ -533,6 +533,11 @@ discovery exchange + `merge_processing`; `collection_id`; `notes_format`;
 `initialise_notes_with_meta` (writes `notes.ydoc` + projections + seeds the map in
 one write, tolerating notes-less capture); a later metadata edit through
 `edit_meta_ydoc` (load → granular `set_*` → save `notes.ydoc`, under `notes_lock`).
+The sync-receive projection is wired in `sync::notes_proto::apply_inbound` (right
+after `NotesStore::apply_update` merges an inbound diff, best-effort); `sync-ffi`'s
+`save_captured` seeds the map at phone capture; and `has_notes` (the FFI meeting
+projection) now means "prosemirror fragment non-empty" (`ydoc::has_notes_content`),
+not "`notes.ydoc` exists", since every meeting now carries one.
 
 **Attachments — shared types (Attachments WS).** Three new vocabulary types and
 four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the

@@ -202,7 +202,22 @@ fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> 
         Err(e) => return Err(Error::Protocol(format!("loading notes.md: {e}"))),
     };
     NotesStore::apply_update(root, meeting_id, diff, &notes_md)
-        .map_err(|e| Error::Protocol(format!("applying inbound update: {e}")))
+        .map_err(|e| Error::Protocol(format!("applying inbound update: {e}")))?;
+
+    // The merged `notes.ydoc` now carries any inbound descriptive-metadata map ops
+    // (0052 — the map rides inside the same doc): project them over `metadata.json`
+    // so a synced meeting shows the origin's real dates/title/codec instead of the
+    // arrival-time placeholder `MeetingFolder::ensure` wrote. Best-effort — a
+    // projection failure must not fail the notes sync; the next sweep re-applies it.
+    if let Err(e) = notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, meeting_id) {
+        tracing::warn!(
+            target: "sync",
+            meeting_id = %meeting_id.0,
+            error = %e,
+            "projecting synced metadata over metadata.json failed; will retry next sweep"
+        );
+    }
+    Ok(())
 }
 
 /// Run the *initiator* (dialling) side of one notes reconciliation for

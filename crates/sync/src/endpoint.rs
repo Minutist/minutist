@@ -277,17 +277,18 @@ fn android_relay_resolver(relay_host: &str, relay_ips: &[String]) -> iroh::dns::
 
 /// Whether a held meeting is materialised enough for [`SyncEngine::adopt_from_peer`]
 /// to skip re-syncing it: its authoritative notes CRDT (`notes.ydoc`), `metadata.json`,
-/// and `audio.opus` are all present. A held-but-incomplete meeting — any of the three
+/// and its audio file are all present. A held-but-incomplete meeting — any of the three
 /// missing (e.g. audio pulled but the notes pull failed on a prior sweep, or vice
 /// versa) — fails this and is re-attempted, so adopt self-heals rather than stranding
-/// it on folder existence alone. `audio.opus` stands in for media completeness; a
-/// meeting genuinely without audio simply re-syncs each sweep — a cheap idempotent
-/// manifest exchange, not a blob transfer.
+/// it on folder existence alone. The audio file (resolved by container, not assumed
+/// `audio.opus` — a synced phone recording is `audio.m4a`) stands in for media
+/// completeness; a meeting genuinely without audio simply re-syncs each sweep — a
+/// cheap idempotent manifest exchange, not a blob transfer.
 fn meeting_is_materialised(meetings_root: &Path, meeting_id: MeetingId) -> bool {
     let dir = meetings_root.join(meeting_id.0.to_string());
     dir.join("notes.ydoc").is_file()
         && dir.join("metadata.json").is_file()
-        && dir.join("audio.opus").is_file()
+        && minutist_common::resolve_audio_path(&dir).is_some()
 }
 
 /// Whether a bound direct socket address is worth publishing to the account

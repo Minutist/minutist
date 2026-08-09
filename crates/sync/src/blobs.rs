@@ -72,7 +72,7 @@ use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::GcConfig;
 use iroh_blobs::HashAndFormat;
-use minutist_common::{HostRef, MeetingId};
+use minutist_common::{resolve_audio_path, HostRef, MeetingId, SUPPORTED_AUDIO_EXTS};
 
 use crate::timeouts::BLOB_DOWNLOAD_TIMEOUT;
 use crate::{Error, Result};
@@ -189,11 +189,20 @@ impl BlobStore {
         let folder = meetings_root.join(meeting_id.0.to_string());
         let mut entries = Vec::new();
 
-        let audio = folder.join(AUDIO_REL);
-        if audio.is_file() {
+        // Resolve the meeting's actual audio file rather than assuming a fixed
+        // container: a desktop recording is `audio.opus`, a synced phone one is
+        // `audio.m4a` (AAC-in-MP4, no hardware Opus encoder) — the shared
+        // `minutist_common::resolve_audio_path` contract (0048). The manifest
+        // carries the real filename so the receiving side writes it under the
+        // same name and `persistence` decode-by-extension finds it.
+        if let Some(audio) = resolve_audio_path(&folder) {
+            let rel = audio
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("resolve_audio_path always yields an `audio.<ext>` filename");
             let hash = self.import_path(&audio, &audio_tag(meeting_id)).await?;
             entries.push(ManifestEntry {
-                rel_path: AUDIO_REL.to_string(),
+                rel_path: rel.to_string(),
                 hash,
             });
         }
@@ -741,9 +750,16 @@ async fn download_capped(
 }
 
 /// Relative path of a meeting's primary audio file within its folder.
-pub(crate) const AUDIO_REL: &str = "audio.opus";
 /// Name of the note-assets subdirectory within a meeting folder.
 pub(crate) const ASSETS_DIR: &str = "assets";
+
+/// Whether `rel` names a meeting's audio file — `audio.<ext>` for any ext in
+/// [`minutist_common::SUPPORTED_AUDIO_EXTS`] (`opus` for a desktop recording,
+/// `m4a` for a synced phone one). The single-audio-per-meeting invariant means
+/// the stem is always `audio`; only the container differs by capture platform.
+fn is_audio_rel(rel: &str) -> bool {
+    matches!(rel.strip_prefix("audio."), Some(ext) if SUPPORTED_AUDIO_EXTS.contains(&ext))
+}
 
 /// The persistent tag name pinning a meeting's audio blob.
 fn audio_tag(meeting_id: MeetingId) -> String {
@@ -765,12 +781,12 @@ fn tag_for_rel(meeting_id: MeetingId, rel: &str) -> String {
     }
 }
 
-/// A relative path is safe iff it is `audio.opus` or `assets/<single-component>`
-/// with no separator-escaping or `..` components. Mirrors the persistence
-/// asset-filename guard so a hostile manifest cannot direct an export outside the
-/// meeting folder.
+/// A relative path is safe iff it is an audio file (`audio.<ext>` for a
+/// supported ext) or `assets/<single-component>` with no separator-escaping or
+/// `..` components. Mirrors the persistence asset-filename guard so a hostile
+/// manifest cannot direct an export outside the meeting folder.
 pub(crate) fn is_safe_rel(rel: &str) -> bool {
-    if rel == AUDIO_REL {
+    if is_audio_rel(rel) {
         return true;
     }
     let Some(filename) = rel.strip_prefix(&format!("{ASSETS_DIR}/")) else {
@@ -1348,7 +1364,33 @@ mod tests {
     #[test]
     fn safe_rel_accepts_audio_and_assets() {
         assert!(is_safe_rel("audio.opus"));
+        assert!(is_safe_rel("audio.m4a"), "a synced phone recording is audio.m4a");
         assert!(is_safe_rel("assets/abc123.png"));
+        // The stem must be exactly `audio`, the ext one of the supported set.
+        assert!(!is_safe_rel("audio.wav"), "unsupported container");
+        assert!(!is_safe_rel("audio."), "no ext");
+        assert!(!is_safe_rel("track.m4a"), "wrong stem");
+    }
+
+    #[tokio::test]
+    async fn import_meeting_picks_up_an_m4a_audio_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let store = BlobStore::open(dir.path()).await.expect("store");
+        let meeting = MeetingId(uuid::Uuid::new_v4());
+        let folder = dir.path().join(meeting.0.to_string());
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        // A phone recording: AAC-in-MP4 stored under the honest .m4a extension.
+        std::fs::write(folder.join("audio.m4a"), b"fake-aac-bytes").expect("write audio");
+
+        let manifest = store
+            .import_meeting(dir.path(), meeting)
+            .await
+            .expect("import");
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(
+            manifest.entries[0].rel_path, "audio.m4a",
+            "the manifest carries the real container filename, not a fixed audio.opus"
+        );
     }
 
     #[test]

@@ -502,8 +502,11 @@ device's container (desktop: opus; phone: m4a, no hardware Opus encoder);
 extension is only how the file is found on disk. This is the shared contract
 `sync` (media import + manifest path-safety, issue 0048) and `persistence`
 (decode dispatch, issue 0047) resolve against so the two surfaces can't
-drift apart. `persistence::read_audio_pcm` is wired to it (0047); `sync` is
-not yet, pending 0048.
+drift apart. Both are wired to it: `persistence::read_audio_pcm` (0047), and
+`sync` (0048) — `BlobStore::import_meeting` imports the resolved file under its
+real filename (so the manifest carries `audio.m4a` for a phone recording, not a
+fixed `audio.opus`), `is_safe_rel` accepts any `audio.<ext>`, and
+`meeting_is_materialised` resolves by container.
 
 **Attachments — shared types (Attachments WS).** Three new vocabulary types and
 four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the

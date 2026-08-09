@@ -506,7 +506,11 @@ drift apart. Both are wired to it: `persistence::read_audio_pcm` (0047), and
 `sync` (0048) — `BlobStore::import_meeting` imports the resolved file under its
 real filename (so the manifest carries `audio.m4a` for a phone recording, not a
 fixed `audio.opus`), `is_safe_rel` accepts any `audio.<ext>`, and
-`meeting_is_materialised` resolves by container.
+`meeting_is_materialised` resolves by container. On the capture side,
+`sync-ffi::save_captured` sniffs the source file's container magic (Ogg → opus,
+`ftyp` → AAC/m4a) and stores the honest extension + codec + true rate/channels,
+so a phone recording is written as `audio.m4a` (not a mislabelled `audio.opus`)
+and its `has_audio` projection resolves by container.
 
 **Attachments — shared types (Attachments WS).** Three new vocabulary types and
 four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the

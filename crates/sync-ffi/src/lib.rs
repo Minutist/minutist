@@ -369,10 +369,13 @@ impl FfiSyncEngine {
 
     /// Persist a freshly-recorded meeting as captured-unprocessed and return its
     /// new id (a hyphenated UUID string). Writes `metadata.json` (as
-    /// `PendingProcessing`), optionally copies `audio_src_path` to the folder's
-    /// `audio.opus` (the Kotlin layer pre-materialises the Opus file), and — when
-    /// `notes_text` is non-empty — seeds `notes.ydoc` from it. `started_at_ms` is
-    /// Unix epoch milliseconds. Does not require a started engine — purely local.
+    /// `PendingProcessing`), optionally copies `audio_src_path` into the folder
+    /// under the honest container extension — `audio.opus` for Ogg-Opus,
+    /// `audio.m4a` for AAC-in-MP4 (the phone's fallback when the device has no
+    /// Opus encoder), sniffed from the source bytes so metadata and filename
+    /// match the real codec — and, when `notes_text` is non-empty, seeds
+    /// `notes.ydoc` from it. `started_at_ms` is Unix epoch milliseconds. Does not
+    /// require a started engine — purely local.
     pub fn save_captured(
         &self,
         title: String,
@@ -639,6 +642,17 @@ fn save_captured_to(
     // temp persists upstream); the meeting id is fresh, so the folder is ours to
     // remove.
     let write = (|| -> Result<(), SyncFfiError> {
+        // Determine the REAL audio format up front so metadata + the stored
+        // filename match the actual bytes. The phone's on-device Opus encoder is
+        // often absent, so the recorder falls back to AAC-in-MP4; the previous
+        // hardcoded `audio.opus` + codec:"opus" was a mislabel the desktop's
+        // Ogg-Opus decoder could not read. The extension is how the file is
+        // resolved on disk (`minutist_common::resolve_audio_path`), and decode
+        // dispatches by it — so it must be honest.
+        let (audio_ext, codec, sample_rate, channels) = match audio_src_path {
+            Some(src) => sniff_captured_audio(Path::new(src))?,
+            None => ("opus", "opus".to_string(), 16_000, 1),
+        };
         let meta = MeetingMeta {
             uuid: id,
             title: title.to_string(),
@@ -646,12 +660,10 @@ fn save_captured_to(
             ended_at: None,
             duration_ms: duration_ms.max(0) as u64,
             speaker_count: 0,
-            // The phone records AAC and transcodes to 16 kHz mono Ogg-Opus before
-            // saving, matching the desktop's `audio.opus` ingest invariant.
             audio_format: AudioFormat {
-                codec: "opus".to_string(),
-                sample_rate: 16_000,
-                channels: 1,
+                codec,
+                sample_rate,
+                channels,
                 bitrate_kbps: None,
             },
             asr_model: None,
@@ -666,8 +678,10 @@ fn save_captured_to(
         notes_crdt::write_metadata(&folder, &meta)?;
 
         if let Some(src) = audio_src_path {
-            std::fs::copy(src, folder.join("audio.opus")).map_err(|e| SyncFfiError::Io {
-                msg: format!("copying captured audio: {e}"),
+            std::fs::copy(src, folder.join(format!("audio.{audio_ext}"))).map_err(|e| {
+                SyncFfiError::Io {
+                    msg: format!("copying captured audio: {e}"),
+                }
             })?;
         }
 
@@ -693,6 +707,81 @@ fn save_captured_to(
 
     tracing::info!(target: "sync-ffi", meeting_id = %id.0, "captured meeting saved");
     Ok(id.0.to_string())
+}
+
+/// Sniff a captured audio file's real format from its container magic: returns
+/// `(extension, codec label, sample_rate, channels)`. The extension + codec come
+/// from the bytes, not from the recorder's own belief about the codec (that
+/// belief is the mislabel bug this fixes). Rate/channels are read from the
+/// container. Errors if it is not a supported audio container.
+fn sniff_captured_audio(src: &Path) -> Result<(&'static str, String, u32, u16), SyncFfiError> {
+    let bytes = std::fs::read(src).map_err(|e| SyncFfiError::Io {
+        msg: format!("reading captured audio: {e}"),
+    })?;
+    if bytes.len() >= 4 && &bytes[0..4] == b"OggS" {
+        // Ogg/Opus: our encoder contract is a fixed 16 kHz mono.
+        return Ok(("opus", "opus".to_string(), 16_000, 1));
+    }
+    if bytes.len() >= 8 && &bytes[4..8] == b"ftyp" {
+        // MP4/AAC (Android MediaRecorder). True rate/channels from the mp4a box;
+        // fall back to the recorder's configured 44.1 kHz mono if the walk can't
+        // locate it (a well-formed recorder file always can) — never a false
+        // 16 kHz that would misrepresent the audio to the decoder/consumer.
+        let (rate, ch) = mp4a_audio_params(&bytes).unwrap_or((44_100, 1));
+        return Ok(("m4a", "aac".to_string(), rate, ch));
+    }
+    Err(SyncFfiError::InvalidArg {
+        msg: "captured audio is neither Ogg/Opus nor MP4 — refusing to mislabel".into(),
+    })
+}
+
+/// Walk an MP4 to the first `mp4a` AudioSampleEntry and return
+/// `(sample_rate, channels)`. Bounded and defensive: any structural surprise
+/// yields `None` and the caller falls back to the recorder's configured values.
+fn mp4a_audio_params(data: &[u8]) -> Option<(u32, u16)> {
+    // Return the BODY (after the 8-byte box header) of the first child box `want`.
+    fn child<'a>(mut buf: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+        while buf.len() >= 8 {
+            let size = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            let end = if size == 0 {
+                buf.len()
+            } else if size < 8 || size > buf.len() {
+                return None;
+            } else {
+                size
+            };
+            if &buf[4..8] == want {
+                return Some(&buf[8..end]);
+            }
+            if size == 0 {
+                return None;
+            }
+            buf = &buf[end..];
+        }
+        None
+    }
+    let stsd = child(
+        child(
+            child(
+                child(child(child(data, b"moov")?, b"trak")?, b"mdia")?,
+                b"minf",
+            )?,
+            b"stbl",
+        )?,
+        b"stsd",
+    )?;
+    // stsd: 4 bytes version+flags, 4 bytes entry_count, then the sample entries.
+    let mp4a = child(stsd.get(8..)?, b"mp4a")?;
+    // AudioSampleEntry body: 8 (SampleEntry) + 8 (reserved) then channelcount(2),
+    // samplesize(2), predefined(2), reserved(2), samplerate(4, 16.16 fixed).
+    let channels = u16::from_be_bytes([*mp4a.get(16)?, *mp4a.get(17)?]).max(1);
+    let sr = u32::from_be_bytes([
+        *mp4a.get(24)?,
+        *mp4a.get(25)?,
+        *mp4a.get(26)?,
+        *mp4a.get(27)?,
+    ]);
+    Some((sr >> 16, channels)) // 16.16 fixed-point → integer part
 }
 
 /// Read `transcript.json` (a `Vec<Segment>`), empty when absent or unreadable. A
@@ -796,7 +885,7 @@ fn project_meeting(meetings_root: &Path, id: MeetingId) -> Option<FfiMeeting> {
                 title: meta.title,
                 started_at_ms,
                 duration_ms: meta.duration_ms as i64,
-                has_audio: folder.join("audio.opus").exists(),
+                has_audio: minutist_common::resolve_audio_path(&folder).is_some(),
                 has_notes: folder.join("notes.ydoc").exists(),
                 processing,
                 claimed_by,
@@ -850,6 +939,32 @@ mod tests {
     use minutist_common::{HostRef, ProcessingClaim};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn sniff_captured_audio_detects_container_by_magic() {
+        let dir = TempDir::new().unwrap();
+        // Ogg/Opus → opus, fixed 16 kHz mono (our encoder contract).
+        let ogg = dir.path().join("a.opus");
+        std::fs::write(&ogg, b"OggS\x00\x02rest-of-header").unwrap();
+        assert_eq!(
+            sniff_captured_audio(&ogg).unwrap(),
+            ("opus", "opus".to_string(), 16_000, 1)
+        );
+        // MP4 (`ftyp` at bytes 4..8) → m4a/aac; params fall back to 44100/1 when
+        // no mp4a box is present (a header-only stub).
+        let mp4 = dir.path().join("a.m4a");
+        std::fs::write(&mp4, b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00isomiso2").unwrap();
+        let (ext, codec, rate, ch) = sniff_captured_audio(&mp4).unwrap();
+        assert_eq!((ext, codec.as_str()), ("m4a", "aac"));
+        assert_eq!((rate, ch), (44_100, 1), "fallback when the mp4a box is absent");
+        // An unknown container is refused rather than mislabelled.
+        let junk = dir.path().join("a.bin");
+        std::fs::write(&junk, b"RIFFxxxxWAVEfmt ").unwrap();
+        assert!(matches!(
+            sniff_captured_audio(&junk),
+            Err(SyncFfiError::InvalidArg { .. })
+        ));
+    }
 
     #[test]
     fn lifecycle_maps_every_variant_carrying_fields() {

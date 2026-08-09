@@ -76,6 +76,78 @@ fn seed_doc(text: &str) -> Value {
     })
 }
 
+/// The 0052 end-to-end proof: a meeting authored on A with REAL descriptive
+/// metadata syncs to B, whose only prior state is the arrival-time placeholder
+/// `metadata.json` that `apply_inbound`'s `MeetingFolder::ensure` writes. After
+/// the notes sync, B's `metadata.json` must show A's real capture time / title /
+/// duration / codec (projected from the meta map that rides inside `notes.ydoc`),
+/// while B's own per-peer `processing` lifecycle stays untouched.
+#[tokio::test]
+async fn descriptive_metadata_converges_to_the_origin_over_sync() {
+    use minutist_common::{AudioFormat, MeetingMeta, ProcessingLifecycle};
+
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+    let meeting = MeetingId::new();
+
+    // A authors the meeting the way capture does: ensure the folder, write the
+    // real metadata.json, then seed notes.ydoc + the authored metadata map.
+    MeetingFolder::ensure(root_a, meeting).expect("ensure a");
+    let real = MeetingMeta {
+        uuid: meeting,
+        title: "Kickoff".to_string(),
+        started_at: "2026-08-01T09:00:00Z".to_string(),
+        ended_at: Some("2026-08-01T10:00:00Z".to_string()),
+        duration_ms: 3_600_000,
+        speaker_count: 0,
+        audio_format: AudioFormat {
+            codec: "aac".to_string(),
+            sample_rate: 44_100,
+            channels: 1,
+            bitrate_kbps: None,
+        },
+        asr_model: None,
+        llm_model: None,
+        diarizer: None,
+        speaker_names: Default::default(),
+        notes_format: 0,
+        processing: ProcessingLifecycle::PendingProcessing,
+        collection_id: None,
+        app_version: "0.1.0".to_string(),
+    };
+    let folder_a = root_a.join(meeting.0.to_string());
+    notes_crdt::write_metadata(&folder_a, &real).expect("write real metadata a");
+    notes_crdt::meta_crdt::initialise_notes_with_meta(root_a, meeting, None, "", &real)
+        .expect("seed notes + meta on a");
+
+    // B has nothing for this meeting; the sync's apply_inbound ensures its folder
+    // (a placeholder metadata.json with started_at = arrival), merges A's
+    // notes.ydoc, and projects the meta map over it.
+    let (a, b) = paired_engines(root_a, root_b).await;
+    a.sync_notes(direct_addr(&b), meeting)
+        .await
+        .expect("sync a -> b");
+
+    let folder_b = root_b.join(meeting.0.to_string());
+    let b_meta = notes_crdt::read_metadata(&folder_b).expect("read b metadata");
+    assert_eq!(
+        b_meta.started_at, "2026-08-01T09:00:00Z",
+        "B adopts A's real capture time, not the arrival-time placeholder"
+    );
+    assert_eq!(b_meta.title, "Kickoff");
+    assert_eq!(b_meta.ended_at.as_deref(), Some("2026-08-01T10:00:00Z"));
+    assert_eq!(b_meta.duration_ms, 3_600_000);
+    assert_eq!(b_meta.audio_format.codec, "aac");
+    // B's own per-peer lifecycle is NOT clobbered by the projection (the meta map
+    // never carries `processing`; it stays the placeholder's default).
+    assert_eq!(b_meta.processing, ProcessingLifecycle::default());
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
 #[tokio::test]
 async fn one_sided_seed_converges_to_seeder() {
     let dir_a = tempfile::TempDir::new().expect("tempdir a");

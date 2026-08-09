@@ -512,6 +512,25 @@ fixed `audio.opus`), `is_safe_rel` accepts any `audio.<ext>`, and
 so a phone recording is written as `audio.m4a` (not a mislabelled `audio.opus`)
 and its `has_audio` projection resolves by container.
 
+**Descriptive-metadata convergence (`notes_crdt::meta_crdt`, issue 0052).** A
+meeting's authored descriptive fields — `title`, `started_at`, `ended_at`,
+`duration_ms`, `speaker_count`, `audio_format`, the ASR/LLM/diarizer model
+descriptors, and `speaker_names` — are mirrored into a top-level Yjs `Map` that
+rides inside the same `notes.ydoc` blob the notes already sync, so they converge
+per-field (last-writer-wins) through the existing notes merge with no bespoke
+protocol. This exists because no sync protocol carried those fields, so a synced
+meeting kept the arrival-time placeholder `MeetingFolder::ensure` writes
+(`started_at = now` → wrong dates). **Invariant:** only an authoritative writer
+touches the map — the capturing device ([`write_descriptive`] at capture), a user
+edit, or the processing host (the granular `set_*` setters) — **never** the
+sync-arrival placeholder path, or a fake `started_at` would enter the CRDT. A peer
+holding the placeholder READS the converged map (`project_ydoc_meta_into_metadata`
+runs after a meeting's `notes.ydoc` merges an inbound update) and projects it over
+`metadata.json`, leaving the per-peer/local fields (`processing` — synced by the
+discovery exchange + `merge_processing`; `collection_id`; `notes_format`;
+`app_version`) untouched. Requires every captured meeting to carry a `notes.ydoc`
+(even notes-less), so the map has a transport.
+
 **Attachments — shared types (Attachments WS).** Three new vocabulary types and
 four new `AppEvent` variants that ride the existing `AppEventPayload` newtype + the
 single `collect_events![AppEventPayload]` registration — no second registration.

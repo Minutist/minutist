@@ -44,6 +44,7 @@
 pub mod error;
 pub mod folder;
 pub mod lifecycle;
+pub mod meta_crdt;
 pub mod metadata;
 pub mod metadata_lock;
 pub mod notes;

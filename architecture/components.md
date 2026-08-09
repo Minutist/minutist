@@ -453,6 +453,28 @@ used, not added here.
   depends on `common` **and** the `notes-crdt` leaf (the notes-CRDT
   primitives it re-exports); libsql / tokio remain external crates,
   not workspace components.
+
+  **Authored-metadata CRDT mirroring (0052).** Every authoritative write of
+  `MeetingMeta`'s descriptive fields — capture (`MeetingWriter::finalise`),
+  `meeting_ops::rename_meeting`, `meeting_ops::set_speaker_name`, and
+  `orchestrator`'s re-transcribe/re-diarize post-processing writes — also
+  mirrors into `notes.ydoc`'s meta CRDT map (`notes_crdt::meta_crdt`, owned
+  by the sync domain) via `persistence::meeting_ops::meta_crdt`, a
+  re-export following the same pattern as the guarded-RMW functions
+  (`update_metadata` etc.) — so `orchestrator` doesn't take its own
+  `notes-crdt` production dependency edge. This is why a peer that only ever
+  received `MeetingFolder::ensure`'s sync-arrival placeholder converges to
+  the real `title`/`started_at`/`duration_ms`/etc. instead of being stuck
+  with invented values forever (the bug 0052 exists to fix). Calls to
+  `meta_crdt::edit_meta_ydoc` happen AFTER the corresponding
+  `update_metadata` RMW returns, never nested inside it —
+  `edit_meta_ydoc` takes `notes_lock`, `update_metadata` takes
+  `metadata_lock`; keeping them un-nested avoids a lock-ordering deadlock
+  against the sync-receive projection path (`project_ydoc_meta_into_metadata`),
+  which takes only `metadata_lock`. `asr_model`/`llm_model` currently have no
+  production write site anywhere in the codebase (always `None`) — there is
+  nothing yet to mirror for those two fields; the `set_asr_model`/
+  `set_llm_model` setters exist in `meta_crdt` for whenever that changes.
 - **`orchestrator`** is the state machine for
   start / stop / pause with the audio meter and capture lifecycle, driving the
   full live pipeline (VAD → ASR → transcript events → diarizer trigger).

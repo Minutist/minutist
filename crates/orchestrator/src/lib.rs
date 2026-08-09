@@ -1641,6 +1641,11 @@ impl Orchestrator {
                 meta.speaker_count = speaker_count;
                 meta.clone()
             })?;
+            // Mirror into the meta CRDT (issue 0052) — after the RMW, un-nested
+            // (see `meeting_ops::rename_meeting`'s lock-ordering note).
+            persistence::meeting_ops::meta_crdt::edit_meta_ydoc(&root, meeting_id, |doc| {
+                persistence::meeting_ops::meta_crdt::set_speaker_count(doc, speaker_count);
+            })?;
             let transcript = persistence::read_transcript(&meeting_dir_for_meta)?;
             Ok(MeetingListEntry {
                 id: meta.uuid,
@@ -2484,7 +2489,7 @@ impl Orchestrator {
             // `Claimed`/`Processed` write cannot be reverted (and vice versa).
             persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
                 meta.speaker_count = speaker_count;
-                meta.diarizer = Some(descriptor);
+                meta.diarizer = Some(descriptor.clone());
                 // Phase 9 (§4.4): a (re-)diarization pass can re-letter speakers, so
                 // any user-set `speaker_names` keyed on the OLD letters is now
                 // potentially wrong. Clear it in this same metadata write (no second
@@ -2493,6 +2498,14 @@ impl Orchestrator {
                 // cannot re-map the way the UI could, so clearing is the only safe
                 // cross-consumer behaviour. See `cross-cutting.md` "Agent chat loop".
                 meta.speaker_names.clear();
+            })?;
+            // Mirror into the meta CRDT (issue 0052) — after the RMW, un-nested,
+            // batched into one edit since all three change together (see
+            // `meeting_ops::rename_meeting`'s lock-ordering note).
+            persistence::meeting_ops::meta_crdt::edit_meta_ydoc(&root, meeting_id, |doc| {
+                persistence::meeting_ops::meta_crdt::set_speaker_count(doc, speaker_count);
+                persistence::meeting_ops::meta_crdt::set_diarizer(doc, Some(&descriptor));
+                persistence::meeting_ops::meta_crdt::set_speaker_names(doc, &std::collections::BTreeMap::new());
             })
         })
         .await

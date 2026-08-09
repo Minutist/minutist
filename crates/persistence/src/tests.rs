@@ -1921,4 +1921,50 @@ fn test_read_audio_pcm_still_errors_on_genuinely_corrupt_opus() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Test 12: capture seeds the meta CRDT (issue 0052)
+// ---------------------------------------------------------------------------
+
+/// `MeetingWriter::finalise` must seed `notes.ydoc`'s meta map from the
+/// finalised `MeetingMeta`, so the real dates/duration converge to a sync
+/// peer instead of it being stuck with `MeetingFolder::ensure`'s placeholder
+/// forever (0052). Projecting the map back over a fresh placeholder-shaped
+/// `MeetingMeta` must recover the real values.
+#[test]
+fn test_finalise_seeds_the_meta_crdt_for_sync_convergence() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    let format = opus_format();
+
+    let mut writer = MeetingWriter::open(tempdir.path(), id, format).expect("open writer");
+    writer.push_samples(&sine_samples(1.0)).expect("push_samples");
+    let meta = dummy_meta(id, 1_000);
+    writer.finalise(meta.clone()).expect("finalise");
+
+    let ydoc_path = tempdir.path().join(id.0.to_string()).join("notes.ydoc");
+    assert!(ydoc_path.exists(), "finalise must create notes.ydoc");
+
+    let bytes = std::fs::read(&ydoc_path).expect("read notes.ydoc");
+    let doc = notes_crdt::ydoc::decode_ydoc(&bytes).expect("decode notes.ydoc");
+    assert!(
+        notes_crdt::meta_crdt::has_descriptive(&doc),
+        "capture must populate the meta map"
+    );
+
+    // A placeholder-shaped MeetingMeta (what MeetingFolder::ensure would seed
+    // on a sync peer) must be corrected by projecting the converged map over
+    // it — proving a peer that only ever received the placeholder would
+    // recover the real values, not just that this device's own copy is right.
+    let mut placeholder = dummy_meta(id, 0);
+    placeholder.title = String::new();
+    placeholder.started_at = "2026-01-01T00:00:00Z".to_string();
+    placeholder.ended_at = None;
+    let applied = notes_crdt::meta_crdt::project_into_meta(&doc, &mut placeholder);
+    assert!(applied, "projection must report it changed the placeholder");
+    assert_eq!(placeholder.title, meta.title);
+    assert_eq!(placeholder.started_at, meta.started_at);
+    assert_eq!(placeholder.ended_at, meta.ended_at);
+    assert_eq!(placeholder.duration_ms, meta.duration_ms);
+}
+
 const SAMPLE_RATE_16K: u32 = 16_000;

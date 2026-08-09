@@ -166,6 +166,28 @@ impl MeetingWriter {
             "metadata.json written"
         );
 
+        // Seed notes.ydoc's authored-metadata map from the just-written
+        // MeetingMeta (issue 0052) — this is the ORIGIN's one-time capture
+        // write, so the CRDT converges the real dates/duration/etc. instead of
+        // a sync peer being stuck with MeetingFolder::ensure's placeholder
+        // forever. No notes content yet at capture (None/""); the editor's own
+        // save path applies real prosemirror content later via
+        // NotesStore::apply_update, independent of this map.
+        let meetings_root = self
+            .folder
+            .path()
+            .parent()
+            .ok_or_else(|| minutist_common::AppError::Internal {
+                context: "meeting folder has no parent; cannot resolve meetings_root".to_string(),
+            })?;
+        notes_crdt::meta_crdt::initialise_notes_with_meta(
+            meetings_root,
+            self.folder.id(),
+            None,
+            "",
+            &meta,
+        )?;
+
         Ok(self.folder)
     }
 

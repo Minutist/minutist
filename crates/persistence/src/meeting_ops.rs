@@ -39,6 +39,12 @@ use crate::reader;
 /// writes, `reader::read_meeting_state`, and `agent-tools` — is unchanged.
 pub use notes_crdt::{update_metadata, update_metadata_if, update_metadata_if_present, MetaUpdate};
 
+/// The authored-metadata CRDT seam (issue 0052), re-exported for the same
+/// reason as the guarded-RMW functions above: `orchestrator`'s post-processing
+/// writes call [`meta_crdt::edit_meta_ydoc`] alongside [`update_metadata`]
+/// without taking its own `notes-crdt` production dependency edge.
+pub use notes_crdt::meta_crdt;
+
 /// A stable, log-safe discriminant for a [`ProcessingLifecycle`] — the variant
 /// name only (the `HostRef` inside a claim is a device key, not user content,
 /// but is omitted to keep log lines minimal).
@@ -68,6 +74,16 @@ pub async fn rename_meeting(
     // `rebuild_from_disk` — the folder is authoritative).
     update_metadata(meetings_root, id, |meta| {
         meta.title = new_title.to_string();
+    })?;
+
+    // Mirror the rename into the meta CRDT (issue 0052) so it converges to
+    // every device, not just this one's metadata.json. After the RMW above
+    // returns (never nested inside it — edit_meta_ydoc takes notes_lock,
+    // update_metadata takes metadata_lock; keeping them un-nested avoids a
+    // lock-ordering deadlock against the sync-receive projection path, which
+    // takes metadata_lock only).
+    notes_crdt::meta_crdt::edit_meta_ydoc(meetings_root, id, |doc| {
+        notes_crdt::meta_crdt::set_title(doc, new_title);
     })?;
 
     // Refresh the index row to match the renamed meeting.
@@ -146,6 +162,12 @@ pub async fn set_speaker_name(
             meta.speaker_names.insert(label.to_string(), name.to_string());
         }
         meta.speaker_names.clone()
+    })?;
+
+    // Mirror into the meta CRDT (issue 0052) — after the RMW, un-nested; see
+    // rename_meeting's lock-ordering note.
+    notes_crdt::meta_crdt::edit_meta_ydoc(meetings_root, id, |doc| {
+        notes_crdt::meta_crdt::set_speaker_names(doc, &speaker_names);
     })?;
 
     tracing::info!(
@@ -409,6 +431,79 @@ mod tests {
             .await
             .expect_err("missing meeting must error");
         assert!(matches!(err, minutist_common::AppError::InvalidInput { .. }));
+    }
+
+    /// `set_speaker_name` must also mirror into the meta CRDT (issue 0052) —
+    /// a peer projecting the converged map recovers the same speaker_names
+    /// `metadata.json` reflects, even though this meeting started with no
+    /// `notes.ydoc` at all (`write_meta_with_no_names` doesn't create one;
+    /// `edit_meta_ydoc` must create it on first use).
+    #[tokio::test]
+    async fn test_set_speaker_name_mirrors_into_meta_crdt() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = write_meta_with_no_names(root);
+        assert!(
+            !root.join(id.0.to_string()).join("notes.ydoc").exists(),
+            "test fixture must start with no notes.ydoc"
+        );
+
+        super::set_speaker_name(root, id, "A", "Alice")
+            .await
+            .expect("set_speaker_name");
+
+        let ydoc_path = root.join(id.0.to_string()).join("notes.ydoc");
+        assert!(ydoc_path.exists(), "edit_meta_ydoc must create notes.ydoc");
+        let bytes = std::fs::read(&ydoc_path).expect("read notes.ydoc");
+        let doc = notes_crdt::ydoc::decode_ydoc(&bytes).expect("decode notes.ydoc");
+
+        let mut projected = MeetingMeta {
+            uuid: id,
+            title: String::new(),
+            started_at: "1970-01-01T00:00:00Z".to_string(),
+            ended_at: None,
+            duration_ms: 0,
+            speaker_count: 0,
+            audio_format: AudioFormat {
+                codec: "opus".into(),
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate_kbps: Some(32),
+            },
+            asr_model: None,
+            llm_model: None,
+            diarizer: None,
+            speaker_names: std::collections::BTreeMap::new(),
+            notes_format: 0,
+            processing: Default::default(),
+            collection_id: None,
+            app_version: String::new(),
+        };
+        notes_crdt::meta_crdt::project_into_meta(&doc, &mut projected);
+        assert_eq!(projected.speaker_names.get("A").map(String::as_str), Some("Alice"));
+    }
+
+    /// `rename_meeting` must also mirror the new title into the meta CRDT
+    /// (issue 0052), not just `metadata.json`.
+    #[tokio::test]
+    async fn test_rename_meeting_mirrors_into_meta_crdt() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let root = tempdir.path();
+        let id = write_meta_with_no_names(root);
+        let index = crate::index::MeetingIndex::open(":memory:").await.expect("open index");
+        index.rebuild_from_disk(root).await.expect("rebuild");
+
+        super::rename_meeting(root, &index, id, "New title")
+            .await
+            .expect("rename_meeting");
+
+        let ydoc_path = root.join(id.0.to_string()).join("notes.ydoc");
+        let bytes = std::fs::read(&ydoc_path).expect("read notes.ydoc");
+        let doc = notes_crdt::ydoc::decode_ydoc(&bytes).expect("decode notes.ydoc");
+        let mut projected = read_metadata(&root.join(id.0.to_string())).expect("read_metadata");
+        projected.title = String::new(); // clear so project_into_meta's write is observable
+        notes_crdt::meta_crdt::project_into_meta(&doc, &mut projected);
+        assert_eq!(projected.title, "New title");
     }
 
     /// `apply_processing_lifecycle` overwrites `metadata.json`'s `processing`

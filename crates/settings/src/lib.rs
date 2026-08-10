@@ -303,16 +303,19 @@ where
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum SummaryPreset {
-    /// Structured summary: Summary / Key Decisions / Action Items. The prior
-    /// (pre-preset) default behaviour.
-    #[default]
+    /// Concise structured summary: Summary / Key Decisions / Action Items. The
+    /// prior (pre-preset) behaviour — a high-level overview.
     Default,
     /// Like `Default` but explicitly omits greetings, small-talk and sign-off
     /// chit-chat at the start and end of the meeting.
     FilterChitChat,
     /// Focus on decisions, action items and their owners.
     ActionItems,
-    /// A thorough, sectioned summary covering topics, discussion and outcomes.
+    /// A thorough, detailed record: every substantive point, question-and-answer,
+    /// and suggestion, organised by topic. The default — a concise overview is too
+    /// high-level to be useful, so a synced/processed meeting gets the full detail
+    /// unless the user picks a lighter preset.
+    #[default]
     Detailed,
 }
 
@@ -354,14 +357,19 @@ pub fn preset_prompt(preset: SummaryPreset) -> &'static str {
              not present in the transcript or notes."
         }
         SummaryPreset::Detailed => {
-            "You are a meeting-notes assistant. Produce a thorough, well-structured \
-             Markdown summary of the meeting transcript and the user's notes. Open with \
-             a `## Summary` overview, then a `## Discussion` section with one `###` \
-             subsection per topic covering the points raised and the reasoning, then \
-             `## Key Decisions` (a bulleted list of decisions made) and `## Action \
-             Items` (a bulleted list of follow-ups, naming the owner when stated). Omit \
-             any section that has no content. Be factual and do not invent information \
-             that is not present in the transcript or notes."
+            "You are a meeting-notes assistant. Produce a THOROUGH, DETAILED Markdown \
+             record of the meeting from the transcript and the user's notes — capture \
+             every substantive point, not a high-level overview. Skip only greetings, \
+             small-talk, and sign-off chit-chat. Structure it as: a brief `## Summary` \
+             (two to four sentences of context), then `## Discussion` with one `###` \
+             subsection per topic that captures the points raised, the reasoning behind \
+             them, and every question asked together with its answer; then `## Decisions` \
+             (a bulleted list of what was decided) and `## Action Items` (a bulleted list \
+             of follow-ups, naming the owner and any due date when stated). Within the \
+             discussion, prefer specific detail — names, numbers, figures, and concrete \
+             suggestions exactly as stated — over generic paraphrase. Omit any section \
+             that has no content. Be factual: include only what is present in the \
+             transcript or notes; do not invent information."
         }
     }
 }
@@ -544,8 +552,10 @@ pub struct Settings {
     /// Selected summary prompt preset (Phase 9 — D4). Drives the effective
     /// summary prompt via [`preset_prompt`] UNLESS `summary_system_prompt` is a
     /// non-empty user override (see [`Settings::effective_summary_prompt`]).
-    /// `#[serde(default)]` defaults to [`SummaryPreset::Default`] (the prior
-    /// behaviour); an older store deserialises to `Default`.
+    /// `#[serde(default)]` defaults to [`SummaryPreset::Detailed`] (the app
+    /// default — a full-detail record); an older store that predates this field
+    /// deserialises to `Detailed`, so an existing user who never picked a preset
+    /// also gets the detailed summary going forward.
     #[serde(default)]
     pub summary_preset: SummaryPreset,
 
@@ -906,19 +916,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn summary_prompt_defaults_to_default_preset() {
+    fn summary_prompt_defaults_to_detailed_preset() {
         // The custom override is EMPTY by default (D4), so the effective prompt is
-        // the Default preset — which asks for the three structured sections (FR-28).
+        // the Detailed preset — the app default is the full-detail record (a
+        // high-level overview was too terse to be useful).
         let s = Settings::default();
         assert!(
             s.summary_system_prompt.is_empty(),
             "custom override must default empty so the preset drives"
         );
-        assert_eq!(s.summary_preset, SummaryPreset::Default);
+        assert_eq!(s.summary_preset, SummaryPreset::Detailed);
         let effective = s.effective_summary_prompt();
-        assert!(effective.contains("Key Decisions"));
+        assert!(effective.contains("Discussion"));
         assert!(effective.contains("Action Items"));
-        assert_eq!(effective, preset_prompt(SummaryPreset::Default));
+        assert_eq!(effective, preset_prompt(SummaryPreset::Detailed));
     }
 
     #[test]
@@ -955,8 +966,9 @@ mod tests {
         );
         assert_eq!(
             restored.effective_summary_prompt(),
-            preset_prompt(SummaryPreset::Default),
-            "with no override + default preset, the effective prompt is the Default preset"
+            preset_prompt(SummaryPreset::Detailed),
+            "with no override + default preset, the effective prompt is the Detailed preset \
+             (the app default; an old store without the field also deserialises to Detailed)"
         );
         assert_eq!(
             restored.llm_model_id, None,
@@ -1319,8 +1331,8 @@ mod tests {
     }
 
     #[test]
-    fn summary_preset_defaults_to_default_variant() {
-        assert_eq!(Settings::default().summary_preset, SummaryPreset::Default);
+    fn summary_preset_defaults_to_detailed_variant() {
+        assert_eq!(Settings::default().summary_preset, SummaryPreset::Detailed);
     }
 
     #[test]
@@ -1369,8 +1381,8 @@ mod tests {
         );
         assert_eq!(
             restored.summary_preset,
-            SummaryPreset::Default,
-            "missing summary_preset must deserialise to Default"
+            SummaryPreset::Detailed,
+            "missing summary_preset must deserialise to the app default (Detailed)"
         );
         assert_eq!(restored.theme, Theme::Dark);
         assert!(restored.start_hidden);

@@ -1,17 +1,14 @@
-//! `minutist` library entry point.
+//! `minutist_lib` — satisfies the `[lib]` crate-type split
+//! (`staticlib`/`cdylib`/`rlib`) Tauri's toolchain requires for a mobile
+//! build. The desktop binary (`main.rs`) does not call anything here; its own
+//! `run()` holds all runtime logic and this crate is otherwise unused on
+//! desktop.
 //!
-//! Tauri convention: the app logic lives in a `lib` crate so it can be
-//! linked into mobile targets (iOS = cdylib, Android = cdylib) as well as
-//! the desktop binary.  The `main.rs` binary simply calls `run()` from here.
-//!
-//! For Phase 1 the mobile targets are not in scope; this file exists to
-//! satisfy the `[lib]` declaration in `Cargo.toml` which Tauri's toolchain
-//! requires for the crate-type split.
+//! This app does not build a mobile target today (no `gen/apple`/`gen/android`
+//! project, no mobile CI leg). `#[tauri::mobile_entry_point]` below is real —
+//! it IS what a mobile build would call — but the function body is an empty
+//! stub, so a mobile build of this crate as it stands would launch and do
+//! nothing. Give this function main.rs's logic before attempting one.
 
-/// Called by `main.rs`.  All runtime logic is in `main.rs` for Phase 1.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    // Delegate to the binary entry point.  In Phase 1 the full run() logic
-    // lives in main.rs; this stub satisfies the lib requirement without
-    // duplication.
-}
+pub fn run() {}

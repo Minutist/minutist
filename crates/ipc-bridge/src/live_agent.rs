@@ -1032,7 +1032,7 @@ fn run_worker_thread(
     // Resolve the held summariser. This calls ensure_summariser which loads the
     // GGUF if not yet loaded. Runs at thread start (before the first refresh),
     // so the load cost is paid once at session spawn, not mid-recording.
-    let summariser_arc = match rt.block_on(ensure_summariser_in_worker(
+    let summariser_arc = match rt.block_on(crate::chat_runtime::ensure_summariser(
         &summariser_cell,
         &orchestrator,
         &settings,
@@ -1063,7 +1063,8 @@ fn run_worker_thread(
         let bg_orchestrator = orchestrator.clone();
         let bg_settings = settings.clone();
         rt.spawn(async move {
-            if let Err(e) = ensure_embedder_in_worker(&bg_cell, &bg_orchestrator, &bg_settings).await
+            if let Err(e) =
+                crate::chat_runtime::ensure_embedder(&bg_cell, &bg_orchestrator, &bg_settings).await
             {
                 tracing::warn!(
                     target: "ipc-bridge",
@@ -1312,79 +1313,6 @@ fn run_worker_thread(
 
 /// Load the held summariser using the shared OnceCell, mirroring the logic in
 /// `ChatHandles::ensure_summariser`. Called once at worker thread start.
-async fn ensure_summariser_in_worker(
-    cell: &Arc<OnceCell<Arc<LlamaSummariser>>>,
-    orchestrator: &Arc<Orchestrator>,
-    settings: &SettingsHandle,
-) -> Result<Arc<LlamaSummariser>, minutist_common::AppError> {
-    let handle = cell
-        .get_or_try_init(|| async {
-            let s = settings.current();
-            let model_id = crate::commands::resolve_llm_model_id(&s);
-            let model_dir = orchestrator.ensure_model_path(&model_id).await?;
-            let plan = minutist_common::resolve_gpu_plan(
-                minutist_common::probe_primary_gpu().as_ref(),
-                s.gpu_acceleration,
-                true,
-            );
-            let n_gpu_layers = crate::commands::resolve_summariser_gpu_layers(plan.summariser_gpu);
-            let summariser = tokio::task::spawn_blocking(move || {
-                crate::commands::open_summariser_in_dir(&model_dir, n_gpu_layers)
-            })
-            .await
-            .map_err(|e| minutist_common::AppError::Internal {
-                context: format!("live-agent summariser load task join failed: {e}"),
-            })??;
-            tracing::info!(
-                target: "ipc-bridge",
-                "live-agent: held LLM summariser loaded"
-            );
-            Ok::<_, minutist_common::AppError>(Arc::new(summariser))
-        })
-        .await?;
-    Ok(Arc::clone(handle))
-}
-
-/// Load the held embedder using the shared `OnceCell`, mirroring
-/// [`crate::chat_runtime::ChatHandles::ensure_embedder`]. Run in the background at
-/// worker start so the load — and any first-use BGE-M3 download — stays off the
-/// digest critical path. Populates the cell the retrieval loop peeks.
-async fn ensure_embedder_in_worker(
-    cell: &Arc<OnceCell<Arc<dyn Embedder>>>,
-    orchestrator: &Arc<Orchestrator>,
-    settings: &SettingsHandle,
-) -> Result<Arc<dyn Embedder>, minutist_common::AppError> {
-    let handle = cell
-        .get_or_try_init(|| async {
-            let s = settings.current();
-            let model_id = minutist_common::ModelId::from(crate::commands::DEFAULT_EMBED_MODEL_ID);
-            let model_dir = orchestrator.ensure_model_path(&model_id).await?;
-            let gguf = crate::commands::find_gguf_weights(&model_dir)?;
-            // The embedder is small (~600 MB); offload it whenever GPU acceleration
-            // is enabled (Off forces CPU). It is not in the summariser-first VRAM plan.
-            let enabled = s.gpu_acceleration != minutist_common::GpuAcceleration::Off;
-            let n_gpu_layers = crate::commands::resolve_summariser_gpu_layers(enabled);
-            let embedder = tokio::task::spawn_blocking(move || {
-                embedder::Bgem3Embedder::open(
-                    &gguf,
-                    crate::commands::DEFAULT_EMBED_MODEL_ID,
-                    n_gpu_layers,
-                )
-            })
-            .await
-            .map_err(|e| minutist_common::AppError::Internal {
-                context: format!("live-agent embedder load task join failed: {e}"),
-            })??;
-            tracing::info!(
-                target: "ipc-bridge",
-                "live-agent: held BGE-M3 embedder loaded (background)"
-            );
-            Ok::<_, minutist_common::AppError>(Arc::new(embedder) as Arc<dyn Embedder>)
-        })
-        .await?;
-    Ok(Arc::clone(handle))
-}
-
 async fn run_worker_loop<B: LiveSessionBackend + ConversationalTurn>(
     meeting_id: MeetingId,
     // HIGH-priority user-chat channel; drained before transcript on each iteration.

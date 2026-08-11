@@ -36,83 +36,101 @@ pub struct ChatHandles {
     pub embedder: Arc<OnceCell<Arc<dyn Embedder>>>,
 }
 
-impl ChatHandles {
-    /// Resolve the held summariser, loading the GGUF once on first use.
-    ///
-    /// The single load implementation (the body that `IpcState::ensure_summariser`
-    /// also calls): the model id is the user-selected `settings.llm_model_id` or
-    /// the bundled default; the directory is resolved (downloaded + verified when
-    /// absent) via `Orchestrator::ensure_model_path`; the GGUF is opened on
-    /// `spawn_blocking`. Subsequent calls return the cached `Arc`.
-    pub async fn ensure_summariser(&self) -> AppResult<Arc<LlamaSummariser>> {
-        let handle = self
-            .summariser
-            .get_or_try_init(|| async {
-                let settings = self.settings.current();
-                let model_id = commands::resolve_llm_model_id(&settings);
-                let model_dir = self.orchestrator.ensure_model_path(&model_id).await?;
-                // VRAM-aware plan: the summariser's GPU decision is `plan.summariser_gpu`
-                // (the summariser is budgeted FIRST). See `architecture/cross-cutting.md`
-                // — "GPU portability".
-                let plan = minutist_common::resolve_gpu_plan(
-                    minutist_common::probe_primary_gpu().as_ref(),
-                    settings.gpu_acceleration,
-                    true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
-                );
-                let n_gpu_layers = commands::resolve_summariser_gpu_layers(plan.summariser_gpu);
-                let summariser = tokio::task::spawn_blocking(move || {
-                    commands::open_summariser_in_dir(&model_dir, n_gpu_layers)
-                })
-                .await
-                .map_err(|e| minutist_common::AppError::Internal {
-                    context: format!("summariser load task join failed: {e}"),
-                })??;
-                tracing::info!(
-                    target: "ipc-bridge",
-                    "held LLM summariser loaded (shared by summarise + chat + inter-agent)"
-                );
-                Ok::<_, minutist_common::AppError>(Arc::new(summariser))
+/// Resolve the held summariser, loading the GGUF once on first use.
+///
+/// The single load implementation, shared by [`ChatHandles::ensure_summariser`]
+/// (the UI `send_chat_message` / inter-agent path) and the live-agent worker
+/// (`live_agent::run_worker_loop`), so both hold the SAME lazily-loaded `Arc`
+/// regardless of which one loads it first. The model id is the user-selected
+/// `settings.llm_model_id` or the bundled default; the directory is resolved
+/// (downloaded + verified when absent) via `Orchestrator::ensure_model_path`;
+/// the GGUF is opened on `spawn_blocking`. Subsequent calls return the cached
+/// `Arc`.
+pub(crate) async fn ensure_summariser(
+    cell: &OnceCell<Arc<LlamaSummariser>>,
+    orchestrator: &Orchestrator,
+    settings: &SettingsHandle,
+) -> AppResult<Arc<LlamaSummariser>> {
+    let handle = cell
+        .get_or_try_init(|| async {
+            let settings = settings.current();
+            let model_id = commands::resolve_llm_model_id(&settings);
+            let model_dir = orchestrator.ensure_model_path(&model_id).await?;
+            // VRAM-aware plan: the summariser's GPU decision is `plan.summariser_gpu`
+            // (the summariser is budgeted FIRST). See `architecture/cross-cutting.md`
+            // — "GPU portability".
+            let plan = minutist_common::resolve_gpu_plan(
+                minutist_common::probe_primary_gpu().as_ref(),
+                settings.gpu_acceleration,
+                true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
+            );
+            let n_gpu_layers = commands::resolve_summariser_gpu_layers(plan.summariser_gpu);
+            let summariser = tokio::task::spawn_blocking(move || {
+                commands::open_summariser_in_dir(&model_dir, n_gpu_layers)
             })
-            .await?;
-        Ok(Arc::clone(handle))
+            .await
+            .map_err(|e| minutist_common::AppError::Internal {
+                context: format!("summariser load task join failed: {e}"),
+            })??;
+            tracing::info!(
+                target: "ipc-bridge",
+                "held LLM summariser loaded (shared by summarise + chat + inter-agent + live-agent)"
+            );
+            Ok::<_, minutist_common::AppError>(Arc::new(summariser))
+        })
+        .await?;
+    Ok(Arc::clone(handle))
+}
+
+/// Resolve the held BGE-M3 embedder, loading the GGUF once on first use.
+///
+/// Mirrors [`ensure_summariser`]: the embedder model dir is resolved
+/// (downloaded + verified when absent) via `Orchestrator::ensure_model_path`,
+/// then opened on `spawn_blocking`. Shared by [`ChatHandles::ensure_embedder`]
+/// and the live-agent worker so the model loads once and serves the RAG write
+/// path, the `retrieve_chunks` tool, and live-agent retrieval.
+pub(crate) async fn ensure_embedder(
+    cell: &OnceCell<Arc<dyn Embedder>>,
+    orchestrator: &Orchestrator,
+    settings: &SettingsHandle,
+) -> AppResult<Arc<dyn Embedder>> {
+    let handle = cell
+        .get_or_try_init(|| async {
+            let settings = settings.current();
+            let model_id = minutist_common::ModelId::from(commands::DEFAULT_EMBED_MODEL_ID);
+            let model_dir = orchestrator.ensure_model_path(&model_id).await?;
+            let gguf = commands::find_gguf_weights(&model_dir)?;
+            // The embedder is small (~600 MB); offload it whenever GPU
+            // acceleration is enabled (Off forces CPU). It is not in the
+            // VRAM plan (which budgets the summariser first).
+            let enabled = settings.gpu_acceleration != minutist_common::GpuAcceleration::Off;
+            let n_gpu_layers = commands::resolve_summariser_gpu_layers(enabled);
+            let embedder = tokio::task::spawn_blocking(move || {
+                Bgem3Embedder::open(&gguf, commands::DEFAULT_EMBED_MODEL_ID, n_gpu_layers)
+            })
+            .await
+            .map_err(|e| minutist_common::AppError::Internal {
+                context: format!("embedder load task join failed: {e}"),
+            })??;
+            tracing::info!(
+                target: "ipc-bridge",
+                "held BGE-M3 embedder loaded (RAG write path + retrieve_chunks + live-agent)"
+            );
+            Ok::<_, minutist_common::AppError>(Arc::new(embedder) as Arc<dyn Embedder>)
+        })
+        .await?;
+    Ok(Arc::clone(handle))
+}
+
+impl ChatHandles {
+    /// Resolve the held summariser. See [`ensure_summariser`].
+    pub async fn ensure_summariser(&self) -> AppResult<Arc<LlamaSummariser>> {
+        ensure_summariser(&self.summariser, &self.orchestrator, &self.settings).await
     }
 
-    /// Resolve the held BGE-M3 embedder, loading the GGUF once on first use.
-    ///
-    /// Mirrors [`Self::ensure_summariser`]: the embedder model dir is resolved
-    /// (downloaded + verified when absent) via `Orchestrator::ensure_model_path`,
-    /// then opened on `spawn_blocking`. Shared with `IpcState` so the model loads
-    /// once and serves both the RAG write path and the `retrieve_chunks` tool.
+    /// Resolve the held BGE-M3 embedder. See [`ensure_embedder`].
     pub async fn ensure_embedder(&self) -> AppResult<Arc<dyn Embedder>> {
-        let handle = self
-            .embedder
-            .get_or_try_init(|| async {
-                let settings = self.settings.current();
-                let model_id =
-                    minutist_common::ModelId::from(commands::DEFAULT_EMBED_MODEL_ID);
-                let model_dir = self.orchestrator.ensure_model_path(&model_id).await?;
-                let gguf = commands::find_gguf_weights(&model_dir)?;
-                // The embedder is small (~600 MB); offload it whenever GPU
-                // acceleration is enabled (Off forces CPU). It is not in the
-                // VRAM plan (which budgets the summariser first).
-                let enabled =
-                    settings.gpu_acceleration != minutist_common::GpuAcceleration::Off;
-                let n_gpu_layers = commands::resolve_summariser_gpu_layers(enabled);
-                let embedder = tokio::task::spawn_blocking(move || {
-                    Bgem3Embedder::open(&gguf, commands::DEFAULT_EMBED_MODEL_ID, n_gpu_layers)
-                })
-                .await
-                .map_err(|e| minutist_common::AppError::Internal {
-                    context: format!("embedder load task join failed: {e}"),
-                })??;
-                tracing::info!(
-                    target: "ipc-bridge",
-                    "held BGE-M3 embedder loaded (RAG write path + retrieve_chunks)"
-                );
-                Ok::<_, minutist_common::AppError>(Arc::new(embedder) as Arc<dyn Embedder>)
-            })
-            .await?;
-        Ok(Arc::clone(handle))
+        ensure_embedder(&self.embedder, &self.orchestrator, &self.settings).await
     }
 
     /// The held embedder ONLY if it is already loaded — a non-blocking peek that

@@ -23,17 +23,30 @@ crates/
   common/         shared types + trait definitions (the architectural contract)
   audio-capture/  cpal capture + device enumeration
   vad-chunker/    Silero VAD + batched-VAD chunking
-  asr-runtime/    llama-cpp-2 mtmd ASR
+  asr-runtime/    llama-cpp-2 mtmd ASR (Qwen3-ASR)
+  asr-parakeet/   sherpa-onnx Parakeet TDT ASR (English + 24 EU locales, timestamps)
+  diarizer/       sherpa-onnx speaker diarization (opt-in, on by default)
   summariser/     llama-cpp-2 text-LLM summarisation
-  diarizer/       sherpa-onnx speaker diarization (opt-in)
+  notes-crdt/     Yjs (yrs) notes CRDT + meeting-folder layout (the mobile-cross-compilable leaf)
+  persistence/    meeting folders, Opus/AAC audio, transcript/metadata, libsql index, RAG cache
   model-registry/ model download + SHA-256 verification
-  persistence/    meeting folders, Opus audio, transcript/notes/metadata, libsql index
   settings/       settings schema, store, change notifications
   orchestrator/   recording lifecycle + the live VAD→ASR pipeline
+  agent-tools/    the shared chat/MCP tool registry (one Tool trait, one ToolRegistry)
+  chat-agent/     llama-cpp-2 chat turn + live co-pilot backend
+  mcp-server/     in-process Streamable HTTP MCP server over agent-tools
+  doc-convert/    attachment-to-markdown conversion
+  rag-retrieval/  chunk fusion (RRF) over the RAG cache
+  embedder/       llama-cpp-2 BGE-M3 embedding
+  tunnel-client/  connected-tier relay tunnel client (pairing + reconnect)
+  sync/           device-to-device notes/media sync (iroh + Yjs)
+  sync-ffi/       UniFFI wrapper exposing `sync` to the Android phone companion
+  election/       producer-gate host-election state machine
   ipc-bridge/     Tauri command + event surface (tauri-specta bindings)
+  headless/       second workspace binary: the user-installed sync hub (`minutist-hub`)
 src-tauri/        Tauri 2 app shell (app-main): bootstrap, tray, updater, capabilities
 ui/               React 19 + Tiptap + Zustand frontend
-spikes/           throwaway Phase-0 API-proof crates (asr, llm, vad-loop, diarize)
+spikes/           throwaway Phase-0 API-proof crates, NOT workspace members (build/test manually)
 scripts/          build / test / render helpers
 .githooks/
   pre-commit      architecture drift guard (install: see below)
@@ -41,7 +54,8 @@ scripts/          build / test / render helpers
 
 Component boundaries, the dependency table, and ownership are authoritative in
 [`architecture/components.md`](architecture/components.md). The `spikes/` crates
-are throwaway Phase-0 API proofs, exempt from the cross-cutting rules.
+are throwaway Phase-0 API proofs, exempt from the cross-cutting rules; they are
+not workspace members, so they neither build nor gate CI.
 
 ## Setup
 

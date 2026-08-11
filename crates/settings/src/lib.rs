@@ -1861,7 +1861,7 @@ mod tests {
     //    deserialisation (Phase 9 auto-driver, WU1)
     // -----------------------------------------------------------------------
 
-    use minutist_common::{live_agent_should_run, GpuAcceleration, GpuProbe, LiveAgentMode};
+    use minutist_common::{GpuAcceleration, LiveAgentMode};
 
     #[test]
     fn live_agent_enabled_defaults_to_off() {
@@ -2025,113 +2025,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // 7. live_agent_should_run: unit tests for Auto/On/Off × GPU capability
-    // -----------------------------------------------------------------------
-
-    fn discrete_probe() -> GpuProbe {
-        GpuProbe {
-            total_bytes: 24 * 1024 * 1024 * 1024, // 24 GiB discrete
-            free_bytes: 20 * 1024 * 1024 * 1024,
-            is_integrated: false,
-            name: "NVIDIA GeForce RTX 3090".to_string(),
-        }
-    }
-
-    fn integrated_probe() -> GpuProbe {
-        GpuProbe {
-            total_bytes: 16 * 1024 * 1024 * 1024, // 16 GiB iGPU (shared RAM)
-            free_bytes: 8 * 1024 * 1024 * 1024,
-            is_integrated: true,
-            name: "AMD Radeon 890M".to_string(),
-        }
-    }
-
-    #[test]
-    fn live_agent_should_run_off_always_false() {
-        assert!(!live_agent_should_run(
-            LiveAgentMode::Off,
-            None,
-            GpuAcceleration::Auto
-        ));
-        assert!(!live_agent_should_run(
-            LiveAgentMode::Off,
-            Some(&discrete_probe()),
-            GpuAcceleration::Auto
-        ));
-        assert!(!live_agent_should_run(
-            LiveAgentMode::Off,
-            Some(&integrated_probe()),
-            GpuAcceleration::On
-        ));
-    }
-
-    #[test]
-    fn live_agent_should_run_on_always_true() {
-        assert!(live_agent_should_run(
-            LiveAgentMode::On,
-            None,
-            GpuAcceleration::Off
-        ));
-        assert!(live_agent_should_run(
-            LiveAgentMode::On,
-            Some(&discrete_probe()),
-            GpuAcceleration::Auto
-        ));
-        assert!(live_agent_should_run(
-            LiveAgentMode::On,
-            Some(&integrated_probe()),
-            GpuAcceleration::On
-        ));
-    }
-
-    #[test]
-    fn live_agent_should_run_auto_no_probe_is_false() {
-        assert!(
-            !live_agent_should_run(LiveAgentMode::Auto, None, GpuAcceleration::Auto),
-            "Auto with no probe (CPU-only build) must be false"
-        );
-    }
-
-    #[test]
-    fn live_agent_should_run_auto_discrete_on_integrated_off() {
-        // A discrete GPU with acceleration active passes Auto; a shared-memory
-        // integrated GPU does NOT (the held context would contend with GPU ASR).
-        assert!(
-            live_agent_should_run(
-                LiveAgentMode::Auto,
-                Some(&discrete_probe()),
-                GpuAcceleration::Auto
-            ),
-            "Auto with discrete GPU and accel on must be true"
-        );
-        assert!(
-            !live_agent_should_run(
-                LiveAgentMode::Auto,
-                Some(&integrated_probe()),
-                GpuAcceleration::Auto
-            ),
-            "Auto with integrated GPU must be false (shared-memory contention)"
-        );
-    }
-
-    #[test]
-    fn live_agent_should_run_auto_accel_off_is_false() {
-        assert!(
-            !live_agent_should_run(
-                LiveAgentMode::Auto,
-                Some(&discrete_probe()),
-                GpuAcceleration::Off
-            ),
-            "Auto with accel=Off must be false (LLM would contend with CPU ASR)"
-        );
-        assert!(
-            !live_agent_should_run(
-                LiveAgentMode::Auto,
-                Some(&integrated_probe()),
-                GpuAcceleration::Off
-            ),
-            "Auto with integrated GPU and accel=Off must be false"
-        );
-    }
+    // live_agent_should_run is pure and owned by `common`; its test suite
+    // lives there (crates/common/src/lib.rs) rather than duplicated here.
 }

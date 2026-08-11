@@ -1385,11 +1385,6 @@ async fn ensure_embedder_in_worker(
     Ok(Arc::clone(handle))
 }
 
-/// Maximum number of tool-dispatch iterations per turn. Dormant in v1 (no
-/// tools are offered to the model), but the loop is present so a future tool
-/// set can plug in without restructuring the worker.
-const TOOL_DISPATCH_CAP: usize = 4;
-
 async fn run_worker_loop<B: LiveSessionBackend + ConversationalTurn>(
     meeting_id: MeetingId,
     // HIGH-priority user-chat channel; drained before transcript on each iteration.
@@ -1495,14 +1490,6 @@ async fn run_worker_loop<B: LiveSessionBackend + ConversationalTurn>(
             }
         }
     }
-}
-
-/// Execute one tool call by name and arguments, returning a JSON result string.
-///
-/// In v1 no tools are offered to the model, so this is never called. The seam
-/// is present so a future tool set can plug in without restructuring the loop.
-fn dispatch_tool(_name: &str, _args: &str) -> String {
-    serde_json::json!({"error": "tool not found"}).to_string()
 }
 
 /// Compose a user-chat turn's content, prepending any transcript that has
@@ -1758,7 +1745,7 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
     // cloneable (Arc-backed). The clones are only live for the duration of
     // their enclosing converse_typed call; `reply_tx` is retained for the
     // terminal Done/Err sends below.
-    let mut raw = {
+    let raw = {
         let cb_tx = reply_tx.clone();
         match session.converse_typed(
             "user",
@@ -1823,41 +1810,9 @@ fn process_request<B: LiveSessionBackend + ConversationalTurn>(
         }
     };
 
-    // Tool-dispatch loop (B3). In v1 no tools are offered so `raw.tool_calls`
-    // is always empty and this loop never executes. The structure is present
-    // so a future tool set plugs in without restructuring the worker.
-    // DEFERRED: wire real tools via `dispatch_tool` in a later phase.
-    let mut iter = 0;
-    while !raw.tool_calls.is_empty() && iter < TOOL_DISPATCH_CAP {
-        iter += 1;
-        let mut tool_result_parts = Vec::new();
-        for tc in &raw.tool_calls {
-            let result_json = dispatch_tool(&tc.name, &tc.arguments_json);
-            tool_result_parts.push(format!("tool:{} result:{}", tc.name, result_json));
-        }
-        let tool_feed = tool_result_parts.join("\n");
-        generated.clear();
-        let cb_tx_tool = reply_tx.clone();
-        raw = match session.converse_typed(
-            "tool",
-            &tool_feed,
-            &req_with_retrieved.sampler,
-            &req_with_retrieved.cancel,
-            &mut |piece: &str| {
-                generated.push_str(piece);
-                if let Some(ref tx) = cb_tx_tool {
-                    let _ = tx.try_send(UserReplyChunk::Token(piece.to_string()));
-                }
-            },
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                let result = classify_converse_error(meeting_id, e, "tool converse");
-                send_err_chunk!(result);
-                return result;
-            }
-        };
-    }
+    // No tools are offered to the live-agent model, so `raw.tool_calls` is
+    // always empty here (contrast the non-live chat path, which does dispatch
+    // through `agent-tools`); there is no dispatch loop to run.
 
     // Use raw.text when the callback-accumulated buffer is empty (happens when
     // the model returns the full text via raw.text rather than incremental pieces).

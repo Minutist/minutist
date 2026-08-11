@@ -2382,12 +2382,18 @@ relay_api_url?: string;
 /**
  * Whether the live in-meeting agent runs during an active recording.
  * 
- * `Auto` (the default) enables the agent when GPU acceleration is active
- * (a usable GPU is present AND `gpu_acceleration != Off`), as resolved by
- * `live_agent_should_run`. `On` enables unconditionally; `Off` disables.
- * Distinct from `gpu_acceleration`, which governs model-layer placement.
- * `#[serde(default)]` → `Auto` (the `LiveAgentMode::default()`); an older
- * store written before this field existed deserialises to `Auto`.
+ * `Auto` enables the agent when GPU acceleration is active (a usable GPU
+ * is present AND `gpu_acceleration != Off`), as resolved by
+ * `live_agent_should_run`. `On` enables unconditionally; `Off` (the
+ * default) disables. Distinct from `gpu_acceleration`, which governs
+ * model-layer placement. An older store written before this field
+ * existed deserialises to `Off` via `default_live_agent_mode`.
+ * 
+ * Kept the wire/on-disk key `live_agent_enabled` (via `serde(rename)`)
+ * for backward compatibility with settings stores written before this
+ * field was renamed from a bool-shaped name to the Rust identifier
+ * `live_agent_mode`, which the tri-state `LiveAgentMode` value it holds
+ * actually matches.
  */
 live_agent_enabled?: LiveAgentMode; 
 /**

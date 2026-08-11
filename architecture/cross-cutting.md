@@ -1215,8 +1215,8 @@ categories. Cross-cutting rules:
   throughput degradation.
 
 - **`LiveAgentMode::Auto` = discrete-GPU-only; default `Off`.**
-  `settings.live_agent_enabled` defaults to `Off` — the in-meeting co-pilot is
-  opt-in until validated on real hardware.
+  `settings.live_agent_mode` (wire key `live_agent_enabled`) defaults to
+  `Off` — the in-meeting co-pilot is opt-in until validated on real hardware.
   `live_agent_should_run(mode, probe, gpu_acceleration)` in `common` resolves it:
   `Auto` is `true` only when a **discrete** GPU is present (`probe.is_some()` AND
   `!probe.is_integrated`) AND `gpu_acceleration != Off`, where the held 32 768-token

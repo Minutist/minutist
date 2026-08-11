@@ -4,7 +4,7 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (53 total)
+//! ## Commands (61 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
@@ -14,6 +14,7 @@
 //! | `prewarm_asr` | `()` | live-test UX |
 //! | `pause_recording` | `()` | 1 |
 //! | `resume_recording` | `()` | 1 |
+//! | `set_recording_title` | `()` | live meeting title |
 //! | `stop_recording` | `MeetingMeta` | 1 |
 //! | `get_recording_state` | `RecordingState` | 1 |
 //! | `get_settings` | `Settings` | 1 |
@@ -35,6 +36,11 @@
 //! | `set_speaker_name` | `()` | transcript speaker rename |
 //! | `delete_meeting` | `()` | 4 |
 //! | `open_meeting_folder` | `()` | themed context menus (#0034) |
+//! | `list_collections` | `Vec<Collection>` | meeting folders |
+//! | `create_collection` | `Collection` | meeting folders |
+//! | `rename_collection` | `()` | meeting folders |
+//! | `delete_collection` | `()` | meeting folders |
+//! | `set_meeting_collection` | `()` | meeting folders |
 //! | `reprocess` | `()` | 4/6 (re-transcribe + re-diarize, #0015) |
 //! | `summarise_meeting` | `()` | 5 |
 //! | `get_summary` | `Option<String>` | 5 |
@@ -56,6 +62,8 @@
 //! | `sync_get_my_ticket` | `String` | WS4-B S5 |
 //! | `sync_add_peer` | `()` | WS4-B S5 |
 //! | `sync_now` | `()` | WS4-B S5 |
+//! | `reject_match` | `()` | #0003 WU8 |
+//! | `clear_all_voiceprints` | `()` | #0003 WU8 (§4 privacy) |
 //! | `list_voiceprints` | `Vec<VoiceprintIdentityInfo>` | #0003 WU8 |
 //! | `merge_voiceprint_identities` | `()` | #0003 WU8 |
 //! | `rename_voiceprint_identity` | `()` | #0003 WU8 |

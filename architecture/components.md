@@ -666,17 +666,22 @@ corrected description below; it no longer refers to a digest or a panel.)
   `GpuAcceleration`: `LiveAgentMode::Auto` is a GPU-acceleration-active gate (run vs
   skip); `GpuAcceleration::Auto` is a VRAM-budget gate (GPU vs CPU layers — it uses
   `resolve_gpu_plan`'s thresholds, which `LiveAgentMode::Auto` does NOT).
-  The `settings.live_agent_enabled` field uses this type; `ipc-bridge` (WU2b) calls
+  The `settings.live_agent_mode` field uses this type (wire/on-disk key
+  `live_agent_enabled`, unchanged since the field's Rust identifier was
+  renamed — see the settings field table below); `ipc-bridge` (WU2b) calls
   `live_agent_should_run` to resolve it.
 
 - `live_agent_should_run(mode: LiveAgentMode, probe: Option<&GpuProbe>, gpu_acceleration: GpuAcceleration) -> bool` —
   pure resolution of `LiveAgentMode`. `Off` → `false`; `On` → `true`; `Auto` →
-  `true` iff `probe` is `Some` AND `gpu_acceleration != Off`. This is a
-  **GPU-acceleration-active proxy** — the LLM runs on the GPU rather than contending
-  with CPU-bound ASR. Does NOT inspect `probe.is_integrated` (the AMD Radeon 890M,
-  integrated + Vulkan, is the validated SP-LIVE hardware). Does NOT invoke
-  `resolve_gpu_plan`. Lives in `common` so consumers can call it without implementing
-  the gate. Fully unit-tested.
+  `true` iff `probe` is `Some` AND **discrete** (`!probe.is_integrated`) AND
+  `gpu_acceleration != Off`. This is a **GPU-acceleration-active proxy** — the
+  LLM runs on the GPU rather than contending with CPU-bound ASR. `Auto`
+  explicitly EXCLUDES an integrated GPU (e.g. the AMD Radeon 890M): the held
+  context and GPU-accelerated ASR/diarization would draw from the same
+  shared memory pool, and co-scheduling them can exhaust it (see
+  `cross-cutting.md` — "`LiveAgentMode::Auto` = discrete-GPU-only"). Does NOT
+  invoke `resolve_gpu_plan`. Lives in `common` so consumers can call it
+  without implementing the gate. Fully unit-tested.
 
 One `AppEvent` variant (placed in a `--- Live agent ---` comment block after
 `ChatContextTrimmed`):
@@ -3485,7 +3490,7 @@ deserialises to the defaults below:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `live_agent_enabled` | `LiveAgentMode` | `Auto` | Whether the live agent runs. `Auto` = discrete-GPU-presence gate (NOT a VRAM-budget check, NOT `resolve_gpu_plan`); `On` = always; `Off` = never. Resolved by `live_agent_should_run` in `common`. |
+| `live_agent_mode` (wire key `live_agent_enabled`, unchanged since the field's Rust identifier was renamed) | `LiveAgentMode` | `Off` | Whether the live agent runs. `Auto` = discrete-GPU-presence gate (NOT a VRAM-budget check, NOT `resolve_gpu_plan`); `On` = always; `Off` = never. Resolved by `live_agent_should_run` in `common`. |
 | `live_agent_min_segments` | `u32` | `8` | Minimum new transcript segments before a digest refresh fires. |
 | `live_agent_min_seconds` | `u32` | `45` | Minimum wall-clock seconds before a digest refresh fires. Both thresholds must be met. |
 | `live_agent_digest_action_items` | `bool` | `true` | Include action items in the digest panel. |
@@ -4677,10 +4682,11 @@ contract's error variant — the success variant, `LiveDigestUpdated`, and its
 `LiveDigest`/`LiveDigestItem` payload types were deleted; see `common`).
 
 The `app-main` watcher task subscribes to `StateChanged`, calls `spawn_live_agent`
-on `Recording` (only when `live_agent_should_run(settings.live_agent_enabled,
-gpu_probe, settings.gpu_acceleration)` returns `true` — `Auto` enables when a GPU is
-present AND `gpu_acceleration != Off`, so the LLM decode lands on the GPU off the
-CPU-ASR path), and raises the returned `watch::Sender` on `Idle`/`Stopping`/`Finalising`.
+on `Recording` (only when `live_agent_should_run(settings.live_agent_mode,
+gpu_probe, settings.gpu_acceleration)` returns `true` — `Auto` enables when a
+**discrete** GPU is present AND `gpu_acceleration != Off`, so the LLM decode
+lands on the GPU off the CPU-ASR path), and raises the returned `watch::Sender`
+on `Idle`/`Stopping`/`Finalising`.
 
 **"New meeting" prep drafts (see `persistence`/`orchestrator` above).** New
 command `create_meeting() -> AppResult<MeetingId>` routes DIRECTLY to

@@ -212,13 +212,13 @@ const fn default_diarization_enabled() -> bool {
     true
 }
 
-/// Default live-agent enabled mode: `Off`. The in-meeting co-pilot is opt-in
+/// Default live-agent mode: `Off`. The in-meeting co-pilot is opt-in
 /// until validated on real hardware; `Auto` would silently run an LLM during
 /// every accelerated recording (and `Auto` itself never enables on a
 /// shared-memory integrated GPU — see [`minutist_common::live_agent_should_run`]).
 /// A store written before this field existed deserialises to `Off` via
 /// `#[serde(default)]`.
-const fn default_live_agent_enabled() -> LiveAgentMode {
+const fn default_live_agent_mode() -> LiveAgentMode {
     LiveAgentMode::Off
 }
 
@@ -686,14 +686,20 @@ pub struct Settings {
     // -----------------------------------------------------------------------
     /// Whether the live in-meeting agent runs during an active recording.
     ///
-    /// `Auto` (the default) enables the agent when GPU acceleration is active
-    /// (a usable GPU is present AND `gpu_acceleration != Off`), as resolved by
-    /// `live_agent_should_run`. `On` enables unconditionally; `Off` disables.
-    /// Distinct from `gpu_acceleration`, which governs model-layer placement.
-    /// `#[serde(default)]` → `Auto` (the `LiveAgentMode::default()`); an older
-    /// store written before this field existed deserialises to `Auto`.
-    #[serde(default = "default_live_agent_enabled")]
-    pub live_agent_enabled: LiveAgentMode,
+    /// `Auto` enables the agent when GPU acceleration is active (a usable GPU
+    /// is present AND `gpu_acceleration != Off`), as resolved by
+    /// `live_agent_should_run`. `On` enables unconditionally; `Off` (the
+    /// default) disables. Distinct from `gpu_acceleration`, which governs
+    /// model-layer placement. An older store written before this field
+    /// existed deserialises to `Off` via `default_live_agent_mode`.
+    ///
+    /// Kept the wire/on-disk key `live_agent_enabled` (via `serde(rename)`)
+    /// for backward compatibility with settings stores written before this
+    /// field was renamed from a bool-shaped name to the Rust identifier
+    /// `live_agent_mode`, which the tri-state `LiveAgentMode` value it holds
+    /// actually matches.
+    #[serde(rename = "live_agent_enabled", default = "default_live_agent_mode")]
+    pub live_agent_mode: LiveAgentMode,
 
     /// Minimum number of new transcript segments that must accumulate before
     /// the live agent fires a digest refresh. The debouncer fires only when
@@ -809,7 +815,7 @@ impl Default for Settings {
             connector_enabled: false,
             relay_url: default_relay_url(),
             relay_api_url: default_relay_api_url(),
-            live_agent_enabled: default_live_agent_enabled(),
+            live_agent_mode: default_live_agent_mode(),
             live_agent_min_segments: default_live_agent_min_segments(),
             live_agent_min_seconds: default_live_agent_min_seconds(),
             live_agent_digest_action_items: default_digest_toggle_true(),
@@ -874,7 +880,7 @@ mod tests {
             connector_enabled: true,
             relay_url: "wss://relay.example/tunnel".to_string(),
             relay_api_url: "https://api.example".to_string(),
-            live_agent_enabled: LiveAgentMode::On,
+            live_agent_mode: LiveAgentMode::On,
             live_agent_min_segments: 5,
             live_agent_min_seconds: 30,
             live_agent_digest_action_items: true,
@@ -893,7 +899,7 @@ mod tests {
         assert_eq!(restored.output_language, "German");
         assert!(restored.connector_enabled);
         assert_eq!(restored.relay_url, "wss://relay.example/tunnel");
-        assert_eq!(restored.live_agent_enabled, LiveAgentMode::On);
+        assert_eq!(restored.live_agent_mode, LiveAgentMode::On);
         assert_eq!(restored.live_agent_min_segments, 5);
         assert_eq!(restored.live_agent_min_seconds, 30);
         assert!(!restored.live_agent_digest_decisions);
@@ -1864,12 +1870,26 @@ mod tests {
     use minutist_common::{GpuAcceleration, LiveAgentMode};
 
     #[test]
-    fn live_agent_enabled_defaults_to_off() {
+    fn live_agent_mode_defaults_to_off() {
         assert_eq!(
-            Settings::default().live_agent_enabled,
+            Settings::default().live_agent_mode,
             LiveAgentMode::Off,
             "live_agent_enabled must default to Off (the co-pilot is opt-in)"
         );
+    }
+
+    #[test]
+    fn live_agent_mode_serialises_under_its_old_wire_key() {
+        // The Rust field was renamed live_agent_enabled -> live_agent_mode (it
+        // holds a tri-state LiveAgentMode, not a bool), but #[serde(rename)]
+        // keeps the on-disk/IPC key unchanged so an existing settings.store
+        // round-trips exactly as before the rename.
+        let json = serde_json::to_string(&Settings::default()).expect("serialise");
+        assert!(
+            json.contains("\"live_agent_enabled\":"),
+            "the wire key must stay live_agent_enabled, not live_agent_mode"
+        );
+        assert!(!json.contains("\"live_agent_mode\":"));
     }
 
     #[test]
@@ -1938,7 +1958,7 @@ mod tests {
     #[test]
     fn live_agent_fields_round_trip() {
         let original = Settings {
-            live_agent_enabled: LiveAgentMode::Off,
+            live_agent_mode: LiveAgentMode::Off,
             live_agent_min_segments: 12,
             live_agent_min_seconds: 60,
             live_agent_digest_action_items: true,
@@ -1952,7 +1972,7 @@ mod tests {
         };
         let json = serde_json::to_string(&original).expect("serialise");
         let restored: Settings = serde_json::from_str(&json).expect("deserialise");
-        assert_eq!(restored.live_agent_enabled, LiveAgentMode::Off);
+        assert_eq!(restored.live_agent_mode, LiveAgentMode::Off);
         assert_eq!(restored.live_agent_min_segments, 12);
         assert_eq!(restored.live_agent_min_seconds, 60);
         assert!(!restored.live_agent_digest_decisions);
@@ -1982,7 +2002,7 @@ mod tests {
         let old_json = r#"{ "theme": "dark", "diarization_enabled": true }"#;
         let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
         assert_eq!(
-            restored.live_agent_enabled,
+            restored.live_agent_mode,
             LiveAgentMode::Off,
             "missing live_agent_enabled must deserialise to Off (the safe default)"
         );

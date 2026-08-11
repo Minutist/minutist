@@ -1331,7 +1331,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
 
                                         let s = la_settings.current();
                                         if !minutist_common::live_agent_should_run(
-                                            s.live_agent_enabled,
+                                            s.live_agent_mode,
                                             gpu_probe.as_ref(),
                                             s.gpu_acceleration,
                                         ) {

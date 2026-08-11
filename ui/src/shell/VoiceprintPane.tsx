@@ -18,9 +18,8 @@
  * Embedding bytes never cross the IPC boundary (§2.2); only the CentroidInfo
  * metadata (sample_count, condition_label) travels to the UI.
  */
-import { useState, useEffect, useCallback } from "react";
-import { commands, unwrap } from "../ipc/client";
-import type { VoiceprintIdentityInfo } from "../ipc/bindings";
+import { useState, useEffect } from "react";
+import { useVoiceprintsStore } from "../state/voiceprints";
 import "./VoiceprintPane.css";
 
 type MergeState =
@@ -31,9 +30,14 @@ type MergeState =
 
 /** Voiceprint management section, rendered inside the SettingsDrawer. */
 export function VoiceprintPane() {
-  const [identities, setIdentities] = useState<VoiceprintIdentityInfo[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const identities = useVoiceprintsStore((s) => s.identities);
+  const loading = useVoiceprintsStore((s) => s.loading);
+  const error = useVoiceprintsStore((s) => s.lastError);
+  const refresh = useVoiceprintsStore((s) => s.refresh);
+  const renameIdentity = useVoiceprintsStore((s) => s.rename);
+  const removeIdentity = useVoiceprintsStore((s) => s.remove);
+  const mergeIdentities = useVoiceprintsStore((s) => s.merge);
+  const clearAllIdentities = useVoiceprintsStore((s) => s.clearAll);
 
   // Rename: the identity currently being renamed and the draft name.
   const [renameId, setRenameId] = useState<string | null>(null);
@@ -46,22 +50,9 @@ export function VoiceprintPane() {
   // Surviving name when the user is confirming a merge.
   const [survivingName, setSurvivingName] = useState("");
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const list = unwrap(await commands.listVoiceprints());
-      setIdentities(list);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
   useEffect(() => {
-    void load();
-  }, [load]);
+    void refresh();
+  }, [refresh]);
 
   // -------------------------------------------------------------------------
   // Rename handlers
@@ -80,14 +71,7 @@ export function VoiceprintPane() {
       return;
     }
     try {
-      unwrap(await commands.renameVoiceprintIdentity(renameId, trimmed));
-      setIdentities((prev) =>
-        prev.map((i) =>
-          i.identityId === renameId ? { ...i, displayName: trimmed } : i,
-        ),
-      );
-    } catch (e) {
-      setError(String(e));
+      await renameIdentity(renameId, trimmed);
     } finally {
       setRenameId(null);
     }
@@ -99,12 +83,7 @@ export function VoiceprintPane() {
 
   async function deleteIdentity(id: string) {
     if (!confirm("Delete this speaker voiceprint? This cannot be undone.")) return;
-    try {
-      unwrap(await commands.deleteVoiceprintIdentity(id));
-      setIdentities((prev) => prev.filter((i) => i.identityId !== id));
-    } catch (e) {
-      setError(String(e));
-    }
+    await removeIdentity(id);
   }
 
   async function clearAll() {
@@ -114,12 +93,7 @@ export function VoiceprintPane() {
       )
     )
       return;
-    try {
-      unwrap(await commands.clearAllVoiceprints());
-      setIdentities([]);
-    } catch (e) {
-      setError(String(e));
-    }
+    await clearAllIdentities();
   }
 
   // -------------------------------------------------------------------------
@@ -165,13 +139,10 @@ export function VoiceprintPane() {
       // Rename keep_id to the chosen surviving name first (if it differs).
       const currentKeepName = identities.find((i) => i.identityId === keepId)?.displayName ?? "";
       if (survivingName.trim() && survivingName.trim() !== currentKeepName) {
-        unwrap(await commands.renameVoiceprintIdentity(keepId, survivingName.trim()));
+        await renameIdentity(keepId, survivingName.trim());
       }
-      unwrap(await commands.mergeVoiceprintIdentities(keepId, mergedId));
-      // Reload to get the post-merge gallery state.
-      await load();
-    } catch (e) {
-      setError(String(e));
+      // merge() reloads the list to get the post-merge gallery state.
+      await mergeIdentities(keepId, mergedId);
     } finally {
       setSelectedIds(new Set());
       setMerge({ kind: "idle" });

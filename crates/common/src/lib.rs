@@ -1580,7 +1580,7 @@ pub enum AsrEngine {
 /// Japanese, Korean, Arabic, etc. — routes to Qwen instead. Keep this in step
 /// with the model card; see `architecture/cross-cutting.md` — "ASR engine
 /// routing".
-pub const PARAKEET_LANGUAGES: &[&str] = &[
+const PARAKEET_LANGUAGES: &[&str] = &[
     "Bulgarian",
     "Croatian",
     "Czech",

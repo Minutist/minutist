@@ -282,11 +282,29 @@ fn now_iso8601() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// A directory entry IS a meeting folder iff it is a directory whose name
+/// parses as a UUID — a meeting UUID's string form never begins with a dot,
+/// so this also rejects the dot-prefixed blob-store dir (`.blobs`). Returns
+/// the parsed [`MeetingId`], or `None` for anything else (a file, a non-UUID
+/// name, unrelated clutter).
+///
+/// The single "is this folder a meeting" predicate — [`list_meeting_ids`] and
+/// `persistence::index`'s own directory scans (which need their own
+/// `read_dir` error handling and so cannot delegate the whole scan) both
+/// filter through this, so a folder is never a meeting to one and clutter to
+/// another.
+pub fn parse_meeting_dir(entry: &std::fs::DirEntry) -> Option<MeetingId> {
+    if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        return None;
+    }
+    let name = entry.file_name().to_str()?.to_string();
+    Uuid::parse_str(&name).ok().map(MeetingId)
+}
+
 /// The meeting ids on disk — the `{uuid}` directories directly under `root`.
 ///
-/// The dot-prefixed blob-store dir (`.blobs`) and any non-UUID entry are skipped:
-/// a meeting UUID's string form never begins with a dot, so the UUID parse rejects
-/// them. Non-directory entries and an unreadable `root` yield no ids.
+/// Non-meeting entries are skipped per [`parse_meeting_dir`]; an unreadable
+/// `root` yields no ids.
 ///
 /// This is the CANONICAL scan. It lives here, beside the meeting-folder layout it
 /// enumerates, so the "which meetings does this device hold" question has one
@@ -294,21 +312,13 @@ fn now_iso8601() -> String {
 /// producer-gate election loop all reach it (directly or via the `persistence`
 /// re-export) rather than each keeping its own copy.
 pub fn list_meeting_ids(root: &Path) -> Vec<MeetingId> {
-    let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
-        return out;
+        return Vec::new();
     };
-    for entry in entries.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        if let Some(name) = entry.file_name().to_str() {
-            if let Ok(uuid) = Uuid::parse_str(name) {
-                out.push(MeetingId(uuid));
-            }
-        }
-    }
-    out
+    entries
+        .flatten()
+        .filter_map(|entry| parse_meeting_dir(&entry))
+        .collect()
 }
 
 #[cfg(test)]

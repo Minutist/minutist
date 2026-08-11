@@ -1804,7 +1804,12 @@ device holds" — the `{uuid}` directories under the meetings root (`.blobs` and
 non-UUID entries skipped). It lives here, beside the folder layout it scans;
 `sync`'s discovery exchange and the `headless` hub delegate to it (the latter via
 the `persistence::folder` re-export), and the producer-gate election loop reads it,
-so there is no per-consumer copy to drift.
+so there is no per-consumer copy to drift. `folder::parse_meeting_dir` is the
+underlying per-entry predicate `list_meeting_ids` filters through; `persistence`'s
+own `index::rebuild_from_disk` / `index::reconcile_orphans` directory scans (which
+need their own `read_dir` error handling, so cannot delegate the whole scan) filter
+through the SAME predicate rather than re-validating folder names themselves, so a
+folder is never a meeting to one of these and clutter to another.
 
 A **leaf** (depends only on `common`). Third-party deps: `yrs` (the Yjs CRDT
 port, workspace-pinned), `chrono`, `serde` / `serde_json`, `thiserror`,

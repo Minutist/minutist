@@ -239,10 +239,13 @@ impl MeetingIndex {
         let mut entries: Vec<MeetingListEntry> = Vec::new();
         for entry in dirs {
             let entry = entry.map_err(Error::Io)?;
-            let path = entry.path();
-            if !path.is_dir() {
+            // The same "is this folder a meeting" predicate `list_meeting_ids`
+            // uses — a folder that isn't a UUID-named directory is never a
+            // meeting to one enumerator and clutter to another.
+            if notes_crdt::folder::parse_meeting_dir(&entry).is_none() {
                 continue;
             }
+            let path = entry.path();
             if !path.join("metadata.json").exists() {
                 continue;
             }
@@ -365,17 +368,19 @@ impl MeetingIndex {
         let mut indexed = 0usize;
         for entry in dirs {
             let entry = entry.map_err(Error::Io)?;
+            // The same "is this folder a meeting" predicate `list_meeting_ids`
+            // uses — a folder that isn't a UUID-named directory is never a
+            // meeting to one enumerator and clutter to another.
+            let Some(meeting_id) = notes_crdt::folder::parse_meeting_dir(&entry) else {
+                continue;
+            };
             let path = entry.path();
-            if !path.is_dir() {
+            // Skip already-indexed folders before any (more expensive)
+            // metadata read.
+            let id = meeting_id.0.to_string();
+            if known.contains(&id) {
                 continue;
             }
-            // The folder name is the meeting uuid; skip already-indexed folders
-            // before any (more expensive) metadata read.
-            let id = match path.file_name().and_then(|n| n.to_str()) {
-                Some(name) if known.contains(name) => continue,
-                Some(name) => name.to_string(),
-                None => continue,
-            };
             if !path.join("metadata.json").exists() {
                 let has_recording_data = minutist_common::resolve_audio_path(&path).is_some()
                     || path.join("transcript.json").exists();
@@ -384,19 +389,6 @@ impl MeetingIndex {
                     // not a meeting folder.
                     continue;
                 }
-
-                let meeting_id = match parse_meeting_id(&id) {
-                    Ok(mid) => mid,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "persistence",
-                            folder = %path.display(),
-                            error = %e,
-                            "skipping recording-data folder with a non-uuid name during orphan reconcile"
-                        );
-                        continue;
-                    }
-                };
 
                 if let Err(e) = synthesize_metadata(&path, meeting_id) {
                     tracing::warn!(

@@ -10,16 +10,101 @@
 //! Also provides the `FlushBackpressureHarness` for directly exercising the
 //! drop-oldest flush queue path without needing a real VAD model.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use minutist_common::{AppError, AppEvent, AppResult, AsrBackend, AudioChunk, MeetingId, Segment};
+use minutist_common::{
+    AppError, AppEvent, AppResult, AsrBackend, AudioChunk, AudioFormat, MeetingId, MeetingMeta,
+    Segment,
+};
 use model_registry::ModelRegistry;
+use persistence::MeetingWriter;
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::broadcast;
 
 use crate::runner::{dispatch_flush_pub, FlushPayload, FlushQueue};
 use crate::Orchestrator;
+
+/// Load the shared real-speech fixture (mono, 16 kHz) as `f32` samples.
+///
+/// The single loader for `tests/fixtures/librispeech_0.wav`, used across the
+/// gated real-audio integration suites (rediarize, transcription, voiceprint
+/// enrolment/matching, timeline coherence, ...) so the WAV-reading logic and
+/// the mono/16 kHz assertions exist in exactly one place.
+pub fn load_fixture_wav() -> Vec<f32> {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/librispeech_0.wav");
+    let mut reader = hound::WavReader::open(&fixture)
+        .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
+    let spec = reader.spec();
+    assert_eq!(spec.channels, 1, "fixture must be mono");
+    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
+    reader
+        .samples::<i16>()
+        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
+        .collect::<Result<_, _>>()
+        .expect("reading samples")
+}
+
+/// Build a finalised meeting folder under `root` via the production
+/// `MeetingWriter`, with `metadata.json` seeded from the given `title` /
+/// `seed_names` and `transcript.json` seeded from `segments`.
+///
+/// The single meeting-fixture builder for the gated real-audio integration
+/// suites. Pass `&[]` for `segments` to seed an empty transcript.json (the
+/// common case for tests that write their own transcript later), and `&[]`
+/// for `seed_names` when the test doesn't need pre-existing speaker names.
+pub fn build_meeting(
+    root: &Path,
+    title: &str,
+    samples: &[f32],
+    segments: &[Segment],
+    seed_names: &[(&str, &str)],
+) -> MeetingId {
+    let meeting_id = MeetingId::new();
+    let format = AudioFormat {
+        codec: "opus".into(),
+        sample_rate: 16_000,
+        channels: 1,
+        bitrate_kbps: Some(32),
+    };
+
+    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
+    writer.push_samples(samples).expect("push samples");
+
+    let mut speaker_names = std::collections::BTreeMap::new();
+    for (k, v) in seed_names {
+        speaker_names.insert((*k).to_string(), (*v).to_string());
+    }
+
+    let meta = MeetingMeta {
+        uuid: meeting_id,
+        title: title.to_string(),
+        started_at: "2026-06-02T09:00:00Z".to_string(),
+        ended_at: Some("2026-06-02T09:00:06Z".to_string()),
+        duration_ms: (samples.len() as u64 * 1000) / 16_000,
+        speaker_count: 0,
+        audio_format: format,
+        asr_model: None,
+        llm_model: None,
+        diarizer: None,
+        speaker_names,
+        notes_format: 0,
+        processing: Default::default(),
+        collection_id: None,
+        recording_started: true,
+        app_version: "0.0.0".into(),
+    };
+    let folder = writer.finalise(meta).expect("finalise");
+
+    std::fs::write(
+        folder.path().join("transcript.json"),
+        serde_json::to_vec_pretty(segments).unwrap(),
+    )
+    .expect("write transcript.json");
+
+    meeting_id
+}
 
 /// Build an `Orchestrator` suitable for unit tests.
 ///

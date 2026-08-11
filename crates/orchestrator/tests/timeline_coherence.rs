@@ -19,33 +19,19 @@
 //! `StubAsrBackend`, whose returned `Segment::start_ms` equals the VAD chunk
 //! start — so the timeline math is asserted directly, model-free.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
-use minutist_common::{AppError, AudioFormat, MeetingId, MeetingMeta, Segment};
-use orchestrator::test_support::{test_orchestrator, StubAsrBackend};
-use persistence::{MeetingIndex, MeetingWriter};
+use minutist_common::{AppError, Segment};
+use orchestrator::test_support::{build_meeting, load_fixture_wav, test_orchestrator, StubAsrBackend};
+use persistence::MeetingIndex;
 use tokio::sync::mpsc;
 
 const SAMPLE_RATE: u64 = 16_000;
 /// 100 ms batch, matching the live capture forwarder's granularity.
 const BATCH_SAMPLES: usize = 1600;
 
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
 
 fn live_streams() -> (
     mpsc::Sender<AudioFrameBatch>,
@@ -260,45 +246,6 @@ async fn paused_meeting_retranscribe_matches_live_pause_excluding_timeline() {
 // #5: two concurrent re_transcribe — exactly one runs, the other InvalidInput
 // ---------------------------------------------------------------------------
 
-/// Build a meeting folder whose `audio.opus` encodes `samples`, with an empty
-/// `transcript.json`. Returns the meeting id.
-fn build_meeting_with_audio(root: &Path, samples: &[f32]) -> MeetingId {
-    let meeting_id = MeetingId::new();
-    let format = AudioFormat {
-        codec: "opus".into(),
-        sample_rate: 16_000,
-        channels: 1,
-        bitrate_kbps: Some(32),
-    };
-    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
-    writer.push_samples(samples).expect("push samples");
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: "Concurrency".into(),
-        started_at: "2026-06-03T09:00:00Z".into(),
-        ended_at: Some("2026-06-03T09:00:10Z".into()),
-        duration_ms: (samples.len() as u64 * 1000) / SAMPLE_RATE,
-        speaker_count: 1,
-        audio_format: format,
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names: std::collections::BTreeMap::new(),
-        notes_format: 0,
-        processing: Default::default(),
-        collection_id: None,
-        recording_started: true,
-        app_version: "0.0.0".into(),
-    };
-    let folder = writer.finalise(meta).expect("finalise");
-    std::fs::write(
-        folder.path().join("transcript.json"),
-        serde_json::to_vec_pretty(&Vec::<Segment>::new()).unwrap(),
-    )
-    .expect("empty transcript.json");
-    meeting_id
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn two_concurrent_re_transcribe_only_one_runs() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -313,7 +260,7 @@ async fn two_concurrent_re_transcribe_only_one_runs() {
     for _ in 0..4 {
         samples.extend_from_slice(&clip);
     }
-    let meeting_id = build_meeting_with_audio(&root, &samples);
+    let meeting_id = build_meeting(&root, "Concurrency", &samples, &[], &[]);
 
     let orch = Arc::new(test_orchestrator(root.clone()));
     let index = Arc::new(MeetingIndex::open(":memory:").await.expect("open index"));

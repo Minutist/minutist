@@ -22,76 +22,15 @@
 //! The default suite (no env var):
 //!   cargo test -p orchestrator --features test-source --test enrol_voiceprint
 
-use std::path::Path;
 use std::sync::Arc;
 
-use minutist_common::{AudioFormat, MeetingId, MeetingMeta, Segment};
-use orchestrator::test_support::test_orchestrator;
-use persistence::{MeetingWriter, VoiceprintStore};
+use minutist_common::Segment;
+use orchestrator::test_support::{build_meeting, load_fixture_wav, test_orchestrator};
+use persistence::VoiceprintStore;
 
 // ---------------------------------------------------------------------------
 // Shared fixture helpers
 // ---------------------------------------------------------------------------
-
-/// Load the committed LibriSpeech fixture (16 kHz mono) as f32 PCM.
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
-
-/// Build a synthetic meeting folder on disk: `audio.opus` encoded from `samples`
-/// via the production `MeetingWriter`, plus a `transcript.json` of `segments`.
-/// Returns the meeting id.
-fn build_meeting(root: &Path, samples: &[f32], segments: &[Segment]) -> MeetingId {
-    let meeting_id = MeetingId::new();
-    let format = AudioFormat {
-        codec: "opus".into(),
-        sample_rate: 16_000,
-        channels: 1,
-        bitrate_kbps: Some(32),
-    };
-
-    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
-    writer.push_samples(samples).expect("push samples");
-
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: "Enrol test meeting".into(),
-        started_at: "2026-06-23T09:00:00Z".into(),
-        ended_at: Some("2026-06-23T09:00:10Z".into()),
-        duration_ms: (samples.len() as u64 * 1000) / 16_000,
-        speaker_count: 1,
-        audio_format: format,
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names: std::collections::BTreeMap::new(),
-        notes_format: 0,
-        processing: Default::default(),
-        collection_id: None,
-        recording_started: true,
-        app_version: "0.0.0".into(),
-    };
-    let folder = writer.finalise(meta).expect("finalise");
-
-    std::fs::write(
-        folder.path().join("transcript.json"),
-        serde_json::to_vec_pretty(segments).unwrap(),
-    )
-    .expect("write transcript.json");
-
-    meeting_id
-}
 
 /// Build a single-speaker segment covering `[start_ms, end_ms)` with label
 /// `label`.
@@ -173,7 +112,7 @@ async fn enrol_voiceprint_skips_when_model_absent_and_does_not_panic() {
 
     // A clean segment for "A" inside Region B on the pause-excluding clock.
     let transcript = vec![seg(excl_region_b_start, excl_region_b_end, "A")];
-    let meeting_id = build_meeting(&root, &samples, &transcript);
+    let meeting_id = build_meeting(&root, "Enrol test meeting", &samples, &transcript, &[]);
 
     // Open an in-memory VoiceprintStore.
     let store = VoiceprintStore::open(":memory:")
@@ -220,7 +159,7 @@ async fn enrol_voiceprint_skips_when_reprocess_claim_held() {
 
     let samples = load_fixture_wav();
     let transcript = vec![seg(0, (samples.len() as u64 * 1000) / 16_000, "A")];
-    let meeting_id = build_meeting(&root, &samples, &transcript);
+    let meeting_id = build_meeting(&root, "Enrol test meeting", &samples, &transcript, &[]);
 
     let store = VoiceprintStore::open(":memory:")
         .await
@@ -408,7 +347,7 @@ async fn enrol_voiceprint_creates_identity_centroid_contribution() {
     let total_ms = (long_samples.len() as u64 * 1000) / 16_000;
     // One segment covering the whole recording, labelled "A".
     let transcript = vec![seg(0, total_ms, "A")];
-    let meeting_id = build_meeting(&root, &long_samples, &transcript);
+    let meeting_id = build_meeting(&root, "Enrol test meeting", &long_samples, &transcript, &[]);
 
     // -- Open an in-memory VoiceprintStore --
     let vp_store = VoiceprintStore::open(":memory:")
@@ -548,7 +487,7 @@ async fn enrol_voiceprint_maps_post_pause_segment_correctly() {
     let excl_region_b_end = (SPEECH_MS * 2) as u64;
 
     let transcript = vec![seg(excl_region_b_start, excl_region_b_end, "A")];
-    let meeting_id = build_meeting(&root, &pcm, &transcript);
+    let meeting_id = build_meeting(&root, "Enrol test meeting", &pcm, &transcript, &[]);
 
     let vp_store = VoiceprintStore::open(":memory:")
         .await

@@ -27,7 +27,7 @@ use audio_capture::{AudioFrameBatch, AudioStreams};
 use diarizer::{OnlineDiarizer, OnlineDiarizerConfig};
 use minutist_common::{AppEvent, Segment};
 use model_registry::ModelRegistry;
-use orchestrator::test_support::StubAsrBackend;
+use orchestrator::test_support::{load_fixture_wav, StubAsrBackend};
 use orchestrator::Orchestrator;
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::{broadcast, mpsc};
@@ -36,20 +36,6 @@ use tokio::sync::{broadcast, mpsc};
 // Fixtures + helpers (shared shape with pipeline_stub_test.rs)
 // ---------------------------------------------------------------------------
 
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {:?}: {e}", fixture));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
 
 fn samples_to_streams(
     samples: Vec<f32>,

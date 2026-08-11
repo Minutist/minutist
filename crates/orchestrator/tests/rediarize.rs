@@ -26,12 +26,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minutist_common::{
-    AppEvent, AudioFormat, MeetingId, MeetingMeta, ModelFileEntry, ModelId, ModelKind,
-    ModelManifestEntry, Segment,
+    AppEvent, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, Segment,
 };
 use model_registry::ModelRegistry;
+use orchestrator::test_support::build_meeting;
 use orchestrator::Orchestrator;
-use persistence::{MeetingIndex, MeetingWriter};
+use persistence::MeetingIndex;
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::broadcast;
 
@@ -134,50 +134,6 @@ fn load_diarizer_fixture(filename: &str) -> Vec<f32> {
         .expect("reading samples")
 }
 
-/// Build a meeting folder whose `audio.opus` is `samples` encoded via the
-/// production Opus encoder, plus a `transcript.json` with `segments` (all
-/// `speaker_id = None`) and a `metadata.json` with `speaker_count = 0`.
-fn build_meeting(root: &Path, samples: &[f32], segments: &[Segment]) -> MeetingId {
-    let meeting_id = MeetingId::new();
-    let format = AudioFormat {
-        codec: "opus".into(),
-        sample_rate: 16_000,
-        channels: 1,
-        bitrate_kbps: Some(32),
-    };
-
-    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
-    writer.push_samples(samples).expect("push fixture samples");
-
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: "Gated rediarize".into(),
-        started_at: "2026-06-02T09:00:00Z".into(),
-        ended_at: Some("2026-06-02T09:00:12Z".into()),
-        duration_ms: (samples.len() as u64 * 1000) / 16_000,
-        speaker_count: 0,
-        audio_format: format,
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names: std::collections::BTreeMap::new(),
-        notes_format: 0,
-        processing: Default::default(),
-        collection_id: None,
-        recording_started: true,
-        app_version: "0.0.0".into(),
-    };
-    let folder = writer.finalise(meta).expect("finalise writer");
-
-    std::fs::write(
-        folder.path().join("transcript.json"),
-        serde_json::to_vec_pretty(segments).unwrap(),
-    )
-    .expect("write transcript.json");
-
-    meeting_id
-}
-
 fn diarize_orchestrator(
     persistence_root: std::path::PathBuf,
     model_cache: std::path::PathBuf,
@@ -273,7 +229,7 @@ async fn run_gated_rediarize_over_fixture(fixture_filename: &str, expected_speak
     }
     assert!(segments.len() >= 6, "fixture must yield several segments");
 
-    let meeting_id = build_meeting(&persistence_root, &samples, &segments);
+    let meeting_id = build_meeting(&persistence_root, "Gated rediarize", &samples, &segments, &[]);
     let meeting_dir = persistence_root.join(meeting_id.0.to_string());
 
     let index = MeetingIndex::open(":memory:").await.expect("open index");

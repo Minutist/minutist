@@ -29,13 +29,11 @@
 //!    model-free suite covers the mechanism; the calibration corpus (WU6) will
 //!    drive the centroid path.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use diarizer::{DiarizerConfig, SpeakerTurn};
-use minutist_common::{AppResult, AsrBackend, AudioChunk, AudioFormat, MeetingId, MeetingMeta, Segment};
-use orchestrator::test_support::test_orchestrator;
-use persistence::MeetingWriter;
+use minutist_common::{AppResult, AsrBackend, AudioChunk, Segment};
+use orchestrator::test_support::{build_meeting, load_fixture_wav, test_orchestrator};
 
 // ---------------------------------------------------------------------------
 // Stub backends
@@ -78,76 +76,6 @@ fn label_only_config() -> DiarizerConfig {
 // ---------------------------------------------------------------------------
 // Fixture helpers
 // ---------------------------------------------------------------------------
-
-/// Load the committed LibriSpeech fixture (16 kHz mono) as f32 PCM.
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
-
-/// Build a meeting on disk: `audio.opus` + `metadata.json` with `speaker_names`
-/// seeded from `seed_names` + `transcript.json` with `stale_segments`.
-/// Returns the meeting id.
-fn build_meeting(
-    root: &Path,
-    samples: &[f32],
-    stale_segments: &[Segment],
-    seed_names: &[(&str, &str)],
-) -> MeetingId {
-    let meeting_id = MeetingId::new();
-    let format = AudioFormat {
-        codec: "opus".into(),
-        sample_rate: 16_000,
-        channels: 1,
-        bitrate_kbps: Some(32),
-    };
-
-    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
-    writer.push_samples(samples).expect("push samples");
-
-    let mut speaker_names = std::collections::BTreeMap::new();
-    for (k, v) in seed_names {
-        speaker_names.insert((*k).to_string(), (*v).to_string());
-    }
-
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: "Reprocess re-map test".into(),
-        started_at: "2026-06-24T09:00:00Z".into(),
-        ended_at: Some("2026-06-24T09:00:06Z".into()),
-        duration_ms: (samples.len() as u64 * 1000) / 16_000,
-        speaker_count: 0,
-        audio_format: format,
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names,
-        notes_format: 0,
-        processing: Default::default(),
-        collection_id: None,
-        recording_started: true,
-        app_version: "0.0.0".into(),
-    };
-    let folder = writer.finalise(meta).expect("finalise");
-
-    std::fs::write(
-        folder.path().join("transcript.json"),
-        serde_json::to_vec_pretty(stale_segments).unwrap(),
-    )
-    .expect("write transcript.json");
-
-    meeting_id
-}
 
 /// Build a single-speaker `SpeakerTurn` (cluster 0) spanning the whole fixture.
 ///
@@ -196,7 +124,13 @@ async fn reprocess_clears_speaker_names_when_enrolment_disabled() {
     let samples = load_fixture_wav();
     let stale_segments = vec![seg(0, 2000, "A")];
     let seed_names = vec![("A", "Alice")];
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     // Build the index.
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
@@ -258,7 +192,13 @@ async fn reprocess_remap_preserves_matched_names_from_ephemeral() {
     let samples = load_fixture_wav();
     let stale_segments = vec![seg(0, 2000, "A"), seg(2000, 4000, "A")];
     let seed_names = vec![("A", "Alice")];
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -319,7 +259,13 @@ async fn reprocess_remap_rejects_mismatched_fresh_clusters() {
     // stale speaker_names is empty (e.g. the user never named anyone).
     let stale_segments = vec![seg(0, 3000, "A")];
     let seed_names: Vec<(&str, &str)> = vec![]; // no names
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -369,7 +315,13 @@ async fn reprocess_remap_handles_label_remapping() {
     let samples = load_fixture_wav();
     let stale_segments = vec![seg(0, 2000, "A"), seg(2000, 4000, "A")];
     let seed_names = vec![("A", "Alice")];
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -417,7 +369,13 @@ async fn reprocess_remap_handles_empty_old_speaker_names() {
     let samples = load_fixture_wav();
     let stale_segments = vec![seg(0, 2000, "A")];
     let seed_names: Vec<(&str, &str)> = vec![]; // empty, no names ever set
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -472,7 +430,13 @@ async fn reprocess_remap_path_is_active_when_enrolment_enabled() {
     let samples = load_fixture_wav();
     let stale_segments = vec![seg(0, 3000, "A")];
     let seed_names = vec![("A", "Alice")];
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -530,7 +494,13 @@ async fn reprocess_remap_split_old_label_partially_restores() {
     // Stale: single "A" cluster covering [0, 4000).
     let stale_segments = vec![seg(0, 4000, "A")];
     let seed_names = vec![("A", "Alice")];
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -601,7 +571,13 @@ async fn reprocess_clears_speaker_names_unconditionally_when_enrolment_disabled(
     let samples = load_fixture_wav();
     let stale_segments = vec![seg(0, 2000, "A"), seg(2000, 4000, "A")];
     let seed_names = vec![("A", "Alice"), ("B", "Bob")];
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     let index = Arc::new(persistence::MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -647,7 +623,13 @@ async fn reprocess_remap_degrades_gracefully_if_stale_transcript_unreadable() {
     let samples = load_fixture_wav();
     let stale_segments = vec![seg(0, 2000, "A")];
     let seed_names = vec![("A", "Alice")];
-    let meeting_id = build_meeting(root.as_path(), &samples, &stale_segments, &seed_names);
+    let meeting_id = build_meeting(
+        root.as_path(),
+        "Reprocess re-map test",
+        &samples,
+        &stale_segments,
+        &seed_names,
+    );
 
     // CORRUPT: delete the stale transcript so the re-map cannot read it.
     let meeting_dir = root.join(meeting_id.0.to_string());

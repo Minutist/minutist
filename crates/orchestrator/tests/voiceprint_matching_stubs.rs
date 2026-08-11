@@ -20,13 +20,11 @@
 //!    (below T_reject) are left unlabelled, fulfilling the "clear then restore
 //!    matched" contract.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use diarizer::DiarizerConfig;
-use minutist_common::{AppResult, AsrBackend, AudioChunk, AudioFormat, MeetingId, MeetingMeta, Segment};
-use orchestrator::test_support::test_orchestrator;
-use persistence::MeetingWriter;
+use minutist_common::{AppResult, AsrBackend, AudioChunk, Segment};
+use orchestrator::test_support::{build_meeting, load_fixture_wav, test_orchestrator};
 
 // ---------------------------------------------------------------------------
 // Stub backends
@@ -63,65 +61,6 @@ fn label_only_config() -> DiarizerConfig {
     }
 }
 
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
-
-fn build_meeting(
-    root: &Path,
-    samples: &[f32],
-    segments: &[Segment],
-) -> MeetingId {
-    let meeting_id = MeetingId::new();
-    let format = AudioFormat {
-        codec: "opus".into(),
-        sample_rate: 16_000,
-        channels: 1,
-        bitrate_kbps: Some(32),
-    };
-
-    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
-    writer.push_samples(samples).expect("push samples");
-
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: "Matching test".into(),
-        started_at: "2026-06-24T09:00:00Z".into(),
-        ended_at: Some("2026-06-24T09:00:06Z".into()),
-        duration_ms: (samples.len() as u64 * 1000) / 16_000,
-        speaker_count: 0,
-        audio_format: format,
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names: std::collections::BTreeMap::new(),
-        notes_format: 0,
-        processing: Default::default(),
-        collection_id: None,
-        recording_started: true,
-        app_version: "0.0.0".into(),
-    };
-    let folder = writer.finalise(meta).expect("finalise");
-
-    std::fs::write(
-        folder.path().join("transcript.json"),
-        serde_json::to_vec_pretty(segments).unwrap(),
-    )
-    .expect("write transcript.json");
-
-    meeting_id
-}
 
 fn seg(start_ms: u64, end_ms: u64, label: &str) -> Segment {
     Segment {
@@ -154,7 +93,7 @@ async fn clear_then_restore_leaves_unmatched_clusters_unlabeled() {
 
     let samples = load_fixture_wav();
     let segments = vec![seg(0, 2000, "A")];
-    let _meeting_id = build_meeting(root.as_path(), &samples, &segments);
+    let _meeting_id = build_meeting(root.as_path(), "Matching test", &samples, &segments, &[]);
 
     // Document the expected behaviour: a cluster with no match is unlabelled.
     // This is verified by the reprocess test suite above.

@@ -42,9 +42,9 @@ use minutist_common::{
     ModelManifestEntry, Segment,
 };
 use model_registry::ModelRegistry;
-use orchestrator::test_support::{test_orchestrator, StubAsrBackend};
+use orchestrator::test_support::{build_meeting, load_fixture_wav, test_orchestrator, StubAsrBackend};
 use orchestrator::Orchestrator;
-use persistence::{MeetingIndex, MeetingWriter};
+use persistence::MeetingIndex;
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::{broadcast, mpsc};
 
@@ -282,20 +282,6 @@ fn link_or_copy(src: &Path, dst: &Path) {
     std::fs::copy(src, dst).unwrap_or_else(|e| panic!("link/copy {src:?} -> {dst:?}: {e}"));
 }
 
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
 
 fn samples_to_streams(
     samples: Vec<f32>,
@@ -497,56 +483,6 @@ async fn re_transcribe_rewrites_transcript_over_fixture() {
 //    (DEFAULT suite — no model env vars)
 // ---------------------------------------------------------------------------
 
-/// Build a meeting folder on disk whose `audio.opus` is `samples` encoded via
-/// the persistence Opus encoder (`MeetingWriter`), plus a `metadata.json`.
-/// Returns the meeting id.
-///
-/// `transcript.json` is left **empty** (`[]`) to prove the offline
-/// re-transcribe REWRITES it from the audio rather than reading a stale file.
-fn build_meeting_with_audio(root: &Path, title: &str, samples: &[f32]) -> MeetingId {
-    let meeting_id = MeetingId::new();
-    let format = AudioFormat {
-        codec: "opus".into(),
-        sample_rate: 16_000,
-        channels: 1,
-        bitrate_kbps: Some(32),
-    };
-
-    // Encode audio.opus + create the folder via the production writer so the
-    // on-disk layout (and the Opus stream the reader decodes) matches exactly.
-    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
-    writer.push_samples(samples).expect("push fixture samples");
-
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: title.to_string(),
-        started_at: "2026-06-02T09:00:00Z".to_string(),
-        ended_at: Some("2026-06-02T09:00:06Z".to_string()),
-        duration_ms: (samples.len() as u64 * 1000) / 16_000,
-        speaker_count: 1,
-        audio_format: format,
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names: std::collections::BTreeMap::new(),
-        notes_format: 0,
-        processing: Default::default(),
-        collection_id: None,
-        recording_started: true,
-        app_version: "0.0.0".into(),
-    };
-    let folder = writer.finalise(meta).expect("finalise writer");
-
-    // Overwrite transcript.json with an empty array — re_transcribe must rewrite it.
-    std::fs::write(
-        folder.path().join("transcript.json"),
-        serde_json::to_vec_pretty(&Vec::<Segment>::new()).unwrap(),
-    )
-    .expect("write empty transcript.json");
-
-    meeting_id
-}
-
 /// Offline re-transcribe with a stub ASR backend over a real-speech fixture.
 ///
 /// This test ALWAYS runs — it is NOT gated on any env var. It exercises the
@@ -579,7 +515,7 @@ async fn re_transcribe_with_stub_backend_rewrites_transcript_over_fixture() {
         samples.extend_from_slice(&clip);
     }
 
-    let meeting_id = build_meeting_with_audio(&root, "Stub re-transcribe", &samples);
+    let meeting_id = build_meeting(&root, "Stub re-transcribe", &samples, &[], &[]);
 
     // transcript.json starts empty.
     let meeting_dir = root.join(meeting_id.0.to_string());
@@ -675,7 +611,7 @@ async fn transcribe_pcm_window_returns_segments_without_rewriting_transcript() {
     for _ in 0..2 {
         samples.extend_from_slice(&clip);
     }
-    let meeting_id = build_meeting_with_audio(&root, "Relisten window", &samples);
+    let meeting_id = build_meeting(&root, "Relisten window", &samples, &[], &[]);
     let meeting_dir = root.join(meeting_id.0.to_string());
 
     // transcript.json starts empty; the window re-listen must NOT change it.

@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
 use minutist_common::{AppEvent, ModelFileEntry, ModelId, ModelKind, ModelManifestEntry, Segment};
+use orchestrator::test_support::load_fixture_wav;
 use orchestrator::Orchestrator;
 use model_registry::ModelRegistry;
 use settings::{JsonFileStore, SettingsHandle};
@@ -178,20 +179,6 @@ fn link_or_copy(src: &Path, dst: &Path) {
 /// The pipeline runs audio through the real Silero VAD, which only emits
 /// speech segments for genuine speech — a synthetic sine tone is rejected,
 /// so the accumulator would never fill. We must feed real speech.
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {:?}: {e}", fixture));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
 
 /// Build `AudioStreams` from pre-loaded samples, chunked into `batch_size`
 /// sample batches. The feeder runs on a blocking task; dropping its sender

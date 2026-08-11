@@ -12,7 +12,10 @@ publish.workspace = true
 [features]
 # Enables the test-support module and the start_with_streams constructor.
 # Used by integration tests that need deterministic audio without a real device.
-test-source = ["audio-capture/test-source"]
+# Pulls in hound (WAV fixture loading) and serde_json (transcript.json fixture
+# writing) — test_support's load_fixture_wav/build_meeting need them, and they
+# have no reason to link into a production build otherwise.
+test-source = ["audio-capture/test-source", "dep:hound", "dep:serde_json"]
 # GPU acceleration backends (Phase 7), OFF by default — fan out to the ML crates
 # orchestrator owns (asr-runtime + diarizer; summariser is reached via ipc-bridge,
 # not here — rule A5). vulkan/metal/rocm drive the llama.cpp-backed asr-runtime;
@@ -38,6 +41,9 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Both optional, enabled only by `test-source` (see [features]).
+hound = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Self-dependency with `test-source` on so `cargo test -p orchestrator` builds
@@ -45,7 +51,6 @@ tracing = { workspace = true }
 # streams, without a `--features test-source` flag on the command line. Same
 # trick `sync` and `headless` use for their own integration suites.
 orchestrator = { path = ".", features = ["test-source"] }
-serde_json = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
 audio-capture = { path = "../audio-capture", features = ["test-source"] }
@@ -59,7 +64,6 @@ sha2 = { workspace = true }
 audiopus = { workspace = true }
 ogg = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-hound = { workspace = true }
 
 [[test]]
 name = "start_record_stop"

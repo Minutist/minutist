@@ -19,14 +19,13 @@
 //! These tests are NOT gated on any env-var and run unconditionally in CI.
 //! They require the `test-source` feature (Cargo.toml `[[test]]` entry).
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use audio_capture::{AudioFrameBatch, AudioStreams};
 use minutist_common::{AppError, AppEvent, Segment};
 use model_registry::ModelRegistry;
-use orchestrator::test_support::{FailingAsrBackend, PanickingAsrBackend};
+use orchestrator::test_support::{load_fixture_wav, FailingAsrBackend, PanickingAsrBackend};
 use orchestrator::Orchestrator;
 use settings::{JsonFileStore, SettingsHandle};
 use tokio::sync::{broadcast, mpsc};
@@ -35,20 +34,6 @@ use tokio::sync::{broadcast, mpsc};
 // Shared helpers (copied from pipeline_stub_test for isolation)
 // ---------------------------------------------------------------------------
 
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {:?}: {e}", fixture));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
 
 fn samples_to_streams(
     samples: Vec<f32>,

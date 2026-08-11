@@ -23,15 +23,12 @@
 //! 3. **`speaker_names` cleared.** A reprocess always diarizes, so a seeded
 //!    `speaker_names` map is cleared every run (accept-and-warn product default).
 
-use std::path::Path;
 use std::sync::Arc;
 
 use diarizer::{DiarizerConfig, SpeakerTurn};
-use minutist_common::{
-    AppError, AppResult, AsrBackend, AudioChunk, AudioFormat, MeetingId, MeetingMeta, Segment,
-};
-use orchestrator::test_support::test_orchestrator;
-use persistence::{MeetingIndex, MeetingWriter};
+use minutist_common::{AppError, AppResult, AsrBackend, AudioChunk, Segment};
+use orchestrator::test_support::{build_meeting, load_fixture_wav, test_orchestrator};
+use persistence::MeetingIndex;
 
 // ---------------------------------------------------------------------------
 // Stub backends + fixture helpers
@@ -77,79 +74,6 @@ fn label_only_config() -> DiarizerConfig {
         max_speakers: None,
         multi_speaker_min_share: 0.30,
     }
-}
-
-/// Load the committed LibriSpeech real-speech fixture (16 kHz mono) as f32 PCM.
-/// Synthetic tones fail the real Silero VAD, so the re-transcribe step needs
-/// real speech to yield segments.
-fn load_fixture_wav() -> Vec<f32> {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/librispeech_0.wav");
-    let mut reader = hound::WavReader::open(&fixture)
-        .unwrap_or_else(|e| panic!("cannot open {fixture:?}: {e}"));
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 1, "fixture must be mono");
-    assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
-    reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .expect("reading samples")
-}
-
-/// Build a meeting folder on disk: `audio.opus` encoded from `samples` via the
-/// production `MeetingWriter`, a `metadata.json` (with `speaker_names` seeded
-/// from `seed_names`), and a `transcript.json` of `stale_segments` (the text the
-/// reprocess must REPLACE). Returns the meeting id.
-fn build_meeting(
-    root: &Path,
-    samples: &[f32],
-    stale_segments: &[Segment],
-    seed_names: &[(&str, &str)],
-) -> MeetingId {
-    let meeting_id = MeetingId::new();
-    let format = AudioFormat {
-        codec: "opus".into(),
-        sample_rate: 16_000,
-        channels: 1,
-        bitrate_kbps: Some(32),
-    };
-
-    let mut writer = MeetingWriter::open(root, meeting_id, format.clone()).expect("open writer");
-    writer.push_samples(samples).expect("push samples");
-
-    let mut speaker_names = std::collections::BTreeMap::new();
-    for (k, v) in seed_names {
-        speaker_names.insert((*k).to_string(), (*v).to_string());
-    }
-
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: "Reprocess me".into(),
-        started_at: "2026-06-02T09:00:00Z".into(),
-        ended_at: Some("2026-06-02T09:00:06Z".into()),
-        duration_ms: (samples.len() as u64 * 1000) / 16_000,
-        speaker_count: 0,
-        audio_format: format,
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names,
-        notes_format: 0,
-        processing: Default::default(),
-        collection_id: None,
-        recording_started: true,
-        app_version: "0.0.0".into(),
-    };
-    let folder = writer.finalise(meta).expect("finalise");
-
-    std::fs::write(
-        folder.path().join("transcript.json"),
-        serde_json::to_vec_pretty(stale_segments).unwrap(),
-    )
-    .expect("write transcript.json");
-
-    meeting_id
 }
 
 /// A single stale ASR segment (Qwen shape: no words) covering `[s, e)`.
@@ -211,7 +135,7 @@ async fn reprocess_holds_one_claim_with_no_idle_window() {
 
     let samples = fixture_samples();
     let stale = vec![stale_seg(0, 1_000, "STALE")];
-    let meeting_id = build_meeting(&root, &samples, &stale, &[]);
+    let meeting_id = build_meeting(&root, "Reprocess me", &samples, &stale, &[]);
 
     let index = Arc::new(MeetingIndex::open(":memory:").await.expect("open index"));
     index.rebuild_from_disk(&root).await.expect("seed index");
@@ -297,7 +221,7 @@ async fn reprocess_retranscribes_then_labels_not_diarize_first() {
     let samples = fixture_samples();
     // Seed a STALE transcript whose text must NOT survive the reprocess.
     let stale = vec![stale_seg(0, 1_000, "STALE-TEXT"), stale_seg(1_000, 2_000, "STALE-TEXT")];
-    let meeting_id = build_meeting(&root, &samples, &stale, &[]);
+    let meeting_id = build_meeting(&root, "Reprocess me", &samples, &stale, &[]);
     let meeting_dir = root.join(meeting_id.0.to_string());
 
     let index = MeetingIndex::open(":memory:").await.expect("open index");
@@ -365,7 +289,7 @@ async fn reprocess_clears_speaker_names() {
     let samples = fixture_samples();
     let stale = vec![stale_seg(0, 1_000, "STALE")];
     // Seed a user-assigned name on the OLD letter scheme.
-    let meeting_id = build_meeting(&root, &samples, &stale, &[("A", "Alice")]);
+    let meeting_id = build_meeting(&root, "Reprocess me", &samples, &stale, &[("A", "Alice")]);
     let meeting_dir = root.join(meeting_id.0.to_string());
 
     // Sanity: the seed is present before reprocess.

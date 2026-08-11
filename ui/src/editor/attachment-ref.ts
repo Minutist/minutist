@@ -49,6 +49,7 @@
 import { Node, mergeAttributes } from "@tiptap/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { ATTACHMENT_SCHEME } from "../ipc/attachments";
+import { formatBytes } from "../lib/format";
 
 /** Supplies the editor's current meeting id (or `null` when none is open). */
 export type MeetingIdSource = () => string | null;
@@ -94,19 +95,6 @@ const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
 /** True when `ext` should render as an image thumbnail rather than a file card. */
 export function isImageExt(ext: string): boolean {
   return IMAGE_EXTS.has(ext.toLowerCase());
-}
-
-/** Human-readable file size (decimal units), mirroring `AttachmentsPane`'s. */
-function formatBytes(bytes: number): string {
-  if (bytes < 1000) return `${bytes} B`;
-  const units = ["kB", "MB", "GB"];
-  let value = bytes / 1000;
-  let unit = 0;
-  while (value >= 1000 && unit < units.length - 1) {
-    value /= 1000;
-    unit += 1;
-  }
-  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 }
 
 /**

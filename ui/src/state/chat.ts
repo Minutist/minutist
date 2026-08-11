@@ -69,6 +69,7 @@ import {
 import type { ChatSession, ChatMessage, ChatSessionId } from "../ipc/chat";
 import type { MeetingId } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
+import { errorMessage } from "../lib/errors";
 
 /** A transient indicator for a tool the agent is running / just ran mid-turn. */
 export type ToolActivity = {
@@ -141,10 +142,6 @@ export type ChatStore = {
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /** A user `ChatMessage` for the optimistic append on send. */
 function userMessage(content: string, turnId: number): ChatMessage {

@@ -18,6 +18,7 @@ import { translateMeeting, getTranslations } from "../ipc/translations";
 import type { MeetingId, Segment } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
 import { activeTranscript } from "./active-transcript";
+import { errorMessage } from "../lib/errors";
 
 export type TranslationsStore = {
   /**
@@ -105,10 +106,6 @@ export type TranslationsStore = {
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /**
  * Convert the backend's segment-INDEX-keyed translation map into one keyed by

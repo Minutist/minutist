@@ -29,6 +29,7 @@ import type {
   VoiceprintSuggestion,
 } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
+import { errorMessage } from "../lib/errors";
 
 export type { MeetingListEntry, MeetingState };
 
@@ -102,10 +103,6 @@ export type MeetingsStore = {
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
   meetings: [],

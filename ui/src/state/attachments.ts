@@ -28,6 +28,7 @@ import {
 } from "../ipc/attachments";
 import type { AttachmentEntry, AttachmentId, MeetingId } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
+import { errorMessage } from "../lib/errors";
 
 export type AttachmentsStore = {
   /** The manifest rows for the loaded meeting, in manifest order. */
@@ -57,10 +58,6 @@ export type AttachmentsStore = {
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /** Replace the row with `id` via `patch`, leaving the rest (and order) intact. */
 function patchRow(

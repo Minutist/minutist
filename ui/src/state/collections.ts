@@ -15,6 +15,7 @@ import {
   deleteCollection,
 } from "../ipc/collections";
 import type { Collection, CollectionId } from "../ipc/collections";
+import { errorMessage } from "../lib/errors";
 
 export type { Collection, CollectionId };
 
@@ -46,10 +47,6 @@ export type CollectionsStore = {
   /** Set the active meeting-list filter. */
   select: (filter: CollectionFilter) => void;
 };
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 export const useCollectionsStore = create<CollectionsStore>((set, get) => ({
   collections: [],

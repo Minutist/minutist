@@ -19,6 +19,7 @@ import { create } from "zustand";
 import { summariseMeeting, getSummary, saveSummary } from "../ipc/summary";
 import type { MeetingId } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
+import { errorMessage } from "../lib/errors";
 
 export type SummaryStore = {
   /** The persisted summary markdown for the active meeting, or `null` if none. */
@@ -75,10 +76,6 @@ export type SummaryStore = {
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
 
 /** Drop a meeting's entry from the auto-pending map (immutably, no-op if absent). */
 function withoutPending(

@@ -88,17 +88,15 @@ restated. Adding any other edge requires updating
 
 - **Live in-meeting agent common types (Phase 9 / WU2b).** The following
   types and functions in `common` are owned by `architecture-owner`:
-  - `LiveDigestItem { text: String, resolved: bool, source: Option<String> }` —
-    one item in a digest category; derives `specta::Type`, crosses IPC.
-  - `LiveDigest { meeting_id, generated_at_ms, action_items, decisions,
-    open_asks, attachment_answers, unresolved_references }` — the full per-meeting
-    digest produced by the live agent on each refresh.
   - `LiveAgentMode { Auto, On, Off }` — user preference for the live agent gate.
     `Auto` resolves to GPU-acceleration-active (see `live_agent_should_run`).
   - `live_agent_should_run(mode, probe, gpu_acceleration) -> bool` — pure gate
     resolution; documented in `components.md` and `cross-cutting.md`.
-  - `AppEvent::LiveDigestUpdated` and `AppEvent::LiveDigestError` — the two
-    event variants emitted by `ipc-bridge`'s live-agent driver.
+  - `AppEvent::LiveDigestError` — the terminal-error event emitted by
+    `ipc-bridge`'s live-agent driver (its sibling `LiveDigestUpdated`, and the
+    `LiveDigest`/`LiveDigestItem` payload types, were a digest-panel design
+    that never got a producer before being superseded by the unified co-pilot
+    chat log — deleted; see `components.md`).
   The live-agent driver implementation (S2b) lives in
   `crates/ipc-bridge/src/live_agent.rs` (systems-engineer). The held-context
   backend (S2a) lives in `crates/chat-agent/src/live.rs` (ml-runtime-engineer).

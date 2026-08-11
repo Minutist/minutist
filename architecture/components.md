@@ -498,7 +498,7 @@ used, not added here.
 `NoteBlock`, `MeetingState`,
 `InterAgentRequest`, `InterAgentReply`,
 `AttachmentId`, `ConversionState`, `AttachmentEntry`,
-`LiveDigestItem`, `LiveDigest`, `LiveAgentMode`,
+`LiveAgentMode`,
 `ProcessingLifecycle`, `ProcessingClaim`, `HostRef`,
 `ChatSession`, `ChatMessage`, `ChatRole`, `VoiceprintSuggestion`,
 `SyncStatus`, `TunnelStatus`),
@@ -619,18 +619,17 @@ absent VLM), `Some(GemmaVlm)` in production. Adding this trait is an
 architecture-owner change; all downstream consumers are updated in the same
 commit.
 
-**Live in-meeting agent — shared types (Phase 9 auto-driver, WU1).** Three new
-public types and two new `AppEvent` variants that ride the existing
+**Live in-meeting agent — shared types (Phase 9 auto-driver, WU1).** One new
+public type and one `AppEvent` variant that ride the existing
 `AppEventPayload` newtype + the single `collect_events![AppEventPayload]`
-registration — no second registration. One pure public function.
-
-- `LiveDigestItem { text: String, resolved: bool, source: Option<String> }` —
-  one item in a digest category. `resolved` is the standing-list flag: `false`
-  while outstanding, `true` once resolved or answered. The live agent carries
-  this flag forward across refreshes so resolved items are not re-added. Serde
-  derives; `specta::Type` (crosses IPC via `LiveDigest`); `source` is
-  `#[serde(default, skip_serializing_if = "Option::is_none")]` so the common
-  source-less case stays compact.
+registration — no second registration. One pure public function. (A digest-
+payload design — `LiveDigestItem`/`LiveDigest`/`AppEvent::LiveDigestUpdated`
+plus a planned `ui/src/shell/LiveDigestPanel.tsx` — was scaffolded here but
+never given a producer before being superseded by the unified co-pilot chat
+log below; the unused types and event variant were deleted, along with the
+`ui/src/state/liveDigest.ts` `digest` field. `AppEvent::LiveDigestError` is
+kept — it is real, currently-emitted driver-error signalling — but see the
+corrected description below; it no longer refers to a digest or a panel.)
 
 - **Post-Stop continuation (`ipc-bridge::commands::load_or_new_session` /
   `chat_turn_base_prompt`).** The meeting's `is_live` session is the co-pilot's
@@ -648,15 +647,8 @@ registration — no second registration. One pure public function.
   `session_id` (an ordinary chat session opened alongside the live one) is
   honoured as before and is unaffected.
 
-- `LiveDigest { meeting_id, generated_at_ms, action_items, decisions, open_asks,
-  attachment_answers, unresolved_references }` — the full digest payload produced
-  by the live agent on each refresh. Each category is a `Vec<LiveDigestItem>`.
-  `generated_at_ms` is wall-clock epoch milliseconds. Serde derives; `specta::Type`;
-  serialises as the existing `AppEvent` nested JSON shape.
-
 - **U1 — unified co-pilot log.** `ChatRole` gains a `Digest` variant: an
-  auto-generated live-agent digest turn whose `content` carries the `LiveDigest`
-  serialised as JSON (mirroring how `Tool` turns carry a JSON result).
+  auto-injected transcript-window turn from the merged-input keep-alive loop.
   `ChatSession` gains `is_live: bool` — the single per-meeting **live co-pilot**
   session the digest writes into (as one in-place-updated `Digest` turn,
   approach A) and in-meeting chat shares. Digest turns are persisted in this log
@@ -686,30 +678,18 @@ registration — no second registration. One pure public function.
   `resolve_gpu_plan`. Lives in `common` so consumers can call it without implementing
   the gate. Fully unit-tested.
 
-Two `AppEvent` variants (placed in a `--- Live agent ---` comment block after
+One `AppEvent` variant (placed in a `--- Live agent ---` comment block after
 `ChatContextTrimmed`):
 
-- `LiveDigestUpdated { meeting_id: MeetingId, digest: LiveDigest }` — the live
-  agent produced a full replacement digest. Lossy-broadcast-safe: a dropped event
-  is recovered on the next refresh (same pattern as `ChatTurnComplete.final_text`).
-- `LiveDigestError { meeting_id: MeetingId, message: String }` — the live agent
-  failed to produce a digest; the panel retains the last valid digest.
+- `LiveDigestError { meeting_id: MeetingId, message: String }` — the live
+  agent's driver hit a terminal error (worker startup failure, a decode error,
+  or context-capacity exhaustion) and has stopped producing further turns for
+  this meeting. Kept its wire tag from the superseded digest design (below);
+  `message` is a concise description of the failure.
 
-**Phase 9 — live digest panel (S3, webview only).** `ui/src/state/liveDigest.ts`
-and `ui/src/shell/LiveDigestPanel.tsx` are purely internal to the webview layer.
-The store is event-driven (no IPC command): `live_digest_updated` overwrites the
-entry for the meeting wholesale (lossy-broadcast-safe, same pattern as
-`ChatTurnComplete.final_text`); `live_digest_error` stores the message and retains
-the last valid digest. The panel toggle in `MainWindow` is gated on whether the backend has sent any
-digest event for the active meeting (`digestFor(activeMeetingId) !== null`), NOT
-on `live_agent_enabled`. This avoids mirroring GPU-probe state to the frontend:
-when `mode=Off` the backend never spawns and no event fires so the toggle stays
-hidden; when `mode=On` or `Auto` with GPU active the toggle appears once the
-first digest event arrives (≤ one cadence interval). `MainWindow` reads from
-`useLiveDigestStore` for this gate (no new seam; the store is already populated
-by the existing event-listener path). No new Cargo edge, no new public IPC
-command — all types (`LiveDigest`, `LiveDigestItem`, `LiveDigestUpdated`,
-`LiveDigestError`) are already in `bindings.ts`.
+`ui/src/state/liveDigest.ts` holds the last `live_digest_error` message per
+meeting id (event-driven, no IPC command) for a future consumer — nothing in
+the webview currently renders it.
 
 **Phase 9 precursor — chat-agent shared types.** `ChatSessionId` (a UUID
 newtype mirroring `MeetingId`); six chat `AppEvent` variants (`ChatToken`,
@@ -4687,9 +4667,9 @@ before passing to `converse_typed`. A non-suppressed reply from a **transcript
 turn** emits `AppEvent::LiveCopilotMessage` (the co-pilot feed surface); a reply
 from a **user-chat turn** is streamed on `reply_tx` only — no
 `LiveCopilotMessage` (the chat-panel surface; see the reply-channel note above).
-Terminal errors emit `AppEvent::LiveDigestError`.
-`AppEvent::LiveDigestUpdated` is **not emitted on the live path** (the digest-JSON
-contract is retired for live sessions).
+Terminal errors emit `AppEvent::LiveDigestError` (the retired digest-JSON
+contract's error variant — the success variant, `LiveDigestUpdated`, and its
+`LiveDigest`/`LiveDigestItem` payload types were deleted; see `common`).
 
 The `app-main` watcher task subscribes to `StateChanged`, calls `spawn_live_agent`
 on `Recording` (only when `live_agent_should_run(settings.live_agent_enabled,

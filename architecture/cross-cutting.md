@@ -1252,9 +1252,11 @@ categories. Cross-cutting rules:
   ride the existing `AppEventPayload` newtype + the single
   `collect_events![AppEventPayload]` registration — no second registration.
   Both are lossy-broadcast-safe (`LiveCopilotMessage` carries the full turn
-  content; a lagged subscriber is notified on next arrival).
-  `LiveDigestUpdated` is **not emitted on the live path** (the digest-JSON
-  contract is retired for live sessions).
+  content; a lagged subscriber is notified on next arrival). `LiveDigestError`
+  kept its wire tag from the retired digest-JSON design (its `LiveDigestUpdated`
+  sibling and the `LiveDigest`/`LiveDigestItem` payload types were deleted —
+  see `components.md`) but now reports a terminal live-agent-driver error, not
+  a digest-refresh failure.
 
 ## MCP transport
 

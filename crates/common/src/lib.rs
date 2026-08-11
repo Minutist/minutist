@@ -770,11 +770,11 @@ pub enum ChatRole {
     Assistant,
     /// A tool-result message appended after the driver ran a tool call.
     Tool,
-    /// An auto-generated live-agent digest turn. `content` carries the
-    /// [`LiveDigest`] serialised as JSON (mirroring how `Tool` messages carry a
-    /// JSON result in `content`). Distinct from `Assistant` so the unified
-    /// co-pilot log can interleave auto-digest turns with user chat turns and a
-    /// client can render them distinctly. (U1 — unified conversation log.)
+    /// An auto-injected transcript-window turn (the merged-input keep-alive
+    /// loop's periodic transcript feed). Distinct from `Assistant` so the
+    /// unified co-pilot log can interleave auto-injected turns with user chat
+    /// turns and a client can render them distinctly. (U1 — unified
+    /// conversation log.)
     Digest,
 }
 
@@ -964,59 +964,6 @@ pub struct InterAgentReply {
 // ---------------------------------------------------------------------------
 // Live in-meeting agent (Phase 9 auto-driver)
 // ---------------------------------------------------------------------------
-
-/// One item in a live digest category (action item, decision, open ask, etc.).
-///
-/// `resolved` carries the standing-list state: `false` = outstanding, `true` =
-/// resolved / answered. The live agent updates this flag across digest refreshes
-/// rather than regenerating the list from scratch, so once an action item is
-/// marked resolved it stays resolved even as new segments arrive. `source` is an
-/// optional short attribution string (e.g. `"from slide deck"` for attachment-
-/// sourced answers) shown in the panel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
-pub struct LiveDigestItem {
-    /// The item text (plain English; one sentence).
-    pub text: String,
-    /// `true` once the item is resolved, answered, or confirmed; `false` while
-    /// it is still outstanding. Carried forward across refreshes so the
-    /// standing list accumulates without full regeneration.
-    pub resolved: bool,
-    /// Optional short attribution (e.g. `"slide deck"`, `"Alice"`). Absent for
-    /// most items; present when the source is worth surfacing in the panel.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
-/// The full live digest payload produced by the live agent on each refresh.
-///
-/// Each category is a `Vec<LiveDigestItem>` with a `resolved` flag that the
-/// agent carries forward across refreshes (the 'asked-for-but-missed' tracker
-/// pattern — the list accumulates and is marked resolved rather than being
-/// regenerated wholesale). `generated_at_ms` is wall-clock epoch milliseconds
-/// for display; `meeting_id` scopes the digest to one meeting.
-///
-/// Crosses IPC (derives `specta::Type`, serialises snake_case) and rides the
-/// existing `AppEventPayload` + `collect_events![AppEventPayload]` channel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "specta", derive(specta::Type))]
-pub struct LiveDigest {
-    pub meeting_id: MeetingId,
-    /// Wall-clock epoch milliseconds when this digest was generated.
-    pub generated_at_ms: u64,
-    /// Tasks or follow-ups explicitly requested or implied during the meeting.
-    pub action_items: Vec<LiveDigestItem>,
-    /// Commitments, conclusions, or choices reached during the meeting.
-    pub decisions: Vec<LiveDigestItem>,
-    /// Questions posed during the meeting that have not yet received an answer.
-    pub open_asks: Vec<LiveDigestItem>,
-    /// Questions answered from attached-document context (documents, slides, etc.),
-    /// retrieved into the live agent's context.
-    pub attachment_answers: Vec<LiveDigestItem>,
-    /// Terms, acronyms, or references mentioned but not explained in the
-    /// transcript (potential knowledge gaps surfaced for the attendee).
-    pub unresolved_references: Vec<LiveDigestItem>,
-}
 
 /// Whether the live in-meeting agent runs during an active recording.
 ///
@@ -1436,21 +1383,11 @@ pub enum AppEvent {
     // --- Live agent ----------------------------------------------------------
     // These ride the existing `AppEventPayload` newtype + the single
     // `collect_events![AppEventPayload]` registration in `ipc-bridge` — no new
-    // event registration needed. The live agent refreshes the digest on a
-    // debounced cadence driven by `TranscriptSegment` events; each refresh
-    // emits a full replacement digest so a lagged subscriber can safely drop
-    // intermediate updates (lossy-broadcast-safe, same approach as
-    // `ChatTurnComplete.final_text`).
-    /// The live in-meeting agent produced a refreshed digest for an active
-    /// meeting. The payload is the FULL replacement digest; the webview
-    /// replaces the previous digest wholesale rather than patching. Lossy-
-    /// broadcast-safe: a dropped event is recovered on the next refresh.
-    LiveDigestUpdated {
-        meeting_id: MeetingId,
-        digest: LiveDigest,
-    },
-    /// The live agent encountered an error producing a digest refresh. The
-    /// panel shows `message` and retains the last valid digest, if any.
+    // event registration needed.
+    /// The live in-meeting agent's driver hit a terminal error (worker startup
+    /// failure, a decode error, or context-capacity exhaustion) and has stopped
+    /// producing further turns for this meeting. `message` is a concise
+    /// human-readable description of what went wrong.
     LiveDigestError {
         meeting_id: MeetingId,
         /// A concise human-readable description of what went wrong.
@@ -1464,8 +1401,8 @@ pub enum AppEvent {
     /// turns, `User` for user-typed messages echoed back. `turn_id` is the
     /// per-session monotonic counter carried on the matching persisted
     /// [`ChatMessage`] so the webview can correlate streamed events with stored
-    /// turns. The digest pane (superseded in U4) should not be updated from this
-    /// event — route it to the unified co-pilot chat view instead.
+    /// turns. This is the unified co-pilot chat view's feed — the sole
+    /// live-agent-turn event (U4 — unified conversation log).
     LiveCopilotMessage {
         meeting_id: MeetingId,
         turn_id: u64,
@@ -3027,61 +2964,6 @@ mod tests {
             serde_json::to_string(&LiveAgentMode::Off).unwrap(),
             "\"off\""
         );
-    }
-
-    #[test]
-    fn live_digest_and_item_round_trip() {
-        let mid = MeetingId::new();
-        let digest = LiveDigest {
-            meeting_id: mid,
-            generated_at_ms: 1_700_000_000_000,
-            action_items: vec![LiveDigestItem {
-                text: "Alice to send the report".to_string(),
-                resolved: false,
-                source: None,
-            }],
-            decisions: vec![LiveDigestItem {
-                text: "Launch date moved to Q3".to_string(),
-                resolved: true,
-                source: Some("slide deck".to_string()),
-            }],
-            open_asks: vec![],
-            attachment_answers: vec![],
-            unresolved_references: vec![],
-        };
-        let json = serde_json::to_string(&digest).unwrap();
-        let back: LiveDigest = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.meeting_id, mid);
-        assert_eq!(back.action_items.len(), 1);
-        assert!(!back.action_items[0].resolved);
-        assert!(back.action_items[0].source.is_none());
-        assert_eq!(back.decisions.len(), 1);
-        assert!(back.decisions[0].resolved);
-        assert_eq!(back.decisions[0].source.as_deref(), Some("slide deck"));
-        // Absent `source` is omitted from the wire shape.
-        assert!(
-            !json.contains("\"source\":null"),
-            "absent source must be omitted not null"
-        );
-    }
-
-    #[test]
-    fn app_event_live_digest_updated_serialises_with_tag() {
-        let mid = MeetingId::new();
-        let e = AppEvent::LiveDigestUpdated {
-            meeting_id: mid,
-            digest: LiveDigest {
-                meeting_id: mid,
-                generated_at_ms: 0,
-                action_items: vec![],
-                decisions: vec![],
-                open_asks: vec![],
-                attachment_answers: vec![],
-                unresolved_references: vec![],
-            },
-        };
-        let json = serde_json::to_string(&e).unwrap();
-        assert!(json.contains("\"kind\":\"live_digest_updated\""));
     }
 
     #[test]

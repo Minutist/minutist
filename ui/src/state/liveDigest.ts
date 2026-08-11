@@ -1,80 +1,40 @@
 /**
- * Per-meeting live digest store (Phase 9 — S3).
+ * Per-meeting live-agent driver error store.
  *
- * Holds the latest `LiveDigest` for each meeting, fed exclusively by the
- * global event bridge (`shell/event-listener.tsx`) via `handleEvent`. No IPC
- * seam — the panel is event-driven; there is nothing to fetch.
+ * Holds the last `live_digest_error` message for each meeting, fed
+ * exclusively by the global event bridge (`shell/event-listener.tsx`) via
+ * `handleEvent`. No IPC seam — event-driven; there is nothing to fetch.
  *
- * Payload semantics: `live_digest_updated` carries the FULL replacement digest
- * and the store OVERWRITES wholesale (lossy-broadcast-safe — a dropped
- * intermediate update is recovered on the next backend refresh; the backend
- * carries `resolved` forward across refreshes so the store never reconciles
- * item-level state itself).
- *
- * `live_digest_error` stores the message and RETAINS the last valid digest for
- * that meeting so the panel does not blank on a transient error.
+ * The event name kept the wire tag `live_digest_error` for backward
+ * compatibility with the Rust `AppEvent::LiveDigestError` variant; it now
+ * reports a terminal live-agent-driver failure (worker startup, decode
+ * error, or context-capacity exhaustion), not a digest-refresh failure —
+ * the digest-panel design it originally served was superseded by the
+ * unified co-pilot chat log (`LiveCopilotMessage`) before a digest producer
+ * was ever written.
  */
 import { create } from "zustand";
-import type { MeetingId, LiveDigest } from "../ipc/bindings";
+import type { MeetingId } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
 
-export type LiveDigestEntry = {
-  /** The latest authoritative digest, or `null` before the first refresh. */
-  digest: LiveDigest | null;
-  /** The last error message from `live_digest_error`, or `null` when none. */
-  lastError: string | null;
-};
-
 export type LiveDigestStore = {
-  /** Latest digest entry per meeting id. */
-  digests: Record<MeetingId, LiveDigestEntry>;
-  /**
-   * Returns the entry for a meeting, or `null` when no digest has arrived for
-   * it yet. Mirrors the `operationFor` selector pattern.
-   */
-  digestFor: (meetingId: MeetingId) => LiveDigestEntry | null;
+  /** Last error message per meeting id, or absent when none has occurred. */
+  errors: Record<MeetingId, string>;
+  /** Returns the last error for a meeting, or `null` when none has occurred. */
+  errorFor: (meetingId: MeetingId) => string | null;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
 
 export const useLiveDigestStore = create<LiveDigestStore>((set, get) => ({
-  digests: {},
+  errors: {},
 
-  digestFor: (meetingId) => get().digests[meetingId] ?? null,
+  errorFor: (meetingId) => get().errors[meetingId] ?? null,
 
   handleEvent: (event) => {
-    switch (event.kind) {
-      case "live_digest_updated": {
-        // Wholesale overwrite — the payload is authoritative.
-        set((s) => ({
-          digests: {
-            ...s.digests,
-            [event.meeting_id]: {
-              digest: event.digest,
-              lastError: null,
-            },
-          },
-        }));
-        break;
-      }
-      case "live_digest_error": {
-        // Retain the last valid digest; only update the error field.
-        set((s) => {
-          const prior = s.digests[event.meeting_id];
-          return {
-            digests: {
-              ...s.digests,
-              [event.meeting_id]: {
-                digest: prior?.digest ?? null,
-                lastError: event.message,
-              },
-            },
-          };
-        });
-        break;
-      }
-      default:
-        break;
-    }
+    if (event.kind !== "live_digest_error") return;
+    set((s) => ({
+      errors: { ...s.errors, [event.meeting_id]: event.message },
+    }));
   },
 }));

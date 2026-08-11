@@ -1283,15 +1283,10 @@ export type AppEvent =
  */
 { kind: "chat_context_trimmed"; session_id: ChatSessionId; dropped_turns: number } | 
 /**
- * The live in-meeting agent produced a refreshed digest for an active
- * meeting. The payload is the FULL replacement digest; the webview
- * replaces the previous digest wholesale rather than patching. Lossy-
- * broadcast-safe: a dropped event is recovered on the next refresh.
- */
-{ kind: "live_digest_updated"; meeting_id: MeetingId; digest: LiveDigest } | 
-/**
- * The live agent encountered an error producing a digest refresh. The
- * panel shows `message` and retains the last valid digest, if any.
+ * The live in-meeting agent's driver hit a terminal error (worker startup
+ * failure, a decode error, or context-capacity exhaustion) and has stopped
+ * producing further turns for this meeting. `message` is a concise
+ * human-readable description of what went wrong.
  */
 { kind: "live_digest_error"; meeting_id: MeetingId; message: string } | 
 /**
@@ -1303,8 +1298,8 @@ export type AppEvent =
  * turns, `User` for user-typed messages echoed back. `turn_id` is the
  * per-session monotonic counter carried on the matching persisted
  * [`ChatMessage`] so the webview can correlate streamed events with stored
- * turns. The digest pane (superseded in U4) should not be updated from this
- * event — route it to the unified co-pilot chat view instead.
+ * turns. This is the unified co-pilot chat view's feed — the sole
+ * live-agent-turn event (U4 — unified conversation log).
  */
 { kind: "live_copilot_message"; meeting_id: MeetingId; turn_id: number; role: ChatRole; content: string } | 
 /**
@@ -1544,11 +1539,11 @@ export type ChatRole =
  */
 "tool" | 
 /**
- * An auto-generated live-agent digest turn. `content` carries the
- * [`LiveDigest`] serialised as JSON (mirroring how `Tool` messages carry a
- * JSON result in `content`). Distinct from `Assistant` so the unified
- * co-pilot log can interleave auto-digest turns with user chat turns and a
- * client can render them distinctly. (U1 — unified conversation log.)
+ * An auto-injected transcript-window turn (the merged-input keep-alive
+ * loop's periodic transcript feed). Distinct from `Assistant` so the
+ * unified co-pilot log can interleave auto-injected turns with user chat
+ * turns and a client can render them distinctly. (U1 — unified
+ * conversation log.)
  */
 "digest"
 /**
@@ -1740,71 +1735,6 @@ export type LiveAgentMode =
  * default until the feature is validated on real hardware.
  */
 "off"
-/**
- * The full live digest payload produced by the live agent on each refresh.
- * 
- * Each category is a `Vec<LiveDigestItem>` with a `resolved` flag that the
- * agent carries forward across refreshes (the 'asked-for-but-missed' tracker
- * pattern — the list accumulates and is marked resolved rather than being
- * regenerated wholesale). `generated_at_ms` is wall-clock epoch milliseconds
- * for display; `meeting_id` scopes the digest to one meeting.
- * 
- * Crosses IPC (derives `specta::Type`, serialises snake_case) and rides the
- * existing `AppEventPayload` + `collect_events![AppEventPayload]` channel.
- */
-export type LiveDigest = { meeting_id: MeetingId; 
-/**
- * Wall-clock epoch milliseconds when this digest was generated.
- */
-generated_at_ms: number; 
-/**
- * Tasks or follow-ups explicitly requested or implied during the meeting.
- */
-action_items: LiveDigestItem[]; 
-/**
- * Commitments, conclusions, or choices reached during the meeting.
- */
-decisions: LiveDigestItem[]; 
-/**
- * Questions posed during the meeting that have not yet received an answer.
- */
-open_asks: LiveDigestItem[]; 
-/**
- * Questions answered from attached-document context (documents, slides, etc.),
- * retrieved into the live agent's context.
- */
-attachment_answers: LiveDigestItem[]; 
-/**
- * Terms, acronyms, or references mentioned but not explained in the
- * transcript (potential knowledge gaps surfaced for the attendee).
- */
-unresolved_references: LiveDigestItem[] }
-/**
- * One item in a live digest category (action item, decision, open ask, etc.).
- * 
- * `resolved` carries the standing-list state: `false` = outstanding, `true` =
- * resolved / answered. The live agent updates this flag across digest refreshes
- * rather than regenerating the list from scratch, so once an action item is
- * marked resolved it stays resolved even as new segments arrive. `source` is an
- * optional short attribution string (e.g. `"from slide deck"` for attachment-
- * sourced answers) shown in the panel.
- */
-export type LiveDigestItem = { 
-/**
- * The item text (plain English; one sentence).
- */
-text: string; 
-/**
- * `true` once the item is resolved, answered, or confirmed; `false` while
- * it is still outstanding. Carried forward across refreshes so the
- * standing list accumulates without full regeneration.
- */
-resolved: boolean; 
-/**
- * Optional short attribution (e.g. `"slide deck"`, `"Alice"`). Absent for
- * most items; present when the source is worth surfacing in the panel.
- */
-source?: string | null }
 /**
  * The live MCP endpoint surfaced to the Settings → MCP pane via
  * `get_mcp_server_info` (Phase 10). The bearer `token` is sensitive: it is
@@ -2141,8 +2071,8 @@ export type RecordingState = { kind: "idle" } | { kind: "recording"; meeting_id:
 /**
  * One transcript segment with optional speaker assignment.
  * 
- * Speaker is populated by the `Diarizer` impl post-hoc; ASR backends
- * leave it `None`.
+ * Speaker is populated by `diarizer`'s post-hoc pass; ASR backends leave
+ * it `None`.
  */
 export type Segment = { start_ms: number; end_ms: number; text: string; speaker_id?: string | null; confidence?: number | null; words: WordTimestamp[]; 
 /**

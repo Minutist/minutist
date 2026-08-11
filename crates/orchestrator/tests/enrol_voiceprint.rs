@@ -324,6 +324,7 @@ fn embedding_path() -> Option<std::path::PathBuf> {
 /// loads the real CAM++ ONNX model. When the env var is unset the test prints a
 /// skip line and returns — the default `cargo test` suite passes with it skipped.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "model-gated: set MINUTIST_DIARIZE_EMB_PATH"]
 async fn enrol_voiceprint_creates_identity_centroid_contribution() {
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -451,6 +452,7 @@ async fn enrol_voiceprint_creates_identity_centroid_contribution() {
 /// pause (> 4 000 ms silence), and a transcript segment placed AFTER the pause
 /// on the excluding clock. The embedding model is required; when absent, skip.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "model-gated: set MINUTIST_DIARIZE_EMB_PATH"]
 async fn enrol_voiceprint_maps_post_pause_segment_correctly() {
     let _ = tracing_subscriber::fmt::try_init();
 

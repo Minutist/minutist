@@ -336,6 +336,7 @@ async fn run_gated_rediarize_over_fixture(fixture_filename: &str, expected_speak
 /// production `DiarizerConfig::default()`. Asserts `speaker_count == 2`. Gated on
 /// the diarize-model env vars; the no-op skip path is what CI runs.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "model-gated: set MINUTIST_DIARIZE_SEG_PATH + MINUTIST_DIARIZE_EMB_PATH"]
 async fn rediarize_assigns_speakers_over_two_speaker_fixture() {
     run_gated_rediarize_over_fixture("two_speakers_synth.wav", 2).await;
 }
@@ -346,6 +347,7 @@ async fn rediarize_assigns_speakers_over_two_speaker_fixture() {
 /// threshold mode does not over-segment a single speaker into multiple. Gated on
 /// the diarize-model env vars; the no-op skip path is what CI runs.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "model-gated: set MINUTIST_DIARIZE_SEG_PATH + MINUTIST_DIARIZE_EMB_PATH"]
 async fn rediarize_reports_single_speaker_over_control_fixture() {
     run_gated_rediarize_over_fixture("single_speaker_control.wav", 1).await;
 }

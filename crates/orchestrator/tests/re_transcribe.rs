@@ -356,6 +356,7 @@ fn e2e_orchestrator(
 /// `AppEvent::TranscriptSegment`. Gated on the ASR model env vars; the no-op
 /// skip path is what CI runs.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "model-gated: set MINUTIST_ASR_MODEL_PATH + MINUTIST_ASR_MMPROJ_PATH"]
 async fn re_transcribe_rewrites_transcript_over_fixture() {
     let _ = tracing_subscriber::fmt::try_init();
 

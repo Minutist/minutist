@@ -74,6 +74,8 @@ fn diarize_at(seg_path: &Path, emb_path: &Path, threshold: f32, audio: &[f32], s
 }
 
 #[test]
+#[ignore = "model-gated: set MINUTIST_RECORDINGS_DIR + MINUTIST_DIARIZE_SEG_PATH + \
+            MINUTIST_DIARIZE_EMB_PATH"]
 fn diarize_real_recording_threshold_sweep() {
     let (recordings, seg, emb) = match (
         env_ne("MINUTIST_RECORDINGS_DIR"),

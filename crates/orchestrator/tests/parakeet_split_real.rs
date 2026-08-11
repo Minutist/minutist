@@ -80,6 +80,8 @@ fn parakeet_segments(pcm: &[f32], parakeet_dir: &str) -> Vec<Segment> {
 }
 
 #[test]
+#[ignore = "model-gated: set MINUTIST_RECORDINGS_DIR + MINUTIST_PARAKEET_DIR + \
+            MINUTIST_DIARIZE_SEG_PATH + MINUTIST_DIARIZE_EMB_PATH"]
 fn parakeet_split_on_real_recording() {
     let (recordings, parakeet_dir, seg, emb) = match (
         env_ne("MINUTIST_RECORDINGS_DIR"),

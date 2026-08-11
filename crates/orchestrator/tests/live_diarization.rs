@@ -208,6 +208,7 @@ async fn none_diarizer_yields_all_none_speaker_ids() {
 /// With a real `OnlineDiarizer`, the emitted segments carry non-None sticky
 /// labels. Skipped (no failure) when `MINUTIST_DIARIZE_EMB_PATH` is unset.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "model-gated: set MINUTIST_DIARIZE_EMB_PATH"]
 async fn live_diarizer_populates_speaker_ids() {
     let _ = tracing_subscriber::fmt::try_init();
 

@@ -282,6 +282,7 @@ fn e2e_orchestrator(
 /// 3. `transcript.json` parses as `Vec<Segment>`, has ≥1 segment, with
 ///    monotonically-increasing `start_ms` values.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "model-gated: set MINUTIST_ASR_MODEL_PATH + MINUTIST_ASR_MMPROJ_PATH"]
 async fn live_pipeline_emits_transcript_segment_and_writes_transcript_json() {
     let _ = tracing_subscriber::fmt::try_init();
 

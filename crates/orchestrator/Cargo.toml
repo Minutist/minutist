@@ -40,6 +40,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Self-dependency with `test-source` on so `cargo test -p orchestrator` builds
+# and runs the integration tests below against real (if fake-device) audio
+# streams, without a `--features test-source` flag on the command line. Same
+# trick `sync` and `headless` use for their own integration suites.
+orchestrator = { path = ".", features = ["test-source"] }
 serde_json = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { workspace = true }

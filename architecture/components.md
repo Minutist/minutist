@@ -45,7 +45,7 @@ appears in:
 | `embedder` | RAG | `common`, `llama-cpp-2` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `notes-crdt`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert`, `embedder`, `rag-retrieval` |
 | `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※ |
-| `headless` (bin) | WS4-B | `common`, `persistence`, `notes-crdt`, `sync`, `settings`, `tunnel-client`⊕ ‖ |
+| `headless` (bin) | WS4-B | `common`, `persistence`, `notes-crdt`, `sync`, `tunnel-client`⊕ ‖ |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
 Cargo feature (default ON). The free artifact is built with
@@ -4853,8 +4853,8 @@ workspace binary beside `app-main`: an always-on device-sync hub now, and
 controls, in its own data root, never shared with a desktop's `{app-data}`; it
 is not a build variant of `app-main` and shares no code path with it.
 
-**Dependency edges:** `common`, `persistence`, `sync`, `settings` (see the
-`headless` ‖-marked dependency-table footnote
+**Dependency edges:** `common`, `persistence`, `notes-crdt`, `sync`,
+`tunnel-client` (see the `headless` ‖-marked dependency-table footnote
 above; a post-launch GPU processing-node role adds the ML-runtime crates as a
 separate table-update commit). No `tauri::*` / `ipc-bridge` edge: the daemon wires
 `sync::SyncEngine` directly and carries no command/event surface.

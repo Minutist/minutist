@@ -125,7 +125,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 sync = component "sync" "Device-to-device sync engine (WS4-B): iroh QUIC transport over a custom SYNC_ALPN. Exchanges Yjs notes-update frames, content-addressed meeting media (audio + note assets, over a second iroh-blobs ALPN), the processing-lifecycle Discovery exchange, and derived-artifact (transcript.json / summary.md) reconciliation. A near-leaf: depends only on common + notes-crdt, never persistence, which keeps its lib cross-compilable to mobile targets. Connected-feature gated; wired into app-main in S5." "Rust crate: crates/sync"
 
-                election = component "election" "Host-election state machine for the producer gate (WS4-B): claims a claimable meeting (PendingProcessing, or a Claimed past its lease) with audio already synced in, runs the pipeline, and writes Processed — via the ElectionDriver trait. A leaf (common + persistence only): the sync (advertise) and orchestrator (process) collaborators sit behind the trait, so this crate takes no edge to either and the one state machine is reused by both eligible host types. Connected-feature gated; wired into app-main in S4." "Rust crate: crates/election"
+                election = component "election" "Host-election state machine for the producer gate (WS4-B): claims a claimable meeting (PendingProcessing, or a Claimed past its lease) with audio already synced in, runs the pipeline, and writes Processed — via the ElectionDriver trait. A leaf (common + persistence + notes-crdt): the sync (advertise) and orchestrator (process) collaborators sit behind the trait, so this crate takes no edge to either and the one state machine is reused by both eligible host types. Connected-feature gated; wired into app-main in S4." "Rust crate: crates/election"
 
                 settings = component "settings" "Settings schema, validation, change notifications. Persists to a single JSON file at {app-data}/settings.store via serde_json + std::fs; no tauri dependency." "Rust crate: crates/settings"
 
@@ -263,6 +263,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         // transcribe_pcm_window through the orchestrator (which keeps the
         // model-registry edge — agent-tools has none).
         minutist.core.agentTools -> minutist.core.persistence "Reads meeting artefacts; writes via existing writers"
+        minutist.core.agentTools -> minutist.core.notesCrdt "Reads/writes metadata.json + notes.ydoc via the lifted primitives"
         minutist.core.agentTools -> minutist.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
         minutist.core.agentTools -> minutist.core.ragRetrieval "rrf_fuse for the retrieve_chunks tool"
 
@@ -293,22 +294,25 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
         // Sync engine + producer-gate election (WS4-B). sync is a near-leaf
         // (common + notes-crdt only, never persistence) so its lib cross-compiles
-        // to mobile; election is a leaf (common + persistence only) — the sync
-        // (advertise) and orchestrator (process) collaborators it drives sit
+        // to mobile; election is a leaf (common + persistence + notes-crdt) — the
+        // sync (advertise) and orchestrator (process) collaborators it drives sit
         // behind the ElectionDriver trait, so neither is a workspace edge of this
         // crate. app-main injects the connected implementations of both behind
         // the same `connected` feature as mcp-server / tunnel-client.
         minutist.core.sync      -> minutist.core.notesCrdt "Reads/merges the authoritative notes.ydoc via NotesStore; MeetingFolder::ensure for inbound folders"
         minutist.core.election  -> minutist.core.persistence "Scans candidates (folder::list_meeting_ids) and claims/renews/reaps via the guarded update_metadata_if re-export"
+        minutist.core.election  -> minutist.core.notesCrdt "Reads the projected notes.ydoc state for claim/renew/reap bookkeeping"
         minutist.core.appMain   -> minutist.core.sync "Injects the connected SyncControl (ConnectedSync); the free build wires disabled_sync() instead (connected-gated)"
         minutist.core.appMain   -> minutist.core.election "Spawns run_election_loop with the DesktopElectionDriver (connected-gated)"
         minutist.headlessHub    -> minutist.core.sync "Wires SyncEngine into the always-on hub daemon"
+        minutist.headlessHub    -> minutist.core.tunnelClient "AccountDirectoryClient: publishes this hub's endpoint, fetches the account's device list (unconditional, not feature-gated)"
         minutist.syncFfiBridge  -> minutist.core.sync "Wraps SyncEngine's transport + lifecycle surface via UniFFI"
         minutist.syncFfiBridge  -> minutist.core.notesCrdt "Reads/writes metadata.json + notes.ydoc via the lifted primitives (persistence-free)"
 
         // IPC bridge — the ONLY crate that knows about Tauri APIs.
         minutist.core.ipcBridge -> minutist.core.orchestrator "Invokes commands; subscribes to events"
         minutist.core.ipcBridge -> minutist.core.persistence "Meeting list / load / delete"
+        minutist.core.ipcBridge -> minutist.core.notesCrdt "Reads/writes metadata.json + notes.ydoc directly for the leaf's own command surface"
         minutist.core.ipcBridge -> minutist.core.summariser  "Triggers Summarise; holds the LLM substrate"
         minutist.core.ipcBridge -> minutist.core.settings    "Get / set settings"
         minutist.core.ipcBridge -> minutist.core.agentTools  "Builds the registry + context; dispatches tools"

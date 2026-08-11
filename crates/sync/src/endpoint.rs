@@ -247,7 +247,7 @@ fn android_relay_resolver(relay_host: &str, relay_ips: &[String]) -> iroh::dns::
             Ok(IpAddr::V4(a)) => v4.push(a),
             Ok(IpAddr::V6(a)) => v6.push(a),
             Err(e) => {
-                tracing::warn!(ip = %ip, error = %e, "skipping unparseable injected relay IP");
+                tracing::warn!(target: "sync", ip = %ip, error = %e, "skipping unparseable injected relay IP");
             }
         }
     }
@@ -262,7 +262,7 @@ fn android_relay_resolver(relay_host: &str, relay_ips: &[String]) -> iroh::dns::
     // No usable injected relay IP → Cloudflare 1.1.1.1 / 1.0.0.1 DoH fallback.
     // Cellular safety net only; a network that blocks outbound 1.1.1.1 (or a
     // full-tunnel VPN) must inject the pre-resolved relay IPs above.
-    tracing::info!("no usable injected relay IP; falling back to public DoH resolver");
+    tracing::info!(target: "sync", "no usable injected relay IP; falling back to public DoH resolver");
     iroh::dns::DnsResolver::builder()
         .with_nameserver(
             "1.1.1.1:443".parse().expect("valid DoH nameserver socket addr"),

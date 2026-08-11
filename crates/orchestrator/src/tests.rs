@@ -137,7 +137,7 @@ async fn state_machine_happy_path_emits_state_changed_events() {
             }
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
-                tracing::warn!("test receiver lagged by {n}");
+                tracing::warn!(target: "orchestrator", "test receiver lagged by {n}");
             }
         }
         if saw_stopping && saw_finalising && saw_idle {

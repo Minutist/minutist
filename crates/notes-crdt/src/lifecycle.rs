@@ -161,7 +161,7 @@ pub fn apply_synced_lifecycle_if_present(
     match merged {
         Some(state) => {
             tracing::info!(
-                target: "persistence",
+                target: "notes-crdt",
                 meeting_id = %id.0,
                 state,
                 "synced processing lifecycle merged"

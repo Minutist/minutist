@@ -38,8 +38,8 @@
 //! paths, so its callers (orchestrator, ipc-bridge, agent-tools, app-main) are
 //! unchanged.
 //!
-//! All log calls use `target: "persistence"` so the moved code stays in the
-//! same filtered log stream as the rest of the meeting-storage surface.
+//! All log calls use `target: "notes-crdt"`, per `architecture/cross-cutting.md`
+//! — "Each component uses a static `target` matching the crate name."
 
 pub mod error;
 pub mod folder;

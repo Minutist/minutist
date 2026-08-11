@@ -414,7 +414,7 @@ impl IpcState {
         let (probe, plan) = minutist_common::probe_and_resolve_gpu_plan(s.gpu_acceleration);
         match &probe {
             Some(p) => tracing::info!(
-                target: "app-main",
+                target: "ipc-bridge",
                 gpu = %p.name,
                 total_mb = p.total_bytes / 1048576,
                 free_mb = p.free_bytes / 1048576,
@@ -426,7 +426,7 @@ impl IpcState {
                 "GPU probe + resolved plan"
             ),
             None => tracing::info!(
-                target: "app-main",
+                target: "ipc-bridge",
                 mode = ?s.gpu_acceleration,
                 "GPU probe: no usable GPU (CPU fallback)"
             ),

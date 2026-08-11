@@ -6,14 +6,17 @@
 
 Check A (all crates): flags the field form `target = "..."` — it silently
 defeats `RUST_LOG` filtering, because `tracing`'s `target` is a macro-time
-directive (`target: "..."`), not a runtime field. Check B (networked crates
-only, see `NETWORKED_CRATES` below): flags any `tracing::*!` call with no
-`target:` directive at all.
+directive (`target: "..."`), not a runtime field. Check B (all crates):
+flags any `tracing::*!` call with no `target:` directive at all. Check C
+(all crates): flags a `target: "..."` directive whose STRING VALUE isn't
+the calling crate's own name — the actual rule text
+(`architecture/cross-cutting.md` — "Logging": "Each component uses a
+static target matching the crate name"), not just "has some target".
 
-Both target checks run against a MASKED copy of each macro span (string-literal
+All three checks run against a MASKED copy of each macro span (string-literal
 and comment CONTENTS blanked, delimiters kept) so a `target =` / `target:`
 occurrence inside a log message or comment cannot trip Check A or suppress a
-real Check B violation. See `find_macro_spans`.
+real Check B/C violation. See `find_macro_spans`.
 
 Assumption: this only matches fully-qualified `tracing::<level>!(...)` calls
 (the convention this codebase uses everywhere); a bare imported `info!(...)`
@@ -30,26 +33,30 @@ import re
 import sys
 from pathlib import Path
 
-# Crates whose entire `tracing` surface must carry an explicit `target:`
-# (Check B). Extend this tuple as other crates adopt the same rule for their
-# own logging streams (see architecture/cross-cutting.md — "Logging").
-NETWORKED_CRATES = ("tunnel-client",)
+# Crates whose logging target deliberately differs from their crate/directory
+# name. `headless`'s daemon is user-facing as `minutist-hub` (see
+# architecture/cross-cutting.md — "Headless server daemon"); nobody filters
+# logs by the internal crate name "headless", so its every call targets "hub"
+# consistently. Extend only with the same rationale — a name users actually
+# filter logs by, not a typo.
+TARGET_OVERRIDES = {"headless": "hub"}
 
 MACRO_RE = re.compile(r"tracing::(?:trace|debug|info|warn|error|event)!\s*\(")
 
 # Check A: the field form `target = "..."` (defeats RUST_LOG filtering).
 TARGET_FIELD_RE = re.compile(r"(?<!\w)target\s*=\s*\"")
-# Check B: the directive form `target: ...` (what a compliant call needs).
-TARGET_DIRECTIVE_RE = re.compile(r"(?<!\w)target\s*:")
+# Check B/C: the directive form `target: "..."` — captures the string value
+# for Check C's crate-name comparison.
+TARGET_DIRECTIVE_RE = re.compile(r"(?<!\w)target\s*:\s*\"([^\"]*)\"")
 
 ESCAPED_CHAR_LITERAL_RE = re.compile(
     r"'\\\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]+\}|.)'"
 )
 
 
-def find_macro_spans(text: str) -> list[tuple[int, str]]:
-    """Return (1-based line number, MASKED call span text) for every
-    `tracing::<level>!(...)` invocation in `text`.
+def find_macro_spans(text: str) -> list[tuple[int, str, str]]:
+    """Return (1-based line number, MASKED call span text, ORIGINAL call span
+    text) for every `tracing::<level>!(...)` invocation in `text`.
 
     Scans forward from the opening paren counting depth, skipping over
     string literals (with `\\"` escapes), char literals, and `//` line
@@ -136,7 +143,7 @@ def find_macro_spans(text: str) -> list[tuple[int, str]]:
             masked.append(c)
             i += 1
         line_no = text.count("\n", 0, start) + 1
-        spans.append((line_no, "".join(masked)))
+        spans.append((line_no, "".join(masked), text[start:i]))
     return spans
 
 
@@ -191,20 +198,31 @@ def main() -> int:
         rel = path.relative_to(repo_root)
         crate = crate_name_for(path, repo_root)
 
-        for line_no, masked_span in find_macro_spans(text):
+        for line_no, masked_span, original_span in find_macro_spans(text):
             calls_checked += 1
             if TARGET_FIELD_RE.search(masked_span):
                 violations.append(
                     f"VIOLATION (target=): {rel}:{line_no} uses field syntax "
                     f"'target =' instead of the directive 'target:'"
                 )
-            if crate in NETWORKED_CRATES and not TARGET_DIRECTIVE_RE.search(
-                masked_span
-            ):
+                continue
+            directive = TARGET_DIRECTIVE_RE.search(masked_span)
+            if directive is None:
                 violations.append(
                     f"VIOLATION (no target): {rel}:{line_no} tracing call in "
                     f"{crate} has no target:"
                 )
+            else:
+                # The masked match's offsets align 1:1 with original_span (masking
+                # preserves length), so re-read the real string value from there —
+                # the masked group is blanked spaces, not the actual target.
+                value = original_span[directive.start(1) : directive.end(1)]
+                expected = TARGET_OVERRIDES.get(crate, crate)
+                if crate is not None and value != expected:
+                    violations.append(
+                        f'VIOLATION (wrong target): {rel}:{line_no} tracing call '
+                        f'in {crate} targets "{value}", expected "{expected}"'
+                    )
 
     if violations:
         for v in violations:

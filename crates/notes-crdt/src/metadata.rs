@@ -41,7 +41,7 @@ pub fn write_metadata(meeting_dir: &Path, meta: &MeetingMeta) -> AppResult<()> {
     write_metadata_atomic(&meeting_dir.join("metadata.json"), meta)?;
 
     tracing::debug!(
-        target: "persistence",
+        target: "notes-crdt",
         folder = %meeting_dir.display(),
         "metadata.json written"
     );

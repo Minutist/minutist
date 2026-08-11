@@ -288,12 +288,14 @@ the macro's `target:` directive (colon):
 and leaves the event's actual target as the module path, silently defeating
 `RUST_LOG` target filtering. The reviewer is expected to flag both forms —
 `target =` misuse and log calls with no target at all — that's how we keep
-logs filterable. `scripts/check-tracing-targets.py` enforces both mechanically:
-the pre-commit hook and the CI `guardrails` job run it against every
-`tracing::*!` call under `crates/*/src/` and `src-tauri/src/`, failing on a
-`target =` field-form call anywhere, and on a `tunnel-client` call with no
-`target:` at all (the crate-by-crate rollout is tracked in the script's
-`NETWORKED_CRATES` constant).
+logs filterable. `scripts/check-tracing-targets.py` enforces this mechanically
+for every crate (the pre-commit hook and the CI `guardrails` job run it against
+every `tracing::*!` call under `crates/*/src/` and `src-tauri/src/`): it fails
+on a `target =` field-form call anywhere, a call with no `target:` at all, and
+a `target:` value that doesn't match the calling crate's own name. The one
+named exception is `headless` (`TARGET_OVERRIDES` in the script) — its daemon
+is user-facing as `minutist-hub`, so every call targets `"hub"`, not the
+internal crate name nobody filters logs by.
 
 No `println!` or `eprintln!` outside test code. Two narrow exceptions:
 
@@ -2531,7 +2533,7 @@ Q4 weights + KV @ 32K + headroom, ≈ 8 GiB), `ASR_SMALL_VRAM_BYTES`,
 They were derived from model file sizes, NOT measured — in particular Gemma's KV
 footprint at the 32K context (and its interleaved sliding-window attention) is
 calculated. **To tune:** run the app on the target GPU and read the one-shot
-startup log line `IpcState::log_gpu_probe` (`target: "app-main"`, fields
+startup log line `IpcState::log_gpu_probe` (`target: "ipc-bridge"`, fields
 `gpu`/`total_mb`/`free_mb`/`integrated`/`summariser_gpu`/`asr_gpu`/`effective_prefer_large`),
 compare the reported VRAM against what the model actually needs (e.g. llama.cpp's
 reported KV/compute-buffer sizes on load), and adjust the consts. `resolve_gpu_plan`

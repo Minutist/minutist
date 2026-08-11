@@ -172,7 +172,7 @@ impl NotesStore {
         write_atomic(&md_path, notes_md.as_bytes())?;
 
         tracing::debug!(
-            target: "persistence",
+            target: "notes-crdt",
             meeting_id = %meeting_id.0,
             folder = %folder.display(),
             "notes.ydoc + derived notes.json + notes.md saved"
@@ -277,7 +277,7 @@ impl NotesStore {
         write_atomic(&md_path, notes_md.as_bytes())?;
 
         tracing::debug!(
-            target: "persistence",
+            target: "notes-crdt",
             meeting_id = %meeting_id.0,
             folder = %folder.display(),
             update_len = update.len(),
@@ -411,7 +411,7 @@ impl NotesStore {
         write_atomic(&ydoc_path, &ydoc_bytes)?;
 
         tracing::info!(
-            target: "persistence",
+            target: "notes-crdt",
             meeting_id = %meeting_id.0,
             folder = %folder.display(),
             "seeded notes.ydoc from notes.json (pre-CRDT migration)"

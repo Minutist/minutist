@@ -33,7 +33,7 @@ impl MeetingFolder {
             .map_err(minutist_common::AppError::from)?;
 
         tracing::info!(
-            target: "persistence",
+            target: "notes-crdt",
             folder = %path.display(),
             "created meeting folder"
         );
@@ -230,7 +230,7 @@ impl MeetingFolder {
 
         if freshly_created {
             tracing::info!(
-                target: "persistence",
+                target: "notes-crdt",
                 folder = %path.display(),
                 "ensured inbound meeting folder (seeded placeholder metadata)"
             );

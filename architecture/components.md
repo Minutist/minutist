@@ -30,7 +30,7 @@ appears in:
 | `summariser` | 5 | `common` |
 | `notes-crdt` | WS4-B | `common` |
 | `persistence` | 1 (minimal) → 4 (full) | `common`, `notes-crdt` |
-| `model-registry` | 2 | `common`, `settings` |
+| `model-registry` | 2 | `common` |
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
 | `agent-tools` | 9 | `common`, `persistence`, `notes-crdt`, `orchestrator`, `rag-retrieval` |
@@ -203,8 +203,8 @@ connected `src-tauri` artefacts never link `headless`; it is built and shipped a
 its own binary, so the cleanliness invariant is that the free `src-tauri` build
 is unchanged and takes no edge to it — NOT that the crate is excluded from a
 workspace build. The daemon's dependencies are `common`, `persistence`,
-`sync`, `settings`, `tunnel-client` (⊕ — account-mediated peer discovery); it
-takes NO `tauri::*` / `ipc-bridge` edge and wires `sync::SyncEngine` into a
+`notes-crdt`, `sync`, `tunnel-client` (⊕ — account-mediated peer discovery);
+it takes NO `tauri::*` / `ipc-bridge` edge and wires `sync::SyncEngine` into a
 daemon directly. A post-launch GPU processing-node
 role adds `orchestrator` + the ML-runtime crates (`asr-runtime` / `asr-parakeet`
 / `diarizer` / `summariser` / `model-registry`) as a separate table update at

@@ -21,7 +21,7 @@ role when work is parallel.
 | `asr-parakeet` | ml-runtime-engineer | `crates/asr-parakeet/**` | Same | `common` |
 | `diarizer` | ml-runtime-engineer | `crates/diarizer/**` | Same | `common` |
 | `summariser` | ml-runtime-engineer | `crates/summariser/**` | Same | `common` |
-| `model-registry` | ml-runtime-engineer | `crates/model-registry/**` | Same | `common`, `settings` |
+| `model-registry` | ml-runtime-engineer | `crates/model-registry/**` | Same | `common` |
 | `notes-crdt` | data-engineer | `crates/notes-crdt/**` | Same | `common` |
 | `persistence` | data-engineer | `crates/persistence/**` | Same | `common`, `notes-crdt` |
 | `doc-convert` | data-engineer | `crates/doc-convert/**` | Same | `common` only — NO other workspace-component edge |

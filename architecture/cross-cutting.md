@@ -2503,6 +2503,9 @@ build CPU-only):
 - `resolve_gpu_plan(probe, mode, prefer_large_asr) -> GpuPlan` is **pure** (the
   probe is an input, so it unit-tests without a GPU) and returns
   `{ summariser_gpu, asr_gpu, effective_prefer_large }`.
+- `probe_and_resolve_gpu_plan(gpu_acceleration) -> (Option<GpuProbe>, GpuPlan)`
+  composes both (always passing `prefer_large_asr = true`) — the one call every
+  model-load decision site uses, so a decision never probes twice.
 
 **Policy.** Placement is **binary per model** (whole model on GPU or on CPU):
 partial layer offload is slower than CPU for models this small, and the existing

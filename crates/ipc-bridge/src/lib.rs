@@ -411,12 +411,7 @@ impl IpcState {
     /// `architecture/cross-cutting.md` — "GPU portability".
     pub fn log_gpu_probe(&self) {
         let s = self.settings.current();
-        let probe = minutist_common::probe_primary_gpu();
-        let plan = minutist_common::resolve_gpu_plan(
-            probe.as_ref(),
-            s.gpu_acceleration,
-            true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
-        );
+        let (probe, plan) = minutist_common::probe_and_resolve_gpu_plan(s.gpu_acceleration);
         match &probe {
             Some(p) => tracing::info!(
                 target: "app-main",

@@ -1816,6 +1816,19 @@ pub fn resolve_gpu_plan(
     }
 }
 
+/// Probe the primary GPU and resolve one [`GpuPlan`] from it, always
+/// requesting the large ASR tier (the VRAM clamp in [`resolve_gpu_plan`]
+/// downgrades to the small tier when it wouldn't fit). The single call every
+/// per-model-load decision should use — probing twice in one decision risks
+/// the two reads disagreeing. Returns the probe alongside the plan for
+/// callers (e.g. diagnostic logging) that also want the raw VRAM reading;
+/// callers that only need the plan can discard it.
+pub fn probe_and_resolve_gpu_plan(gpu_acceleration: GpuAcceleration) -> (Option<GpuProbe>, GpuPlan) {
+    let probe = probe_primary_gpu();
+    let plan = resolve_gpu_plan(probe.as_ref(), gpu_acceleration, true);
+    (probe, plan)
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostic report (issue #0014 — crash capture + "Report a problem")
 // ---------------------------------------------------------------------------

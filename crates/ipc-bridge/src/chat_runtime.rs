@@ -59,11 +59,7 @@ pub(crate) async fn ensure_summariser(
             // VRAM-aware plan: the summariser's GPU decision is `plan.summariser_gpu`
             // (the summariser is budgeted FIRST). See `architecture/cross-cutting.md`
             // — "GPU portability".
-            let plan = minutist_common::resolve_gpu_plan(
-                minutist_common::probe_primary_gpu().as_ref(),
-                settings.gpu_acceleration,
-                true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
-            );
+            let plan = minutist_common::probe_and_resolve_gpu_plan(settings.gpu_acceleration).1;
             let n_gpu_layers = commands::resolve_summariser_gpu_layers(plan.summariser_gpu);
             let summariser = tokio::task::spawn_blocking(move || {
                 commands::open_summariser_in_dir(&model_dir, n_gpu_layers)

@@ -278,11 +278,7 @@ impl Orchestrator {
     /// portability" and "ASR engine routing".
     fn gpu_plan(&self) -> minutist_common::GpuPlan {
         let s = self.settings.current();
-        minutist_common::resolve_gpu_plan(
-            minutist_common::probe_primary_gpu().as_ref(),
-            s.gpu_acceleration,
-            true, // always request the large tier; the VRAM clamp in resolve_gpu_plan decides
-        )
+        minutist_common::probe_and_resolve_gpu_plan(s.gpu_acceleration).1
     }
 
     pub async fn prewarm_asr(&self) {

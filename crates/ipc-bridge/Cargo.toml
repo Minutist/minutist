@@ -16,7 +16,6 @@ vulkan = ["summariser/vulkan", "orchestrator/vulkan", "chat-agent/vulkan", "embe
 metal = ["summariser/metal", "orchestrator/metal", "chat-agent/metal", "embedder/metal"]
 rocm = ["summariser/rocm", "orchestrator/rocm", "chat-agent/rocm", "embedder/rocm"]
 cuda = ["summariser/cuda", "orchestrator/cuda", "chat-agent/cuda", "embedder/cuda"]
-directml = ["orchestrator/directml"]
 
 [dependencies]
 async-trait = { workspace = true }

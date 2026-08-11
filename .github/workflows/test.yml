@@ -300,22 +300,21 @@ jobs:
   # GPU feature-graph gate. The CPU `test` job above never enables a GPU
   # feature, and build.yml only builds vulkan/metal (and only on push to main),
   # so a broken feature-forward (e.g. a renamed/typo'd asr-runtime/vulkan edge,
-  # or cuda/rocm/directml fan-out that no longer resolves) could merge green.
+  # or a cuda/rocm fan-out that no longer resolves) could merge green.
   #
   # This job validates the FULL GPU feature graph on every PR. For each backend
   # we resolve `cargo tree -e features`, which expands every inter-crate
   # feature-forward edge and exits non-zero if any edge is missing/renamed —
-  # WITHOUT invoking the C++/CUDA/ROCm/DirectML build scripts, so it needs no
-  # GPU toolkit installed. vulkan (Linux) and metal (macOS) are then
-  # additionally `cargo check`ed because their toolchain is present on the
-  # runner, validating the build-script/link path too.
+  # WITHOUT invoking the C++/CUDA/ROCm build scripts, so it needs no GPU
+  # toolkit installed. vulkan (Linux) and metal (macOS) are then additionally
+  # `cargo check`ed because their toolchain is present on the runner,
+  # validating the build-script/link path too.
   #
-  # cuda/rocm (NVIDIA/AMD toolkits absent), directml (Windows-only, SDK absent),
-  # and Windows vulkan (Vulkan SDK with glslc absent on windows-latest runners —
-  # the loader is present but llama.cpp CMake requires glslc from the full SDK)
-  # are graph-only: the goal is that a broken feature-forward fails CI, not a
-  # full kernel build. Windows vulkan is validated end-to-end by build.yml on
-  # push to main.
+  # cuda/rocm (NVIDIA/AMD toolkits absent) and Windows vulkan (Vulkan SDK with
+  # glslc absent on windows-latest runners — the loader is present but
+  # llama.cpp CMake requires glslc from the full SDK) are graph-only: the goal
+  # is that a broken feature-forward fails CI, not a full kernel build.
+  # Windows vulkan is validated end-to-end by build.yml on push to main.
   gpu-features:
     name: gpu-features (${{ matrix.os }})
     # Fork-PR guard: the Linux leg of this matrix runs on the self-hosted runner,
@@ -334,17 +333,17 @@ jobs:
           - os: [self-hosted, linux, x64]
             check_features: vulkan
             graph_features: cuda rocm
-          # macOS: metal is in the OS -> full check. (cuda/rocm/directml N/A.)
+          # macOS: metal is in the OS -> full check. (cuda/rocm N/A.)
           - os: macos-latest
             check_features: metal
             graph_features: ""
           # Windows: Vulkan SDK (full SDK with glslc) not present on
-          # windows-latest runners, so vulkan is graph-only here. directml,
-          # cuda, rocm also graph-only. Windows vulkan is fully checked in
-          # build.yml on push to main.
+          # windows-latest runners, so vulkan is graph-only here. cuda, rocm
+          # also graph-only. Windows vulkan is fully checked in build.yml on
+          # push to main.
           - os: windows-latest
             check_features: ""
-            graph_features: cuda rocm directml vulkan
+            graph_features: cuda rocm vulkan
 
     steps:
       - name: Checkout

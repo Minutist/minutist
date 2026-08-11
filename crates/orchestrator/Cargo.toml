@@ -15,12 +15,12 @@ test-source = ["audio-capture/test-source"]
 # GPU acceleration backends (Phase 7), OFF by default — fan out to the ML crates
 # orchestrator owns (asr-runtime + diarizer; summariser is reached via ipc-bridge,
 # not here — rule A5). vulkan/metal/rocm drive the llama.cpp-backed asr-runtime;
-# cuda also reaches the sherpa-backed diarizer; directml is diarizer-only.
+# cuda also reaches the sherpa-backed diarizer. No `directml` — neither
+# diarizer nor asr-parakeet exposes it (see their Cargo.tomls).
 vulkan = ["asr-runtime/vulkan"]
 metal = ["asr-runtime/metal"]
 rocm = ["asr-runtime/rocm"]
 cuda = ["asr-runtime/cuda", "diarizer/cuda", "asr-parakeet/cuda"]
-directml = ["diarizer/directml", "asr-parakeet/directml"]
 
 [dependencies]
 minutist-common = { path = "../common" }

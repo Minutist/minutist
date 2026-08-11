@@ -6,11 +6,12 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-# GPU acceleration backends, OFF by default — forward to sherpa-rs. sherpa-onnx
-# exposes CUDA and (Windows) DirectML; no Vulkan/Metal ONNX backend, so this
-# follows the diarizer in staying CPU (ONNX Runtime CPU EP) on those platforms.
+# GPU acceleration backend, OFF by default — forwards to sherpa-rs. No
+# `directml` feature: `ParakeetBackend::new` hardcodes the ONNX Runtime
+# provider string to `"cpu"` unconditionally (src/lib.rs), so a DirectML
+# feature would link without the backend ever requesting that provider; not
+# exposed until the provider selection is actually wired to the build feature.
 cuda = ["sherpa-rs/cuda"]
-directml = ["sherpa-rs/directml"]
 
 [dependencies]
 minutist-common = { path = "../common" }

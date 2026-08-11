@@ -150,21 +150,18 @@ jobs:
             ~/AppData/Local/ort.pyke.io
 
       # GPU feature-graph guard for the backends NOT bundled on this leg
-      # (cuda/rocm everywhere; directml on Windows — sherpa's DirectML backend).
-      # The bundled backend (vulkan/metal, matrix.features) is already validated
-      # by the build below; these toolkits aren't installed on the runner, so we
-      # only resolve the feature graph via `cargo tree -e features`, which
-      # expands every inter-crate feature-forward edge and fails if one is
-      # missing/renamed — without compiling any GPU kernel. This makes a broken
-      # feature-forward fail CI on push to main even for unbuilt backends.
+      # (cuda/rocm everywhere). The bundled backend (vulkan/metal,
+      # matrix.features) is already validated by the build below; these
+      # toolkits aren't installed on the runner, so we only resolve the
+      # feature graph via `cargo tree -e features`, which expands every
+      # inter-crate feature-forward edge and fails if one is missing/renamed —
+      # without compiling any GPU kernel. This makes a broken feature-forward
+      # fail CI on push to main even for unbuilt backends.
       - name: Validate GPU feature graph (unbundled backends)
         shell: bash
         run: |
           set -euo pipefail
           graph_features="cuda rocm"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            graph_features="cuda rocm directml"
-          fi
           for feat in $graph_features; do
             echo "::group::cargo tree -e features --features $feat"
             cargo tree -p minutist --no-default-features \

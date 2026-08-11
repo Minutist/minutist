@@ -27,7 +27,6 @@ vulkan = ["ipc-bridge/vulkan"]
 metal = ["ipc-bridge/metal"]
 rocm = ["ipc-bridge/rocm"]
 cuda = ["ipc-bridge/cuda"]
-directml = ["ipc-bridge/directml"]
 
 # Connected tier (Phase 10): in-process MCP server, bearer-token generation.
 # ON by default so `cargo build` / `cargo run` retain current behaviour.

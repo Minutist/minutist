@@ -2469,9 +2469,13 @@ SDK installed. Feature names match the backend they enable:
 
 - `vulkan` / `metal` / `cuda` / `rocm` forward to `llama-cpp-2/<backend>` (the
   ASR + summariser path).
-- `cuda` / `directml` forward to `sherpa-rs/<backend>` (the diarizer path);
-  there is no Vulkan/Metal diarization backend, so on those platforms the
-  diarizer stays on the ONNX Runtime CPU EP.
+- `cuda` forwards to `sherpa-rs/cuda` (the diarizer + Parakeet ASR path);
+  there is no Vulkan/Metal diarization backend, so on those platforms both
+  stay on the ONNX Runtime CPU EP. No `directml` feature: `diarizer` and
+  `asr-parakeet` both hardcode the ONNX Runtime provider string to CPU
+  regardless of build features, so a DirectML feature would link without ever
+  requesting that provider — not exposed until the provider selection is
+  actually wired to the build feature.
 
 Enabling a feature also offloads work to the device, but the per-model placement
 is a **VRAM-aware runtime** decision driven by the tri-state

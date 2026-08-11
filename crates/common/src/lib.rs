@@ -1626,12 +1626,14 @@ pub trait AsrBackend: Send {
 /// one behind `Box<dyn AsrBackend>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AsrEngine {
-    /// Parakeet TDT 0.6B v3 via sherpa-onnx. Primary for the languages it covers.
+    /// Parakeet TDT 0.6B v3 via sherpa-onnx. Primary for the languages it
+    /// covers when the GPU-Qwen tier isn't available.
     ParakeetEuV3,
     /// Qwen3-ASR 0.6B via llama-cpp-2 mtmd. Broad-language CPU default / fallback.
     Qwen06B,
-    /// Qwen3-ASR 1.7B via llama-cpp-2 mtmd. Opt-in GPU tier (broader + better
-    /// multilingual accuracy).
+    /// Qwen3-ASR 1.7B via llama-cpp-2 mtmd. GPU tier, preferred over Parakeet
+    /// for EVERY language once it fits in VRAM — real-world (non-clean-benchmark)
+    /// audio favours it over Parakeet even for English/EU.
     Qwen17B,
 }
 
@@ -1916,18 +1918,24 @@ pub struct DiagnosticReport {
 }
 
 /// Choose the ASR engine deterministically from the user's transcription-language
-/// setting (never by inspecting the audio — the language isn't known before
-/// transcription). Pure so the orchestrator and any future UI surface agree.
+/// setting and GPU capability (never by inspecting the audio — the language
+/// isn't known before transcription). Pure so the orchestrator and any future
+/// UI surface agree.
 ///
-/// - language in [`PARAKEET_LANGUAGES`] → [`AsrEngine::ParakeetEuV3`] (better
-///   English/EU accuracy + timestamps);
-/// - the `""` / `"auto"` sentinel (auto-detect) → Qwen (broadest coverage is the
-///   safe default when the language is unknown);
-/// - any other named language (Chinese, Japanese, …) → Qwen.
-///
-/// Within the Qwen branch, `prefer_gpu_qwen` selects the 1.7B GPU tier over the
-/// 0.6B CPU default.
+/// - `prefer_gpu_qwen` (the caller's resolved `GpuPlan::effective_prefer_large`)
+///   → [`AsrEngine::Qwen17B`], for every language including
+///   [`PARAKEET_LANGUAGES`]: on a GPU that fits the large tier, Qwen-1.7B
+///   out-transcribes Parakeet on real-world (non-clean-benchmark) audio, so it
+///   takes priority over the language-based route;
+/// - else, language in [`PARAKEET_LANGUAGES`] → [`AsrEngine::ParakeetEuV3`]
+///   (better English/EU accuracy + timestamps than the CPU-tier Qwen);
+/// - else (the `""` / `"auto"` sentinel, or any other named language such as
+///   Chinese/Japanese/…) → [`AsrEngine::Qwen06B`], the broad-coverage CPU
+///   default.
 pub fn asr_engine_for_language(transcription_language: &str, prefer_gpu_qwen: bool) -> AsrEngine {
+    if prefer_gpu_qwen {
+        return AsrEngine::Qwen17B;
+    }
     let lang = transcription_language.trim();
     let is_auto = lang.is_empty() || lang.eq_ignore_ascii_case("auto");
     if !is_auto
@@ -1936,8 +1944,6 @@ pub fn asr_engine_for_language(transcription_language: &str, prefer_gpu_qwen: bo
             .any(|l| l.eq_ignore_ascii_case(lang))
     {
         AsrEngine::ParakeetEuV3
-    } else if prefer_gpu_qwen {
-        AsrEngine::Qwen17B
     } else {
         AsrEngine::Qwen06B
     }
@@ -2192,13 +2198,18 @@ mod tests {
     }
 
     #[test]
-    fn asr_routing_gpu_flag_only_affects_the_qwen_branch() {
-        // Parakeet languages ignore the GPU-Qwen preference.
+    fn asr_routing_gpu_qwen_tier_takes_priority_over_parakeet_languages() {
+        // The GPU-Qwen preference overrides Parakeet languages, not just the
+        // Qwen branch: a GPU that fits the large tier out-transcribes Parakeet
+        // on English/EU audio too.
+        assert_eq!(asr_engine_for_language("English", true), AsrEngine::Qwen17B);
+        assert_eq!(asr_engine_for_language("French", true), AsrEngine::Qwen17B);
+        // Without the GPU tier, Parakeet languages still route to Parakeet.
         assert_eq!(
-            asr_engine_for_language("English", true),
+            asr_engine_for_language("English", false),
             AsrEngine::ParakeetEuV3
         );
-        // Qwen languages honour it: 1.7B when opted in, else 0.6B.
+        // Qwen languages honour it regardless: 1.7B when opted in, else 0.6B.
         assert_eq!(asr_engine_for_language("Chinese", true), AsrEngine::Qwen17B);
         assert_eq!(
             asr_engine_for_language("Chinese", false),

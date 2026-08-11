@@ -292,6 +292,16 @@ impl Orchestrator {
             plan.effective_prefer_large,
         );
 
+        // The large-tier GPU route only helps once the 1.7B weights are on
+        // disk; nothing else fetches it proactively (unlike the mandatory
+        // Qwen-0.6B onboarding download). Kick off a background fetch here so
+        // a GPU-qualifying routing decision (see `asr_engine_for_language`)
+        // is actually honoured on the next launch rather than silently
+        // falling back to whatever `init_asr_backend`'s fallback chain finds.
+        if engine == AsrEngine::Qwen17B {
+            self.spawn_asr_model_prefetch(engine);
+        }
+
         // Idempotent: skip if we already hold a backend for this engine.
         {
             let guard = self.prewarmed_asr.lock().expect("prewarm mutex poisoned");
@@ -355,6 +365,39 @@ impl Orchestrator {
                 );
             }
         }
+    }
+
+    /// Fire-and-forget background download of `engine`'s model when it is not
+    /// yet present, so a GPU-qualifying routing decision is honoured rather
+    /// than silently falling back to whatever is already on disk. Spawned
+    /// (never awaited) — the caller must not block on a multi-GB download. A
+    /// failure is logged and swallowed; `init_asr_backend`'s fallback chain
+    /// remains the safety net for the current call, and the next
+    /// `prewarm_asr` retries the fetch.
+    fn spawn_asr_model_prefetch(&self, engine: AsrEngine) {
+        let model_id = ModelId::from(runner::engine_model_id(engine));
+        let already_available = {
+            use minutist_common::ModelStatusState;
+            self.model_registry
+                .list_models()
+                .into_iter()
+                .find(|s| s.id == model_id)
+                .map(|s| matches!(s.status, ModelStatusState::Available { .. }))
+                .unwrap_or(false)
+        };
+        if already_available {
+            return;
+        }
+        let registry = Arc::clone(&self.model_registry);
+        tokio::spawn(async move {
+            if let Err(e) = registry.ensure(&model_id).await {
+                tracing::warn!(
+                    target: "orchestrator",
+                    "background ASR model prefetch failed for {}: {e}",
+                    model_id.0
+                );
+            }
+        });
     }
 
     /// Take the prewarmed backend if it matches `engine` (live-test UX T2).

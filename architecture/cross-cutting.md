@@ -422,28 +422,41 @@ CPU) and `asr-runtime` (llama-cpp-2 Qwen3-ASR — 52 languages/dialects, no
 timestamps; 0.6B CPU default + optional 1.7B GPU tier).
 
 The engine is chosen **deterministically from the user's `transcription_language`
-setting**, never by inspecting the audio (the language isn't known before
-transcription). The mapping is a pure function in `common`
+setting AND the resolved GPU plan**, never by inspecting the audio (the language
+isn't known before transcription). The mapping is a pure function in `common`
 (`asr_engine_for_language`) so the orchestrator and the UI agree:
 
-- language ∈ Parakeet's set (English + the 24 EU locales) → **Parakeet** (primary
-  — better English/EU accuracy + timestamps);
-- language ∈ Qwen-only (Chinese, Japanese, Korean, Arabic, …) → **Qwen**;
-- `Auto-detect` (the `""`/`"auto"` sentinel) → **Qwen** (broadest coverage is the
-  safe default when the language is unknown).
+- the GPU large-Qwen tier fits (`GpuPlan::effective_prefer_large`) → **Qwen-1.7B**,
+  for every language, INCLUDING Parakeet's set. Qwen-1.7B out-transcribes
+  Parakeet on real-world (non-clean-benchmark) audio, so once the large tier
+  fits it takes priority over the language route rather than only applying
+  within the Qwen branch;
+- else, language ∈ Parakeet's set (English + the 24 EU locales) → **Parakeet**
+  (better English/EU accuracy + timestamps than the CPU-tier Qwen);
+- else, language ∈ Qwen-only (Chinese, Japanese, Korean, Arabic, …), or
+  `Auto-detect` (the `""`/`"auto"` sentinel) → **Qwen-0.6B**.
 
-Within the Qwen branch, the **large tier (1.7B) is requested automatically** —
-the call sites pass `true` as the `prefer_large_asr` argument to
-`resolve_gpu_plan`, and the VRAM clamp inside that function decides whether the
-1.7B fits alongside whatever else is placed on GPU; if not, `effective_prefer_large`
-comes back `false` and the 0.6B is used instead. `GpuAcceleration::On` applies the
-same clamp. There is no user-facing "prefer large model" toggle: the large tier is
-always requested and the VRAM clamp is the sole decider, so no setting can force a
-1.7B that would not fit on the available GPU. The orchestrator
-resolves the engine once at recording start (and at re-transcribe) in
-`runner::build_asr_backend`, mirroring how it already resolves the language hint
-and GPU layers. `model-registry` only fetches the model(s) for the selected
-engine; pulling all three is opt-in (disk).
+The large tier is requested automatically — the call sites pass `true` as the
+`prefer_large_asr` argument to `resolve_gpu_plan`, and the VRAM clamp inside that
+function decides whether the 1.7B fits alongside whatever else is placed on GPU;
+if not, `effective_prefer_large` comes back `false` and the language route above
+applies instead. `GpuAcceleration::On` applies the same clamp. There is no
+user-facing "prefer large model" toggle: the large tier is always requested and
+the VRAM clamp is the sole decider, so no setting can force a 1.7B that would not
+fit on the available GPU. The orchestrator resolves the engine once at recording
+start (and at re-transcribe) in `runner::build_asr_backend`, mirroring how it
+already resolves the language hint and GPU layers.
+
+`model-registry` only fetches the model(s) for the selected engine; pulling all
+three is opt-in (disk) EXCEPT the large Qwen tier: because nothing else
+proactively fetches it (unlike the mandatory Qwen-0.6B onboarding download),
+`Orchestrator::prewarm_asr` spawns a background `ModelRegistry::ensure` for it
+whenever the routed engine resolves to `Qwen17B`, so a GPU-qualifying routing
+decision is actually honoured rather than silently falling back to whatever
+model happens to already be on disk (`spawn_asr_model_prefetch`, fire-and-forget,
+never blocks prewarm/startup). Parakeet itself is still download-on-demand only —
+a fresh English install without a qualifying GPU runs on Qwen-0.6B until the user
+downloads Parakeet from the Models surface.
 
 ## FFI null-safety at C-API boundaries
 

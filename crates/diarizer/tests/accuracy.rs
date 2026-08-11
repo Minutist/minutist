@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use diarizer::{DiarizerConfig, SherpaDiarizer};
-use minutist_common::{Diarizer, Segment};
+use minutist_common::Segment;
 
 const SAMPLE_RATE: u32 = 16_000;
 /// Speaker A occupies `[0, A_END_MS)` of the two-speaker fixture; speaker B the

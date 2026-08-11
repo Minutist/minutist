@@ -267,8 +267,8 @@ pub struct AudioChunk {
 
 /// One transcript segment with optional speaker assignment.
 ///
-/// Speaker is populated by the `Diarizer` impl post-hoc; ASR backends
-/// leave it `None`.
+/// Speaker is populated by `diarizer`'s post-hoc pass; ASR backends leave
+/// it `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Segment {
@@ -1947,33 +1947,6 @@ pub fn asr_engine_for_language(transcription_language: &str, prefer_gpu_qwen: bo
     } else {
         AsrEngine::Qwen06B
     }
-}
-
-/// Synchronous diarizer. Implementations live in `diarizer` (production).
-///
-/// Post-hoc only in v1: runs after the recording stops or as a
-/// user-triggered re-diarize. Not on the live path.
-///
-/// Threading: sync, called from `spawn_blocking`.
-pub trait Diarizer: Send {
-    /// Assign `speaker_id` to each segment by clustering speaker embeddings
-    /// extracted from `audio` over each segment's `[start_ms, end_ms]` window,
-    /// returning the (possibly longer) segment list plus the distinct-speaker
-    /// count.
-    ///
-    /// `audio` is the entire buffered recording at `sample_rate` Hz. `segments`
-    /// is the ASR output for the same recording, consumed by value: a segment
-    /// spanning a speaker change is split at the turn boundary, which GROWS the
-    /// list — an in-place `&mut [Segment]` slice cannot add elements, so the
-    /// owned list is taken in and returned out.
-    ///
-    /// Returns `(segments, speaker_count)`.
-    fn assign_speakers(
-        &self,
-        audio: &[f32],
-        sample_rate: u32,
-        segments: Vec<Segment>,
-    ) -> AppResult<(Vec<Segment>, u32)>;
 }
 
 /// Synchronous summariser. Implementations live in `summariser`

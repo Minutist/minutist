@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use asr_parakeet::{ParakeetBackend, ParakeetConfig};
 use diarizer::{DiarizerConfig, SherpaDiarizer};
-use minutist_common::{AsrBackend, AudioChunk, Diarizer, Segment};
+use minutist_common::{AsrBackend, AudioChunk, Segment};
 use persistence::read_audio_pcm;
 use vad_chunker::{default_model_path, VadChunker, VadConfig, VadEvent};
 

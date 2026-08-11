@@ -87,7 +87,7 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
                 // Components — one crate per component, depend only on `common`.
                 // ------------------------------------------------------------
 
-                common = component "common" "Shared interface types and trait definitions: Segment, AudioChunk, MeetingId, AsrBackend, Diarizer, Summariser, error types. The only crate every other component is allowed to depend on." "Rust crate: crates/common" {
+                common = component "common" "Shared interface types and trait definitions: Segment, AudioChunk, MeetingId, AsrBackend, Summariser, error types. The only crate every other component is allowed to depend on." "Rust crate: crates/common" {
                     tags "Component" "Shared"
                 }
 

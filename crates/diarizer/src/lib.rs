@@ -70,7 +70,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use minutist_common::{AppResult, Diarizer, Segment};
+use minutist_common::{AppResult, Segment};
 use sherpa_rs::diarize::{Diarize, DiarizeConfig};
 
 mod error;
@@ -460,21 +460,29 @@ fn sherpa_diarize_config(config: &DiarizerConfig) -> DiarizeConfig {
     }
 }
 
-impl Diarizer for SherpaDiarizer {
-    fn assign_speakers(
+impl SherpaDiarizer {
+    /// Assign `speaker_id` to each segment by clustering speaker embeddings
+    /// extracted from `audio` over each segment's `[start_ms, end_ms]` window,
+    /// returning the (possibly longer) segment list plus the distinct-speaker
+    /// count.
+    ///
+    /// `audio` is the entire buffered recording at `sample_rate` Hz. `segments`
+    /// is the ASR output for the same recording, consumed by value: a segment
+    /// spanning a speaker change is split at the turn boundary, which GROWS the
+    /// list — an in-place `&mut [Segment]` slice cannot add elements, so the
+    /// owned list is taken in and returned out.
+    ///
+    /// Test-only convenience: composes the two public seams (`compute_turns` +
+    /// `overlay_speakers`) with no voiceprint veto/merge. Production (the
+    /// orchestrator's split funnel) calls both directly when it needs the
+    /// cluster→letter map this discards.
+    pub fn assign_speakers(
         &self,
         audio: &[f32],
         sample_rate: u32,
         segments: Vec<Segment>,
     ) -> AppResult<(Vec<Segment>, u32)> {
-        // Compose the two public seams: compute the raw turns, then overlay them
-        // onto the ASR segments. The cluster→letter map is discarded here (the
-        // trait contract is `(Vec<Segment>, u32)`); the orchestrator's split
-        // funnel calls `compute_turns` + `overlay_speakers` directly when it needs
-        // the map.
         self.compute_turns(audio, sample_rate).map(|turns| {
-            // `assign_speakers` is the `common::Diarizer` trait implementation;
-            // it has no access to the voiceprint library so no veto verdicts or merge.
             let (segs, n, _map) = overlay_speakers(&turns, segments, &self.config, &[], &[]);
             (segs, n)
         })

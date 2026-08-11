@@ -502,7 +502,7 @@ used, not added here.
 `ProcessingLifecycle`, `ProcessingClaim`, `HostRef`,
 `ChatSession`, `ChatMessage`, `ChatRole`, `VoiceprintSuggestion`,
 `SyncStatus`, `TunnelStatus`),
-trait definitions (`AsrBackend`, `Diarizer`,
+trait definitions (`AsrBackend`,
 `Summariser`, `DocVlm`, `Embedder` — the last is **batch-first** (`embed_batch`
 primary; scalar `embed` default-delegates), and `ModelKind` carries an `Embed`
 variant for the retrieval embedder), the shared `AppError` enum + `AppResult<T>` alias,
@@ -1257,7 +1257,6 @@ from the Apache-2.0 Qwen models).
 **Crate:** `crates/diarizer`
 **Owns:** sherpa-onnx binding, the embedding + clustering pipeline.
 
-**Implements:** `Diarizer` from `common`.
 **Inputs:** the full buffered audio + the segment array from ASR.
 **Outputs:** mutates segments in place, setting `speaker_id`.
 
@@ -1281,8 +1280,10 @@ normalise to first-seen-order labels (`A`, `B`, …) before populating
 
 **Phase 6 — public surface + model bundle (license-verified 2026-06).** The
 crate exposes `SherpaDiarizer::open(seg_onnx, emb_onnx, DiarizerConfig)` and
-`impl Diarizer` (`assign_speakers(audio, sample_rate=16000, Vec<Segment>) ->
-(Vec<Segment>, u32)`), which runs sherpa `Diarize::compute`, relabels first-seen
+the test-only inherent method `assign_speakers(audio, sample_rate=16000,
+Vec<Segment>) -> (Vec<Segment>, u32)` (not a trait impl — production calls
+`compute_turns` + `overlay_speakers` directly, below), which runs sherpa
+`Diarize::compute`, relabels first-seen
 `A`/`B`/…, and overlays `speaker_id` onto the ASR segments by max-overlap
 interval-join. The raw turns are exposed as a diarizer-public POD
 `SpeakerTurn { start_ms, end_ms, cluster: i32 }` (deliberately NOT a
@@ -1316,10 +1317,10 @@ MIT + Apache NOTICE/attribution (the k2-fsa / HF mirrors don't carry the
 upstream notices).
 
 **Implementation (Phase 6 Stream S1).** `SherpaDiarizer::open` constructs the
-`sherpa_rs::diarize::Diarize` engine once and holds it behind a `Mutex` (the
-`common::Diarizer` trait takes `&self`; sherpa's `compute` takes `&mut self`,
-and diarization is single-threaded per call so the mutex is never contended on
-the hot path). `DiarizerConfig` maps onto sherpa's `DiarizeConfig`:
+`sherpa_rs::diarize::Diarize` engine once and holds it behind a `Mutex`
+(`compute_turns`/`assign_speakers` take `&self`; sherpa's `compute` takes
+`&mut self`, and diarization is single-threaded per call so the mutex is
+never contended on the hot path). `DiarizerConfig` maps onto sherpa's `DiarizeConfig`:
 `num_clusters = Some(n)` → exact-cluster mode; `None` → `num_clusters = Some(-1)`
 (sherpa's "use threshold" sentinel, Spike 4) with `cluster_threshold`, plus
 sherpa's `min_duration_on` / `min_duration_off` smoothing. The orchestrator
@@ -1447,9 +1448,9 @@ here so the reviewer sees the decision.
 into the orchestrator (see the `orchestrator` "Phase B — live
 diarization wiring" note) WITHOUT adding a dependency edge or a `common`-level
 trait: the `orchestrator → diarizer` edge already exists,
-`OnlineDiarizer` is re-exported from the `diarizer` crate, and the live path stays
-a concrete struct (no second `common` trait — the existing `common::Diarizer`
-trait is offline-only and unchanged). No new crate-dependency edge is introduced —
+`OnlineDiarizer` is re-exported from the `diarizer` crate, and the live path
+stays a concrete struct alongside the offline `SherpaDiarizer`, with no
+`common`-level trait for either. No new crate-dependency edge is introduced —
 `sherpa-rs` is already a `diarizer` dependency, and `EmbeddingExtractor` /
 `ExtractorConfig` live in `sherpa_rs::speaker_id` within the same crate. Tests: the pure `OnlineClusterer` is covered model-free in
 `src/online/clusterer.rs` (separation, stickiness, threshold split, centroid
@@ -1534,7 +1535,7 @@ pub fn overlay_speakers(
 ```
 
 `surviving_clusters` (private) gains the same `veto_ids: &[i32]` parameter from WU7.
-`assign_speakers` (the one-shot `Diarizer` impl entry point) passes `&[]` for both
+`assign_speakers` (the test-only one-shot convenience entry point) passes `&[]` for both
 — the veto and merge are only exercised when the orchestrator calls
 `overlay_speakers` directly with populated lists.
 
@@ -2725,9 +2726,9 @@ depend on `persistence` (the orchestrator sources audio through
   thread.)
 - **#0015 phase 4 — re-ASR split of mixed Qwen segments.** The blocking core is
   the free fn `diarize_split_merge(turns, segments, pcm, Option<backend>, config,
-  …)` — turns + backend are EXPLICIT params (it does NOT dispatch through the
-  `common::Diarizer` trait), so the default suite drives the whole split with
-  stub-supplied turns + a stub `AsrBackend` (no `SherpaDiarizer`, no Qwen GGUF),
+  …)` — turns + backend are EXPLICIT params, so the default suite drives the
+  whole split with stub-supplied turns + a stub `AsrBackend` (no
+  `SherpaDiarizer`, no Qwen GGUF),
   mirroring `transcribe_pcm_window_blocking`'s stub seam. The async caller builds
   the `SherpaDiarizer` + the routed Qwen backend best-effort
   (`runner::build_asr_backend_for_retranscribe`; absent model → `None` → degrade

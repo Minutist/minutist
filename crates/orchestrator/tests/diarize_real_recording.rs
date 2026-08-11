@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use diarizer::{DiarizerConfig, SherpaDiarizer};
-use minutist_common::{Diarizer, Segment};
+use minutist_common::Segment;
 use persistence::read_audio_pcm;
 
 fn env_ne(k: &str) -> Option<String> {

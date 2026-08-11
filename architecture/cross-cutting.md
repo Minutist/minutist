@@ -164,8 +164,8 @@ drain-loop thread and rides a parallel `speaker_ids` column
 authoritative: when `diarization_enabled` is true, the whole-transcript
 rewrite on stop overwrites the live labels with the offline result. The
 wiring adds no dependency edge (the `orchestrator → diarizer` edge pre-exists)
-and no `common`-level online trait (the live path is a concrete struct;
-the existing `common::Diarizer` trait stays offline-only).
+and no `common`-level trait for either path — the live `OnlineDiarizer` and the
+offline `SherpaDiarizer` are both concrete structs.
 
 **Real-time capture-callback invariant.** The cpal audio callback — and, on
 Windows, the WASAPI communications-mode capture thread that substitutes for it

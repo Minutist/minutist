@@ -34,6 +34,7 @@ use std::{
 };
 
 use minutist_common::{AppError, AppResult, AttachmentEntry, AttachmentId, ConversionState, MeetingId};
+use notes_crdt::MeetingFolder;
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;
@@ -73,12 +74,12 @@ fn manifest_lock(id: MeetingId) -> Arc<Mutex<()>> {
 
 /// `{root}/{meeting_id}/attachments/`
 fn attachments_dir(root: &Path, meeting_id: MeetingId) -> PathBuf {
-    root.join(meeting_id.0.to_string()).join("attachments")
+    MeetingFolder::open(root, meeting_id).attachments_dir()
 }
 
 /// `{root}/{meeting_id}/attachments/attachments.json`
 fn manifest_path(root: &Path, meeting_id: MeetingId) -> PathBuf {
-    attachments_dir(root, meeting_id).join("attachments.json")
+    MeetingFolder::open(root, meeting_id).attachments_manifest_path()
 }
 
 // ---------------------------------------------------------------------------

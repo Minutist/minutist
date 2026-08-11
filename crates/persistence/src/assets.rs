@@ -29,13 +29,14 @@
 use std::path::Path;
 
 use minutist_common::{AppResult, MeetingId};
+use notes_crdt::MeetingFolder;
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;
 
 /// Resolve `{root}/{meeting_id}/assets/`.
 fn assets_dir(root: &Path, meeting_id: MeetingId) -> std::path::PathBuf {
-    root.join(meeting_id.0.to_string()).join("assets")
+    MeetingFolder::open(root, meeting_id).assets_dir()
 }
 
 /// Persist a note image `bytes` under the meeting's `assets/` directory and

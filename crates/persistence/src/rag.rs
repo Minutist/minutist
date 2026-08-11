@@ -37,6 +37,7 @@ use minutist_common::{
     voiceprint_math::{cmp_desc_finite_first, cosine_unit},
     AppResult,
 };
+use notes_crdt::MeetingFolder;
 
 use crate::blob::{blob_to_f32_vec, f32_slice_to_blob};
 use crate::error::Error;
@@ -50,8 +51,8 @@ pub fn meeting_db_path(
     meetings_dir: &Path,
     meeting_id: minutist_common::MeetingId,
 ) -> std::path::PathBuf {
-    meetings_dir
-        .join(meeting_id.0.to_string())
+    MeetingFolder::open(meetings_dir, meeting_id)
+        .path()
         .join("meeting.db")
 }
 

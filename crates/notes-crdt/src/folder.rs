@@ -44,13 +44,28 @@ impl MeetingFolder {
         })
     }
 
+    /// Build a handle for a meeting folder ASSUMED to already exist at
+    /// `{root}/{meeting_id}/` — pure path construction, no I/O, no existence
+    /// check. The one place that knows the on-disk layout (`{root}/{uuid}/`),
+    /// for callers that need a path into an existing folder rather than to
+    /// create one — use [`Self::create`] for a brand-new folder,
+    /// [`Self::ensure`] to idempotently create one, or
+    /// [`Self::open_existing`] when the folder's absence must be an error.
+    pub fn open(root: &Path, meeting_id: MeetingId) -> Self {
+        Self {
+            path: root.join(meeting_id.0.to_string()),
+            id: meeting_id,
+        }
+    }
+
     /// Open a handle to an already-existing per-meeting directory.
     ///
     /// Fails with `Error::MeetingNotFound` if the folder is absent — unlike
-    /// [`Self::create`], this never creates anything. The seam for promoting
-    /// an existing "New meeting" prep draft to an active recording: the
-    /// folder (and its `metadata.json` + `notes.ydoc`) already exist from
-    /// draft creation, only the audio capture is new.
+    /// [`Self::create`], this never creates anything, and unlike
+    /// [`Self::open`] it checks. The seam for promoting an existing "New
+    /// meeting" prep draft to an active recording: the folder (and its
+    /// `metadata.json` + `notes.ydoc`) already exist from draft creation,
+    /// only the audio capture is new.
     pub fn open_existing(root: &Path, meeting_id: MeetingId) -> AppResult<Self> {
         let path = root.join(meeting_id.0.to_string());
 
@@ -300,6 +315,20 @@ pub fn list_meeting_ids(root: &Path) -> Vec<MeetingId> {
 mod tests {
     use super::*;
     use crate::read_metadata;
+
+    #[test]
+    fn open_derives_the_path_without_touching_disk() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = MeetingId::new();
+
+        let folder = MeetingFolder::open(dir.path(), id);
+        assert_eq!(folder.path(), dir.path().join(id.0.to_string()));
+        assert_eq!(folder.id(), id);
+        assert!(
+            !folder.path().exists(),
+            "open must not create the folder on disk"
+        );
+    }
 
     #[test]
     fn ensure_creates_folder_and_seeds_metadata() {

@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use minutist_common::fs::write_atomic;
 use minutist_common::{AppResult, ChatSession, ChatSessionId, MeetingId};
+use notes_crdt::MeetingFolder;
 
 use crate::error::Error;
 
@@ -38,7 +39,7 @@ pub struct ChatStore;
 impl ChatStore {
     /// The `{root}/{meeting_id}/chat/` directory for a meeting.
     fn chat_dir(root: &Path, meeting_id: MeetingId) -> PathBuf {
-        root.join(meeting_id.0.to_string()).join("chat")
+        MeetingFolder::open(root, meeting_id).path().join("chat")
     }
 
     /// The `{root}/{meeting_id}/chat/{session_id}.json` path for one session.

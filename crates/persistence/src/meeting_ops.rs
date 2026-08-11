@@ -24,6 +24,7 @@
 use std::path::Path;
 
 use minutist_common::{AppResult, CollectionId, MeetingId, ProcessingLifecycle};
+use notes_crdt::MeetingFolder;
 
 use crate::error::Error;
 use crate::index::MeetingIndex;
@@ -87,7 +88,7 @@ pub async fn rename_meeting(
     })?;
 
     // Refresh the index row to match the renamed meeting.
-    let folder = meetings_root.join(id.0.to_string());
+    let folder = MeetingFolder::open(meetings_root, id).path().to_path_buf();
     let entry = list_entry_from(&folder)?;
     index.upsert(&entry).await?;
 
@@ -125,7 +126,7 @@ pub async fn set_meeting_collection(
     })?;
 
     // Refresh the index row so the derived `collection_id` mirror matches.
-    let folder = meetings_root.join(id.0.to_string());
+    let folder = MeetingFolder::open(meetings_root, id).path().to_path_buf();
     let entry = list_entry_from(&folder)?;
     index.upsert(&entry).await?;
 
@@ -300,7 +301,7 @@ pub async fn delete_meeting(
     index: &MeetingIndex,
     id: MeetingId,
 ) -> AppResult<()> {
-    let folder = meetings_root.join(id.0.to_string());
+    let folder = MeetingFolder::open(meetings_root, id).path().to_path_buf();
 
     match std::fs::remove_dir_all(&folder) {
         Ok(()) => {}

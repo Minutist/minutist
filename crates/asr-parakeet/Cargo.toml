@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 [features]
 # GPU acceleration backend, OFF by default — forwards to sherpa-rs. No

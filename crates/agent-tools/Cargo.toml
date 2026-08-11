@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Phase 9: the shared tool layer. One `Tool` trait + one `ToolRegistry`; the
 # single place a chat-agent / MCP tool is defined. Edges: common, persistence,

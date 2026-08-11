@@ -24,27 +24,6 @@
 #   MIT-0         MIT No Attribution — public-domain-equivalent (dunce).
 #   Unlicense     Public-domain dedication — permissive, acceptable.
 
-# Throwaway spike crates (spikes/*) are excluded from the crate graph: they are
-# scratch experiments that never ship (CLAUDE.local.md), so their dependencies
-# should not gate CI on advisories or licences.  This is FORWARD-LOOKING hygiene,
-# not a current fix: today it is a no-op for all four legs (removing this list
-# still passes), because the crates unique to the spikes — e.g. pdfium-render via
-# spike-doc-vlm — carry clean (MIT/Apache) licences and no active advisory.  The
-# licence rejections that were cleared came from the zip/image feature trims, not
-# from this exclusion.  Crates a real application crate also depends on are
-# unaffected — exclude only removes a crate and the dependencies unique to it.
-# Latent caveat (accepted per policy): a future spike dep with a GPL/denied
-# licence or a live advisory will NOT gate CI while it is spike-only.  If a spike
-# is ever promoted to a real crate, remove it from this list so its dependencies
-# re-enter the graph and are audited.
-exclude = [
-    "spike-asr",
-    "spike-llm",
-    "spike-vad-loop",
-    "spike-diarize",
-    "spike-doc-vlm",
-]
-
 [graph]
 # Resolve the full workspace to catch every crate's licence, but only check
 # the crates that actually make it into a build (no [dev-dependencies]-only

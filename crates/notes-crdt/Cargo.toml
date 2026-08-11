@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Leaf crate carrying the notes-CRDT primitives shared by `persistence` (which
 # re-exports them at its existing paths) and `sync` (which transports the

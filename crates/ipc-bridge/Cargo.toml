@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # The ONLY non-app-main crate allowed to import `tauri::*`.
 # See architecture/domain-ownership.md — `ipc-bridge` / `systems-engineer` role.

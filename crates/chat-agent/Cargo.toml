@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Phase 9: the stateless, OpenAI-compatible, tool-calling chat TURN engine over
 # the bundled local LLM. Sits ABOVE summariser (the loaded-model substrate) and

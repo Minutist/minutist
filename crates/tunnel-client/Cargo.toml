@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # WS4-A S3b: the app-side half of the connected-tier tunnel. It dials the hosted
 # relay over WSS, receives framed MCP HTTP requests, and replays them against the

@@ -26,11 +26,6 @@ members = [
     "crates/headless",
     "crates/election",
     "src-tauri",
-    "spikes/asr",
-    "spikes/llm",
-    "spikes/vad-loop",
-    "spikes/diarize",
-    "spikes/doc-vlm-spike",
 ]
 
 [workspace.package]
@@ -38,6 +33,7 @@ edition = "2021"
 version = "0.1.0"
 license = "AGPL-3.0-only"
 authors = ["Andrew Leech <andrew@alelec.net>"]
+publish = false
 
 [workspace.dependencies]
 # Existing

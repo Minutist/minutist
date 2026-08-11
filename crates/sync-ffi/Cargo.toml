@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Android FFI wrapper over the `sync` crate's `SyncEngine` (WS4-B, phone
 # companion / issue 0016). UniFFI exposes the transport subset to Kotlin; the

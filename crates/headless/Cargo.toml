@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # WS4-B: the user-installed headless server daemon (`minutist-hub`). The user
 # runs it as an always-on service on their OWN hardware; it pairs into the device

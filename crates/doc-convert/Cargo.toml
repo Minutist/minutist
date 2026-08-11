@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Owner role: data-engineer.
 # Converts raw document bytes to markdown for the summariser reference-material

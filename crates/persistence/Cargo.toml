@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Phase 4 full surface: readers (incl. graduated Opus decoder), the libsql
 # `index.db` index + forward-only migration runner + rebuild-from-disk,

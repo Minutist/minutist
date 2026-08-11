@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Phase 1 Stream D: minimal state machine (start/stop/pause, audio meter forwarding).
 # The live pipeline (VAD → ASR → events) lands in Phase 2 — do NOT preempt that.

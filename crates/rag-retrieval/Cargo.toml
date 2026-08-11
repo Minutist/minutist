@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Owner role: ml-runtime-engineer.
 # Retrieval-augmented context for the meeting agent (iGPU tier): chunk attachment

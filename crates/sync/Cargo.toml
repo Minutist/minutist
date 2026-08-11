@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # WS4-B: device-to-device sync over iroh. The crate exchanges Yjs notes-updates
 # (a small custom QUIC protocol) and content-addressed meeting media (audio +

@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+publish.workspace = true
 
 # Phase 10: the in-process Streamable HTTP MCP server. A SECOND consumer of the
 # Phase-9 `agent-tools` registry — it adds NO tools, projecting

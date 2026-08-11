@@ -60,4 +60,26 @@ describe("meetings store — terminal-event refreshes (T6 / T3)", () => {
     expect(openMeeting).toHaveBeenCalledWith("m1");
     expect(listMeetings).toHaveBeenCalledOnce();
   });
+
+  it("meeting_finalised clears the STALE pre-recording openMeetingState synchronously, not just openMeetingId", () => {
+    // Simulate: this meeting was open as a "New meeting" prep draft
+    // (recording_started: false) right before it was promoted and recorded.
+    useMeetingsStore.setState({
+      openMeetingId: "m1",
+      openMeetingState: {
+        meta: { recording_started: false } as never,
+        transcript: [],
+      },
+    });
+
+    const event: AppEvent = { kind: "meeting_finalised", meeting_id: "m1" };
+    useMeetingsStore.getState().handleEvent(event);
+
+    // Cleared in the SAME synchronous update as openMeetingId — never left
+    // holding the pre-recording draft snapshot while the async re-open is in
+    // flight (that combination reads as "an open, unstarted draft" to
+    // MeetingControls/MainWindow — a real press of Start or Discard in that
+    // window would truncate or delete the meeting that was just recorded).
+    expect(useMeetingsStore.getState().openMeetingState).toBeNull();
+  });
 });

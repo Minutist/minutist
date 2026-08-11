@@ -21,7 +21,7 @@ use crate::error::Error;
 
 /// The schema version this build of `persistence` targets. Bump this and add a
 /// matching arm in [`apply_migration`] when the schema changes.
-pub const CURRENT_VERSION: i64 = 2;
+pub const CURRENT_VERSION: i64 = 3;
 
 /// Bring `conn`'s schema up to [`CURRENT_VERSION`].
 ///
@@ -159,6 +159,17 @@ async fn apply_migration(conn: &Connection, version: i64) -> Result<(), Error> {
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_meetings_collection_id
                  ON meetings (collection_id)",
+                (),
+            )
+            .await?;
+            Ok(())
+        }
+        3 => {
+            // Mirrors `MeetingMeta::recording_started`: `false` marks an
+            // unstarted "New meeting" prep draft. Default 1 (true) so every
+            // existing row (all of which are real recordings) is unaffected.
+            conn.execute(
+                "ALTER TABLE meetings ADD COLUMN recording_started INTEGER NOT NULL DEFAULT 1",
                 (),
             )
             .await?;

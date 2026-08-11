@@ -643,7 +643,26 @@ pub struct MeetingMeta {
     /// `planning/DESIGN_processing-lifecycle.md`.
     #[serde(default)]
     pub processing: ProcessingLifecycle,
+    /// Whether audio capture has ever started for this meeting. `false` only
+    /// for a meeting created via the "New meeting" prep flow before the user
+    /// presses Start — the meeting list surfaces these as resumable drafts.
+    ///
+    /// `#[serde(default = "default_recording_started")]` = `true`, so every
+    /// pre-existing `metadata.json` (written before this field existed) and
+    /// the sync-arrival placeholder ([`crate::MeetingFolder::ensure`], defined
+    /// in `notes-crdt`) both read as "not a draft" by default. This is NOT a
+    /// converged value: the field is not carried in the meta CRDT, so a peer
+    /// that syncs an origin's still-unpromoted draft (title/notes with no
+    /// audio) reads `true` here regardless — a known gap, tracked as a
+    /// follow-up alongside the wider question of whether an unpromoted draft
+    /// should sync at all before it has real content.
+    #[serde(default = "default_recording_started")]
+    pub recording_started: bool,
     pub app_version: String,
+}
+
+const fn default_recording_started() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -677,6 +696,10 @@ pub struct MeetingListEntry {
     /// `None` = unfiled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection_id: Option<CollectionId>,
+    /// Mirrors [`MeetingMeta::recording_started`] — `false` marks an unstarted
+    /// draft so the list can show it as resumable without a per-row disk read.
+    #[serde(default = "default_recording_started")]
+    pub recording_started: bool,
 }
 
 /// A user-facing "folder" that groups meetings (UI label: "Folders").
@@ -2493,6 +2516,7 @@ mod tests {
             notes_format: 0,
             processing: Default::default(),
             collection_id: None,
+            recording_started: true,
             app_version: "0.0.0".to_string(),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -2569,6 +2593,7 @@ mod tests {
             speaker_count: 2,
             excerpt: None,
             collection_id: None,
+            recording_started: true,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains("excerpt"), "absent excerpt must be omitted");
@@ -2598,6 +2623,7 @@ mod tests {
             notes_format: 0,
             processing: Default::default(),
             collection_id: None,
+            recording_started: true,
             app_version: "0.0.0".to_string(),
         };
         let segment = Segment {

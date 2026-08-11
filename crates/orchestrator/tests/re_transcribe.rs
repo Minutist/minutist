@@ -100,6 +100,7 @@ fn write_synthetic_meeting(root: &Path, title: &str, first_text: &str) -> Meetin
         notes_format: 0,
         processing: Default::default(),
         collection_id: None,
+        recording_started: true,
         app_version: "0.0.0".into(),
     };
     std::fs::write(
@@ -530,6 +531,7 @@ fn build_meeting_with_audio(root: &Path, title: &str, samples: &[f32]) -> Meetin
         notes_format: 0,
         processing: Default::default(),
         collection_id: None,
+        recording_started: true,
         app_version: "0.0.0".into(),
     };
     let folder = writer.finalise(meta).expect("finalise writer");

@@ -22,16 +22,34 @@ async listDevices() : Promise<Result<AudioDevice[], AppError>> {
 }
 },
 /**
- * Start a new recording session.
+ * Create a "New meeting" prep draft: a real, durable meeting folder
+ * (`metadata.json` + `notes.ydoc`) with no audio yet, so a title, notes, and
+ * attachments can be added before recording ever starts.
+ * 
+ * Routes DIRECTLY to `persistence::writer::create_draft` (no orchestrator —
+ * the meeting has no live recording state until `start_recording` promotes
+ * it), mirroring `add_attachment`'s direct-to-persistence routing.
+ */
+async createMeeting() : Promise<Result<MeetingId, AppError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("create_meeting") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start recording into an existing "New meeting" prep draft (created via
+ * [`create_meeting`]).
  * 
  * `device_id = None` → use the device configured in settings, or the OS
  * default if none is configured.
  * 
- * Returns the new `MeetingId` on success.
+ * Returns `meeting_id` on success.
  */
-async startRecording(deviceId: string | null) : Promise<Result<MeetingId, AppError>> {
+async startRecording(meetingId: MeetingId, deviceId: string | null) : Promise<Result<MeetingId, AppError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("start_recording", { deviceId }) };
+    return { status: "ok", data: await TAURI_INVOKE("start_recording", { meetingId, deviceId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -80,12 +98,14 @@ async resumeRecording() : Promise<Result<null, AppError>> {
 }
 },
 /**
- * Set the meeting title for the LIVE recording (the active meeting has no
- * `metadata.json` yet, so this cannot route through `rename_meeting`). Held in
- * the orchestrator's in-progress state and consumed by `stop()` in place of the
- * `Recording <timestamp>` default; a no-op if `meeting_id` is not the meeting
- * currently recording/paused. Trimmed + capped so the UI cannot persist an
- * unbounded value (mirrors the speaker-name / collection-name caps).
+ * Set the meeting title WHILE actively recording. Held in the orchestrator's
+ * in-progress state (not written to `metadata.json` immediately) and
+ * consumed by `stop()`, which prefers it over whatever title is already on
+ * disk (e.g. one set via `rename_meeting` during the "New meeting" prep
+ * phase, before recording started); a no-op if `meeting_id` is not the
+ * meeting currently recording/paused. Trimmed + capped so the UI cannot
+ * persist an unbounded value (mirrors the speaker-name / collection-name
+ * caps).
  */
 async setRecordingTitle(meetingId: MeetingId, title: string) : Promise<Result<null, AppError>> {
     try {
@@ -1821,7 +1841,12 @@ excerpt?: string | null;
  * a derived mirror of [`MeetingMeta::collection_id`] for filtered listing.
  * `None` = unfiled.
  */
-collection_id?: CollectionId | null }
+collection_id?: CollectionId | null; 
+/**
+ * Mirrors [`MeetingMeta::recording_started`] — `false` marks an unstarted
+ * draft so the list can show it as resumable without a per-row disk read.
+ */
+recording_started?: boolean }
 /**
  * Per-meeting metadata persisted as `metadata.json`.
  * 
@@ -1876,7 +1901,23 @@ collection_id?: CollectionId | null;
  * defaulted-field pattern `notes_format` uses. See
  * `planning/DESIGN_processing-lifecycle.md`.
  */
-processing?: ProcessingLifecycle; app_version: string }
+processing?: ProcessingLifecycle; 
+/**
+ * Whether audio capture has ever started for this meeting. `false` only
+ * for a meeting created via the "New meeting" prep flow before the user
+ * presses Start — the meeting list surfaces these as resumable drafts.
+ * 
+ * `#[serde(default = "default_recording_started")]` = `true`, so every
+ * pre-existing `metadata.json` (written before this field existed) and
+ * the sync-arrival placeholder ([`crate::MeetingFolder::ensure`], defined
+ * in `notes-crdt`) both read as "not a draft" by default. This is NOT a
+ * converged value: the field is not carried in the meta CRDT, so a peer
+ * that syncs an origin's still-unpromoted draft (title/notes with no
+ * audio) reads `true` here regardless — a known gap, tracked as a
+ * follow-up alongside the wider question of whether an unpromoted draft
+ * should sync at all before it has real content.
+ */
+recording_started?: boolean; app_version: string }
 /**
  * The full restorable state of a meeting, assembled by `persistence` for
  * `open_meeting`: metadata, transcript segments, and the notes document
@@ -2293,8 +2334,10 @@ chat_system_prompt?: string;
  * Selected summary prompt preset (Phase 9 — D4). Drives the effective
  * summary prompt via [`preset_prompt`] UNLESS `summary_system_prompt` is a
  * non-empty user override (see [`Settings::effective_summary_prompt`]).
- * `#[serde(default)]` defaults to [`SummaryPreset::Default`] (the prior
- * behaviour); an older store deserialises to `Default`.
+ * `#[serde(default)]` defaults to [`SummaryPreset::Detailed`] (the app
+ * default — a full-detail record); an older store that predates this field
+ * deserialises to `Detailed`, so an existing user who never picked a preset
+ * also gets the detailed summary going forward.
  */
 summary_preset?: SummaryPreset; 
 /**
@@ -2340,6 +2383,18 @@ mcp_write_tools?: boolean;
  * Agent/stop lifecycle.
  */
 auto_summarise_on_stop?: boolean; 
+/**
+ * Start recording immediately when creating a new meeting.
+ * 
+ * When `false` (the default), a new meeting opens on the "New meeting"
+ * prep screen — set a title, write notes, attach resources — and the
+ * user starts recording explicitly via a separate action. When `true`,
+ * restores the legacy behaviour: recording starts the moment a new
+ * meeting is created. `#[serde(default = ...)]` defaults to `false`; an
+ * older store written before this field existed also deserialises to
+ * `false`.
+ */
+auto_start_recording_on_new_meeting?: boolean; 
 /**
  * Preload the summary/chat LLM at app startup and keep it resident.
  * 
@@ -2478,8 +2533,8 @@ live_agent_system_prompt?: string }
  */
 export type SummaryPreset = 
 /**
- * Structured summary: Summary / Key Decisions / Action Items. The prior
- * (pre-preset) default behaviour.
+ * Concise structured summary: Summary / Key Decisions / Action Items. The
+ * prior (pre-preset) behaviour — a high-level overview.
  */
 "default" | 
 /**
@@ -2492,7 +2547,10 @@ export type SummaryPreset =
  */
 "action_items" | 
 /**
- * A thorough, sectioned summary covering topics, discussion and outcomes.
+ * A thorough, detailed record: every substantive point, question-and-answer,
+ * and suggestion, organised by topic. The default — a concise overview is too
+ * high-level to be useful, so a synced/processed meeting gets the full detail
+ * unless the user picks a lighter preset.
  */
 "detailed"
 /**

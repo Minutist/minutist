@@ -547,6 +547,7 @@ mod diarization {
             notes_format: 0,
             processing: Default::default(),
             collection_id: None,
+            recording_started: true,
             app_version: "0.0.0".into(),
         };
         let folder = writer.finalise(meta).expect("finalise");
@@ -1036,6 +1037,75 @@ mod diarization {
         assert_eq!(
             meta.title, "Quarterly planning",
             "stop() must use the trimmed live title"
+        );
+    }
+
+    /// A title already on disk (e.g. set during the "New meeting" prep phase,
+    /// before recording started) survives `stop()` when no LIVE title was
+    /// typed during the recording — `stop()`'s metadata.json write is a raw
+    /// overwrite driven entirely by the `MeetingMeta` it builds, so it must
+    /// fall back to the on-disk title rather than synthesizing the
+    /// `Recording <timestamp>` default over a real prep-phase title.
+    #[tokio::test]
+    async fn stop_falls_back_to_the_on_disk_title_when_no_live_title_was_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        let source = DummyAudioSource::new(3200, 1600);
+        let streams = source.generate_streams(5, 32, 64);
+        let meeting_id = orch.start_with_streams(streams).await.expect("start");
+
+        // Simulate a title already on disk (the prep-phase rename path),
+        // without going through `set_pending_title` (the LIVE-recording path).
+        persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
+            meta.title = "Prepped title".to_string();
+        })
+        .expect("seed on-disk title");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let meta = orch.stop().await.expect("stop");
+        assert_eq!(
+            meta.title, "Prepped title",
+            "stop() must fall back to the on-disk title, not synthesize a default"
+        );
+    }
+
+    /// A folder assignment and `notes_format` set during the "New meeting"
+    /// prep phase (before recording started) must survive `stop()` —
+    /// `finalise`'s `metadata.json` write is a raw overwrite of the
+    /// `MeetingMeta` `stop()` builds, so any field the recording itself does
+    /// not own must be read back from disk and carried forward, or it is
+    /// silently lost (issue: `collection_id`/`notes_format` were previously
+    /// hardcoded to `None`/`0`, unfiling the meeting and falsifying the
+    /// Yjs-authoritative flag on every stop).
+    #[tokio::test]
+    async fn stop_preserves_the_prep_phase_collection_and_notes_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let orch = test_orchestrator(root.clone());
+
+        let source = DummyAudioSource::new(3200, 1600);
+        let streams = source.generate_streams(5, 32, 64);
+        let meeting_id = orch.start_with_streams(streams).await.expect("start");
+
+        let collection_id = minutist_common::CollectionId::new();
+        persistence::meeting_ops::update_metadata(&root, meeting_id, |meta| {
+            meta.collection_id = Some(collection_id);
+            meta.notes_format = 1;
+        })
+        .expect("seed on-disk collection_id + notes_format");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let meta = orch.stop().await.expect("stop");
+        assert_eq!(
+            meta.collection_id,
+            Some(collection_id),
+            "stop() must not unfile a meeting that was filed during prep"
+        );
+        assert_eq!(
+            meta.notes_format, 1,
+            "stop() must not falsify the draft's Yjs-authoritative notes_format"
         );
     }
 

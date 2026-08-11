@@ -68,7 +68,16 @@ const K_SPEAKER_NAMES: &str = "speaker_names";
 pub fn write_descriptive(doc: &Doc, meta: &MeetingMeta) {
     let map = doc.get_or_insert_map(META_MAP);
     let mut txn = doc.transact_mut();
-    map.insert(&mut txn, K_TITLE, meta.title.clone());
+    // An empty title (a fresh "New meeting" prep draft, before the user has
+    // typed one) must NOT become a live LWW register holding "" — that
+    // would let a peer's inbound merge blank an already-real title. Absent,
+    // not empty, so `project_into_meta` leaves the receiver's value alone.
+    put_opt_str(
+        &mut txn,
+        &map,
+        K_TITLE,
+        Some(meta.title.as_str()).filter(|t| !t.is_empty()),
+    );
     map.insert(&mut txn, K_STARTED_AT, meta.started_at.clone());
     put_opt_str(&mut txn, &map, K_ENDED_AT, meta.ended_at.as_deref());
     map.insert(&mut txn, K_DURATION_MS, Any::BigInt(meta.duration_ms as i64));
@@ -104,6 +113,24 @@ pub fn set_title(doc: &Doc, title: &str) {
     let map = doc.get_or_insert_map(META_MAP);
     let mut txn = doc.transact_mut();
     map.insert(&mut txn, K_TITLE, title.to_string());
+}
+
+/// Set the recording start time — the "New meeting" prep-draft promotion
+/// site, when the real capture start (not the draft-creation placeholder)
+/// becomes known.
+pub fn set_started_at(doc: &Doc, started_at: &str) {
+    let map = doc.get_or_insert_map(META_MAP);
+    let mut txn = doc.transact_mut();
+    map.insert(&mut txn, K_STARTED_AT, started_at.to_string());
+}
+
+/// Set the audio format — the prep-draft promotion site, alongside
+/// [`set_started_at`], in case the device/format resolved at capture start
+/// differs from the draft's speculative default.
+pub fn set_audio_format(doc: &Doc, format: &AudioFormat) {
+    let map = doc.get_or_insert_map(META_MAP);
+    let mut txn = doc.transact_mut();
+    put_json(&mut txn, &map, K_AUDIO_FORMAT, Some(format));
 }
 
 /// Set the recording end time.
@@ -417,6 +444,7 @@ mod tests {
             notes_format: 1,
             processing: ProcessingLifecycle::PendingProcessing,
             collection_id: None,
+            recording_started: true,
             app_version: "0.1.0".to_string(),
         }
     }
@@ -451,6 +479,7 @@ mod tests {
                 },
             },
             collection_id: None,
+            recording_started: true,
             app_version: String::new(),
         }
     }
@@ -582,5 +611,64 @@ mod tests {
         // A's original name is still there (not lost by Y's block-write, since
         // Y wrote the whole map including A).
         assert_eq!(out.speaker_names.get("A").map(String::as_str), Some("Andrew"));
+    }
+
+    /// `set_started_at`/`set_audio_format` — the "New meeting" prep-draft
+    /// promotion setters — each touch only their own key, so a title set at
+    /// draft-creation time survives promotion untouched.
+    #[test]
+    fn set_started_at_and_audio_format_touch_only_their_own_keys() {
+        let doc = crate::ydoc::new_ydoc();
+        write_descriptive(&doc, &base_meta());
+
+        set_started_at(&doc, "2026-08-11T09:05:00Z");
+        set_audio_format(
+            &doc,
+            &AudioFormat {
+                codec: "opus".to_string(),
+                sample_rate: 16_000,
+                channels: 1,
+                bitrate_kbps: Some(32),
+            },
+        );
+
+        let mut out = placeholder_meta(base_meta().uuid);
+        project_into_meta(&doc, &mut out);
+        assert_eq!(out.started_at, "2026-08-11T09:05:00Z");
+        assert_eq!(out.audio_format.codec, "opus");
+        assert_eq!(out.audio_format.sample_rate, 16_000);
+        // The title from write_descriptive's original capture is untouched.
+        assert_eq!(out.title, "Original");
+    }
+
+    /// `write_descriptive` with an empty title (a fresh "New meeting" prep
+    /// draft, before the user has typed one) must NOT write a live "" LWW
+    /// register — that would let an inbound merge blank a peer's real title.
+    /// The key must be genuinely absent, so `project_into_meta` leaves the
+    /// receiver's existing title alone.
+    #[test]
+    fn write_descriptive_with_an_empty_title_leaves_no_title_key() {
+        let doc = crate::ydoc::new_ydoc();
+        let mut draft = base_meta();
+        draft.title = String::new();
+        write_descriptive(&doc, &draft);
+
+        assert!(
+            has_descriptive(&doc),
+            "the map is still populated by the other fields"
+        );
+
+        let mut peer = placeholder_meta(draft.uuid);
+        peer.title = "Peer's real title".to_string();
+        let changed_title = {
+            let before = peer.title.clone();
+            project_into_meta(&doc, &mut peer);
+            peer.title != before
+        };
+        assert!(
+            !changed_title,
+            "an absent title key must not overwrite an existing title"
+        );
+        assert_eq!(peer.title, "Peer's real title");
     }
 }

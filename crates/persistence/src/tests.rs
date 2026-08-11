@@ -118,6 +118,7 @@ fn dummy_meta(id: MeetingId, duration_ms: u64) -> MeetingMeta {
         notes_format: 0,
         processing: Default::default(),
         collection_id: None,
+        recording_started: true,
         app_version: "0.0.0-test".to_string(),
     }
 }
@@ -505,13 +506,13 @@ fn test_zero_segment_meeting_finalise_ok() {
 // Meeting durability: metadata.json is written at `open`, not only `finalise`
 // ---------------------------------------------------------------------------
 
-/// `MeetingWriter::open` writes an in-progress `metadata.json` stub before
-/// any sample is pushed: `duration_ms == 0`, `started_at` is present and
-/// parses, and the folder is a real meeting on disk from the first moment
-/// (the durability fix — a crash right after `open` must still leave a
+/// `MeetingWriter::open` writes an in-progress `metadata.json` before any
+/// sample is pushed: `duration_ms == 0`, `started_at` is present and parses,
+/// and the folder is a real meeting on disk from the first moment (the
+/// durability fix — a crash right after `open` must still leave a
 /// recoverable folder, not an invisible orphan).
 #[test]
-fn test_open_writes_initial_metadata_stub() {
+fn test_open_writes_in_progress_metadata_before_first_sample() {
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();
 
@@ -528,7 +529,14 @@ fn test_open_writes_initial_metadata_stub() {
 
     assert_eq!(meta.uuid, id);
     assert_eq!(meta.duration_ms, 0, "an in-progress stub has no duration yet");
-    assert!(!meta.title.is_empty(), "the stub carries a default title");
+    assert!(
+        meta.title.is_empty(),
+        "the draft's title is empty until the user types one or it defaults at finalise"
+    );
+    assert!(
+        meta.recording_started,
+        "open() promotes the draft to actively-recording in the same call"
+    );
     // `started_at` must be a well-formed RFC 3339 timestamp.
     chrono::DateTime::parse_from_rfc3339(&meta.started_at)
         .expect("started_at must be RFC 3339");
@@ -536,11 +544,11 @@ fn test_open_writes_initial_metadata_stub() {
     drop(writer);
 }
 
-/// `finalise` overwrites the `open`-time stub with the full record:
-/// `duration_ms` becomes non-zero and the caller-supplied title/timestamps
-/// win over the stub's defaults.
+/// `finalise` overwrites the `open`-time in-progress record with the full
+/// record: `duration_ms` becomes non-zero and the caller-supplied
+/// title/timestamps win over the draft's empty/placeholder values.
 #[test]
-fn test_finalise_overwrites_initial_metadata_stub() {
+fn test_finalise_overwrites_the_in_progress_metadata() {
     let tempdir = TempDir::new().expect("tempdir");
     let id = MeetingId::new();
 
@@ -557,6 +565,127 @@ fn test_finalise_overwrites_initial_metadata_stub() {
     assert_eq!(back.duration_ms, 12_345, "finalise must overwrite the stub's duration_ms = 0");
     assert_eq!(back.title, meta.title, "finalise must overwrite the stub's default title");
     assert_eq!(back.started_at, meta.started_at);
+}
+
+/// `create_draft` alone (the "New meeting" prep flow, before any capture
+/// starts) must produce a real, durable, resumable meeting: a folder with an
+/// empty-title `recording_started: false` `metadata.json`, and a `notes.ydoc`
+/// carrying that same draft metadata in its meta map — so title/notes/
+/// attachment edits made during prep are real and syncable immediately, not
+/// deferred until recording starts.
+#[test]
+fn test_create_draft_produces_a_resumable_unstarted_meeting() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+
+    let folder = crate::writer::create_draft(tempdir.path(), id).expect("create_draft");
+
+    let meta = crate::reader::read_metadata(folder.path()).expect("read metadata.json");
+    assert_eq!(meta.uuid, id);
+    assert!(meta.title.is_empty(), "a fresh draft has no title yet");
+    assert!(
+        !meta.recording_started,
+        "a draft must not look like a resumed/already-recorded meeting"
+    );
+    assert_eq!(meta.duration_ms, 0);
+
+    let ydoc_path = folder.path().join("notes.ydoc");
+    assert!(ydoc_path.is_file(), "the draft must seed notes.ydoc immediately");
+    let bytes = std::fs::read(&ydoc_path).expect("read notes.ydoc");
+    let doc = notes_crdt::ydoc::decode_ydoc(&bytes).expect("decode notes.ydoc");
+    assert!(
+        notes_crdt::meta_crdt::has_descriptive(&doc),
+        "the draft's meta map must be populated so title/notes edits sync during prep"
+    );
+}
+
+/// Promoting a draft via `open_for_recording` must flip `recording_started`
+/// and stamp the real capture start into BOTH `metadata.json` and the meta
+/// CRDT (via the granular `set_started_at`/`set_audio_format` setters, which
+/// touch only their own keys) — checked right after promotion, before
+/// `finalise` runs. `finalise` itself still does a raw overwrite of
+/// `metadata.json` with the caller's `MeetingMeta` (unchanged), so a caller
+/// that needs the promotion-time `started_at` (or a prep-phase title) to
+/// survive `finalise` must carry it forward into the `MeetingMeta` it
+/// builds — that carry-forward is the orchestrator's responsibility (it
+/// already tracks `started_at` from its own `start()` call), not
+/// `MeetingWriter`'s.
+#[test]
+fn test_open_for_recording_promotes_a_draft() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+    let id = MeetingId::new();
+
+    crate::writer::create_draft(root, id).expect("create_draft");
+
+    let before_promote = chrono::Utc::now();
+    let writer =
+        MeetingWriter::open_for_recording(root, id, opus_format()).expect("open_for_recording");
+
+    let meeting_dir = root.join(id.0.to_string());
+    let meta = crate::reader::read_metadata(&meeting_dir).expect("read metadata.json");
+    assert!(meta.recording_started, "promotion must flip recording_started");
+    let started_at =
+        chrono::DateTime::parse_from_rfc3339(&meta.started_at).expect("started_at must be RFC 3339");
+    assert!(
+        started_at >= before_promote,
+        "started_at must be the real promotion-time capture start"
+    );
+
+    // The meta CRDT must agree.
+    let ydoc_path = meeting_dir.join("notes.ydoc");
+    let bytes = std::fs::read(&ydoc_path).expect("read notes.ydoc");
+    let doc = notes_crdt::ydoc::decode_ydoc(&bytes).expect("decode notes.ydoc");
+    let mut projected = dummy_meta(id, 0);
+    notes_crdt::meta_crdt::project_into_meta(&doc, &mut projected);
+    let projected_started_at = chrono::DateTime::parse_from_rfc3339(&projected.started_at)
+        .expect("projected started_at must be RFC 3339");
+    assert!(projected_started_at >= before_promote);
+
+    drop(writer);
+}
+
+/// `open_for_recording` must fail cleanly (not create a folder) when no
+/// draft exists for the given id — it promotes, it never creates.
+#[test]
+fn test_open_for_recording_rejects_a_nonexistent_draft() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let id = MeetingId::new();
+    assert!(
+        MeetingWriter::open_for_recording(tempdir.path(), id, opus_format()).is_err(),
+        "open_for_recording must not silently create a missing draft"
+    );
+}
+
+/// `open_for_recording` must refuse a meeting that has ALREADY recorded —
+/// re-promoting one would `File::create` a fresh, empty `audio.opus` over
+/// the real recording, silently truncating it to zero bytes.
+#[test]
+fn test_open_for_recording_rejects_an_already_recorded_meeting() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+    let id = MeetingId::new();
+
+    let mut writer = MeetingWriter::open(root, id, opus_format()).expect("open writer");
+    let samples = sine_samples(0.5);
+    writer.push_samples(&samples).expect("push_samples");
+    let folder = writer.finalise(dummy_meta(id, 1_000)).expect("finalise");
+
+    let audio_path = folder.audio_path();
+    let recorded_bytes = std::fs::metadata(&audio_path).expect("stat audio.opus").len();
+    assert!(recorded_bytes > 0, "sanity: the recording actually wrote audio");
+
+    assert!(
+        MeetingWriter::open_for_recording(root, id, opus_format()).is_err(),
+        "open_for_recording must refuse an already-recorded meeting"
+    );
+
+    // The real recording must be untouched by the refused attempt.
+    let bytes_after = std::fs::metadata(&audio_path).expect("stat audio.opus").len();
+    assert_eq!(
+        bytes_after, recorded_bytes,
+        "a refused re-promotion must not touch the existing audio.opus"
+    );
 }
 
 // ===========================================================================
@@ -1391,6 +1520,7 @@ fn list_entry(title: &str, started_at: &str) -> minutist_common::MeetingListEntr
         speaker_count: 1,
         excerpt: Some(format!("{title} excerpt")),
         collection_id: None,
+        recording_started: true,
     }
 }
 
@@ -1936,13 +2066,20 @@ fn test_finalise_seeds_the_meta_crdt_for_sync_convergence() {
     let id = MeetingId::new();
     let format = opus_format();
 
+    // `open()` composes `create_draft` (seeds notes.ydoc) + promotion (stamps
+    // the REAL capture-open started_at into the CRDT) — capture the bound so
+    // the assertion below can tell it apart from `dummy_meta`'s fixed value.
+    let before_open = chrono::Utc::now();
     let mut writer = MeetingWriter::open(tempdir.path(), id, format).expect("open writer");
     writer.push_samples(&sine_samples(1.0)).expect("push_samples");
     let meta = dummy_meta(id, 1_000);
     writer.finalise(meta.clone()).expect("finalise");
 
     let ydoc_path = tempdir.path().join(id.0.to_string()).join("notes.ydoc");
-    assert!(ydoc_path.exists(), "finalise must create notes.ydoc");
+    assert!(
+        ydoc_path.exists(),
+        "notes.ydoc (created at open's draft-creation step) must still be there"
+    );
 
     let bytes = std::fs::read(&ydoc_path).expect("read notes.ydoc");
     let doc = notes_crdt::ydoc::decode_ydoc(&bytes).expect("decode notes.ydoc");
@@ -1954,17 +2091,30 @@ fn test_finalise_seeds_the_meta_crdt_for_sync_convergence() {
     // A placeholder-shaped MeetingMeta (what MeetingFolder::ensure would seed
     // on a sync peer) must be corrected by projecting the converged map over
     // it — proving a peer that only ever received the placeholder would
-    // recover the real values, not just that this device's own copy is right.
+    // recover the real end-time/duration values, not just that this device's
+    // own copy is right.
     let mut placeholder = dummy_meta(id, 0);
     placeholder.title = String::new();
     placeholder.started_at = "2026-01-01T00:00:00Z".to_string();
     placeholder.ended_at = None;
     let applied = notes_crdt::meta_crdt::project_into_meta(&doc, &mut placeholder);
     assert!(applied, "projection must report it changed the placeholder");
-    assert_eq!(placeholder.title, meta.title);
-    assert_eq!(placeholder.started_at, meta.started_at);
     assert_eq!(placeholder.ended_at, meta.ended_at);
     assert_eq!(placeholder.duration_ms, meta.duration_ms);
+    // `started_at` is the real capture-open time, stamped by `open()`'s
+    // promotion step — independent of `dummy_meta`'s fixed value.
+    let started_at = chrono::DateTime::parse_from_rfc3339(&placeholder.started_at)
+        .expect("started_at must be RFC 3339");
+    assert!(
+        started_at >= before_open,
+        "started_at must be the real capture-open time, not dummy_meta's fixed value"
+    );
+    // `finalise` re-affirms the title (via `set_title`, using the caller's
+    // now-final `meta.title`) — the draft's own key was absent (an empty
+    // title never enters the map, see `write_descriptive`), so this is what
+    // actually gets a title into the CRDT for a meeting that was never
+    // renamed during prep.
+    assert_eq!(placeholder.title, meta.title);
 }
 
 const SAMPLE_RATE_16K: u32 = 16_000;

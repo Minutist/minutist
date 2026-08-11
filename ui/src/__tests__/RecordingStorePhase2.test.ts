@@ -28,6 +28,7 @@ vi.mock("../ipc/bindings", () => {
   return {
     commands: {
       listDevices: vi.fn(),
+      createMeeting: vi.fn(),
       startRecording: vi.fn(),
       pauseRecording: vi.fn(),
       resumeRecording: vi.fn(),
@@ -76,14 +77,19 @@ describe("recording store — Phase 2 extensions", () => {
 
     await useRecordingStore.getState().start();
 
+    expect(commands.createMeeting).not.toHaveBeenCalled();
     expect(commands.startRecording).not.toHaveBeenCalled();
     expect(useRecordingStore.getState().lastError).toBe(
       "ASR model not yet downloaded",
     );
   });
 
-  it("start calls startRecording when isAsrModelReady is true", async () => {
+  it("start creates a draft then calls startRecording when isAsrModelReady is true", async () => {
     useModelsStore.setState({ isAsrModelReady: true });
+    vi.mocked(commands.createMeeting).mockResolvedValueOnce({
+      status: "ok",
+      data: "meeting-uuid",
+    });
     vi.mocked(commands.startRecording).mockResolvedValueOnce({
       status: "ok",
       data: "meeting-uuid",
@@ -91,7 +97,11 @@ describe("recording store — Phase 2 extensions", () => {
 
     await useRecordingStore.getState().start();
 
-    expect(commands.startRecording).toHaveBeenCalledOnce();
+    expect(commands.createMeeting).toHaveBeenCalledOnce();
+    expect(commands.startRecording).toHaveBeenCalledWith(
+      "meeting-uuid",
+      null,
+    );
     expect(useRecordingStore.getState().lastError).toBeNull();
   });
 
@@ -190,6 +200,10 @@ describe("recording store — Phase 2 extensions", () => {
 
   it("start sets the optimistic `preparing` flag before the recording event arrives", async () => {
     useModelsStore.setState({ isAsrModelReady: true });
+    vi.mocked(commands.createMeeting).mockResolvedValueOnce({
+      status: "ok",
+      data: "m-prep",
+    });
     vi.mocked(commands.startRecording).mockResolvedValueOnce({
       status: "ok",
       data: "m-prep",
@@ -235,6 +249,10 @@ describe("recording store — Phase 2 extensions", () => {
 
   it("start clears `preparing` and surfaces lastError when startRecording rejects", async () => {
     useModelsStore.setState({ isAsrModelReady: true });
+    vi.mocked(commands.createMeeting).mockResolvedValueOnce({
+      status: "ok",
+      data: "m-err",
+    });
     vi.mocked(commands.startRecording).mockResolvedValueOnce({
       status: "error",
       error: { code: "internal", context: "device busy" },

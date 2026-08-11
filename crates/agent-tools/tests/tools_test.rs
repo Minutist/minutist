@@ -118,6 +118,7 @@ async fn seed_meeting(
         notes_format: 0,
         processing: Default::default(),
         collection_id: None,
+        recording_started: true,
         app_version: "0.0.0".to_string(),
     };
     notes_crdt::write_metadata(&dir, &meta).expect("write metadata");
@@ -134,6 +135,7 @@ async fn seed_meeting(
         speaker_count: meta.speaker_count,
         excerpt: segments_excerpt(meetings_dir, id),
         collection_id: meta.collection_id,
+        recording_started: meta.recording_started,
     };
     index.upsert(&entry).await.expect("index upsert");
     id

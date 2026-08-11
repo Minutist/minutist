@@ -20,11 +20,13 @@ import { formatDate, formatDuration, formatSpeakers } from "./MeetingList";
 import "./MeetingMasthead.css";
 
 /**
- * Whether a title is still the orchestrator's auto-generated default
- * (`Recording <ISO timestamp>`, set at `start`) rather than a user-chosen name.
+ * Whether a title is still a placeholder rather than a user-chosen name: the
+ * orchestrator's auto-generated default (`Recording <ISO timestamp>`, set at
+ * `start`), or a "New meeting" prep draft's empty title (set at
+ * `create_meeting`, before the user has typed one).
  */
 export function isDefaultMeetingTitle(title: string): boolean {
-  return /^Recording \d{4}-\d{2}-\d{2}T/.test(title);
+  return title.trim() === "" || /^Recording \d{4}-\d{2}-\d{2}T/.test(title);
 }
 
 function PencilIcon() {

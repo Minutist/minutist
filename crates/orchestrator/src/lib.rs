@@ -379,20 +379,25 @@ impl Orchestrator {
     // Public command surface
     // ------------------------------------------------------------------
 
-    /// Start a new recording session.
+    /// Start recording into an existing "New meeting" prep draft.
     ///
-    /// Opens an audio capture device (`device_id = None` → OS default),
-    /// creates a per-meeting folder under `persistence_root`, and starts the
-    /// drain runner task.
+    /// Opens an audio capture device (`device_id = None` → OS default) and
+    /// starts the drain runner task, promoting `meeting_id`'s draft folder
+    /// (created by the `create_meeting` IPC command — or, for the
+    /// auto-start-immediately setting, by the same command called
+    /// immediately beforehand) to an actively-recording meeting via
+    /// [`persistence::MeetingWriter::open_for_recording`].
     ///
-    /// Returns the new `MeetingId`.
+    /// Returns `meeting_id` unchanged, for IPC-call-signature symmetry with
+    /// the pre-draft API.
     ///
     /// # Errors
     ///
-    /// `AppError::InvalidInput` if not in `Idle` state.
-    pub async fn start(&self, device_id: Option<String>) -> AppResult<MeetingId> {
+    /// `AppError::InvalidInput` if not in `Idle` state, or if no draft folder
+    /// exists for `meeting_id`.
+    pub async fn start(&self, meeting_id: MeetingId, device_id: Option<String>) -> AppResult<MeetingId> {
         let mut guard = self.inner.lock().await;
-        let (meeting_id, started_at_ms) = transition_start(&mut guard.state)?;
+        let started_at_ms = transition_start(&mut guard.state, meeting_id)?;
 
         let started_at =
             DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64).unwrap_or_else(Utc::now);
@@ -437,15 +442,16 @@ impl Orchestrator {
             bitrate_kbps: Some(32),
         };
 
-        let writer = match MeetingWriter::open(&self.persistence_root, meeting_id, audio_format) {
-            Ok(w) => w,
-            Err(e) => {
-                guard.state = InternalState::Idle;
-                // Stop the capture stream we already started.
-                let _ = capture.stop();
-                return Err(e);
-            }
-        };
+        let writer =
+            match MeetingWriter::open_for_recording(&self.persistence_root, meeting_id, audio_format) {
+                Ok(w) => w,
+                Err(e) => {
+                    guard.state = InternalState::Idle;
+                    // Stop the capture stream we already started.
+                    let _ = capture.stop();
+                    return Err(e);
+                }
+            };
 
         // Surface the live state NOW — capture is already running and the writer
         // is open, so the recording is genuinely live. Emitting here, BEFORE the
@@ -662,11 +668,36 @@ impl Orchestrator {
         let ended_at = Utc::now();
         let duration_ms = (ended_at - started_at).num_milliseconds().max(0) as u64;
 
+        // `finalise`'s metadata.json write below is a raw overwrite driven
+        // entirely by this `meta` — so any field the recording itself does
+        // not own must be read back from disk and carried forward here, or
+        // it is silently lost. That is `title` (may have been set via
+        // `rename_meeting` during the "New meeting" prep phase, before
+        // recording started), `collection_id` (a folder assignment made
+        // during prep), and `notes_format` (the draft's `1`, Yjs-authoritative
+        // — this device's own literal default of `0` would falsify it, self-
+        // healing only on next open). An absent/unreadable meeting_dir (should
+        // not happen — the folder exists from draft creation onward) leaves
+        // all three at their fresh-meeting defaults.
+        let meeting_dir = self.persistence_root.join(meeting_id.0.to_string());
+        let existing = tokio::task::spawn_blocking(move || persistence::read_metadata(&meeting_dir).ok())
+            .await
+            .unwrap_or(None);
+        let existing_title = existing
+            .as_ref()
+            .map(|m| m.title.clone())
+            .filter(|t| !t.trim().is_empty());
+        let collection_id = existing.as_ref().and_then(|m| m.collection_id);
+        let notes_format = existing.as_ref().map_or(0, |m| m.notes_format);
+
         // Use the title the user typed during recording when present + non-blank;
-        // otherwise fall back to the synthesized `Recording <timestamp>` default.
+        // else fall back to whatever is already on disk. Only when NEITHER
+        // source has a title does it synthesize the `Recording <timestamp>`
+        // default.
         let title = pending_title
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
+            .or(existing_title)
             .unwrap_or_else(|| format!("Recording {}", started_at.format("%Y-%m-%dT%H:%M:%SZ")));
 
         let meta = MeetingMeta {
@@ -686,10 +717,11 @@ impl Orchestrator {
             llm_model: None,
             diarizer: None,
             speaker_names: std::collections::BTreeMap::new(),
-            notes_format: 0,
-            collection_id: None,
+            notes_format,
+            collection_id,
             // Recorded and processed on this device → the `Local` default.
             processing: Default::default(),
+            recording_started: true,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 
@@ -1655,6 +1687,7 @@ impl Orchestrator {
                 speaker_count: meta.speaker_count,
                 excerpt: transcript.first().map(|s| s.text.clone()),
                 collection_id: meta.collection_id,
+                recording_started: meta.recording_started,
             })
         })
         .await
@@ -2439,6 +2472,7 @@ impl Orchestrator {
                     speaker_count: meta.speaker_count,
                     excerpt: transcript.first().map(|s| s.text.clone()),
                     collection_id: meta.collection_id,
+                    recording_started: meta.recording_started,
                 })
             })
             .await
@@ -4277,7 +4311,8 @@ impl Orchestrator {
         streams: audio_capture::AudioStreams,
     ) -> AppResult<MeetingId> {
         let mut guard = self.inner.lock().await;
-        let (meeting_id, started_at_ms) = transition_start(&mut guard.state)?;
+        let meeting_id = MeetingId::new();
+        let started_at_ms = transition_start(&mut guard.state, meeting_id)?;
 
         let started_at =
             DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64).unwrap_or_else(Utc::now);
@@ -4362,7 +4397,8 @@ impl Orchestrator {
         online_diarizer: Option<Arc<OnlineDiarizer>>,
     ) -> AppResult<MeetingId> {
         let mut guard = self.inner.lock().await;
-        let (meeting_id, started_at_ms) = transition_start(&mut guard.state)?;
+        let meeting_id = MeetingId::new();
+        let started_at_ms = transition_start(&mut guard.state, meeting_id)?;
 
         let started_at =
             DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64).unwrap_or_else(Utc::now);

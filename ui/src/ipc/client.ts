@@ -55,7 +55,11 @@ async function callCommand<K extends CommandName>(
 /** Delegating commands surface; see {@link callCommand}. */
 export const commands: Commands = {
   listDevices: () => callCommand("listDevices", []),
-  startRecording: (deviceId) => callCommand("startRecording", [deviceId]),
+  // "New meeting" prep draft (no capture yet) — see `createMeeting`'s doc
+  // comment in `bindings.ts`.
+  createMeeting: () => callCommand("createMeeting", []),
+  startRecording: (meetingId, deviceId) =>
+    callCommand("startRecording", [meetingId, deviceId]),
   // Live-test UX T2: pre-warm the ASR model so the first record is not a cold
   // ~29 s load. Best-effort; the DEV shim no-ops it.
   prewarmAsr: () => callCommand("prewarmAsr", []),

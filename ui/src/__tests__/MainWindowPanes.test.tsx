@@ -133,6 +133,27 @@ describe("MainWindow workspace columns", () => {
     );
   });
 
+  it("an open 'New meeting' prep draft shows notes but NO summary column (nothing to summarise yet)", async () => {
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" } });
+      useMeetingsStore.setState({
+        openMeetingId: "draft-uuid",
+        openMeetingState: {
+          meta: { uuid: "draft-uuid", recording_started: false } as never,
+          transcript: [],
+        },
+      });
+    });
+    render(<MainWindow />);
+    await waitFor(() => expect(screen.getByTestId("notes")).toBeInTheDocument());
+    expect(screen.queryByTestId("summary")).not.toBeInTheDocument();
+    // The Summary segment itself is not offered for a draft.
+    expect(within(viewToggle()).queryByRole("button", { name: "Summary" })).toBeNull();
+    // The prep-mode banner + its Discard action are shown.
+    expect(screen.getByText(/New meeting/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Discard" })).toBeInTheDocument();
+  });
+
   it("the view toggle reflects visibility (notes + summary on, transcript off)", async () => {
     await renderFinishedMeeting();
     expect(segment("Notes")).toHaveAttribute("aria-pressed", "true");

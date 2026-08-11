@@ -137,6 +137,19 @@ const fn default_auto_summarise_on_stop() -> bool {
     true
 }
 
+/// Default for `auto_start_recording_on_new_meeting`: OFF. A new meeting
+/// opens on the "New meeting" prep screen (set a title, write notes, attach
+/// resources) rather than starting audio capture immediately; the user
+/// starts recording explicitly when ready. Turning this ON restores the
+/// legacy immediate-record behaviour. `#[serde(default = ...)]` defaults to
+/// `false`; an older store written before this field existed also
+/// deserialises to `false`, adopting the new prep-first default for
+/// existing users too — the same "new default applies to everyone" pattern
+/// `auto_summarise_on_stop` uses.
+const fn default_auto_start_recording_on_new_meeting() -> bool {
+    false
+}
+
 /// Default for `notes_paper_rules`: ON. The notes editor renders faint
 /// horizontal "writing paper" rules behind the text by default; users disable
 /// them in the Appearance settings. The oxblood *vertical* margin rule that
@@ -602,6 +615,18 @@ pub struct Settings {
     #[serde(default = "default_auto_summarise_on_stop")]
     pub auto_summarise_on_stop: bool,
 
+    /// Start recording immediately when creating a new meeting.
+    ///
+    /// When `false` (the default), a new meeting opens on the "New meeting"
+    /// prep screen — set a title, write notes, attach resources — and the
+    /// user starts recording explicitly via a separate action. When `true`,
+    /// restores the legacy behaviour: recording starts the moment a new
+    /// meeting is created. `#[serde(default = ...)]` defaults to `false`; an
+    /// older store written before this field existed also deserialises to
+    /// `false`.
+    #[serde(default = "default_auto_start_recording_on_new_meeting")]
+    pub auto_start_recording_on_new_meeting: bool,
+
     /// Preload the summary/chat LLM at app startup and keep it resident.
     ///
     /// The summary path and the chat agent share ONE held `LlamaSummariser`
@@ -778,6 +803,7 @@ impl Default for Settings {
             mcp_port: default_mcp_port(),
             mcp_write_tools: false,
             auto_summarise_on_stop: default_auto_summarise_on_stop(),
+            auto_start_recording_on_new_meeting: default_auto_start_recording_on_new_meeting(),
             preload_summariser: default_preload_summariser(),
             output_language: default_output_language(),
             connector_enabled: false,
@@ -842,6 +868,7 @@ mod tests {
             mcp_port: 9999,
             mcp_write_tools: true,
             auto_summarise_on_stop: false,
+            auto_start_recording_on_new_meeting: true,
             preload_summariser: false,
             output_language: "German".to_string(),
             connector_enabled: true,
@@ -1051,6 +1078,43 @@ mod tests {
         assert!(
             restored.auto_summarise_on_stop,
             "missing auto_summarise_on_stop must deserialise to true (#68 default)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 1e''. auto_start_recording_on_new_meeting: default + round-trip +
+    //       missing-field deserialisation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn auto_start_recording_on_new_meeting_defaults_to_false() {
+        assert!(
+            !Settings::default().auto_start_recording_on_new_meeting,
+            "a new meeting opens on the prep screen by default (recording does not auto-start)"
+        );
+    }
+
+    #[test]
+    fn auto_start_recording_on_new_meeting_round_trips() {
+        let original = Settings {
+            auto_start_recording_on_new_meeting: true,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&original).expect("serialise");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(restored.auto_start_recording_on_new_meeting);
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn old_store_json_without_auto_start_recording_field_defaults_to_false() {
+        // A settings store written before `auto_start_recording_on_new_meeting`
+        // existed must adopt the new prep-first default.
+        let old_json = r#"{ "theme": "dark", "diarization_enabled": true }"#;
+        let restored: Settings = serde_json::from_str(old_json).expect("deserialise old store");
+        assert!(
+            !restored.auto_start_recording_on_new_meeting,
+            "missing auto_start_recording_on_new_meeting must deserialise to false"
         );
     }
 

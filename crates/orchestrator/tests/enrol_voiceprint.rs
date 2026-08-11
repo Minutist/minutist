@@ -79,6 +79,7 @@ fn build_meeting(root: &Path, samples: &[f32], segments: &[Segment]) -> MeetingI
         notes_format: 0,
         processing: Default::default(),
         collection_id: None,
+        recording_started: true,
         app_version: "0.0.0".into(),
     };
     let folder = writer.finalise(meta).expect("finalise");

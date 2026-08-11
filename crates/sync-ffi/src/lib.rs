@@ -673,6 +673,7 @@ fn save_captured_to(
             notes_format: 1,
             processing: ProcessingLifecycle::PendingProcessing,
             collection_id: None,
+            recording_started: true,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         notes_crdt::write_metadata(&folder, &meta)?;
@@ -1129,6 +1130,7 @@ mod tests {
                 at: "2026-06-30T09:30:00+00:00".into(),
             },
             collection_id: None,
+            recording_started: true,
             app_version: "0.0.0".into(),
         };
         notes_crdt::write_metadata(&folder, &meta).expect("write meta");

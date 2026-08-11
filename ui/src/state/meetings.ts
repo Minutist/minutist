@@ -257,7 +257,16 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
       // goes `Idle` (the orchestrator emits this BEFORE the `Idle` transition).
       // Background passes then update the open meeting in place (see the
       // transcript_ready / diarization_complete branch below).
-      set({ openMeetingId: event.meeting_id });
+      //
+      // `openMeetingState` is cleared in the SAME set() — it still held the
+      // PRE-recording draft snapshot (`meta.recording_started: false`) when
+      // this meeting was promoted (promotion never re-reads it), and the
+      // recorder goes `Idle` moments after this event. Left stale, that
+      // combination reads as "an open, unstarted draft" to
+      // `MeetingControls`/`MainWindow` for the duration of the async `open()`
+      // below — a real press of "Start" or "Discard" in that window would
+      // truncate or delete the meeting that was just recorded.
+      set({ openMeetingId: event.meeting_id, openMeetingState: null });
       void get().open(event.meeting_id);
       // Refresh the list too, so the row (and its masthead entry) is present.
       void get().refresh();

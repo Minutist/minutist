@@ -201,6 +201,19 @@
   font-style: italic;
 }
 
+.meeting-list__draft-chip {
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.4rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  font-family: var(--font-text);
+  font-size: 0.7rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  vertical-align: middle;
+}
+
 .meeting-list__title-input {
   font-family: var(--font-display);
   font-size: 1.2rem;

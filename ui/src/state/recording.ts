@@ -12,6 +12,7 @@ import type {
   AudioDevice,
   GpuAcceleration,
   LiveAgentMode,
+  MeetingId,
   Settings,
   Segment,
 } from "../ipc/bindings";
@@ -22,6 +23,7 @@ import { withGpuAcceleration } from "./gpu-acceleration-settings";
 import { withLiveAgentMode } from "./live-agent-settings";
 import { withPreloadSummariser } from "./preload-summariser-settings";
 import { withCaptureSystemAudio } from "./system-audio-settings";
+import { withAutoStartRecordingOnNewMeeting } from "./auto-start-recording-settings";
 import { withOnboardingCompleted, withTheme } from "./onboarding-settings";
 import { withTranscriptionLanguage } from "./transcription-language-settings";
 import { withOutputLanguage } from "./output-language-settings";
@@ -135,6 +137,31 @@ export type RecordingStore = {
    * trigger for when the window opens after a settings change.
    */
   prewarmAsr: () => Promise<void>;
+  /**
+   * Create a "New meeting" prep draft — a real, durable meeting folder with
+   * no audio yet — WITHOUT touching the recording transport (no ASR-ready
+   * gate, no capture device). The caller (`MeetingControls`) opens the
+   * returned id via `useMeetingsStore.open` to show the prep screen. Returns
+   * `null` on failure (surfaced via `lastError`).
+   */
+  createMeeting: () => Promise<MeetingId | null>;
+  /**
+   * Promote an existing "New meeting" prep draft to an actively-recording
+   * meeting: opens the audio device and starts capture into `meetingId`'s
+   * existing folder. Same guards/optimistic `preparing` transient as `start`.
+   *
+   * `initialTitle` seeds the live masthead's title field from whatever the
+   * draft was already named during prep (via `rename_meeting`) — that title
+   * lives on disk/the meta CRDT, not in `pendingTitle`, so without this it
+   * would visibly disappear from the masthead the instant recording starts
+   * (recovered only later, at `stop`, via its own on-disk fallback).
+   */
+  promote: (meetingId: MeetingId, initialTitle?: string) => Promise<void>;
+  /**
+   * Legacy immediate-start entry point (the `auto_start_recording_on_new_meeting`
+   * setting ON): create a draft, then promote it in the same call, so
+   * recording begins the instant a new meeting is created.
+   */
   start: () => Promise<void>;
   pause: () => Promise<void>;
   resume: () => Promise<void>;
@@ -185,6 +212,14 @@ export type RecordingStore = {
    * call from the speakers (echo).
    */
   setCaptureSystemAudio: (enabled: boolean) => Promise<void>;
+  /**
+   * Toggle immediate recording on a new meeting (off by default), persisting
+   * via `commands.updateSettings` — the same round-trip-through-settings
+   * pattern as `setCaptureSystemAudio`. Off: a new meeting opens the "New
+   * meeting" prep screen. On: recording starts the instant a new meeting is
+   * created (the legacy behaviour).
+   */
+  setAutoStartRecordingOnNewMeeting: (enabled: boolean) => Promise<void>;
   /**
    * Set the ASR transcription-language hint, persisting via
    * `commands.updateSettings` so the choice survives an app restart — the same
@@ -323,7 +358,18 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     }
   },
 
-  start: async () => {
+  createMeeting: async () => {
+    try {
+      const meetingId = unwrap(await commands.createMeeting());
+      set({ lastError: null });
+      return meetingId;
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+      return null;
+    }
+  },
+
+  promote: async (meetingId, initialTitle) => {
     // Guard against a double-press / start-while-busy (live-test UX T1a): only a
     // genuinely idle recorder may start. A second press while Recording would
     // otherwise re-call `startRecording`, which the orchestrator rejects with
@@ -341,10 +387,15 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
     // "Preparing transcription model…" while the backend opens capture and (on
     // the first record) lazy-loads the ASR model. Cleared on the `recording`
     // state event (see `handleEvent`) or on error below.
-    // Clear any title from a prior recording so it cannot bleed into this one.
-    set({ preparing: true, lastError: null, pendingTitle: "" });
+    // `pendingTitle` becomes the draft's already-known title (if any) rather
+    // than being blindly cleared — a fresh draft (via `start`) has none, so
+    // this is still effectively a clear for that path.
+    set({ preparing: true, lastError: null, pendingTitle: initialTitle ?? "" });
     try {
-      const result = await commands.startRecording(get().selectedDeviceId);
+      const result = await commands.startRecording(
+        meetingId,
+        get().selectedDeviceId,
+      );
       unwrap(result);
       set({ lastError: null });
     } catch (err) {
@@ -355,6 +406,22 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
         lastError: err instanceof Error ? err.message : String(err),
       });
     }
+  },
+
+  start: async () => {
+    if (get().state.kind !== "idle" || get().preparing) {
+      return;
+    }
+    // Checked here too (not just in `promote`) so a not-ready model leaves
+    // this genuinely a no-op — no draft is created at all — rather than
+    // creating an orphaned draft that then fails to promote.
+    if (!useModelsStore.getState().isAsrModelReady) {
+      set({ lastError: "ASR model not yet downloaded" });
+      return;
+    }
+    const meetingId = await get().createMeeting();
+    if (meetingId === null) return;
+    await get().promote(meetingId);
   },
 
   pause: async () => {
@@ -433,6 +500,12 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   setCaptureSystemAudio: async (enabled) => {
     await updateSetting(get, set, (current) =>
       withCaptureSystemAudio(current, enabled),
+    );
+  },
+
+  setAutoStartRecordingOnNewMeeting: async (enabled) => {
+    await updateSetting(get, set, (current) =>
+      withAutoStartRecordingOnNewMeeting(current, enabled),
     );
   },
 

@@ -93,6 +93,7 @@ export function MainWindow() {
   const recordingState = useRecordingStore((s) => s.state);
   const refreshModels = useModelsStore((s) => s.refreshModels);
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
+  const openMeetingState = useMeetingsStore((s) => s.openMeetingState);
   const closeMeeting = useMeetingsStore((s) => s.close);
   // Re-processing (re-transcribe / re-identify speakers) is a rare action that
   // lives in the transcript pane's action toolbar (#67) — see TranscriptPane —
@@ -126,12 +127,22 @@ export function MainWindow() {
     openMeetingId ??
     (recordingState.kind === "idle" ? null : recordingState.meeting_id);
 
-  // A finished, opened meeting: idle and viewing a saved meeting. Only then is a
-  // summary meaningful (you cannot summarise a recording mid-flight), so the
-  // summary column is offered only in this mode.
+  // A finished, opened meeting: idle and viewing a saved meeting. Drives the
+  // back-to-list header affordance (valid for a "New meeting" prep draft
+  // too — you can always return to the list before recording starts).
   const isFinishedMeeting =
     openMeetingId !== null && recordingState.kind === "idle";
-  const showSummaryPane = isFinishedMeeting;
+
+  // A "New meeting" prep draft: open, idle, never recorded. Only a TRULY
+  // finished meeting has anything to summarise, so the summary column is
+  // narrower than `isFinishedMeeting` — it excludes an unstarted draft. The
+  // `uuid` check guards against a stale `openMeetingState` snapshot (see
+  // `meetings.ts`'s `meeting_finalised` handler) being misread as a draft.
+  const isOpenDraft =
+    isFinishedMeeting &&
+    openMeetingState?.meta.uuid === openMeetingId &&
+    openMeetingState.meta.recording_started === false;
+  const showSummaryPane = isFinishedMeeting && !isOpenDraft;
 
   // Phase 9 — the chat agent is meeting-scoped: offered whenever the workspace
   // is operating on a concrete meeting (a live recording's meeting or an opened
@@ -373,6 +384,26 @@ export function MainWindow() {
       */}
       <div className="main-window__chrome">
         <UpdateBanner />
+        {isOpenDraft && openMeetingId !== null && (
+          <div className="main-window__draft-banner" role="status">
+            <span className="main-window__draft-banner-text">
+              New meeting — set a title, write notes, or attach resources,
+              then press Start when you're ready to record.
+            </span>
+            <button
+              type="button"
+              className="main-window__draft-banner-discard"
+              onClick={() => {
+                // Close the workspace FIRST: `remove` doesn't clear
+                // `openMeetingId`, and the folder is about to stop existing.
+                closeMeeting();
+                void useMeetingsStore.getState().remove(openMeetingId);
+              }}
+            >
+              Discard
+            </button>
+          </div>
+        )}
         <ModelDownloadStatus />
         {lastError && (
           <div className="main-window__error" role="alert">

@@ -434,6 +434,37 @@
   border-color: var(--accent-soft);
 }
 
+/* --- "New meeting" prep-draft banner ------------------------------------- */
+
+.main-window__draft-banner {
+  background: var(--sheet);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--ink-soft);
+  border-radius: var(--radius);
+  color: var(--ink-soft);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.main-window__draft-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.main-window__draft-banner-discard {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  color: var(--ink-soft);
+  padding: 0.15rem 0.5rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
 /* --- Error banner ------------------------------------------------------- */
 
 .main-window__error {

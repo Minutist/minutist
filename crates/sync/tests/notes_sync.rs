@@ -115,6 +115,7 @@ async fn descriptive_metadata_converges_to_the_origin_over_sync() {
         notes_format: 0,
         processing: ProcessingLifecycle::PendingProcessing,
         collection_id: None,
+        recording_started: true,
         app_version: "0.1.0".to_string(),
     };
     let folder_a = root_a.join(meeting.0.to_string());

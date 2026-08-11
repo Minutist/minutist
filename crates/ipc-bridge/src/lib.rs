@@ -4,11 +4,12 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
-//! ## Commands (52 total)
+//! ## Commands (53 total)
 //!
 //! | Command | Returns | Phase |
 //! |---|---|---|
 //! | `list_devices` | `Vec<AudioDevice>` | 1 |
+//! | `create_meeting` | `MeetingId` | "New meeting" prep draft |
 //! | `start_recording` | `MeetingId` | 1 |
 //! | `prewarm_asr` | `()` | live-test UX |
 //! | `pause_recording` | `()` | 1 |
@@ -978,6 +979,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             commands::list_devices,
+            commands::create_meeting,
             commands::start_recording,
             commands::prewarm_asr,
             commands::pause_recording,

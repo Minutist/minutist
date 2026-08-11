@@ -106,6 +106,9 @@ describe("SettingsDrawer", () => {
     expect(screen.getByText("Identify speakers")).toBeInTheDocument();
     expect(screen.getByText("GPU acceleration")).toBeInTheDocument();
     expect(screen.getByText("Capture call / system audio")).toBeInTheDocument();
+    expect(
+      screen.getByText("Start recording immediately on a new meeting"),
+    ).toBeInTheDocument();
     // Output language dropdown (Processing section).
     expect(screen.getByLabelText("Output language")).toBeInTheDocument();
   });

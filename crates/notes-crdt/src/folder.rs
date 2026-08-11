@@ -44,9 +44,41 @@ impl MeetingFolder {
         })
     }
 
+    /// Open a handle to an already-existing per-meeting directory.
+    ///
+    /// Fails with `Error::MeetingNotFound` if the folder is absent — unlike
+    /// [`Self::create`], this never creates anything. The seam for promoting
+    /// an existing "New meeting" prep draft to an active recording: the
+    /// folder (and its `metadata.json` + `notes.ydoc`) already exist from
+    /// draft creation, only the audio capture is new.
+    pub fn open_existing(root: &Path, meeting_id: MeetingId) -> AppResult<Self> {
+        let path = root.join(meeting_id.0.to_string());
+
+        if !path.exists() {
+            return Err(Error::MeetingNotFound(meeting_id).into());
+        }
+
+        Ok(Self {
+            path,
+            id: meeting_id,
+        })
+    }
+
     /// Absolute path to the meeting folder.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The `{root}` this folder was created/opened under — `self.path`'s
+    /// parent. Always `Some` in practice (`path` is always `root.join(uuid)`);
+    /// `AppResult` only to give callers a real error instead of a panic on
+    /// the theoretical case of a root with no parent component.
+    pub fn meetings_root(&self) -> AppResult<&Path> {
+        self.path
+            .parent()
+            .ok_or_else(|| minutist_common::AppError::Internal {
+                context: "meeting folder has no parent; cannot resolve meetings_root".to_string(),
+            })
     }
 
     /// The `MeetingId` this folder was created for.
@@ -166,6 +198,16 @@ impl MeetingFolder {
                 // must not look adoptable. See
                 // planning/DESIGN_processing-lifecycle.md §7 Q4.
                 processing: Default::default(),
+                // Never treat a fresh inbound-sync arrival as a resumable
+                // draft — `true` is the safe default so this device does not
+                // itself start recording into a folder it did not originate.
+                // NOT a converged value: `recording_started` is not carried
+                // in the meta CRDT, so a peer syncing an ORIGIN's still-
+                // unpromoted "New meeting" draft (title/notes, no audio) ends
+                // up with `true` here regardless — a known gap, not a
+                // guarantee this placeholder can make. See
+                // `MeetingMeta::recording_started`.
+                recording_started: true,
                 app_version: String::new(),
             };
             crate::write_metadata(&path, &placeholder)?;
@@ -277,6 +319,30 @@ mod tests {
             meta.title.is_empty(),
             "the placeholder carries no title until the authoritative metadata syncs"
         );
+        assert!(
+            meta.recording_started,
+            "an inbound-sync placeholder must never look like a resumable draft"
+        );
+    }
+
+    #[test]
+    fn open_existing_rejects_an_absent_folder() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = MeetingId::new();
+        assert!(
+            MeetingFolder::open_existing(dir.path(), id).is_err(),
+            "open_existing must not create a folder that isn't there"
+        );
+    }
+
+    #[test]
+    fn open_existing_opens_a_folder_created_by_create() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = MeetingId::new();
+        let created = MeetingFolder::create(dir.path(), id).expect("create");
+        let opened = MeetingFolder::open_existing(dir.path(), id).expect("open_existing");
+        assert_eq!(created.path(), opened.path());
+        assert_eq!(opened.id(), id);
     }
 
     #[test]

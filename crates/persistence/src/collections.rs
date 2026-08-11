@@ -185,6 +185,7 @@ mod tests {
             notes_format: 0,
             processing: Default::default(),
             collection_id,
+            recording_started: true,
             app_version: "0.0.0".into(),
         };
         write_metadata(folder.path(), &meta).expect("write metadata");

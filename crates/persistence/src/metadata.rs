@@ -3,13 +3,13 @@
 //! The public atomic writer keyed on the meeting **directory** —
 //! `notes_crdt::write_metadata` — lives in the leaf `notes-crdt` crate. This
 //! module retains only the crate-private path-keyed form used by
-//! [`crate::MeetingWriter::open`] and [`crate::MeetingWriter::finalise`], which
-//! already hold the resolved `metadata.json` path. Both share the one atomic
-//! implementation in `notes_crdt::metadata`.
+//! [`crate::MeetingWriter::finalise`], which already holds the resolved
+//! `metadata.json` path. Delegates to the same atomic implementation in
+//! `notes_crdt::metadata`.
 
 use std::path::Path;
 
-use minutist_common::{AudioFormat, MeetingId, MeetingMeta};
+use minutist_common::MeetingMeta;
 
 use crate::error::Result;
 
@@ -23,55 +23,4 @@ use crate::error::Result;
 /// signature is unchanged.
 pub(crate) fn write_metadata_to_path(path: &Path, meta: &MeetingMeta) -> Result<()> {
     Ok(notes_crdt::write_metadata_atomic(path, meta)?)
-}
-
-/// Write a minimal in-progress `metadata.json` for a just-opened meeting,
-/// unless one is already present at `path`.
-///
-/// Registers the meeting folder on disk the moment recording starts — rather
-/// than only at [`crate::MeetingWriter::finalise`] — so
-/// [`crate::MeetingIndex::reconcile_orphans`] can recover it after a crash or
-/// kill mid-recording (see `architecture/cross-cutting.md`, "`metadata.json`
-/// is written at recording start, not only at finalise"). The stub carries
-/// `duration_ms = 0` and a synthesised "Recording <timestamp>" title, matching
-/// the default `finalise` itself falls back to when the user never typed a
-/// title; `finalise` overwrites this stub with the full record once recording
-/// stops normally.
-///
-/// Guarded on `!path.exists()`: `MeetingFolder::create` already rejects a
-/// pre-existing directory, so a real `metadata.json` collision cannot occur on
-/// the normal `open` path today, but the guard keeps this helper safe to call
-/// defensively without ever downgrading a richer, already-finalised
-/// `metadata.json` back to the empty stub.
-pub(crate) fn write_initial_metadata_if_absent(
-    path: &Path,
-    meeting_id: MeetingId,
-    audio_format: &AudioFormat,
-) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-
-    let now = chrono::Utc::now();
-    let meta = MeetingMeta {
-        uuid: meeting_id,
-        title: format!("Recording {}", now.format("%Y-%m-%dT%H:%M:%SZ")),
-        started_at: now.to_rfc3339(),
-        ended_at: None,
-        duration_ms: 0,
-        speaker_count: 0,
-        audio_format: audio_format.clone(),
-        asr_model: None,
-        llm_model: None,
-        diarizer: None,
-        speaker_names: std::collections::BTreeMap::new(),
-        notes_format: 0,
-        collection_id: None,
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
-        // Local recording processed on this device (the back-compat default);
-        // the lifecycle field is owned by the sync/producer-gate work.
-        processing: Default::default(),
-    };
-
-    write_metadata_to_path(path, &meta)
 }

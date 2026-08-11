@@ -393,7 +393,11 @@ export const devCommands = {
   async listDevices(): Promise<Result<AudioDevice[], AppError>> {
     return ok(DEV_DEVICES);
   },
+  async createMeeting(): Promise<Result<MeetingId, AppError>> {
+    return ok(DEV_MEETING_ID);
+  },
   async startRecording(
+    _meetingId: MeetingId,
     _deviceId: string | null,
   ): Promise<Result<MeetingId, AppError>> {
     return ok(DEV_MEETING_ID);

@@ -254,6 +254,9 @@ function MeetingRow(props: MeetingRowProps) {
             {displayTitle}
           </button>
         )}
+        {meeting.recording_started === false && (
+          <span className="meeting-list__draft-chip">Draft</span>
+        )}
 
         <p className="meeting-list__meta tnum">
           <span>{formatDate(meeting.started_at)}</span>

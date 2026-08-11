@@ -1069,7 +1069,15 @@ impl Tool for StartRecording {
             .get("device_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let meeting_id = ctx.orchestrator.start(device_id).await?;
+        // This tool starts recording immediately (no "New meeting" prep
+        // step in the chat-agent/MCP surface) — mint a fresh draft, then
+        // promote it in the same call, mirroring the auto-start-immediately
+        // desktop path.
+        let meetings_dir = ctx.meetings_dir.clone();
+        let draft_id = minutist_common::MeetingId::new();
+        spawn_blocking_io(move || persistence::writer::create_draft(&meetings_dir, draft_id).map(|_| ()))
+            .await?;
+        let meeting_id = ctx.orchestrator.start(draft_id, device_id).await?;
         let data = json!({ "meeting_id": meeting_id });
         Ok(ToolOutput::new(
             data,

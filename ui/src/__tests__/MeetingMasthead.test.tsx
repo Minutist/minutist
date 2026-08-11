@@ -70,6 +70,11 @@ describe("isDefaultMeetingTitle", () => {
     expect(isDefaultMeetingTitle("Launch sync — Tuesday")).toBe(false);
     expect(isDefaultMeetingTitle("Recording notes")).toBe(false);
   });
+
+  it("also treats a New-meeting prep draft's empty title as a placeholder", () => {
+    expect(isDefaultMeetingTitle("")).toBe(true);
+    expect(isDefaultMeetingTitle("   ")).toBe(true);
+  });
 });
 
 describe("MeetingMasthead", () => {

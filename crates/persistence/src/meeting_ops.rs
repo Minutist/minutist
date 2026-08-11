@@ -336,6 +336,7 @@ fn list_entry_from(folder: &Path) -> Result<minutist_common::MeetingListEntry, E
         speaker_count: meta.speaker_count,
         excerpt,
         collection_id: meta.collection_id,
+        recording_started: meta.recording_started,
     })
 }
 
@@ -376,6 +377,7 @@ mod tests {
             notes_format: 0,
             processing: Default::default(),
             collection_id: None,
+            recording_started: true,
             app_version: "0.0.0".into(),
         };
         write_metadata(folder.path(), &meta).expect("write metadata");
@@ -477,6 +479,7 @@ mod tests {
             notes_format: 0,
             processing: Default::default(),
             collection_id: None,
+            recording_started: true,
             app_version: String::new(),
         };
         notes_crdt::meta_crdt::project_into_meta(&doc, &mut projected);

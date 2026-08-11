@@ -84,7 +84,7 @@ impl MeetingIndex {
         let rows = self
             .conn
             .query(
-                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id
+                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started
                  FROM meetings
                  ORDER BY started_at DESC",
                 (),
@@ -104,7 +104,7 @@ impl MeetingIndex {
         let rows = self
             .conn
             .query(
-                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id
+                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started
                  FROM meetings
                  WHERE title LIKE ?1 ESCAPE '\\' OR excerpt LIKE ?1 ESCAPE '\\'
                  ORDER BY started_at DESC",
@@ -126,15 +126,16 @@ impl MeetingIndex {
     async fn upsert_inner(&self, entry: &MeetingListEntry) -> Result<(), Error> {
         self.conn
             .execute(
-                "INSERT INTO meetings (id, title, started_at, duration_ms, speaker_count, excerpt, collection_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                "INSERT INTO meetings (id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      started_at = excluded.started_at,
                      duration_ms = excluded.duration_ms,
                      speaker_count = excluded.speaker_count,
                      excerpt = excluded.excerpt,
-                     collection_id = excluded.collection_id",
+                     collection_id = excluded.collection_id,
+                     recording_started = excluded.recording_started",
                 libsql::params![
                     entry.id.0.to_string(),
                     entry.title.clone(),
@@ -143,6 +144,7 @@ impl MeetingIndex {
                     entry.speaker_count as i64,
                     entry.excerpt.clone(),
                     entry.collection_id.map(|c| c.0.to_string()),
+                    entry.recording_started as i64,
                 ],
             )
             .await?;
@@ -475,6 +477,7 @@ fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> 
         speaker_count: meta.speaker_count,
         excerpt,
         collection_id: meta.collection_id,
+        recording_started: meta.recording_started,
     })
 }
 
@@ -543,6 +546,9 @@ fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error
         // A recovered local recording; the lifecycle field defaults to the
         // local-processed state (owned by the sync/producer-gate work).
         processing: Default::default(),
+        // Orphan recovery only fires when audio or a transcript already
+        // exists on disk — never a draft.
+        recording_started: true,
     };
 
     crate::metadata::write_metadata_to_path(&folder.join("metadata.json"), &meta)
@@ -638,6 +644,7 @@ fn row_to_entry(row: &libsql::Row) -> Result<MeetingListEntry, Error> {
     // `collection_id` is nullable (NULL = unfiled); parse the stored UUID string.
     let collection_id: Option<String> = row.get(6)?;
     let collection_id = collection_id.as_deref().map(parse_collection_id).transpose()?;
+    let recording_started: i64 = row.get(7)?;
 
     Ok(MeetingListEntry {
         id,
@@ -647,6 +654,7 @@ fn row_to_entry(row: &libsql::Row) -> Result<MeetingListEntry, Error> {
         speaker_count: speaker_count as u32,
         excerpt,
         collection_id,
+        recording_started: recording_started != 0,
     })
 }
 
@@ -705,6 +713,7 @@ mod tests {
             speaker_count: 1,
             excerpt: None,
             collection_id: None,
+            recording_started: true,
         }
     }
 

@@ -130,21 +130,76 @@ pub async fn list_devices(state: State<'_, IpcState>) -> AppResult<Vec<AudioDevi
 // Recording lifecycle
 // ---------------------------------------------------------------------------
 
-/// Start a new recording session.
+/// Create a "New meeting" prep draft: a real, durable meeting folder
+/// (`metadata.json` + `notes.ydoc`) with no audio yet, so a title, notes, and
+/// attachments can be added before recording ever starts.
+///
+/// Routes DIRECTLY to `persistence::writer::create_draft` (no orchestrator —
+/// the meeting has no live recording state until `start_recording` promotes
+/// it), mirroring `add_attachment`'s direct-to-persistence routing.
+#[tauri::command]
+#[specta::specta]
+pub async fn create_meeting(state: State<'_, IpcState>) -> AppResult<MeetingId> {
+    let meetings_dir = state.meetings_dir.clone();
+    let meeting_id = MeetingId::new();
+    tokio::task::spawn_blocking(move || persistence::writer::create_draft(&meetings_dir, meeting_id))
+        .await
+        .map_err(|e| AppError::Internal {
+            context: format!("create_meeting join failed: {e}"),
+        })??;
+
+    // Index it now (best-effort) so it appears in `list_meetings` in this
+    // session, mirroring `stop_recording`'s stop-time upsert — an absent row
+    // self-heals via `reconcile_orphans` on the next `list_meetings` call.
+    let meetings_dir = state.meetings_dir.clone();
+    let entry = tokio::task::spawn_blocking(move || {
+        let meta = persistence::read_metadata(&meetings_dir.join(meeting_id.0.to_string()))?;
+        Ok::<_, AppError>(meeting_list_entry_for_meta(&meetings_dir, &meta))
+    })
+    .await;
+    match entry {
+        Ok(Ok(entry)) => {
+            if let Err(e) = state.index.upsert(&entry).await {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "index upsert after create_meeting failed: {e}; will self-heal on next list"
+                );
+            }
+        }
+        Ok(Err(e)) => tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "building index entry after create_meeting failed: {e}; will self-heal on next list"
+        ),
+        Err(join_err) => tracing::warn!(
+            target: "ipc-bridge",
+            meeting_id = %meeting_id.0,
+            "building index entry after create_meeting failed (join error): {join_err}; \
+             will self-heal on next list"
+        ),
+    }
+
+    Ok(meeting_id)
+}
+
+/// Start recording into an existing "New meeting" prep draft (created via
+/// [`create_meeting`]).
 ///
 /// `device_id = None` → use the device configured in settings, or the OS
 /// default if none is configured.
 ///
-/// Returns the new `MeetingId` on success.
+/// Returns `meeting_id` on success.
 #[tauri::command]
 #[specta::specta]
 pub async fn start_recording(
+    meeting_id: MeetingId,
     device_id: Option<String>,
     state: State<'_, IpcState>,
 ) -> AppResult<MeetingId> {
     state
         .orchestrator
-        .start(device_id)
+        .start(meeting_id, device_id)
         .await
 }
 
@@ -179,12 +234,14 @@ pub async fn resume_recording(state: State<'_, IpcState>) -> AppResult<()> {
     state.orchestrator.resume().await
 }
 
-/// Set the meeting title for the LIVE recording (the active meeting has no
-/// `metadata.json` yet, so this cannot route through `rename_meeting`). Held in
-/// the orchestrator's in-progress state and consumed by `stop()` in place of the
-/// `Recording <timestamp>` default; a no-op if `meeting_id` is not the meeting
-/// currently recording/paused. Trimmed + capped so the UI cannot persist an
-/// unbounded value (mirrors the speaker-name / collection-name caps).
+/// Set the meeting title WHILE actively recording. Held in the orchestrator's
+/// in-progress state (not written to `metadata.json` immediately) and
+/// consumed by `stop()`, which prefers it over whatever title is already on
+/// disk (e.g. one set via `rename_meeting` during the "New meeting" prep
+/// phase, before recording started); a no-op if `meeting_id` is not the
+/// meeting currently recording/paused. Trimmed + capped so the UI cannot
+/// persist an unbounded value (mirrors the speaker-name / collection-name
+/// caps).
 #[tauri::command]
 #[specta::specta]
 pub async fn set_recording_title(
@@ -573,6 +630,7 @@ fn meeting_list_entry_for_meta(meetings_dir: &Path, meta: &MeetingMeta) -> Meeti
         speaker_count: meta.speaker_count,
         excerpt,
         collection_id: meta.collection_id,
+        recording_started: meta.recording_started,
     }
 }
 
@@ -1732,6 +1790,7 @@ fn meeting_list_entry_for_meta_with_summary(
         speaker_count: meta.speaker_count,
         excerpt,
         collection_id: meta.collection_id,
+        recording_started: meta.recording_started,
     }))
 }
 
@@ -3811,6 +3870,7 @@ mod tests {
             notes_format: 0,
             processing: Default::default(),
             collection_id: None,
+            recording_started: true,
             app_version: "0.0.0".into(),
         };
         let meta_json = serde_json::to_vec_pretty(&meta).expect("serialise metadata");

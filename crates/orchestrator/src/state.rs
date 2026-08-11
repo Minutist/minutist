@@ -177,7 +177,10 @@ pub(crate) fn transition_offline_release(state: &mut InternalState) -> bool {
 
 /// Validate and execute `Idle | Offline → Recording`.
 ///
-/// Returns `(meeting_id, started_at_ms)` on success.
+/// `meeting_id` is supplied by the caller — either a fresh id for the
+/// auto-start-immediately path, or an existing "New meeting" prep draft's id
+/// being promoted — rather than minted here, so a draft's identity survives
+/// the promotion unchanged. Returns `started_at_ms` on success.
 ///
 /// Starting from `Offline` **preempts** a post-stop repair pass (re-transcribe /
 /// re-diarize / auto-summarise) for the PREVIOUS meeting: the user must not be
@@ -187,7 +190,7 @@ pub(crate) fn transition_offline_release(state: &mut InternalState) -> bool {
 /// release becomes a no-op (see [`transition_offline_release`]). The genuine
 /// `Stopping` / `Finalising` drain is NOT preemptible — that is the capture
 /// teardown + transcript/metadata write, which must complete first.
-pub(crate) fn transition_start(state: &mut InternalState) -> AppResult<(MeetingId, u64)> {
+pub(crate) fn transition_start(state: &mut InternalState, meeting_id: MeetingId) -> AppResult<u64> {
     match state {
         InternalState::Idle | InternalState::Offline { .. } => {}
         _ => {
@@ -198,13 +201,12 @@ pub(crate) fn transition_start(state: &mut InternalState) -> AppResult<(MeetingI
         }
     }
 
-    let meeting_id = MeetingId::new();
     let started_at_ms = now_ms();
     *state = InternalState::Recording {
         meeting_id,
         started_at_ms,
     };
-    Ok((meeting_id, started_at_ms))
+    Ok(started_at_ms)
 }
 
 /// Validate and execute Recording → Paused.
@@ -321,7 +323,8 @@ mod tests {
     #[test]
     fn start_from_idle_records() {
         let mut state = InternalState::Idle;
-        let (id, _) = transition_start(&mut state).expect("idle start");
+        let id = MeetingId::new();
+        transition_start(&mut state, id).expect("idle start");
         assert!(matches!(state, InternalState::Recording { meeting_id, .. } if meeting_id == id));
     }
 
@@ -333,7 +336,8 @@ mod tests {
 
         // Starting the next meeting must succeed (NOT block) and take over the
         // slot with a fresh meeting id.
-        let (new_id, _) = transition_start(&mut state).expect("start preempts Offline");
+        let new_id = MeetingId::new();
+        transition_start(&mut state, new_id).expect("start preempts Offline");
         assert_ne!(new_id, old, "the new recording is a distinct meeting");
         assert!(matches!(state, InternalState::Recording { meeting_id, .. } if meeting_id == new_id));
     }
@@ -380,7 +384,7 @@ mod tests {
             InternalState::Finalising { meeting_id: id },
         ] {
             assert!(
-                transition_start(&mut state).is_err(),
+                transition_start(&mut state, MeetingId::new()).is_err(),
                 "start must be refused from a live/finalising state: {state:?}"
             );
         }

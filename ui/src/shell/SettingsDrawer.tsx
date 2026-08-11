@@ -23,6 +23,7 @@ import { readGpuAcceleration } from "../state/gpu-acceleration-settings";
 import { readLiveAgentMode } from "../state/live-agent-settings";
 import { readPreloadSummariser } from "../state/preload-summariser-settings";
 import { readCaptureSystemAudio } from "../state/system-audio-settings";
+import { readAutoStartRecordingOnNewMeeting } from "../state/auto-start-recording-settings";
 import { readNotesPaperRules } from "../state/notes-paper-settings";
 import { readTheme } from "../state/onboarding-settings";
 import type { GpuAcceleration, LiveAgentMode, Theme } from "../ipc/bindings";
@@ -121,6 +122,9 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
   const setCaptureSystemAudio = useRecordingStore(
     (s) => s.setCaptureSystemAudio,
   );
+  const setAutoStartRecordingOnNewMeeting = useRecordingStore(
+    (s) => s.setAutoStartRecordingOnNewMeeting,
+  );
   const setTheme = useRecordingStore((s) => s.setTheme);
   const setNotesPaperRules = useRecordingStore((s) => s.setNotesPaperRules);
 
@@ -129,6 +133,8 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
   const liveAgentMode = readLiveAgentMode(settings);
   const preloadSummariser = readPreloadSummariser(settings);
   const captureSystemAudio = readCaptureSystemAudio(settings);
+  const autoStartRecordingOnNewMeeting =
+    readAutoStartRecordingOnNewMeeting(settings);
   const theme = readTheme(settings);
   const notesPaperRules = readNotesPaperRules(settings);
 
@@ -218,6 +224,20 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
               onChange={(e) => void setCaptureSystemAudio(e.target.checked)}
             />
             <span>Capture call / system audio</span>
+          </label>
+          <label
+            className="settings-drawer__toggle"
+            title="When off (the default), a new meeting opens a prep screen — set a title, add notes or attachments — and you start recording when ready. When on, recording starts the instant you create a new meeting."
+          >
+            <input
+              type="checkbox"
+              checked={autoStartRecordingOnNewMeeting}
+              disabled={settings === null}
+              onChange={(e) =>
+                void setAutoStartRecordingOnNewMeeting(e.target.checked)
+              }
+            />
+            <span>Start recording immediately on a new meeting</span>
           </label>
         </section>
 

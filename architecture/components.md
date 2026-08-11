@@ -2490,6 +2490,55 @@ for generating contribution-row primary keys (plain `TEXT PRIMARY KEY`, no typed
 newtype); `uuid` is a third-party dep, not a crate-to-crate edge, so the
 dependency table above is unchanged.
 
+**"New meeting" prep drafts — a meeting that exists before its audio does.**
+Creating a new meeting and starting its audio capture are now two separate
+steps rather than one: `writer::create_draft(root, meeting_id) ->
+AppResult<MeetingFolder>` builds the on-disk shell (folder,
+`metadata.json` with `recording_started: false` + an empty title, and a
+`notes.ydoc` seeded via `notes_crdt::meta_crdt::initialise_notes_with_meta`)
+with NO audio file — the Attachments feature and the notes editor both need a
+real `MeetingId` + folder to exist before capture starts, so a prep draft is a
+real durable meeting, not a client-side-only placeholder. Two `MeetingWriter`
+entry points share a `start_capturing` body that opens `audio.opus` + the
+encoder + the transcript writer, then RMWs `metadata.json` (never a raw
+overwrite — a promoted draft may already carry a real title/collection from
+the prep phase) to flip `recording_started: true` and stamp the real capture
+`started_at`/`audio_format`, mirroring the same two fields into the meta CRDT
+via new granular `meta_crdt::set_started_at`/`set_audio_format` setters:
+- `MeetingWriter::open(root, meeting_id, format)` — the auto-start-immediately
+  path: `create_draft` then `start_capturing`, back-to-back, no visible gap.
+  Existing external contract unchanged (still mints-and-opens in one call).
+- `MeetingWriter::open_for_recording(root, meeting_id, format)` — promotes an
+  EXISTING draft (`notes_crdt::MeetingFolder::open_existing`, which errors
+  rather than creates if the folder is absent).
+
+`finalise()` correspondingly never (re)initialises the meta CRDT map — since
+`notes.ydoc` now always already exists by the time it runs (seeded at draft
+creation, for every meeting, no exceptions) — it mirrors `ended_at` /
+`duration_ms` / `speaker_count` / `asr_model` / `llm_model` / `diarizer` /
+`speaker_names` via `edit_meta_ydoc` + the existing granular setters, same
+lock-ordering rule as `meeting_ops::rename_meeting` (RMW first, un-nested).
+`title`/`started_at`/`audio_format` are untouched at finalise — they are
+draft-creation/promotion-owned, so a concurrent rename during a live
+recording (now genuinely possible, since a draft's `notes.ydoc` syncs during
+prep, before this device's own recording even starts) cannot be clobbered.
+
+`MeetingMeta.recording_started: bool` (`#[serde(default = "..")]` = `true`)
+is the "never recorded" signal on THIS device, deliberately independent of
+the `duration_ms == 0` sync-placeholder ambiguity issue 0052 disambiguated —
+`notes_crdt::MeetingFolder::ensure`'s inbound-sync placeholder and orphan
+recovery (`synthesize_metadata`) both explicitly set it `true` as the safe
+default. It is NOT carried in the meta CRDT and so does not converge: a peer
+that syncs an origin's still-unpromoted draft (title/notes with no audio)
+reads `true` regardless of the origin's real `false` — a known gap, tracked
+alongside the wider open question of whether an unpromoted draft should sync
+at all before it has real content (today it does, from `create_draft`
+onward, unconditionally). Mirrored onto `MeetingListEntry` (`index.db`
+migration 3: `recording_started INTEGER NOT NULL DEFAULT 1`) and surfaced as
+a "Draft" chip in `MeetingList.tsx` (`meeting.recording_started === false`)
+so an abandoned/unpromoted draft is at least identifiable in the list, since
+nothing yet garbage-collects one.
+
 ### `orchestrator`
 **Crate:** `crates/orchestrator`
 **Owns:** the live recording state machine. Wires `audio-capture →
@@ -2921,6 +2970,24 @@ for the explicit confirmation path before the centroid is folded. This is the
 primary slow-poison defence; the gating is in `ipc-bridge` (only `set_speaker_name`
 triggers enrolment), not in the orchestrator.
 
+**"New meeting" prep drafts (see `persistence` above).** `start(meeting_id,
+device_id) -> AppResult<MeetingId>` no longer mints its own id —
+`transition_start` takes a caller-supplied `MeetingId` (an existing draft,
+created by `ipc-bridge`'s `create_meeting` command or, for the
+auto-start-immediately setting, that same command called immediately
+beforehand) and calls `MeetingWriter::open_for_recording` instead of `open`.
+No new `RecordingState` variant: a draft with no active capture is simply
+never represented there (it stays `Idle`); the orchestrator only learns a
+meeting_id exists at the moment `start()` promotes it. `stop()`'s title
+fallback now has three tiers, not two: the LIVE `pending_title` (typed during
+the recording via `set_recording_title`) wins if set; else whatever title is
+already on disk (e.g. one set via `rename_meeting` during the prep phase,
+before recording ever started — `stop()`'s `metadata.json` write is a raw
+overwrite of the `MeetingMeta` it builds, so this must be read back
+explicitly or a prep-phase title would be silently clobbered by the
+synthesized default); only when neither is set does it fall back to
+`Recording <timestamp>`.
+
 ### `agent-tools`
 **Crate:** `crates/agent-tools`
 **Owns:** the shared tool layer — one `Tool` trait + one `ToolRegistry`, the
@@ -3018,7 +3085,13 @@ Record-control writes (#62): `start_recording` (optional `device_id`, returns th
 new `MeetingId`), `stop_recording` (returns the finished meeting's id + title +
 duration), `pause_recording`, `resume_recording` — each dispatches to the
 matching `Orchestrator` method (`start`/`stop`/`pause`/`resume`), adding no new
-dependency edge. All four are `is_write` AND override `expose_over_mcp() == true`,
+dependency edge. This tool's `start_recording` starts recording immediately (no
+prep-draft step in the chat-agent/MCP surface — that concept is desktop-UI-only,
+`ipc-bridge`'s separate `create_meeting` command): it mints a fresh `MeetingId`,
+calls `persistence::writer::create_draft` directly on `spawn_blocking` (no
+orchestrator involvement, mirroring `add_attachment`'s direct-to-persistence
+routing), then `Orchestrator::start(draft_id, device_id)` promotes it in the
+same call. All four are `is_write` AND override `expose_over_mcp() == true`,
 so they are **write-gated** like `set_speaker_name`/`rename_meeting`: absent +
 rejected when `mcp_write_tools` is OFF (the default), exposed + callable when it
 is ON — the deliberate opt-in that lets an external MCP client drive the
@@ -3442,6 +3515,14 @@ deserialises to the defaults below:
 `specta::Type` so it crosses IPC). All ten fields are added to the hand-written
 `Default` impl. No new `settings` dependency edge (`LiveAgentMode` / `GpuProbe`
 are already in `common` which `settings` already depends on).
+
+**`auto_start_recording_on_new_meeting: bool`** (`#[serde(default = ...)]` =
+`false`, the same default for a fresh store AND an older store missing the
+field — the new prep-first default applies to everyone, the same pattern
+`auto_summarise_on_stop` uses). Off: a new meeting opens the "New meeting"
+prep screen (`ipc-bridge`'s `create_meeting`); on: recording starts the
+instant a new meeting is created (the legacy behaviour, restored as an
+explicit opt-in). See `persistence`/`orchestrator` above.
 
 ### `doc-convert`
 **Crate:** `crates/doc-convert`
@@ -4615,6 +4696,20 @@ gpu_probe, settings.gpu_acceleration)` returns `true` — `Auto` enables when a 
 present AND `gpu_acceleration != Off`, so the LLM decode lands on the GPU off the
 CPU-ASR path), and raises the returned `watch::Sender` on `Idle`/`Stopping`/`Finalising`.
 
+**"New meeting" prep drafts (see `persistence`/`orchestrator` above).** New
+command `create_meeting() -> AppResult<MeetingId>` routes DIRECTLY to
+`persistence::writer::create_draft` (no orchestrator — the meeting has no
+live recording state until `start_recording` promotes it), mirroring
+`add_attachment`'s direct-to-persistence routing; it also best-effort
+upserts the index row (mirroring `stop_recording`'s stop-time upsert) so the
+draft appears in `list_meetings` in this session rather than waiting on
+`reconcile_orphans`'s next self-heal pass. `start_recording` gains a
+`meeting_id: MeetingId` parameter (the draft being promoted), passed through
+to `Orchestrator::start`. `set_recording_title`'s doc updated to no longer
+claim "the active meeting has no `metadata.json` yet" — every meeting has one
+from draft creation onward now; title editing during prep instead reuses the
+existing `rename_meeting` command unchanged.
+
 ### `app-main` (bin)
 **Crate:** `src-tauri/` (Tauri convention)
 **Owns:** the Tauri main binary, tray icon, window management, process
@@ -4925,6 +5020,25 @@ two-column 50/50 layout (controls left, transcript right).
   `shell/meeting-dnd.ts` (a `MEETING_DND_MIME` distinct from the transcript-segment
   drag, so a folder only accepts a meeting). The DEV shim seeds sample folders +
   membership so the sidebar renders + mutates under `vite dev`.
+- **"New meeting" prep drafts.** `MeetingControls`'s single record toggle is
+  now context-aware across THREE actions, not two: `new_meeting` (idle, no
+  open draft, the `auto_start_recording_on_new_meeting` setting off — the
+  default) creates + opens a draft via `useRecordingStore.createMeeting` +
+  `useMeetingsStore.open`, with NO ASR-readiness gate (creating a draft
+  touches no model); `start` (idle, WITH an open draft, or the setting on)
+  promotes via `useRecordingStore.promote`/`start`, ASR-gated exactly like
+  the legacy toggle; `stop` unchanged. `MainWindow` narrows `showSummaryPane`
+  to exclude an open draft (`openMeetingState.meta.recording_started ===
+  false` — nothing to summarise yet) while leaving `isFinishedMeeting`
+  (drives the back-to-list header affordance) matching any open+idle
+  meeting, draft or finished; the notes editor and Attachments pane need no
+  changes — they already operate on any `openMeetingId` regardless of
+  recording history. A chrome-strip banner (`main-window__draft-banner`)
+  offers a "Discard" action (`close` then `useMeetingsStore.remove`, in that
+  order — `remove` does not itself clear `openMeetingId`, and the folder is
+  about to stop existing) while a draft is open. `MeetingMasthead`'s `isDefaultMeetingTitle` now also treats an empty
+  title (a fresh draft's) as the placeholder state, alongside the
+  orchestrator's `Recording <timestamp>` default.
 - **Cross-reference, paragraph-RANGE granularity (FR-22/23).** On the
   pause-EXCLUDING timeline (`data-anchor-ms` ↔ `Segment.start_ms`, NEVER
   `Date.now()`). `ui/src/editor/hover-bridge.ts` (`NotesHoverBridge`) is a

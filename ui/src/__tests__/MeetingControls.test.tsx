@@ -22,6 +22,7 @@ import {
 } from "../shell/MeetingControls";
 import { useRecordingStore } from "../state/recording";
 import { useModelsStore } from "../state/models";
+import { useMeetingsStore } from "../state/meetings";
 import type { RecordingState } from "../ipc/bindings";
 
 // ---------------------------------------------------------------------------
@@ -70,9 +71,12 @@ describe("MeetingControls", () => {
         lastError: null,
         transcript: [],
         preparing: false,
+        settings: null,
       });
       // Phase 2: ASR model is ready by default so Start is enabled in idle.
       useModelsStore.setState({ isAsrModelReady: true });
+      // No meeting open by default — the plain "New meeting" idle case.
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
     });
   });
 
@@ -82,32 +86,71 @@ describe("MeetingControls", () => {
     expect(screen.getAllByRole("button")).toHaveLength(2);
   });
 
-  it("Idle: RECORD shows Start (enabled); PAUSE shows Pause (disabled)", () => {
+  it("Idle, no open draft, auto-start off: RECORD shows 'New meeting' (enabled); PAUSE shows Pause (disabled)", () => {
     setRecordingState({ kind: "idle" });
     render(<MeetingControls />);
 
-    expect(getButton("Start")).not.toBeDisabled();
+    expect(getButton("New meeting")).not.toBeDisabled();
     expect(getButton("Pause")).toBeDisabled();
-    // No standalone Stop / Resume buttons exist anymore.
+    // No standalone Stop / Resume / Start buttons exist in this mode.
     expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
   });
 
-  it("Idle + ASR model not ready: Start disabled", () => {
+  it("'New meeting' stays enabled even when the ASR model is not ready — creating a draft touches no model", () => {
     act(() => {
       useModelsStore.setState({ isAsrModelReady: false });
     });
     setRecordingState({ kind: "idle" });
     render(<MeetingControls />);
 
+    expect(getButton("New meeting")).not.toBeDisabled();
+  });
+
+  it("Idle with an open draft: RECORD shows Start (ASR-gated)", () => {
+    setRecordingState({ kind: "idle" });
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "draft-uuid",
+        openMeetingState: {
+          meta: { uuid: "draft-uuid", recording_started: false } as never,
+          transcript: [],
+        },
+      });
+    });
+    render(<MeetingControls />);
+    expect(getButton("Start")).not.toBeDisabled();
+
+    act(() => {
+      useModelsStore.setState({ isAsrModelReady: false });
+    });
     expect(getButton("Start")).toBeDisabled();
   });
 
-  it("Idle + preparing: RECORD shows 'Preparing…' and is disabled", () => {
+  it("Idle, auto-start setting on: RECORD shows Start even with no open draft", () => {
+    setRecordingState({ kind: "idle" });
     act(() => {
+      useRecordingStore.setState({
+        settings: { auto_start_recording_on_new_meeting: true } as never,
+      });
+    });
+    render(<MeetingControls />);
+    expect(getButton("Start")).not.toBeDisabled();
+  });
+
+  it("Idle + preparing (an open draft being promoted): RECORD shows 'Preparing…' and is disabled", () => {
+    setRecordingState({ kind: "idle" });
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "draft-uuid",
+        openMeetingState: {
+          meta: { uuid: "draft-uuid", recording_started: false } as never,
+          transcript: [],
+        },
+      });
       useRecordingStore.setState({ preparing: true });
     });
-    setRecordingState({ kind: "idle" });
     render(<MeetingControls />);
 
     expect(getButton("Preparing…")).toBeDisabled();
@@ -153,17 +196,23 @@ describe("MeetingControls", () => {
   // Action wiring: each toggle invokes the mapped recording-store action.
   // -------------------------------------------------------------------------
 
-  it("RECORD calls start when idle and stop when recording", () => {
-    const start = vi.fn();
+  it("RECORD calls createMeeting+open when idle with no draft, and stop when recording", async () => {
+    const createMeeting = vi.fn().mockResolvedValue("new-draft-uuid");
+    const open = vi.fn().mockResolvedValue(undefined);
     const stop = vi.fn();
     act(() => {
-      useRecordingStore.setState({ start, stop });
+      useRecordingStore.setState({ createMeeting, stop });
+      useMeetingsStore.setState({ open });
     });
 
     setRecordingState({ kind: "idle" });
     const { unmount } = render(<MeetingControls />);
-    fireEvent.click(getButton("Start"));
-    expect(start).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      fireEvent.click(getButton("New meeting"));
+      await Promise.resolve();
+    });
+    expect(createMeeting).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledWith("new-draft-uuid");
     unmount();
 
     setRecordingState({
@@ -174,6 +223,31 @@ describe("MeetingControls", () => {
     render(<MeetingControls />);
     fireEvent.click(getButton("Stop"));
     expect(stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("RECORD calls promote (with the draft's already-known title) when idle with an open draft", () => {
+    const promote = vi.fn();
+    act(() => {
+      useRecordingStore.setState({ promote });
+      useMeetingsStore.setState({
+        openMeetingId: "draft-uuid",
+        openMeetingState: {
+          meta: {
+            uuid: "draft-uuid",
+            recording_started: false,
+            title: "Prepped title",
+          } as never,
+          transcript: [],
+        },
+      });
+    });
+
+    setRecordingState({ kind: "idle" });
+    render(<MeetingControls />);
+    fireEvent.click(getButton("Start"));
+    // The title, not just the id: promoting must not silently blank the live
+    // masthead's title field for a draft the user already named during prep.
+    expect(promote).toHaveBeenCalledWith("draft-uuid", "Prepped title");
   });
 
   it("PAUSE calls pause when recording and resume when paused", () => {
@@ -209,25 +283,48 @@ describe("MeetingControls", () => {
 // ---------------------------------------------------------------------------
 
 describe("deriveButtonStates", () => {
-  it("idle (model ready, not preparing): Start enabled; Pause disabled", () => {
+  it("idle, no draft, auto-start off (default): new_meeting enabled regardless of model; Pause disabled", () => {
     expect(deriveButtonStates({ kind: "idle" }, true, false)).toEqual({
-      recordAction: "start",
+      recordAction: "new_meeting",
+      recordEnabled: true,
+      pauseAction: "pause",
+      pauseEnabled: false,
+    });
+    expect(deriveButtonStates({ kind: "idle" }, false, false)).toEqual({
+      recordAction: "new_meeting",
       recordEnabled: true,
       pauseAction: "pause",
       pauseEnabled: false,
     });
   });
 
-  it("idle (model not ready): Start disabled", () => {
-    expect(deriveButtonStates({ kind: "idle" }, false, false).recordEnabled).toBe(
-      false,
-    );
+  it("idle with an open draft: start, ASR-gated", () => {
+    expect(
+      deriveButtonStates({ kind: "idle" }, true, false, true).recordAction,
+    ).toBe("start");
+    expect(
+      deriveButtonStates({ kind: "idle" }, true, false, true).recordEnabled,
+    ).toBe(true);
+    expect(
+      deriveButtonStates({ kind: "idle" }, false, false, true).recordEnabled,
+    ).toBe(false);
   });
 
-  it("idle (preparing): Start disabled", () => {
-    expect(deriveButtonStates({ kind: "idle" }, true, true).recordEnabled).toBe(
-      false,
-    );
+  it("idle with auto-start on (no draft needed): start, ASR-gated", () => {
+    expect(
+      deriveButtonStates({ kind: "idle" }, true, false, false, true)
+        .recordAction,
+    ).toBe("start");
+    expect(
+      deriveButtonStates({ kind: "idle" }, false, false, false, true)
+        .recordEnabled,
+    ).toBe(false);
+  });
+
+  it("idle (start path, preparing): Start disabled", () => {
+    expect(
+      deriveButtonStates({ kind: "idle" }, true, true, true).recordEnabled,
+    ).toBe(false);
   });
 
   it("recording: Stop + Pause both enabled", () => {

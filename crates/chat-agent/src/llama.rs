@@ -99,6 +99,12 @@ pub(crate) fn render_tool_machinery_for_model(
 /// Runtime knobs for the real turn backend. Mirrors the relevant
 /// `summariser::SummariserConfig` fields so the chat context is sized like the
 /// summary context.
+///
+/// Note: GPU offload (`n_gpu_layers`) is a model-load-time decision — it is
+/// set on `LlamaModelParams` when the `LlamaModel` is constructed by
+/// `ipc-bridge`, not on `LlamaContextParams`. `LlamaTurnBackend` borrows an
+/// already-loaded `&LlamaModel` (see [`LlamaTurnBackend::new`]) and therefore
+/// carries no `n_gpu_layers` field, same as [`crate::live::LlamaLiveConfig`].
 #[derive(Debug, Clone)]
 pub struct LlamaTurnConfig {
     /// Context window to allocate, in tokens.
@@ -107,9 +113,6 @@ pub struct LlamaTurnConfig {
     pub n_batch: u32,
     /// CPU threads for llama.cpp inference.
     pub threads: i32,
-    /// Number of model layers to offload to the GPU (runtime GPU toggle; `0`
-    /// forces CPU even in a GPU build, like `summariser`).
-    pub n_gpu_layers: u32,
 }
 
 impl Default for LlamaTurnConfig {
@@ -119,7 +122,6 @@ impl Default for LlamaTurnConfig {
             n_ctx: 32_768,
             n_batch: 512,
             threads,
-            n_gpu_layers: summariser::gpu_layers(),
         }
     }
 }

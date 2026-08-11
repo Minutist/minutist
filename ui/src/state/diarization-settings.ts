@@ -1,34 +1,23 @@
 /**
- * Diarization settings helpers (Phase 6).
+ * Diarization settings helpers.
  *
- * The Phase-6 diarization toggle is the `settings.diarization_enabled` field
- * (off by default; gates the orchestrator's on-stop diarization pass — see
- * `architecture/components.md`, the `diarizer` Phase-6 section). The field is
- * owned by the `settings` crate and is now a first-class member of the generated
- * `Settings` type (the Phase-6 backend JOIN regenerated `bindings.ts`), so the
- * earlier `Settings`-augmentation shim has collapsed: these helpers read/write
- * the canonical field directly.
+ * `settings.diarization_enabled` gates the orchestrator's live + on-stop
+ * diarization passes and is owned by the `settings` crate, which defaults it
+ * to `true` (see `default_diarization_enabled` in `crates/settings/src/lib.rs`).
+ * These helpers read/write that field directly.
  */
 import type { Settings } from "../ipc/bindings";
 
 /**
- * `Settings` carrying the Phase-6 diarization toggle.
- *
- * Retained as a named alias of the canonical generated `Settings` (the field is
- * now part of it) so existing call sites and tests keep importing this type with
- * no change.
- */
-export type SettingsWithDiarization = Settings;
-
-/**
  * Read the diarization-enabled flag from a settings snapshot.
  *
- * Defaults to `false` (off) when the field is absent (an older store written
- * before it existed) or the snapshot is `null`.
+ * Defaults to `true` (on), matching the backend's `default_diarization_enabled`,
+ * when the field is absent (an older store written before it existed) or the
+ * snapshot is `null` (not yet loaded).
  */
 export function readDiarizationEnabled(settings: Settings | null): boolean {
-  if (settings === null) return false;
-  return settings.diarization_enabled === true;
+  if (settings === null) return true;
+  return settings.diarization_enabled !== false;
 }
 
 /**

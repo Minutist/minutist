@@ -524,9 +524,9 @@ describe("diarization_enabled toggle round-trip (Phase 6)", () => {
     expect(commands.updateSettings).not.toHaveBeenCalled();
   });
 
-  it("defaults to off (false) when the field is absent", () => {
-    expect(readDiarizationEnabled(BASE_SETTINGS)).toBe(false);
-    expect(readDiarizationEnabled(null)).toBe(false);
+  it("defaults to on (true) when the field is absent, matching the backend default", () => {
+    expect(readDiarizationEnabled(BASE_SETTINGS)).toBe(true);
+    expect(readDiarizationEnabled(null)).toBe(true);
   });
 
   // G2 — the shared `updateSetting` helper writes optimistically and rolls

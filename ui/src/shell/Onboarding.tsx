@@ -134,7 +134,7 @@ function SettingsStep() {
           <span>
             Identify speakers after recording
             <span className="onboarding__hint">
-              Identifies who spoke each line when a recording stops. Off by
+              Identifies who spoke each line when a recording stops. On by
               default.
             </span>
           </span>

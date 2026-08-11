@@ -438,16 +438,28 @@ impl Orchestrator {
     ///
     /// `AppError::InvalidInput` if not in `Idle` state, or if no draft folder
     /// exists for `meeting_id`.
-    pub async fn start(&self, meeting_id: MeetingId, device_id: Option<String>) -> AppResult<MeetingId> {
-        let mut guard = self.inner.lock().await;
-        let started_at_ms = transition_start(&mut guard.state, meeting_id)?;
-
-        let started_at =
-            DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64).unwrap_or_else(Utc::now);
-        guard.started_at = Some(started_at);
-        // Fresh recording: drop any title left over from a prior meeting so it
-        // cannot bleed across. A live title arrives later via `set_pending_title`.
-        guard.pending_title = None;
+    pub async fn start(
+        &self,
+        meeting_id: MeetingId,
+        device_id: Option<String>,
+    ) -> AppResult<MeetingId> {
+        // The state-transition fields are mutated under the lock, then the lock
+        // is released before any of the `await`s below (device open, model
+        // loads) — holding it across an await would block every other async
+        // caller of the orchestrator (including plain `state()` reads) for the
+        // duration of that work, same rationale as `pause`/`resume`/`stop`.
+        let started_at_ms = {
+            let mut guard = self.inner.lock().await;
+            let started_at_ms = transition_start(&mut guard.state, meeting_id)?;
+            let started_at = DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64)
+                .unwrap_or_else(Utc::now);
+            guard.started_at = Some(started_at);
+            // Fresh recording: drop any title left over from a prior meeting so
+            // it cannot bleed across. A live title arrives later via
+            // `set_pending_title`.
+            guard.pending_title = None;
+            started_at_ms
+        };
 
         // Resolve device: caller wins; fall back to settings; then OS default.
         let resolved_device = device_id.or_else(|| self.settings.current().input_device_id);
@@ -456,7 +468,7 @@ impl Orchestrator {
         let mut capture = match AudioCaptureManager::open(resolved_device) {
             Ok(c) => c,
             Err(e) => {
-                guard.state = InternalState::Idle;
+                self.inner.lock().await.state = InternalState::Idle;
                 return Err(e);
             }
         };
@@ -473,7 +485,7 @@ impl Orchestrator {
         ) {
             Ok(s) => s,
             Err(e) => {
-                guard.state = InternalState::Idle;
+                self.inner.lock().await.state = InternalState::Idle;
                 return Err(e);
             }
         };
@@ -485,16 +497,19 @@ impl Orchestrator {
             bitrate_kbps: Some(32),
         };
 
-        let writer =
-            match MeetingWriter::open_for_recording(&self.persistence_root, meeting_id, audio_format) {
-                Ok(w) => w,
-                Err(e) => {
-                    guard.state = InternalState::Idle;
-                    // Stop the capture stream we already started.
-                    let _ = capture.stop();
-                    return Err(e);
-                }
-            };
+        let writer = match MeetingWriter::open_for_recording(
+            &self.persistence_root,
+            meeting_id,
+            audio_format,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                self.inner.lock().await.state = InternalState::Idle;
+                // Stop the capture stream we already started.
+                let _ = capture.stop();
+                return Err(e);
+            }
+        };
 
         // Surface the live state NOW — capture is already running and the writer
         // is open, so the recording is genuinely live. Emitting here, BEFORE the
@@ -506,7 +521,10 @@ impl Orchestrator {
         // only the event moved earlier). No state rollback follows this point:
         // the remaining steps degrade rather than fail.
         self.emit(AppEvent::StateChanged {
-            state: guard.state.as_public(),
+            state: RecordingState::Recording {
+                meeting_id,
+                started_at_ms,
+            },
         });
 
         // GPU offload is a VRAM-aware runtime decision: a single plan probes the
@@ -569,8 +587,11 @@ impl Orchestrator {
             prewarmed_backend,
         );
 
-        guard.capture = Some(capture);
-        guard.runner = Some(runner_handle);
+        {
+            let mut guard = self.inner.lock().await;
+            guard.capture = Some(capture);
+            guard.runner = Some(runner_handle);
+        }
 
         // StateChanged(Recording) was already emitted above (right after capture +
         // writer came up) so the UI switched to the meeting screen immediately;
@@ -4353,13 +4374,17 @@ impl Orchestrator {
         &self,
         streams: audio_capture::AudioStreams,
     ) -> AppResult<MeetingId> {
-        let mut guard = self.inner.lock().await;
+        // Scoped exactly as the production `start()` path: the lock is released
+        // before the `build_live_diarizer` await below, so it never blocks other
+        // async callers for the duration of that (potential) model load.
         let meeting_id = MeetingId::new();
-        let started_at_ms = transition_start(&mut guard.state, meeting_id)?;
-
-        let started_at =
-            DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64).unwrap_or_else(Utc::now);
-        guard.started_at = Some(started_at);
+        {
+            let mut guard = self.inner.lock().await;
+            let started_at_ms = transition_start(&mut guard.state, meeting_id)?;
+            let started_at = DateTime::<Utc>::from_timestamp_millis(started_at_ms as i64)
+                .unwrap_or_else(Utc::now);
+            guard.started_at = Some(started_at);
+        }
 
         let audio_format = AudioFormat {
             codec: "opus".into(),
@@ -4371,7 +4396,7 @@ impl Orchestrator {
         let writer = match MeetingWriter::open(&self.persistence_root, meeting_id, audio_format) {
             Ok(w) => w,
             Err(e) => {
-                guard.state = InternalState::Idle;
+                self.inner.lock().await.state = InternalState::Idle;
                 return Err(e);
             }
         };
@@ -4405,10 +4430,13 @@ impl Orchestrator {
             online_diarizer,
             None,
         );
-        guard.runner = Some(runner_handle);
-        // No AudioCaptureManager to store (guard.capture stays None).
 
-        let new_state = guard.state.as_public();
+        let new_state = {
+            let mut guard = self.inner.lock().await;
+            guard.runner = Some(runner_handle);
+            // No AudioCaptureManager to store (guard.capture stays None).
+            guard.state.as_public()
+        };
         self.emit(AppEvent::StateChanged { state: new_state });
 
         tracing::info!(

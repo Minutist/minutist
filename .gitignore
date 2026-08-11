@@ -5,3 +5,11 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Python bytecode cache from scripts/*.py (PEP 723 inline-script deps).
+scripts/__pycache__/
+# Ad-hoc screenshots dropped at the repo root during manual/visual QA.
+0*.png
+[0-9][0-9]-*.png
+# Playwright MCP's local browser-session artefacts.
+.playwright-mcp/

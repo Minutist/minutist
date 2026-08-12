@@ -298,8 +298,8 @@ pub async fn send_chat_message(
                 user_tx,
                 message,
                 state.event_tx.clone(),
-                Arc::clone(&state.chat_in_flight),
-                Arc::clone(&state.chat_cancel),
+                Arc::clone(&state.chat_runtime.chat_in_flight),
+                Arc::clone(&state.chat_runtime.chat_cancel),
             )
             .await;
         }
@@ -317,6 +317,7 @@ pub async fn send_chat_message(
     // Single in-flight turn per session.
     {
         let mut in_flight = state
+            .chat_runtime
             .chat_in_flight
             .lock()
             .expect("chat_in_flight poisoned");
@@ -352,7 +353,7 @@ pub async fn send_chat_message(
     // the multi-GB GGUF). `cancel_chat_turn` finds a flag to raise only via
     // this map; registering it after the load would leave a `cancel_chat_turn`
     // that arrives during a slow first load silently dropped.
-    let cancel_map = Arc::clone(&state.chat_cancel);
+    let cancel_map = Arc::clone(&state.chat_runtime.chat_cancel);
     let cancel = chat_agent::CancelFlag::new();
     cancel_map
         .lock()
@@ -366,6 +367,7 @@ pub async fn send_chat_message(
         Ok(s) => s,
         Err(e) => {
             state
+                .chat_runtime
                 .chat_in_flight
                 .lock()
                 .expect("chat_in_flight poisoned")
@@ -420,9 +422,9 @@ pub async fn send_chat_message(
         &chat_system_prompt_for_meeting(base_prompt, meeting_id, title.as_deref()),
         &current_settings.output_language,
     );
-    let registry = Arc::clone(&state.tool_registry);
+    let registry = Arc::clone(&state.chat_runtime.tool_registry);
     let event_tx = state.event_tx.clone();
-    let in_flight = Arc::clone(&state.chat_in_flight);
+    let in_flight = Arc::clone(&state.chat_runtime.chat_in_flight);
     let handle = tokio::runtime::Handle::current();
     // `cancel_map` and `cancel` are already registered above, before
     // `ensure_summariser`, and are reused as-is here — re-registering a fresh
@@ -499,6 +501,7 @@ pub async fn cancel_chat_turn(
     state: State<'_, IpcState>,
 ) -> AppResult<()> {
     if let Some(flag) = state
+        .chat_runtime
         .chat_cancel
         .lock()
         .expect("chat_cancel poisoned")
@@ -527,7 +530,7 @@ pub async fn cancel_chat_turn(
 pub async fn get_mcp_server_info(
     state: State<'_, IpcState>,
 ) -> AppResult<Option<crate::McpServerInfo>> {
-    Ok(state.mcp_info.lock().expect("mcp_info poisoned").clone())
+    Ok(state.connected.mcp_info.lock().expect("mcp_info poisoned").clone())
 }
 
 

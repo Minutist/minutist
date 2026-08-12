@@ -162,7 +162,7 @@ pub fn disabled_tunnel() -> Arc<dyn TunnelControl> {
 #[tauri::command]
 #[specta::specta]
 pub async fn tunnel_begin_pairing(state: State<'_, IpcState>) -> AppResult<PairingPrompt> {
-    state.tunnel.begin_pairing().await
+    state.connected.tunnel.begin_pairing().await
 }
 
 /// Poll the in-progress pairing once, returning the current [`TunnelStatus`].
@@ -172,7 +172,7 @@ pub async fn tunnel_begin_pairing(state: State<'_, IpcState>) -> AppResult<Pairi
 #[tauri::command]
 #[specta::specta]
 pub async fn tunnel_poll_pairing(state: State<'_, IpcState>) -> AppResult<TunnelStatus> {
-    state.tunnel.poll_pairing().await
+    state.connected.tunnel.poll_pairing().await
 }
 
 /// Enable or disable the connector. Enabling with a stored credential starts the
@@ -191,8 +191,8 @@ pub async fn set_connector_enabled(
     state: State<'_, IpcState>,
     enabled: bool,
 ) -> AppResult<TunnelSnapshot> {
-    let snapshot = state.tunnel.set_enabled(enabled).await?;
-    if let Err(e) = state.sync.set_enabled(enabled).await {
+    let snapshot = state.connected.tunnel.set_enabled(enabled).await?;
+    if let Err(e) = state.connected.sync.set_enabled(enabled).await {
         tracing::warn!(
             target: "ipc-bridge",
             error = ?e,
@@ -208,7 +208,7 @@ pub async fn set_connector_enabled(
 #[tauri::command]
 #[specta::specta]
 pub async fn tunnel_status(state: State<'_, IpcState>) -> AppResult<TunnelSnapshot> {
-    Ok(state.tunnel.snapshot().await)
+    Ok(state.connected.tunnel.snapshot().await)
 }
 
 /// Erase the paired account and sign out (GDPR Art 17). `DELETE /v1/account` on
@@ -220,8 +220,8 @@ pub async fn tunnel_status(state: State<'_, IpcState>) -> AppResult<TunnelSnapsh
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_account(state: State<'_, IpcState>) -> AppResult<()> {
-    state.tunnel.delete_account().await?;
-    if let Err(e) = state.sync.set_enabled(false).await {
+    state.connected.tunnel.delete_account().await?;
+    if let Err(e) = state.connected.sync.set_enabled(false).await {
         tracing::warn!(
             target: "ipc-bridge",
             error = ?e,

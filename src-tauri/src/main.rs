@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ipc_bridge::{spawn_event_forwarder, IpcState};
+use ipc_bridge::{
+    spawn_event_forwarder, ChatRuntimeState, ConnectedState, DiagnosticsInfo, IpcState,
+};
 use settings::{JsonFileStore, SettingsHandle};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -1050,22 +1052,28 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 index: index.clone(),
                 event_tx: ipc_event_tx.clone(),
                 attachment_convert_tx,
-                summariser: summariser_cell.clone(),
-                embedder: embedder_cell.clone(),
-                tool_registry,
-                chat_in_flight: chat_in_flight.clone(),
-                chat_cancel: chat_cancel.clone(),
+                chat_runtime: ChatRuntimeState {
+                    summariser: summariser_cell.clone(),
+                    embedder: embedder_cell.clone(),
+                    tool_registry,
+                    chat_in_flight: chat_in_flight.clone(),
+                    chat_cancel: chat_cancel.clone(),
+                },
                 translate_in_flight: Arc::new(std::sync::Mutex::new(
                     std::collections::HashSet::new(),
                 )),
-                mcp_info: mcp_info.clone(),
-                tunnel: tunnel_control,
-                sync: sync_control,
-                logs_dir: logs_dir.clone(),
-                app_version: app_handle.package_info().version.to_string(),
-                platform: platform_string(),
+                connected: ConnectedState {
+                    tunnel: tunnel_control,
+                    sync: sync_control,
+                    mcp_info: mcp_info.clone(),
+                },
                 voiceprints,
                 live_copilot_handles: Arc::clone(&live_copilot_handles),
+                diagnostics: DiagnosticsInfo {
+                    logs_dir: logs_dir.clone(),
+                    app_version: app_handle.package_info().version.to_string(),
+                    platform: platform_string(),
+                },
             });
 
             // Log the GPU probe + the resolved default plan at startup so the

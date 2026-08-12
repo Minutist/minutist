@@ -200,9 +200,9 @@ fn gpu_string(gpu_acceleration: minutist_common::GpuAcceleration) -> String {
 pub async fn get_diagnostic_report(
     state: State<'_, IpcState>,
 ) -> AppResult<DiagnosticReport> {
-    let logs_dir = state.logs_dir.clone();
-    let app_version = state.app_version.clone();
-    let platform = state.platform.clone();
+    let logs_dir = state.diagnostics.logs_dir.clone();
+    let app_version = state.diagnostics.app_version.clone();
+    let platform = state.diagnostics.platform.clone();
     let gpu_acceleration = state.settings.current().gpu_acceleration;
 
     let report = tokio::task::spawn_blocking(move || {

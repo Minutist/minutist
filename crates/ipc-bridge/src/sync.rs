@@ -149,7 +149,7 @@ pub fn disabled_sync() -> Arc<dyn SyncControl> {
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_status(state: State<'_, IpcState>) -> AppResult<SyncStatus> {
-    Ok(state.sync.status().await)
+    Ok(state.connected.sync.status().await)
 }
 
 /// This device's shareable ticket string. The UI shows it (and/or a QR) so the
@@ -161,7 +161,7 @@ pub async fn sync_status(state: State<'_, IpcState>) -> AppResult<SyncStatus> {
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_get_my_ticket(state: State<'_, IpcState>) -> AppResult<String> {
-    state.sync.my_ticket().await
+    state.connected.sync.my_ticket().await
 }
 
 /// Register a peer device from its shareable ticket (produced by
@@ -169,7 +169,7 @@ pub async fn sync_get_my_ticket(state: State<'_, IpcState>) -> AppResult<String>
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_add_peer(state: State<'_, IpcState>, ticket: String) -> AppResult<()> {
-    state.sync.add_peer(ticket).await
+    state.connected.sync.add_peer(ticket).await
 }
 
 /// Trigger a notes sync for one meeting with the paired peers. Progress and
@@ -177,7 +177,7 @@ pub async fn sync_add_peer(state: State<'_, IpcState>, ticket: String) -> AppRes
 #[tauri::command]
 #[specta::specta]
 pub async fn sync_now(state: State<'_, IpcState>, meeting_id: MeetingId) -> AppResult<()> {
-    state.sync.sync_now(meeting_id).await
+    state.connected.sync.sync_now(meeting_id).await
 }
 
 #[cfg(test)]

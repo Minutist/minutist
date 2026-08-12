@@ -279,7 +279,7 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
             </p>
           </div>
           <div className="settings-drawer__field">
-            <label htmlFor="settings-live-agent">Live co-pilot</label>
+            <label htmlFor="settings-live-agent">Live assistant</label>
             <select
               id="settings-live-agent"
               value={liveAgentMode}

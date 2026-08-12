@@ -28,6 +28,11 @@ jobs:
   # the code licence by accident).
   reuse-lint:
     name: reuse lint
+    # Fork-PR guard: keep untrusted fork PRs off the self-hosted runner (ci/runner/),
+    # which shares hosts with production. Runs for push/dispatch and same-repo PRs only.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
@@ -42,6 +47,11 @@ jobs:
   # against the checked-out commit.
   guardrails:
     name: guardrails (dep-table, tracing-targets)
+    # Fork-PR guard: keep untrusted fork PRs off the self-hosted runner (this job
+    # runs attacker-controllable scripts from the checked-out tree).
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
@@ -55,6 +65,12 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    # Fork-PR guard: the Linux leg of this matrix runs on the self-hosted runner,
+    # so gate the whole job off fork PRs. (Trade-off: fork PRs get no CI here; a
+    # later refinement can keep the GitHub-hosted windows/macOS legs for forks.)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -266,6 +282,11 @@ jobs:
   # are skipped).
   cargo-deny:
     name: cargo deny
+    # Fork-PR guard: keep untrusted fork PRs off the self-hosted runner (this job
+    # spawns a container action through the host docker socket).
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout
@@ -297,6 +318,12 @@ jobs:
   # push to main.
   gpu-features:
     name: gpu-features (${{ matrix.os }})
+    # Fork-PR guard: the Linux leg of this matrix runs on the self-hosted runner,
+    # so gate the whole job off fork PRs. (Trade-off as in `test`: fork PRs get no
+    # CI here; a later refinement can keep the GitHub-hosted legs for forks.)
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

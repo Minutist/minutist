@@ -4417,8 +4417,9 @@ surface. They are NOT added to `common` (the embedding-free PODs
 IPC mirror lives here to keep `persistence` specta-free).
 
 **Connected-tier tunnel surface (`tunnel_begin_pairing` / `tunnel_poll_pairing` /
-`set_connector_enabled` / `tunnel_status`, WS4-A S5b).** The webview drives device
-pairing and the connector toggle through these four commands; the live tunnel
+`set_connector_enabled` / `tunnel_status` / `delete_account`, WS4-A S5b).** The
+webview drives device pairing, the connector toggle, and account erasure through
+these five commands; the live tunnel
 state rides `AppEvent::TunnelStatusChanged { status: TunnelStatus }` on the
 existing event bus (no second event registration). The commands call through a
 `TunnelControl` async-trait object held in `IpcState.tunnel` — `ipc-bridge` takes
@@ -4431,8 +4432,13 @@ returns the `PairingPrompt { user_code, verification_uri }` for the UI to show +
 open; the issued device credential never crosses to the webview — `app-main`
 stores it securely. `tunnel_status` / `set_connector_enabled` return a
 `TunnelSnapshot { enabled, status, account_id }` (the paired account is the
-non-secret rauthy `sub`). No `tunnel-client` edge is added to `ipc-bridge` in the
-dependency table.
+non-secret rauthy `sub`). `delete_account` erases the paired account (GDPR
+Art 17): it calls the account-service `DELETE /v1/account` with the device
+credential, and — only once the server confirms the erase (or reports the
+credential already gone) — forgets the local credential, stops the tunnel, and
+returns to `Disconnected`; a failed server call leaves the device paired and the
+operation retryable, and `DisabledTunnel` rejects it as `Unsupported`. No
+`tunnel-client` edge is added to `ipc-bridge` in the dependency table.
 
 **Diagnostic report (`get_diagnostic_report`, issue #0014).** Assembles + REDACTS
 the `common::DiagnosticReport` the no-telemetry "Report a problem" flow pre-fills
@@ -4904,7 +4910,7 @@ than packages.
 |---|---|---|
 | Notes editor | `ui/src/editor/` | Tiptap editor, markdown shortcuts, paragraph-anchor extension. |
 | Transcript pane | `ui/src/transcript/` | Live-appending transcript view, hover/click cross-reference. The live audio meter (`AudioMeter.tsx`) renders at the top of this pane. Rows are virtualised (`@tanstack/react-virtual`) and keyed by segment `start_ms`: only the rows in the scroll container's visible window (plus a small overscan) are mounted, and identity follows the segment across a splice/reorder rather than sticking to an array position. The per-row component (`TranscriptRow`) is memoised so a live append re-renders only the newly-visible rows. Speaker chips carry a live colour dot when diarization labels are present (`speaker-color.ts`: deterministic `speaker_id` → palette slot; colour pairs with the visible label for accessibility). Consecutive rows are grouped: the labelled chip shows once at the start of a speaker's run; continuation rows keep only the colour dot. |
-| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, a Connection pane (`ConnectionSettingsPane.tsx` — connector enable toggle, "Pair this device" via the device-code flow that shows the `user_code` and opens the verification URL with `tauri-plugin-opener`, live `Connecting → Online` status, and the paired account; honest that the connector channel transits content to the AI vendor by design, never "private"), and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one read command `get_mcp_server_info`; the Connection pane drives the four tunnel commands. Both connected-only panes are `VITE_CONNECTED`-gated (lazy-loaded; dropped from the free bundle). |
+| Meeting shell | `ui/src/shell/` | Window chrome (start/stop/pause, meeting list); the pane-visibility toggle; and the Settings drawer (`SettingsDrawer.tsx` — an Appearance group with the colour-theme control + the notes writing-paper-rules toggle, plus input device, transcription language, diarize-on-stop, GPU acceleration, system-audio capture, a Connection pane (`ConnectionSettingsPane.tsx` — connector enable toggle, "Pair this device" via the device-code flow that shows the `user_code` and opens the verification URL with `tauri-plugin-opener`, live `Connecting → Online` status, the paired account, and a guarded "Delete account" action (erases the account server-side via `delete_account`, shown only when paired); honest that the connector channel transits content to the AI vendor by design, never "private"), and a Connections (MCP) pane: `McpSettingsPane.tsx` — enable toggle, fixed port, write-tools toggle, and the live endpoint URL + bearer-token reveal/copy via `get_mcp_server_info`). The summary is a workspace column, not an overlay. The capture/processing/appearance settings live in the drawer rather than the top bar so the masthead stays a single non-overflowing row. The settings controls route through the existing settings seams; the MCP pane adds the one read command `get_mcp_server_info`; the Connection pane drives the five tunnel commands. Both connected-only panes are `VITE_CONNECTED`-gated (lazy-loaded; dropped from the free bundle). |
 | IPC client | `ui/src/ipc/` | Typed wrapper around `invoke` + `listen`. Generated stubs from tauri-specta live here. |
 | UI state store | `ui/src/state/` | Zustand store. Derived UI state only — transient. Also holds a `settings` snapshot loaded once via `refreshSettings` on mount; user-driven changes (e.g. device selection) round-trip through `commands.updateSettings` so they persist across app restarts. |
 

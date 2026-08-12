@@ -47,8 +47,8 @@ use serde::{Deserialize, Serialize};
 use settings::SettingsHandle;
 use tokio::sync::broadcast;
 use tunnel_client::{
-    next_interval, ConnectionState, DeviceCodeClient, InternalBearer, LoopbackTarget, PairingError,
-    PollOutcome, TunnelConfig, TunnelHandle,
+    next_interval, AccountDirectoryClient, AccountDirectoryError, ConnectionState, DeviceCodeClient,
+    InternalBearer, LoopbackTarget, PairingError, PollOutcome, TunnelConfig, TunnelHandle,
 };
 
 /// The file under `{app-data}` holding the device credential. 0600 on Unix.
@@ -516,6 +516,60 @@ impl TunnelControl for ConnectedTunnel {
             account_id: rt.credential.as_ref().map(|c| c.account_id.clone()),
         }
     }
+
+    async fn delete_account(&self) -> AppResult<()> {
+        // The stored credential identifies the account to erase. No credential →
+        // already signed out; nothing to do (idempotent).
+        let credential = {
+            let rt = self.runtime.lock().expect("tunnel runtime poisoned");
+            rt.credential.clone()
+        };
+        let Some(credential) = credential else {
+            return Ok(());
+        };
+
+        // Ask the account service to erase the account. `DELETE /v1/account`
+        // removes the rauthy identity (email + credentials) and cascade-deletes
+        // every device row (labels, credential hashes, endpoint addressing,
+        // direct addresses). The device is identified by its credential.
+        let api = self.settings.current().relay_api_url;
+        let client = AccountDirectoryClient::new(api, credential.device_credential.clone())
+            .map_err(map_account_err)?;
+        match client.delete_account().await {
+            // Erased, or the credential no longer resolves (the account is
+            // already gone) — either way it is not there. Proceed to clear the
+            // local state. Any other error leaves the account intact and the
+            // operation retryable, so we surface it WITHOUT clearing local state.
+            Ok(()) | Err(AccountDirectoryError::Unauthorised) => {}
+            Err(e) => return Err(map_account_err(e)),
+        }
+
+        // Server-side erasure confirmed: tear down the local device identity.
+        self.stop_tunnel().await;
+        let cred_path = StoredCredential::path(&self.app_data_dir);
+        if let Err(e) = std::fs::remove_file(&cred_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    target: "app-main",
+                    "delete_account: could not remove {}: {e}",
+                    cred_path.display()
+                );
+            }
+        }
+        {
+            let mut rt = self.runtime.lock().expect("tunnel runtime poisoned");
+            rt.credential = None;
+            rt.pairing = None;
+            rt.status = TunnelStatus::Disconnected;
+        }
+        // Disable the connector so nothing tries to reconnect a deleted account.
+        let _ = self.settings.update(|s| s.connector_enabled = false).await;
+        let _ = self.event_tx.send(AppEvent::TunnelStatusChanged {
+            status: TunnelStatus::Disconnected,
+        });
+        tracing::info!(target: "app-main", "account erased; device signed out");
+        Ok(())
+    }
 }
 
 /// Strip a full endpoint URL (`http://127.0.0.1:8765/mcp`) to its origin
@@ -555,6 +609,29 @@ fn map_pairing_err(e: PairingError) -> AppError {
         },
         PairingError::MalformedAuthorisation => AppError::Internal {
             context: "the account service returned a malformed authorisation".to_string(),
+        },
+    }
+}
+
+/// Map an account-directory error to the IPC command error. Coarse (no oracle)
+/// and never includes the credential. `Unauthorised` is normally handled as
+/// "already gone" before mapping; it is covered here for completeness.
+fn map_account_err(e: AccountDirectoryError) -> AppError {
+    match e {
+        AccountDirectoryError::Config => AppError::InvalidInput {
+            context: "the relay api URL must be https:// (or a loopback http://)".to_string(),
+        },
+        AccountDirectoryError::Transport(_) => AppError::Io {
+            context: "could not reach the account service".to_string(),
+        },
+        AccountDirectoryError::Unauthorised => AppError::Internal {
+            context: "the account service rejected the device credential".to_string(),
+        },
+        AccountDirectoryError::Status { status } => AppError::Internal {
+            context: format!("the account service returned status {status}"),
+        },
+        AccountDirectoryError::Decode(_) => AppError::Internal {
+            context: "the account service returned an unexpected response".to_string(),
         },
     }
 }

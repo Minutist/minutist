@@ -89,6 +89,16 @@ pub trait TunnelControl: Send + Sync {
 
     /// The current snapshot (enabled flag + live status + paired account).
     async fn snapshot(&self) -> TunnelSnapshot;
+
+    /// Erase the paired account and sign this device out (GDPR Art 17).
+    ///
+    /// Calls the account-service erase endpoint (`DELETE /v1/account`) with the
+    /// stored device credential, then — only once the server confirms the erase
+    /// (or reports the account already gone) — forgets the local credential,
+    /// stops the tunnel, and moves the status to `Disconnected`, emitting the
+    /// change. A failed server call leaves the device paired and the operation
+    /// retryable. In the local build (no credential) this is `Unsupported`.
+    async fn delete_account(&self) -> AppResult<()>;
 }
 
 /// The no-op tunnel control used by the free build and by a connected build with
@@ -122,6 +132,12 @@ impl TunnelControl for DisabledTunnel {
             status: TunnelStatus::Disconnected,
             account_id: None,
         }
+    }
+
+    async fn delete_account(&self) -> AppResult<()> {
+        Err(AppError::Unsupported {
+            context: "there is no connected account to delete in this build".to_string(),
+        })
     }
 }
 
@@ -195,6 +211,26 @@ pub async fn tunnel_status(state: State<'_, IpcState>) -> AppResult<TunnelSnapsh
     Ok(state.tunnel.snapshot().await)
 }
 
+/// Erase the paired account and sign out (GDPR Art 17). `DELETE /v1/account` on
+/// the account-service erases the rauthy identity (email + credentials) and
+/// every device row; the local device credential is then forgotten. The sync
+/// engine is stopped alongside (best-effort, like [`set_connector_enabled`]). On
+/// success the device is fully unpaired and the account is gone server-side; a
+/// failure leaves the device paired and the call retryable.
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_account(state: State<'_, IpcState>) -> AppResult<()> {
+    state.tunnel.delete_account().await?;
+    if let Err(e) = state.sync.set_enabled(false).await {
+        tracing::warn!(
+            target: "ipc-bridge",
+            error = ?e,
+            "delete_account: stopping the sync engine failed (best-effort)"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +243,10 @@ mod tests {
             Err(AppError::Unsupported { .. })
         ));
         assert_eq!(t.poll_pairing().await.unwrap(), TunnelStatus::Disconnected);
+        assert!(matches!(
+            t.delete_account().await,
+            Err(AppError::Unsupported { .. })
+        ));
         let snap = t.snapshot().await;
         assert!(!snap.enabled);
         assert_eq!(snap.status, TunnelStatus::Disconnected);

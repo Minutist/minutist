@@ -252,3 +252,15 @@
   color: var(--ink);
   border-color: var(--stone-faint);
 }
+
+/* Destructive variant (e.g. Delete account): oxblood accent, mixed down at
+   rest so it reads as available-but-consequential and saturates on hover. */
+.settings-drawer__about--danger {
+  color: color-mix(in srgb, var(--accent) 70%, var(--ink-soft));
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.settings-drawer__about--danger:hover {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}

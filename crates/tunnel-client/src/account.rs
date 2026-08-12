@@ -165,6 +165,27 @@ impl AccountDirectoryClient {
         status_check(resp.status())?;
         Ok(())
     }
+
+    /// `DELETE /v1/account` — erase this account and everything the service
+    /// derives from it: every device on the account (labels, credential hashes,
+    /// endpoint addressing, published direct addresses) and the rauthy identity
+    /// (email + credentials). The account is identified by the credential, so no
+    /// body is sent. Success is `204 No Content`.
+    ///
+    /// A `401` ([`AccountDirectoryError::Unauthorised`]) means the credential no
+    /// longer resolves — the account is already gone — which the caller may treat
+    /// as erasure already complete when tearing down local state.
+    pub async fn delete_account(&self) -> Result<(), AccountDirectoryError> {
+        let resp = self
+            .http
+            .delete(self.url("/v1/account"))
+            .bearer_auth(&self.device_credential)
+            .send()
+            .await
+            .map_err(AccountDirectoryError::Transport)?;
+        status_check(resp.status())?;
+        Ok(())
+    }
 }
 
 /// Map a response status to the coarse error. `401` is the service's uniform
@@ -283,6 +304,34 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_account_sends_delete_with_bearer_and_accepts_204() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/account"))
+            .and(header("authorization", "Bearer mdc_test.secret"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client_for(&server).delete_account().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_account_maps_401_to_unauthorised() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/account"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        assert!(matches!(
+            client_for(&server).delete_account().await,
+            Err(AccountDirectoryError::Unauthorised)
+        ));
     }
 
     #[tokio::test]

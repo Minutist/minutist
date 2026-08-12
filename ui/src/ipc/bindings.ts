@@ -1015,6 +1015,22 @@ async tunnelStatus() : Promise<Result<TunnelSnapshot, AppError>> {
 }
 },
 /**
+ * Erase the paired account and sign out (GDPR Art 17). `DELETE /v1/account` on
+ * the account-service erases the rauthy identity (email + credentials) and
+ * every device row; the local device credential is then forgotten. The sync
+ * engine is stopped alongside (best-effort, like [`set_connector_enabled`]). On
+ * success the device is fully unpaired and the account is gone server-side; a
+ * failure leaves the device paired and the call retryable.
+ */
+async deleteAccount() : Promise<Result<null, AppError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_account") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The sync engine's current live status for the Settings → Sync pane.
  */
 async syncStatus() : Promise<Result<SyncStatus, AppError>> {

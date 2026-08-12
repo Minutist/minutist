@@ -44,6 +44,12 @@ export type TunnelStatusStore = {
   setEnabled: (enabled: boolean) => Promise<void>;
   /** Begin device pairing: show the code, open the URL, and poll to completion. */
   beginPairing: () => Promise<void>;
+  /**
+   * Erase the paired account and sign this device out via `delete_account`.
+   * On success the account is gone server-side and the local credential is
+   * forgotten; the snapshot flips to the signed-out (unpaired) state.
+   */
+  deleteAccount: () => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
@@ -137,6 +143,20 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
       }
     };
     setTimeout(() => void poll(), PAIRING_POLL_INTERVAL_MS);
+  },
+
+  deleteAccount: async () => {
+    try {
+      unwrap(await commands.deleteAccount());
+      // Erased server-side and locally forgotten: reflect the signed-out state.
+      set({
+        snapshot: { enabled: false, status: "disconnected", account_id: null },
+        userCode: null,
+        lastError: null,
+      });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
   },
 
   handleEvent: (event) => {

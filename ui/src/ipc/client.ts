@@ -180,6 +180,10 @@ export const commands: Commands = {
   setConnectorEnabled: (enabled) =>
     callCommand("setConnectorEnabled", [enabled]),
   tunnelStatus: () => callCommand("tunnelStatus", []),
+  // Erase the paired account (email + credentials + every device) server-side
+  // and forget the local credential. In the free build (or the dev shim) it is
+  // unsupported / inert.
+  deleteAccount: () => callCommand("deleteAccount", []),
   // WS4-B S5: the connected-tier peer-to-peer notes sync surface. `syncStatus`
   // reads the engine's live state; `syncGetMyTicket` returns the shareable ticket
   // for pairing another device; `syncAddPeer` registers a peer from its ticket;

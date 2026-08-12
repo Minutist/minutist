@@ -41,6 +41,7 @@ export function ConnectionSettingsPane() {
   const refresh = useTunnelStatusStore((s) => s.refresh);
   const setEnabled = useTunnelStatusStore((s) => s.setEnabled);
   const beginPairing = useTunnelStatusStore((s) => s.beginPairing);
+  const deleteAccount = useTunnelStatusStore((s) => s.deleteAccount);
 
   // Fetch the snapshot on mount so the pane reflects the live state. Status
   // changes after that arrive on the event bus (tunnel_status_changed).
@@ -52,6 +53,19 @@ export function ConnectionSettingsPane() {
   const status = snapshot?.status ?? "disconnected";
   const account = snapshot?.account_id ?? null;
   const paired = account !== null;
+
+  async function confirmDeleteAccount() {
+    if (
+      !confirm(
+        "Delete your Minutist account? This erases your account and every " +
+          "paired device from the server — your email, sign-in credentials, and " +
+          "this device's pairing. Your local meetings stay on this computer. " +
+          "This cannot be undone.",
+      )
+    )
+      return;
+    await deleteAccount();
+  }
 
   return (
     <section className="settings-drawer__group" aria-label="Connection">
@@ -112,6 +126,24 @@ export function ConnectionSettingsPane() {
         from sync, which is end-to-end. The connector stays off until you enable
         it and pair this device.
       </p>
+
+      {paired && (
+        <div className="settings-drawer__field" aria-label="Delete account">
+          <button
+            type="button"
+            className="settings-drawer__about settings-drawer__about--danger"
+            disabled={status === "pairing"}
+            onClick={() => void confirmDeleteAccount()}
+          >
+            Delete account
+          </button>
+          <p className="settings-drawer__hint">
+            Erases your account and every paired device from the server — your
+            email, sign-in credentials, and this device's pairing. Your local
+            meetings stay on this computer. This cannot be undone.
+          </p>
+        </div>
+      )}
 
       {lastError && (
         <p className="settings-drawer__hint settings-drawer__hint--warn">

@@ -1038,6 +1038,7 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             tunnel::tunnel_poll_pairing,
             tunnel::set_connector_enabled,
             tunnel::tunnel_status,
+            tunnel::delete_account,
             sync::sync_status,
             sync::sync_get_my_ticket,
             sync::sync_add_peer,

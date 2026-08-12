@@ -1,12 +1,146 @@
-//! `orchestrator` — Phase 2 live recording pipeline.
+//! `orchestrator` — the live recording state machine and its offline
+//! companion passes.
 //!
 //! Owns the recording lifecycle (start / pause / resume / stop), wires
-//! `audio-capture → vad-chunker → asr-runtime → persistence`, and fans out
-//! `AppEvent` to subscribers.
+//! `audio-capture → vad-chunker → asr-runtime → persistence`, kicks off
+//! `diarizer` on stop, and fans out `AppEvent` (transcript-segment-appended,
+//! meter-level, state-changed, recording-clock, diarization-complete, …) that
+//! `ipc-bridge` forwards to the webview.
 //!
-//! Phase 2 adds the live pipeline: VAD → batched-VAD accumulator → ASR →
-//! transcript events. See `runner.rs` for implementation details and
-//! `architecture/cross-cutting.md` "ASR chunking constraint" for constraints.
+//! This is the **thorniest crate** in the workspace: it is the one place that
+//! wires `audio-capture`, `vad-chunker`, `asr-runtime`, `diarizer`,
+//! `model-registry`, `persistence`, and `settings` together into one state
+//! machine. A change to any one of those crates that affects the live
+//! pipeline's shape (buffering, flush cadence, event ordering) is an
+//! orchestration-owner decision here, not something a parallel change to the
+//! upstream crate alone can settle.
+//!
+//! ## Dependency shape
+//!
+//! `orchestrator → { audio-capture, vad-chunker, asr-runtime, asr-parakeet,
+//! diarizer, model-registry, persistence, settings }` (see `Cargo.toml`). It
+//! is the only crate below `ipc-bridge` allowed to depend on `model-registry`
+//! AND `diarizer` AND `persistence` simultaneously: the live pipeline needs
+//! model resolution (ASR + diarize models), audio persistence, and the
+//! diarizer's clustering pipeline all in the same place to keep the
+//! `model-registry` edge out of `diarizer` and `agent-tools` (see the
+//! `diarizer` crate's dependency-boundary note, and the transcribe/relisten
+//! surfaces below). It does **not** depend on `summariser` — `ipc-bridge`
+//! loads the summariser directly (`ensure_model_path` resolves the model
+//! directory here, but the summariser itself is opened by `ipc-bridge`) — nor
+//! on `ipc-bridge` itself, so no `tauri::*` import is reachable from this
+//! crate (see "No Tauri" below).
+//!
+//! ## "New meeting" prep drafts (see `persistence`)
+//!
+//! [`Orchestrator::start`] takes `(meeting_id, device_id)`: `meeting_id` is
+//! always caller-supplied — either an existing "New meeting" prep draft
+//! (created ahead of time by `ipc-bridge`'s `create_meeting` IPC command) or,
+//! for the auto-start-immediately setting, a draft created by that same
+//! command called immediately beforehand — never minted inside `start()`
+//! itself. `start()` promotes the draft to an actively-recording meeting via
+//! [`persistence::MeetingWriter::open_for_recording`] rather than
+//! [`persistence::MeetingWriter::open`].
+//!
+//! A prep draft with no active capture has no representation of its own in
+//! `RecordingState`/`InternalState`: it stays `Idle` from the orchestrator's
+//! point of view, and the orchestrator only learns the meeting exists at the
+//! moment `start()` promotes it. Title/notes/attachment edits made during the
+//! prep phase converge through the draft's `notes.ydoc`, independent of this
+//! crate.
+//!
+//! [`Orchestrator::stop`]'s title has three sources, in priority order: the
+//! live `pending_title` set mid-recording via
+//! [`Orchestrator::set_pending_title`] wins if present and non-blank;
+//! otherwise whatever title is already on disk (e.g. one set via
+//! `rename_meeting` during the prep phase, before recording ever started);
+//! only when neither is set does it fall back to the synthesized `Recording
+//! <timestamp>` default. The on-disk title must be read back explicitly for
+//! this fallback to take effect: `stop()`'s `metadata.json` write is a raw
+//! overwrite of the `MeetingMeta` it builds, so without that read-back a
+//! prep-phase title would be silently clobbered by the synthesized default.
+//!
+//! ## Live pipeline
+//!
+//! The live pipeline is VAD → batched-VAD accumulator → ASR →
+//! `AppEvent::TranscriptSegment`, with an additive live diarizer hint layered
+//! on top:
+//! - The capture-drain runner (`runner` module, private — see its module doc)
+//!   feeds sample batches through a `VadChunker`, accumulates VAD segments
+//!   with zero-padded gap capping, and flushes to a separate ASR worker task
+//!   on a size/latency/end-of-stream trigger. See `runner.rs`'s module doc and
+//!   `architecture/cross-cutting.md` "ASR chunking constraint".
+//! - When `diarization_enabled` is on and the embedding model is locally
+//!   available (no download, no block), an `Arc<OnlineDiarizer>` assigns a
+//!   sticky speaker label to each VAD segment as it closes, threaded through
+//!   to `Segment::speaker_id`. This is a best-effort, additive hint only.
+//! - The runner emits a throttled `AppEvent::RecordingClock { clock_ms }`
+//!   (~5 Hz) on the sample-receive path, `clock_ms` being the pause-EXCLUDING
+//!   capture-sample clock the notes editor uses to stamp paragraph anchors
+//!   (see `architecture/cross-cutting.md` "Notes paragraph-anchor clock").
+//! - A user-typed title set mid-recording (`set_pending_title`) is consumed by
+//!   `stop()` in place of the synthesized `Recording <timestamp>` default; it
+//!   is user content and is never logged.
+//! - `pause`/`resume`/`stop` deliver their writer commands to the runner via
+//!   an awaited channel `send()` — back-pressured, never dropped, since a lost
+//!   pause/resume command would desynchronise the encoder-pause silence from
+//!   the pause-excluding timeline. Both stop paths (Recording-stop and
+//!   paused-stop) drain every sample batch still queued in the channel
+//!   through the writer AND the VAD before finalising, so a batch accepted
+//!   just before a stop is never stranded.
+//!
+//! ## On-stop diarization (the `orchestrator → diarizer` edge)
+//!
+//! The orchestrator owns the diarizer's lifecycle end to end: it resolves
+//! both model directories via `model-registry` and opens a `SherpaDiarizer`,
+//! keeping the `model-registry` edge out of `diarizer` (which takes only
+//! resolved `&Path`s — see that crate's doc). Diarization is **decoupled**
+//! from `stop()`: `stop()` finalises and returns the meeting un-diarized the
+//! instant it is on disk, and — when the user's `diarization_enabled` setting
+//! (surfaced via [`Orchestrator::diarization_enabled`]) is true — `ipc-bridge`
+//! spawns [`Orchestrator::rediarize`] in the background afterward, so a slow
+//! or hung diarization pass can never wedge `stop()` or hide the meeting.
+//!
+//! ## Offline surfaces
+//!
+//! Beyond the live state machine, this crate exposes offline, `Idle`-only
+//! (claim-guarded) operations over a previously-recorded meeting, all
+//! rejecting a concurrent live recording or another offline op with
+//! `AppError::InvalidInput`:
+//! - [`Orchestrator::re_transcribe`] — re-runs ASR over the stored
+//!   `audio.opus` through the same batched-VAD machinery the live path uses,
+//!   rewriting `transcript.json`. Also run as an automatic background repair
+//!   after `stop()` when the live transcript fell behind.
+//! - [`Orchestrator::rediarize`] — re-runs diarization (with the #0015
+//!   re-ASR split of mixed segments) over the existing transcript; this IS the
+//!   on-stop pass, auto-triggered.
+//! - [`Orchestrator::reprocess`] — re-transcribe THEN re-diarize under one
+//!   claim, so no `Idle` window opens between the two sub-steps.
+//! - [`Orchestrator::transcribe_pcm_window`] and
+//!   [`Orchestrator::extract_segment_wav`] — read-only, take no offline claim
+//!   (safe during a live recording), and back the agent `relisten_section`
+//!   tool and the transcript pane's per-segment playback control
+//!   respectively.
+//! - [`Orchestrator::enrol_voiceprint`] — builds a speaker voiceprint centroid
+//!   from clean segments of a finished meeting and enrols it into a
+//!   `VoiceprintStore` passed in by `ipc-bridge`.
+//!
+//! All of these translate between the transcript's pause-EXCLUDING clock and
+//! the decoded audio's pause-INCLUDING clock via `runner::pcm_window_for_excluding_range`
+//! (`pub(crate)`), and keep the `model-registry` resolution edge inside this
+//! crate so callers like `agent-tools` never reach `model-registry` directly.
+//!
+//! ## Test seams
+//!
+//! Test-only constructor and driver variants are consolidated behind one
+//! `#[cfg(any(test, feature = "test-source"))]` seam per production entry
+//! point (`re_transcribe_with_backend`, `rediarize_with_split_inputs`,
+//! `transcribe_pcm_window_with_backend`, `start_with_streams_and_backend`),
+//! each delegating to the same inner implementation the production path uses
+//! with a caller-supplied `AsrBackend`/turns stub in place of a resolved
+//! model — so the default (model-free) test suite exercises the real
+//! machinery without a multi-GB model on disk. See `test_support` and
+//! `tests/` for the integration-test harnesses built on these seams.
 //!
 //! ## Threading model
 //!

@@ -1,11 +1,26 @@
 //! `chat-agent` — the stateless, OpenAI-compatible, tool-calling chat TURN
-//! engine (Phase 9).
+//! engine.
 //!
 //! One assistant turn per call over the bundled local LLM, reusing the
 //! `summariser` substrate (the loaded `LlamaModel`, D5) and the `agent-tools`
 //! tool descriptors. The crate sits ABOVE both `summariser` and `agent-tools`;
 //! folding the loop into `summariser` would force a backwards `summariser →
 //! agent-tools` edge.
+//!
+//! # Boundaries (binding — see `architecture/components.md`)
+//!
+//! Edges: `common`, `summariser`, `agent-tools` (+ the external `llama-cpp-2`,
+//! `serde`, `serde_json`, `thiserror`, `tracing`, `encoding_rs` crates).
+//!
+//! Deliberately **no** `tauri`/`specta` edge, and no `persistence`/
+//! `orchestrator` edge directly — the driver (`ipc-bridge`) reaches those
+//! through `agent-tools`. No `model-registry` edge — the engine reuses the
+//! already-loaded model via the `summariser` substrate seam below rather than
+//! loading its own. The engine types ([`ChatEngine`], [`ChatMessage`],
+//! [`TurnOutcome`], [`SamplerConfig`], [`TurnBackend`]) live in this crate, not
+//! `common`, because no `common`-level signature names them — the asymmetry
+//! with `common::Summariser` is principled: `Summariser` is named by a
+//! `common` type (`agent_tools::ToolContext`), so it stays in `common`.
 //!
 //! # The boundary (binding — §1.2 / §1.3)
 //!
@@ -446,7 +461,7 @@ mod tests {
     /// The `agent-tools` contract forbids regex `pattern` in schemas because the
     /// vendored llama.cpp schema→GBNF converter rejects PCRE shorthands. Compile
     /// every v1 registry schema through `json_schema_to_grammar`; a future
-    /// incompatible schema fails CI here (a Phase 9 guard).
+    /// incompatible schema fails CI here.
     #[test]
     fn every_registry_schema_compiles_to_grammar() {
         let registry = agent_tools::ToolRegistry::v1(false);

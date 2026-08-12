@@ -127,7 +127,7 @@ that still separates two distinct speakers, maximising single-speaker merging.
 The greedy online path has little margin, so live labels stay provisional — the
 on-stop pass is the safety net.
 
-**Offline over-split prune (issue #63).** On long, acoustically-
+**Offline over-split prune.** On long, acoustically-
 varied recordings (room coloration + system-audio loopback + a podcast over a
 loudspeaker) the offline pass over-split: one speaker's embeddings drift past the
 single distance `cluster_threshold`, minting extra clusters — the field saw 19 /
@@ -310,7 +310,7 @@ No `println!` or `eprintln!` outside test code. Two narrow exceptions:
 The reviewer is expected to flag any `println!` / `eprintln!` outside these
 two carve-outs and outside `#[cfg(test)]`.
 
-**Crash capture (issue #0014, no telemetry).** `app-main` adds a `tracing`
+**Crash capture (no telemetry).** `app-main` adds a `tracing`
 ring-buffer layer (`src-tauri/src/crash.rs`) that retains the last N formatted
 log lines in a process-wide static (under the same `EnvFilter`, so it sees the
 same info+ lines the file appender does), plus a `std::panic::set_hook` that, on
@@ -319,7 +319,7 @@ platform, best-effort GPU mode, panic message + location, backtrace, and the
 recent ring lines). The hook chains the previous one so the default print/abort
 behaviour is preserved. Every line written passes through a meeting-id-UUID
 redaction pass (`crash::redact`, mirroring the webview's `redactMeetingPaths`).
-By the #0014 privacy audit, no meeting *content* (transcript / notes / title /
+No meeting *content* (transcript / notes / title /
 speaker text) is logged at any level, so the ring never holds it; the UUID strip
 is the defensive boundary for paths. This invariant is enforced at the source:
 the ASR backends (`asr-runtime`, `asr-parakeet`) log `text_chars`/`words`
@@ -413,7 +413,7 @@ the real transcript end. `asr-runtime` MUST stop generation on
 `</asr_text>` in addition to EOG.
 
 Alternative strategies (pad-to-30s-per-call, post-filter hallucinated
-tail) are documented in Spike 1's README as fallbacks if batched-VAD's
+tail) are documented in `spikes/asr/README.md` as fallbacks if batched-VAD's
 latency profile is unacceptable.
 
 ## ASR engine routing
@@ -482,7 +482,7 @@ this section must be updated to cover it.
 
 ## Notes paragraph-anchor clock
 
-Binding rule (stress-test correction A4). Notes paragraph anchors
+Binding rule. Notes paragraph anchors
 (`data-anchor-ms` on each paragraph, first-keystroke-per-paragraph while
 recording) MUST be stamped from the capture-sample, pause-**excluding**
 recording clock — the same timeline as `Segment::start_ms`. That value is
@@ -512,7 +512,7 @@ Consequence: `audio.opus` is recorded pause-*including* (the encoder pads each
 pause with synthesised silence), while anchors and segment timestamps are
 pause-*excluding*. Cross-reference (FR-22/23) operates **entirely on the
 pause-excluding timeline** (`data-anchor-ms` ↔ `Segment::start_ms`), so it needs
-no conversion. The **summariser** relies on the same coincidence (#70): it
+no conversion. The **summariser** relies on the same coincidence: it
 merges anchored note paragraphs with transcript segments by comparing
 `data-anchor-ms` directly against `Segment::start_ms`, no conversion, to weave
 each note in at the time it was written (see `components.md` — `summariser`). Audio-file *seek-to-anchor* (playing the audio at a clicked
@@ -536,9 +536,9 @@ exactly as the live capture clock froze during the pause). Decode also trims the
 re-transcribed post-pause segment lands on the pause-excluding clock (not inflated
 by the pause). Limitation: a ≥ 4 s run of genuinely-silent *input* would be
 misclassified; a persisted pause-interval map (a `common`/schema change) would
-make this exact rather than heuristic — tracked for a later phase.
+make this exact rather than heuristic — not implemented.
 
-**Re-diarize re-ASR split must stay on a single clock (#0015).** The
+**Re-diarize re-ASR split must stay on a single clock.** The
 offline re-diarize pass re-ASRs each kept mixed Qwen segment into single-speaker
 sub-clips at its speaker-change boundaries. The two clocks must never be
 compared directly: `SherpaDiarizer::compute_turns` runs over the pause-INCLUDING
@@ -564,7 +564,7 @@ internal `Offline` state under the orchestrator lock (rejecting a concurrent
 offline op with `AppError::InvalidInput`) and release it on every exit path, so
 two offline ops can't race and clobber the SAME meeting's `transcript.json`.
 
-**`reprocess` (#0015) takes ONE claim for a re-transcribe + diarize
+**`reprocess` takes ONE claim for a re-transcribe + diarize
 pass.** It merges `re_transcribe` and `rediarize` into a single offline op under
 ONE `claim_offline`/`release_offline`, never re-claiming between the two
 sub-steps: it drives their CLAIMED bodies (the post-claim logic, factored out so
@@ -663,8 +663,8 @@ Owned by `model-registry`. The contract:
   LLM was skipped, the Summarise action's in-progress UI distinguishes the
   one-time **model-download phase** (with %) from actual summarisation, so the
   multi-GB wait is not mislabelled "Summarising…". A downloaded-but-not-yet-
-  loaded LLM still costs an mmap + warmup on the first summarise; #69 surfaces
-  THAT as the indeterminate **"Loading the summarisation model…"** phase of the
+  loaded LLM still costs an mmap + warmup on the first summarise; this surfaces
+  as the indeterminate **"Loading the summarisation model…"** phase of the
   summarise progress bar (see "Operation progress"), distinct from the download.
 - **Progress UX.** `ensureModel` enters the downloading state optimistically on
   click (seeded at the model's known partial fraction) because resuming a large
@@ -766,9 +766,9 @@ indicator. Producers + determinism:
 - **`ReTranscribe` (determinate)** — `orchestrator::runner::re_transcribe_buffer`
   emits per accumulator flush, `fraction = kept-samples-fed / total-kept-samples`
   (a pure `re_transcribe_fraction`, unit-tested). Cleared by `TranscriptReady`.
-- **`Summarise` (two-phase determinate + indeterminate lead-in, #69)** —
+- **`Summarise` (two-phase determinate + indeterminate lead-in)** —
   `ipc-bridge::run_held_summarise` drives the concrete
-  `LlamaSummariser::summarise_with_progress`, which now reports a phased
+  `LlamaSummariser::summarise_with_progress`, which reports a phased
   `SummariseProgress`. The bar progresses through up to four labelled phases so
   the user is never staring at a silent 0% on a long meeting: (1) indeterminate
   **"Loading the summarisation model…"** around `ensure_summariser` (the
@@ -804,7 +804,7 @@ disk); the heavy background passes run AFTER. They run in order in one
 fire-and-forget task: (1) re-transcribe if the live transcript fell behind, then
 (2) re-diarize — both under the `Offline` claim (which reports the public
 **`Idle`** state, so Start stays enabled — see "Offline ops are serialized") —
-then (3) **auto-summarise** (#68), gated on `settings.auto_summarise_on_stop`
+then (3) **auto-summarise**, gated on `settings.auto_summarise_on_stop`
 (default ON; serde-default so an older store adopts it). The auto-summarise step
 runs LAST so it summarises the FINAL transcript (after any re-transcribe /
 re-diarize), drives the SAME held-summariser path as the user-triggered
@@ -884,7 +884,7 @@ rules, binding on the engine:
   re-clusters and can re-letter speakers, a `rediarize` pass CLEARS `speaker_names`
   (the old label→name mapping is no longer valid); the `set_speaker_name` tool
   re-establishes names afterward. Names are an overlay applied at read time, never
-  baked into `transcript.json`. The merged `reprocess` (#0015) ALWAYS
+  baked into `transcript.json`. The merged `reprocess` ALWAYS
   diarizes. When `voiceprint_enrolment_enabled` is ON, a `reprocess` re-identifies
   known speakers from your library: enrolled speakers keep their names across a
   re-letter (via global gallery centroid matching), and unenrolled speakers
@@ -912,7 +912,7 @@ rules, binding on the engine:
   via a captured `Handle::block_on(registry.dispatch(...))` for the dispatch step
   only (§4.5 — the one async/sync crossing).
 
-- **Assistant-`tool_calls` message in history (binding, CQ1).** The OpenAI tool
+- **Assistant-`tool_calls` message in history (binding).** The OpenAI tool
   protocol the GGUF tool template renders is `assistant(tool_calls) →
   tool(result)*`: a `tool` message MUST be preceded by the assistant message that
   bears the matching `tool_calls` array. When a turn requests tools, the driver
@@ -926,7 +926,7 @@ rules, binding on the engine:
   Vec<ToolCallRecord>` on the assistant message, `tool_call_id` on the tool
   message) so a reloaded multi-tool turn reconstructs the same valid sequence.
 
-- **Turn cancellation (binding, P1).** Each turn runs against a
+- **Turn cancellation (binding).** Each turn runs against a
   `chat_agent::CancelFlag` (`Arc<AtomicBool>`). `send_chat_message` registers one
   per session in `IpcState::chat_cancel`; the `cancel_chat_turn(session_id)`
   command raises it. The engine's real decode loop checks the flag BETWEEN decoded
@@ -936,12 +936,12 @@ rules, binding on the engine:
   guard + the cancel-flag entry, and persists the session. The inter-agent (MCP)
   path drives a fresh never-raised flag (no user cancel surface).
 
-- **Group-boundary eviction (binding, CQ2/P2).** `chat_agent::trim_to_budget` is a
+- **Group-boundary eviction (binding).** `chat_agent::trim_to_budget` is a
   pure planner that returns the MINIMUM messages to drop after the pinned system
   head. The driver (which owns the message roles) SNAPS that count forward to the
   next user-message boundary before draining, so the survivor at `history[1]` is a
-  `User` turn — never an orphan `assistant`/`tool` lead (which, with the CQ1
-  assistant-`tool_calls` rule, would be a malformed sequence). On any eviction the
+  `User` turn — never an orphan `assistant`/`tool` lead (which, with the
+  assistant-`tool_calls` rule above, would be a malformed sequence). On any eviction the
   driver emits `AppEvent::ChatContextTrimmed { session_id, dropped_turns }`; the
   webview shows a quiet "history trimmed" affordance.
 
@@ -961,7 +961,7 @@ rules, binding on the engine:
   events already delivered the reply). `delete_meeting` removes the meeting folder,
   so chat sessions go with it.
 
-- **Held-model lifecycle (C2).** The LLM GGUF is loaded **once**, lazily, on first
+- **Held-model lifecycle.** The LLM GGUF is loaded **once**, lazily, on first
   chat/summarise use into `IpcState::summariser`
   (`Arc<OnceCell<Arc<LlamaSummariser>>>`), and shared by both the chat engine (which
   borrows `&LlamaModel`) and the one-shot `summarise_meeting` path. GPU placement is resolved **at load time** from
@@ -985,7 +985,7 @@ categories. Cross-cutting rules:
   agent holds **one** `LlamaContext` for the entire live session on a dedicated
   single-owned thread. The small prefix (system prompt + digest
   categories) is prefilled ONCE at recording start as the OPEN USER TURN of a Gemma
-  chat-template prompt (#0022 — the instruct model needs the turn framing to reply
+  chat-template prompt (the instruct model needs the turn framing to reply
   with JSON, not continue the transcript). Each refresh then **prunes the KV back to
   the prefix** and decodes a fresh, BOUNDED tail on top (retrieved context + running
   digest + recent transcript window + the chat-template suffix that closes the user
@@ -1210,9 +1210,9 @@ categories. Cross-cutting rules:
   agent tears down); and (c) chat is user-initiated — simultaneous use is unlikely
   during an active meeting. The `LlamaContext`s are distinct (no shared KV state);
   llama.cpp serialises concurrent `decode` calls via internal locks.
-  WU2b should add a coordination guard (e.g. the live agent skips a refresh while
-  a foreground chat/summarise decode holds the model) if field testing reveals
-  throughput degradation.
+  A coordination guard (e.g. the live agent skips a refresh while
+  a foreground chat/summarise decode holds the model) is a candidate fix if field
+  testing reveals throughput degradation; none exists yet.
 
 - **`LiveAgentMode::Auto` = discrete-GPU-only; default `Off`.**
   `settings.live_agent_mode` (wire key `live_agent_enabled`) defaults to
@@ -1226,7 +1226,8 @@ categories. Cross-cutting rules:
   and a native allocation failure aborts the process — so `Auto` resolves `false`
   there. `Off` disables unconditionally; `On` is the explicit opt-in that accepts the
   integrated-GPU contention. It does NOT consult `resolve_gpu_plan`'s VRAM-budget
-  thresholds; WU2b could refine the discrete-GPU case to a free-VRAM headroom check.
+  thresholds; refining the discrete-GPU case to a free-VRAM headroom check is a
+  possible future improvement, not implemented.
 
 - **KV quantisation: OFF.** q8_0 KV quantisation costs ~15 % decode throughput for
   memory savings the 36 GB test GPU does not need. Not applied to the live agent
@@ -1255,10 +1256,8 @@ categories. Cross-cutting rules:
   `collect_events![AppEventPayload]` registration — no second registration.
   Both are lossy-broadcast-safe (`LiveCopilotMessage` carries the full turn
   content; a lagged subscriber is notified on next arrival). `LiveDigestError`
-  kept its wire tag from the retired digest-JSON design (its `LiveDigestUpdated`
-  sibling and the `LiveDigest`/`LiveDigestItem` payload types were deleted —
-  see `components.md`) but now reports a terminal live-agent-driver error, not
-  a digest-refresh failure.
+  reports a terminal live-agent-driver error — despite the name, it is not
+  scoped to digest refreshes specifically.
 
 ## MCP transport
 
@@ -1281,7 +1280,7 @@ revision 2025-11-25). Binding controls:
   `watch::Sender<bool>` for the running server; the watcher fires it on
   disable and spawns a fresh server (with a new inter-agent driver and a new
   shutdown sender) on re-enable. `settings.mcp_port` is a FIXED default
-  loopback port (8765, D1 — one instance runs, so a stable port keeps a
+  loopback port (8765 — one instance runs, so a stable port keeps a
   saved client URL valid). Changing the port or `mcp_write_tools` IS
   restart-required (the running server was built with those values at startup).
   On stop, `AppEvent::McpServerStopped` is emitted so the Settings → MCP pane
@@ -1334,12 +1333,12 @@ revision 2025-11-25). Binding controls:
   test override) and otherwise falls back to the loaded `tunnel_device.json`
   credential, so a GUI desktop with no env variable still authenticates to the
   flipped relay (`/relay-authz`) from its paired credential — mirroring the
-  phone's `getStoredCredential() ?? RELAY_AUTH_TOKEN` (0043). The
+  phone's `getStoredCredential() ?? RELAY_AUTH_TOKEN`. The
   account-directory `AccountEndpoint` it advertises to other paired devices
   carries `SyncConfig::DEFAULT_RELAY_URL` (the sync relay it actually homes
   on), not `settings.relay_url` — that setting is the separate connector
-  tunnel's WSS rendezvous URL and was previously advertised by mistake (0045),
-  which pointed peers at the wrong host to dial the desktop.
+  tunnel's WSS rendezvous URL. Advertising `settings.relay_url` here points
+  peers at the wrong host to dial the desktop.
 
   **Token lifetime and the connected-relay path.** The token is stable across
   restarts: `app-main` reads the existing file on start and reuses it so that
@@ -1358,13 +1357,13 @@ revision 2025-11-25). Binding controls:
   radius); `retranscribe_meeting` / `rediarize_meeting` are internal-only (heavy;
   holding the offline claim via MCP would block the user's recording); the
   record-control tools (`start_recording` / `stop_recording` / `pause_recording`
-  / `resume_recording`, #62) are MCP-allowlisted **write-gated** control tools —
+  / `resume_recording`) are MCP-allowlisted **write-gated** control tools —
   `is_write` AND `expose_over_mcp() == true`, so the recording lifecycle is
   driveable over MCP **only when the user turns `mcp_write_tools` ON** (off by
   default, behind the bearer token + loopback bind); this is the deliberate opt-in
   that lets an external client run the record→transcribe→read loop for E2E. No
   destructive tool (`delete_meeting`, notes mutation, summary overwrite) is in the
-  v1 registry at all. ON TOP of that, `settings.mcp_write_tools` (D3, default
+  v1 registry at all. ON TOP of that, `settings.mcp_write_tools` (default
   `false`) gates the reversible writes: off ⇒ read/compute + the inter-agent tool
   only; on ⇒ the two reversible writes join. The gate is enforced at projection
   AND on call (`mcp_call_allowed`). NOTE: read-only ≠ zero-cost — even with writes
@@ -1527,7 +1526,7 @@ restart. Moving existing data is the user's responsibility (no automatic
 migration). There is currently no UI for this field; it must be set by editing
 `settings.store` directly.
 
-**`index.db` is a derived, rebuildable cache (binding — A6).** The
+**`index.db` is a derived, rebuildable cache (binding).** The
 per-meeting folders are the **source of truth**; `index.db` (the libsql
 meeting-list index) is a query cache derived from each meeting's
 `metadata.json` / `transcript.json`. `persistence` opens it lazily and
@@ -1655,7 +1654,7 @@ that feature.)
 
 ## Voiceprint matching
 
-**Scope (issue #0003).** Cross-session speaker voiceprints: a speaker enrolled
+**Scope.** Cross-session speaker voiceprints: a speaker enrolled
 by name in one meeting can be automatically re-identified in later meetings,
 keeping their name across re-diarization without clearing `speaker_names`.
 
@@ -1694,9 +1693,9 @@ transcript-read path are never blocked. There is no auto-repair path
 (unlike `index.db`'s `rebuild_from_disk`) — voiceprints are primary data
 and cannot be reconstructed.
 
-**Thresholds (placeholders — WU6 calibration required).** The numbers below
-are documented placeholders. They have no grounding in any in-repo sweep; WU6
-assembles the labelled multi-session corpus and calibrates them.
+**Thresholds (placeholders — calibration required).** The numbers below
+are documented placeholders. They have no grounding in any in-repo sweep;
+calibrating them needs a labelled multi-session corpus, which does not exist yet.
 
 | Band | Cosine similarity | Action |
 |------|------------------|--------|
@@ -1704,7 +1703,7 @@ assembles the labelled multi-session corpus and calibrates them.
 | Uncertain | `T_reject <= sim < T_accept` (placeholder `0.45..0.60`) | Suggest "is this \<Name\>?" — label shows the bare letter until confirmed |
 | Reject | `sim < T_reject` (placeholder `0.45`) | No name, anonymous letter only |
 
-**Refinement thresholds (placeholders — WU6):**
+**Refinement thresholds (placeholders):**
 - `FOLD_GATE = 0.70` — cosine similarity floor for folding a new contribution
   into an existing centroid rather than creating a new condition entry. Not the
   offline clustering distance `0.75`; a different metric for a different purpose.
@@ -1854,7 +1853,7 @@ contribution's weight (`count` = number of clean windows) is clamped by
 meeting's influence on an established centroid. Because contributions are
 retained (§2.9.1 invariant), a later `reject_match` can drop the
 contribution and recompute — refinement is reversible. `FOLD_GATE` and
-`REFINE_WEIGHT_CAP` remain placeholder constants (WU6 calibrates them).
+`REFINE_WEIGHT_CAP` remain placeholder constants pending calibration.
 
 **Reprocess re-map (§2.6 — ephemeral centroid + timeline-coherence).** The
 `reprocess` path (re-transcribe → diarize → finalise) clears `speaker_names` in
@@ -1878,7 +1877,7 @@ two additional steps surround this:
    - **Timeline-coherence fallback** (model-free): computes the Jaccard temporal
      overlap between the fresh label's merged speech intervals and each old named
      label's merged speech intervals. If the overlap clears `TIMELINE_JACCARD_THRESHOLD`
-     (placeholder `0.50`, calibrated in WU6) and the match is unambiguous (no tie),
+     (placeholder `0.50`, not yet calibrated) and the match is unambiguous (no tie),
      the name is restored. This path makes the re-map testable in the default suite
      without any embedding model.
 
@@ -1888,8 +1887,9 @@ re-map only restores names where a match is found. Unmatched fresh labels stay
 anonymous. The offline claim is still held throughout, so no concurrent op can race
 the second metadata write.
 
-`TIMELINE_JACCARD_THRESHOLD = 0.50` is a placeholder pending WU6 calibration. It is
-named as a constant (not a magic literal) so WU6 can swap the value at one call site.
+`TIMELINE_JACCARD_THRESHOLD = 0.50` is a placeholder pending calibration against a
+labelled corpus. It is named as a constant (not a magic literal) so the value can be
+swapped at one call site.
 The standalone `rediarize` path (no re-transcribe) also runs the ephemeral re-map via
 `rediarize_inner_with_snapshot`, but reads the snapshot itself from disk at the top of
 the pass (before `run_diarization_blocking` overwrites `transcript.json`).
@@ -1923,7 +1923,7 @@ OUTSIDE the diarizer (the diarizer must not read the store — no
 `diarizer → persistence` edge is created); the orchestrator computes a verdict
 list and passes it in as `veto_ids: &[i32]`.
 
-**Library-informed merge (issue #0023).** Extends the same extractor pass
+**Library-informed merge.** Extends the same extractor pass
 to also detect when ≥2 diarizer clusters both match the same enrolled identity
 and unify them before the prune/cap. The merge is computed in `compute_prune_veto_verdicts`
 alongside the veto; a `merge_map: Vec<(i32, i32)>` (source → canonical pairs) is
@@ -1961,7 +1961,7 @@ leaves behaviour bit-identical to a call with no merge. Gated on `voiceprint_enr
    pattern `apply_voiceprint_matches` uses. The offline claim is held throughout,
    so no concurrent op can race the second write.
 
-**Gallery loading.** `load_voiceprint_gallery` is a new async free function in
+**Gallery loading.** `load_voiceprint_gallery` is an async free function in
 the orchestrator that calls `VoiceprintStore::all(DIARIZE_EMB_MODEL_ID).await`
 and returns a `Vec<StoredVoiceprint>` (best-effort; empty on error). The
 `rediarize` public method accepts `voiceprint_store: Option<&persistence::VoiceprintStore>`,
@@ -1970,7 +1970,7 @@ Paths that have no access to the store (the `reprocess` path, stub/test paths)
 pass `None`; the prune-veto and merge are then no-ops (empty veto_ids, empty
 merge_map).
 
-**Extractor instantiation.** `build_prune_veto_extractor` is a new async method
+**Extractor instantiation.** `build_prune_veto_extractor` is an async method
 on `Orchestrator` that opens a `VoiceprintExtractor` from the embedding model
 path (resolved via `DIARIZE_EMB_MODEL_ID`). It is best-effort: it returns
 `None` on any failure. When `gallery` is empty (no enrolled speakers) or
@@ -1991,7 +1991,7 @@ a canonical. Two clusters matched to different identities can never be merged.
 This is enforced by `compute_prune_veto_verdicts` and must not be bypassed.
 
 **`PRUNE_VETO_MIN_WINDOWS: u64 = 3` (diarizer constant — placeholder).** Matches
-`matcher::NOISE_GUARD_MIN_WINDOWS`. Calibrated in WU6 alongside the acceptance
+`matcher::NOISE_GUARD_MIN_WINDOWS`. Pending calibration alongside the acceptance
 thresholds.
 
 **Enrolment-enabled gate (inherited from §4).** Both the prune-veto and the
@@ -1999,8 +1999,8 @@ library-informed merge are gated on `settings.voiceprint_enrolment_enabled`
 (default `false`). When OFF, `gallery` is never loaded and the extractor is
 never opened; `veto_ids` and `merge_map` are both always `&[]`.
 
-**Identity management (issue #0003 §2.9.4, §4).** Five new IPC commands
-and two new `VoiceprintStore` methods complete the management surface:
+**Identity management (§2.9.4, §4).** Five IPC commands
+and two `VoiceprintStore` methods complete the management surface:
 
 - `VoiceprintStore::rename_identity(id, new_name)` — renames in place; trims
   whitespace; rejects blank name. Unit-tested in `persistence::voiceprints::tests`.
@@ -2075,7 +2075,7 @@ The content-hash filename means identical pastes dedupe to one file.
   whole meeting folder, so `assets/` (and its images) are deleted with the
   meeting — no separate asset cleanup path is required.
 
-- **Attachment assets — the parallel `attachment:` scheme (#0038).** A file
+- **Attachment assets — the parallel `attachment:` scheme.** A file
   dropped/pasted into the notes editor is stored as a normal **attachment**
   (single storage, under `attachments/`), not a note-asset; the notes editor's
   `AttachmentRef` node references it and serves the inline thumbnail/original
@@ -2094,14 +2094,14 @@ The content-hash filename means identical pastes dedupe to one file.
 
 ## Recording-audio re-listen serving (`meetingrecording:`)
 
-The transcript "play segment" affordance (#0023) plays the audio under a single
+The transcript "play segment" affordance plays the audio under a single
 transcript row. It does NOT expose `audio.opus` to the webview; instead the
 backend cuts a self-contained WAV of exactly the requested window and the webview
 plays that clip start-to-finish (no seeking).
 
 - **Why a pre-cut WAV, not browser seeking.** `Segment::start_ms`/`end_ms` are on
-  the pause-EXCLUDING transcript clock, while `audio.opus` is pause-INCLUDING
-  (TIMELINE-DRIFT #4), so a browser `<audio>` seek to a transcript timestamp would
+  the pause-EXCLUDING transcript clock, while `audio.opus` is pause-INCLUDING,
+  so a browser `<audio>` seek to a transcript timestamp would
   land at the wrong place regardless of container conformance. Cutting the slice
   server-side reuses `orchestrator::runner::pcm_window_for_excluding_range` (the
   same pause-aware mapping the re-listen / re-ASR paths use, including the
@@ -2199,7 +2199,7 @@ temp file is written.
 
 "Open" is a host hand-off, not a webview fetch, so it uses no custom URI scheme.
 Inline **display** of an attachment inside the notes editor (the `AttachmentRef`
-node's thumbnail, #0038) is a separate need served by the `attachment:` scheme
+node's thumbnail) is a separate need served by the `attachment:` scheme
 (see "Note image assets" above) — the two are complementary: `attachment:`
 renders the image thumbnail in the webview, while "Open" launches the OS default
 app for the full file. (Note images use the parallel `meetingasset:` scheme.)
@@ -2762,4 +2762,4 @@ These need decisions but are not yet binding:
   log analysis) or stays human-readable. Defer until first time we need
   to grep production logs.
 - Auto-update mechanics for native libs (llama.cpp / sherpa-onnx) vs
-  models. Currently both ride the app bundle. Revisit at phase 7.
+  models. Currently both ride the app bundle.

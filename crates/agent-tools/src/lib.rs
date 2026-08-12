@@ -1,10 +1,10 @@
-//! `agent-tools` — the shared tool layer (Phase 9).
+//! `agent-tools` — the shared tool layer.
 //!
 //! One [`Tool`] trait + one [`ToolRegistry`]: the single place a tool is
-//! defined. Both consumers drive the same registry — the internal chat agent
-//! (Phase 9) and the MCP server (Phase 10) — so the hard constraint "the
-//! internal agent and an external MCP client use the same tools" is satisfied
-//! by there being exactly one definition site per tool.
+//! defined. Both consumers — the internal chat agent and the MCP server —
+//! drive the same registry, so the hard constraint "the internal agent and an
+//! external MCP client use the same tools" is satisfied by there being
+//! exactly one definition site per tool.
 //!
 //! # Boundaries (binding — see `architecture/components.md`)
 //!
@@ -26,8 +26,19 @@
 //!
 //! `agent-tools` has no `tauri`/`specta` concern: `serde_json::Value` results
 //! cross the IPC boundary as a `String` in `ipc-bridge`'s event envelope, not
-//! here. The `AppError → McpError` mapping is Phase 10's concern and lives in
-//! `mcp-server` (keeps `rmcp` out of this crate's deps).
+//! here. The `AppError → McpError` mapping lives in `mcp-server`, which keeps
+//! `rmcp` out of this crate's deps.
+//!
+//! # Recording lifecycle
+//!
+//! `start_recording` has no prep-draft step of its own — the create-then-
+//! confirm two-step flow ("New meeting" in the desktop UI) is a desktop-UI
+//! concern, exposed through `ipc-bridge`'s separate `create_meeting` command,
+//! not through this crate. The tool mints a fresh `MeetingId`, calls
+//! `persistence::writer::create_draft` directly on `spawn_blocking` (no
+//! [`RecordingControl`] involvement for that step), then calls
+//! [`RecordingControl::start`] with the minted id and the requested device to
+//! promote the draft to a recording in the same tool invocation.
 //!
 //! # Threading
 //!
@@ -94,7 +105,7 @@ mod tools;
 pub use tools::*;
 
 // ---------------------------------------------------------------------------
-// Inter-agent bridge (Phase 10) — the channel ends only; the chat-engine
+// Inter-agent bridge — the channel ends only; the chat-engine
 // driver lives in `ipc-bridge`.
 // ---------------------------------------------------------------------------
 
@@ -125,7 +136,7 @@ pub type InterAgentBridge = mpsc::Sender<InterAgentEnvelope>;
 /// One capability the agent (or an MCP client) can invoke.
 ///
 /// Every tool is one `impl Tool`, registered once in [`ToolRegistry::v1`]; it
-/// then appears in the LLM tool list, the GBNF grammar, and (Phase 10) the MCP
+/// then appears in the LLM tool list, the GBNF grammar, and the MCP
 /// `tools/list` with no further edits.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -156,7 +167,7 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    /// Whether the tool is exposed over MCP (Phase 10). Default-safe: reads and
+    /// Whether the tool is exposed over MCP. Default-safe: reads and
     /// compute are exposed, writes are not (opt-in per tool via the allowlist
     /// in [`ToolRegistry::v1`]). See `architecture/cross-cutting.md`
     /// "Agent chat loop + tool layer".
@@ -203,7 +214,7 @@ pub struct ToolContext {
     /// The shared `AppEvent` broadcast bus. Currently UNREAD by any tool — the
     /// offline write op (`reprocess`) emits
     /// `TranscriptReady`/`DiarizationComplete` via the orchestrator's own bus,
-    /// and the chat driver (Phase 9 ipc-bridge) emits the chat events itself.
+    /// and the chat driver (`ipc-bridge`) emits the chat events itself.
     /// Held on the context so a future tool that needs to emit progress can,
     /// without a signature change. Kept symmetric with the orchestrator's bus.
     pub event_tx: broadcast::Sender<AppEvent>,
@@ -212,7 +223,7 @@ pub struct ToolContext {
     /// explicitly. A tool resolves the effective meeting via
     /// [`ToolContext::resolve_meeting`].
     pub default_meeting: Option<MeetingId>,
-    /// The inter-agent bridge sender (Phase 10), present ONLY for the MCP
+    /// The inter-agent bridge sender, present ONLY for the MCP
     /// registry instance (`v1(true)`). `send_to_internal_agent` reads it here;
     /// `None` for the internal chat agent's context (it must not message
     /// itself). Held here so the bridge tool needs no `chat-agent` edge — the
@@ -288,11 +299,11 @@ impl ToolOutput {
 }
 
 // ---------------------------------------------------------------------------
-// MCP descriptor (projection; consumed by Phase 10 tools/list)
+// MCP descriptor (projection; consumed by the MCP tools/list)
 // ---------------------------------------------------------------------------
 
 /// A name/description/schema projection of one tool, for the LLM tool list and
-/// (Phase 10) the MCP `tools/list`. Pure projection — single source of truth is
+/// the MCP `tools/list`. Pure projection — single source of truth is
 /// the [`Tool`] impl.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolDescriptor {
@@ -316,9 +327,27 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// Build the v1 registry.
+    /// Build the v1 registry: 23 base tools in insertion order, plus
+    /// `send_to_internal_agent` when `include_inter_agent_bridge` is set (24).
     ///
-    /// `include_inter_agent_bridge` is the Phase-10 `send_to_internal_agent`
+    /// Read/compute tools (`list_meetings`, `search_meetings`, `get_meeting`,
+    /// `get_transcript`(`_slice`), `get_summary`, `get_notes`, `get_metadata`,
+    /// `get_recording_state`, `search_within_transcript`, `retrieve_chunks`,
+    /// `relisten_section`, `resummarise`, `speaker_talk_time`,
+    /// `list_attachments`, `get_attachment_markdown`) are exposed over MCP by
+    /// default. Reversible low-blast-radius writes (`set_speaker_name`,
+    /// `rename_meeting`) are MCP-allowlisted. `reprocess_meeting` is
+    /// internal-only (heavy — re-transcribes then re-diarizes under one
+    /// offline claim; holding that claim via MCP would block the user's
+    /// ability to record). The four record-control writes (`start_recording`,
+    /// `stop_recording`, `pause_recording`, `resume_recording`) are
+    /// write-gated like the metadata writes: absent and rejected over MCP
+    /// when the `mcp_write_tools` setting is off (the default), exposed and
+    /// callable when it is on — the deliberate opt-in that lets an external
+    /// MCP client drive the record→transcribe→read loop end-to-end. The
+    /// internal UI chat is not subject to this gate.
+    ///
+    /// `include_inter_agent_bridge` is the `send_to_internal_agent`
     /// flag — `ipc-bridge` passes `false` (the internal agent must not be able
     /// to message itself); `app-main` passes `true` for the registry instance
     /// handed to `mcp-server`. The tool's *body* reaches the chat engine through
@@ -359,7 +388,7 @@ impl ToolRegistry {
         ];
 
         if include_inter_agent_bridge {
-            // Phase 10: the MCP-only inter-agent tool. Appended last so the
+            // The MCP-only inter-agent tool. Appended last so the
             // read/write ordering above is unchanged.
             tools.push(Arc::new(tools::SendToInternalAgent));
         }
@@ -447,10 +476,20 @@ impl ToolRegistry {
     ///
     /// Looks up the tool (`InvalidInput` on unknown name), validates `args`
     /// shape against the tool's schema (`InvalidInput` on mismatch), then calls
-    /// `execute`. The per-tool write serialization (the metadata mutex) lives in
-    /// the write tools themselves (§4.2), which hold a [`ToolContext`]-owned
-    /// per-meeting lock; the offline-claim write ops inherit the orchestrator's
-    /// claim for free.
+    /// `execute`. `persistence` is the sole writer under `meetings/`; no tool
+    /// opens a file there directly. `reprocess_meeting` inherits the
+    /// orchestrator's offline claim for free (`InvalidInput` when busy). The
+    /// two metadata-write tools (`set_speaker_name`, `rename_meeting`) route
+    /// through `persistence::meeting_ops`, which serialises the
+    /// read-modify-write on `notes_crdt::metadata_lock` — a process-wide
+    /// per-meeting lock shared with every other `metadata.json` writer (the
+    /// orchestrator's own metadata writes, the sync lifecycle subscriber), not
+    /// a lock this crate owns. `relisten_section` and `resummarise` are
+    /// read-only-with-compute (write nothing). The record-control tools
+    /// (`start_recording`/`stop_recording`/`pause_recording`/`resume_recording`)
+    /// take no lock of their own — they delegate to
+    /// [`RecordingControl`], whose implementation serialises lifecycle
+    /// transitions and rejects an invalid one with `InvalidInput`.
     pub async fn dispatch(
         &self,
         ctx: &ToolContext,

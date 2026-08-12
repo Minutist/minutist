@@ -1,3 +1,96 @@
+//! `app-main` — the Tauri assembler binary (package `minutist`).
+//!
+//! Owns the Tauri main binary, tray icon, window management, and process
+//! lifetime: it wires every other crate together into a running app but
+//! contains no domain logic of its own. Code here should mostly be
+//! construction and plumbing — the thinnest crate in the workspace.
+//!
+//! # The `connected` feature — free vs paid artifact split
+//!
+//! `mcp-server`, `tunnel-client`, `sync`, `election`, and `account-directory`
+//! are all optional dependency edges gated behind the single Cargo feature
+//! `connected`. Building without it produces the free, fully local artifact
+//! (no MCP server, no sync/tunnel/relay code compiled in at all — verified by
+//! `cargo build -p minutist --no-default-features`); building with it adds
+//! the paid connected tier (MCP-over-tunnel relay access and cross-device
+//! sync). The feature gate is checked at compile time throughout this crate
+//! (`#[cfg(feature = "connected")]` on `sync.rs` / `tunnel.rs` and the code
+//! paths that construct their state), so the split is enforced by the
+//! compiler, not by a runtime flag alone. In the free build, `IpcState.tunnel`
+//! is filled with `ipc_bridge::disabled_tunnel()` so `ipc-bridge`'s surface is
+//! identical either way and callers do not need their own `cfg`.
+//!
+//! # Startup wiring
+//!
+//! - **Logging**: a file appender at `{app-data}/logs/minutist.log` (daily
+//!   rotation, 7-day retention via startup cleanup) plus a console layer in
+//!   debug builds only, filtered via `EnvFilter::from_default_env()`. The
+//!   app-data path isn't known until the Tauri app handle exists, so the
+//!   log directory is computed manually (mirroring Tauri's own resolution)
+//!   to let the subscriber start before the Tauri runtime does.
+//! - **Crash capture** (`crash.rs`): a `tracing` ring-buffer layer (last 200
+//!   log lines, process-wide static) plus a `std::panic::set_hook` that
+//!   writes a redacted `last-crash.txt` to the logs dir on panic (version,
+//!   platform, configured GPU mode, panic message/location, backtrace,
+//!   recent ring lines). Every line passes through `crash::redact`
+//!   (meeting-id-UUID stripping) before it is written. `IpcState` carries
+//!   `logs_dir` / `app_version` / `platform` so `ipc-bridge`'s diagnostic
+//!   report command can read the crash file and log tail.
+//! - **Data-directory resolution**: after settings load, the pure
+//!   `resolve_data_roots(platform_root, settings.data_directory)` helper
+//!   derives three roots — `meetings/`, `models/`, and the `index.db`
+//!   parent. `None` keeps them under the platform `app_data_dir`; `Some(path)`
+//!   relocates all three under `path` (which must be absolute and creatable —
+//!   a relative or uncreatable path falls back to the platform default with a
+//!   `tracing::error`, never aborting startup). `settings.store` itself and
+//!   `logs/` are excluded from the override (bootstrap constraints: the store
+//!   carries the override, and logging starts before settings load), so they
+//!   always sit at the platform default. Roots are fixed for the process
+//!   lifetime — changing the setting needs a restart, and existing data is
+//!   not migrated automatically.
+//! - **Tray**: a single tray icon built programmatically in `build_tray`
+//!   ("Open minutist" focuses the main window, "Quit" exits), using the real
+//!   app logo via `app.default_window_icon()`. There is deliberately no
+//!   declarative `app.trayIcon` in `tauri.conf.json` — that produces a second,
+//!   handler-less duplicate icon — so the tray is owned entirely by
+//!   `build_tray`. Closing the window hides it rather than exiting the app.
+//! - **Chat/MCP tool wiring**: `app-main` builds the chat `ToolRegistry`
+//!   once and constructs `IpcState` with it, a lazily-initialised held-model
+//!   cell (`Arc<OnceCell<Arc<LlamaSummariser>>>`, loaded on first chat or
+//!   summarise use — `app-main` never loads the GGUF at startup), and the
+//!   chat in-flight guard.
+//!
+//! # MCP server lifecycle
+//!
+//! Gated on the `mcp_enabled` setting (off by default) and started/stopped by
+//! `do_start_mcp_server`, which loads the summariser, spawns the inter-agent
+//! driver with a shutdown watch channel, builds the MCP tool registry and a
+//! bearer token (generated on first enable, persisted with owner-only
+//! permissions), and serves on a loopback port. A settings-watcher task reacts
+//! to `mcp_enabled` transitions live (start/stop with no app restart); port
+//! and write-tool settings changes are NOT reacted to and require a restart,
+//! since the running server was built with those values. Whether the server
+//! is achieved-running is tracked by the presence of its handles, not by the
+//! desired setting value, so a failed start leaves it retryable on the next
+//! toggle.
+//!
+//! # Connected-tier tunnel (feature `connected`)
+//!
+//! `tunnel.rs` builds a `ConnectedTunnel` implementing `ipc_bridge::TunnelControl`,
+//! owning device pairing, reconnect, and lifecycle against the relay
+//! (`settings.relay_url` / `relay_api_url`, user-overridable, defaulting to
+//! the hosted minutist.ai endpoints). It replays relayed requests against the
+//! loopback MCP server using the app's own internal bearer — never the
+//! caller's — so the relay never sees a credential that could reach the local
+//! server directly. The issued device credential is stored with owner-only
+//! permissions via the same helper that protects the MCP bearer token.
+//!
+//! # Bindings harness
+//!
+//! `cargo run -p minutist --bin generate-bindings` (alias `cargo
+//! gen-bindings`) writes `ui/src/ipc/bindings.ts` without starting the GUI.
+//! Run after any `ipc-bridge` command/event surface change.
+
 // Prevents additional console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

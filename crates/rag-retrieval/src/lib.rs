@@ -13,13 +13,32 @@
 //! # What this crate is (and isn't)
 //!
 //! PURE retrieval logic — chunking ([`chunk_text`]) and cosine ranking
-//! ([`rank_top_k`], reusing `common::voiceprint_math`), driven through the
-//! [`Embedder`] seam (defined in `common` alongside `Summariser`/`DocVlm`, and
-//! re-exported here). It depends ONLY on `common`; it does NOT load models or
-//! pull `llama-cpp-2`. The concrete llama-backed embedder (BGE-M3 by default) is
-//! provided by the `embedder` crate against `common::Embedder`; per-meeting chunk/vector
-//! persistence (libsql + FTS5) and the `retrieve_chunks` tool live in
-//! `persistence` / `agent-tools` (later phases).
+//! ([`rank_top_k`], reusing `common::voiceprint_math::cosine_unit`; embeddings
+//! are L2-normalised, so cosine similarity is the plain dot product), driven
+//! through the [`Embedder`] seam (defined in `common` alongside
+//! `Summariser`/`DocVlm`, and re-exported here for convenience). It depends
+//! ONLY on `common`; it does NOT load models or pull in `llama-cpp-2`.
+//!
+//! [`chunk_text`] produces newline-aligned, char-boundary-safe windows with
+//! overlap (≈256-token chunks). [`RagChunk`]/[`DocType`] are the
+//! pre-persistence chunk value (attachment or transcript text); `persistence`
+//! assigns the durable row and identity columns when it stores them.
+//!
+//! The concrete embedder (BGE-M3 by default) is provided by the `embedder`
+//! crate against `common::Embedder`; `rag-retrieval` itself never depends on
+//! it, keeping the retrieval logic model-agnostic and llama-free. `ipc-bridge`
+//! constructs and holds the concrete embedder, and owns the RAG write path
+//! (its `rag_index` module): chunks are produced at attachment-convert time
+//! (skipped when the content hash is already indexed) and at every
+//! transcript-finalise point, plus incrementally during a live recording so
+//! earlier turns become retrievable before the meeting stops. Chunks are
+//! embedded via the held [`Embedder`] and persisted per-meeting (libsql +
+//! FTS5) through `persistence`'s `RagStore`, which records the embedder's
+//! `model_id` alongside each chunk. RAG indexing is a rebuildable cache:
+//! failures there are logged and swallowed rather than failing attachment
+//! conversion or the transcript-finalise flow. The index is consumed by the
+//! chat agent's `retrieve_chunks` tool (`agent-tools`) and by the live
+//! agent's per-refresh retrieval in `ipc-bridge`.
 
 mod chunk;
 mod score;

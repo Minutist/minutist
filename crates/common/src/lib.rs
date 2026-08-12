@@ -1,16 +1,103 @@
 //! Shared interface types and trait definitions for minutist.
 //!
-//! This crate is the architectural contract. Every other crate depends on
-//! it; nothing here may depend on another crate in this workspace.
+//! This crate is the workspace's shared kernel: the one leaf every other
+//! crate may depend on, and nothing here may depend on another crate in
+//! this workspace. It is the dependency-inversion seam for the whole
+//! app — a trait defined here (`AsrBackend`, `Summariser`, `DocVlm`,
+//! `Embedder`) lets a consumer crate (e.g. `doc-convert`, `rag-retrieval`)
+//! call into model-backed inference without acquiring a workspace edge to
+//! the crate that implements it (`asr-runtime`, `summariser`, `ipc-bridge`,
+//! `embedder`); the concrete impl is injected by whichever crate is allowed
+//! to hold both edges. The same pattern applies to identifiers that would
+//! otherwise pull a heavyweight or cross-cutting dependency into a leaf
+//! crate: [`HostRef`] is an opaque `String` newtype specifically so `sync`'s
+//! `iroh::EndpointId` never has to appear here, and timestamps are RFC 3339
+//! `String`s throughout so no time crate needs to enter `common`.
 //!
 //! Changes here ripple to every downstream crate. Adding, removing, or
 //! changing a public item is an **architecture-owner** decision and
 //! requires an update to `architecture/components.md` in the same commit.
 //!
-//! The trait method signatures here are **load-bearing**: parallel
-//! sub-agents implement these traits independently against these
-//! signatures. Do not change a signature without coordinating the
-//! downstream crates.
+//! The trait method signatures and `AppEvent` variants here are the
+//! **stable, locked architectural surface**: parallel sub-agents implement
+//! these traits, and consume these events, independently against these
+//! signatures. Do not change a signature or event shape without
+//! coordinating the downstream crates. See
+//! `architecture/agent-dispatch.md` — "Prerequisites for parallel
+//! dispatch".
+//!
+//! # What this crate owns
+//!
+//! - **Identifiers** — `MeetingId`, `ChatSessionId`, `CollectionId`,
+//!   `AttachmentId`, `VoiceprintIdentityId`, `VoiceprintCentroidId`,
+//!   `ModelId`: UUID or opaque-string newtypes, transparently serialised.
+//! - **Meeting domain types** — [`MeetingMeta`], [`MeetingListEntry`],
+//!   [`MeetingState`], [`Collection`], [`NotesDocument`], [`NoteBlock`],
+//!   [`Segment`], [`WordTimestamp`], [`AudioChunk`], [`AudioFormat`],
+//!   [`AudioDevice`], [`AudioMeterFrame`], [`RecordingState`].
+//! - **Chat / live-agent domain types** — [`ChatSession`], [`ChatMessage`],
+//!   [`ChatRole`], [`ToolCallRecord`], [`LiveAgentMode`],
+//!   [`InterAgentRequest`], [`InterAgentReply`], and the pure gate
+//!   [`live_agent_should_run`].
+//! - **Attachments** — [`AttachmentEntry`], [`ConversionState`].
+//! - **Model registry types** — [`ModelKind`], [`ModelManifestEntry`],
+//!   [`ModelFileEntry`], [`ModelStatusState`], [`ModelStatus`],
+//!   [`ModelDescriptor`].
+//! - **Processing lifecycle + host election** — [`ProcessingLifecycle`],
+//!   [`ProcessingClaim`], [`HostRef`] (see module section for the
+//!   capture → claim → processed state machine).
+//! - **The event bus contract** — [`AppEvent`] (every variant the backend
+//!   may push to the webview) and [`AppError`] (the one error shape that
+//!   crosses IPC; per-crate error enums convert into it via `From`).
+//! - **Traits (the dependency-inversion seam)** — [`AsrBackend`],
+//!   [`Summariser`], [`DocVlm`], [`Embedder`].
+//! - **GPU placement** — [`GpuProbe`], [`GpuAcceleration`], [`GpuPlan`],
+//!   [`resolve_gpu_plan`], [`probe_and_resolve_gpu_plan`],
+//!   [`asr_engine_for_language`]: the pure VRAM-budget decision every
+//!   model-load call site uses, decoupled from the probe so it is
+//!   unit-testable without a GPU.
+//! - **Diagnostics** — [`DiagnosticReport`], deliberately shaped with no
+//!   meeting-content field so a "Report a problem" payload cannot carry
+//!   transcript/notes/title/speaker-name text by construction.
+//! - [`voiceprint_math`] — pure, FFI-free vector maths (`unit_normalise`,
+//!   `cosine_unit`, `weighted_merge`) shared by `diarizer` and
+//!   `persistence` without a `persistence → diarizer` edge.
+//! - [`fs`] — the shared atomic-write primitive ([`fs::write_atomic`])
+//!   every crate that persists JSON/binary blobs to disk writes through.
+//! - [`llama_backend`] (feature `llama-backend`) — the single process-wide
+//!   `LlamaBackend` cell shared by `asr-runtime`, `summariser`, and
+//!   `embedder`, since `LlamaBackend::init()` is a global, once-per-process
+//!   call and a private `OnceLock` per crate would make whichever
+//!   initialises second fail.
+//! - [`SUPPORTED_AUDIO_EXTS`] / [`resolve_audio_path`] — the shared
+//!   audio-container-discovery contract (see their docs for the consumers).
+//!
+//! # Cross-cutting conventions
+//!
+//! - **Additive schema evolution.** A field added to an already-persisted
+//!   type (`MeetingMeta`, `ChatMessage`, `ChatSession`, …) is always
+//!   `#[serde(default)]` (plus `skip_serializing_if` for `Option`/
+//!   collection fields) so an on-disk file written before the field existed
+//!   still deserialises, and the wire shape only grows when the field is
+//!   actually set. This crate never ships a breaking on-disk migration for
+//!   an additive field.
+//! - **The `specta` feature.** Every type that crosses `tauri-specta` IPC
+//!   derives `specta::Type` behind the optional `specta` feature (kept
+//!   optional so a build that doesn't need the TypeScript bindings, e.g.
+//!   the headless hub, doesn't pay for it). `ipc-bridge` enables the
+//!   feature on this crate (and on `settings`) so the generated bindings
+//!   consume these canonical types directly, with no mirror layer.
+//! - **MeetingMeta's authoritative-writer discipline.** `MeetingMeta`'s
+//!   authored descriptive fields (`title`, `started_at`, `ended_at`,
+//!   `duration_ms`, `speaker_count`, `audio_format`, the model descriptors,
+//!   `speaker_names`) are, once notes-CRDT sync is in play, projected from a
+//!   converged copy that `notes_crdt` mirrors into the meeting's
+//!   `notes.ydoc`. Only an authoritative writer — the capturing device, a
+//!   user edit, or the processing host — may set them; a sync-arrival path
+//!   that seeds a new local folder must never write a placeholder value
+//!   (e.g. `started_at = now`) into that projection. `common` defines the
+//!   fields; `notes_crdt` owns the convergence mechanism and this
+//!   invariant's enforcement.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -396,11 +483,18 @@ pub struct AudioFormat {
 /// `metadata.json`'s [`AudioFormat::codec`] is the authoritative codec label;
 /// the extension is only how the file is found on disk.
 ///
-/// This is the shared contract `sync` (import, manifest path-safety —
-/// tracked as 0048) and `persistence` (decode — 0047) resolve against so the
-/// two can't drift apart. `persistence::read_audio_pcm` is wired to it as of
-/// 0047; `sync` is not yet — it still hardcodes a single `AUDIO_REL` literal
-/// pending 0048.
+/// This is the shared contract `sync` (media import + manifest path-safety)
+/// and `persistence` (decode dispatch) resolve against so the two surfaces
+/// can't drift apart. Both are wired to it: `persistence::read_audio_pcm`
+/// decodes by the resolved container; `sync`'s `BlobStore::import_meeting`
+/// imports the resolved file under its real filename (so a phone recording's
+/// manifest carries `audio.m4a`, not a fixed `audio.opus`), `is_safe_rel`
+/// accepts any `audio.<ext>`, and `meeting_is_materialised` resolves by
+/// container. On the capture side, `sync-ffi::save_captured` sniffs the
+/// source file's container magic (Ogg → opus, `ftyp` → AAC/m4a) and stores
+/// the honest extension + codec + true rate/channels, so a phone recording
+/// is written as `audio.m4a` and its `has_audio` projection resolves by
+/// container.
 pub const SUPPORTED_AUDIO_EXTS: &[&str] = &["opus", "m4a"];
 
 /// Resolve a meeting folder's actual audio file — the single `audio.<ext>`

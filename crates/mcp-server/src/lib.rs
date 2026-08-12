@@ -1,6 +1,6 @@
-//! `mcp-server` — the in-process Streamable HTTP MCP server (Phase 10).
+//! `mcp-server` — the in-process Streamable HTTP MCP server.
 //!
-//! A SECOND consumer of the Phase-9 `agent-tools` registry: it adds NO tools,
+//! A SECOND consumer of the `agent-tools` registry: it adds NO tools,
 //! projecting [`agent_tools::ToolRegistry::mcp_tool_descriptors_gated`] onto MCP
 //! `tools/list` and [`agent_tools::ToolRegistry::dispatch`] onto `tools/call`.
 //! Any tool logic, schema, or name living here rather than in `agent-tools` is a
@@ -8,16 +8,34 @@
 //!
 //! # Boundaries (binding — see `architecture/components.md`)
 //!
-//! Edges: `common`, `agent-tools` (+ the rmcp SDK and its hyper/http/tower leaf
-//! externals). Deliberately **no** `chat-agent` edge — the inter-agent bridge
+//! Edges: `common`, `agent-tools` (+ the rmcp SDK 1.7 and its
+//! `hyper`/`hyper-util`/`http`/`http-body-util`/`tower-service`/`tokio-util`
+//! leaf crates — [`error::app_error_to_mcp`] is the **only** place rmcp error
+//! types are constructed). SDK: `rmcp`'s own hyper-based `StreamableHttpService`
+//! serves the single `/mcp` endpoint directly — no `axum`.
+//!
+//! Deliberately **no** `chat-agent` edge — the inter-agent bridge
 //! (`send_to_internal_agent`) reaches the chat engine through a `common`-typed
 //! channel held on the [`agent_tools::ToolContext`], whose receiver + chat turn
 //! live in `ipc-bridge`. Deliberately **no** `tauri`/`specta` concern — the
 //! listener is spawned by `app-main` via `tauri::async_runtime::spawn`; this
 //! crate takes the registry + context + a shutdown receiver + bind/token config
-//! and serves until the shutdown fires.
+//! and serves until the shutdown fires. Deliberately no direct `persistence`/
+//! `orchestrator` edge — it drives the [`agent_tools::ToolRegistry`], whose
+//! `ToolContext` already carries those handles (built by `app-main`).
 //!
-//! # Security (Phase 10 §4)
+//! `agent-tools` itself has no `orchestrator` edge (its recording-lifecycle
+//! tools drive `agent_tools::RecordingControl`, a trait object); the real
+//! implementation is normally supplied by `ipc-bridge`'s
+//! `OrchestratorRecordingControl` adapter. This crate does not depend on
+//! `ipc-bridge` (the edge runs the other way), so its own tests and examples
+//! that need a live `RecordingControl` — the `handler.rs` unit test, the
+//! `examples/serve.rs` example, and `tests/http_test.rs` — each define a local
+//! `TestRecordingControl` newtype wrapping `orchestrator::Orchestrator` (a dev
+//! dependency) instead of reaching for `ipc-bridge`'s adapter, which would
+//! invert the crate layering.
+//!
+//! # Security
 //!
 //! - **Loopback bind only** — `serve` binds the caller-provided `SocketAddr`,
 //!   which `app-main` sets to `127.0.0.1:{mcp_port}`. Never `0.0.0.0`.
@@ -257,7 +275,7 @@ fn unauthorized_response() -> Response<BoxBody<Bytes, Infallible>> {
         .expect("static 401 response is always valid")
 }
 
-/// The loopback `Origin` values to allow (Phase 10 §4.3). A browser page served
+/// The loopback `Origin` values to allow. A browser page served
 /// from another origin then gets a 403; a non-browser MCP client (no `Origin`
 /// header) is unaffected (rmcp passes missing-Origin requests). Both `127.0.0.1`
 /// and `localhost`, http + (defensively) https, at the bound port.

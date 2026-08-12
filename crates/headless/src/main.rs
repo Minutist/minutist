@@ -20,7 +20,11 @@
 //!   engine bound to the relay, load paired peers from `{data-dir}/peers`, and run
 //!   until `SIGTERM` / `SIGINT`.
 //! - `print-ticket` — print this device's pairing ticket to stdout and exit (paste
-//!   it into a desktop's Sync settings to pair).
+//!   it into a desktop's Sync settings to pair). Unlike `status`, this briefly
+//!   binds the sync engine to obtain the addressed ticket, so on a fresh data
+//!   root it mints a device identity (an 0600 ed25519 key) as a side effect —
+//!   `status` never does this, which is why it is safe to poll as a read-only
+//!   oracle.
 //! - `add-peer <ticket>` — register a peer device by its pairing ticket, appending
 //!   it to `{data-dir}/peers`. A running daemon re-reads that file periodically, so
 //!   the new peer is authorised without a restart.
@@ -36,6 +40,27 @@
 //! The data root is entirely separate from any desktop's `{app-data}` — the
 //! single-writer rule applies per data root, so the daemon must never share a root
 //! with another process.
+//!
+//! ## Dependency shape
+//!
+//! `minutist-hub` is a SECOND workspace binary beside `app-main` (`src-tauri`):
+//! a standalone `cargo build` target with no Tauri/webview pipeline, so it
+//! cross-compiles to a server target and packages as a systemd unit or a
+//! minimal OCI image. There is no `app-main -> headless` edge in either
+//! direction and no shared code path. Its dependencies are `common`,
+//! `persistence`, `notes-crdt`, `sync`, `tunnel-client`, and
+//! `account-directory` (the same `AccountDirectorySource` adapter `app-main`
+//! uses, so neither binary carries its own copy — see `crates/account-directory`).
+//! It takes no `tauri::*` / `ipc-bridge` edge: it wires [`sync::SyncEngine`]
+//! directly and carries no command/event surface. `tunnel-client` backs the
+//! account-mediated peer-discovery loop (`AccountDirectoryClient` publishes
+//! this daemon's endpoint and fetches the account's device list); a seeded
+//! `minutist-hub` is always account-capable, so unlike `app-main`'s `connected`
+//! Cargo feature, this crate's workspace membership and its edges to `sync` /
+//! `tunnel-client` / `account-directory` are unconditional, not feature-gated.
+//! A post-launch GPU processing-node role adds `orchestrator` and the
+//! ML-runtime crates (`asr-runtime`, `asr-parakeet`, `diarizer`, `summariser`,
+//! `model-registry`).
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;

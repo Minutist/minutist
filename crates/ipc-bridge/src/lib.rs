@@ -4,6 +4,29 @@
 //! Every other crate is free of Tauri imports, which keeps them testable
 //! without a running Tauri app.
 //!
+//! ## Dependency shape
+//!
+//! `ipc-bridge` is the systems-engineer composition layer with the broadest
+//! read access of any library crate in the workspace: `orchestrator`,
+//! `persistence`, `notes-crdt`, `summariser`, `settings`, `agent-tools`,
+//! `chat-agent`, `doc-convert`, `embedder`, and `rag-retrieval` (see the
+//! dependency table in `architecture/components.md`). Each edge exists
+//! because a domain crate's capability needs a direct Tauri command or event
+//! surface, and no other crate is positioned to own that wiring without
+//! leaking `tauri::*` into the domain crate itself.
+//!
+//! Two edges a command surface might suggest are deliberately withheld: no
+//! `model-registry` edge (models are resolved through
+//! `Orchestrator::ensure_model_path` / `ensure_model`, never opened
+//! directly by this crate) and no `diarizer` edge (diarization runs inside
+//! `Orchestrator::reprocess`). `tunnel-client` and `sync` are likewise NOT
+//! Cargo edges even though this crate exposes their surfaces: `ipc-bridge`
+//! defines the `TunnelControl` / `SyncControl` trait seams (plus
+//! [`DisabledTunnel`] / [`DisabledSync`], the free-build / not-yet-configured
+//! no-ops) and `app-main` injects the connected implementation, keeping the
+//! relay/transport stacks out of this crate's dependency tree entirely (see
+//! "Connected-tier injection seams" below).
+//!
 //! ## Commands (61 total)
 //!
 //! | Command | Returns | Phase |
@@ -74,15 +97,6 @@
 //! in Phase 5 once `summarise_meeting` landed: the meeting-list row's Summarise
 //! action points at `summarise_meeting`, so the stub had no caller.
 //!
-//! The Phase-9 chat commands realise the granted `ipc-bridge → agent-tools` +
-//! `ipc-bridge → chat-agent` edges. `send_chat_message` creates/loads the chat
-//! [`minutist_common::ChatSession`], appends the user message, and spawns the
-//! turn on a background task; the turn streams via the chat `AppEvent`s and the
-//! session is persisted via `persistence::ChatStore` at turn end. The held LLM
-//! substrate ([`IpcState::summariser`], a lazily-loaded `Arc<LlamaSummariser>`)
-//! is loaded once and shared by both the chat engine (which borrows
-//! `&LlamaModel`) and `summarise_meeting` (Phase 9 — C2).
-//!
 //! All commands return `AppResult<T>`.
 //!
 //! `save_notes` / `load_notes` route **directly** to `notes_crdt::NotesStore`
@@ -127,6 +141,236 @@
 //! `ipc-bridge` routes via the orchestrator. The `AppEvent::DiarizationComplete`
 //! event is emitted by the **orchestrator**, not here.
 //!
+//! ## Meeting-lifecycle side effects of `stop_recording`
+//!
+//! `stop_recording` does more than forward to `Orchestrator::stop`:
+//!
+//! - **Index upsert.** The orchestrator finalises the meeting folder but does
+//!   not own a `MeetingIndex`, so `stop_recording` builds a
+//!   `MeetingListEntry` from the returned `MeetingMeta` (transcript excerpt
+//!   read on `spawn_blocking`) and `upsert`s it into `IpcState::index`
+//!   immediately — the just-recorded meeting appears in `list_meetings`
+//!   within the same session rather than waiting for the next startup's
+//!   `rebuild_from_disk`. An upsert failure is logged and swallowed: the
+//!   recording is safely on disk and the index is a derived cache the next
+//!   startup reconciles.
+//! - **Self-healing list.** A derived cache can drift from disk (e.g. the
+//!   process is killed between finalise and the stop-time upsert), so
+//!   `list_meetings` first calls `MeetingIndex::reconcile_orphans` — a cheap
+//!   `readdir` + set-diff that lazily indexes any on-disk meeting folder
+//!   missing from the cache — so a meeting can never stay hidden within a
+//!   session even without a restart. Reconcile is best-effort and never
+//!   deletes; removals are reconciled only by the next startup rebuild.
+//! - **Decoupled background post-processing.** After the upsert,
+//!   `stop_recording` spawns up to two heavy passes OFF the stop path in one
+//!   fire-and-forget task, so neither can wedge the response or hide the
+//!   meeting: a `reprocess` pass (re-run ASR over the complete `audio.opus`,
+//!   then re-diarize) when the live transcript may have fallen behind
+//!   (`Orchestrator::take_transcript_incomplete`) or diarization is enabled,
+//!   followed — only once that pass finishes — by an auto-summarise pass
+//!   (`settings.auto_summarise_on_stop`, default on) so the summary is
+//!   generated from the final transcript. Both passes share the exact code
+//!   path a user-triggered `reprocess` / `summarise_meeting` call uses
+//!   ([`run_held_summarise`] is `pub` at the crate root precisely so
+//!   `app-main`'s election-delegation driver can invoke it too for a
+//!   meeting it processes on another device's behalf). The gating/ordering
+//!   (`commands::post_stop_passes`) and the per-pass
+//!   fire-and-tolerate-errors execution (`commands::run_post_stop_passes`)
+//!   are extracted as pure/injectable helpers so they are unit-tested
+//!   without a Tauri runtime or a real orchestrator.
+//!
+//! The `Finalising` recorder state, the `MeetingFinalised` event, and the
+//! finalise-failure recovery that keeps a failed stop from wedging the
+//! recorder forever are owned by `Orchestrator::stop` itself —
+//! `stop_recording` is a thin caller that only forwards `Err`; see the
+//! `orchestrator` crate doc for that handshake.
+//!
+//! ## "New meeting" prep drafts
+//!
+//! `create_meeting` routes DIRECTLY to `persistence::writer::create_draft`,
+//! bypassing the orchestrator: a prep draft has no live recording state, so
+//! there is nothing for `Orchestrator::start` to own until `start_recording`
+//! promotes it, mirroring `add_attachment`'s direct-to-persistence routing.
+//! `create_draft` writes the folder's `metadata.json` (empty title,
+//! `recording_started: false`) and seeds `notes.ydoc` from that metadata, so
+//! every meeting has a `metadata.json` from creation onward, whether or not
+//! it has ever recorded. `create_meeting` also best-effort upserts the draft
+//! into `IpcState::index` before returning, mirroring `stop_recording`'s
+//! stop-time upsert, so the draft appears in `list_meetings` within the same
+//! session; an upsert failure is logged and swallowed, since
+//! `list_meetings`'s `reconcile_orphans` self-heals an absent row from disk
+//! on the next call.
+//!
+//! `start_recording` takes a `meeting_id: MeetingId` identifying the prep
+//! draft to promote, and passes it through to `Orchestrator::start`.
+//!
+//! Because every meeting has a `metadata.json` from draft creation onward,
+//! editing the title during the prep phase, before recording starts, goes
+//! through the existing `rename_meeting` command rather than a prep-specific
+//! one. `set_recording_title` is the separate, narrower command that sets the
+//! title WHILE actively recording (see above).
+//!
+//! ## URI-scheme asset resolvers
+//!
+//! `ipc-bridge` owns three custom Tauri URI-scheme resolvers. `app-main`
+//! registers the protocol handlers, but the resolvers are implemented here
+//! so their `persistence` / `orchestrator` reads stay inside this crate's
+//! dependency edges rather than leaking onto `app-main`:
+//!
+//! - [`MEETING_ASSET_SCHEME`] / [`resolve_note_asset`] — serves a pasted or
+//!   dropped note image's bytes (`persistence::read_note_asset`).
+//! - [`ATTACHMENT_SCHEME`] / [`resolve_attachment_asset`] — serves an
+//!   attachment original's bytes for the notes editor's inline
+//!   `AttachmentRef` thumbnail (`persistence::read_attachment_original`).
+//! - [`MEETING_RECORDING_SCHEME`] / [`resolve_recording_slice`] — serves a
+//!   decoded WAV slice of the recording for the transcript "play segment"
+//!   affordance (`Orchestrator::extract_segment_wav`); registered as an
+//!   **asynchronous** protocol (the other two are synchronous) because the
+//!   decode runs on the orchestrator's blocking pool, which a synchronous
+//!   handler cannot await.
+//!
+//! All three parse a percent-decoded `/<meeting_id>/<...>` request path —
+//! decode-BEFORE-split matters, since `convertFileSrc` percent-encodes the
+//! whole path and the separating `/` arrives as `%2F` — and fail closed to
+//! `AppError::InvalidInput` on any malformation (non-UUID id, nested
+//! segments, malformed window). The registered handler maps every error to
+//! an empty 404 so no detail leaks to the webview.
+//!
+//! ## Identity / voiceprint management (issue #0003)
+//!
+//! `set_speaker_name` maps a diarizer label to a display name in
+//! `metadata.json` via `persistence::meeting_ops::set_speaker_name`. When
+//! `settings.voiceprint_enrolment_enabled` is on and `IpcState::voiceprints`
+//! holds a live store, the same command also calls
+//! `Orchestrator::enrol_voiceprint` (errors logged and swallowed — a rename
+//! must never fail because enrolment failed). The MCP/agent-tools
+//! `set_speaker_name` tool shares the underlying write path but does NOT
+//! enrol: it has no audio/diarizer access.
+//!
+//! Five more commands manage the voiceprint gallery directly against
+//! `persistence::VoiceprintStore`: `list_voiceprints`,
+//! `merge_voiceprint_identities`, `rename_voiceprint_identity`,
+//! `delete_voiceprint_identity`, and `forget_meeting_voiceprints` (intended
+//! to be invoked by any path that deletes a meeting, so biometric data never
+//! outlives the audio that produced it — currently a standalone command,
+//! not yet wired into `delete_meeting`). `VoiceprintIdentityInfo` /
+//! `CentroidInfo` are `ipc-bridge`-local specta types, not in `common`:
+//! they carry only metadata, no embedding bytes, which lets `persistence`'s
+//! embedding-bearing PODs stay specta-free.
+//!
+//! `IpcState::voiceprints: Arc<Option<VoiceprintStore>>` is opened once at
+//! startup by [`open_voiceprints`], mirroring [`open_meeting_index`]: any
+//! open/migration error degrades to `Arc::new(None)` rather than aborting
+//! startup — voiceprint matching turns off and commands check the `Option`.
+//!
+//! ## Startup index/store bootstrap
+//!
+//! [`open_meeting_index`] and [`open_voiceprints`] are called once by
+//! `app-main` at startup, each driving its crate's async `open` (plus
+//! `rebuild_from_disk` for the index) on a one-shot `block_on` — the only
+//! sanctioned use of `block_on` in this crate, since the
+//! no-`block_on`-in-command-handlers rule binds request handlers, not
+//! bootstrap. Both treat their store as a derived cache that must never
+//! abort startup: [`open_meeting_index`] quarantines a bad `index.db` (plus
+//! its `-wal`/`-shm` sidecars) under a fixed `.corrupt` suffix, recreates
+//! and rebuilds a fresh one from the meetings root, and falls back to an
+//! in-memory index if even that fails — so the app always starts, degraded
+//! rather than panicking.
+//!
+//! ## Chat and the live in-meeting agent
+//!
+//! `send_chat_message` / `cancel_chat_turn` / `get_chat_session` /
+//! `list_chat_sessions` / `delete_chat_session` realise the granted
+//! `ipc-bridge → agent-tools` + `ipc-bridge → chat-agent` edges. The turn
+//! driver loop itself (tool dispatch, context trimming, cancellation,
+//! per-turn sampler seeding) is the state-free `crate::chat::run_chat_turn`
+//! — see that module's doc for the mechanism. `crate::live_agent` drives one
+//! keep-alive co-pilot session per active recording and routes a live
+//! meeting's chat turns into it instead of spinning up a fresh
+//! `LlamaTurnBackend` — see that module's doc for the channel/threading
+//! design. Both share the held LLM substrate below.
+//!
+//! **Held model (C2).** `IpcState`'s chat-runtime bundle carries
+//! `summariser: Arc<OnceCell<Arc<LlamaSummariser>>>` — the LLM GGUF is
+//! loaded once, on first chat/summarise/live-agent use, via
+//! `IpcState::ensure_summariser` (model id + directory resolved through
+//! `Orchestrator::ensure_model_path`; GPU-offload count resolved from the
+//! VRAM-aware `GpuPlan` at load time), and shared thereafter. The chat
+//! engine and the live-agent worker both borrow `&LlamaModel` from this one
+//! handle; `summarise_meeting` and the `agent-tools` `resummarise` tool
+//! reuse the same `Arc<LlamaSummariser>` rather than opening a second copy.
+//!
+//! ## Connected-tier injection seams
+//!
+//! The tunnel (device pairing / relay account) and sync (device-to-device
+//! CRDT sync) surfaces are wired through trait objects `ipc-bridge` defines
+//! and holds on `IpcState` — `TunnelControl` and `SyncControl` — rather than
+//! through direct `tunnel-client` / `sync` Cargo edges, keeping those
+//! transport stacks out of this crate's dependency tree (and out of the
+//! free build) entirely. `app-main` injects the connected implementation
+//! behind the `connected` Cargo feature; the free build (or a connected
+//! build before a credential is stored) gets [`disabled_tunnel`] /
+//! [`disabled_sync`], which report a disconnected/disabled status and
+//! reject actions as `AppError::Unsupported`. `delete_account` performs
+//! GDPR Art. 17 erasure: it forgets the local device credential and stops
+//! the tunnel only after the account-service confirms the server-side erase
+//! (or reports it already gone), so a failed call leaves the device paired
+//! and the operation retryable.
+//!
+//! ## Diagnostics
+//!
+//! `get_diagnostic_report` assembles and REDACTS the
+//! `common::DiagnosticReport` the no-telemetry "Report a problem" flow
+//! pre-fills into a GitHub issue (nothing is sent automatically). Redaction
+//! is owned here, in the `diagnostics` module, because that's where the raw
+//! log/backtrace text is read (`{logs}/last-crash.txt` when present, else
+//! the tail of the rolling log file); it strips meeting-id UUIDs via a
+//! local `redact` — `app-main` and the webview each keep their own copy,
+//! since `ipc-bridge` cannot import `app-main`. `IpcState`'s diagnostics
+//! bundle (`logs_dir`, `app_version`, `platform`) is populated by
+//! `app-main`, which owns the log writes and the `connected` feature flag
+//! `platform` encodes.
+//!
+//! ## Attachments (`doc-convert` edge)
+//!
+//! `add_attachment` / `list_attachments` / `open_attachment` /
+//! `remove_attachment` route directly to `persistence::attachments` on
+//! `spawn_blocking` (no orchestrator involvement, mirroring
+//! `save_note_image`), validating the extension against
+//! `doc_convert::supported_exts()` — the one dependency-table edge this
+//! surface adds. `open_attachment` hands the original's absolute path to
+//! `tauri-plugin-opener`'s Rust API (a host hand-off — no filesystem path
+//! crosses IPC, no opener capability scope needed), distinct from the
+//! inline `attachment:`-scheme thumbnail above.
+//!
+//! A bounded `mpsc::Sender<ConvertJob>` (`IpcState::attachment_convert_tx`)
+//! feeds ONE long-lived conversion worker `app-main` spawns via
+//! [`spawn_attachment_convert_worker`]: it reads the original, calls
+//! `doc_convert::convert_to_markdown` (optionally through [`GemmaVlm`] — a
+//! thin `DocVlm` adapter over the held summariser's
+//! `ensure_vision`/`image_to_markdown` for image OCR, serialising all
+//! vision calls through the single worker so there is no parallel GPU
+//! contention), and emits `AttachmentConverted` / `AttachmentConversionFailed`.
+//! A full queue makes `add_attachment` mark the entry `Failed` immediately
+//! via `try_send` rather than leaving it `Pending` forever. Ready
+//! attachments' markdown feeds `summarise_meeting`'s prompt under a
+//! `## Attachment: <name>` header, budget-truncated per attachment; an
+//! empty manifest reproduces the no-attachment output byte-for-byte.
+//!
+//! ## Translation (`sys-locale` dependency)
+//!
+//! `translate_meeting` / `get_translations` reuse the existing `summariser`
+//! + `persistence` edges (no new dependency-table edge) plus a direct
+//! `sys-locale = "0.3"` third-party dependency the `output_language` module
+//! uses to resolve the `"auto"` output-language sentinel to the OS locale's
+//! language name. `translate_meeting` rejects a second concurrent call for
+//! the same `(meeting_id, language)` pair (`IpcState::translate_in_flight`),
+//! translates segment-by-segment on `spawn_blocking`, and flushes
+//! `translations.json` on a throttled cadence (plus unconditionally on loop
+//! exit) so partial progress survives interruption. `TranslationReady` is
+//! emitted on every exit path, success or error, so the progress indicator
+//! always clears.
+//!
 //! ## Specta types
 //!
 //! `common` and `settings` derive `specta::Type` directly behind their
@@ -138,8 +382,17 @@
 //!
 //! `AppEventPayload` is a `#[serde(transparent)]` newtype around
 //! `common::AppEvent`. The wire name is `"app-event-payload"`.
-//! `spawn_event_forwarder` subscribes to the orchestrator's broadcast
-//! channel and emits each event to all Tauri windows.
+//! [`spawn_event_forwarder`] subscribes to a single broadcast channel and
+//! emits every event it sees to all Tauri windows.
+//!
+//! That channel — `IpcState::event_tx: broadcast::Sender<AppEvent>` — is one
+//! bus shared by clone: `app-main` constructs it once and hands clones to
+//! the `Orchestrator`, the `ModelRegistry`, and `IpcState` itself. `ipc-bridge`
+//! is not only a forwarder but a first-class PRODUCER on this bus: the
+//! summarise, translate, attachment-conversion, and live-agent code paths
+//! all emit directly onto the same `event_tx` clone rather than routing
+//! through the orchestrator, and `spawn_event_forwarder`'s single
+//! subscription sees all of them because the channel is shared.
 //!
 //! ## Tracing
 //!

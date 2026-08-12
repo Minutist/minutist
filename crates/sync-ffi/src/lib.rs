@@ -319,6 +319,15 @@ impl FfiSyncEngine {
     /// (no relay, no DNS — the crux of 0049 on Android, where the relay
     /// hostname does not resolve in-process under a full-tunnel VPN). Pass an
     /// empty list for relay-only addressing. Unparseable entries are skipped.
+    ///
+    /// The phone drives its own `listDevices -> addAccountPeer` loop from
+    /// TypeScript and always calls this — it is a pure upsert with no dial, so
+    /// gating the add on dial-suppression would permanently drop a peer that
+    /// went suppressed, left the account, and later rejoined. Suppression is
+    /// engine-internal at the dial site and only gates the Rust refresh loop's
+    /// first-contact dial-kick; the phone has no dial-kick of its own, so
+    /// `is_suppressed` has no FFI consumer and is not exposed here (dial
+    /// outcomes are never phone-driven).
     pub fn add_account_peer(
         &self,
         endpoint_id: String,

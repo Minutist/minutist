@@ -66,6 +66,52 @@
 //! functions ([`overlay_speakers`]) covered by the default (no-model) test
 //! suite; the sherpa `compute` call is exercised by the env-var-gated accuracy
 //! test (`tests/accuracy.rs`) and the count-vs-knob eval (`tests/oversplit_eval.rs`).
+//!
+//! ## Dependency boundary: `common` only
+//!
+//! This crate depends on `minutist-common` and `sherpa-rs` — nothing else. It
+//! takes RESOLVED model paths (`&Path`) into [`SherpaDiarizer::open`] /
+//! [`online::OnlineDiarizer::open`] / [`VoiceprintExtractor::open`]; it never
+//! resolves a model id itself. All `model-registry` resolution (locating and
+//! downloading the segmentation + embedding model directories) lives in the
+//! orchestrator (`runner::build_diarizer`, `runner::build_online_diarizer`),
+//! which owns the `orchestrator → model-registry` edge and passes the resolved
+//! paths in. Likewise this crate never touches `persistence` at runtime (it is
+//! a dev-dependency only, for the env-var-gated accuracy/over-split fixtures) —
+//! the orchestrator decodes audio via `persistence::read_audio_pcm` and hands
+//! this crate plain PCM. Keeping the diarizer a pure `common`-only compute
+//! layer means it can be exercised (and its clustering/pruning math unit
+//! tested) without a `persistence` root or a `model-registry` handle.
+//!
+//! The `sherpa-rs = 0.6.8` version pin, its `download-binaries`/`static`
+//! feature split, and the rationale for the pin are documented on the
+//! workspace `Cargo.toml` dependency entry (not repeated here); the
+//! k2-fsa-owned `sherpa-onnx` crate remains a candidate binding to
+//! re-evaluate against `sherpa-rs`, not yet acted on.
+//!
+//! ## Voiceprint enrolment surface (WU1, #0003)
+//!
+//! [`Voiceprint`] and [`VoiceprintExtractor`] (re-exported from [`online`])
+//! give the orchestrator a stateless embed → centroid path for enrolling a
+//! named speaker from clean transcript segments, sharing the same embedding
+//! model and unit-normalise/running-mean maths (`common::voiceprint_math`) as
+//! [`OnlineClusterer`] so the two centroid spaces are directly comparable by
+//! cosine. See the type docs below for the full surface.
+//!
+//! ## Prune-veto and library-informed merge (WU7/WU9, #0003 §2.5, #0023)
+//!
+//! [`overlay_speakers`] takes two additional slices beyond the turns/segments/
+//! config: `veto_ids` exempts specific clusters from the share-floor prune and
+//! the `max_speakers` cap (used when a low-share cluster matches an enrolled
+//! voiceprint — see [`PRUNE_VETO_MIN_WINDOWS`]), and `merge_map` remaps source
+//! clusters to a canonical cluster before pruning (used when two clusters
+//! independently match the same enrolled identity), so their combined speech
+//! mass is what the prune sees. Both default to `&[]`, which is bit-identical
+//! to the pre-WU7/WU9 behaviour. The candidate-selection logic for both
+//! (embedding low-share clusters and matching them against the voiceprint
+//! gallery) lives in the orchestrator, not here — see
+//! `orchestrator::matcher::match_each_cluster`, which this crate does not
+//! depend on or call.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

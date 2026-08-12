@@ -4,7 +4,18 @@
 //! llama.cpp model (BGE-M3 by default): CLS-pooled, 1024-dim, **L2-normalised**
 //! output, so the retrieval cosine reduces to a dot product. It is the embedding
 //! peer of `summariser` / `asr-runtime` / `diarizer` — a model-loading leaf crate
-//! that owns the `llama-cpp-2` FFI, depending only on `common`.
+//! that owns the `llama-cpp-2` FFI for embeddings, depending only on `common`
+//! ([`Embedder`], `AppError`, `shared_llama_backend`,
+//! `voiceprint_math::unit_normalise`) plus `llama-cpp-2` itself — so `ipc-bridge`
+//! (a Tauri crate) carries no direct llama edge of its own for embeddings.
+//! GPU features (`vulkan` / `cuda` / `metal` / `rocm`) forward straight through
+//! to `llama-cpp-2`, enabled transitively by `ipc-bridge`.
+//!
+//! [`Bgem3Embedder`] is constructed and held lazily by `ipc-bridge`
+//! (`ensure_embedder`) and consumed by the RAG attach/transcript write path and
+//! the `retrieve_chunks` tool, both in `rag-retrieval`/`agent-tools` territory —
+//! this crate supplies only the model, never the retrieval logic that consumes
+//! its output.
 //!
 //! # Why a separate context per call
 //!
@@ -21,6 +32,20 @@
 //! [`Bgem3Embedder::embed_batch`] embeds each input with its own fresh context (the
 //! spike-proven path). True multi-sequence packing into one batch is a possible
 //! future optimisation but is unverified and not shipped here.
+//!
+//! # Test-only dev-dependencies
+//!
+//! The `#[ignore]`d real-model retrieval-quality eval
+//! (`tests/retrieval_quality_eval.rs`, gated on `MINUTIST_BGE_M3_PATH`) drives
+//! the full retrieval path end-to-end: it embeds a planted-fact corpus with the
+//! real BGE-M3, indexes the vectors via `persistence::RagStore`, and fuses the
+//! dense and lexical legs with `rag_retrieval::rrf_fuse`, so it catches a
+//! degraded or mis-quantised embedder (near-zero or scrambled vectors) that
+//! stub-embedder unit coverage cannot. This adds test-only dev-dependency edges
+//! `embedder → persistence` and `embedder → rag-retrieval` (both of which
+//! depend only on `common`, so no cycle results); these are **not** runtime
+//! edges and do not appear in the crate's production dependency shape
+//! (mirrors `diarizer`'s test-only `persistence` dev-dependency).
 
 use std::num::NonZeroU32;
 use std::path::Path;

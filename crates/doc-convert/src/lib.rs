@@ -1,8 +1,11 @@
 //! Document-to-markdown conversion for the summariser reference-material feed.
 //!
 //! Owner role: **data-engineer** (byte parsing, NOT ML). Depends only on
-//! `minutist-common` (AppError/AppResult at the boundary) and third-party parser
-//! crates; no other workspace-component edges.
+//! `minutist-common` (AppError/AppResult at the boundary, and the [`DocVlm`]
+//! trait it calls through) and third-party parser crates — no other
+//! workspace-component edge. `image` (decode an image attachment and
+//! re-encode it to PNG for the VLM OCR path) is likewise a third-party dep,
+//! not a workspace edge, so the `common`-only rule holds.
 //!
 //! # Public surface
 //!
@@ -10,6 +13,33 @@
 //! pub fn convert_to_markdown(bytes: &[u8], ext: &str, vlm: Option<&dyn DocVlm>) -> AppResult<String>
 //! pub fn supported_exts() -> &'static [&'static str]
 //! ```
+//!
+//! [`dispatch`] routes each extension to one [`converters`] function, one
+//! match arm per format:
+//!
+//! | Extension | Converter |
+//! |---|---|
+//! | `txt`, `md` | passthrough (UTF-8 lossy, then markdown normalisation) |
+//! | `csv`, `tsv` | `csv` crate → a markdown pipe-table (first row = header) |
+//! | `json`, `yaml`/`yml`, `xml`, `log` | wrapped verbatim in a fenced code block — these are not markdown, so re-emitting them through `pulldown-cmark` would mangle them |
+//! | `xlsx`, `ods` | `calamine` → a markdown pipe-table per sheet; date cells render as ISO via `ExcelDateTime::as_datetime()`, not the raw serial number |
+//! | `html`, `htm` | `dom_smoothie` readability extraction → `htmd` markdown |
+//! | `eml` | `mail-parser` → HTML body through the `html` path, or a plain-text body passthrough |
+//! | `pdf` | `pdf_oxide` (pure-Rust digital-text extraction, no native lib; a page that fails to decode is skipped, not fatal) |
+//! | `pptx` | `zip` + `quick-xml` walk of `ppt/slides/slideN.xml` `<a:t>` runs (incl. table cells), one `## Slide N` per slide, with per-slide speaker notes appended as a `### Notes` block |
+//! | `docx` | `zip` + `quick-xml` walk of `word/document.xml` (`<w:p>`/`<w:t>`/`<w:tbl>`); no `docx-rs` production dependency (it is a dev-dependency only, used to synthesise the DOCX test fixture) |
+//! | `png`, `jpg`, `jpeg`, `tiff` | VLM OCR only — no pure-Rust text path |
+//!
+//! For `pptx`/`docx` the bar is textual content for the summariser, not
+//! faithful structure: paragraph/list/cell text is captured; numbering
+//! glyphs and exact layout are not reconstructed. Every converter's output is
+//! normalised through `pulldown-cmark` (parse → re-emit) before it is
+//! returned, so the stored markdown is canonical.
+//!
+//! Integration tests (`tests/integration_tests.rs`) drive every converter
+//! against a small committed fixture file per format under `tests/fixtures/`
+//! — the smallest valid document of each type — asserting structural
+//! properties of the converted markdown rather than exact byte output.
 //!
 //! # Robustness contract
 //!

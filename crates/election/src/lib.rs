@@ -41,6 +41,20 @@
 //! only while its lease is LIVE; an expired one is reapable regardless of `HostRef`
 //! (`DESIGN_producer-gate.md` §10, review CRITICAL-1). The renewal re-asserts over
 //! such a replay rather than aborting.
+//!
+//! # Who binds it
+//!
+//! [`Capability`] is computed by the binding crate (`app-main` / `headless`, which
+//! definitively link the GPU probe) and passed in, so this leaf stays pure and
+//! testable and its correctness never hinges on Cargo feature unification: a
+//! `ParkSyncOnly` host runs [`run_election_loop`] but never claims. Both eligible
+//! host types implement [`ElectionDriver`] over the same collaborators this crate
+//! never depends on directly — a desktop's `SyncEngine` + `Orchestrator` (adapted
+//! by `app-main`, gated behind the same `connected` feature as `sync` /
+//! `mcp-server` / `tunnel-client`, since the free build runs no election loop and
+//! never delegates or claims processing) and the headless GPU node's equivalent —
+//! so the one state machine here is the only implementation of host election in
+//! the workspace.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

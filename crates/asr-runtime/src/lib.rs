@@ -1,35 +1,78 @@
 //! ASR runtime — llama-cpp-2 mtmd Qwen3-ASR binding.
 //!
-//! Loads the Qwen3-ASR GGUF + mmproj pair once per process (via a module-level
-//! `OnceLock` for the `LlamaBackend`), allocates a fresh `LlamaContext` per
-//! `transcribe_chunk` call (cheap; sub-100 ms per Spike 1 Q-P0-2), and reuses
-//! the shared `MtmdContext` across calls.
+//! Implements `minutist_common::AsrBackend`: takes an `AudioChunk`, returns
+//! `Vec<Segment>`. Loads the Qwen3-ASR GGUF + mmproj pair once per process —
+//! `LlamaModel` and `MtmdContext` are built once in `AsrRuntime::new`, using
+//! the shared process-wide `LlamaBackend` singleton in `minutist_common`
+//! (`summariser` also loads a GGUF in the same process, so a private
+//! per-crate `OnceLock` here would make whichever crate inits second fail).
+//! Each `transcribe_chunk` call allocates a fresh `LlamaContext` (cheap,
+//! sub-100 ms) to guarantee a clean KV cache, reusing the shared
+//! `MtmdContext` across calls.
+//!
+//! This crate also drives **Qwen3-ASR-1.7B** (same mtmd path, official
+//! `ggml-org` GGUF + mmproj) as a higher-accuracy, better-multilingual tier
+//! alongside the 0.6B default; the orchestrator's VRAM clamp
+//! (`resolve_gpu_plan`) decides whether the 1.7B fits alongside the
+//! summariser, falling back to the 0.6B CPU default otherwise. Both tiers
+//! share the encoder-window constraint below, so batched-VAD chunking
+//! upstream is mandatory for either.
+//!
+//! # Encoder-window constraint
+//!
+//! mtmd's audio encoder uses a fixed 30 s window: sub-30 s input is
+//! silence-padded internally and the model continues generating into the
+//! padded region, hallucinating words that were never in the audio. This
+//! crate's `AsrBackend` implementation does not itself work around the
+//! constraint — the orchestrator is responsible for shaping calls into it,
+//! via the batched-VAD strategy (collect VAD segments into a ≥25 s buffer,
+//! keeping the original inter-utterance silences zero-padded and capped at
+//! ~3 s each, before dispatch; see `architecture/cross-cutting.md` — "ASR
+//! chunking constraint").
 //!
 //! # Stop conditions
 //!
 //! Generation stops on either:
 //! 1. `model.is_eog_token(token)` — the model emits an end-of-generation token.
 //! 2. The concatenated detokenised text contains `</asr_text>` — Qwen3-ASR's
-//!    explicit transcript-terminator. The model does not always emit EOG when
-//!    audio is shorter than the 30 s encoder window (Spike 3 API surprise #4).
-//!    The check is against the full concatenated string so the tag is detected
-//!    even when it spans token boundaries.
+//!    explicit transcript-terminator, which this crate MUST also check for:
+//!    the model does not always emit EOG for sub-window audio. The check is
+//!    against the full concatenated string so the tag is detected even when
+//!    it spans a token boundary.
+//!
+//! # Language hint
+//!
+//! `AsrRuntimeConfig.language: Option<String>` (full English name, e.g.
+//! `Some("English")`) prefix-forces the output language. `None` (the
+//! default) is auto-detect and produces a prompt byte-identical to the
+//! no-language-hint path — a locked guarantee. When `Some(name)`, the prompt
+//! is prefix-forced via an assistant-turn prefill appended AFTER
+//! `apply_chat_template` (never inside the user message): the rendered
+//! prompt ends with `language <name><asr_text>`, exactly the wrapper
+//! Qwen3-ASR emits itself, so the model only generates the transcript. The
+//! orchestrator resolves the hint from `settings.transcription_language` at
+//! start.
 //!
 //! # Auto-language spurious-CJK guard
 //!
-//! When `config.language` is `None` (auto-detect), the runtime tracks a rolling
-//! history of script observations across chunks. If the current chunk's text is
-//! majority-CJK but the recent session history is majority-Latin with at least
-//! two prior Latin observations, the chunk is re-run once with `language` forced
-//! to `"English"`. The retry is accepted only if it is plausible (non-empty,
-//! non-degenerate, CJK-free) AND its mean-token-logprob exceeds the auto run's
-//! by more than a small epsilon. If the retry loses or is within epsilon, the
-//! auto result is kept and a warning is emitted — genuine Chinese utterances in
-//! a mixed room are never silently dropped. See `architecture/components.md` —
-//! `asr-runtime` guard contract.
+//! When `config.language` is `None` (auto-detect), the runtime tracks a
+//! rolling history of per-chunk script observations (`ScriptHistory`, last 8
+//! chunks: Latin / CJK / Other). If the current chunk's text is majority-CJK
+//! (> 50% of non-whitespace chars) but the recent session history is
+//! majority-Latin with at least two prior Latin observations, the chunk is
+//! re-run once with `language` forced to `"English"`. The retry is accepted
+//! only if it is plausible (non-empty, non-degenerate, CJK-free) AND its
+//! mean-token-logprob (computed from sample-time logits, log-sum-exp for
+//! numerical stability) exceeds the auto run's by more than a small epsilon
+//! (0.05). If the retry loses or is within epsilon, the auto result is kept
+//! and a warning is emitted — genuine Chinese utterances in a mixed room are
+//! never silently dropped. In a non-English Latin-script room the forced
+//! retry typically scores worse and is rejected, which is self-correcting,
+//! though the forced language is currently hardcoded to English rather than
+//! derived from a user locale setting. The guard is inert (and
+//! `ScriptHistory` is not updated) when `config.language` is `Some(..)`.
 //!
-//! See `architecture/cross-cutting.md` — "ASR chunking constraint" and
-//! `spikes/asr/README.md` + `spikes/vad-loop/README.md` for findings.
+//! See `architecture/cross-cutting.md` — "ASR chunking constraint".
 
 use std::ffi::CString;
 use std::num::NonZeroU32;

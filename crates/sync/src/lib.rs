@@ -1,30 +1,139 @@
-//! Device-to-device sync (WS4-B).
+//! Device-to-device sync (WS4-B): direct sync between a user's own paired
+//! devices over [iroh] QUIC, dialled through the self-hosted relay at
+//! `sync.minutist.ai`.
 //!
-//! Synchronises a user's own paired devices directly over [iroh] QUIC, dialled
-//! through the self-hosted relay at `sync.minutist.ai`.
+//! # Protocols
 //!
-//! - **Notes** — Yjs CRDT update frames over the sync ALPN protocol
-//!   ([`notes_proto`]) on the one [`SyncEngine`] endpoint. The authoritative
-//!   document is `notes-crdt`'s `notes.ydoc`; received updates are merged with
-//!   [`notes_crdt::NotesStore::apply_update`].
-//! - **Meeting media** — audio (`audio.opus`) and note assets, content-addressed
-//!   over `iroh-blobs` ([`blobs`]). The two sides exchange a media manifest of
-//!   `(relative-path, BLAKE3 hash)` pairs ([`media_proto`]) over the same sync
-//!   ALPN, then pull the blobs each is missing over the blobs ALPN, exporting to
-//!   the per-meeting paths `notes-crdt` owns (via `MeetingFolder::ensure`).
+//! One [`SyncEngine`] endpoint accepts two ALPNs. The primary ALPN
+//! ([`notes_proto::SYNC_ALPN`]) multiplexes four request/response protocols over
+//! a single bidirectional QUIC stream, dispatched by a leading
+//! [`notes_proto::StreamKind`] tag — so one paired-peer authorisation point
+//! (the inbound `AcceptHook`) covers all four. Framing is shared ([`frame`]).
 //!
-//! Both exchanges share one ALPN, dispatched by a leading
-//! [`notes_proto::StreamKind`] tag, so one paired-peer authorisation point covers
-//! both. Framing is shared ([`frame`]).
+//! - **Notes** ([`notes_proto`], tag `1`) — Yjs CRDT state-vector/diff
+//!   reconciliation. The authoritative document is `notes-crdt`'s `notes.ydoc`;
+//!   received updates are merged with
+//!   [`notes_crdt::NotesStore::apply_update`], which re-derives the `notes.json`
+//!   / `notes.md` projections. `sync` never materialises a yrs `Doc` itself.
+//! - **Media** ([`media_proto`], tag `2`) — a manifest of
+//!   `(relative-path, BLAKE3 hash)` pairs for `audio.opus` and each note asset,
+//!   then a pull of the missing blobs over the second ALPN ([`blobs`],
+//!   `iroh_blobs::ALPN`), exported to the per-meeting paths `notes-crdt` owns
+//!   (via `MeetingFolder::ensure`). Blobs are immutable and content-addressed,
+//!   so "pull what I lack by hash" is the whole rule.
+//! - **Discovery** ([`discovery_proto`], tag `3`) — each side advertises the
+//!   `(MeetingId, ProcessingLifecycle)` of every meeting it holds, so a peer
+//!   learns both which meetings exist and their host-authoritative processing
+//!   state. `sync` has no `persistence` edge, so it only reads the local
+//!   `processing` state to advertise and emits received states on
+//!   [`SyncEngine::subscribe_lifecycle_events`] for a `persistence`-linked
+//!   consumer to apply.
+//! - **Artifacts** ([`artifacts_proto`], tag `4`) — reconciles a meeting's
+//!   DERIVED outputs (`transcript.json` / `summary.md`, the files processing
+//!   produces). Mirrors media's manifest-then-pull shape, but a derived
+//!   artifact is MUTABLE (a meeting can be reprocessed), so each manifest entry
+//!   carries the authority that produced those exact bytes (`produced_by` host
+//!   + `produced_at`); a peer entry is pulled only when it strictly supersedes
+//!   the local one. That authority travels WITH the bytes and is never
+//!   re-derived from `metadata.json`, whose `Processed` stamp propagates over
+//!   Discovery independently of the bytes — deriving from it would let a stale
+//!   relay copy clobber a newer producer copy.
 //!
-//! Peers are learned out-of-band from the account service (the same connected-tier
-//! surface as `tunnel-client`), so addressing uses iroh's `MemoryLookup` rather
-//! than DNS/pkarr discovery. [`account`] carries the account-mediated peer-
-//! discovery loop; manual pairing ([`SyncEngine::add_peer_from_ticket`]) is the
-//! other, additive source that feeds the same [`address_lookup::PeerDirectory`].
+//! The second ALPN ([`iroh_blobs::ALPN`], via [`blobs`]) moves blob bytes for
+//! both the media and artifacts protocols; its accept side is guarded by the
+//! same paired-peer check as the primary ALPN, so it never serves an unpaired
+//! remote even though `iroh-blobs`' own protocol handler would.
 //!
-//! This crate is part of the CONNECTED feature surface. It lives in the workspace
-//! unconditionally; the free build omits the `app-main -> sync` wiring.
+//! # Peer addressing
+//!
+//! Peers are learned two ways, additive into the one
+//! [`address_lookup::PeerDirectory`], which backs iroh's `MemoryLookup` rather
+//! than DNS/pkarr discovery:
+//!
+//! - manual, out-of-band ticket exchange — [`SyncEngine::my_ticket`] /
+//!   [`SyncEngine::add_peer_from_ticket`]; pairing is mutual, each side must add
+//!   the other's ticket;
+//! - account-mediated discovery ([`account`]) — a periodic loop fed by a
+//!   consumer-supplied [`account::AccountEndpointSource`], so this crate takes
+//!   no HTTP or account-service dependency of its own.
+//!
+//! A re-advertised peer's address set REPLACES rather than unions with the
+//! tracked one ([`address_lookup::PeerDirectory`]), so a stale direct address
+//! (an old ephemeral port, a phantom cross-L2 LAN candidate on a tailnet
+//! device) cannot linger as a dead dial candidate that aggravates iroh's
+//! per-remote path-churn actor.
+//!
+//! # Dependency shape
+//!
+//! This crate depends on `common` (shared types/errors) and `notes-crdt` (the
+//! `notes.ydoc` reader/writer and `MeetingFolder`) — nothing else in the
+//! workspace. It never depends on `persistence`: the notes-CRDT primitives were
+//! extracted into the leaf `notes-crdt` crate specifically so this crate's lib
+//! stays off the C-heavy graph `persistence` pulls in (libsql / audiopus /
+//! ogg), which lets it cross-compile to `aarch64-linux-android` for the phone
+//! companion (the `sync-ffi` crate). `persistence::assets` (note-image
+//! round-trips) is reached only as a dev-dependency, by this crate's own
+//! integration tests — never by the crate's own lib.
+//!
+//! This crate is part of the CONNECTED feature surface. It compiles
+//! unconditionally as a workspace member; the free build omits only the
+//! `app-main -> sync` wiring (`ipc-bridge`'s `SyncControl` trait, backed by a
+//! no-op implementation in the free build and this crate's engine in the
+//! connected one — see `cross-cutting.md`, "Build variants").
+//!
+//! # Public API
+//!
+//! [`SyncEngine::start`] binds the iroh endpoint and starts serving;
+//! `start_direct` is the relay-less path used by integration tests
+//! (`test-support` feature only). Beyond pairing and the four per-protocol
+//! initiator calls (`sync_notes` / `sync_media` / `sync_artifacts` /
+//! `discover_with`), two composite operations drive a full reconciliation:
+//!
+//! - [`SyncEngine::push_all_to_peer`] reconciles every locally-held meeting
+//!   (notes, then media, then a discovery dial) to one peer — the PUSH
+//!   direction.
+//! - [`SyncEngine::adopt_from_peer`] / [`SyncEngine::adopt_all`] are the PULL
+//!   direction: discover a peer's meeting list, then pull every meeting this
+//!   device lacks OR holds only incompletely (notes + media + artifacts). A
+//!   held meeting is skipped only when FULLY materialised (`notes.ydoc` +
+//!   `metadata.json` + `audio.opus` all present); a half-synced meeting — audio
+//!   pulled but the notes pull failed on a prior sweep, or vice versa — is
+//!   re-attempted rather than stranded on folder existence alone, so a sweep
+//!   self-heals across restarts. This is the sync-replica hub's backfill path:
+//!   the hub runs no producer/election loop, so an adopted meeting is never
+//!   claimed for processing, only lifecycle-applied as received. Each pass logs
+//!   one per-peer summary (discovered / adopted / recompleted /
+//!   skipped_complete) at debug, so a sweep's decision is observable without
+//!   per-meeting spam.
+//!
+//! [`SyncEngine::subscribe_peer_events`] / [`SyncEngine::subscribe_lifecycle_events`]
+//! are the two bounded broadcast channels a host (the headless daemon, or a
+//! desktop driver) reacts to. [`SyncEngine::shutdown`] is the owning, graceful
+//! stop. Failed dials are tracked per-peer by [`backoff::BackoffRegistry`] and
+//! exponentially suppressed, independent of directory membership, so a
+//! recovery sweep does not burn a per-dial timeout on every pass against an
+//! unreachable peer.
+//!
+//! # Third-party dependencies
+//!
+//! `iroh` (the QUIC transport, pinned EXACT) and `iroh-tickets` (the
+//! `EndpointTicket` round-trip for manual pairing, pinned EXACT alongside the
+//! same iroh 1.0 line). `iroh-blobs` (pinned EXACT `=0.103.0`, `fs-store`
+//! feature) supplies the BLAKE3 blob store and `BlobsProtocol` handler for the
+//! second ALPN; it depends on `iroh ^1.0.0`, and the workspace's `=1.0.0` pin is
+//! in that range, so there is exactly one `iroh` in the dependency tree and the
+//! endpoint/connection types unify across the accept/connect/download
+//! boundary. `yrs` (the same workspace pin as `persistence`) backs the notes
+//! CRDT diff. `uuid` decodes the fixed 16-byte meeting id off the wire into a
+//! `common::MeetingId`. `futures-util` (workspace-pinned, already a dependency
+//! of `tunnel-client`) supplies `StreamExt` over the blob downloader's progress
+//! stream — capping a transfer mid-flight once it crosses the per-blob size
+//! cap, rather than only discovering an oversized transfer after it has
+//! already landed on disk — and `join_all` for concurrent per-peer dialling
+//! (a dead or slow peer must not delay discovery/adopt for the peers behind
+//! it). `tokio-util` supplies `CancellationToken`, the account-refresh loop's
+//! cancel primitive — the same leaf `mcp-server` already carries, so it adds no
+//! new crate to the dependency tree.
 //!
 //! [iroh]: https://docs.rs/iroh/1.0.0/iroh/
 

@@ -1,9 +1,17 @@
 //! Adapts `tunnel_client::AccountDirectoryClient` (an HTTP client) onto
 //! `sync::AccountEndpointSource` (the trait `sync` depends on instead of an
 //! HTTP client), so `sync` and `tunnel-client` never take an edge on each
-//! other. `app-main` and `headless` — the two account-mediated-discovery
-//! consumers (B4) — both depend on this crate instead of each carrying their
-//! own copy of the adapter.
+//! other. `app-main` (its account-refresh wiring) and `headless` (its
+//! account-discovery startup path) — the two account-mediated-discovery
+//! consumers — both depend on this crate instead of each carrying their own
+//! copy of the adapter: before this crate existed, the two implementations
+//! were identical apart from an `AppError` import qualifier.
+//!
+//! A leaf on top of both `sync` and `tunnel-client`. It exists only to serve
+//! the account-mediated discovery loop, so it is part of the connected feature
+//! surface — every consumer that wires it in does so behind the same
+//! `connected` Cargo feature as `sync` / `tunnel-client` / `mcp-server` /
+//! `election`; the free build has no relay and no account directory to adapt.
 
 use minutist_common::{AppError, AppResult};
 use sync::{AccountEndpoint, AccountEndpointSource};

@@ -1,16 +1,59 @@
 //! VAD-based audio chunker for minutist.
 //!
-//! Wraps the Silero VAD model (via `vad-rs`) with an onset/hangover smoother
-//! and a partial-frame accumulator. Accepts raw f32 samples at 16 kHz mono
-//! and emits [`VadEvent`]s as speech boundaries are detected.
+//! Wraps the Silero VAD v4 model (via `vad-rs`) with an onset/hangover
+//! smoother and a partial-frame accumulator, turning the raw 16 kHz mono f32
+//! sample stream from `audio-capture` into speech segments.
+//! [`VadChunker::process_samples`] accepts samples as they arrive and returns
+//! [`VadEvent::SegmentStart`]/[`VadEvent::SegmentEnd`] as speech boundaries
+//! are detected; [`VadChunker::flush_end_of_stream`] closes any segment still
+//! open at end-of-stream. A `SegmentEnd` carries `{start_ms, end_ms,
+//! samples}` for the whole segment — pre-roll included, hangover silence
+//! trimmed.
+//!
+//! # Framing
+//!
+//! Silero v4 requires exactly 480-sample (30 ms @ 16 kHz) frames and panics
+//! on any other size. `process_samples` accumulates a partial-frame
+//! remainder across calls and only ever feeds the VAD complete frames.
+//!
+//! # Smoothing and chunking strategy
+//!
+//! Defaults ([`VadConfig::default`]): threshold 0.5, onset 3 frames (90 ms),
+//! hangover 24 frames (720 ms), prefill 5 frames (150 ms pre-roll). A segment
+//! is force-split past `max_segment_ms` (default 10 s), continuing the
+//! speech seamlessly in a fresh segment — this bounds the audio handed
+//! downstream, since Qwen3-ASR's mtmd path hallucinates and loops on
+//! over-long input, and keeps live transcription flowing during a long
+//! monologue.
+//!
+//! # Timeline discontinuities and `reset`
+//!
+//! `process_samples` re-anchors its frame clock to the caller-supplied
+//! `start_ms` on every call. A gap between where the internal clock expected
+//! the next sample and where the caller says it actually starts discards the
+//! stale partial-frame buffer and pre-roll ring, so a post-gap region starts
+//! cleanly on the caller's timeline instead of the chunker anchoring the next
+//! segment to pre-gap timestamps.
+//!
+//! [`VadChunker::reset`] goes further: it restores the chunker to its
+//! just-opened state (Silero RNN hidden state, smoother, partial-frame
+//! buffer, pre-roll ring, frame clock, any in-progress segment) without
+//! reloading the model. It is used at a hard region boundary where the next
+//! audio is independent rather than a continuation — the orchestrator's
+//! offline re-transcribe calls it at each detected recording pause, so a
+//! post-pause utterance onsets afresh instead of merging with the pre-pause
+//! one across the skipped silence.
+//!
+//! # Model provenance
+//!
+//! The Silero ONNX file is vendored under `resources/silero/` rather than
+//! managed by `model-registry` (see `architecture/cross-cutting.md` — "Model
+//! lifecycle"). The bundled path is resolved at build time via
+//! `option_env!("MINUTIST_SILERO_PATH")`, falling back to
+//! `{CARGO_MANIFEST_DIR}/../../resources/silero/silero_vad_v4.onnx`.
 //!
 //! # Design constraints (from `architecture/cross-cutting.md`)
 //!
-//! - 30 ms / 480-sample frames at 16 kHz (Silero v4 requirement).
-//! - `Vad::compute` panics on wrong frame size; `process_samples` accumulates
-//!   a partial-frame remainder and only feeds complete 480-sample frames.
-//! - Smoothing defaults: threshold 0.5, onset 3 frames, hangover 24 frames,
-//!   prefill 5 frames.
 //! - No `anyhow` in public signatures; per-crate `Error` with `From` into
 //!   `AppError` at the boundary.
 //! - No `println!` / `eprintln!`; `tracing` with target `"vad-chunker"`.

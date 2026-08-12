@@ -2107,8 +2107,6 @@ export type Segment = { start_ms: number; end_ms: number; text: string; speaker_
 shared_speakers: string[] }
 /**
  * Application settings.
- * 
- * Fields added in later phases live in their respective phase plans.
  */
 export type Settings = { 
 /**

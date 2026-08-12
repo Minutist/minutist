@@ -1,21 +1,47 @@
 //! `asr-parakeet` — NVIDIA Parakeet TDT 0.6B v3 via sherpa-onnx, implementing
 //! [`minutist_common::AsrBackend`] with per-word timestamps.
 //!
-//! The sibling of `asr-runtime`: that crate is the llama-cpp-2 / Qwen domain;
-//! this is the sherpa-onnx / Parakeet domain. Both are interchangeable behind
-//! `Box<dyn AsrBackend>`; the orchestrator selects one by the resolved
-//! transcription language (`common::asr_engine_for_language`). Parakeet covers
-//! English + 24 EU languages and — unlike the mtmd path — emits token-level
-//! timestamps, which we aggregate into word-level `Segment.words`.
+//! # Why a separate crate from `asr-runtime`
 //!
-//! Binding note: sherpa-rs 0.6.8 `TransducerRecognizer::transcribe()` returns
-//! only the text and drops timestamps. We enable the `sys` feature and call the
-//! C API directly (`SherpaOnnxGetOfflineStreamResult`) to read text + tokens +
-//! timestamps. The recogniser (incl. the ~650 MB encoder) is loaded once in
-//! [`ParakeetBackend::new`]; each `transcribe_chunk` allocates a fresh offline
-//! stream (cheap).
+//! Keeps the single-domain rule: `asr-runtime` is the llama-cpp-2/Qwen
+//! domain, this is the sherpa-onnx/Parakeet domain (sherpa-onnx already
+//! enters the workspace via `diarizer`; this is its second consumer, FFI via
+//! `sherpa-rs`, the same `=0.6.8` pin). The two backends are interchangeable
+//! behind `Box<dyn AsrBackend + Send>`; the orchestrator selects one per the
+//! resolved transcription language (`runner::build_asr_backend`).
 //!
-//! License: the Parakeet model is CC-BY-4.0 (attribution shipped in About).
+//! # Language routing
+//!
+//! Parakeet TDT v3 covers 25 European languages (English + EU). Languages
+//! outside that set, and `Auto-detect`, route to the Qwen `asr-runtime`
+//! tiers instead (broadest coverage). The mapping is a pure function in
+//! `common` (`asr_engine_for_language`) so the UI and the orchestrator agree
+//! on it.
+//!
+//! # Binding note
+//!
+//! sherpa-rs 0.6.8 `TransducerRecognizer::transcribe()` returns only the text
+//! and drops the per-token timestamps the C result carries
+//! (`SherpaOnnxGetOfflineStreamResult` → `timestamps` + `tokens`). This crate
+//! enables the `sherpa-rs` `sys` feature and calls the C API directly to read
+//! text + tokens + timestamps, then groups Parakeet's sub-word tokens into
+//! words on the leading-space boundary to fill `Segment.words` — the
+//! per-word timestamps the mtmd path cannot produce. The recogniser
+//! (including the ~650 MB encoder) is loaded once in [`ParakeetBackend::new`];
+//! each `transcribe_chunk` allocates a fresh offline stream (cheap).
+//!
+//! # Output guard
+//!
+//! A chunk whose decode is a degenerate repetition runaway — one word
+//! exceeding 50% of the output (over ≥ 5 words), or a distinct-word ratio
+//! below 0.35 (over ≥ 8 words) — yields no segment rather than a hallucinated
+//! transcript. Discontinuous or starved audio (a dropped-frame burst) drives
+//! the transducer to loop a word or clause; dropping the window keeps the
+//! loop out of the transcript, summary, and RAG index. This is the Parakeet
+//! counterpart to `asr-runtime`'s plausibility check.
+//!
+//! License: the Parakeet model is CC-BY-4.0, distinct from the Apache-2.0
+//! Qwen models — attribution is shipped in the About dialog.
 
 use std::ffi::{CStr, CString};
 use std::mem;

@@ -1,12 +1,25 @@
 //! `summariser` — local-LLM text summarisation.
 //!
 //! Implements [`minutist_common::Summariser`] by driving a GGUF text model
-//! through `llama-cpp-2`. The model is resolved + selected by the caller
-//! (settings `llm_model_id` → `model-registry`), so this crate is
-//! **model-agnostic**: it reads the GGUF's baked-in chat template rather than
-//! assuming a specific family (Gemma 4 / Qwen / Granite). See
-//! `architecture/components.md` — `summariser`, and `cross-cutting.md`
-//! ("llama.cpp prefill batching" — chunked-prefill is mandatory).
+//! through `llama-cpp-2`: llama-cpp-2 text-LLM lifecycle, summarisation
+//! prompts, and the optional external-LLM dispatcher (Ollama / LM Studio).
+//! Inputs are a transcript and notes (read by the caller via `persistence`);
+//! output is a markdown summary (written by the caller via `persistence`).
+//! The model is resolved + selected by the caller (settings `llm_model_id` →
+//! `model-registry`), so this crate is **model-agnostic**: it reads the
+//! GGUF's baked-in chat template rather than assuming a specific family
+//! (Gemma 4 / Qwen / Granite). See `cross-cutting.md` ("llama.cpp prefill
+//! batching" — chunked-prefill is mandatory).
+//!
+//! The bundled default model is Gemma 4 E4B-it (`gemma4` arch, Apache-2.0),
+//! with a low-end tier of Gemma 4 E2B-it (same family/loader) and IBM
+//! Granite 4.1-3b (Apache-2.0, dense, no PLE, non-thinking) as a fallback if
+//! the Gemma-4 PLE forward-graph bug degrades quality on a given build. Its
+//! 128K context fits a 30-minute transcript in one pass. The model is
+//! **settings-selected, never hard-coded** — switching model families is a
+//! manifest + `llm_model_id` change, not a code change; the chat-template and
+//! fallback machinery below is what makes that possible without per-model
+//! branching.
 //!
 //! # Lifecycle (mirrors `asr-runtime`)
 //!
@@ -22,10 +35,26 @@
 //!
 //! 1. **Prompt** is built from the GGUF's baked-in chat template
 //!    (`chat_template(None)` + `apply_chat_template(messages, add_ass=true)`)
-//!    with a `system` message (the user-configured prompt) and a `user`
-//!    message (the rendered transcript + the notes markdown). Missing/unusable
-//!    template → [`Error::Template`] (→ `AppError::InvalidInput`), never a
-//!    hand-built scaffold.
+//!    with the system prompt folded into a SINGLE `user` turn — not a
+//!    separate `system` message, since several templates (notably Gemma)
+//!    have no `system` role — followed by the rendered transcript + notes.
+//!    Missing/unusable template → [`Error::Template`] (→
+//!    `AppError::InvalidInput`), never a silent hand-built scaffold for an
+//!    unrecognised model.
+//!
+//!    That said, the bundled llama.cpp build cannot RENDER a chat template
+//!    newer than itself: the shipped Gemma-4 GGUF's template postdates the
+//!    vendored llama.cpp, so `apply_chat_template` returns `ffi error -1`
+//!    even for a well-formed user-only message set. On that specific
+//!    failure, [`LlamaSummariser`] falls back to a hand-built Gemma turn-
+//!    format prompt (`<bos><start_of_turn>user … <end_of_turn>` then an open
+//!    `model` turn — [`model_turn_prompt`]) with turn markers probed from the
+//!    model's own vocabulary, matching the format the shipped LLM actually
+//!    uses. Every other model keeps rendering its baked template unchanged.
+//!    `<bos>` is explicit in the fallback because generation tokenises with
+//!    `AddBos::Never` and `str_to_token` parses special tokens directly. This
+//!    same fallback chain is reused by the OCR prompt and the translation
+//!    prompt, not just `summarise`.
 //! 2. **Thinking is disabled** — we never inject a think token. If the model
 //!    nonetheless emits a `<think>…</think>` block, it is stripped before the
 //!    summary is returned.
@@ -33,10 +62,88 @@
 //! 4. **Prefill is chunked by `n_batch`** ([`plan_prefill`]): the prompt is
 //!    decoded in `n_batch`-sized [`LlamaBatch`] chunks, with `logits = true`
 //!    set only on the final token of the final chunk, so a long transcript
-//!    never trips `GGML_ASSERT(n_tokens_all <= n_batch)`.
-//! 5. **Generation** is greedy, stops on `model.is_eog_token(token)`, and is
-//!    capped at `config.max_tokens`. Detokenisation is incremental via an
+//!    (which routinely exceeds the default 512-token `n_batch`) never trips
+//!    `GGML_ASSERT(n_tokens_all <= n_batch)`.
+//! 5. **Generation** is greedy, stops on `model.is_eog_token(token)` (covers
+//!    both EOS and `<|im_end|>` for Qwen), and is capped at
+//!    `config.max_tokens`. Detokenisation is incremental via an
 //!    `encoding_rs` UTF-8 decoder (mirrors `asr-runtime`).
+//!
+//! # Notes weaving
+//!
+//! The `Summariser` trait takes `notes: &[NoteBlock]` rather than a flat
+//! markdown string; `NoteBlock { at_ms: Option<u64>, text }` is a `common`
+//! vocabulary type projected from a meeting's `notes.json` by
+//! `persistence::note_blocks_from_json` / `read_note_blocks`. When any note
+//! is anchored to the recording clock, [`render_user_content`] merges the
+//! transcript and the anchored notes into one time-ordered, `[m:ss]`-
+//! prefixed timeline so the model sees each note beside what was being said
+//! when it was written; un-anchored notes trail the timeline. With no
+//! anchored notes the transcript renders as a plain transcript plus a flat
+//! `# Notes` block, spending no extra context tokens over the pre-weaving
+//! format. [`summarise_with_progress`](LlamaSummariser::summarise_with_progress)
+//! reports two-phase progress (`Prefill { done, total }` per prompt chunk,
+//! then `Generate { done, max }` per token) so a caller-side progress bar
+//! does not sit pinned at 0% through the prefill stretch.
+//!
+//! # Attachments feed
+//!
+//! `Summariser::summarise` takes a leading `attachments_markdown: &str`
+//! parameter (before `system_prompt`, matching the prompt fold order). The
+//! caller assembles this by concatenating each Ready attachment's converted
+//! `<hash>.md` content in manifest order, each under a
+//! `## Attachment: <original_filename>` header. [`render_user_content`]
+//! prepends a `# Reference material (attachments)` section — before
+//! `# Transcript` — only when the string is non-empty, so an empty string
+//! produces byte-identical output to the no-attachment path. Attachments are
+//! reference material, not time-woven: they never enter the transcript/notes
+//! timeline merge. The caller is responsible for a budget guard: before
+//! calling `summarise`, it deterministically truncates the assembled
+//! attachments string (per-attachment, equal-share, with a visible
+//! `[truncated]` marker on any trimmed part) if the full prompt would
+//! overflow `n_ctx` minus reserves for transcript, notes, and generation
+//! headroom — this crate has no `n_ctx` awareness of its own for that
+//! purpose beyond [`check_context_budget`], which validates prompt tokens
+//! plus `max_tokens` against `n_ctx` at generation time.
+//!
+//! # Auxiliary generation surfaces
+//!
+//! Beyond `summarise`, [`LlamaSummariser`] exposes several concrete methods
+//! (not on the `Summariser` trait, since they have no meaningful remote-
+//! backend equivalent and the trait stays minimal for its other impls):
+//!
+//! - [`translate_segment`](LlamaSummariser::translate_segment) — translates
+//!   one transcript segment into a target language via a minimal single-turn
+//!   prompt, reusing the same template/fallback and chunked-prefill path.
+//! - [`generate_attachment_awareness`](LlamaSummariser::generate_attachment_awareness)
+//!   — produces a compact description + keyword list for a converted
+//!   attachment, pinned into the live co-pilot prefix.
+//! - [`model`](LlamaSummariser::model) — lends the held `&LlamaModel` to the
+//!   `chat-agent` engine's turn backend (and the same handle coerces to
+//!   `Arc<dyn Summariser>` for `agent-tools`). The model is `unsafe impl Send
+//!   + Sync`, so it is safely referenced concurrently; each caller still
+//!   builds its own fresh, `!Sync` `LlamaContext` per turn, exactly as
+//!   `summarise` does — no GGUF is ever reloaded. This is an accessor, not a
+//!   wrapper, so it adds no `summariser → chat-agent` dependency edge
+//!   (`chat-agent` depends on `summariser`, never the reverse).
+//! - [`ensure_vision`](LlamaSummariser::ensure_vision) /
+//!   [`image_to_markdown`](LlamaSummariser::image_to_markdown) — a lazily-
+//!   built vision `MtmdContext` bound to the already-loaded Gemma-4 model (no
+//!   second model, same GPU budget) backing document-page OCR into markdown.
+//!
+//! # External dispatcher
+//!
+//! The optional `external-ollama` cargo feature adds
+//! [`OllamaSummariser`](ollama::OllamaSummariser): a `reqwest::blocking`
+//! dispatcher to a local Ollama/LM-Studio-compatible `/api/chat` endpoint,
+//! selected instead of the bundled GGUF when settings prefer an external
+//! model. `reqwest` and `serde` are pulled in only by that feature, so the
+//! default build stays dependent on `common` alone. Its deterministic seams
+//! (URL normalisation, request-shape construction, HTTP-error mapping) are
+//! covered by `#[cfg(test)]` unit tests that need no live server; the gated
+//! verification harness runs `cargo test -p summariser --features
+//! external-ollama` as an extra step so those tests are exercised even
+//! though the default build does not compile them.
 
 use std::ffi::CString;
 use std::num::NonZeroU32;

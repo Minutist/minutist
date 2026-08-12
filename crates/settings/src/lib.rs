@@ -1,18 +1,63 @@
-//! Application settings — Phase 1 fields.
+//! Application settings: schema, persistence, and change notification.
 //!
 //! This crate is the single source of truth for runtime configuration.
 //! Other crates read settings via [`SettingsHandle`]; nobody parses the
 //! backing JSON file directly.
+//!
+//! ## Persistence + defaults
+//!
+//! [`Settings`] is backed by a single JSON file (conventionally
+//! `{app-data}/settings.store`), read/written whole via [`JsonFileStore`]
+//! (`serde_json` + `std::fs`; see [`store`]). A missing file loads as
+//! [`Settings::default`]; a corrupt file is an error one layer up
+//! ([`SettingsHandle::new`] falls back to defaults with a logged warning —
+//! the store itself just propagates `Err`).
+//!
+//! Every field carries `#[serde(default = ...)]` (or plain `#[serde(default)]`
+//! for a zero-valued type), so a store written before the field existed
+//! deserialises it to that default rather than failing — the schema only ever
+//! grows. Because several fields default to non-`Default::default()` values
+//! (e.g. `true`, or a non-empty prompt string), [`Settings`] carries a
+//! hand-written [`Default`] impl rather than `#[derive(Default)]`; each
+//! default value is produced by a small named `default_*` function so the
+//! same value backs both the `serde` attribute and the `Default` impl. A
+//! field whose on-disk shape changed (e.g. `gpu_acceleration`'s bool → enum
+//! migration, `live_agent_system_prompt`'s legacy-prompt upgrade) uses
+//! `deserialize_with` to accept the old shape and normalise it on load,
+//! rather than bumping a schema version — there is no store-wide version
+//! field; each field manages its own backward compatibility.
+//!
+//! ## Change notification
+//!
+//! [`SettingsHandle`] wraps the current [`Settings`] behind a
+//! `tokio::sync::RwLock` (cheap concurrent reads) and a
+//! `tokio::sync::watch::Sender` (capacity 1 — a subscriber always observes
+//! the latest value, never a queue of intermediate ones) that broadcasts the
+//! full snapshot on every [`SettingsHandle::update`], not a diff. The
+//! broadcast is direct — it does not route through the orchestrator.
 //!
 //! ## Architecture constraints
 //!
 //! - **No `tauri::*` imports.** Tauri glue lives only in `ipc-bridge` and
 //!   `app-main`. This crate receives a `PathBuf` at construction time and
 //!   reads/writes JSON via `serde_json` + `std::fs`.
-//! - Settings changes broadcast directly from this crate via
-//!   [`tokio::sync::watch`], not through the orchestrator.
 //! - Per-crate [`Error`] via `thiserror`; `From<Error> for AppError` is
 //!   implemented in [`error`].
+//!
+//! ## Fields with cross-crate behaviour
+//!
+//! Most fields are consulted only by whichever crate reads [`Settings`]; one
+//! is worth calling out because the crate that interprets it isn't obvious
+//! from the field alone:
+//!
+//! - **`auto_start_recording_on_new_meeting: bool`** — `#[serde(default =
+//!   "default_auto_start_recording_on_new_meeting")]` resolves to `false` for
+//!   both a fresh store and an older store written before the field existed,
+//!   the same "one default for everyone" pattern `auto_summarise_on_stop`
+//!   uses. `ipc-bridge`'s `create_meeting` reads it: `false` opens the "New
+//!   meeting" prep screen (set a title, write notes, attach resources, start
+//!   recording explicitly); `true` starts recording the instant a new
+//!   meeting is created.
 
 use std::path::PathBuf;
 
@@ -388,8 +433,6 @@ pub fn preset_prompt(preset: SummaryPreset) -> &'static str {
 }
 
 /// Application settings.
-///
-/// Fields added in later phases live in their respective phase plans.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct Settings {

@@ -2,10 +2,14 @@
 #
 # pre-commit — architecture drift guard + mechanical guardrails
 #
-# Fails the commit if source under crates/, src-tauri/, or ui/src/ is staged
-# without a matching change under architecture/. The intent is to
-# keep the live architecture docs honest: a structural change is incomplete
-# until the C4 docs reflect it.
+# Fails the commit if it adds/removes a crate or widens/narrows `common`'s
+# public surface without a matching change under architecture/. Both are
+# mechanical, cheap-to-detect proxies for "this needs a human architecture
+# decision" — a new dependency EDGE on an existing crate is caught
+# unconditionally by check-dep-table.py below instead, so it is not
+# re-checked here. This deliberately does NOT fire on every commit that
+# touches crates/ — an earlier version did, and in practice that trained
+# `SKIP_ARCH_CHECK=1` as a reflex rather than a considered exception.
 #
 # Also runs two mechanical lints (scripts/check-dep-table.py,
 # scripts/check-tracing-targets.py) against the working tree whenever the
@@ -43,21 +47,26 @@ if [ "${SKIP_ARCH_CHECK:-0}" = "1" ]; then
     exit 0
 fi
 
-# Code paths whose changes require an architecture-doc touch.
-# Tests under crates/*/tests/ and fixtures are excluded — they don't affect
-# architectural shape.
-code_changed=0
+# Mechanical signals for "this needs an architecture-doc decision":
+#   1. A crate was added or removed (a Cargo.toml appeared or disappeared
+#      under crates/ or src-tauri/).
+#   2. `common`'s public surface changed (a `pub ` line was added or
+#      removed in crates/common/src/lib.rs) — the one crate every other
+#      crate can see, so a widened/narrowed surface there is workspace-wide.
+arch_signal=0
 while IFS= read -r path; do
     case "$path" in
-        crates/*/tests/*) ;;
-        tests/fixtures/*) ;;
-        crates/*|src-tauri/*|ui/src/*)
-            code_changed=1
+        crates/*/Cargo.toml|src-tauri/Cargo.toml)
+            arch_signal=1
             ;;
     esac
-done <<< "$staged"
+done <<< "$(git diff --cached --name-only --diff-filter=AD)"
 
-if [ "$code_changed" = "0" ]; then
+if git diff --cached -- crates/common/src/lib.rs | grep -qE '^[+-]pub '; then
+    arch_signal=1
+fi
+
+if [ "$arch_signal" = "0" ]; then
     exit 0
 fi
 
@@ -78,24 +87,21 @@ fi
 cat >&2 <<EOF
 [pre-commit] architecture drift check FAILED
 
-  This commit touches source under crates/, src-tauri/, or ui/src/ but
-  no file under architecture/ is staged.
+  This commit adds/removes a crate, or changes common's public surface,
+  but no file under architecture/ is staged.
 
   The architecture docs are LIVE — they describe the code as it is in the
-  current commit. If your change affects component boundaries, interfaces,
-  dependencies, or cross-cutting concerns, update the relevant file:
+  current commit. Update the relevant file:
 
     architecture/system-context.md
     architecture/containers.md
     architecture/components.md
-    architecture/cross-cutting.md
     architecture/domain-ownership.md
     architecture/workspace.dsl   (then re-run scripts/render-architecture.sh)
 
-  If your change is purely internal to one component (no boundary effect,
-  no public-surface change), say so explicitly by updating components.md
-  with a no-op edit such as a clarification, or set SKIP_ARCH_CHECK=1 on
-  this commit and explain in the commit message.
+  If this trigger is a false positive (e.g. common's pub surface changed
+  but nothing externally consumer-visible actually moved), set
+  SKIP_ARCH_CHECK=1 on this commit and explain in the commit message.
 
   Bypass:  SKIP_ARCH_CHECK=1 git commit ...
 EOF

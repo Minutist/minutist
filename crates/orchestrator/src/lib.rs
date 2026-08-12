@@ -4353,7 +4353,14 @@ async fn load_voiceprint_gallery(
 }
 
 // ---------------------------------------------------------------------------
-// Test-only constructor (bypasses real AudioCaptureManager)
+// Test-construction seam
+//
+// Every test-only entry point into `Orchestrator` lives in this one
+// `impl` block, under this one `cfg` gate, so there is exactly one place
+// that grants tests access not available in production: starting from
+// pre-built streams instead of a real capture device, swapping in a stub
+// `AsrBackend`, or reaching into diarization/retranscription/settings
+// internals directly. None of it compiles into a release binary.
 // ---------------------------------------------------------------------------
 
 #[cfg(any(test, feature = "test-source"))]

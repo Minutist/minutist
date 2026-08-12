@@ -59,6 +59,69 @@ jobs:
         if: runner.os == 'Linux'
         run: ./ci/scripts/install-linux-deps.sh
 
+      # Install the LunarG Vulkan SDK on Windows so llama.cpp CMake can find
+      # glslc (required by FindVulkan.cmake). humbletim/setup-vulkan-sdk builds
+      # components from source; its CMakeLists.txt does not recognise "shaderc"
+      # as a buildable component (available: Vulkan-Headers, Vulkan-Loader,
+      # SPIRV-Tools, Glslang — glslc is NOT included). The LunarG prebuilt
+      # installer ships the complete SDK including glslc.exe at %VULKAN_SDK%\Bin\.
+      # Pinned to 1.4.309.0 (latest available from sdk.lunarg.com as of 2026-06).
+      # The installer is cached by actions/cache keyed on the pinned version so
+      # re-runs do not re-download the ~250 MB exe.
+      - name: Cache Vulkan SDK installer (Windows)
+        if: runner.os == 'Windows'
+        id: vulkan-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK
+          key: windows-vulkan-sdk-1.4.309.0
+
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows' && steps.vulkan-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = "1.4.309.0"
+          $url = "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe"
+          $installer = "$env:TEMP\VulkanSDK-Installer.exe"
+          Write-Host "Downloading LunarG Vulkan SDK $version..."
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Write-Host "Installing (unattended)..."
+          # LunarG's SDK installer is Qt IFW-based; the NSIS-style /S switch
+          # is silently ignored (nothing installs). The IFW unattended form
+          # installs the core SDK, which includes Bin\glslc.exe.
+          Start-Process -FilePath $installer -ArgumentList @(
+            "--accept-licenses", "--default-answer", "--confirm-command", "install"
+          ) -Wait
+          if (-not (Test-Path "C:\VulkanSDK\$version\Bin\glslc.exe")) {
+            Write-Error "glslc.exe not found after install; aborting"
+            exit 1
+          }
+
+      - name: Set VULKAN_SDK env (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "1.4.309.0"
+          $sdk = "C:\VulkanSDK\$version"
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # audiopus_sys v0.2.2's bundled opus CMake tree requires
+      # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.
+      # Installing system Opus bypasses the vendored CMake build via pkg-config.
+      - name: Install macOS system dependencies
+        if: runner.os == 'macOS'
+        run: brew install opus
+
+      - name: Install Windows system dependencies (Opus)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          vcpkg install opus:x64-windows-static
+          $libDir = "C:\vcpkg\installed\x64-windows-static"
+          "LIBOPUS_LIB_DIR=$libDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LIBOPUS_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 

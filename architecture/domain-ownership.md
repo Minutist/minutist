@@ -48,206 +48,39 @@ restated. Adding any other edge requires updating
 
 ## Cross-cutting ownership notes
 
-- **Attachments common types (Attachments WS).** `AttachmentId`, `ConversionState`,
-  `AttachmentEntry`, and the four `AppEvent` variants (`AttachmentAdded`,
-  `AttachmentConverted`, `AttachmentConversionFailed`, `AttachmentRemoved`) are owned
-  by `common` (architecture-owner). Adding them was an architecture-owner change
-  (parallel-work rule 2). They follow the additive-field discipline (serde-defaulted,
-  specta-derived) and ride the existing `AppEventPayload` + `collect_events!`
-  registration — no second event bus.
+Durable exceptions to the one-domain-one-owner rule — cases where a type,
+trait, or invariant is owned by one role but implemented or consumed by
+another. Implementation history (which work unit added what, and why) lives
+in git log and `planning/journal.md`, not here.
 
-- **`DocVlm` trait (image-attachment OCR).** `common::DocVlm` is the injection
-  seam that lets `doc-convert` call vision inference without taking a workspace
-  edge beyond `common`. The trait is owned by `common` (architecture-owner). The
-  concrete `GemmaVlm` implementation lives in `ipc-bridge` (systems-engineer):
-  it wraps the held `LlamaSummariser` and its lazy `MtmdContext`, and is wired
-  through the conversion worker in `ipc-bridge` and `app-main`. `doc-convert`
-  (data-engineer) gains `image` as a third-party dep (decode/re-encode image
-  attachments to PNG) — NOT a workspace-component edge, so `doc-convert` remains
-  a `common`-only leaf. No new row is needed in the dependency table for either
-  `GemmaVlm` (it lives inside `ipc-bridge`, which already depends on
-  `summariser`) or `image` (third-party). Scanned/image-only PDF OCR — which
-  would add `pdfium-render` for page rasterisation — is deferred (planning issue
-  0019).
-
-- **`Summariser::summarise` widening (Attachments WS).** The trait gains
-  `attachments_markdown: &str` before `system_prompt` — an architecture-owner
-  change (the "Change shape" table: trait changes are architecture-owner). All
-  impls and call sites are updated in the same commit so the workspace compiles
-  throughout; the empty-string path is byte-identical to the prior no-attachment
-  behaviour (asserted by a `summariser` unit test).
-
+- **`DocVlm` trait (image-attachment OCR).** Owned by `common`
+  (architecture-owner) as the injection seam; the concrete `GemmaVlm`
+  implementation lives in `ipc-bridge` (systems-engineer) — see `ipc-bridge`'s
+  own module doc.
 - **VRAM-aware GPU placement.** `common` (architecture-owner) owns the VRAM
-  probe `probe_primary_gpu()` (behind the `llama-backend` feature) + the **pure**
-  `resolve_gpu_plan()` and its `GpuProbe` / `GpuAcceleration` / `GpuPlan` types.
-  `ipc-bridge` and `orchestrator` (systems-engineer) are **consumers**: each
-  calls `resolve_gpu_plan` at a model-load moment and maps the plan to the
-  per-model GPU decision (`ipc-bridge` for the summariser; `orchestrator` for
-  ASR). The thresholds + policy are documented in `cross-cutting.md` — "GPU
-  portability". Changing the probe or the plan is an architecture-owner change in
-  `common`; changing only how a consumer uses the plan stays in that consumer.
-
-- **Live in-meeting agent common types (Phase 9 / WU2b).** The following
-  types and functions in `common` are owned by `architecture-owner`:
-  - `LiveAgentMode { Auto, On, Off }` — user preference for the live agent gate.
-    `Auto` resolves to GPU-acceleration-active (see `live_agent_should_run`).
-  - `live_agent_should_run(mode, probe, gpu_acceleration) -> bool` — pure gate
-    resolution; documented in `components.md` and `cross-cutting.md`.
-  - `AppEvent::LiveDigestError` — the terminal-error event emitted by
-    `ipc-bridge`'s live-agent driver (its sibling `LiveDigestUpdated`, and the
-    `LiveDigest`/`LiveDigestItem` payload types, were a digest-panel design
-    that never got a producer before being superseded by the unified co-pilot
-    chat log — deleted; see `components.md`).
-  The live-agent driver implementation (S2b) lives in
-  `crates/ipc-bridge/src/live_agent.rs` (systems-engineer). The held-context
-  backend (S2a) lives in `crates/chat-agent/src/live.rs` (ml-runtime-engineer).
-  The backend adds a KV checkpoint mechanism (U2-A1): immediately after
-  `prefill_prefix` completes, it captures the full per-sequence KV state via
-  `state_seq_get_data_ext` into a private `snapshot: Option<Vec<u8>>`. Each
-  `refresh` can restore from this snapshot via `state_seq_set_data_ext` instead
-  of `clear_kv_cache_seq`. Promotion from opt-in (`USE_KV_CHECKPOINT = false`)
-  to active requires BOTH gated real-model tests to pass —
-  `kv_checkpoint_round_trip_smoke` and `kv_checkpoint_refresh_path_a_smoke`
-  (matching `components.md` and the `USE_KV_CHECKPOINT` const doc). A
-  `snapshot_size()` accessor exposes the snapshot byte count for driver logging.
-  Neither the mechanism nor the accessor adds a new dependency edge beyond what
-  is already in the table.
-  **U2 keep-alive append-turn:** `LlamaLiveBackend` (in `live.rs`,
-  ml-runtime-engineer) gains `append_turn(role, content, &ChatTemplateResult,
-  cfg, cancel, token_cb) -> RawTurn` — the keep-alive conversational primitive
-  that appends framing tokens to the growing KV without pruning or restoring.
-  `LlamaTurnBackend` (in `llama.rs`, same domain) gains `render_tool_machinery`
-  (public) to render the tool-aware `ChatTemplateResult` once per session for
-  reuse across turns. `run_on_persistent_ctx` (existing public method) now
-  delegates to `append_turn` via `last_message_role_content` extraction; the
-  restore-per-turn model is replaced. No new crate or workspace dependency edge
-  is added.
-  **U2 scheduler + registry (B2/B5 — `ipc-bridge`, systems-engineer).**
-  `spawn_live_agent` grows a fourth `registry` parameter
-  (`Arc<Mutex<HashMap<MeetingId, LiveCopilotHandle>>>`). The driver inserts a
-  `LiveCopilotHandle { user_tx }` on start and removes it on exit. The worker
-  now runs a two-lane biased select: HIGH-priority user-chat requests are always
-  drained before LOW-priority transcript requests, so a user message preempts a
-  pending cadence refresh. Three depth-1 channels replace the prior single
-  channel: `user_req`, `transcript_req`, and `user_msg`. The registry is stored
-  on `IpcState::live_copilot_handles`. The `ConversationalTurn` trait bound is
-  added to `run_worker_loop`'s `B` parameter to allow both the
-  transcript-refresh (`LiveSession::refresh_typed`) and the append-turn
-  (`ConversationalTurn::append_turn`) paths from one loop. No new dependency
-  edge is added (the `ipc-bridge → chat-agent` edge pre-exists).
-  **U4 A3 chat→live-worker routing (`ipc-bridge`, systems-engineer).** The
-  `send_chat_message` command now checks `IpcState::live_copilot_handles`; when
-  a handle exists for the target meeting it routes the user message into the live
-  co-pilot session rather than a fresh `LlamaTurnBackend` context. Concretely:
-  - `LiveCopilotHandle::user_tx` changes from `mpsc::Sender<String>` to
-    `mpsc::Sender<UserChatRequest>` where `UserChatRequest { message, reply_tx }`.
-  - `UserReplyChunk { Token(String), Done(String), Err(String) }` is a new type
-    carrying the streaming reply from the worker back to the command task.
-  - `CopilotTurnRequest` gains `reply_tx: Option<mpsc::Sender<UserReplyChunk>>`
-    (Some for UserChat turns, None for Transcript turns).
-  - The worker's `converse_typed` token callback `try_send`s `Token` per piece;
-    at turn end `blocking_send`s `Done`/`Err`. UserChat turns do NOT emit
-    `LiveCopilotMessage` (chat-panel surface only); Transcript turns keep emitting
-    it (co-pilot feed surface).
-  - `send_chat_message` resolves the live `ChatSessionId` via
-    `ChatStore::load_or_create_live` (`spawn_blocking`), inserts it into
-    `chat_in_flight`, and spawns a drain task that converts reply chunks into
-    `ChatToken` / `ChatTurnComplete` / `ChatError` events with the live session id.
-  No new crate dependency edge is added (all within `ipc-bridge`; existing
-  `ipc-bridge → persistence` and `ipc-bridge → chat-agent` edges cover the
-  `ChatStore` and `CancelFlag` uses).
-  **U2 eviction-when-full (chat-agent + ipc-bridge, ml-runtime-engineer +
-  systems-engineer).**
-  - `chat-agent` (`live.rs`, ml-runtime-engineer) adds two required methods to
-    `LiveSessionBackend`: `reset_to_prefix() -> Result<(), Error>` (prunes the KV
-    to the pinned prefix via `prune_kv_to_prefix`, shared with `refresh`'s restore
-    step) and `has_room_for(estimated_tokens, max_gen) -> bool` (capacity check:
-    `n_past + estimated + max_gen <= n_ctx`). A third method `n_past() -> i32` is
-    also added to the trait so the IPC worker can read the pre-eviction depth for
-    tracing without the `LlamaLiveBackend`-specialised accessor. `LiveSession<B>`
-    (generic) gains `reset_to_prefix() -> AppResult<()>` and
-    `has_room_for(estimated_tokens, max_gen) -> bool` and `n_past() -> i32`
-    passthroughs. No new dependency edge
-    (`chat-agent` has no new imports; all changes are within `live.rs`).
-  - `ipc-bridge` (`live_agent.rs`, systems-engineer) adds `process_request`
-    eviction logic: before each `converse` call, estimate `model_prompt.len() / 3 +
-    FRAMING_TOKEN_MARGIN` (a deliberate over-estimate); if `!session.has_room_for(...)`,
-    read the last-K recap from
-    the persisted live `ChatSession` (`load_eviction_recap`, best-effort), call
-    `session.reset_to_prefix()`, and prepend a sanitised recap header to the model
-    prompt. `tracing::info!` records the eviction (meeting id, n_past, recap
-    turns/chars). A post-`converse` `ContextOverflow` that was not pre-emptively
-    evicted triggers one evict-and-retry; a still-overflowing turn maps to
-    `CapacityExhausted` (an `already_evicted` guard bounds this to one eviction
-    per turn). No new dependency edge (the `ipc-bridge → chat-agent` and
-    `ipc-bridge → persistence` edges pre-exist).
-  **v2 rolling-summary layered budget** (summarising the evicted middle rather than
-  only keeping last-K verbatim) is **deferred**. The infrastructure is in place;
-  the summarisation call is the missing piece.
-  **U2 attachment awareness (ipc-bridge + summariser + persistence,
-  systems-engineer + ml-runtime-engineer + data-engineer).** The two-tier
-  attachment context described in `cross-cutting.md` — "Two-tier attachment
-  context" is implemented across three domains:
-  - `summariser` (ml-runtime-engineer) gains
-    `LlamaSummariser::generate_attachment_awareness(&self, md: &str) ->
-    AppResult<String>` — a bounded (first ~8–12 kB of input, ≤ 256 output tokens)
-    one-shot call that produces a 1–3 sentence summary + `Keywords: …` line. No
-    new dependency edge (`summariser` already depends on `common`).
-  - `persistence` (data-engineer) gains `set_entry_awareness(root, meeting_id,
-    attachment_id, awareness: &str) -> AppResult<()>` — persists the generated
-    text onto `AttachmentEntry::awareness` under the per-meeting manifest lock.
-    No new dependency edge (`persistence` already depends on `common`).
-  - `ipc-bridge` (systems-engineer) calls `generate_attachment_awareness` inside
-    the conversion worker's `Ok(Ok(true))` arm (best-effort, never fails the
-    conversion), then `set_entry_awareness` on success. At worker startup,
-    `run_worker_thread` reads the manifest, collects `Ready` entries with
-    `awareness = Some(...)`, sanitises each, and passes the block to
-    `build_prefix(s, markers, awareness_block)`. The attach-worker → summariser
-    edge (`rag_handles.ensure_summariser`) already existed via `rag_handles`; no
-    new dependency-table edge is needed. The `ipc-bridge → persistence` edge
-    pre-exists. Mid-session re-seed (an attachment added while the session is
-    running) is deferred — see `cross-cutting.md` — "Two-tier attachment context".
-- **Voiceprint identity types + maths (issue #0003 WU0 — one-way door).**
-  `VoiceprintIdentityId` and `VoiceprintCentroidId` are UUID newtypes added to
-  `common` by the architecture-owner. Adding them is a **one-way-door** per
-  parallel-work rule 2 — many downstream changes (persistence schema, IPC
-  commands, orchestrator wiring) follow. The dependency table in `components.md`
-  is **unchanged**: `diarizer` and `persistence` already depend on `common` and
-  gain no new edge here.
-
-  `common::voiceprint_math` (three pure functions: `unit_normalise`,
-  `cosine_unit`, `weighted_merge`) is also architecture-owner territory: it is
-  the canonical centroid-maths implementation shared by `diarizer` (embedding
-  extraction) and `persistence` (centroid cache recomputation). Both crates
-  already depend on `common` — no new edge.
-
-  `persistence` (data-engineer) gains `voiceprints.db` within its owned scope
-  (`{app-data}/voiceprints.db` — the sixth durable `{app-data}` entry). It
-  remains a `common`-only crate; no `diarizer` edge is permitted or needed
-  (the pure maths live in `common`; the embedding extraction stays in
-  `diarizer`; only the final `Vec<f32>` bytes cross into `persistence`).
-- **Processing-lifecycle + host-election types (WS4-B — issue 0016 / 0020).**
-  `ProcessingLifecycle`, `ProcessingClaim`, and `HostRef` are added to `common`
-  by the architecture-owner, alongside the `MeetingMeta.processing` field
-  (`#[serde(default)] = Local`, no migration). `HostRef(String)` is an opaque
-  device key — the seam that keeps `iroh` OUT of `common`: `sync` maps it
-  from/to `iroh::EndpointId` at the wire boundary, so **`common` gains no `iroh`
-  dependency**. The dependency table in `components.md` is **unchanged**: `sync`
-  and `persistence` already depend on `common` and gain no new edge. The
-  lifecycle's transport (a new bidirectional Discovery/lifecycle `StreamKind`
-  carrying `(MeetingId, ProcessingLifecycle)`, plus the receive path that writes
-  the propagated state into the local `metadata.json`) is `sync`'s domain
-  (systems-engineer), landed as separate `crates/sync` PRs gated on this one.
-  See `planning/DESIGN_processing-lifecycle.md` (the binding §7 decisions).
-- **Per-meeting `metadata.json` write lock — orchestrator + agent-tools
-  follow-up (issue 0025).** A guarded RMW helper
-  `persistence::meeting_ops::update_metadata` puts every `metadata.json`
-  read-modify-write on one per-meeting lock. Routing the `orchestrator`'s five
-  post-processing RMW sites and `agent-tools`' write tools onto it (and deleting
-  `agent-tools`' own lock registry) are cross-domain edits into systems-engineer
-  crates; `planning/issues/0025-metadata-lock-orchestrator-followup.md` is the
-  agreed proposal authorising them. The dependency table is **unchanged**:
-  `orchestrator` and `agent-tools` already depend on `persistence`.
+  probe and the pure `resolve_gpu_plan()`; `ipc-bridge` and `orchestrator`
+  (systems-engineer) are consumers only. See `cross-cutting.md` — "GPU
+  portability".
+- **Live in-meeting agent.** Gate types (`LiveAgentMode`,
+  `live_agent_should_run`) are owned by `common`. The driver lives in
+  `ipc-bridge::live_agent` (systems-engineer); the held-context backend lives
+  in `chat-agent::live` (ml-runtime-engineer). See `cross-cutting.md` — "Live
+  in-meeting agent (auto-driver)" and each crate's own module doc for the
+  KV-checkpoint / eviction / routing mechanisms.
+- **Voiceprint identity types + maths.** `VoiceprintIdentityId`,
+  `VoiceprintCentroidId`, and `common::voiceprint_math` are owned by `common`;
+  `diarizer` (embedding extraction) and `persistence` (centroid cache) consume
+  them. Neither takes a new edge — both already depend on `common`.
+- **Processing-lifecycle + host-election types.** `ProcessingLifecycle`,
+  `ProcessingClaim`, and `HostRef` are owned by `common`. `HostRef` is an
+  opaque device key — the seam that keeps `iroh` out of `common`; `sync` maps
+  it to/from `iroh::EndpointId` at the wire boundary. Transport is `sync`'s
+  domain (systems-engineer).
+- **Per-meeting `metadata.json` write lock.** `persistence::meeting_ops`
+  owns the guarded RMW helper; `orchestrator` and `agent-tools`
+  (systems-engineer) route their metadata writes through it rather than
+  writing directly. No dependency-table change — both already depend on
+  `persistence`.
 
 ## Role definitions
 
@@ -403,8 +236,8 @@ These rules let multiple agents work concurrently without coordination:
 
 - A crate importing another crate that isn't in its allowed list (see
   `components.md` dependency table).
-- A `crates/` source change in a commit with no
-  `architecture/` touch — caught by the pre-commit hook.
+- A crate added/removed, or `common`'s public surface changed, in a
+  commit with no `architecture/` touch — caught by the pre-commit hook.
 - A new `pub` item in `common` without an entry in this doc.
 - `tauri::*` imports outside `ipc-bridge` and `app-main`.
 - Filesystem writes outside the owning crate's directory scope (see

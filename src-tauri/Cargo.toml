@@ -34,7 +34,7 @@ cuda = ["ipc-bridge/cuda"]
 # The free artifact is built with --no-default-features (plus an explicit GPU
 # feature when needed, e.g. --no-default-features --features vulkan).
 # See architecture/cross-cutting.md "Build variants".
-connected = ["dep:mcp-server", "dep:tunnel-client", "dep:sync", "dep:election", "dep:async-trait", "dep:rand", "dep:hex"]
+connected = ["dep:mcp-server", "dep:tunnel-client", "dep:sync", "dep:election", "dep:account-directory", "dep:async-trait", "dep:rand", "dep:hex"]
 default = ["connected"]
 
 [build-dependencies]
@@ -58,6 +58,11 @@ sync = { path = "../crates/sync", optional = true }
 # (in `sync.rs`, connected-gated) wires it to the SyncEngine + Orchestrator. Part of
 # the connected feature surface — the free build omits it.
 election = { path = "../crates/election", optional = true }
+# The AccountDirectorySource adapter (sync::AccountEndpointSource over
+# tunnel_client::AccountDirectoryClient) used by sync.rs's B4 account-mediated
+# discovery, shared with `headless` so the adapter is written once. Part of the
+# connected feature surface — the free build omits it.
+account-directory = { path = "../crates/account-directory", optional = true }
 settings = { path = "../crates/settings" }
 tauri = { workspace = true, features = ["tray-icon"] }
 tauri-plugin-fs = { workspace = true }

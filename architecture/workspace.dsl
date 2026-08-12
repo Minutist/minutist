@@ -123,6 +123,8 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
                 tunnelClient = component "tunnel-client" "App-side half of the connected-tier relay tunnel (WS4-A). Dials the hosted relay OUTBOUND over WSS, re-implements the relay's postcard wire frames, and replays relayed MCP requests against the loopback mcp-server with the internal bearer. No workspace edge; connected-feature gated; wired into app-main in S5." "Rust crate: crates/tunnel-client"
 
+                accountDirectory = component "account-directory" "Adapts tunnel-client's AccountDirectoryClient (an HTTP client) onto sync's AccountEndpointSource trait, so sync and tunnel-client never take an edge on each other. Shared by app-main and headless (B4 account-mediated peer discovery) instead of each carrying its own copy of the adapter." "Rust crate: crates/account-directory"
+
                 sync = component "sync" "Device-to-device sync engine (WS4-B): iroh QUIC transport over a custom SYNC_ALPN. Exchanges Yjs notes-update frames, content-addressed meeting media (audio + note assets, over a second iroh-blobs ALPN), the processing-lifecycle Discovery exchange, and derived-artifact (transcript.json / summary.md) reconciliation. A near-leaf: depends only on common + notes-crdt, never persistence, which keeps its lib cross-compilable to mobile targets. Connected-feature gated; wired into app-main in S5." "Rust crate: crates/sync"
 
                 election = component "election" "Host-election state machine for the producer gate (WS4-B): claims a claimable meeting (PendingProcessing, or a Claimed past its lease) with audio already synced in, runs the pipeline, and writes Processed — via the ElectionDriver trait. A leaf (common + persistence + notes-crdt): the sync (advertise) and orchestrator (process) collaborators sit behind the trait, so this crate takes no edge to either and the one state machine is reused by both eligible host types. Connected-feature gated; wired into app-main in S4." "Rust crate: crates/election"
@@ -306,6 +308,13 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
         minutist.core.appMain   -> minutist.core.election "Spawns run_election_loop with the DesktopElectionDriver (connected-gated)"
         minutist.headlessHub    -> minutist.core.sync "Wires SyncEngine into the always-on hub daemon"
         minutist.headlessHub    -> minutist.core.tunnelClient "AccountDirectoryClient: publishes this hub's endpoint, fetches the account's device list (unconditional, not feature-gated)"
+
+        // account-directory: the ONE AccountEndpointSource adapter, shared by
+        // app-main and headless rather than each carrying its own copy.
+        minutist.core.accountDirectory -> minutist.core.sync "Implements sync::AccountEndpointSource"
+        minutist.core.accountDirectory -> minutist.core.tunnelClient "Wraps tunnel_client::AccountDirectoryClient"
+        minutist.core.appMain   -> minutist.core.accountDirectory "B4 account-refresh wiring in src-tauri/src/sync.rs (connected-gated)"
+        minutist.headlessHub    -> minutist.core.accountDirectory "Account-discovery startup path (unconditional, not feature-gated)"
         minutist.syncFfiBridge  -> minutist.core.sync "Wraps SyncEngine's transport + lifecycle surface via UniFFI"
         minutist.syncFfiBridge  -> minutist.core.notesCrdt "Reads/writes metadata.json + notes.ydoc via the lifted primitives (persistence-free)"
 

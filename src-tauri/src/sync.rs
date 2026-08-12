@@ -332,7 +332,7 @@ impl ConnectedSync {
                     ) {
                         Ok(client) => {
                             let source: Arc<dyn AccountEndpointSource> =
-                                Arc::new(AccountDirectorySource { client });
+                                Arc::new(account_directory::AccountDirectorySource::new(client));
                             let self_endpoint = AccountEndpoint {
                                 device_id: cred.device_id,
                                 endpoint_id: engine.endpoint_id().to_string(),
@@ -662,48 +662,6 @@ fn resolve_relay_token(app_data_base: &Path, _settings: &SettingsHandle) -> Opti
 /// testable without touching the process-global `MINUTIST_SYNC_TOKEN` env.
 fn credential_relay_token(app_data_base: &Path) -> Option<String> {
     crate::tunnel::load_device_credential(app_data_base).map(|cred| cred.device_credential)
-}
-
-/// Adapts the `tunnel-client` account-directory HTTP client onto the
-/// [`AccountEndpointSource`] trait `sync` consumes (B4). The adapter lives here
-/// in `app-main` — the assembler that already depends on both crates — so
-/// `tunnel-client` stays a near-leaf with no `sync` dependency edge, and `sync`
-/// keeps its account seam behind a trait rather than an HTTP client.
-struct AccountDirectorySource {
-    client: tunnel_client::AccountDirectoryClient,
-}
-
-#[async_trait]
-impl AccountEndpointSource for AccountDirectorySource {
-    async fn list_endpoints(&self) -> AppResult<Vec<AccountEndpoint>> {
-        let devices = self.client.list_devices().await.map_err(|e| {
-            minutist_common::AppError::Internal {
-                context: format!("account directory list: {e}"),
-            }
-        })?;
-        Ok(devices
-            .into_iter()
-            .map(|d| AccountEndpoint {
-                device_id: d.device_id,
-                endpoint_id: d.endpoint_id,
-                relay_url: d.relay_url,
-                direct_addrs: d.direct_addrs,
-            })
-            .collect())
-    }
-
-    async fn register_self(&self, endpoint: &AccountEndpoint) -> AppResult<()> {
-        self.client
-            .register_self_endpoint(
-                &endpoint.endpoint_id,
-                &endpoint.relay_url,
-                &endpoint.direct_addrs,
-            )
-            .await
-            .map_err(|e| minutist_common::AppError::Internal {
-                context: format!("account directory register-self: {e}"),
-            })
-    }
 }
 
 /// The desktop's [`ElectionDriver`] (producer-gate S4): drives the election loop's

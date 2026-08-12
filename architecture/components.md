@@ -37,6 +37,7 @@ appears in:
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
+| `account-directory` | B4 | `common`, `sync`, `tunnel-client` |
 | `sync` | WS4-B | `common`, `notes-crdt` |
 | `sync-ffi` | WS4-B (phone) | `common`, `sync`, `notes-crdt` ¶ |
 | `election` | WS4-B (producer-gate) | `common`, `persistence`, `notes-crdt` |
@@ -44,8 +45,8 @@ appears in:
 | `rag-retrieval` | RAG | `common` |
 | `embedder` | RAG | `common`, `llama-cpp-2` |
 | `ipc-bridge` | 1 | `common`, `orchestrator`, `persistence`, `notes-crdt`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert`, `embedder`, `rag-retrieval` |
-| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※ |
-| `headless` (bin) | WS4-B | `common`, `persistence`, `notes-crdt`, `sync`, `tunnel-client`⊕ ‖ |
+| `app-main` (bin) | 1 | `common`, `orchestrator`, `ipc-bridge`, `model-registry`, `settings`, `agent-tools`, `mcp-server`†, `tunnel-client`‡, `sync`§, `election`※, `account-directory`Δ |
+| `headless` (bin) | WS4-B | `common`, `persistence`, `notes-crdt`, `sync`, `tunnel-client`⊕ ‖, `account-directory` |
 
 † `mcp-server` is an **optional** edge of `app-main`, gated by the `connected`
 Cargo feature (default ON). The free artifact is built with
@@ -85,9 +86,10 @@ the free build wires `disabled_sync()` and takes no edge. See `cross-cutting.md`
 `sync::account` adds a SECOND, additive source of peer addresses beside manual
 ticket pairing: `account::AccountEndpointSource` is a trait `sync` defines and
 the consumer implements — the account-service HTTP fetcher bound to the device's
-credential — so `sync` gains **no** new dependency-table edge (no HTTP/account
-crate; the trait is the boundary, exactly as `election::ElectionDriver` keeps
-`election` off `sync`/`orchestrator`). `account::run_account_refresh_loop_v2`
+credential, i.e. the `account-directory` crate's `AccountDirectorySource` — so
+`sync` gains **no** new dependency-table edge (no HTTP/account crate; the trait
+is the boundary, exactly as `election::ElectionDriver` keeps `election` off
+`sync`/`orchestrator`). `account::run_account_refresh_loop_v2`
 takes the injected source, registers this device's endpoint, then on each tick
 fetches the account's endpoint list and, for every entry `account::peers_to_add`
 selects (self filtered, de-duplicated by endpoint id), drives a caller-supplied
@@ -181,12 +183,22 @@ behind the trait — so this is the single point that binds them together, exact
 `app-main` injects the connected `SyncControl`. The free artifact omits it. See
 `cross-cutting.md` — "Build variants".
 
+Δ `account-directory` is an **optional** edge of `app-main`, gated by the same
+`connected` Cargo feature as `mcp-server` / `tunnel-client` / `sync` / `election`
+(it exists only to adapt `tunnel_client::AccountDirectoryClient` onto
+`sync::AccountEndpointSource` for the B4 account-mediated discovery loop —
+see the `account-directory` crate section and its ⊕ counterpart on
+`headless` below, which shares this same crate rather than carrying its own
+copy of the adapter). The free artifact omits it.
+
 ⊕ `tunnel-client` is a dependency of `headless` (account-mediated peer
 discovery). `headless` uses `tunnel_client::AccountDirectoryClient` to
 publish its endpoint and fetch the account's device list, adapting the
-`AccountDirectoryClient` into a `sync::AccountEndpointSource`. The
-`tunnel-client` crate stays a near-leaf: this edge does NOT go in the
-opposite direction. The `headless → tunnel-client` edge is
+`AccountDirectoryClient` into a `sync::AccountEndpointSource` via the
+`account-directory` crate (shared with `app-main`, which needs the same
+adapter — see its Δ footnote — rather than each binary carrying its own
+copy). The `tunnel-client` crate stays a near-leaf: this edge does NOT go
+in the opposite direction. The `headless → tunnel-client` edge is
 **unconditional** (not feature-gated): a seeded headless instance is
 always account-capable, so there is no free/connected split here.
 
@@ -203,9 +215,9 @@ connected `src-tauri` artefacts never link `headless`; it is built and shipped a
 its own binary, so the cleanliness invariant is that the free `src-tauri` build
 is unchanged and takes no edge to it — NOT that the crate is excluded from a
 workspace build. The daemon's dependencies are `common`, `persistence`,
-`notes-crdt`, `sync`, `tunnel-client` (⊕ — account-mediated peer discovery);
-it takes NO `tauri::*` / `ipc-bridge` edge and wires `sync::SyncEngine` into a
-daemon directly. A post-launch GPU processing-node
+`notes-crdt`, `sync`, `tunnel-client` (⊕ — account-mediated peer discovery),
+`account-directory`; it takes NO `tauri::*` / `ipc-bridge` edge and wires
+`sync::SyncEngine` into a daemon directly. A post-launch GPU processing-node
 role adds `orchestrator` + the ML-runtime crates (`asr-runtime` / `asr-parakeet`
 / `diarizer` / `summariser` / `model-registry`) as a separate table update at
 that time. See `cross-cutting.md` — "Headless server daemon".
@@ -3744,6 +3756,24 @@ would let a relay-supplied `authorization` ride alongside the internal one, and
 whichever was inserted FIRST, i.e. the untrusted one. `run_tunnel` **refuses a
 non-`wss://` relay** (`TunnelError::Config`) before dialing — `ws://` is
 tolerated only for a loopback host, where cleartext never leaves the machine.
+
+### `account-directory`
+**Crate:** `crates/account-directory`
+**Owns:** the ONE adapter from `tunnel_client::AccountDirectoryClient` (an HTTP
+client) onto `sync::AccountEndpointSource` (the trait `sync` depends on
+instead of an HTTP client), so `sync` and `tunnel-client` never take an edge
+on each other. A leaf on top of both: `common`, `sync`, `tunnel-client`,
+`async-trait`.
+
+Both `app-main` (`src-tauri/src/sync.rs`'s B4 account-refresh wiring) and
+`headless` (`crates/headless/src/main.rs`'s account-discovery startup path)
+depend on this crate instead of each defining their own copy of
+`AccountDirectorySource` — before this crate existed the two implementations
+were byte-for-byte identical apart from an `AppError` import qualifier. Its
+public surface is `AccountDirectorySource::new(tunnel_client::
+AccountDirectoryClient) -> AccountDirectorySource`, implementing
+`sync::AccountEndpointSource::{list_endpoints, register_self}` by mapping
+`tunnel_client`'s device-list/self-registration calls onto `sync::AccountEndpoint`.
 
 ### `sync`
 **Crate:** `crates/sync`

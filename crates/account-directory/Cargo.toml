@@ -1,0 +1,21 @@
+[package]
+name = "account-directory"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+# Leaf crate: adapts tunnel-client's AccountDirectoryClient (an HTTP client) onto
+# sync's AccountEndpointSource (a trait sync depends on instead of an HTTP
+# client). Both `sync` and `tunnel-client` stay leaves with no edge to each
+# other; this crate is the assembler that depends on both, so app-main and
+# headless — the two account-mediated-discovery consumers — share ONE adapter
+# instead of each carrying its own copy (issue: architecture review finding
+# "AccountDirectorySource is written twice").
+
+[dependencies]
+minutist-common = { path = "../common" }
+sync = { path = "../sync" }
+tunnel-client = { path = "../tunnel-client" }
+async-trait = { workspace = true }

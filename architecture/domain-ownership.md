@@ -33,12 +33,13 @@ role when work is parallel.
 | `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
 | `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |
+| `account-directory` | systems-engineer | `crates/account-directory/**` | Same | `common`, `sync`, `tunnel-client` (the `AccountEndpointSource` adapter shared by `app-main` and `headless`, so neither carries its own copy) |
 | `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `notes-crdt` |
 | `sync-ffi` | systems-engineer | `crates/sync-ffi/**` | This file too if changing the FFI wrapper contract. | `common`, `sync` (mobile-only UniFFI wrapper — see the `¶` footnote in `components.md`) |
 | `election` | systems-engineer | `crates/election/**` | This file too if changing the `ElectionDriver` trait contract. | `common`, `persistence`, `notes-crdt` (the producer-gate host-election leaf — drives `sync` / `orchestrator` only behind the `ElectionDriver` trait, so it takes no edge to either) |
 | `ipc-bridge` | systems-engineer | `crates/ipc-bridge/**` | Same | `common`, `orchestrator`, `persistence`, `notes-crdt`, `summariser`, `settings`, `agent-tools`, `chat-agent`, `doc-convert`, `embedder`, `rag-retrieval` |
 | `app-main` (bin) | systems-engineer | `src-tauri/**` | Same | All crates (it's the assembler) |
-| `headless` (bin) | systems-engineer | `crates/headless/**` | Same | `common`, `persistence`, `notes-crdt`, `sync`, `tunnel-client` |
+| `headless` (bin) | systems-engineer | `crates/headless/**` | Same | `common`, `persistence`, `notes-crdt`, `sync`, `tunnel-client`, `account-directory` |
 | Webview UI | frontend-engineer | `ui/src/**` | This file too if changing UI domain layout. | `ui/src/ipc/bindings.ts` only — never the Rust source. |
 
 The "Can call without doc update" column is the dependency rule

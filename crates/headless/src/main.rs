@@ -44,7 +44,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use iroh_tickets::endpoint::EndpointTicket;
 use minutist_common::{AppError, AppResult, MeetingId, ProcessingLifecycle};
@@ -123,46 +122,6 @@ impl StoredCredential {
                 None
             }
         }
-    }
-}
-
-/// Adapts `tunnel_client::AccountDirectoryClient` onto `sync::AccountEndpointSource`.
-///
-/// `tunnel-client` stays a near-leaf (no `sync` edge); `headless` is the
-/// assembler that depends on both and bridges them. This adapter mirrors the
-/// `AccountDirectorySource` in `app-main`'s `src-tauri/src/sync.rs`.
-struct AccountDirectorySource {
-    client: tunnel_client::AccountDirectoryClient,
-}
-
-#[async_trait]
-impl AccountEndpointSource for AccountDirectorySource {
-    async fn list_endpoints(&self) -> AppResult<Vec<AccountEndpoint>> {
-        let devices = self.client.list_devices().await.map_err(|e| AppError::Internal {
-            context: format!("account directory list: {e}"),
-        })?;
-        Ok(devices
-            .into_iter()
-            .map(|d| AccountEndpoint {
-                device_id: d.device_id,
-                endpoint_id: d.endpoint_id,
-                relay_url: d.relay_url,
-                direct_addrs: d.direct_addrs,
-            })
-            .collect())
-    }
-
-    async fn register_self(&self, endpoint: &AccountEndpoint) -> AppResult<()> {
-        self.client
-            .register_self_endpoint(
-                &endpoint.endpoint_id,
-                &endpoint.relay_url,
-                &endpoint.direct_addrs,
-            )
-            .await
-            .map_err(|e| AppError::Internal {
-                context: format!("account directory register-self: {e}"),
-            })
     }
 }
 
@@ -591,7 +550,7 @@ async fn start_engine(
                 }
                 Ok(client) => {
                     let source: Arc<dyn AccountEndpointSource> =
-                        Arc::new(AccountDirectorySource { client });
+                        Arc::new(account_directory::AccountDirectorySource::new(client));
                     let self_endpoint = AccountEndpoint {
                         device_id: cred.device_id,
                         endpoint_id: engine.endpoint_id().to_string(),

@@ -28,15 +28,16 @@ path = "src/main.rs"
 [dependencies]
 minutist-common = { path = "../common" }
 sync = { path = "../sync" }
-# Account-mediated peer discovery (5.5b): headless uses AccountDirectoryClient to
-# publish its own endpoint and fetch the account's device list, adapting onto
-# sync::AccountEndpointSource — so a seeded hub is a GUI-free "device B" without
-# a manual ticket exchange. headless -> tunnel-client is unconditional; the edge
-# is documented in architecture/components.md (⊕ footnote).
+# Account-mediated peer discovery (5.5b): headless uses AccountDirectoryClient
+# (via the shared `account-directory` adapter) to publish its own endpoint and
+# fetch the account's device list — so a seeded hub is a GUI-free "device B"
+# without a manual ticket exchange. headless -> tunnel-client is unconditional;
+# the edge is documented in architecture/components.md (⊕ footnote).
 tunnel-client = { path = "../tunnel-client" }
-# Required by the AccountDirectorySource adapter that implements
-# sync::AccountEndpointSource.
-async-trait = { workspace = true }
+# The AccountDirectorySource adapter (sync::AccountEndpointSource over
+# tunnel_client::AccountDirectoryClient), shared with app-main so the adapter
+# is written once, not duplicated per binary.
+account-directory = { path = "../account-directory" }
 # Used directly by the `status` subcommand to project a meeting's notes.ydoc to a
 # content digest (NotesStore::read_ydoc_state + ydoc::{apply_update_v1,ydoc_to_json})
 # and to scan meeting-folder ids (folder::list_meeting_ids) — read from the leaf

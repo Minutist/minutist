@@ -17,6 +17,7 @@ members = [
     "crates/chat-agent",
     "crates/mcp-server",
     "crates/tunnel-client",
+    "crates/account-directory",
     "crates/sync",
     "crates/sync-ffi",
     "crates/doc-convert",

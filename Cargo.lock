@@ -4775,6 +4775,7 @@ name = "mcp-server"
 version = "0.1.0"
 dependencies = [
  "agent-tools",
+ "async-trait",
  "bytes",
  "http",
  "http-body-util",

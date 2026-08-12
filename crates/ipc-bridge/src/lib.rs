@@ -175,7 +175,7 @@ pub use events::{spawn_event_forwarder, AppEventPayload};
 pub use inter_agent::spawn_inter_agent_driver;
 pub use ipc_state::{
     open_meeting_index, open_voiceprints, ChatRuntimeState, ConnectedState, DiagnosticsInfo,
-    IpcState, McpServerInfo,
+    IpcState, McpServerInfo, OrchestratorRecordingControl,
 };
 pub use lifecycle::spawn_lifecycle_subscriber;
 pub use live_agent::{spawn_live_agent, LiveAgentHandles, LiveCopilotHandle};

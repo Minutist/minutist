@@ -33,7 +33,7 @@ appears in:
 | `model-registry` | 2 | `common` |
 | `settings` | 1 | `common` |
 | `orchestrator` | 1 (minimal) → 2 (live pipeline) | `common`, `audio-capture`, `vad-chunker`, `asr-runtime`, `asr-parakeet`, `diarizer`, `persistence`, `model-registry`, `settings` |
-| `agent-tools` | 9 | `common`, `persistence`, `notes-crdt`, `orchestrator`, `rag-retrieval` |
+| `agent-tools` | 9 | `common`, `persistence`, `notes-crdt`, `rag-retrieval` |
 | `chat-agent` | 9 | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | 10 | `common`, `agent-tools` |
 | `tunnel-client` | WS4-A | (nothing in this workspace) |
@@ -2998,18 +2998,32 @@ single place a chat-agent / MCP tool is defined. Both consumers (the
 internal chat agent and the MCP server) drive the SAME registry, so the
 "internal agent and an external MCP client use the same tools" constraint is
 satisfied by there being exactly one definition site per tool. Edges: `common`,
-`persistence`, `orchestrator`.
+`persistence`, `notes-crdt`, `rag-retrieval`.
 
-**Deliberately NOT edges.** No `summariser` edge — the one LLM-using tool
-(`resummarise`) drives an `Arc<dyn common::Summariser>` held in `ToolContext`,
-constructed by `ipc-bridge`/`app-main` (which own the `summariser` edge; the
-bundled impl is `Send + Sync` per SP0). No `model-registry` edge —
-`relisten_section` resolves and builds its ASR backend through
-`Orchestrator::transcribe_pcm_window`, never by calling `model-registry`. No
-`tauri`/`specta` — `serde_json::Value` results cross the IPC boundary as a
-`String` in `ipc-bridge`'s event envelope, not here; the `AppError → McpError`
-mapping is Phase 10's concern and lives in `mcp-server` (keeps `rmcp` out of this
-crate).
+**Deliberately NOT edges.** No `orchestrator` edge — the recording-lifecycle
+tools (`relisten_section`, `reprocess_meeting`, `get_recording_state`, and the
+start/stop/pause/resume tools) drive `RecordingControl`, a `Send + Sync`
+async trait `ToolContext` holds as `Arc<dyn RecordingControl>` (`state`,
+`start`, `stop`, `pause`, `resume`, `reprocess`, `transcribe_pcm_window` —
+one method per `Orchestrator` method the tools need). The caller that
+constructs a `ToolContext` (`ipc-bridge`/`app-main`, which own the
+`orchestrator` edge) supplies the implementation: `ipc-bridge`'s
+`OrchestratorRecordingControl` newtype wraps a real `Arc<Orchestrator>` and
+delegates each method — a local type is required because Rust's orphan rule
+blocks `ipc-bridge` from `impl`ing a foreign trait (`RecordingControl`, defined
+in `agent-tools`) for a foreign type (`Orchestrator`, defined in
+`orchestrator`) directly. Mirrors the `TunnelControl`/`SyncControl`
+newtype-adapter pattern in `ipc-bridge`. No `summariser` edge — the one
+LLM-using tool (`resummarise`) drives an `Arc<dyn common::Summariser>` held in
+`ToolContext`, constructed by `ipc-bridge`/`app-main` (which own the
+`summariser` edge; the bundled impl is `Send + Sync` per SP0). No
+`model-registry` edge — `relisten_section` resolves and builds its ASR backend
+through `RecordingControl::transcribe_pcm_window`, never by calling
+`model-registry` (the orchestrator-side `OrchestratorRecordingControl` impl
+keeps that edge inside `orchestrator`). No `tauri`/`specta` — `serde_json::Value`
+results cross the IPC boundary as a `String` in `ipc-bridge`'s event envelope,
+not here; the `AppError → McpError` mapping is Phase 10's concern and lives in
+`mcp-server` (keeps `rmcp` out of this crate).
 
 **The `Tool` trait** (`Send + Sync`, async `execute`): `name() -> &'static str`
 (stable snake_case wire name), `title() -> &'static str` (required — every tool
@@ -3030,7 +3044,7 @@ The rmcp 1.7 `Tool` type exposes `.with_title(str)` which sets the top-level
 `mcp-server` handler uses this method, not `ToolAnnotations.title`, because the
 spec promotes title to a first-class field from revision 2025-11-25 onward.
 
-**`ToolContext`** (Clone): `Arc<Orchestrator>`, `Arc<MeetingIndex>`,
+**`ToolContext`** (Clone): `Arc<dyn RecordingControl>`, `Arc<MeetingIndex>`,
 `meetings_dir: PathBuf`, `Arc<dyn Summariser>`, the shared
 `broadcast::Sender<AppEvent>`, an optional `default_meeting` (the internal-UI
 session scope; MCP leaves it `None` so an MCP caller passes `meeting_id`

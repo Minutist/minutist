@@ -11,7 +11,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_tools::ToolRegistry;
+use agent_tools::{RecordingControl, ToolRegistry};
+use async_trait::async_trait;
 use minutist_common::{AppEvent, AppResult};
 use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
@@ -24,6 +25,59 @@ use crate::chat_runtime::ChatHandles;
 use crate::live_agent::LiveCopilotHandle;
 use crate::sync::SyncControl;
 use crate::tunnel::TunnelControl;
+
+/// Adapts `orchestrator::Orchestrator` to `agent_tools::RecordingControl`.
+///
+/// `agent-tools` has no dependency on the concrete `orchestrator` crate (see
+/// its "Boundaries" doc); Rust's orphan rule means the impl for a foreign
+/// trait + a foreign type must live behind a local newtype, so `ipc-bridge`
+/// (which owns both edges) provides this one. Every `ToolContext::new` call
+/// site in this crate (and in `app-main`, which depends on `ipc-bridge`) wraps
+/// its `Arc<Orchestrator>` in this before constructing the context — the same
+/// pattern [`crate::tunnel::DisabledTunnel`] / the `connected`-tier
+/// `ConnectedTunnel` use for `TunnelControl`.
+pub struct OrchestratorRecordingControl(pub Arc<Orchestrator>);
+
+#[async_trait]
+impl RecordingControl for OrchestratorRecordingControl {
+    async fn state(&self) -> minutist_common::RecordingState {
+        self.0.state().await
+    }
+    async fn start(
+        &self,
+        meeting_id: minutist_common::MeetingId,
+        device_id: Option<String>,
+    ) -> AppResult<minutist_common::MeetingId> {
+        self.0.start(meeting_id, device_id).await
+    }
+    async fn stop(&self) -> AppResult<minutist_common::MeetingMeta> {
+        self.0.stop().await
+    }
+    async fn pause(&self) -> AppResult<()> {
+        self.0.pause().await
+    }
+    async fn resume(&self) -> AppResult<()> {
+        self.0.resume().await
+    }
+    async fn reprocess(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: minutist_common::MeetingId,
+    ) -> AppResult<()> {
+        self.0.reprocess(index, meeting_id).await
+    }
+    async fn transcribe_pcm_window(
+        &self,
+        meeting_id: minutist_common::MeetingId,
+        start_ms: u64,
+        end_ms: u64,
+        language: Option<String>,
+    ) -> AppResult<Vec<minutist_common::Segment>> {
+        self.0
+            .transcribe_pcm_window(meeting_id, start_ms, end_ms, language)
+            .await
+    }
+}
 
 /// The lazily-loaded LLM/embedder substrate + chat-driver bookkeeping shared
 /// by the chat, summarise, and live-agent paths.

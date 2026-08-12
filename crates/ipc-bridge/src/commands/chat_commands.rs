@@ -387,7 +387,9 @@ pub async fn send_chat_message(
     // download cost (the write path loads it; the tool errors gracefully when None).
     let embedder = state.embedder_if_loaded();
     let ctx = ToolContext::new(
-        Arc::clone(&state.orchestrator),
+        Arc::new(crate::OrchestratorRecordingControl(Arc::clone(
+            &state.orchestrator,
+        ))),
         Arc::clone(&state.index),
         meetings_dir.clone(),
         summariser.clone() as Arc<dyn Summariser>,

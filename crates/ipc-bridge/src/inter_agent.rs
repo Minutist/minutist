@@ -247,7 +247,9 @@ async fn run_one_turn(
     // The internal-agent context drives the INTERNAL registry; default_meeting
     // scopes meeting_id omission to the addressed meeting.
     let ctx = ToolContext::new(
-        Arc::clone(&handles.orchestrator),
+        Arc::new(crate::OrchestratorRecordingControl(Arc::clone(
+            &handles.orchestrator,
+        ))),
         Arc::clone(&handles.index),
         handles.meetings_dir.clone(),
         summariser.clone() as Arc<dyn Summariser>,

@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use agent_tools::{ToolContext, ToolRegistry};
+use agent_tools::{RecordingControl, ToolContext, ToolRegistry};
+use async_trait::async_trait;
 use minutist_common::{
     AppEvent, AppResult, AudioFormat, MeetingId, MeetingMeta, NoteBlock, Segment, Summariser,
 };
@@ -18,6 +19,49 @@ use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use tempfile::TempDir;
 use tokio::sync::broadcast;
+
+/// Adapts a test [`Orchestrator`] to [`RecordingControl`] — the trait object
+/// `ToolContext` actually holds (`agent-tools` has no dependency on the
+/// concrete `orchestrator` crate; see its "Boundaries" doc). Mirrors the
+/// adapter `ipc-bridge` provides in production.
+struct TestRecordingControl(Arc<Orchestrator>);
+
+#[async_trait]
+impl RecordingControl for TestRecordingControl {
+    async fn state(&self) -> minutist_common::RecordingState {
+        self.0.state().await
+    }
+    async fn start(
+        &self,
+        meeting_id: MeetingId,
+        device_id: Option<String>,
+    ) -> AppResult<MeetingId> {
+        self.0.start(meeting_id, device_id).await
+    }
+    async fn stop(&self) -> AppResult<MeetingMeta> {
+        self.0.stop().await
+    }
+    async fn pause(&self) -> AppResult<()> {
+        self.0.pause().await
+    }
+    async fn resume(&self) -> AppResult<()> {
+        self.0.resume().await
+    }
+    async fn reprocess(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()> {
+        self.0.reprocess(index, meeting_id).await
+    }
+    async fn transcribe_pcm_window(
+        &self,
+        meeting_id: MeetingId,
+        start_ms: u64,
+        end_ms: u64,
+        language: Option<String>,
+    ) -> AppResult<Vec<Segment>> {
+        self.0
+            .transcribe_pcm_window(meeting_id, start_ms, end_ms, language)
+            .await
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test substrate
@@ -69,7 +113,9 @@ async fn make_ctx() -> (TempDir, std::path::PathBuf, ToolContext) {
     std::fs::create_dir_all(&meetings_dir).expect("meetings dir");
 
     let index = Arc::new(MeetingIndex::open(":memory:").await.expect("index"));
-    let orchestrator: Arc<Orchestrator> = Arc::new(test_orchestrator(meetings_dir.clone()));
+    let orchestrator: Arc<dyn RecordingControl> = Arc::new(TestRecordingControl(Arc::new(
+        test_orchestrator(meetings_dir.clone()),
+    )));
     let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
     let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
 
@@ -430,7 +476,9 @@ async fn retrieve_chunks_returns_indexed_passages() {
 
     // A ToolContext with the stub embedder, scoped to this meeting.
     let index = Arc::new(MeetingIndex::open(":memory:").await.unwrap());
-    let orchestrator: Arc<Orchestrator> = Arc::new(test_orchestrator(meetings_dir.clone()));
+    let orchestrator: Arc<dyn RecordingControl> = Arc::new(TestRecordingControl(Arc::new(
+        test_orchestrator(meetings_dir.clone()),
+    )));
     let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
     let embedder: Arc<dyn minutist_common::Embedder> = Arc::new(StubEmbedder);
     let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
@@ -1408,14 +1456,32 @@ async fn start_then_stop_recording_via_registry_round_trips() {
     // assert the tool can stop it.
     use audio_capture::test_source::DummyAudioSource;
 
-    let (_t, _root, ctx) = make_ctx().await;
+    // Built inline (not via `make_ctx`) so this test keeps a raw
+    // `Arc<Orchestrator>` handle for `start_with_streams` — a test-only seam
+    // outside `RecordingControl`'s surface, which the `ToolContext` otherwise
+    // only exposes as an opaque trait object.
+    let tempdir = TempDir::new().expect("tempdir");
+    let meetings_dir = tempdir.path().join("meetings");
+    std::fs::create_dir_all(&meetings_dir).expect("meetings dir");
+    let index = Arc::new(MeetingIndex::open(":memory:").await.expect("index"));
+    let orchestrator: Arc<Orchestrator> = Arc::new(test_orchestrator(meetings_dir.clone()));
+    let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
+    let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
+    let ctx = ToolContext::new(
+        Arc::new(TestRecordingControl(Arc::clone(&orchestrator))),
+        index,
+        meetings_dir.clone(),
+        summariser,
+        None,
+        event_tx,
+        None,
+    );
     let reg = ToolRegistry::v1(false);
 
     // Start a recording through the test-source seam (no real microphone).
     let source = DummyAudioSource::new(1600, 800);
     let streams = source.generate_streams(4, 32, 64);
-    let started_id = ctx
-        .orchestrator
+    let started_id = orchestrator
         .start_with_streams(streams)
         .await
         .expect("test-source start should succeed");

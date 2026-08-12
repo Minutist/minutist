@@ -8,12 +8,20 @@
 //!
 //! # Boundaries (binding — see `architecture/components.md`)
 //!
-//! Edges: `common`, `persistence`, `orchestrator`. Deliberately **no**
-//! `summariser` edge — the one LLM-using tool (`resummarise`) drives an
-//! `Arc<dyn minutist_common::Summariser>` held in [`ToolContext`],
-//! constructed by `ipc-bridge`/`app-main` (which own the `summariser` edge).
+//! Edges: `common`, `persistence`, `notes-crdt`, `rag-retrieval`.
+//! Deliberately **no** `orchestrator` edge — the recording-lifecycle tools
+//! (`relisten_section`, `reprocess_meeting`, `get_recording_state`, and the
+//! start/stop/pause/resume tools) drive [`RecordingControl`], a trait object
+//! held in [`ToolContext`], instead of the concrete `orchestrator::Orchestrator`
+//! type; the caller that constructs a `ToolContext` (`ipc-bridge`/`app-main`,
+//! which own the `orchestrator` edge) supplies the implementation. Mirrors the
+//! deliberately-absent `summariser` edge below.
+//! Deliberately **no** `summariser` edge — the one LLM-using tool
+//! (`resummarise`) drives an `Arc<dyn minutist_common::Summariser>` held in
+//! [`ToolContext`], constructed by `ipc-bridge`/`app-main` (which own the
+//! `summariser` edge).
 //! Deliberately **no** `model-registry` edge — `relisten_section` resolves and
-//! builds its ASR backend through [`orchestrator::Orchestrator::transcribe_pcm_window`],
+//! builds its ASR backend through [`RecordingControl::transcribe_pcm_window`],
 //! never by calling `model-registry`.
 //!
 //! `agent-tools` has no `tauri`/`specta` concern: `serde_json::Value` results
@@ -24,7 +32,7 @@
 //! # Threading
 //!
 //! [`Tool::execute`] is `async` because the backing operations are async
-//! (`Orchestrator::reprocess`/`transcribe_pcm_window` are
+//! (`RecordingControl::reprocess`/`transcribe_pcm_window` are
 //! `async fn`; `MeetingIndex::list_meetings`/`search` are async libsql). Tool
 //! *bodies* still push CPU/fs/inference work onto `tokio::task::spawn_blocking`
 //! — the trait being async does not relax the cross-cutting rule.
@@ -36,11 +44,50 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use minutist_common::{
     AppError, AppEvent, AppResult, Embedder, InterAgentReply, InterAgentRequest, MeetingId,
-    Summariser,
+    MeetingMeta, RecordingState, Segment, Summariser,
 };
-use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use tokio::sync::{broadcast, mpsc, oneshot};
+
+/// The recording-lifecycle operations the recording-related tools need.
+///
+/// Injected as a trait object so `agent-tools` does not depend on the
+/// concrete `orchestrator` crate (see the crate-level "Boundaries" doc). The
+/// caller that constructs a [`ToolContext`] (`ipc-bridge`/`app-main`) supplies
+/// an implementation that delegates to a real `orchestrator::Orchestrator`.
+#[async_trait]
+pub trait RecordingControl: Send + Sync {
+    /// The current recording state. Backs `get_recording_state`.
+    async fn state(&self) -> RecordingState;
+    /// Promote the prep draft `meeting_id` to an active recording on the given
+    /// input device (`None` = default). Backs the `start_recording` tool, which
+    /// creates the draft itself immediately beforehand.
+    async fn start(
+        &self,
+        meeting_id: MeetingId,
+        device_id: Option<String>,
+    ) -> AppResult<MeetingId>;
+    /// Stop the active recording, returning its finalised metadata. Backs the
+    /// `stop_recording` tool.
+    async fn stop(&self) -> AppResult<MeetingMeta>;
+    /// Pause the active recording. Backs the `pause_recording` tool.
+    async fn pause(&self) -> AppResult<()>;
+    /// Resume a paused recording. Backs the `resume_recording` tool.
+    async fn resume(&self) -> AppResult<()>;
+    /// Re-transcribe then re-diarize `meeting_id` under one offline claim,
+    /// refreshing `index`'s row. Backs `reprocess_meeting`.
+    async fn reprocess(&self, index: &MeetingIndex, meeting_id: MeetingId) -> AppResult<()>;
+    /// Re-run ASR over `[start_ms, end_ms)` of `meeting_id`'s decoded audio,
+    /// optionally overriding the transcription language. Backs
+    /// `relisten_section`.
+    async fn transcribe_pcm_window(
+        &self,
+        meeting_id: MeetingId,
+        start_ms: u64,
+        end_ms: u64,
+        language: Option<String>,
+    ) -> AppResult<Vec<Segment>>;
+}
 
 mod tools;
 
@@ -131,10 +178,13 @@ pub trait Tool: Send + Sync {
 /// `broadcast::Sender`).
 #[derive(Clone)]
 pub struct ToolContext {
-    /// The recording orchestrator. Backs `relisten_section`, `reprocess_meeting`,
-    /// and `get_recording_state`. Owns the `model-registry` edge so `agent-tools`
-    /// need not.
-    pub orchestrator: Arc<Orchestrator>,
+    /// The recording-lifecycle control surface. Backs `relisten_section`,
+    /// `reprocess_meeting`, `get_recording_state`, and the start/stop/pause/
+    /// resume tools. A trait object ([`RecordingControl`]) rather than the
+    /// concrete `orchestrator::Orchestrator` — see the crate-level
+    /// "Boundaries" doc — whose implementation also owns the
+    /// `model-registry` edge so `agent-tools` need not.
+    pub orchestrator: Arc<dyn RecordingControl>,
     /// The libsql meeting index. Backs `list_meetings` + `search_meetings`, and
     /// is passed to the orchestrator's offline ops which refresh its rows.
     pub index: Arc<MeetingIndex>,
@@ -173,7 +223,7 @@ pub struct ToolContext {
 impl ToolContext {
     /// Construct a context.
     pub fn new(
-        orchestrator: Arc<Orchestrator>,
+        orchestrator: Arc<dyn RecordingControl>,
         index: Arc<MeetingIndex>,
         meetings_dir: PathBuf,
         summariser: Arc<dyn Summariser>,

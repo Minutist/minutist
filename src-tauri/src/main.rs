@@ -460,7 +460,9 @@ async fn do_start_mcp_server(params: McpStartParams) {
 
     let ctx = Arc::new(
         agent_tools::ToolContext::new(
-            params.orchestrator.clone(),
+            Arc::new(ipc_bridge::OrchestratorRecordingControl(
+                params.orchestrator.clone(),
+            )),
             params.index.clone(),
             params.meetings_dir.clone(),
             summariser as Arc<dyn minutist_common::Summariser>,

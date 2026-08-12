@@ -54,6 +54,9 @@ tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"
 # wrapper runs without a real model. The raw-socket client avoids a heavy HTTP
 # client dependency.
 orchestrator = { path = "../orchestrator", features = ["test-source"] }
+# Local RecordingControl adapter over the test orchestrator (agent-tools has
+# no orchestrator dependency; see its "Boundaries" doc).
+async-trait = { workspace = true }
 persistence = { path = "../persistence" }
 tempfile = "3"
 # WS4-A S4 live-smoke harness only (examples/serve.rs): a standalone loopback

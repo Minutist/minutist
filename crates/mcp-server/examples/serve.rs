@@ -23,10 +23,12 @@
 
 use std::sync::Arc;
 
-use agent_tools::{ToolContext, ToolRegistry};
+use agent_tools::{RecordingControl, ToolContext, ToolRegistry};
+use async_trait::async_trait;
 use mcp_server::{serve, McpServerConfig};
 use minutist_common::{AppEvent, AppResult, NoteBlock, Segment, Summariser};
 use orchestrator::test_support::test_orchestrator;
+use orchestrator::Orchestrator;
 use persistence::MeetingIndex;
 use tokio::sync::{broadcast, watch};
 
@@ -43,6 +45,53 @@ impl Summariser for StubSummariser {
         _system_prompt: &str,
     ) -> AppResult<String> {
         Ok(String::new())
+    }
+}
+
+/// `agent-tools` has no dependency on the concrete `orchestrator` crate (see
+/// its "Boundaries" doc); this local adapter over the test orchestrator
+/// mirrors `ipc-bridge`'s `OrchestratorRecordingControl` (unreachable here —
+/// mcp-server does not depend on ipc-bridge).
+struct TestRecordingControl(Arc<Orchestrator>);
+
+#[async_trait]
+impl RecordingControl for TestRecordingControl {
+    async fn state(&self) -> minutist_common::RecordingState {
+        self.0.state().await
+    }
+    async fn start(
+        &self,
+        meeting_id: minutist_common::MeetingId,
+        device_id: Option<String>,
+    ) -> AppResult<minutist_common::MeetingId> {
+        self.0.start(meeting_id, device_id).await
+    }
+    async fn stop(&self) -> AppResult<minutist_common::MeetingMeta> {
+        self.0.stop().await
+    }
+    async fn pause(&self) -> AppResult<()> {
+        self.0.pause().await
+    }
+    async fn resume(&self) -> AppResult<()> {
+        self.0.resume().await
+    }
+    async fn reprocess(
+        &self,
+        index: &MeetingIndex,
+        meeting_id: minutist_common::MeetingId,
+    ) -> AppResult<()> {
+        self.0.reprocess(index, meeting_id).await
+    }
+    async fn transcribe_pcm_window(
+        &self,
+        meeting_id: minutist_common::MeetingId,
+        start_ms: u64,
+        end_ms: u64,
+        language: Option<String>,
+    ) -> AppResult<Vec<Segment>> {
+        self.0
+            .transcribe_pcm_window(meeting_id, start_ms, end_ms, language)
+            .await
     }
 }
 
@@ -70,7 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&meetings_dir)?;
 
     let index = Arc::new(MeetingIndex::open(":memory:").await?);
-    let orchestrator = Arc::new(test_orchestrator(meetings_dir.clone()));
+    let orchestrator: Arc<dyn RecordingControl> = Arc::new(TestRecordingControl(Arc::new(
+        test_orchestrator(meetings_dir.clone()),
+    )));
     let summariser: Arc<dyn Summariser> = Arc::new(StubSummariser);
     let (event_tx, _rx) = broadcast::channel::<AppEvent>(16);
 

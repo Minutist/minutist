@@ -261,12 +261,13 @@ workspace "Minutist" "Local-first desktop meeting-notes application." {
 
         // Shared tool layer (Phase 9). One Tool trait + ToolRegistry, driven by
         // both the chat agent and (Phase 10) the MCP server. Reads meeting
-        // artefacts through persistence; runs re-transcribe / rediarize /
-        // transcribe_pcm_window through the orchestrator (which keeps the
-        // model-registry edge — agent-tools has none).
+        // artefacts through persistence. Recording-lifecycle tools (re-transcribe /
+        // rediarize / transcribe_pcm_window / start / stop / pause / resume) drive
+        // RecordingControl, a trait object ipc-bridge/app-main implement over a
+        // real orchestrator — no agentTools -> orchestrator edge (which also keeps
+        // the model-registry edge out of agent-tools).
         minutist.core.agentTools -> minutist.core.persistence "Reads meeting artefacts; writes via existing writers"
         minutist.core.agentTools -> minutist.core.notesCrdt "Reads/writes metadata.json + notes.ydoc via the lifted primitives"
-        minutist.core.agentTools -> minutist.core.orchestrator "Re-transcribe / rediarize / transcribe_pcm_window"
         minutist.core.agentTools -> minutist.core.ragRetrieval "rrf_fuse for the retrieve_chunks tool"
 
         // RAG (Phase B/D). ipc-bridge drives the write path (chunk + embed + persist

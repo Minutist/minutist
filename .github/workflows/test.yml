@@ -309,6 +309,31 @@ jobs:
             Write-Host "dumpbin not found"
           }
 
+      # VCRUNTIME140D.dll/ucrtbased.dll/MSVCP140_1.dll in the import dump above
+      # are the DEBUG CRT (only present with a full VS install, version-
+      # fragile) — a stronger lead than onnxruntime. Run the exe directly and
+      # pull the actual Windows Error Reporting record for the faulting module
+      # name, rather than inferring further from the static import table.
+      - name: Get authoritative crash cause for ipc-bridge test exe (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "target\debug\deps" -Filter "ipc_bridge-*.exe" |
+            Select-Object -First 1 -ExpandProperty FullName
+          $before = (Get-Date).AddSeconds(-5)
+          & $exe 2>&1 | Out-Null
+          Write-Host "Direct run exit code: $LASTEXITCODE"
+          Start-Sleep -Seconds 5
+          Write-Host "--- Application event log entries since direct run ---"
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $before } -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Message -like "*ipc_bridge*" -or $_.ProviderName -like "*Application Error*" -or $_.Id -eq 1000
+            } |
+            ForEach-Object {
+              Write-Host "=== Event $($_.Id) [$($_.ProviderName)] ==="
+              Write-Host $_.Message
+            }
+
       - name: cargo test --workspace
         if: runner.os != 'Linux'
         run: cargo test --workspace --locked

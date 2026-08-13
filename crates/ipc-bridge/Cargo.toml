@@ -35,6 +35,7 @@ embedder = { path = "../embedder" }
 rag-retrieval = { path = "../rag-retrieval" }
 settings = { path = "../settings", features = ["specta"] }
 chrono = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 specta = { workspace = true }

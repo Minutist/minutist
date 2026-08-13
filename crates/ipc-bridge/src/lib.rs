@@ -57,7 +57,9 @@
 //! | `open_meeting` | `MeetingState` | 4 |
 //! | `rename_meeting` | `()` | 4 |
 //! | `set_speaker_name` | `()` | transcript speaker rename |
-//! | `delete_meeting` | `()` | 4 |
+//! | `delete_meeting` | `()` | 4 (soft delete — trash) |
+//! | `restore_meeting` | `()` | trash |
+//! | `purge_meeting` | `()` | trash |
 //! | `open_meeting_folder` | `()` | themed context menus (#0034) |
 //! | `list_collections` | `Vec<Collection>` | meeting folders |
 //! | `create_collection` | `Collection` | meeting folders |
@@ -853,6 +855,8 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::rename_meeting,
             commands::set_speaker_name,
             commands::delete_meeting,
+            commands::restore_meeting,
+            commands::purge_meeting,
             commands::open_meeting_folder,
             commands::list_collections,
             commands::create_collection,

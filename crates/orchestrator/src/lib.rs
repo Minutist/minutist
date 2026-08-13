@@ -888,6 +888,11 @@ impl Orchestrator {
             .filter(|t| !t.trim().is_empty());
         let collection_id = existing.as_ref().and_then(|m| m.collection_id);
         let notes_format = existing.as_ref().map_or(0, |m| m.notes_format);
+        // Carried forward for the same reason as `collection_id`: a "New
+        // meeting" draft can be soft-deleted before it is ever promoted to
+        // recording (unusual, but the raw-overwrite finalise write must not
+        // silently un-delete it).
+        let deletion = existing.as_ref().map_or_else(Default::default, |m| m.deletion.clone());
 
         // Use the title the user typed during recording when present + non-blank;
         // else fall back to whatever is already on disk. Only when NEITHER
@@ -921,6 +926,7 @@ impl Orchestrator {
             // Recorded and processed on this device → the `Local` default.
             processing: Default::default(),
             recording_started: true,
+            deletion,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 
@@ -1887,6 +1893,7 @@ impl Orchestrator {
                 excerpt: transcript.first().map(|s| s.text.clone()),
                 collection_id: meta.collection_id,
                 recording_started: meta.recording_started,
+                deleted_at: meta.deletion.deleted_at(),
             })
         })
         .await
@@ -2672,6 +2679,7 @@ impl Orchestrator {
                     excerpt: transcript.first().map(|s| s.text.clone()),
                     collection_id: meta.collection_id,
                     recording_started: meta.recording_started,
+                    deleted_at: meta.deletion.deleted_at(),
                 })
             })
             .await

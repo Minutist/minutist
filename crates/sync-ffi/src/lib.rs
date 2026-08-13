@@ -45,7 +45,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use minutist_common::{AppError, AudioFormat, MeetingId, MeetingMeta, ProcessingLifecycle, Segment};
+use minutist_common::{
+    AppError, AudioFormat, DeletionState, MeetingId, MeetingMeta, ProcessingLifecycle, Segment,
+};
 use notes_crdt::{MeetingFolder, NotesStore};
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use tokio::runtime::Runtime;
@@ -506,7 +508,7 @@ impl FfiSyncEngine {
         let rx = self.engine()?.subscribe_lifecycle_events();
         let meetings_root = self.meetings_root.clone();
         spawn_drain(rx, move |item| match item {
-            Drained::Event((meeting, lifecycle)) => {
+            Drained::Event((meeting, lifecycle, deletion)) => {
                 let id_str = meeting.0.to_string();
                 // Persist the inbound state to our local metadata.json FIRST,
                 // then notify the UI to re-snapshot — mirroring the desktop's
@@ -516,6 +518,7 @@ impl FfiSyncEngine {
                 // skipped). The drain runs on a dedicated OS thread, so this sync
                 // RMW is fine.
                 apply_inbound_lifecycle(&meetings_root, meeting, lifecycle.clone());
+                apply_inbound_deletion(&meetings_root, meeting, deletion);
                 listener.on_lifecycle(id_str, lifecycle.into());
             }
             Drained::Lagged => listener.on_lagged(),
@@ -753,6 +756,7 @@ fn save_captured_to(
             processing: ProcessingLifecycle::PendingProcessing,
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         };
         notes_crdt::write_metadata(&folder, &meta)?;
@@ -1027,6 +1031,21 @@ fn apply_inbound_lifecycle(meetings_root: &Path, id: MeetingId, incoming: Proces
     }
 }
 
+/// Apply a peer-advertised deletion state to our local `metadata.json`,
+/// skipping a meeting we do not hold yet. Mirrors [`apply_inbound_lifecycle`]
+/// exactly — same shared leaf primitive
+/// ([`notes_crdt::apply_synced_deletion_if_present`]), same best-effort
+/// logging. Unlike the desktop/hub path
+/// (`persistence::meeting_ops::apply_synced_deletion_if_present`), there is no
+/// index mirror to refresh here — the phone has no `persistence`/`index.db`
+/// edge at all.
+fn apply_inbound_deletion(meetings_root: &Path, id: MeetingId, incoming: DeletionState) {
+    let result = notes_crdt::apply_synced_deletion_if_present(meetings_root, id, incoming);
+    if let Err(e) = result {
+        tracing::warn!(target: "sync-ffi", meeting_id = %id.0, error = %e, "applying synced deletion state failed");
+    }
+}
+
 /// Parse a hyphenated UUID string off the boundary into a [`MeetingId`].
 fn parse_meeting(s: &str) -> Result<MeetingId, SyncFfiError> {
     Uuid::parse_str(s)
@@ -1210,6 +1229,7 @@ mod tests {
             },
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: "0.0.0".into(),
         };
         notes_crdt::write_metadata(&folder, &meta).expect("write meta");
@@ -1427,6 +1447,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn inbound_deletion_merges_by_version_and_skips_absent() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let id = MeetingId(
+            Uuid::parse_str(&save_captured_to(root, "m", 1_000, 10, None, "").unwrap()).unwrap(),
+        );
+
+        apply_inbound_deletion(
+            root,
+            id,
+            DeletionState {
+                deleted: true,
+                version: 1,
+                by: HostRef("host-a".into()),
+                changed_at: "2026-06-30T00:00:00Z".into(),
+            },
+        );
+        let meta = notes_crdt::read_metadata(&root.join(id.0.to_string())).expect("read after apply");
+        assert!(meta.deletion.deleted, "version 1 delete must apply");
+
+        // A stale lower-version advertisement must not walk it backwards.
+        apply_inbound_deletion(
+            root,
+            id,
+            DeletionState {
+                deleted: false,
+                version: 0,
+                by: HostRef("host-b".into()),
+                changed_at: "2026-06-30T00:00:01Z".into(),
+            },
+        );
+        let meta = notes_crdt::read_metadata(&root.join(id.0.to_string())).expect("read after stale apply");
+        assert!(meta.deletion.deleted, "a lower-version restore must not regress the delete");
+
+        // A meeting we do not hold at all: must not panic or create the folder.
+        let absent = MeetingId::new();
+        apply_inbound_deletion(
+            root,
+            absent,
+            DeletionState {
+                deleted: true,
+                version: 1,
+                by: HostRef("host-a".into()),
+                changed_at: "2026-06-30T00:00:00Z".into(),
+            },
+        );
+        assert!(!root.join(absent.0.to_string()).exists());
     }
 
     /// `save_captured` is all-or-nothing: a failed audio copy rolls back the

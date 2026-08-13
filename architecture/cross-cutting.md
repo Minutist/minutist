@@ -792,6 +792,24 @@ instance early; otherwise it skips (the model loads on first use). The held
 (preloaded or on-demand) it stays ready — the `preload_summariser` toggle only
 chooses startup-warm vs load-on-demand, there is no idle unload.
 
+**Trash auto-purge sweep (same background-task shape).** `app-main`'s `setup`
+spawns a `tokio::time::interval(3600s)` loop (immediately after `IpcState` is
+managed, alongside the GPU-probe log + summariser-preload spawns above) that
+calls `IpcState::run_trash_sweep(7)` — `tokio::time::interval` ticks
+immediately on first `.tick()`, so this covers "once at startup" and "hourly
+thereafter" with one loop, no separate immediate call. `run_trash_sweep`
+delegates to `persistence::meeting_ops::sweep_expired_deletions` then
+best-effort unpins each purged meeting's blobs, mirroring what a manual
+"Delete forever" (`commands::purge_meeting`) does. Best-effort throughout: a
+sweep failure is logged, never fatal — the next hourly tick, or the next
+launch, retries. `headless` (the hub) runs the equivalent on its own
+`MINUTIST_HUB_TRASH_SWEEP_MS`-overridable interval (default also 1h) inside
+its `serve_until_shutdown` select loop, calling the index-free
+`sweep_expired_deletions_no_index` variant instead (the hub keeps no
+`index.db`). See `architecture/components.md` — "Trash (soft delete)" for the
+full design (merge semantics, the resurrection hazard the sweep interacts
+with via `persistence::purged`).
+
 ## Operation progress
 
 Long-running per-meeting operations emit `AppEvent::OperationProgress {

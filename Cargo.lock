@@ -3839,6 +3839,7 @@ dependencies = [
  "chrono",
  "doc-convert",
  "embedder",
+ "futures-util",
  "llama-cpp-2",
  "minutist-common",
  "model-registry",

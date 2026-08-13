@@ -353,6 +353,42 @@ impl IpcState {
             ),
         }
     }
+
+    /// Purge every meeting whose trash age exceeds `ttl_days` (default 7):
+    /// [`persistence::meeting_ops::sweep_expired_deletions`], then best-effort
+    /// unpin each purged meeting's blobs — the same step
+    /// [`crate::commands::purge_meeting`] performs for a manual purge, so the
+    /// automatic sweep leaves nothing behind that a manual "Delete forever"
+    /// would have cleaned up. Called by `app-main` once at startup and on a
+    /// periodic timer for the life of the run.
+    pub async fn run_trash_sweep(&self, ttl_days: i64) -> AppResult<Vec<minutist_common::MeetingId>> {
+        let app_data_root = self
+            .index_db_path
+            .parent()
+            .expect("index_db_path always has a parent (the app-data root)");
+        let purged = persistence::meeting_ops::sweep_expired_deletions(
+            &self.meetings_dir,
+            app_data_root,
+            &self.index,
+            self.voiceprints.as_ref().as_ref(),
+            ttl_days,
+        )
+        .await?;
+        // Unpin concurrently — a slow/dead blob store must not delay the rest,
+        // the same reasoning `SyncEngine::adopt_all` gives for dialling peers
+        // concurrently.
+        futures_util::future::join_all(purged.iter().map(|meeting_id| async move {
+            if let Err(e) = self.connected.sync.delete_meeting_blobs(*meeting_id).await {
+                tracing::warn!(
+                    target: "ipc-bridge",
+                    meeting_id = %meeting_id.0,
+                    "unpinning auto-purged meeting's blobs failed (best-effort): {e}"
+                );
+            }
+        }))
+        .await;
+        Ok(purged)
+    }
 }
 
 // ---------------------------------------------------------------------------

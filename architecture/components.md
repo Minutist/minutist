@@ -389,9 +389,14 @@ attachments, chat sessions, translations, and `summary.md`.
 **Read/index surface:** the folder readers (including the audio decoder and
 the `MeetingState` assembler), the libsql `index.db` meeting index with a
 forward-only migration runner, `rebuild_from_disk`, and the self-heal
-`reconcile_orphans`; rename/delete meeting operations; a `collections.json`
-store; a per-meeting RAG cache (`meeting.db`); and a separate
-`voiceprints.db` speaker-voiceprint library.
+`reconcile_orphans`; rename/soft-delete/restore/purge meeting operations
+(trash — a soft delete only flips `MeetingMeta.deletion`, leaving the folder,
+voiceprints, and blobs untouched until restore or purge; purge is the
+destructive op, also driven by an automatic 7-day sweep, and records a
+`purged.json` tombstone so a hub's peer-adopt sweep can never resurrect it —
+see `crates/persistence/src/meeting_ops.rs` and `src/purged.rs`); a
+`collections.json` store; a per-meeting RAG cache (`meeting.db`); and a
+separate `voiceprints.db` speaker-voiceprint library.
 
 Every write to `metadata.json`'s authoritative fields also mirrors into the
 notes CRDT's meta map, so a sync peer that only ever received a
@@ -652,10 +657,11 @@ See `crates/account-directory/src/lib.rs` for implementation detail.
 **Owns:** the device-to-device sync engine — an iroh QUIC transport
 multiplexing four wire protocols over the crate's ALPNs between a user's own
 paired devices: Yjs notes reconciliation (`notes_proto`), content-addressed
-meeting-media transfer (`blobs`, via `iroh-blobs`), processing-lifecycle
-discovery (`discovery_proto`), and derived-artifact (`transcript.json` /
-`summary.md`) reconciliation (`artifacts_proto`) — plus account-mediated peer
-discovery (`account`).
+meeting-media transfer (`blobs`, via `iroh-blobs`), processing-lifecycle +
+trash-state discovery (`discovery_proto`, carrying each meeting's
+`ProcessingLifecycle` and `DeletionState` in one frame), and derived-artifact
+(`transcript.json` / `summary.md`) reconciliation (`artifacts_proto`) — plus
+account-mediated peer discovery (`account`).
 
 **Dependency edges:** `common` + `notes-crdt` only, never `persistence` — the
 notes-CRDT primitives live in the leaf `notes-crdt` crate specifically so this
@@ -742,8 +748,9 @@ without a running Tauri app.
 
 **Command surface, by domain:** recording lifecycle; settings; model
 list/ensure; notes (JSON + CRDT/Yjs binding) and note images; attachments
-(add/list/open/remove + conversion); meeting list/open/rename/delete/
-collections; reprocess (re-transcribe + re-diarize); summarise; chat
+(add/list/open/remove + conversion); meeting list/open/rename/
+delete(soft)/restore/purge/collections; reprocess (re-transcribe +
+re-diarize); summarise; chat
 (send/cancel/session CRUD) and the live in-meeting co-pilot; translation;
 voiceprint/identity management; diagnostics; and the connected-tier tunnel
 pairing, account erasure, and sync commands. `stop_recording` also upserts

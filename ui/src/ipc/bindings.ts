@@ -459,20 +459,51 @@ async setSpeakerName(meetingId: MeetingId, label: string, name: string) : Promis
 }
 },
 /**
- * Delete a meeting: removes the folder then the index row, then purges any
- * voiceprint contributions that were derived from this meeting's audio (§4
- * meeting-granularity erasure).
+ * Move a meeting to the trash: it stays fully recoverable — the folder,
+ * voiceprint contributions, and blobs are all left untouched — until
+ * [`restore_meeting`] brings it back or [`purge_meeting`] (manual or the
+ * 7-day auto-purge sweep) removes it for good.
+ * 
+ * Routes to `persistence::meeting_ops::soft_delete_meeting`.
+ */
+async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, AppError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_meeting", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Restore a meeting out of the trash — the mirror image of [`delete_meeting`].
+ * 
+ * Routes to `persistence::meeting_ops::restore_meeting`.
+ */
+async restoreMeeting(meetingId: MeetingId) : Promise<Result<null, AppError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("restore_meeting", { meetingId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Permanently remove a meeting ("Delete forever" on a trashed row): the
+ * folder, its index row, its voiceprint contributions, and its blobs — then
+ * records a purged tombstone so a hub replica can never resurrect it from a
+ * slow peer (see `persistence::purged`). Unlike a soft delete, this is NOT
+ * reversible.
  * 
  * The voiceprint purge is best-effort: if the `VoiceprintStore` is not open
  * (degraded-to-off) the step is skipped silently. The folder/index deletion
  * runs first so a crash between the two steps leaves at most an orphaned
  * voiceprint entry, not an orphaned meeting folder.
  * 
- * Routes to `persistence::meeting_ops::delete_meeting`.
+ * Routes to `persistence::meeting_ops::purge_meeting`.
  */
-async deleteMeeting(meetingId: MeetingId) : Promise<Result<null, AppError>> {
+async purgeMeeting(meetingId: MeetingId) : Promise<Result<null, AppError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("delete_meeting", { meetingId }) };
+    return { status: "ok", data: await TAURI_INVOKE("purge_meeting", { meetingId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1190,6 +1221,13 @@ export type AppEvent =
  */
 { kind: "meeting_finalised"; meeting_id: MeetingId } | 
 /**
+ * A peer device deleted or restored this meeting (its `DeletionState`
+ * converged via the sync discovery exchange, `notes_crdt::merge_deletion`).
+ * The webview refreshes the meeting list so the row moves into/out of
+ * the Deleted bucket without waiting for an unrelated refresh.
+ */
+{ kind: "meeting_deletion_changed"; meeting_id: MeetingId } | 
+/**
  * An offline re-transcribe finished rewriting `transcript.json`. The webview
  * re-reads the meeting's transcript (list excerpt + any open-meeting view),
  * mirroring `DiarizationComplete`. Emitted by both the user-triggered
@@ -1641,6 +1679,30 @@ export type ConversionState =
  */
 { state: "failed"; reason: string }
 /**
+ * Whether a meeting is in the trash, persisted on [`MeetingMeta`]
+ * (`metadata.json`) and propagated to peers over the same discovery
+ * exchange as [`ProcessingLifecycle`] — device/lifecycle state, not
+ * user-authored content, so it does not live in the notes CRDT.
+ * 
+ * `version` is the merge-arbitration field: whichever device toggles
+ * delete/restore bumps it, and the higher `version` wins a peer merge; a tie
+ * (two devices toggling offline from the same base) breaks on the lowest
+ * `by` (`HostRef`), lexicographically — never on `changed_at`. Cross-device
+ * clock skew makes wall-clock ordering unreliable for a merge winner, the
+ * same reason [`ProcessingClaim`]'s timestamps are excluded from that
+ * role. `changed_at` is informational only: the purge-countdown display and
+ * the local purge-sweep's age check read it, but never the merge.
+ * 
+ * Default (`version: 0`) never wins against a real toggle (`version >= 1`),
+ * so an untouched meeting is unambiguously "not deleted" without a real
+ * timestamp.
+ */
+export type DeletionState = { deleted: boolean; version: number; by: HostRef; 
+/**
+ * RFC 3339 UTC, or empty for the never-touched default.
+ */
+changed_at: string }
+/**
  * A redacted diagnostic snapshot for the user-driven "Report a problem" flow.
  * 
  * Assembled and **redacted** by `ipc-bridge` (`get_diagnostic_report`), it
@@ -1792,7 +1854,12 @@ collection_id?: CollectionId | null;
  * Mirrors [`MeetingMeta::recording_started`] — `false` marks an unstarted
  * draft so the list can show it as resumable without a per-row disk read.
  */
-recording_started?: boolean }
+recording_started?: boolean; 
+/**
+ * A derived mirror of [`MeetingMeta::deletion`]'s `changed_at`, present
+ * only while the meeting is in the trash. `None` = active.
+ */
+deleted_at?: string | null }
 /**
  * Per-meeting metadata persisted as `metadata.json`.
  * 
@@ -1863,7 +1930,16 @@ processing?: ProcessingLifecycle;
  * follow-up alongside the wider question of whether an unpromoted draft
  * should sync at all before it has real content.
  */
-recording_started?: boolean; app_version: string }
+recording_started?: boolean; 
+/**
+ * Trash state. Host-authoritative in the same sense `processing` is —
+ * propagated via the sync lifecycle exchange, merged by
+ * `notes_crdt::merge_deletion`, never carried in the notes CRDT.
+ * `#[serde(default)]` so existing `metadata.json` (written before the
+ * field existed) reads as "not deleted", the same defaulted-field
+ * pattern `processing`/`recording_started` use.
+ */
+deletion?: DeletionState; app_version: string }
 /**
  * The full restorable state of a meeting, assembled by `persistence` for
  * `open_meeting`: metadata, transcript segments, and the notes document

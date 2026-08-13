@@ -149,9 +149,6 @@ describe("MainWindow workspace columns", () => {
     expect(screen.queryByTestId("summary")).not.toBeInTheDocument();
     // The Summary segment itself is not offered for a draft.
     expect(within(viewToggle()).queryByRole("button", { name: "Summary" })).toBeNull();
-    // The prep-mode banner + its Discard action are shown.
-    expect(screen.getByText(/New meeting/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Discard" })).toBeInTheDocument();
   });
 
   it("the view toggle reflects visibility (notes + summary on, transcript off)", async () => {

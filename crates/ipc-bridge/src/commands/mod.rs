@@ -83,6 +83,15 @@ mod voiceprints;
 #[cfg(test)]
 mod tests;
 
+/// The app-data root (the dir holding `index.db`, `meetings/`, and
+/// `collections.json`), derived from the index path.
+pub(super) fn app_data_root(state: &IpcState) -> &Path {
+    state
+        .index_db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+}
+
 pub use device::*;
 pub use recording::*;
 pub use models::*;

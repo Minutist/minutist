@@ -21,7 +21,7 @@ use crate::error::Error;
 
 /// The schema version this build of `persistence` targets. Bump this and add a
 /// matching arm in [`apply_migration`] when the schema changes.
-pub const CURRENT_VERSION: i64 = 3;
+pub const CURRENT_VERSION: i64 = 4;
 
 /// Bring `conn`'s schema up to [`CURRENT_VERSION`].
 ///
@@ -170,6 +170,20 @@ async fn apply_migration(conn: &Connection, version: i64) -> Result<(), Error> {
             // existing row (all of which are real recordings) is unaffected.
             conn.execute(
                 "ALTER TABLE meetings ADD COLUMN recording_started INTEGER NOT NULL DEFAULT 1",
+                (),
+            )
+            .await?;
+            Ok(())
+        }
+        4 => {
+            // Mirrors `MeetingMeta::deletion`'s `changed_at`, present only
+            // while the meeting is in the trash. Nullable = active (the
+            // default for every existing row).
+            conn.execute("ALTER TABLE meetings ADD COLUMN deleted_at TEXT", ())
+                .await?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_meetings_deleted_at
+                 ON meetings (deleted_at)",
                 (),
             )
             .await?;

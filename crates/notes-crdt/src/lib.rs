@@ -35,6 +35,9 @@
 //!   merge-and-skip-if-absent logic: `persistence::meeting_ops` re-exports it as
 //!   a thin `async` wrapper (its desktop/hub subscribers `.await` it), and
 //!   `sync-ffi` calls it directly (the phone has no `persistence` edge).
+//! - [`merge_deletion`] / [`apply_synced_deletion_if_present`]: the same
+//!   precedence-merge-and-skip-if-absent shape as the pair above, for the trash
+//!   (`DeletionState`) field.
 //! - [`folder::list_meeting_ids`]: the ONE enumeration of "which meetings this
 //!   device holds" — the `{uuid}` directories under the meetings root (`.blobs`
 //!   and non-UUID entries skipped). It lives beside the folder layout it scans;
@@ -110,7 +113,10 @@ pub mod ydoc;
 
 pub use error::Error;
 pub use folder::MeetingFolder;
-pub use lifecycle::{apply_synced_lifecycle_if_present, merge_processing};
+pub use lifecycle::{
+    apply_synced_deletion_if_present, apply_synced_lifecycle_if_present, merge_deletion,
+    merge_processing,
+};
 pub use metadata::{
     read_metadata, update_metadata, update_metadata_if, update_metadata_if_present, write_metadata,
     write_metadata_atomic, MetaUpdate,

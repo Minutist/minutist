@@ -500,6 +500,7 @@ pub(crate) fn meeting_list_entry_for_meta(meetings_dir: &Path, meta: &MeetingMet
         excerpt,
         collection_id: meta.collection_id,
         recording_started: meta.recording_started,
+        deleted_at: meta.deletion.deleted_at(),
     }
 }
 

@@ -8,12 +8,14 @@
  * list (each `MeetingListEntry.collection_id`), so they update when a meeting is
  * filed or a list refresh lands.
  */
-import { useState, type DragEvent } from "react";
+import { useMemo, useState, type DragEvent } from "react";
 import { useMeetingsStore } from "../state/meetings";
 import {
   useCollectionsStore,
   ALL_FILTER,
   UNFILED_FILTER,
+  DELETED_FILTER,
+  meetingMatchesFilter,
   type CollectionFilter,
   type CollectionId,
 } from "../state/collections";
@@ -44,10 +46,32 @@ export function CollectionsSidebar() {
   // The folder entry currently under a meeting drag (for the drop highlight).
   const [dragOverKey, setDragOverKey] = useState<string | null>(null);
 
-  const total = meetings.length;
-  const unfiledCount = meetings.filter((m) => !m.collection_id).length;
-  const countFor = (id: string) =>
-    meetings.filter((m) => m.collection_id === id).length;
+  // "All meetings" and every folder implicitly exclude trashed meetings — the
+  // Deleted bucket below is the only place they show; `meetingMatchesFilter`
+  // is the single shared rule for that, reused here rather than re-derived.
+  const total = useMemo(
+    () => meetings.filter((m) => meetingMatchesFilter(ALL_FILTER, m.collection_id, m.deleted_at)).length,
+    [meetings],
+  );
+  const unfiledCount = useMemo(
+    () => meetings.filter((m) => meetingMatchesFilter(UNFILED_FILTER, m.collection_id, m.deleted_at)).length,
+    [meetings],
+  );
+  // One pass over `meetings` building per-collection counts, rather than a
+  // fresh filter of the whole list for every folder rendered below.
+  const collectionCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const m of meetings) {
+      if (!m.collection_id || !meetingMatchesFilter(ALL_FILTER, m.collection_id, m.deleted_at)) continue;
+      counts.set(m.collection_id, (counts.get(m.collection_id) ?? 0) + 1);
+    }
+    return counts;
+  }, [meetings]);
+  const countFor = (id: string) => collectionCounts.get(id) ?? 0;
+  const deletedCount = useMemo(
+    () => meetings.filter((m) => meetingMatchesFilter(DELETED_FILTER, m.collection_id, m.deleted_at)).length,
+    [meetings],
+  );
 
   function commitCreate() {
     const name = draft.trim();
@@ -200,6 +224,27 @@ export function CollectionsSidebar() {
             </span>
             <span className="collections-sidebar__count tnum">
               {unfiledCount}
+            </span>
+          </button>
+        </li>
+
+        <li className="collections-sidebar__separator" role="separator" />
+        <li>
+          <button
+            type="button"
+            className={
+              "collections-sidebar__item" +
+              (sameFilter(filter, DELETED_FILTER)
+                ? " collections-sidebar__item--active"
+                : "")
+            }
+            onClick={() => select(DELETED_FILTER)}
+          >
+            <span className="collections-sidebar__label collections-sidebar__label--muted">
+              Deleted
+            </span>
+            <span className="collections-sidebar__count tnum">
+              {deletedCount}
             </span>
           </button>
         </li>

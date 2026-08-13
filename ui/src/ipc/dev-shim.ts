@@ -512,6 +512,12 @@ export const devCommands = {
   async deleteMeeting(_meetingId: MeetingId): Promise<Result<null, AppError>> {
     return ok(null);
   },
+  async restoreMeeting(_meetingId: MeetingId): Promise<Result<null, AppError>> {
+    return ok(null);
+  },
+  async purgeMeeting(_meetingId: MeetingId): Promise<Result<null, AppError>> {
+    return ok(null);
+  },
   // Themed context menus (#0034) — no backend, so there is no real folder to
   // open in the shim; it just no-ops successfully.
   async openMeetingFolder(

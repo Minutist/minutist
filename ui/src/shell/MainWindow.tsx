@@ -384,26 +384,6 @@ export function MainWindow() {
       */}
       <div className="main-window__chrome">
         <UpdateBanner />
-        {isOpenDraft && openMeetingId !== null && (
-          <div className="main-window__draft-banner" role="status">
-            <span className="main-window__draft-banner-text">
-              New meeting — set a title, write notes, or attach resources,
-              then press Start when you're ready to record.
-            </span>
-            <button
-              type="button"
-              className="main-window__draft-banner-discard"
-              onClick={() => {
-                // Close the workspace FIRST: `remove` doesn't clear
-                // `openMeetingId`, and the folder is about to stop existing.
-                closeMeeting();
-                void useMeetingsStore.getState().remove(openMeetingId);
-              }}
-            >
-              Discard
-            </button>
-          </div>
-        )}
         <ModelDownloadStatus />
         {lastError && (
           <div className="main-window__error" role="alert">

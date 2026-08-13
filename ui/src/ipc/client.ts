@@ -99,7 +99,11 @@ export const commands: Commands = {
     callCommand("renameMeeting", [meetingId, title]),
   setSpeakerName: (meetingId, label, name) =>
     callCommand("setSpeakerName", [meetingId, label, name]),
+  // Trash: delete = soft delete (recoverable); restore reverses it; purge is
+  // the permanent "Delete forever" (manual or the auto-purge sweep).
   deleteMeeting: (meetingId) => callCommand("deleteMeeting", [meetingId]),
+  restoreMeeting: (meetingId) => callCommand("restoreMeeting", [meetingId]),
+  purgeMeeting: (meetingId) => callCommand("purgeMeeting", [meetingId]),
   // Themed context menus (#0034) — meeting-list "Open storage folder" entry.
   // Resolves the on-disk directory server-side and hands it to the host OS
   // file explorer via `tauri-plugin-opener`; the DEV shim no-ops it.

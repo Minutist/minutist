@@ -291,16 +291,145 @@ pub async fn apply_synced_lifecycle_if_present(
     notes_crdt::apply_synced_lifecycle_if_present(meetings_root, id, processing)
 }
 
-/// Delete a meeting: remove the folder recursively, then remove the index row.
+/// Apply a peer-advertised deletion state to a meeting we hold, or skip it if
+/// that meeting is not present locally yet.
 ///
-/// An absent folder is treated as already-deleted (the index row is still
-/// removed so the two converge). The index `delete` is a no-op for an absent
-/// row.
-pub async fn delete_meeting(
+/// Unlike [`apply_synced_lifecycle_if_present`] (`processing` has no index
+/// mirror), `deletion` mirrors into `index.db`'s `deleted_at` column — so,
+/// beyond delegating the merge to [`notes_crdt::apply_synced_deletion_if_present`],
+/// this also refreshes the index row when the merge actually applied,
+/// keeping the two converged.
+pub async fn apply_synced_deletion_if_present(
     meetings_root: &Path,
     index: &MeetingIndex,
     id: MeetingId,
+    deletion: minutist_common::DeletionState,
+) -> AppResult<bool> {
+    let applied = notes_crdt::apply_synced_deletion_if_present(meetings_root, id, deletion)?;
+    if applied {
+        let folder = meetings_root.join(id.0.to_string());
+        let meta = reader::read_metadata_inner(&folder)?;
+        patch_deleted_at(index, &folder, id, meta.deletion.deleted_at()).await?;
+    }
+    Ok(applied)
+}
+
+/// Patch just `deleted_at` onto the existing index row rather than
+/// re-deriving the whole entry via [`list_entry_from`], which would re-parse
+/// `summary.md`/`transcript.json` (via `derive_excerpt`) just to leave them
+/// unchanged. Falls back to a full folder-derived upsert if the meeting isn't
+/// indexed yet (e.g. a synced deletion racing ahead of the row's own upsert).
+async fn patch_deleted_at(
+    index: &MeetingIndex,
+    folder: &Path,
+    id: MeetingId,
+    deleted_at: Option<String>,
 ) -> AppResult<()> {
+    let mut entry = match index.get(id).await? {
+        Some(entry) => entry,
+        None => list_entry_from(folder)?,
+    };
+    entry.deleted_at = deleted_at;
+    index.upsert(&entry).await?;
+    Ok(())
+}
+
+/// Move a meeting to the trash: bump its [`DeletionState`](minutist_common::DeletionState)
+/// (`deleted: true`, `version + 1`), authored by `by` (this device), then
+/// refresh the index row. Does NOT touch the folder, voiceprints, or blobs —
+/// those are real destructive side effects that belong to [`purge_meeting`]
+/// only, or "restore" would be a lie.
+pub async fn soft_delete_meeting(
+    meetings_root: &Path,
+    index: &MeetingIndex,
+    id: MeetingId,
+    by: minutist_common::HostRef,
+) -> AppResult<()> {
+    set_deletion(meetings_root, index, id, true, by).await
+}
+
+/// Restore a meeting out of the trash: the mirror image of
+/// [`soft_delete_meeting`] (`deleted: false`, `version + 1`).
+pub async fn restore_meeting(
+    meetings_root: &Path,
+    index: &MeetingIndex,
+    id: MeetingId,
+    by: minutist_common::HostRef,
+) -> AppResult<()> {
+    set_deletion(meetings_root, index, id, false, by).await
+}
+
+async fn set_deletion(
+    meetings_root: &Path,
+    index: &MeetingIndex,
+    id: MeetingId,
+    deleted: bool,
+    by: minutist_common::HostRef,
+) -> AppResult<()> {
+    let changed_at = chrono::Utc::now().to_rfc3339();
+    update_metadata(meetings_root, id, |meta| {
+        meta.deletion = minutist_common::DeletionState {
+            deleted,
+            version: meta.deletion.version + 1,
+            by: by.clone(),
+            changed_at: changed_at.clone(),
+        };
+    })?;
+
+    let folder = meetings_root.join(id.0.to_string());
+    let deleted_at = deleted.then_some(changed_at);
+    patch_deleted_at(index, &folder, id, deleted_at).await?;
+
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        deleted,
+        "deletion state applied"
+    );
+
+    Ok(())
+}
+
+/// Permanently remove a meeting: the folder, its index row, its voiceprint
+/// contributions, and record it in the purged tombstone set (so a hub's
+/// `adopt_from_peer` sweep can recognise this id as deliberately gone, not
+/// merely never-seen, and never resurrect it from a slow peer's still-existing
+/// copy — see `persistence::purged`).
+///
+/// An absent folder is treated as already-purged (the index row and
+/// voiceprint contributions are still cleared so everything converges). The
+/// index `delete` and voiceprint `forget_meeting` are no-ops for an absent
+/// row/meeting. `voiceprints: None` (the store degraded-to-off) skips the
+/// voiceprint purge silently — best-effort, mirroring how the caller already
+/// treats a missing `VoiceprintStore` elsewhere.
+pub async fn purge_meeting(
+    meetings_root: &Path,
+    app_data_root: &Path,
+    index: &MeetingIndex,
+    voiceprints: Option<&crate::voiceprints::VoiceprintStore>,
+    id: MeetingId,
+) -> AppResult<()> {
+    remove_folder_and_tombstone(meetings_root, app_data_root, id)?;
+
+    index.delete(id).await?;
+    if let Some(voiceprints) = voiceprints {
+        voiceprints.forget_meeting(id).await?;
+    }
+
+    tracing::info!(
+        target: "persistence",
+        meeting_id = %id.0,
+        "meeting purged"
+    );
+
+    Ok(())
+}
+
+/// Remove a meeting's folder (tolerating an already-absent one) and record its
+/// purge tombstone. Shared core of [`purge_meeting`] and
+/// [`purge_meeting_no_index`], which differ only in whether they also touch an
+/// `index.db`/`VoiceprintStore`.
+fn remove_folder_and_tombstone(meetings_root: &Path, app_data_root: &Path, id: MeetingId) -> AppResult<()> {
     let folder = MeetingFolder::open(meetings_root, id).path().to_path_buf();
 
     match std::fs::remove_dir_all(&folder) {
@@ -309,15 +438,110 @@ pub async fn delete_meeting(
         Err(e) => return Err(Error::Io(e).into()),
     }
 
-    index.delete(id).await?;
+    crate::purged::PurgedStore::record(app_data_root, id)?;
+    Ok(())
+}
+
+/// Purge every meeting whose trash age exceeds `ttl_days`, and garbage-collect
+/// purged-tombstone entries older than a generous 30-day slack (long enough
+/// for a slow peer to converge before the tombstone itself is dropped).
+/// Returns the ids purged this sweep, for a caller's UI toast/log line.
+///
+/// Called on app launch and on a periodic timer (desktop `app-main`, and the
+/// `headless` hub — a hub-run meeting can age out with no desktop open).
+pub async fn sweep_expired_deletions(
+    meetings_root: &Path,
+    app_data_root: &Path,
+    index: &MeetingIndex,
+    voiceprints: Option<&crate::voiceprints::VoiceprintStore>,
+    ttl_days: i64,
+) -> AppResult<Vec<MeetingId>> {
+    let cutoff = trash_cutoff(ttl_days);
+    let mut purged = Vec::new();
+    for entry in index.list_meetings().await? {
+        if is_expired(entry.deleted_at.as_deref(), cutoff) {
+            purge_meeting(meetings_root, app_data_root, index, voiceprints, entry.id).await?;
+            purged.push(entry.id);
+        }
+    }
+    crate::purged::PurgedStore::gc(app_data_root, 30)?;
+    if !purged.is_empty() {
+        tracing::info!(
+            target: "persistence",
+            count = purged.len(),
+            ttl_days,
+            "trash sweep purged expired meetings"
+        );
+    }
+    Ok(purged)
+}
+
+/// The instant before which a soft-deleted meeting's TTL has elapsed.
+fn trash_cutoff(ttl_days: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() - chrono::Duration::days(ttl_days)
+}
+
+/// Whether a `deleted_at` (RFC 3339, or absent for an active meeting) is past
+/// `cutoff`. A malformed timestamp is never treated as expired — never
+/// destroy on a parse glitch, the same conservative rule `lifecycle::lease_ge`
+/// follows.
+fn is_expired(deleted_at: Option<&str>, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(deleted_at) = deleted_at else {
+        return false;
+    };
+    let Ok(deleted_at) = chrono::DateTime::parse_from_rfc3339(deleted_at) else {
+        return false;
+    };
+    deleted_at.with_timezone(&chrono::Utc) < cutoff
+}
+
+/// Index-free purge for a caller with no `index.db` (the hub, `crates/headless` —
+/// it runs no `MeetingIndex` at all, replica-only). Removes the folder and
+/// records the purged tombstone; there is no index row or voiceprint store to
+/// touch (the hub runs neither). Otherwise identical to [`purge_meeting`].
+pub fn purge_meeting_no_index(meetings_root: &Path, app_data_root: &Path, id: MeetingId) -> AppResult<()> {
+    remove_folder_and_tombstone(meetings_root, app_data_root, id)?;
 
     tracing::info!(
         target: "persistence",
         meeting_id = %id.0,
-        "meeting deleted"
+        "meeting purged (no-index)"
     );
 
     Ok(())
+}
+
+/// Index-free counterpart to [`sweep_expired_deletions`] for the hub: scans
+/// `metadata.json` directly (via [`notes_crdt::folder::list_meeting_ids`])
+/// rather than querying a `MeetingIndex`, since the hub keeps none. Otherwise
+/// the same TTL/GC semantics.
+pub fn sweep_expired_deletions_no_index(
+    meetings_root: &Path,
+    app_data_root: &Path,
+    ttl_days: i64,
+) -> AppResult<Vec<MeetingId>> {
+    let cutoff = trash_cutoff(ttl_days);
+    let mut purged = Vec::new();
+    for id in notes_crdt::folder::list_meeting_ids(meetings_root) {
+        let meta = match notes_crdt::read_metadata(&meetings_root.join(id.0.to_string())) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if is_expired(meta.deletion.deleted_at().as_deref(), cutoff) {
+            purge_meeting_no_index(meetings_root, app_data_root, id)?;
+            purged.push(id);
+        }
+    }
+    crate::purged::PurgedStore::gc(app_data_root, 30)?;
+    if !purged.is_empty() {
+        tracing::info!(
+            target: "persistence",
+            count = purged.len(),
+            ttl_days,
+            "trash sweep (no-index) purged expired meetings"
+        );
+    }
+    Ok(purged)
 }
 
 /// Build a `MeetingListEntry` from a meeting folder's metadata + excerpt.
@@ -338,6 +562,7 @@ fn list_entry_from(folder: &Path) -> Result<minutist_common::MeetingListEntry, E
         excerpt,
         collection_id: meta.collection_id,
         recording_started: meta.recording_started,
+        deleted_at: meta.deletion.deleted_at(),
     })
 }
 
@@ -379,6 +604,7 @@ mod tests {
             processing: Default::default(),
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: "0.0.0".into(),
         };
         write_metadata(folder.path(), &meta).expect("write metadata");
@@ -481,6 +707,7 @@ mod tests {
             processing: Default::default(),
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: String::new(),
         };
         notes_crdt::meta_crdt::project_into_meta(&doc, &mut projected);

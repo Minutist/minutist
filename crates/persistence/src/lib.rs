@@ -332,6 +332,7 @@ pub mod meeting_ops;
 pub mod metadata;
 pub mod migrations;
 pub mod opus_encoder;
+pub mod purged;
 pub mod rag;
 pub mod reader;
 pub mod summary;
@@ -360,6 +361,7 @@ pub use chat::ChatStore;
 pub use collections::{collections_path, delete_collection, CollectionStore};
 pub use error::Error;
 pub use index::MeetingIndex;
+pub use purged::{purged_path, PurgedStore};
 pub use rag::{meeting_db_path, NewChunk, RagStore, RetrievedChunk};
 pub use reader::{
     read_audio_pcm, read_meeting_state, read_metadata, read_note_blocks, read_transcript,

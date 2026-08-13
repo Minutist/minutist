@@ -18,6 +18,8 @@ import {
   renameMeeting,
   setSpeakerName,
   deleteMeeting,
+  restoreMeeting,
+  purgeMeeting,
   reprocess,
   rejectMatch,
 } from "../ipc/meetings";
@@ -69,8 +71,12 @@ export type MeetingsStore = {
    * transcript re-renders without a reload.
    */
   setSpeakerName: (label: string, name: string) => Promise<void>;
-  /** Delete a meeting, then refresh the list. */
+  /** Move a meeting to the trash (soft delete), then refresh the list. */
   remove: (meetingId: MeetingId) => Promise<void>;
+  /** Restore a trashed meeting, then refresh the list. */
+  restore: (meetingId: MeetingId) => Promise<void>;
+  /** Permanently remove a trashed meeting ("Delete forever"), then refresh. */
+  purge: (meetingId: MeetingId) => Promise<void>;
   /**
    * File a meeting into a folder (or unfile it with `null`), then refresh the
    * list so the row's `collection_id` (and the sidebar counts derived from it)
@@ -188,6 +194,26 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
     }
   },
 
+  restore: async (meetingId) => {
+    try {
+      await restoreMeeting(meetingId);
+      set({ lastError: null });
+      await get().refresh();
+    } catch (err) {
+      set({ lastError: errorMessage(err) });
+    }
+  },
+
+  purge: async (meetingId) => {
+    try {
+      await purgeMeeting(meetingId);
+      set({ lastError: null });
+      await get().refresh();
+    } catch (err) {
+      set({ lastError: errorMessage(err) });
+    }
+  },
+
   setCollection: async (meetingId, collectionId) => {
     try {
       await setMeetingCollection(meetingId, collectionId);
@@ -274,6 +300,12 @@ export const useMeetingsStore = create<MeetingsStore>((set, get) => ({
       // now the summary blurb (the backend refreshed the index row). Refresh the
       // list so the row shows the blurb without a manual reload. (The summary
       // PANE re-read is the summary store's job; this only touches the list.)
+      void get().refresh();
+      return;
+    }
+    if (event.kind === "meeting_deletion_changed") {
+      // A peer device deleted or restored this meeting; refresh so the row
+      // moves into/out of the Deleted bucket without an unrelated refresh.
       void get().refresh();
       return;
     }

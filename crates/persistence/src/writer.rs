@@ -48,6 +48,7 @@ pub fn create_draft(root: &Path, meeting_id: MeetingId) -> AppResult<MeetingFold
         collection_id: None,
         processing: Default::default(),
         recording_started: false,
+        deletion: Default::default(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
     };
 

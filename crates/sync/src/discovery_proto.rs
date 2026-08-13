@@ -35,7 +35,7 @@
 use std::path::Path;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use minutist_common::{MeetingId, MeetingMeta, ProcessingLifecycle};
+use minutist_common::{DeletionState, MeetingId, MeetingMeta, ProcessingLifecycle};
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{read_frame, write_frame};
@@ -43,14 +43,16 @@ use crate::notes_proto::StreamKind;
 use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
 use crate::{Error, Result};
 
-/// One meeting's identity + its host-authoritative processing state, as carried
-/// on a [`StreamKind::Discovery`] stream.
+/// One meeting's identity + its host-authoritative processing AND deletion
+/// state, as carried on a [`StreamKind::Discovery`] stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryEntry {
     /// The meeting id.
     pub meeting_id: MeetingId,
     /// The meeting's processing-lifecycle state, read from its `metadata.json`.
     pub processing: ProcessingLifecycle,
+    /// The meeting's trash state, read from its `metadata.json`.
+    pub deletion: DeletionState,
 }
 
 /// Enumerate the meeting ids this device holds on disk — delegates to the canonical
@@ -93,15 +95,47 @@ pub(crate) fn read_local_processing(root: &Path, id: MeetingId) -> ProcessingLif
 }
 
 /// The local entries to advertise: every meeting on disk paired with its
-/// processing state.
+/// processing and deletion state.
+///
+/// Reads each meeting's `metadata.json` once via [`read_local_state`] rather
+/// than reading it separately for `processing` and `deletion`, which would
+/// parse the same file twice per meeting on every discovery exchange.
 fn local_entries(root: &Path) -> Vec<DiscoveryEntry> {
     list_meeting_ids(root)
         .into_iter()
-        .map(|meeting_id| DiscoveryEntry {
-            processing: read_local_processing(root, meeting_id),
-            meeting_id,
+        .map(|meeting_id| {
+            let (processing, deletion) = read_local_state(root, meeting_id);
+            DiscoveryEntry {
+                processing,
+                deletion,
+                meeting_id,
+            }
         })
         .collect()
+}
+
+/// Read a meeting's `metadata.json` once and return both its `processing` and
+/// `deletion` state, defaulting each to its conservative default (`Local`,
+/// not-deleted) when the file is absent or unparseable — the same
+/// never-guess-adoptable rule [`read_local_processing`] follows, combined so a
+/// caller needing both fields parses the file once rather than twice.
+fn read_local_state(root: &Path, id: MeetingId) -> (ProcessingLifecycle, DeletionState) {
+    let path = root.join(id.0.to_string()).join("metadata.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice::<MeetingMeta>(&bytes) {
+            Ok(meta) => (meta.processing, meta.deletion),
+            Err(error) => {
+                tracing::warn!(
+                    target: "sync",
+                    meeting_id = %id.0,
+                    %error,
+                    "discovery: metadata.json parse failed; advertising defaults"
+                );
+                (ProcessingLifecycle::default(), DeletionState::default())
+            }
+        },
+        Err(_) => (ProcessingLifecycle::default(), DeletionState::default()),
+    }
 }
 
 /// Encode an entry list as one JSON frame body.
@@ -187,6 +221,7 @@ mod tests {
         DiscoveryEntry {
             meeting_id: MeetingId::new(),
             processing,
+            deletion: DeletionState::default(),
         }
     }
 
@@ -230,5 +265,15 @@ mod tests {
             read_local_processing(tmp.path(), id),
             ProcessingLifecycle::Local
         );
+    }
+
+    #[test]
+    fn read_local_state_defaults_to_not_deleted_when_metadata_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let id = MeetingId::new();
+        std::fs::create_dir(tmp.path().join(id.0.to_string())).expect("mk dir");
+        let (processing, deletion) = read_local_state(tmp.path(), id);
+        assert_eq!(processing, ProcessingLifecycle::Local);
+        assert_eq!(deletion, DeletionState::default());
     }
 }

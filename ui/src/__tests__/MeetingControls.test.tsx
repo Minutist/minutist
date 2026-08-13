@@ -199,10 +199,11 @@ describe("MeetingControls", () => {
   it("RECORD calls createMeeting+open when idle with no draft, and stop when recording", async () => {
     const createMeeting = vi.fn().mockResolvedValue("new-draft-uuid");
     const open = vi.fn().mockResolvedValue(undefined);
+    const refresh = vi.fn().mockResolvedValue(undefined);
     const stop = vi.fn();
     act(() => {
       useRecordingStore.setState({ createMeeting, stop });
-      useMeetingsStore.setState({ open });
+      useMeetingsStore.setState({ open, refresh });
     });
 
     setRecordingState({ kind: "idle" });
@@ -213,6 +214,10 @@ describe("MeetingControls", () => {
     });
     expect(createMeeting).toHaveBeenCalledTimes(1);
     expect(open).toHaveBeenCalledWith("new-draft-uuid");
+    // The masthead's title-editing affordance reads the meetings LIST, not
+    // `openMeetingState` — the new draft must be refreshed into it so the
+    // prep screen can show it immediately.
+    expect(refresh).toHaveBeenCalledTimes(1);
     unmount();
 
     setRecordingState({

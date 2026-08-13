@@ -101,6 +101,7 @@ fn write_synthetic_meeting(root: &Path, title: &str, first_text: &str) -> Meetin
         processing: Default::default(),
         collection_id: None,
         recording_started: true,
+        deletion: Default::default(),
         app_version: "0.0.0".into(),
     };
     std::fs::write(

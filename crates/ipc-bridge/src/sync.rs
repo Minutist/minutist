@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use minutist_common::{AppError, AppResult, MeetingId, SyncStatus};
+use minutist_common::{AppError, AppResult, HostRef, MeetingId, SyncStatus};
 
 use crate::IpcState;
 use tauri::State;
@@ -42,6 +42,16 @@ pub trait SyncControl: Send + Sync {
     /// The sync engine's current live state. Never errors — a disabled engine
     /// reports [`SyncStatus::Disabled`].
     async fn status(&self) -> SyncStatus;
+
+    /// This device's identity for cross-device merge arbitration — stamped on
+    /// a meeting's [`minutist_common::DeletionState`] by [`crate::commands::delete_meeting`]
+    /// / `restore_meeting`, mirroring the production `HostRef(endpoint_id().to_string())`
+    /// shape `crates/election` uses for `ProcessingClaim`. Infallible — a
+    /// soft-delete/restore must succeed even while the engine is mid-dial or
+    /// disabled: [`DisabledSync`] returns a fixed placeholder (there is nothing
+    /// to disambiguate against when this device never syncs), and a connected
+    /// implementation whose engine has not yet bound does the same.
+    async fn host_ref(&self) -> HostRef;
 
     /// This device's shareable endpoint ticket: a string the user copies to
     /// another of their devices so it can dial this one. Carries this device's
@@ -101,6 +111,11 @@ const SYNC_UNAVAILABLE: &str = "sync not available in this build";
 impl SyncControl for DisabledSync {
     async fn status(&self) -> SyncStatus {
         SyncStatus::Disabled
+    }
+
+    async fn host_ref(&self) -> HostRef {
+        // Never compared against another device's — this build never syncs.
+        HostRef("local".to_string())
     }
 
     async fn my_ticket(&self) -> AppResult<String> {

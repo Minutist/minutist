@@ -75,7 +75,11 @@ in git log and `planning/journal.md`, not here.
   `ProcessingClaim`, and `HostRef` are owned by `common`. `HostRef` is an
   opaque device key — the seam that keeps `iroh` out of `common`; `sync` maps
   it to/from `iroh::EndpointId` at the wire boundary. Transport is `sync`'s
-  domain (systems-engineer).
+  domain (systems-engineer). `DeletionState` (the trash soft-delete field,
+  `MeetingMeta.deletion`) rides the same Discovery stream alongside
+  `ProcessingLifecycle`, under the same ownership split and the same
+  no-new-dependency-edge constraint — see `crates/notes-crdt/src/lib.rs`'s
+  module doc.
 - **Per-meeting `metadata.json` write lock.** `persistence::meeting_ops`
   owns the guarded RMW helper; `orchestrator` and `agent-tools`
   (systems-engineer) route their metadata writes through it rather than

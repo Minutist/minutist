@@ -273,6 +273,7 @@ fn write_synthetic_meeting(
         processing: Default::default(),
         collection_id: None,
         recording_started: true,
+        deletion: Default::default(),
         app_version: "0.0.0".into(),
     };
     let meta_json = serde_json::to_vec_pretty(&meta).expect("serialise metadata");
@@ -504,9 +505,10 @@ fn stop_upsert_entry_has_no_excerpt_without_transcript() {
     assert!(entry.excerpt.is_none(), "no transcript → excerpt None");
 }
 
-/// `delete_meeting` removes the on-disk folder and the index row.
+/// `delete_meeting` (soft delete) leaves the folder in place; `purge_meeting`
+/// (the "Delete forever" path) removes the on-disk folder and the index row.
 #[tokio::test]
-async fn delete_meeting_removes_folder_and_index_row() {
+async fn delete_then_purge_meeting_removes_folder_and_index_row() {
     let tempdir = TempDir::new().expect("tempdir");
     let root = tempdir.path();
     let meeting_id =
@@ -515,11 +517,22 @@ async fn delete_meeting_removes_folder_and_index_row() {
     let index = seeded_index(root).await;
     assert_eq!(index.list_meetings().await.expect("list").len(), 1);
 
-    meeting_ops::delete_meeting(root, &index, meeting_id)
-        .await
-        .expect("delete");
+    meeting_ops::soft_delete_meeting(
+        root,
+        &index,
+        meeting_id,
+        minutist_common::HostRef("test-device".to_string()),
+    )
+    .await
+    .expect("soft delete");
 
     let meeting_dir = root.join(meeting_id.0.to_string());
+    assert!(meeting_dir.exists(), "soft delete must not remove the folder");
+
+    meeting_ops::purge_meeting(root, root, &index, None, meeting_id)
+        .await
+        .expect("purge");
+
     assert!(!meeting_dir.exists(), "folder must be removed");
     assert!(
         index.list_meetings().await.expect("list").is_empty(),

@@ -235,6 +235,14 @@ jobs:
       # System32 that wins over PATH entries and lacks the C-API exports our
       # build links (STATUS_ENTRYPOINT_NOT_FOUND at process start). Staging the
       # correct DLLs beside the exes is the only placement that always wins.
+      #
+      # ipc-bridge's test binary is the one crate that needs BOTH onnxruntime
+      # builds at once: sherpa-rs's (DirectML-EP, via asr-parakeet/diarizer)
+      # and ort's (via vad-chunker's vad-rs dep). Both ship a same-named
+      # onnxruntime.dll, and every workspace test binary shares this one
+      # deps dir, so only one copy can occupy it. sherpa-rs is listed last so
+      # its DirectML-capable build wins the overwrite — ort's plain build is
+      # missing the export sherpa's needs, not the other way round.
       - name: Build tests (Windows)
         if: runner.os == 'Windows'
         run: cargo build --workspace --tests --locked
@@ -244,7 +252,7 @@ jobs:
         shell: pwsh
         run: |
           $deps = "target\debug\deps"
-          $sources = @("$env:LOCALAPPDATA\sherpa-rs", "$env:LOCALAPPDATA\ort.pyke.io", "target\debug")
+          $sources = @("$env:LOCALAPPDATA\ort.pyke.io", "$env:LOCALAPPDATA\sherpa-rs", "target\debug")
           foreach ($root in $sources) {
             if (Test-Path $root) {
               Get-ChildItem -Path $root -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |

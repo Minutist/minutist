@@ -119,9 +119,13 @@ jobs:
       # audiopus_sys v0.2.2's bundled opus CMake tree requires
       # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.
       # Installing system Opus bypasses the vendored CMake build via pkg-config.
+      #
+      # The macOS runner image ships only Xcode's bundled clang, not Homebrew's
+      # llvm keg — bindgen (via llama-cpp-sys-2's build script) needs the
+      # latter's libclang.dylib, so it's installed explicitly here.
       - name: Install macOS system dependencies
         if: runner.os == 'macOS'
-        run: brew install opus
+        run: brew install opus llvm
 
       - name: Install Windows system dependencies (Opus)
         if: runner.os == 'Windows'
@@ -153,7 +157,7 @@ jobs:
       - name: Set LIBCLANG_PATH (macOS)
         if: runner.os == 'macOS'
         run: |
-          echo "LIBCLANG_PATH=$(brew --prefix llvm@18 2>/dev/null || brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
 
       - name: Set LIBCLANG_PATH (Windows)
         if: runner.os == 'Windows'

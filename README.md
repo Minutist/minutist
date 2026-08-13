@@ -5,9 +5,25 @@ transcribes them on-device, takes hand-typed notes alongside, summarises
 with a local LLM. Cross-platform (Windows / macOS / Linux).
 
 **Status:** in development. The full pipeline (record → transcribe → notes →
-summarise → opt-in diarize) is implemented across the workspace crates and the
-Tauri 2 + React app; native Windows/macOS/Linux builds run. Distribution
-(code-signing, auto-update) and on-hardware validation are the remaining work.
+summarise → opt-in diarize), the live in-meeting assistant, translation,
+image-attachment OCR, and cross-session voiceprints are implemented and have
+been manually verified on the maintainer's own hardware. Native Windows/macOS/
+Linux builds run. What remains: signed, published release builds for every
+platform (see "Release status" below) and broader on-hardware validation
+across more machines.
+
+### Release status
+
+Git tags up to the current version are internal development milestones, not
+all of them published releases; check the
+[Releases page](https://github.com/Minutist/minutist/releases) for what is
+actually downloadable. Right now that is a Linux AppImage (x86_64), built by
+`release.yml`; no code-signing secrets are configured yet, so it is
+unsigned. Windows (x64, NSIS/MSI) and macOS (Apple Silicon, arm64, macOS 12+,
+`.app`/DMG) release builds are still being brought up in CI; until a given
+platform has a published asset, building from source (see "Development"
+below) is the working install path for it. There is no ARM Linux or Intel
+macOS build.
 
 ## Architecture
 

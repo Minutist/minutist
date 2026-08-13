@@ -283,6 +283,32 @@ jobs:
             }
           Get-ChildItem -Path $deps -Filter "*.dll" | Select-Object -ExpandProperty Name
 
+      # Diagnostic: the hash dump above ruled out an onnxruntime.dll version
+      # mismatch (only one candidate exists at all in this build). Dump
+      # ipc-bridge's test exe's actual PE import table so we can see exactly
+      # which DLL and symbol the loader can't resolve (STATUS_ENTRYPOINT_NOT_FOUND
+      # is a link-time-import failure at process start, before any Rust code
+      # runs — no other workspace test binary imports the same native libs, so
+      # there's no working sibling to diff against).
+      - name: Dump ipc-bridge test exe's PE imports (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "target\debug\deps" -Filter "ipc_bridge-*.exe" |
+            Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "Inspecting $exe"
+          $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
+          if (-not $dumpbin) {
+            $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsPath = & $vswhere -latest -products * -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+            if ($vsPath) { $dumpbin = $vsPath }
+          }
+          if ($dumpbin) {
+            & $dumpbin /imports $exe
+          } else {
+            Write-Host "dumpbin not found"
+          }
+
       - name: cargo test --workspace
         if: runner.os != 'Linux'
         run: cargo test --workspace --locked

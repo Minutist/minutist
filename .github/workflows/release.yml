@@ -106,6 +106,16 @@ jobs:
           "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$sdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
+      # llama.cpp's vulkan-shaders-gen nested CMake sub-build fails under the
+      # MSBuild/Visual Studio generator ("could not load cache" / "cannot find
+      # batch label VCEnd"); Ninja sidesteps the .vcxproj custom-build-rule
+      # machinery. windows-latest ships Ninja preinstalled. Mirrors the same
+      # workaround in scripts/build-windows-app.ps1 for local builds.
+      - name: Set CMAKE_GENERATOR (Windows)
+        if: runner.os == 'Windows'
+        run: echo "CMAKE_GENERATOR=Ninja" >> "$env:GITHUB_ENV"
+        shell: pwsh
+
       # audiopus_sys v0.2.2's bundled opus CMake tree requires
       # cmake_minimum_required >= 3.5; CMake 3.27+ rejects older declarations.
       # Installing system Opus bypasses the vendored CMake build via pkg-config.

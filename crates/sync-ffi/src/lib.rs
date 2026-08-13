@@ -19,6 +19,19 @@
 //! - `sync::Error` is mapped to the coarse [`SyncFfiError`] categories so the
 //!   phone can tell a transient transport failure from a fatal protocol one.
 //!
+//! Beyond the transport surface, the wrapper owns the phone's authoritative
+//! LOCAL writes — [`FfiSyncEngine::save_captured`] and
+//! [`FfiSyncEngine::rename_meeting`] — because this crate has no `persistence`
+//! edge (issue 0016) and so cannot call `persistence::meeting_ops`. Each
+//! reimplements that module's semantics over `notes-crdt` primitives, including
+//! its lock ordering: the `metadata.json` read-modify-write (holding
+//! `metadata_lock`) completes and RELEASES before the meta-CRDT mirror (holding
+//! `notes_lock`) begins. Nesting them would invert the order the sync-receive
+//! projection path uses, which takes `metadata_lock` alone, and deadlock
+//! against it. These methods are local-only: they do not require a started
+//! engine, and the caller pushes the result with
+//! [`FfiSyncEngine::sync_notes`].
+//!
 //! Runtime — [`SyncEngine`] holds no tokio runtime (its accept loop is spawned
 //! under an ambient one) and the phone has no Tauri/ambient runtime, so the
 //! wrapper owns a multi-thread [`tokio::runtime::Runtime`]: synchronous FFI
@@ -403,6 +416,24 @@ impl FfiSyncEngine {
         )
     }
 
+    /// Rename a meeting held on this device, mirroring the new title into the
+    /// meta CRDT so it converges to every paired peer.
+    ///
+    /// `new_title` must be non-empty: the meta CRDT title is a live register, so
+    /// writing a blank one would blank a peer's real title on merge rather than
+    /// being ignored. Returns `SyncFfiError::Data` (`MeetingNotFound`) when this
+    /// device holds no `metadata.json` for `meeting_id` — renaming a meeting
+    /// this device does not have would otherwise seed a `notes.ydoc` for a
+    /// folder with nothing in it. Purely local and does not require a started
+    /// engine; the caller pushes the result to peers with [`Self::sync_notes`].
+    pub fn rename_meeting(
+        &self,
+        meeting_id: String,
+        new_title: String,
+    ) -> Result<(), SyncFfiError> {
+        rename_meeting_in(&self.meetings_root, &meeting_id, &new_title)
+    }
+
     /// Every meeting this device holds, projected to the phone model, newest
     /// first (by start time). A folder that fails to read is skipped, not fatal.
     pub fn list_meetings(&self) -> Result<Vec<FfiMeeting>, SyncFfiError> {
@@ -630,6 +661,45 @@ fn rfc3339_to_ms(s: &str) -> i64 {
     chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(0)
+}
+
+/// Rename a meeting on disk (the [`FfiSyncEngine::rename_meeting`] body,
+/// factored out for direct testing).
+fn rename_meeting_in(
+    meetings_root: &Path,
+    meeting_id: &str,
+    new_title: &str,
+) -> Result<(), SyncFfiError> {
+    let id = parse_meeting(meeting_id)?;
+    if new_title.is_empty() {
+        return Err(SyncFfiError::InvalidArg {
+            msg: "new_title must not be empty".to_string(),
+        });
+    }
+
+    // `metadata.json` is authoritative on this device; the meta CRDT is what
+    // carries the rename to peers. The two writes are sequential and NEVER
+    // nested: `update_metadata_if_present` holds `metadata_lock`,
+    // `edit_meta_ydoc` holds `notes_lock`, and the sync-receive projection path
+    // takes `metadata_lock` alone — nesting the notes lock inside the metadata
+    // lock here would invert that order and deadlock against it. Mirrors
+    // `persistence::meeting_ops::rename_meeting`, which this crate cannot call
+    // (no `persistence` edge — issue 0016).
+    let updated = notes_crdt::update_metadata_if_present(meetings_root, id, |meta| {
+        meta.title = new_title.to_string();
+    })?;
+    if updated.is_none() {
+        return Err(AppError::from(notes_crdt::Error::MeetingNotFound(id)).into());
+    }
+
+    notes_crdt::meta_crdt::edit_meta_ydoc(meetings_root, id, |doc| {
+        notes_crdt::meta_crdt::set_title(doc, new_title);
+    })?;
+
+    // Do NOT log `new_title` — a meeting title is user content (issue #0014
+    // privacy audit); the meeting id identifies the row for diagnostics.
+    tracing::info!(target: "sync-ffi", meeting_id = %id.0, "meeting renamed");
+    Ok(())
 }
 
 /// Write a captured-unprocessed meeting (the [`FfiSyncEngine::save_captured`] body,
@@ -1185,6 +1255,77 @@ mod tests {
             }
             other => panic!("expected Captured, got {other:?}"),
         }
+    }
+
+    /// `rename_meeting` updates `metadata.json` AND the meta CRDT, so the new
+    /// title is what a peer converges to — not just a local-only edit.
+    ///
+    /// The CRDT half is asserted the way a receiving peer actually reads it:
+    /// blank the on-disk title back, then run the receive-side projection
+    /// (`project_ydoc_meta_into_metadata`) and check the new title returns. If
+    /// `rename_meeting` only wrote `metadata.json`, the projection would restore
+    /// the STALE title and this fails.
+    #[test]
+    fn rename_meeting_writes_metadata_and_the_meta_crdt() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let id_str = save_captured_to(root, "old title", 1_000, 10, None, "notes").unwrap();
+        let id = MeetingId(Uuid::parse_str(&id_str).unwrap());
+        let folder = root.join(&id_str);
+
+        rename_meeting_in(root, &id_str, "new title").expect("rename");
+        assert_eq!(
+            notes_crdt::read_metadata(&folder).unwrap().title,
+            "new title",
+            "metadata.json is authoritative locally and must carry the rename"
+        );
+
+        notes_crdt::update_metadata(root, id, |m| m.title = "old title".to_string()).unwrap();
+        notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, id).expect("project");
+        assert_eq!(
+            notes_crdt::read_metadata(&folder).unwrap().title,
+            "new title",
+            "the rename must be mirrored into the meta CRDT, which is what converges to peers"
+        );
+    }
+
+    /// An empty `new_title` is rejected rather than written: the meta CRDT title
+    /// is a live register, so a blank one would blank a peer's real title on
+    /// merge instead of being ignored.
+    #[test]
+    fn rename_meeting_rejects_an_empty_title() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let id_str = save_captured_to(root, "keep me", 1_000, 10, None, "").unwrap();
+
+        assert!(matches!(
+            rename_meeting_in(root, &id_str, ""),
+            Err(SyncFfiError::InvalidArg { .. })
+        ));
+        assert_eq!(
+            notes_crdt::read_metadata(&root.join(&id_str)).unwrap().title,
+            "keep me",
+            "a rejected rename must not have written anything"
+        );
+    }
+
+    /// Renaming a meeting this device does not hold is an error, and creates
+    /// nothing — in particular no `notes.ydoc` for an otherwise-absent folder.
+    #[test]
+    fn rename_meeting_rejects_an_absent_meeting() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let missing = MeetingId::new().0.to_string();
+
+        assert!(rename_meeting_in(root, &missing, "whatever").is_err());
+        assert!(
+            !root.join(&missing).exists(),
+            "renaming an absent meeting must not materialise its folder"
+        );
+        assert!(matches!(
+            rename_meeting_in(root, "not-a-uuid", "whatever"),
+            Err(SyncFfiError::InvalidArg { .. })
+        ));
     }
 
     /// A `Processed` meeting with a transcript + summary projects as `Synced`, with

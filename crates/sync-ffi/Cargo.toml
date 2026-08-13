@@ -42,9 +42,10 @@ sync = { path = "../sync" }
 # boundary.
 minutist-common = { path = "../common" }
 # The C-free leaf the phone data layer rides: `MeetingFolder::ensure`,
-# `NotesStore`, and the lifted `read_metadata` / `write_metadata` /
-# `update_metadata_if_present` + `merge_processing` — so save / list / get +
-# lifecycle-apply stay off `persistence`'s C-heavy graph (issue 0016).
+# `NotesStore`, the lifted `read_metadata` / `write_metadata` /
+# `update_metadata_if_present` + `merge_processing`, and `meta_crdt`'s
+# `edit_meta_ydoc` / `set_title` — so save / list / get + lifecycle-apply +
+# rename stay off `persistence`'s C-heavy graph (issue 0016).
 notes-crdt = { path = "../notes-crdt" }
 # UniFFI binding generation. `cli` provides `uniffi_bindgen_main` for the
 # library-mode bindgen binary above.

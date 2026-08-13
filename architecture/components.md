@@ -81,7 +81,11 @@ independent workspace binary with no `app-main` edge.
 ¶ `sync-ffi` is the Android FFI wrapper over `sync` (phone companion):
 UniFFI-exposes `SyncEngine`'s transport surface to Kotlin, cross-compiled to
 `aarch64-linux-android`. Mobile-only; no edge from `app-main` or `headless`.
-Takes no workspace edge beyond `common`, `sync`, and `notes-crdt`. See
+Takes no workspace edge beyond `common`, `sync`, and `notes-crdt`. Because it
+has no `persistence` edge (issue 0016 — the phone stays off `persistence`'s
+C-heavy graph), the phone's authoritative local writes (capture, rename)
+reimplement `persistence::meeting_ops`' semantics over `notes-crdt` primitives
+rather than calling it, including its metadata-then-CRDT lock ordering. See
 `crates/sync-ffi/src/lib.rs`.
 
 The notes-sync / media-sync / derived-artifact wire protocols, the pairing

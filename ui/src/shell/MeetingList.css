@@ -243,6 +243,10 @@
   color: var(--stone-faint);
 }
 
+.meeting-list__purge-countdown {
+  color: var(--accent);
+}
+
 .meeting-list__excerpt {
   font-family: var(--font-text);
   font-size: 0.95rem;

@@ -58,6 +58,7 @@ fn seed_meeting(root: &Path) -> MeetingId {
         processing: ProcessingLifecycle::Local,
         collection_id: None,
         recording_started: true,
+        deletion: Default::default(),
         app_version: "0.0.0".into(),
     };
     write_metadata(folder.path(), &meta).expect("write metadata");

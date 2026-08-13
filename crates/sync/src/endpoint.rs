@@ -46,7 +46,7 @@ use iroh::{
     RelayUrl,
 };
 use iroh_tickets::endpoint::EndpointTicket;
-use minutist_common::{MeetingId, ProcessingLifecycle};
+use minutist_common::{DeletionState, MeetingId, ProcessingLifecycle};
 use tokio::sync::broadcast;
 
 use crate::account::{AccountEndpoint, RefreshSink};
@@ -97,14 +97,14 @@ pub struct SyncEngine {
     /// [`EndpointId`], so a consumer (including the mobile FFI wrapper) never
     /// needs an `iroh` type.
     peer_events: broadcast::Sender<String>,
-    /// Fires each `(MeetingId, ProcessingLifecycle)` received from a discovery
+    /// Fires each `(MeetingId, ProcessingLifecycle, DeletionState)` received from a discovery
     /// exchange ([`crate::discovery_proto`]). A consumer in a crate depending on
     /// both `sync` and `persistence` (ipc-bridge / headless) subscribes via
     /// [`Self::subscribe_lifecycle_events`] and persists each via
     /// `persistence::apply_processing_lifecycle` — `sync` has no `persistence`
     /// edge, so it emits rather than writes. Bounded; a consumer that hits
     /// [`broadcast::error::RecvError::Lagged`] recovers by re-running discovery.
-    lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
+    lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
 }
 
 /// Capacity of the peer-arrived broadcast channel. Small by design: a lagging hub
@@ -441,7 +441,7 @@ impl SyncEngine {
         meetings_root: &Path,
         peer_events: broadcast::Sender<String>,
         peer_arrivals: PeerArrivalTracker,
-        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
+        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
     ) -> Router {
         let blobs_protocol = iroh_blobs::BlobsProtocol::new(blobs.inner(), None);
         Router::builder(endpoint.clone())
@@ -807,7 +807,7 @@ impl SyncEngine {
     /// [`broadcast::error::RecvError::Lagged`] recovers by re-running discovery.
     pub fn subscribe_lifecycle_events(
         &self,
-    ) -> broadcast::Receiver<(MeetingId, ProcessingLifecycle)> {
+    ) -> broadcast::Receiver<(MeetingId, ProcessingLifecycle, DeletionState)> {
         self.lifecycle_events.subscribe()
     }
 
@@ -979,7 +979,7 @@ impl SyncEngine {
 
     /// Run a discovery exchange with `peer`: dial it on the [`SYNC_ALPN`] and run
     /// the initiator side ([`discovery_proto::initiate_discovery`]), learning the
-    /// peer's `(MeetingId, ProcessingLifecycle)` for every meeting it holds. Each
+    /// peer's `(MeetingId, ProcessingLifecycle, DeletionState)` for every meeting it holds. Each
     /// received state is emitted on the lifecycle-event surface
     /// ([`Self::subscribe_lifecycle_events`]) for the ipc-bridge / headless
     /// subscriber to persist via `persistence::apply_synced_lifecycle_if_present`;
@@ -1002,7 +1002,7 @@ impl SyncEngine {
         for entry in theirs {
             let _ = self
                 .lifecycle_events
-                .send((entry.meeting_id, entry.processing));
+                .send((entry.meeting_id, entry.processing, entry.deletion));
         }
         Ok(ids)
     }
@@ -1072,13 +1072,28 @@ impl SyncEngine {
     /// lifecycle is applied as-received. Notes are the anchor (they ensure the
     /// folder and carry the doc); media/artifacts ride best-effort. A per-meeting
     /// pull failure is logged and skipped so one bad meeting doesn't abort the set.
-    pub async fn adopt_from_peer(&self, peer_id: &str) -> Result<usize> {
+    ///
+    /// `is_purged` guards against resurrecting a permanently-deleted meeting: an
+    /// unheld id a peer still advertises is normally adopted (the peer is simply
+    /// ahead), but if THIS device already purged it, its absence is deliberate,
+    /// not a gap — pulling it back down would undo the purge from a peer that
+    /// merely hasn't caught up yet. `sync` has no `persistence` dependency, so
+    /// the caller (`headless`, which has both) supplies this from
+    /// `persistence::purged::PurgedStore::is_purged`. Not a concern for the
+    /// *soft*-deleted case: a trashed meeting's folder still exists and still
+    /// converges via the ordinary discovery/lifecycle exchange.
+    pub async fn adopt_from_peer(
+        &self,
+        peer_id: &str,
+        is_purged: &impl Fn(MeetingId) -> bool,
+    ) -> Result<usize> {
         let theirs = self.discover_with_peer(peer_id).await?;
         let mine = discovery_proto::list_meeting_ids(&self.meetings_root);
         let discovered = theirs.len();
         let mut adopted = 0usize;
         let mut recompleted = 0usize;
         let mut skipped_complete = 0usize;
+        let mut skipped_purged = 0usize;
         for meeting_id in theirs {
             // Skip a meeting only when it is already FULLY materialised locally —
             // NOT on mere folder existence. sync_notes creates the folder before
@@ -1092,6 +1107,10 @@ impl SyncEngine {
             let held = mine.contains(&meeting_id);
             if held && meeting_is_materialised(&self.meetings_root, meeting_id) {
                 skipped_complete += 1;
+                continue;
+            }
+            if !held && is_purged(meeting_id) {
+                skipped_purged += 1;
                 continue;
             }
             if let Err(e) = self.sync_notes_to_peer(peer_id, meeting_id).await {
@@ -1123,6 +1142,7 @@ impl SyncEngine {
             adopted,
             recompleted,
             skipped_complete,
+            skipped_purged,
             "adopt: pass complete for peer"
         );
         Ok(adopted)
@@ -1131,8 +1151,9 @@ impl SyncEngine {
     /// Adopt from every known peer NOT in failed-dial backoff — the hub's periodic
     /// replica sweep. Per-peer [`Self::adopt_from_peer`], relay-addressed like
     /// [`Self::discover_all`]. A per-peer failure is logged and skipped; returns
-    /// the total meetings newly adopted across all peers this sweep.
-    pub async fn adopt_all(&self) -> Result<usize> {
+    /// the total meetings newly adopted across all peers this sweep. `is_purged`
+    /// is threaded through to every [`Self::adopt_from_peer`] call — see its doc.
+    pub async fn adopt_all(&self, is_purged: &(impl Fn(MeetingId) -> bool + Sync)) -> Result<usize> {
         // Adopt from every peer CONCURRENTLY: a dead or slow peer (e.g. a
         // backgrounded phone whose dial runs the full timeout) must not delay the
         // sweep for the peers behind it — serialising the sweep let one unreachable
@@ -1140,7 +1161,7 @@ impl SyncEngine {
         // logged and contributes zero to the total.
         let counts = futures_util::future::join_all(self.peers_to_dial().into_iter().map(
             |peer| async move {
-                match self.adopt_from_peer(&peer.to_string()).await {
+                match self.adopt_from_peer(&peer.to_string(), is_purged).await {
                     Ok(n) => n,
                     Err(e) => {
                         tracing::warn!(target: "sync", peer = %peer, error = %e, "adopt sweep: peer discovery failed");
@@ -1417,9 +1438,9 @@ struct AcceptHook {
     /// Coalesces the burst of connections one sync session opens into a single
     /// [`Self::peer_events`] fire per visit — see [`PeerArrivalTracker`].
     peer_arrivals: PeerArrivalTracker,
-    /// Fires each `(MeetingId, ProcessingLifecycle)` received on an inbound
+    /// Fires each `(MeetingId, ProcessingLifecycle, DeletionState)` received on an inbound
     /// discovery exchange (see [`SyncEngine::subscribe_lifecycle_events`]).
-    lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
+    lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
 }
 
 impl AcceptHook {
@@ -1430,7 +1451,7 @@ impl AcceptHook {
         endpoint: Endpoint,
         peer_events: broadcast::Sender<String>,
         peer_arrivals: PeerArrivalTracker,
-        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle)>,
+        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
     ) -> Self {
         Self {
             meetings_root,
@@ -1555,7 +1576,7 @@ impl AcceptHook {
                 for entry in theirs {
                     let _ = self
                         .lifecycle_events
-                        .send((entry.meeting_id, entry.processing));
+                        .send((entry.meeting_id, entry.processing, entry.deletion));
                 }
                 Ok(())
             }

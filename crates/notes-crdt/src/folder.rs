@@ -223,6 +223,11 @@ impl MeetingFolder {
                 // guarantee this placeholder can make. See
                 // `MeetingMeta::recording_started`.
                 recording_started: true,
+                // Never adopted-and-deleted before the origin's real
+                // `deletion` state syncs in — the discovery exchange
+                // overwrites this with the source host's authoritative
+                // state, mirroring `processing` above.
+                deletion: Default::default(),
                 app_version: String::new(),
             };
             crate::write_metadata(&path, &placeholder)?;

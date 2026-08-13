@@ -74,9 +74,10 @@ async fn adopt_pulls_lacked_meetings_and_skips_held() {
     seed(dir_b.path(), m1, "meeting one"); // B already has m1
 
     // B adopts A: pulls m2 (lacked), skips m1 (held).
+    let never_purged = |_: MeetingId| false;
     let adopted = tokio::time::timeout(
         Duration::from_secs(30),
-        b.adopt_from_peer(&a.endpoint_id().to_string()),
+        b.adopt_from_peer(&a.endpoint_id().to_string(), &never_purged),
     )
     .await
     .expect("adopt timed out")
@@ -90,10 +91,67 @@ async fn adopt_pulls_lacked_meetings_and_skips_held() {
 
     // Idempotent: a second adopt pulls nothing new (B now holds all of A's).
     let again = b
-        .adopt_from_peer(&a.endpoint_id().to_string())
+        .adopt_from_peer(&a.endpoint_id().to_string(), &never_purged)
         .await
         .expect("second adopt failed");
     assert_eq!(again, 0, "a second adopt pulls nothing once B holds all of A's meetings");
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
+/// A meeting B already purged (recorded in its local purged set) must NOT be
+/// resurrected just because A still advertises it — the whole point of the
+/// purge-guard (`crates/persistence/src/purged.rs`'s design rationale).
+#[tokio::test]
+async fn adopt_never_resurrects_a_locally_purged_meeting() {
+    let (_relay_map, relay_url, _relay_guard) = iroh::test_utils::run_relay_server()
+        .await
+        .expect("spawn local test relay");
+    let relay_url = relay_url.to_string();
+    let relay: RelayUrl = relay_url.parse().expect("relay url parses");
+
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
+    let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
+
+    let cfg = |dir: &Path| SyncConfig {
+        relay_url: relay_url.clone(),
+        relay_auth_token: None,
+        meetings_root: dir.to_path_buf(),
+        backoff_policy: Default::default(),
+        relay_ips: Vec::new(),
+    };
+    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a)
+        .await
+        .expect("engine A binds");
+    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b)
+        .await
+        .expect("engine B binds");
+
+    a.add_peer(EndpointAddr::new(b.endpoint_id()).with_relay_url(relay.clone()));
+    b.add_peer(EndpointAddr::new(a.endpoint_id()).with_relay_url(relay.clone()));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // A still holds `m` (it hasn't caught up to the purge); B does not — and
+    // remembers, via `is_purged`, that its absence is deliberate.
+    let m = MeetingId(Uuid::new_v4());
+    seed(dir_a.path(), m, "purged meeting");
+    let purged_locally_on_b = |id: MeetingId| id == m;
+
+    let adopted = tokio::time::timeout(
+        Duration::from_secs(30),
+        b.adopt_from_peer(&a.endpoint_id().to_string(), &purged_locally_on_b),
+    )
+    .await
+    .expect("adopt timed out")
+    .expect("adopt failed");
+    assert_eq!(adopted, 0, "a purged id must never be re-adopted");
+    assert!(
+        !dir_b.path().join(m.0.to_string()).exists(),
+        "B must not have resurrected the purged meeting's folder"
+    );
 
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");

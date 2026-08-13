@@ -672,6 +672,57 @@ pub enum ProcessingLifecycle {
     Processed { processed_by: HostRef, at: String },
 }
 
+/// Whether a meeting is in the trash, persisted on [`MeetingMeta`]
+/// (`metadata.json`) and propagated to peers over the same discovery
+/// exchange as [`ProcessingLifecycle`] — device/lifecycle state, not
+/// user-authored content, so it does not live in the notes CRDT.
+///
+/// `version` is the merge-arbitration field: whichever device toggles
+/// delete/restore bumps it, and the higher `version` wins a peer merge; a tie
+/// (two devices toggling offline from the same base) breaks on the lowest
+/// `by` (`HostRef`), lexicographically — never on `changed_at`. Cross-device
+/// clock skew makes wall-clock ordering unreliable for a merge winner, the
+/// same reason [`ProcessingClaim`]'s timestamps are excluded from that
+/// role. `changed_at` is informational only: the purge-countdown display and
+/// the local purge-sweep's age check read it, but never the merge.
+///
+/// Default (`version: 0`) never wins against a real toggle (`version >= 1`),
+/// so an untouched meeting is unambiguously "not deleted" without a real
+/// timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct DeletionState {
+    pub deleted: bool,
+    pub version: u64,
+    pub by: HostRef,
+    /// RFC 3339 UTC, or empty for the never-touched default.
+    pub changed_at: String,
+}
+
+impl Default for DeletionState {
+    fn default() -> Self {
+        Self {
+            deleted: false,
+            version: 0,
+            by: HostRef(String::new()),
+            changed_at: String::new(),
+        }
+    }
+}
+
+impl DeletionState {
+    /// The `deleted_at` projection used throughout the app: `changed_at` when
+    /// deleted, `None` otherwise. The single source of truth for this
+    /// derivation — callers must not re-derive it inline.
+    pub fn deleted_at(&self) -> Option<String> {
+        self.deleted.then(|| self.changed_at.clone())
+    }
+}
+
+/// A soft-deleted meeting purges after this many days — the single source
+/// shared by the desktop and hub sweep timers.
+pub const TRASH_TTL_DAYS: i64 = 7;
+
 // ---------------------------------------------------------------------------
 // Meeting metadata
 // ---------------------------------------------------------------------------
@@ -752,6 +803,14 @@ pub struct MeetingMeta {
     /// should sync at all before it has real content.
     #[serde(default = "default_recording_started")]
     pub recording_started: bool,
+    /// Trash state. Host-authoritative in the same sense `processing` is —
+    /// propagated via the sync lifecycle exchange, merged by
+    /// `notes_crdt::merge_deletion`, never carried in the notes CRDT.
+    /// `#[serde(default)]` so existing `metadata.json` (written before the
+    /// field existed) reads as "not deleted", the same defaulted-field
+    /// pattern `processing`/`recording_started` use.
+    #[serde(default)]
+    pub deletion: DeletionState,
     pub app_version: String,
 }
 
@@ -794,6 +853,10 @@ pub struct MeetingListEntry {
     /// draft so the list can show it as resumable without a per-row disk read.
     #[serde(default = "default_recording_started")]
     pub recording_started: bool,
+    /// A derived mirror of [`MeetingMeta::deletion`]'s `changed_at`, present
+    /// only while the meeting is in the trash. `None` = active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
 }
 
 /// A user-facing "folder" that groups meetings (UI label: "Folders").
@@ -1326,6 +1389,11 @@ pub enum AppEvent {
     /// `StateChanged { Idle }`: the list refresh keys on the meeting being
     /// *ready on disk*, which is exactly when this fires.
     MeetingFinalised { meeting_id: MeetingId },
+    /// A peer device deleted or restored this meeting (its `DeletionState`
+    /// converged via the sync discovery exchange, `notes_crdt::merge_deletion`).
+    /// The webview refreshes the meeting list so the row moves into/out of
+    /// the Deleted bucket without waiting for an unrelated refresh.
+    MeetingDeletionChanged { meeting_id: MeetingId },
     /// An offline re-transcribe finished rewriting `transcript.json`. The webview
     /// re-reads the meeting's transcript (list excerpt + any open-meeting view),
     /// mirroring `DiarizationComplete`. Emitted by both the user-triggered
@@ -2545,6 +2613,7 @@ mod tests {
             processing: Default::default(),
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: "0.0.0".to_string(),
         };
         let json = serde_json::to_string(&m).unwrap();
@@ -2590,6 +2659,47 @@ mod tests {
     }
 
     #[test]
+    fn deletion_state_defaults_to_not_deleted() {
+        assert!(!DeletionState::default().deleted);
+        assert_eq!(DeletionState::default().version, 0);
+    }
+
+    #[test]
+    fn deletion_state_serde_round_trips() {
+        let state = DeletionState {
+            deleted: true,
+            version: 3,
+            by: HostRef("endpoint-abc".to_string()),
+            changed_at: "2026-08-12T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let back: DeletionState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
+    }
+
+    #[test]
+    fn meeting_meta_without_deletion_field_reads_as_not_deleted() {
+        // A `metadata.json` written before the field existed must deserialise
+        // as "not deleted" — the same no-migration `#[serde(default)]`
+        // contract `processing` uses.
+        let legacy = r#"{
+            "uuid": "00000000-0000-4000-8000-000000000000",
+            "title": "Legacy meeting",
+            "started_at": "2026-01-01T00:00:00Z",
+            "ended_at": null,
+            "duration_ms": 0,
+            "speaker_count": 0,
+            "audio_format": {"codec":"opus","sample_rate":16000,"channels":1,"bitrate_kbps":32},
+            "asr_model": null,
+            "llm_model": null,
+            "diarizer": null,
+            "app_version": "0.1.0"
+        }"#;
+        let meta: MeetingMeta = serde_json::from_str(legacy).unwrap();
+        assert!(!meta.deletion.deleted);
+    }
+
+    #[test]
     fn meeting_meta_without_processing_field_reads_as_local() {
         // A `metadata.json` written before the field existed must deserialise as
         // a locally-processed meeting — the `#[serde(default)]` no-migration
@@ -2622,6 +2732,7 @@ mod tests {
             excerpt: None,
             collection_id: None,
             recording_started: true,
+            deleted_at: None,
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(!json.contains("excerpt"), "absent excerpt must be omitted");
@@ -2652,6 +2763,7 @@ mod tests {
             processing: Default::default(),
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: "0.0.0".to_string(),
         };
         let segment = Segment {

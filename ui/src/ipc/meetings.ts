@@ -62,9 +62,26 @@ export async function setSpeakerName(
   return unwrap(await commands.setSpeakerName(meetingId, label, name));
 }
 
-/** Delete a meeting and its on-disk folder. */
+/**
+ * Move a meeting to the trash (soft delete) — recoverable via
+ * {@link restoreMeeting}, or permanently removed via {@link purgeMeeting}
+ * (manual "Delete forever" or the 7-day auto-purge sweep).
+ */
 export async function deleteMeeting(meetingId: MeetingId): Promise<void> {
   unwrap(await commands.deleteMeeting(meetingId));
+}
+
+/** Restore a trashed meeting — the mirror image of {@link deleteMeeting}. */
+export async function restoreMeeting(meetingId: MeetingId): Promise<void> {
+  unwrap(await commands.restoreMeeting(meetingId));
+}
+
+/**
+ * Permanently remove a trashed meeting ("Delete forever"): its folder, index
+ * row, voiceprint contributions, and blobs. NOT reversible.
+ */
+export async function purgeMeeting(meetingId: MeetingId): Promise<void> {
+  unwrap(await commands.purgeMeeting(meetingId));
 }
 
 /**

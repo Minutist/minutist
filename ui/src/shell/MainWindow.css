@@ -297,18 +297,19 @@
   font-family: var(--font-text);
   font-size: 0.78rem;
   letter-spacing: 0.02em;
-  color: var(--stone);
-  background: transparent;
-  border: 1px solid var(--rule);
+  color: var(--ink-soft);
+  background: var(--sheet);
+  border: 1px solid var(--rule-strong);
   border-radius: var(--radius);
   padding: 0.3rem 0.7rem;
   cursor: pointer;
-  transition: color 120ms ease, border-color 120ms ease;
+  transition: color 120ms ease, border-color 120ms ease, transform 120ms ease;
 }
 
 .main-window__header-btn:hover {
-  color: var(--ink-soft);
-  border-color: var(--rule-strong);
+  color: var(--ink);
+  border-color: var(--stone-faint);
+  transform: translateY(-1px);
 }
 
 /* --- Pane-visibility toggle (segmented) --------------------------------- */
@@ -454,37 +455,6 @@
 .model-download-status__download-btn:hover {
   background: var(--accent-soft);
   border-color: var(--accent-soft);
-}
-
-/* --- "New meeting" prep-draft banner ------------------------------------- */
-
-.main-window__draft-banner {
-  background: var(--sheet);
-  border: 1px solid var(--rule);
-  border-left: 3px solid var(--ink-soft);
-  border-radius: var(--radius);
-  color: var(--ink-soft);
-  padding: 0.5rem 0.75rem;
-  font-size: 0.85rem;
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.main-window__draft-banner-text {
-  flex: 1;
-  min-width: 0;
-}
-
-.main-window__draft-banner-discard {
-  flex: none;
-  background: transparent;
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  color: var(--ink-soft);
-  padding: 0.15rem 0.5rem;
-  font-size: 0.8rem;
-  cursor: pointer;
 }
 
 /* --- Error banner ------------------------------------------------------- */

@@ -54,6 +54,27 @@ export function formatSpeakers(count: number): string {
   return count === 1 ? "1 speaker" : `${count} speakers`;
 }
 
+/** The trash auto-purge TTL, mirroring the backend's `TRASH_TTL_DAYS`. */
+const TRASH_TTL_DAYS = 7;
+
+/**
+ * Days remaining before a trashed meeting auto-purges (never negative — a
+ * `deletedAt` past the TTL, e.g. mid-sweep, shows "Purges today" rather than
+ * a negative count).
+ */
+export function daysUntilPurge(deletedAt: string, ttlDays = TRASH_TTL_DAYS): number {
+  const elapsedMs = Date.now() - new Date(deletedAt).getTime();
+  const elapsedDays = elapsedMs / 86_400_000;
+  return Math.max(0, Math.ceil(ttlDays - elapsedDays));
+}
+
+/** Format the purge countdown for a trashed row's meta line. */
+export function formatPurgeCountdown(deletedAt: string): string {
+  const days = daysUntilPurge(deletedAt);
+  if (days <= 0) return "Purges today";
+  return days === 1 ? "Purges in 1 day" : `Purges in ${days} days`;
+}
+
 /**
  * "Move to…" popover: files the meeting into a folder (or Unfiled). A backdrop
  * button closes the menu on an outside click; the current folder is marked.
@@ -130,6 +151,8 @@ type MeetingRowProps = {
   onOpen: () => void;
   onRename: (title: string) => void;
   onDelete: () => void;
+  onRestore: () => void;
+  onPurge: () => void;
   onMove: (collectionId: CollectionId | null) => void;
 };
 
@@ -177,25 +200,36 @@ function MeetingRow(props: MeetingRowProps) {
       onSelect: () => props.onMove(c.id),
     })),
   ];
-  const menuEntries: ContextMenuEntry[] = [
-    { label: "Open", onSelect: props.onOpen },
-    { label: "Rename", onSelect: startRename },
-    { label: "Delete", onSelect: props.onDelete, danger: true },
-    {
-      kind: "submenu",
-      label: "Move to…",
-      items: moveItems,
-      emptyLabel: "No folders yet",
+  const isDeleted = !!meeting.deleted_at;
+  const openStorageFolderEntry: ContextMenuEntry = {
+    label: "Open storage folder",
+    onSelect: () => {
+      void openMeetingFolder(meeting.id).catch((err) => {
+        console.error("open_meeting_folder failed", err);
+      });
     },
-    {
-      label: "Open storage folder",
-      onSelect: () => {
-        void openMeetingFolder(meeting.id).catch((err) => {
-          console.error("open_meeting_folder failed", err);
-        });
-      },
-    },
-  ];
+  };
+  // A trashed row drops Rename/Move-to (managing a meeting on its way out is
+  // low value) in favour of Restore + the irreversible Delete forever.
+  const menuEntries: ContextMenuEntry[] = isDeleted
+    ? [
+        { label: "Open", onSelect: props.onOpen },
+        { label: "Restore", onSelect: props.onRestore },
+        { label: "Delete forever", onSelect: props.onPurge, danger: true },
+        openStorageFolderEntry,
+      ]
+    : [
+        { label: "Open", onSelect: props.onOpen },
+        { label: "Rename", onSelect: startRename },
+        { label: "Delete", onSelect: props.onDelete, danger: true },
+        {
+          kind: "submenu",
+          label: "Move to…",
+          items: moveItems,
+          emptyLabel: "No folders yet",
+        },
+        openStorageFolderEntry,
+      ];
 
   return (
     <li
@@ -203,7 +237,7 @@ function MeetingRow(props: MeetingRowProps) {
       // Drag the row onto a sidebar folder to file it (a parallel path to the
       // "Move to…" menu). Disabled while renaming so the inline input stays
       // usable. The drop target + the actual move live in CollectionsSidebar.
-      draggable={!renaming}
+      draggable={!renaming && !isDeleted}
       onDragStart={(e) => {
         if (e.dataTransfer) writeMeetingDrag(e.dataTransfer, meeting.id);
       }}
@@ -268,6 +302,16 @@ function MeetingRow(props: MeetingRowProps) {
             ·
           </span>
           <span>{formatSpeakers(meeting.speaker_count)}</span>
+          {meeting.deleted_at && (
+            <>
+              <span className="meeting-list__meta-dot" aria-hidden="true">
+                ·
+              </span>
+              <span className="meeting-list__purge-countdown">
+                {formatPurgeCountdown(meeting.deleted_at)}
+              </span>
+            </>
+          )}
         </p>
 
         {meeting.excerpt ? (
@@ -288,25 +332,46 @@ function MeetingRow(props: MeetingRowProps) {
         >
           Open
         </button>
-        <MoveMenu
-          current={meeting.collection_id}
-          collections={props.collections}
-          onMove={props.onMove}
-        />
-        <button
-          type="button"
-          className="meeting-list__action"
-          onClick={startRename}
-        >
-          Rename
-        </button>
-        <button
-          type="button"
-          className="meeting-list__action meeting-list__action--danger"
-          onClick={props.onDelete}
-        >
-          Delete
-        </button>
+        {isDeleted ? (
+          <>
+            <button
+              type="button"
+              className="meeting-list__action"
+              onClick={props.onRestore}
+            >
+              Restore
+            </button>
+            <button
+              type="button"
+              className="meeting-list__action meeting-list__action--danger"
+              onClick={props.onPurge}
+            >
+              Delete forever
+            </button>
+          </>
+        ) : (
+          <>
+            <MoveMenu
+              current={meeting.collection_id}
+              collections={props.collections}
+              onMove={props.onMove}
+            />
+            <button
+              type="button"
+              className="meeting-list__action"
+              onClick={startRename}
+            >
+              Rename
+            </button>
+            <button
+              type="button"
+              className="meeting-list__action meeting-list__action--danger"
+              onClick={props.onDelete}
+            >
+              Delete
+            </button>
+          </>
+        )}
       </div>
 
       {menu && (
@@ -328,6 +393,8 @@ export function MeetingList() {
   const open = useMeetingsStore((s) => s.open);
   const rename = useMeetingsStore((s) => s.rename);
   const remove = useMeetingsStore((s) => s.remove);
+  const restore = useMeetingsStore((s) => s.restore);
+  const purge = useMeetingsStore((s) => s.purge);
   const setCollection = useMeetingsStore((s) => s.setCollection);
 
   const collections = useCollectionsStore((s) => s.collections);
@@ -342,7 +409,7 @@ export function MeetingList() {
   const [query, setQuery] = useState("");
 
   const inFolder = meetings.filter((m) =>
-    meetingMatchesFilter(filter, m.collection_id),
+    meetingMatchesFilter(filter, m.collection_id, m.deleted_at),
   );
 
   // Client-side title/excerpt search over the folder-filtered set. Case-
@@ -365,7 +432,9 @@ export function MeetingList() {
         : "No meetings yet. Start a recording to begin."
       : q
         ? `No meetings match “${query.trim()}”.`
-        : "No meetings in this folder.";
+        : filter.kind === "deleted"
+          ? "Nothing in the trash."
+          : "No meetings in this folder.";
 
   // Count reads as a plain total normally, or "shown of total" while searching.
   const countLabel = q
@@ -407,6 +476,8 @@ export function MeetingList() {
                   onOpen={() => void open(meeting.id)}
                   onRename={(title) => void rename(meeting.id, title)}
                   onDelete={() => void remove(meeting.id)}
+                  onRestore={() => void restore(meeting.id)}
+                  onPurge={() => void purge(meeting.id)}
                   onMove={(collectionId) =>
                     void setCollection(meeting.id, collectionId)
                   }

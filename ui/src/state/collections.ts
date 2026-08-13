@@ -19,14 +19,21 @@ import { errorMessage } from "../lib/errors";
 
 export type { Collection, CollectionId };
 
-/** The active meeting-list folder filter. */
+/**
+ * The active meeting-list folder filter. `"deleted"` is the trash bucket
+ * (`MeetingListEntry.deleted_at` set) — mutually exclusive with the other
+ * three, which all implicitly exclude trashed meetings (see
+ * `meetingMatchesFilter`).
+ */
 export type CollectionFilter =
   | { kind: "all" }
   | { kind: "unfiled" }
-  | { kind: "collection"; id: CollectionId };
+  | { kind: "collection"; id: CollectionId }
+  | { kind: "deleted" };
 
 export const ALL_FILTER: CollectionFilter = { kind: "all" };
 export const UNFILED_FILTER: CollectionFilter = { kind: "unfiled" };
+export const DELETED_FILTER: CollectionFilter = { kind: "deleted" };
 
 export type CollectionsStore = {
   /** Folder definitions, ordered by position. */
@@ -109,13 +116,18 @@ export const useCollectionsStore = create<CollectionsStore>((set, get) => ({
 }));
 
 /**
- * Whether a meeting (by its `collection_id`) matches the active folder filter.
- * Pure — shared by the meeting list (row filtering) and tests.
+ * Whether a meeting (by its `collection_id` + `deleted_at`) matches the
+ * active folder filter. Pure — shared by the meeting list (row filtering)
+ * and tests. Every non-`"deleted"` filter implicitly excludes trashed
+ * meetings — the Deleted bucket is the only place they show.
  */
 export function meetingMatchesFilter(
   filter: CollectionFilter,
   collectionId: CollectionId | null | undefined,
+  deletedAt: string | null | undefined,
 ): boolean {
+  if (filter.kind === "deleted") return !!deletedAt;
+  if (deletedAt) return false;
   switch (filter.kind) {
     case "all":
       return true;

@@ -84,7 +84,7 @@ impl MeetingIndex {
         let rows = self
             .conn
             .query(
-                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started
+                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started, deleted_at
                  FROM meetings
                  ORDER BY started_at DESC",
                 (),
@@ -104,7 +104,7 @@ impl MeetingIndex {
         let rows = self
             .conn
             .query(
-                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started
+                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started, deleted_at
                  FROM meetings
                  WHERE title LIKE ?1 ESCAPE '\\' OR excerpt LIKE ?1 ESCAPE '\\'
                  ORDER BY started_at DESC",
@@ -126,8 +126,8 @@ impl MeetingIndex {
     async fn upsert_inner(&self, entry: &MeetingListEntry) -> Result<(), Error> {
         self.conn
             .execute(
-                "INSERT INTO meetings (id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO meetings (id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started, deleted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
                      title = excluded.title,
                      started_at = excluded.started_at,
@@ -135,7 +135,8 @@ impl MeetingIndex {
                      speaker_count = excluded.speaker_count,
                      excerpt = excluded.excerpt,
                      collection_id = excluded.collection_id,
-                     recording_started = excluded.recording_started",
+                     recording_started = excluded.recording_started,
+                     deleted_at = excluded.deleted_at",
                 libsql::params![
                     entry.id.0.to_string(),
                     entry.title.clone(),
@@ -145,10 +146,34 @@ impl MeetingIndex {
                     entry.excerpt.clone(),
                     entry.collection_id.map(|c| c.0.to_string()),
                     entry.recording_started as i64,
+                    entry.deleted_at.clone(),
                 ],
             )
             .await?;
         Ok(())
+    }
+
+    /// Fetch the current index row for `id`, if any. Used to patch a single
+    /// field (e.g. `deleted_at`) onto the existing row without re-deriving
+    /// the whole entry from disk (which would re-read `metadata.json` and
+    /// re-run `derive_excerpt`'s transcript/summary scan for no reason).
+    pub async fn get(&self, id: MeetingId) -> AppResult<Option<MeetingListEntry>> {
+        Ok(self.get_inner(id).await?)
+    }
+
+    async fn get_inner(&self, id: MeetingId) -> Result<Option<MeetingListEntry>, Error> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, title, started_at, duration_ms, speaker_count, excerpt, collection_id, recording_started, deleted_at
+                 FROM meetings WHERE id = ?1",
+                libsql::params![id.0.to_string()],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row_to_entry(&row)?)),
+            None => Ok(None),
+        }
     }
 
     /// Delete the index row for `id`. A no-op if the row is absent.
@@ -470,6 +495,7 @@ fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> 
         excerpt,
         collection_id: meta.collection_id,
         recording_started: meta.recording_started,
+        deleted_at: meta.deletion.deleted_at(),
     })
 }
 
@@ -541,6 +567,9 @@ fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error
         // Orphan recovery only fires when audio or a transcript already
         // exists on disk — never a draft.
         recording_started: true,
+        // A recovered recording is never in the trash — nothing purged this
+        // orphan (it still has on-disk data to recover).
+        deletion: Default::default(),
     };
 
     crate::metadata::write_metadata_to_path(&folder.join("metadata.json"), &meta)
@@ -637,6 +666,8 @@ fn row_to_entry(row: &libsql::Row) -> Result<MeetingListEntry, Error> {
     let collection_id: Option<String> = row.get(6)?;
     let collection_id = collection_id.as_deref().map(parse_collection_id).transpose()?;
     let recording_started: i64 = row.get(7)?;
+    // `deleted_at` is nullable (NULL = active).
+    let deleted_at: Option<String> = row.get(8)?;
 
     Ok(MeetingListEntry {
         id,
@@ -647,6 +678,7 @@ fn row_to_entry(row: &libsql::Row) -> Result<MeetingListEntry, Error> {
         excerpt,
         collection_id,
         recording_started: recording_started != 0,
+        deleted_at,
     })
 }
 
@@ -706,6 +738,7 @@ mod tests {
             excerpt: None,
             collection_id: None,
             recording_started: true,
+            deleted_at: None,
         }
     }
 

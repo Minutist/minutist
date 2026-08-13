@@ -119,6 +119,7 @@ fn dummy_meta(id: MeetingId, duration_ms: u64) -> MeetingMeta {
         processing: Default::default(),
         collection_id: None,
         recording_started: true,
+        deletion: Default::default(),
         app_version: "0.0.0-test".to_string(),
     }
 }
@@ -1504,6 +1505,9 @@ async fn test_index_prior_schema_migrates_without_data_loss() {
     assert_eq!(meetings.len(), 1, "legacy row must survive forward migration");
     assert_eq!(meetings[0].title, "Legacy meeting");
     assert_eq!(meetings[0].excerpt.as_deref(), Some("legacy excerpt"));
+    // Migration 4 (`deleted_at`) must default every pre-existing row to
+    // active, not accidentally trash it.
+    assert_eq!(meetings[0].deleted_at, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,6 +1525,7 @@ fn list_entry(title: &str, started_at: &str) -> minutist_common::MeetingListEntr
         excerpt: Some(format!("{title} excerpt")),
         collection_id: None,
         recording_started: true,
+        deleted_at: None,
     }
 }
 
@@ -1907,8 +1912,54 @@ async fn test_rename_meeting_updates_folder_and_index() {
     assert!(err.is_err(), "renaming an absent meeting must error");
 }
 
+/// `soft_delete_meeting` moves a meeting to the trash without touching the
+/// folder; `restore_meeting` brings it back out — recovery is real, not a
+/// lie, because nothing destructive happens until `purge_meeting`.
 #[tokio::test]
-async fn test_delete_meeting_removes_folder_and_index() {
+async fn test_soft_delete_then_restore_leaves_the_folder_untouched() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = write_synthetic_meeting(
+        root,
+        "To trash",
+        "2026-06-01T09:00:00Z",
+        &[make_segment(0, 500, "bye")],
+        None,
+        None,
+    );
+    let folder_dir = root.join(id.0.to_string());
+    let audio_bytes_before = std::fs::read(folder_dir.join("audio.opus")).ok();
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    index.rebuild_from_disk(root).await.expect("rebuild");
+
+    let by = minutist_common::HostRef("device-a".to_string());
+    crate::meeting_ops::soft_delete_meeting(root, &index, id, by.clone())
+        .await
+        .expect("soft delete");
+
+    assert!(folder_dir.exists(), "soft delete must not remove the folder");
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 1, "soft-deleted row stays in the index");
+    assert!(listed[0].deleted_at.is_some(), "deleted_at must be set");
+
+    crate::meeting_ops::restore_meeting(root, &index, id, by)
+        .await
+        .expect("restore");
+
+    assert!(folder_dir.exists());
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed[0].deleted_at, None, "restore must clear deleted_at");
+    assert_eq!(
+        std::fs::read(folder_dir.join("audio.opus")).ok(),
+        audio_bytes_before,
+        "restore must not have touched the audio bytes"
+    );
+}
+
+#[tokio::test]
+async fn test_purge_meeting_removes_folder_and_index() {
     let tempdir = TempDir::new().expect("tempdir");
     let root = tempdir.path();
 
@@ -1925,9 +1976,10 @@ async fn test_delete_meeting_removes_folder_and_index() {
     index.rebuild_from_disk(root).await.expect("rebuild");
     assert_eq!(index.list_meetings().await.expect("list").len(), 1);
 
-    crate::meeting_ops::delete_meeting(root, &index, id)
+    let voiceprints = crate::VoiceprintStore::open(":memory:").await.expect("open voiceprints");
+    crate::meeting_ops::purge_meeting(root, root, &index, Some(&voiceprints), id)
         .await
-        .expect("delete");
+        .expect("purge");
 
     let folder_dir = root.join(id.0.to_string());
     assert!(!folder_dir.exists(), "meeting folder not removed");
@@ -1935,11 +1987,113 @@ async fn test_delete_meeting_removes_folder_and_index() {
         index.list_meetings().await.expect("list").is_empty(),
         "index row not removed"
     );
+    assert!(
+        crate::purged::PurgedStore::is_purged(root, id).expect("is_purged"),
+        "purge must record a tombstone"
+    );
 
-    // Deleting again (folder + row both gone) is a no-op, not an error.
-    crate::meeting_ops::delete_meeting(root, &index, id)
+    // Purging again (folder + row both gone) is a no-op, not an error.
+    crate::meeting_ops::purge_meeting(root, root, &index, Some(&voiceprints), id)
         .await
-        .expect("delete idempotent");
+        .expect("purge idempotent");
+}
+
+/// `sweep_expired_deletions` purges rows past the TTL and leaves fresh ones —
+/// and never destroys a meeting whose `deleted_at` fails to parse.
+#[tokio::test]
+async fn test_sweep_expired_deletions_purges_only_past_ttl() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let stale = write_synthetic_meeting(root, "Stale trash", "2026-06-01T09:00:00Z", &[], None, None);
+    let fresh = write_synthetic_meeting(root, "Fresh trash", "2026-06-01T09:00:00Z", &[], None, None);
+    let kept = write_synthetic_meeting(root, "Never deleted", "2026-06-01T09:00:00Z", &[], None, None);
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    index.rebuild_from_disk(root).await.expect("rebuild");
+
+    let by = minutist_common::HostRef("device-a".to_string());
+    crate::meeting_ops::soft_delete_meeting(root, &index, stale, by.clone())
+        .await
+        .expect("soft delete stale");
+    crate::meeting_ops::soft_delete_meeting(root, &index, fresh, by)
+        .await
+        .expect("soft delete fresh");
+
+    // Backdate `stale`'s index row 8 days into the past (past the 7-day TTL);
+    // leave `fresh`'s `deleted_at` (just now) alone.
+    let mut stale_entry = index
+        .list_meetings()
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|e| e.id == stale)
+        .expect("stale entry present");
+    stale_entry.deleted_at = Some((chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339());
+    index.upsert(&stale_entry).await.expect("backdate stale");
+
+    let voiceprints = crate::VoiceprintStore::open(":memory:").await.expect("open voiceprints");
+    let purged = crate::meeting_ops::sweep_expired_deletions(root, root, &index, Some(&voiceprints), 7)
+        .await
+        .expect("sweep");
+
+    assert_eq!(purged, vec![stale]);
+    assert!(!root.join(stale.0.to_string()).exists(), "stale folder must be purged");
+    assert!(root.join(fresh.0.to_string()).exists(), "fresh trash must survive the sweep");
+    assert!(root.join(kept.0.to_string()).exists(), "a never-deleted meeting must survive the sweep");
+    let remaining_ids: Vec<_> = index
+        .list_meetings()
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|e| e.id)
+        .collect();
+    assert!(!remaining_ids.contains(&stale));
+    assert!(remaining_ids.contains(&fresh));
+    assert!(remaining_ids.contains(&kept));
+}
+
+/// The hub's index-free counterpart: same TTL semantics, driven purely off
+/// each meeting's `metadata.json` (no `MeetingIndex` involved at all).
+#[tokio::test]
+async fn test_sweep_expired_deletions_no_index_purges_only_past_ttl() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let stale = write_synthetic_meeting(root, "Stale trash", "2026-06-01T09:00:00Z", &[], None, None);
+    let fresh = write_synthetic_meeting(root, "Fresh trash", "2026-06-01T09:00:00Z", &[], None, None);
+    let kept = write_synthetic_meeting(root, "Never deleted", "2026-06-01T09:00:00Z", &[], None, None);
+
+    let by = minutist_common::HostRef("hub".to_string());
+    notes_crdt::update_metadata(root, stale, |meta| {
+        meta.deletion = minutist_common::DeletionState {
+            deleted: true,
+            version: 1,
+            by: by.clone(),
+            changed_at: (chrono::Utc::now() - chrono::Duration::days(8)).to_rfc3339(),
+        };
+    })
+    .expect("backdate stale");
+    notes_crdt::update_metadata(root, fresh, |meta| {
+        meta.deletion = minutist_common::DeletionState {
+            deleted: true,
+            version: 1,
+            by: by.clone(),
+            changed_at: chrono::Utc::now().to_rfc3339(),
+        };
+    })
+    .expect("mark fresh deleted");
+
+    let purged = crate::meeting_ops::sweep_expired_deletions_no_index(root, root, 7).expect("sweep");
+
+    assert_eq!(purged, vec![stale]);
+    assert!(!root.join(stale.0.to_string()).exists(), "stale folder must be purged");
+    assert!(root.join(fresh.0.to_string()).exists(), "fresh trash must survive the sweep");
+    assert!(root.join(kept.0.to_string()).exists(), "a never-deleted meeting must survive the sweep");
+    assert!(
+        crate::purged::PurgedStore::is_purged(root, stale).expect("is_purged"),
+        "purge must record a tombstone"
+    );
 }
 
 // ---------------------------------------------------------------------------

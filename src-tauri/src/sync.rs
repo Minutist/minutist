@@ -133,6 +133,11 @@ pub struct ConnectedSync {
     settings: SettingsHandle,
     app_data_base: PathBuf,
     meetings_dir: PathBuf,
+    /// The shared meeting index — handed to the lifecycle subscriber
+    /// (`ipc_bridge::spawn_lifecycle_subscriber`) so a synced deletion state
+    /// keeps `index.db`'s `deleted_at` mirror in step, exactly like the rest
+    /// of the app's writers.
+    index: Arc<ipc_bridge::MeetingIndex>,
     /// Guards [`Self::request_start`] so the engine is started at most once:
     /// construction with the connector already enabled, and a later runtime
     /// [`SyncControl::set_enabled`] (F5), both funnel through it — whichever
@@ -165,6 +170,7 @@ impl ConnectedSync {
         app_data_base: PathBuf,
         meetings_dir: PathBuf,
         election: Option<ElectionDeps>,
+        index: Arc<ipc_bridge::MeetingIndex>,
     ) -> Arc<Self> {
         let enabled = settings.current().connector_enabled;
         let this = Arc::new(Self {
@@ -178,6 +184,7 @@ impl ConnectedSync {
             settings,
             app_data_base,
             meetings_dir,
+            index,
             start_requested: AtomicBool::new(false),
             self_ref: OnceLock::new(),
         });
@@ -375,6 +382,8 @@ impl ConnectedSync {
                 ipc_bridge::spawn_lifecycle_subscriber(
                     engine.subscribe_lifecycle_events(),
                     subscriber_meetings_dir,
+                    Arc::clone(&self.index),
+                    self.event_tx.clone(),
                 );
 
                 // Producer-gate election loop (S4): claim + process the
@@ -481,6 +490,17 @@ impl ConnectedSync {
 impl SyncControl for ConnectedSync {
     async fn status(&self) -> SyncStatus {
         self.runtime.lock().await.status.clone()
+    }
+
+    async fn host_ref(&self) -> HostRef {
+        match self.runtime.lock().await.engine {
+            Some(ref engine) => HostRef(engine.endpoint_id().to_string()),
+            // Not yet bound (disabled, or the bind is still in flight): a
+            // fixed placeholder, mirroring `DisabledSync` — a soft-delete/
+            // restore performed in this brief window is vanishingly unlikely
+            // to race a peer's own toggle of the SAME meeting.
+            None => HostRef("local".to_string()),
+        }
     }
 
     async fn my_ticket(&self) -> AppResult<String> {
@@ -909,6 +929,11 @@ mod tests {
         let meetings = tempfile::TempDir::new().expect("meetings tempdir");
         let settings = connector_enabled_settings(app_data.path()).await;
         let (event_tx, events) = broadcast::channel(256);
+        let index = Arc::new(
+            ipc_bridge::MeetingIndex::open(":memory:")
+                .await
+                .expect("open in-memory index"),
+        );
 
         let sync = ConnectedSync::new(
             settings,
@@ -919,6 +944,7 @@ mod tests {
             // surface, not the producer-gate loop (which the crates/election tests
             // cover).
             None,
+            index,
         );
 
         let deadline = tokio::time::Instant::now() + BIND_TIMEOUT;

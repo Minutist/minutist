@@ -136,7 +136,13 @@ export function MeetingControls() {
     }
     if (recordAction === "new_meeting") {
       const meetingId = await createMeeting();
-      if (meetingId !== null) await openMeeting(meetingId);
+      if (meetingId !== null) {
+        await openMeeting(meetingId);
+        // The masthead (the draft's title-editing affordance) reads the
+        // meetings-LIST entry, not `openMeetingState` — refresh so the new
+        // draft is in that list the instant the prep screen renders.
+        await useMeetingsStore.getState().refresh();
+      }
       return;
     }
     // recordAction === "start": either promote the already-open draft, or

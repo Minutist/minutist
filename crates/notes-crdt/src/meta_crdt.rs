@@ -445,6 +445,7 @@ mod tests {
             processing: ProcessingLifecycle::PendingProcessing,
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: "0.1.0".to_string(),
         }
     }
@@ -480,6 +481,7 @@ mod tests {
             },
             collection_id: None,
             recording_started: true,
+            deletion: Default::default(),
             app_version: String::new(),
         }
     }

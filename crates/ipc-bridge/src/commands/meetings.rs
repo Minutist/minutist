@@ -134,35 +134,71 @@ pub async fn set_speaker_name(
     Ok(result)
 }
 
-/// Delete a meeting: removes the folder then the index row, then purges any
-/// voiceprint contributions that were derived from this meeting's audio (§4
-/// meeting-granularity erasure).
+/// Move a meeting to the trash: it stays fully recoverable — the folder,
+/// voiceprint contributions, and blobs are all left untouched — until
+/// [`restore_meeting`] brings it back or [`purge_meeting`] (manual or the
+/// 7-day auto-purge sweep) removes it for good.
 ///
-/// The voiceprint purge is best-effort: if the `VoiceprintStore` is not open
-/// (degraded-to-off) the step is skipped silently. The folder/index deletion
-/// runs first so a crash between the two steps leaves at most an orphaned
-/// voiceprint entry, not an orphaned meeting folder.
-///
-/// Routes to `persistence::meeting_ops::delete_meeting`.
+/// Routes to `persistence::meeting_ops::soft_delete_meeting`.
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_meeting(
     meeting_id: MeetingId,
     state: State<'_, IpcState>,
 ) -> AppResult<()> {
-    meeting_ops::delete_meeting(&state.meetings_dir, &state.index, meeting_id)
-        .await?;
+    meeting_ops::soft_delete_meeting(
+        &state.meetings_dir,
+        &state.index,
+        meeting_id,
+        state.connected.sync.host_ref().await,
+    )
+    .await
+}
 
-    // Purge voiceprint contributions derived from this meeting's audio.
-    if let Some(store) = state.voiceprints.as_ref().as_ref() {
-        if let Err(e) = store.forget_meeting(meeting_id).await {
-            tracing::warn!(
-                target: "ipc-bridge",
-                meeting_id = %meeting_id.0,
-                "voiceprint purge after meeting delete failed (best-effort): {e}"
-            );
-        }
-    }
+/// Restore a meeting out of the trash — the mirror image of [`delete_meeting`].
+///
+/// Routes to `persistence::meeting_ops::restore_meeting`.
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_meeting(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> AppResult<()> {
+    meeting_ops::restore_meeting(
+        &state.meetings_dir,
+        &state.index,
+        meeting_id,
+        state.connected.sync.host_ref().await,
+    )
+    .await
+}
+
+/// Permanently remove a meeting ("Delete forever" on a trashed row): the
+/// folder, its index row, its voiceprint contributions, and its blobs — then
+/// records a purged tombstone so a hub replica can never resurrect it from a
+/// slow peer (see `persistence::purged`). Unlike a soft delete, this is NOT
+/// reversible.
+///
+/// The voiceprint purge is best-effort: if the `VoiceprintStore` is not open
+/// (degraded-to-off) the step is skipped silently. The folder/index deletion
+/// runs first so a crash between the two steps leaves at most an orphaned
+/// voiceprint entry, not an orphaned meeting folder.
+///
+/// Routes to `persistence::meeting_ops::purge_meeting`.
+#[tauri::command]
+#[specta::specta]
+pub async fn purge_meeting(
+    meeting_id: MeetingId,
+    state: State<'_, IpcState>,
+) -> AppResult<()> {
+    meeting_ops::purge_meeting(
+        &state.meetings_dir,
+        app_data_root(&state),
+        &state.index,
+        state.voiceprints.as_ref().as_ref(),
+        meeting_id,
+    )
+    .await?;
 
     // Best-effort: unpin this meeting's blobs from the local blob store (a no-op
     // on the free build, or before the sync engine has started).
@@ -170,7 +206,7 @@ pub async fn delete_meeting(
         tracing::warn!(
             target: "ipc-bridge",
             meeting_id = %meeting_id.0,
-            "unpinning deleted meeting's blobs failed (best-effort): {e}"
+            "unpinning purged meeting's blobs failed (best-effort): {e}"
         );
     }
 

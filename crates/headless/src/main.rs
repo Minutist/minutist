@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use iroh_tickets::endpoint::EndpointTicket;
-use minutist_common::{AppError, AppResult, MeetingId, ProcessingLifecycle};
+use minutist_common::{AppError, AppResult, DeletionState, MeetingId, ProcessingLifecycle};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sync::{
@@ -98,6 +98,12 @@ const PEER_PUSH_DEBOUNCE: Duration = Duration::from_secs(15);
 /// (advertised before the meeting's folder had synced in) is eventually
 /// re-applied; override `MINUTIST_HUB_DISCOVERY_MS`.
 const DISCOVERY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Default interval for the trash auto-purge sweep (7-day TTL) — a hub-run
+/// meeting can age out with no desktop open; override
+/// `MINUTIST_HUB_TRASH_SWEEP_MS`. Mirrors the desktop's hourly wiring in
+/// `src-tauri/src/main.rs`.
+const TRASH_SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Interval between account-directory refreshes (fetch peer list + re-register
 /// endpoint). Same as the desktop's B4 wiring in `src-tauri/src/sync.rs`.
@@ -466,6 +472,21 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
 /// sha256 (hex) of a meeting's `notes.ydoc` PROJECTED to canonical JSON — stable
 /// across devices that have converged on the same content (the raw CRDT encoding
 /// differs by client history; the projection does not). `None` if no `notes.ydoc`.
+/// Snapshot the purged-tombstone set into memory and return a closure over
+/// it, for `adopt_all`/`adopt_from_peer`'s `is_purged` check.
+///
+/// A sweep checks many candidate ids against one snapshot, so reading
+/// `purged.json` once per sweep call (here) and checking the in-memory set
+/// per id is one file read instead of one per candidate id via repeated
+/// `PurgedStore::is_purged` calls. A tombstone-read failure fails OPEN (an
+/// empty set, so nothing is treated as purged) — a rare spurious
+/// resurrection is far cheaper than permanently starving a legitimate adopt
+/// on a transient read error.
+fn purged_lookup(data_dir: &Path) -> impl Fn(MeetingId) -> bool + Sync {
+    let ids = persistence::purged::PurgedStore::purged_ids(data_dir).unwrap_or_default();
+    move |id| ids.contains(&id)
+}
+
 fn meeting_digest(meetings_root: &Path, meeting: MeetingId) -> Option<String> {
     let state = notes_crdt::NotesStore::read_ydoc_state(meetings_root, meeting).ok()??;
     let doc = notes_crdt::ydoc::new_ydoc();
@@ -633,6 +654,11 @@ async fn serve_until_shutdown(
     let debounce = dur_or_env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", PEER_PUSH_DEBOUNCE);
     let mut discovery_poll =
         tokio::time::interval(dur_or_env("MINUTIST_HUB_DISCOVERY_MS", DISCOVERY_INTERVAL));
+    // Ticks immediately on the first `.tick()`, then every `TRASH_SWEEP_INTERVAL`
+    // — so a meeting deleted while the hub was offline is purged promptly on
+    // this run's first tick, not just on the hourly cadence thereafter.
+    let mut trash_sweep_poll =
+        tokio::time::interval(dur_or_env("MINUTIST_HUB_TRASH_SWEEP_MS", TRASH_SWEEP_INTERVAL));
     let mut peer_events = engine.subscribe_peer_events();
     let meetings_root = data_dir.join("meetings");
     let mut last_push: HashMap<_, Instant> = HashMap::new();
@@ -643,7 +669,7 @@ async fn serve_until_shutdown(
     // fn, so the task is aborted on shutdown rather than seeing `Closed` on its own.
     let lifecycle_task = tokio::spawn(apply_lifecycle_events(
         engine.subscribe_lifecycle_events(),
-        meetings_root,
+        meetings_root.clone(),
     ));
 
     // Pin the shutdown future ONCE so its signal handlers persist across loop
@@ -679,6 +705,12 @@ async fn serve_until_shutdown(
     };
     tokio::pin!(account_refresh);
 
+    // A meeting this hub already purged must never be re-adopted from a slow
+    // peer that hasn't caught up yet (see `persistence::purged`'s design
+    // rationale). A tombstone-read failure fails OPEN (treated as not-purged)
+    // — a rare spurious resurrection is far cheaper than permanently starving
+    // a legitimate adopt on a transient read error.
+
     'serve: loop {
         tokio::select! {
             _ = &mut shutdown => break 'serve,
@@ -687,15 +719,33 @@ async fn serve_until_shutdown(
             // exits (on cancel); under normal operation it parks here.
             _ = &mut account_refresh => {}
             _ = poll.tick() => { sync::peers::reload_into(&engine, data_dir, seen); },
+            _ = trash_sweep_poll.tick() => {
+                // Purge this hub's own expired trash. Blocking `std::fs` work run
+                // directly (not `spawn_blocking`): the hub has no dedicated worker
+                // pool and every other filesystem scan on this loop (`list_meeting_ids`
+                // via discovery, `reload_into`) is already called the same way.
+                match persistence::meeting_ops::sweep_expired_deletions_no_index(
+                    &meetings_root,
+                    data_dir,
+                    minutist_common::TRASH_TTL_DAYS,
+                ) {
+                    Ok(purged) if !purged.is_empty() => {
+                        tracing::info!(target: "hub", count = purged.len(), "trash auto-purge sweep");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(target: "hub", error = %e, "trash auto-purge sweep failed"),
+                }
+            }
             _ = discovery_poll.tick() => {
                 // Replica sweep: re-discover every known peer (re-applying a lifecycle
                 // a consumer dropped [Lagged] or skipped) AND pull every meeting the
                 // hub still lacks — the periodic backfill so a sometimes-online peer
                 // converges through the hub. Raced against shutdown, like the push arm.
                 // (The first, immediate tick is a no-op before peers load.)
+                let lookup = purged_lookup(data_dir);
                 tokio::select! {
                     _ = &mut shutdown => break 'serve,
-                    result = engine.adopt_all() => match result {
+                    result = engine.adopt_all(&lookup) => match result {
                         Ok(n) => tracing::debug!(target: "hub", adopted = n, "periodic replica sweep"),
                         Err(e) => tracing::warn!(target: "hub", error = %e, "periodic replica sweep failed"),
                     },
@@ -740,9 +790,10 @@ async fn serve_until_shutdown(
                     // account's meetings — the backfill direction (a hub that comes
                     // up after a device recorded must pull that device's history).
                     // Raced against shutdown like the push.
+                    let lookup = purged_lookup(data_dir);
                     tokio::select! {
                         _ = &mut shutdown => break 'serve,
-                        result = engine.adopt_from_peer(&peer) => match result {
+                        result = engine.adopt_from_peer(&peer, &lookup) => match result {
                             Ok(n) => tracing::info!(target: "hub", peer = %peer, adopted = n, "adopted meetings from arrived peer"),
                             Err(e) => tracing::warn!(target: "hub", peer = %peer, error = %e, "adopt from arrived peer failed"),
                         },
@@ -771,12 +822,12 @@ async fn serve_until_shutdown(
 /// `ipc-bridge`). `Lagged` is logged; the periodic `discover_all` sweep
 /// re-advertises and this drain re-applies — no self-triggered re-discovery.
 async fn apply_lifecycle_events(
-    mut lifecycle_events: broadcast::Receiver<(MeetingId, ProcessingLifecycle)>,
+    mut lifecycle_events: broadcast::Receiver<(MeetingId, ProcessingLifecycle, DeletionState)>,
     meetings_root: PathBuf,
 ) {
     loop {
         match lifecycle_events.recv().await {
-            Ok((meeting_id, processing)) => {
+            Ok((meeting_id, processing, deletion)) => {
                 match persistence::meeting_ops::apply_synced_lifecycle_if_present(
                     &meetings_root,
                     meeting_id,
@@ -787,6 +838,13 @@ async fn apply_lifecycle_events(
                     Ok(true) => {}
                     Ok(false) => tracing::debug!(target: "hub", meeting_id = %meeting_id.0, "synced lifecycle for a meeting not present locally; skipping (re-applied on a later discovery)"),
                     Err(e) => tracing::warn!(target: "hub", meeting_id = %meeting_id.0, error = %e, "failed to apply synced lifecycle"),
+                }
+                // The hub runs no `index.db` — unlike `persistence::meeting_ops`'s
+                // index-aware wrapper, call the leaf directly (nothing to mirror).
+                match notes_crdt::apply_synced_deletion_if_present(&meetings_root, meeting_id, deletion) {
+                    Ok(true) => {}
+                    Ok(false) => tracing::debug!(target: "hub", meeting_id = %meeting_id.0, "synced deletion state for a meeting not present locally; skipping"),
+                    Err(e) => tracing::warn!(target: "hub", meeting_id = %meeting_id.0, error = %e, "failed to apply synced deletion state"),
                 }
             }
             Err(RecvError::Lagged(dropped)) => {

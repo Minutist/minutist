@@ -94,7 +94,7 @@ async fn discovery_exchanges_meeting_list_and_lifecycle() {
 
     // A received B's meeting's lifecycle on the event surface — the Processed
     // state, proving the host-authoritative lifecycle crossed the wire.
-    let (id, processing) = timeout(Duration::from_secs(5), rx_a.recv())
+    let (id, processing, _deletion) = timeout(Duration::from_secs(5), rx_a.recv())
         .await
         .expect("A lifecycle event within timeout")
         .expect("A lifecycle event");
@@ -102,7 +102,7 @@ async fn discovery_exchanges_meeting_list_and_lifecycle() {
     assert_eq!(processing, processed, "A must receive B's Processed state");
 
     // B (the responder) symmetrically learned A's meeting (placeholder `Local`).
-    let (id_b_side, proc_b_side) = timeout(Duration::from_secs(5), rx_b.recv())
+    let (id_b_side, proc_b_side, _deletion_b_side) = timeout(Duration::from_secs(5), rx_b.recv())
         .await
         .expect("B lifecycle event within timeout")
         .expect("B lifecycle event");

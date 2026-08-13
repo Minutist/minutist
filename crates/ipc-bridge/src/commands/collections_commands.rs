@@ -8,15 +8,6 @@
 //! `collections.json` sits.
 use super::*;
 
-/// The app-data root (the dir holding `index.db`, `meetings/`, and
-/// `collections.json`), derived from the index path.
-fn app_data_root(state: &IpcState) -> &Path {
-    state
-        .index_db_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-}
-
 /// Max length for a user-set collection (folder) name. Bounds the persisted
 /// value so the UI cannot store an unbounded string (mirrors the speaker-name cap).
 const MAX_COLLECTION_NAME_LEN: usize = 128;

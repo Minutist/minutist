@@ -29,6 +29,8 @@ vi.mock("../ipc/meetings", () => ({
   renameMeeting: vi.fn().mockResolvedValue(undefined),
   setSpeakerName: vi.fn().mockResolvedValue({}),
   deleteMeeting: vi.fn().mockResolvedValue(undefined),
+  restoreMeeting: vi.fn().mockResolvedValue(undefined),
+  purgeMeeting: vi.fn().mockResolvedValue(undefined),
   reprocess: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("../ipc/summary", () => ({
@@ -44,6 +46,7 @@ import {
   meetingMatchesFilter,
   ALL_FILTER,
   UNFILED_FILTER,
+  DELETED_FILTER,
 } from "../state/collections";
 import { useMeetingsStore } from "../state/meetings";
 import * as collectionsIpc from "../ipc/collections";
@@ -92,17 +95,27 @@ function seedStores() {
 
 describe("meetingMatchesFilter", () => {
   it("matches All always, Unfiled only when no folder, and a folder by id", () => {
-    expect(meetingMatchesFilter(ALL_FILTER, "col-projects")).toBe(true);
-    expect(meetingMatchesFilter(ALL_FILTER, null)).toBe(true);
+    expect(meetingMatchesFilter(ALL_FILTER, "col-projects", null)).toBe(true);
+    expect(meetingMatchesFilter(ALL_FILTER, null, null)).toBe(true);
 
-    expect(meetingMatchesFilter(UNFILED_FILTER, null)).toBe(true);
-    expect(meetingMatchesFilter(UNFILED_FILTER, undefined)).toBe(true);
-    expect(meetingMatchesFilter(UNFILED_FILTER, "col-projects")).toBe(false);
+    expect(meetingMatchesFilter(UNFILED_FILTER, null, null)).toBe(true);
+    expect(meetingMatchesFilter(UNFILED_FILTER, undefined, undefined)).toBe(true);
+    expect(meetingMatchesFilter(UNFILED_FILTER, "col-projects", null)).toBe(false);
 
     const f = { kind: "collection", id: "col-projects" } as const;
-    expect(meetingMatchesFilter(f, "col-projects")).toBe(true);
-    expect(meetingMatchesFilter(f, "col-personal")).toBe(false);
-    expect(meetingMatchesFilter(f, null)).toBe(false);
+    expect(meetingMatchesFilter(f, "col-projects", null)).toBe(true);
+    expect(meetingMatchesFilter(f, "col-personal", null)).toBe(false);
+    expect(meetingMatchesFilter(f, null, null)).toBe(false);
+  });
+
+  it("a trashed meeting is excluded from All/Unfiled/a folder, and matches only Deleted", () => {
+    expect(meetingMatchesFilter(ALL_FILTER, "col-projects", "2026-08-01T00:00:00Z")).toBe(false);
+    expect(meetingMatchesFilter(UNFILED_FILTER, null, "2026-08-01T00:00:00Z")).toBe(false);
+    const f = { kind: "collection", id: "col-projects" } as const;
+    expect(meetingMatchesFilter(f, "col-projects", "2026-08-01T00:00:00Z")).toBe(false);
+
+    expect(meetingMatchesFilter(DELETED_FILTER, "col-projects", "2026-08-01T00:00:00Z")).toBe(true);
+    expect(meetingMatchesFilter(DELETED_FILTER, null, null)).toBe(false);
   });
 });
 
@@ -158,11 +171,12 @@ describe("CollectionsSidebar", () => {
     expect(screen.getByText("Projects")).toBeInTheDocument();
     expect(screen.getByText("Personal")).toBeInTheDocument();
     expect(screen.getByText("Unfiled")).toBeInTheDocument();
-    // Counts: 2 total, 1 in Projects, 0 in Personal, 1 unfiled.
+    expect(screen.getByText("Deleted")).toBeInTheDocument();
+    // Counts: 2 total, 1 in Projects, 0 in Personal, 1 unfiled, 0 deleted.
     const counts = screen
       .getAllByText(/^\d+$/)
       .map((n) => n.textContent);
-    expect(counts).toEqual(["2", "1", "0", "1"]);
+    expect(counts).toEqual(["2", "1", "0", "1", "0"]);
   });
 
   it("selecting a folder sets the filter", () => {
@@ -276,6 +290,77 @@ describe("MeetingList folder filtering + move", () => {
         "m2",
         "col-personal",
       ),
+    );
+  });
+});
+
+describe("MeetingList Deleted bucket", () => {
+  const TRASHED_MEETINGS = [
+    ...MEETINGS,
+    {
+      id: "m3",
+      title: "Trashed one",
+      started_at: "2026-05-01T09:00:00Z",
+      duration_ms: 10 * 60 * 1000,
+      speaker_count: 1,
+      excerpt: null,
+      collection_id: "col-projects",
+      deleted_at: new Date(Date.now() - 2 * 86_400_000).toISOString(),
+    },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(meetingsIpc.listMeetings).mockResolvedValue(TRASHED_MEETINGS);
+    vi.mocked(collectionsIpc.listCollections).mockResolvedValue([
+      PROJECTS,
+      PERSONAL,
+    ]);
+    act(() => {
+      useMeetingsStore.setState({
+        meetings: TRASHED_MEETINGS,
+        loading: false,
+        openMeetingId: null,
+        openMeetingState: null,
+        lastError: null,
+      });
+      useCollectionsStore.setState({
+        collections: [PROJECTS, PERSONAL],
+        filter: ALL_FILTER,
+        lastError: null,
+      });
+    });
+  });
+
+  it("a trashed meeting is hidden from All and shown only under Deleted, with a purge countdown", async () => {
+    render(<MeetingList />);
+    await screen.findByText("Launch sync");
+    // All: the trashed meeting is hidden even though it's still filed under Projects.
+    expect(screen.queryByText("Trashed one")).not.toBeInTheDocument();
+
+    act(() => {
+      useCollectionsStore.getState().select(DELETED_FILTER);
+    });
+    expect(await screen.findByText("Trashed one")).toBeInTheDocument();
+    expect(screen.queryByText("Launch sync")).not.toBeInTheDocument();
+    expect(screen.getByText(/Purges in \d+ days?/)).toBeInTheDocument();
+  });
+
+  it("Restore and Delete forever route through the meetings seam", async () => {
+    render(<MeetingList />);
+    act(() => {
+      useCollectionsStore.getState().select(DELETED_FILTER);
+    });
+    await screen.findByText("Trashed one");
+
+    fireEvent.click(screen.getByRole("button", { name: "Restore" }));
+    await waitFor(() =>
+      expect(meetingsIpc.restoreMeeting).toHaveBeenCalledWith("m3"),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete forever" }));
+    await waitFor(() =>
+      expect(meetingsIpc.purgeMeeting).toHaveBeenCalledWith("m3"),
     );
   });
 });

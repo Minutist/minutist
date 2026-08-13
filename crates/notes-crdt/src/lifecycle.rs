@@ -19,7 +19,7 @@
 use std::path::Path;
 
 use chrono::DateTime;
-use minutist_common::{AppResult, MeetingId, ProcessingLifecycle};
+use minutist_common::{AppResult, DeletionState, MeetingId, ProcessingLifecycle};
 
 use crate::metadata::update_metadata_if_present;
 
@@ -172,6 +172,59 @@ pub fn apply_synced_lifecycle_if_present(
     }
 }
 
+/// Merge an inbound (peer-advertised) [`DeletionState`] into the `current`
+/// local one, returning the winner.
+///
+/// Precedence: the higher `version` wins, so a device's toggle (delete or
+/// restore) always beats a stale prior advertisement. A tie — two devices
+/// toggling offline from the same base version — breaks on the lowest `by`
+/// (`HostRef`), lexicographically, the same clock-independent tiebreak
+/// convention [`merge_processing`] uses for `Claimed`/`Processed`; `changed_at`
+/// is never consulted here (display/purge-timing only).
+pub fn merge_deletion(current: &DeletionState, incoming: DeletionState) -> DeletionState {
+    match incoming.version.cmp(&current.version) {
+        std::cmp::Ordering::Greater => incoming,
+        std::cmp::Ordering::Less => current.clone(),
+        std::cmp::Ordering::Equal => {
+            if incoming.by.0 < current.by.0 {
+                incoming
+            } else {
+                current.clone()
+            }
+        }
+    }
+}
+
+/// Apply a peer-advertised [`DeletionState`] to a meeting we hold, or skip it
+/// if that meeting is not present locally yet.
+///
+/// Mirrors [`apply_synced_lifecycle_if_present`] exactly — same skip-if-absent
+/// shape, same guarded RMW via [`update_metadata_if_present`] — merging by
+/// [`merge_deletion`] instead of [`merge_processing`], so a stale inbound
+/// advertisement can never regress the local trash state.
+pub fn apply_synced_deletion_if_present(
+    meetings_root: &Path,
+    id: MeetingId,
+    deletion: DeletionState,
+) -> AppResult<bool> {
+    let merged = update_metadata_if_present(meetings_root, id, |meta| {
+        meta.deletion = merge_deletion(&meta.deletion, deletion);
+        meta.deletion.deleted
+    })?;
+    match merged {
+        Some(deleted) => {
+            tracing::info!(
+                target: "notes-crdt",
+                meeting_id = %id.0,
+                deleted,
+                "synced deletion state merged"
+            );
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +296,60 @@ mod tests {
     fn processed_tiebreak_is_lowest_hostref_convergent() {
         assert_eq!(merge_processing(&processed("b"), processed("a")), processed("a"));
         assert_eq!(merge_processing(&processed("a"), processed("b")), processed("a"));
+    }
+
+    fn deletion(deleted: bool, version: u64, by: &str) -> DeletionState {
+        DeletionState {
+            deleted,
+            version,
+            by: HostRef(by.to_string()),
+            changed_at: "2026-08-12T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The headline invariant: a lower-version inbound advertisement never
+    /// walks the local state backwards, regardless of `deleted`/`changed_at`.
+    #[test]
+    fn deletion_higher_version_always_wins() {
+        let current = deletion(true, 3, "a");
+        let stale = deletion(false, 2, "a");
+        assert_eq!(merge_deletion(&current, stale), current);
+
+        let current = deletion(false, 5, "a");
+        let fresher_restore = deletion(false, 6, "b");
+        assert_eq!(merge_deletion(&current, fresher_restore.clone()), fresher_restore);
+    }
+
+    /// A restore (higher version) beats a delete (lower version) just as
+    /// readily as the reverse — deletion is bidirectional, unlike
+    /// `ProcessingLifecycle`'s monotonic pipeline.
+    #[test]
+    fn deletion_restore_can_beat_delete_and_vice_versa() {
+        let deleted_v1 = deletion(true, 1, "a");
+        let restored_v2 = deletion(false, 2, "b");
+        assert_eq!(merge_deletion(&deleted_v1, restored_v2.clone()), restored_v2);
+
+        let restored_v1 = deletion(false, 1, "a");
+        let deleted_v2 = deletion(true, 2, "b");
+        assert_eq!(merge_deletion(&restored_v1, deleted_v2.clone()), deleted_v2);
+    }
+
+    /// Equal version (two devices toggling offline from the same base) breaks
+    /// on the lowest `HostRef`, never on `changed_at`.
+    #[test]
+    fn deletion_tiebreak_is_lowest_hostref_not_clock() {
+        let current = deletion(true, 4, "b");
+        let incoming = deletion(false, 4, "a");
+        assert_eq!(merge_deletion(&current, incoming.clone()), incoming);
+
+        let current = deletion(true, 4, "a");
+        let incoming = deletion(false, 4, "b");
+        assert_eq!(merge_deletion(&current, incoming), current);
+    }
+
+    #[test]
+    fn deletion_same_state_replay_is_idempotent() {
+        let current = deletion(true, 2, "a");
+        assert_eq!(merge_deletion(&current, current.clone()), current);
     }
 }

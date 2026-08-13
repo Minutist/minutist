@@ -1121,6 +1121,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                         embedder: embedder_cell.clone(),
                     },
                 }),
+                index.clone(),
             );
             #[cfg(not(feature = "connected"))]
             let sync_control: Arc<dyn ipc_bridge::SyncControl> = ipc_bridge::disabled_sync();
@@ -1194,6 +1195,33 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 let preload_handles = app.state::<IpcState>().chat_handles();
                 tauri::async_runtime::spawn(async move {
                     preload_handles.maybe_preload_summariser().await;
+                });
+            }
+
+            // Trash auto-purge sweep (7-day TTL): once at startup, then hourly for
+            // the life of the run. A meeting deleted while the app was closed is
+            // still purged promptly on the next launch; the hourly re-check covers a
+            // long-running session without needing a restart. Best-effort — a sweep
+            // failure is logged, never fatal (the next hourly tick, or the next
+            // launch, retries).
+            {
+                let sweep_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                    loop {
+                        interval.tick().await;
+                        match sweep_handle
+                            .state::<IpcState>()
+                            .run_trash_sweep(minutist_common::TRASH_TTL_DAYS)
+                            .await
+                        {
+                            Ok(purged) if !purged.is_empty() => {
+                                tracing::info!(target: "app-main", count = purged.len(), "trash auto-purge sweep");
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(target: "app-main", error = %e, "trash auto-purge sweep failed"),
+                        }
+                    }
                 });
             }
 

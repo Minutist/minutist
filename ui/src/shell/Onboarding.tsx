@@ -61,26 +61,29 @@ function ModelStep() {
     <div className="onboarding__body">
       <h1 className="onboarding__title">Models</h1>
       <p className="onboarding__lede">
-        Local models do the work: a speech model for the transcript and a
-        language model for summaries. The English &amp; European speech model
-        provides word-level timings; a separate multilingual model covers
-        Chinese, Japanese, Korean, Arabic, and more. Download what you need
-        now, or fetch it later from the main window.
+        Two downloads get you going: one speech model, plus the summarisation
+        model below. Download what you need now, or fetch it later from the
+        main window.
       </p>
-      {/* Per-model cards — each self-tracks progress / ready / retry. */}
+
+      <p className="onboarding__group-label">
+        Speech model — pick the one that matches your meetings
+      </p>
       <div className="onboarding__models">
         <ModelDownloadCard
           modelId={PARAKEET_MODEL_ID}
-          fallbackName="Speech model — English & European"
+          hint="English & European — word-level timings"
+          badge="Recommended"
         />
         <ModelDownloadCard
           modelId={ASR_MODEL_ID}
-          fallbackName="Speech model — other languages"
+          hint="Chinese, Japanese, Korean, Arabic & more"
         />
-        <ModelDownloadCard
-          modelId={LLM_MODEL_ID}
-          fallbackName="Summarisation model"
-        />
+      </div>
+
+      <p className="onboarding__group-label">Summary model</p>
+      <div className="onboarding__models">
+        <ModelDownloadCard modelId={LLM_MODEL_ID} />
       </div>
     </div>
   );
@@ -134,7 +137,7 @@ function SettingsStep() {
           <span>
             Identify speakers after recording
             <span className="onboarding__hint">
-              Identifies who spoke each line when a recording stops. On by
+              Identifies who spoke each line when a recording stops. Off by
               default.
             </span>
           </span>

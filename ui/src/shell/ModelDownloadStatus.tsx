@@ -3,11 +3,12 @@ import { useModelsStore } from "../state/models";
 /**
  * Per-model download surface.
  *
- * `ModelDownloadCard` renders one model's status (display name + size, a
+ * `ModelDownloadCard` renders one model's status (a role-first label such as
+ * "Speech (Parakeet)", the backend's technical name + size underneath, a
  * progress bar while downloading, an error + retry on failure, a "ready" tick
  * when present) and a Download button otherwise. It is model-agnostic — keyed
  * entirely by `modelId` against the models store, which tracks progress and
- * errors per id. Used for both the ASR model and the summarisation LLM.
+ * errors per id. Used for both the ASR models and the summarisation LLM.
  *
  * `ModelDownloadStatus` is the ASR-only wrapper the main window uses: it
  * self-hides once the ASR model is ready (the first-run prompt disappears).
@@ -21,6 +22,17 @@ export const PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3-int8";
 export const ASR_MODEL_ID = "qwen3-asr-0.6b-q8_0";
 export const LLM_MODEL_ID = "gemma-4-e4b-it-q4_k_m";
 
+// Role-first labels for the known models, keyed by id. The backend's
+// `display_name` is the raw model filename/variant (e.g. "Qwen3-ASR 0.6B
+// Q8_0") — useful as a technical detail, but not what a first-run user needs
+// to decide what to download. This is the label users see; it always takes
+// priority over the backend name.
+const MODEL_ROLE_LABELS: Record<string, string> = {
+  [PARAKEET_MODEL_ID]: "Speech (Parakeet)",
+  [ASR_MODEL_ID]: "Speech, other languages (Qwen)",
+  [LLM_MODEL_ID]: "Summarise / Chat (Gemma)",
+};
+
 function formatBytes(n: number): string {
   if (n <= 0) return "";
   const gb = n / 1_000_000_000;
@@ -30,10 +42,14 @@ function formatBytes(n: number): string {
 
 export function ModelDownloadCard({
   modelId,
-  fallbackName,
+  label,
+  hint,
+  badge,
 }: {
   modelId: string;
-  fallbackName?: string;
+  label?: string;
+  hint?: string;
+  badge?: string;
 }) {
   const models = useModelsStore((s) => s.models);
   const downloadInProgress = useModelsStore((s) => s.downloadInProgress);
@@ -43,7 +59,8 @@ export function ModelDownloadCard({
   const model = models.find((m) => m.id === modelId);
   const status = model?.status;
   const ready = status?.state === "available";
-  const displayName = model?.display_name ?? fallbackName ?? modelId;
+  const roleLabel = label ?? MODEL_ROLE_LABELS[modelId] ?? modelId;
+  const technicalName = model?.display_name;
   const inProgress = downloadInProgress[modelId];
   const downloadError = downloadErrors[modelId];
   const isDownloading =
@@ -68,17 +85,25 @@ export function ModelDownloadCard({
     <div
       className="model-download-status"
       role="region"
-      aria-label={`Model ${displayName}`}
+      aria-label={`Model ${roleLabel}`}
     >
       <p className="model-download-status__name">
-        <span className="model-download-status__display-name">{displayName}</span>
-        {sizeHint && (
-          <span className="model-download-status__size"> · {sizeHint}</span>
-        )}
+        <span className="model-download-status__display-name">{roleLabel}</span>
         {ready && (
           <span className="model-download-status__ready"> · ready</span>
         )}
+        {!ready && badge && (
+          <span className="model-download-status__badge">{badge}</span>
+        )}
       </p>
+      {hint && <p className="model-download-status__hint">{hint}</p>}
+      {(technicalName || sizeHint) && (
+        <p className="model-download-status__technical">
+          {technicalName && <span>{technicalName}</span>}
+          {technicalName && sizeHint && " · "}
+          {sizeHint && <span>{sizeHint}</span>}
+        </p>
+      )}
 
       {isDownloading && (
         <div
@@ -87,7 +112,7 @@ export function ModelDownloadCard({
           aria-valuenow={Math.round(progressFraction * 100)}
           aria-valuemin={0}
           aria-valuemax={100}
-          aria-label={`Downloading ${displayName}`}
+          aria-label={`Downloading ${roleLabel}`}
         >
           <div
             className="model-download-status__progress-bar"
@@ -121,5 +146,5 @@ export function ModelDownloadCard({
 export function ModelDownloadStatus() {
   const isAsrModelReady = useModelsStore((s) => s.isAsrModelReady);
   if (isAsrModelReady) return null;
-  return <ModelDownloadCard modelId={ASR_MODEL_ID} fallbackName="ASR Model" />;
+  return <ModelDownloadCard modelId={ASR_MODEL_ID} />;
 }

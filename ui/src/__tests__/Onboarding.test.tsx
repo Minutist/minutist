@@ -200,17 +200,22 @@ describe("onboarding step progression (Phase 7)", () => {
     expect(useOnboardingStore.getState().step).toBe("welcome");
 
     // → model. The two speech models (Parakeet primary + the broad-language
-    // Qwen) and the summarisation model are offered here (listModels is mocked
-    // empty, so the cards show their fallback names).
+    // Qwen) and the summarisation model are offered here, labelled by role
+    // (listModels is mocked empty, so no backend display_name is shown).
     act(() => fireEvent.click(screen.getByRole("button", { name: "Continue" })));
     expect(screen.getByText("Models")).toBeInTheDocument();
+    expect(screen.getByText("Speech (Parakeet)")).toBeInTheDocument();
     expect(
-      screen.getByText("Speech model — English & European"),
+      screen.getByText("Speech, other languages (Qwen)"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Summarise / Chat (Gemma)")).toBeInTheDocument();
+    expect(
+      screen.getByText("English & European — word-level timings"),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Speech model — other languages"),
+      screen.getByText("Chinese, Japanese, Korean, Arabic & more"),
     ).toBeInTheDocument();
-    expect(screen.getByText("Summarisation model")).toBeInTheDocument();
+    expect(screen.getByText("Recommended")).toBeInTheDocument();
     expect(useOnboardingStore.getState().step).toBe("model");
 
     // → settings (final step: primary becomes Finish).

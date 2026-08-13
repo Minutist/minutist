@@ -381,10 +381,19 @@
   color: var(--ink);
 }
 
-.model-download-status__size {
+.model-download-status__hint {
+  margin: 0.15rem 0 0;
   font-family: var(--font-text);
   font-weight: 400;
-  font-size: 0.8rem;
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+}
+
+.model-download-status__technical {
+  margin: 0.1rem 0 0;
+  font-family: var(--font-text);
+  font-weight: 400;
+  font-size: 0.78rem;
   color: var(--ink-soft);
 }
 
@@ -393,6 +402,19 @@
   font-weight: 400;
   font-size: 0.8rem;
   color: var(--accent);
+}
+
+.model-download-status__badge {
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  font-family: var(--font-text);
+  font-weight: 500;
+  font-size: 0.68rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent);
+  background: var(--accent-tint);
 }
 
 .model-download-status__error {

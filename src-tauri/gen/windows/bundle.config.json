@@ -1,0 +1,25 @@
+{
+  "publisher": "CN=REPLACE_WITH_PARTNER_CENTER_PUBLISHER_ID",
+  "publisherDisplayName": "Minutist",
+  "capabilities": {
+    "general": [
+      "internetClient"
+    ],
+    "device": [
+      "microphone"
+    ]
+  },
+  "extensions": {
+    "shareTarget": false,
+    "fileAssociations": [],
+    "protocolHandlers": []
+  },
+  "signing": {
+    "pfx": null,
+    "pfxPassword": null
+  },
+  "resourceIndex": {
+    "enabled": false,
+    "keepConfig": false
+  }
+}

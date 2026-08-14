@@ -247,14 +247,14 @@ jobs:
       # gathering evidence).
       - name: Build tests (Windows)
         if: runner.os == 'Windows'
-        run: cargo build --workspace --tests --locked
+        run: cargo build --workspace --tests --locked --release
 
       - name: Stage sherpa/onnxruntime DLLs beside test executables (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $deps = "target\debug\deps"
-          $sources = @("$env:LOCALAPPDATA\ort.pyke.io", "$env:LOCALAPPDATA\sherpa-rs", "target\debug")
+          $deps = "target\release\deps"
+          $sources = @("$env:LOCALAPPDATA\ort.pyke.io", "$env:LOCALAPPDATA\sherpa-rs", "target\release")
 
           # Diagnostic: dump every onnxruntime*.dll candidate (path, size, hash)
           # BEFORE the copy, so we can see whether the two caches actually
@@ -294,7 +294,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path "target\debug\deps" -Filter "ipc_bridge-*.exe" |
+          $exe = Get-ChildItem -Path "target\release\deps" -Filter "ipc_bridge-*.exe" |
             Select-Object -First 1 -ExpandProperty FullName
           Write-Host "Inspecting $exe"
           $dumpbin = Get-Command dumpbin -ErrorAction SilentlyContinue
@@ -311,32 +311,21 @@ jobs:
 
       # VCRUNTIME140D.dll/ucrtbased.dll/MSVCP140_1.dll in the import dump above
       # are the DEBUG CRT (only present with a full VS install, version-
-      # fragile) — a stronger lead than onnxruntime. Run the exe directly and
-      # pull the actual Windows Error Reporting record for the faulting module
-      # name, rather than inferring further from the static import table.
-      - name: Get authoritative crash cause for ipc-bridge test exe (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem -Path "target\debug\deps" -Filter "ipc_bridge-*.exe" |
-            Select-Object -First 1 -ExpandProperty FullName
-          $before = (Get-Date).AddSeconds(-5)
-          & $exe 2>&1 | Out-Null
-          Write-Host "Direct run exit code: $LASTEXITCODE"
-          Start-Sleep -Seconds 5
-          Write-Host "--- Application event log entries since direct run ---"
-          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $before } -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.Message -like "*ipc_bridge*" -or $_.ProviderName -like "*Application Error*" -or $_.Id -eq 1000
-            } |
-            ForEach-Object {
-              Write-Host "=== Event $($_.Id) [$($_.ProviderName)] ==="
-              Write-Host $_.Message
-            }
-
-      - name: cargo test --workspace
-        if: runner.os != 'Linux'
+      # fragile) — a stronger lead than onnxruntime. A direct run reproduces
+      # the crash instantly with no Application-log entry (STATUS_ENTRYPOINT_
+      # NOT_FOUND fails process *creation* itself, before WER's runtime-crash
+      # hook ever engages, so there is no faulting-module record to query).
+      # cc-rs links the debug CRT into any C/C++ shim it compiles whenever
+      # cargo's profile is dev/debug, unless overridden — testing whether
+      # building in --release (the universally-available /MD release CRT)
+      # avoids the dependency entirely.
+      - name: cargo test --workspace (macOS)
+        if: runner.os == 'macOS'
         run: cargo test --workspace --locked
+
+      - name: cargo test --workspace --release (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --locked --release
 
       - name: Install UI dependencies
         if: runner.os != 'Linux'

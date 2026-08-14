@@ -139,8 +139,24 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # sherpa-rs and ort download prebuilt shared libraries at build time into
+      # platform-specific cache dirs outside the cargo target tree (see the
+      # same note in build.yml). A `target/`-only cache hit can leave a build
+      # script's fingerprint "clean" without ever re-running it on a fresh
+      # runner, so its cached link-search paths point at files that were
+      # never actually downloaded here — a hard link failure (missing
+      # onnxruntime/cargs libs), not just a slow rebuild. Tying these dirs to
+      # the same cache key closes that gap.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.cache/sherpa-rs
+            ~/.cache/ort.pyke.io
+            ~/Library/Caches/sherpa-rs
+            ~/Library/Caches/ort.pyke.io
+            ~/AppData/Local/sherpa-rs
+            ~/AppData/Local/ort.pyke.io
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -301,8 +317,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # See the main release job's identically-named step: a target/-only
+      # cache hit can skip re-running a build script that would otherwise
+      # re-download these, leaving its cached link-search paths pointing at
+      # files that were never fetched on this runner.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/AppData/Local/sherpa-rs
+            ~/AppData/Local/ort.pyke.io
 
       # tauri-windows-bundle's default `--runner cargo` shells out to
       # `cargo tauri build`, which needs the tauri-cli subcommand on PATH.

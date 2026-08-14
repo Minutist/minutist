@@ -333,9 +333,19 @@ jobs:
       # src-tauri/ (this workspace has no root package.json). Uses the
       # lockfile-pinned devDependency (installed by npm ci above), not a
       # fresh npx registry fetch.
+      #
+      # -c src-tauri/tauri.msix.conf.json: bare `cargo tauri build` (unlike
+      # tauri-action's JS CLI) runs beforeBuildCommand with cwd = the
+      # frontendDist-derived directory (ui/), not the app root, so the shared
+      # "cd ui && npm run build" hook fails here with "can't cd to ui" (ui/ui/
+      # doesn't exist). This override drops the "cd ui" for this one
+      # invocation path only; the shared tauri.conf.json / tauri.windows.conf.json
+      # are untouched, so every other build path is unaffected. Verified
+      # locally: reproduces on Linux too, so it's a bare-CLI-vs-tauri-action
+      # cwd difference, not a Windows quirk.
       - name: Build MSIX bundle
         working-directory: ui
-        run: npx tauri-windows-bundle build --arch x64 --runner cargo --cargo-args "--features vulkan" --verbose
+        run: npx tauri-windows-bundle build --arch x64 --runner cargo --cargo-args "--features vulkan -c src-tauri/tauri.msix.conf.json" --verbose
 
       - name: Upload MSIX bundle artifact
         uses: actions/upload-artifact@v4

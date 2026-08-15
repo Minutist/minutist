@@ -272,19 +272,20 @@ jobs:
   windows-msix:
     name: windows msix (Store submission artifact)
     runs-on: windows-latest
-    # This job always does a cold build of llama-cpp-sys-2's vulkan-shaders-gen
-    # CMake sub-project (its --target x86_64-pc-windows-msvc flag puts it in
-    # a target-triple-suffixed build dir the main release leg's cache never
-    # warms), which hits "fatal error C1041: cannot open program database
-    # ... vc140.pdb" during CMake's own compiler-ABI TryCompile sanity check
-    # (CMakeTestCCompiler.cmake). That check runs before CMAKE_C_FLAGS/CFLAGS
-    # is threaded through, so /FS (which serialises writers to a shared PDB)
-    # never reaches this particular cl.exe invocation. /Z7 sidesteps the
-    # problem instead of racing around it: it embeds debug info in each .obj
-    # rather than a shared .pdb, so there's nothing to collide over.
+    # --target x86_64-pc-windows-msvc (needed so tauri-windows-bundle's cargo
+    # invocation matches its own target-triple-suffixed output dir) adds a
+    # `target\x86_64-pc-windows-msvc\` segment the main release leg's plain
+    # `target\release\` doesn't have. That's enough to push
+    # llama-cpp-sys-2's vulkan-shaders-gen CMake scratch paths over Windows'
+    # 260-char MAX_PATH, which cl.exe surfaces as "fatal error C1041: cannot
+    # open program database ... vc140.pdb" during CMake's compiler-ABI
+    # TryCompile — a generic "can't open this file" message, not the
+    # concurrent-writers case its text describes (CMAKE_C_FLAGS/CFLAGS never
+    # reaches that TryCompile at all, so /FS and /Z7 both had zero effect).
+    # A short CARGO_TARGET_DIR keeps every path under the build tree well
+    # clear of the limit.
     env:
-      CFLAGS: /Z7
-      CXXFLAGS: /Z7
+      CARGO_TARGET_DIR: C:\t
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -399,4 +400,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: minutist-windows-msix
-          path: '**/target/msix/*.msixbundle'
+          path: 'C:/t/msix/*.msixbundle'

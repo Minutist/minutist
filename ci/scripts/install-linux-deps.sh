@@ -14,8 +14,10 @@
 #   - AppImage bundling: libfuse2 xdg-utils file desktop-file-utils
 #   - Vulkan backend:    libvulkan-dev glslang-tools glslc
 #
-# glslc ships from the `shaderc` source package in Ubuntu's universe
-# component, so universe is enabled before the install.
+# glslc ships as its own package (Ubuntu 24.04+) or bundled under `shaderc`
+# (from Ubuntu's universe on releases that carry it) — 22.04 and earlier carry
+# neither, so this falls back to LunarG's Vulkan SDK repo, which ships the
+# same binary as `shaderc` there. See the glslc install below.
 #
 # Idempotent: re-running is a no-op when the packages are already present.
 set -euo pipefail
@@ -48,5 +50,21 @@ $SUDO apt-get install -y --no-install-recommends \
     file \
     desktop-file-utils \
     libvulkan-dev \
-    glslang-tools \
-    glslc
+    glslang-tools
+
+# glslc: Ubuntu 24.04+ packages it directly as `glslc`. Older releases (22.04
+# and earlier) never packaged it — under any name — so fall back to LunarG's
+# Vulkan SDK repo, which ships the same binary as `shaderc`.
+if $SUDO apt-get install -y --no-install-recommends glslc; then
+    :
+else
+    if [ ! -f /etc/apt/sources.list.d/lunarg-vulkan.list ]; then
+        codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+        wget -qO /tmp/lunarg-vulkan-key.asc https://packages.lunarg.com/lunarg-signing-key-pub.asc
+        $SUDO gpg --batch --yes --dearmor -o /usr/share/keyrings/lunarg-vulkan-keyring.gpg /tmp/lunarg-vulkan-key.asc
+        echo "deb [signed-by=/usr/share/keyrings/lunarg-vulkan-keyring.gpg] https://packages.lunarg.com/vulkan $codename main" |
+            $SUDO tee /etc/apt/sources.list.d/lunarg-vulkan.list
+        $SUDO apt-get update
+    fi
+    $SUDO apt-get install -y --no-install-recommends shaderc
+fi

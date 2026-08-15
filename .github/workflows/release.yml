@@ -265,6 +265,17 @@ jobs:
   windows-msix:
     name: windows msix (Store submission artifact)
     runs-on: windows-latest
+    # This job always does a cold build of llama-cpp-sys-2's vulkan-shaders-gen
+    # CMake sub-project (its --target x86_64-pc-windows-msvc flag puts it in
+    # a target-triple-suffixed build dir the main release leg's cache never
+    # warms), which hits a real CMake/MSVC race: concurrent cl.exe TryCompile
+    # sanity checks writing the same default vc140.pdb ("fatal error C1041:
+    # cannot open program database ... if multiple CL.EXE write to the same
+    # .PDB file, please use /FS"). CMake seeds its own compiler flags from
+    # CFLAGS/CXXFLAGS, so this forces per-TU PDBs everywhere in this job.
+    env:
+      CFLAGS: /FS
+      CXXFLAGS: /FS
     steps:
       - name: Checkout
         uses: actions/checkout@v4

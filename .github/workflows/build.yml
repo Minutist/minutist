@@ -152,9 +152,16 @@ jobs:
       # paths reference these dirs, the linker fails if the files are absent.
       # Including them ties their lifetime to the cargo cache key. Non-existent
       # paths are silently skipped by the action.
+      # The self-hosted Linux runners share the generic `Linux-x64` cache key
+      # regardless of which physical machine built it — one runner's cached
+      # objects can carry glibc-version-specific symbols another runner's
+      # older glibc can't satisfy at link time (STATUS_ENTRYPOINT_NOT_FOUND-
+      # style but for Linux: "undefined symbol: __isoc23_strtoll"). Add
+      # runner.name to the key so each machine gets its own cache namespace.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os == 'Linux' && runner.name || '' }}
           cache-directories: |
             ~/.cache/sherpa-rs
             ~/.cache/ort.pyke.io
@@ -326,9 +333,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # See the connected `build` job's identically-named step: disambiguate
+      # the cache per physical machine so one self-hosted runner's compiled
+      # objects (glibc-version-specific) never get restored onto another.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.name }}
           cache-directories: |
             ~/.cache/sherpa-rs
             ~/.cache/ort.pyke.io

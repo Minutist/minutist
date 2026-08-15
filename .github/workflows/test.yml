@@ -138,9 +138,16 @@ jobs:
       # paths reference these dirs, the linker (and the runtime loader) fails if
       # the .so/.dylib/.dll files are absent. Including them ties their lifetime
       # to the cargo cache key. Non-existent paths are silently skipped.
+      # The self-hosted Linux runners share the generic `Linux-x64` cache key
+      # regardless of which physical machine built it — one runner's cached
+      # objects can carry glibc-version-specific symbols another runner's
+      # older glibc can't satisfy at link time ("undefined symbol:
+      # __isoc23_strtoll" and friends). Add runner.name to the key so each
+      # machine gets its own cache namespace.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os == 'Linux' && runner.name || '' }}
           cache-directories: |
             ~/.cache/sherpa-rs
             ~/.cache/ort.pyke.io
@@ -456,9 +463,13 @@ jobs:
       # sherpa-rs and ort download prebuilt shared libraries at build time into
       # platform-specific cache dirs outside the cargo target tree. See the
       # same note in the test job's rust-cache step for the full explanation.
+      # See the test job's identically-named step: disambiguate the cache per
+      # physical machine so one self-hosted runner's compiled objects
+      # (glibc-version-specific) never get restored onto another.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os == 'Linux' && runner.name || '' }}
           cache-directories: |
             ~/.cache/sherpa-rs
             ~/.cache/ort.pyke.io

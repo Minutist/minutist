@@ -147,9 +147,16 @@ jobs:
       # never actually downloaded here — a hard link failure (missing
       # onnxruntime/cargs libs), not just a slow rebuild. Tying these dirs to
       # the same cache key closes that gap.
+      # The self-hosted Linux runners share the generic `Linux-x64` cache key
+      # regardless of which physical machine built it — one runner's cached
+      # objects can carry glibc-version-specific symbols another runner's
+      # older glibc can't satisfy at link time ("undefined symbol:
+      # __isoc23_strtoll" and friends). Add runner.name to the key so each
+      # machine gets its own cache namespace.
       - name: Cache cargo build + registry
         uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ runner.os == 'Linux' && runner.name || '' }}
           cache-directories: |
             ~/.cache/sherpa-rs
             ~/.cache/ort.pyke.io

@@ -161,7 +161,7 @@ jobs:
       - name: Set LIBCLANG_PATH (Linux)
         if: runner.os == 'Linux'
         run: |
-          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(find /usr/lib -maxdepth 3 -iname 'libclang.so*' 2>/dev/null | xargs -n1 dirname | sort -V -u | tail -1)" >> "$GITHUB_ENV"
 
       - name: Set LIBCLANG_PATH (macOS)
         if: runner.os == 'macOS'
@@ -468,7 +468,7 @@ jobs:
       - name: Set LIBCLANG_PATH (Linux)
         if: runner.os == 'Linux'
         run: |
-          echo "LIBCLANG_PATH=/usr/lib/llvm-18/lib" >> "$GITHUB_ENV"
+          echo "LIBCLANG_PATH=$(find /usr/lib -maxdepth 3 -iname 'libclang.so*' 2>/dev/null | xargs -n1 dirname | sort -V -u | tail -1)" >> "$GITHUB_ENV"
 
       - name: Set LIBCLANG_PATH (macOS)
         if: runner.os == 'macOS'

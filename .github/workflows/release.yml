@@ -268,17 +268,26 @@ jobs:
     # This job always does a cold build of llama-cpp-sys-2's vulkan-shaders-gen
     # CMake sub-project (its --target x86_64-pc-windows-msvc flag puts it in
     # a target-triple-suffixed build dir the main release leg's cache never
-    # warms), which hits a real CMake/MSVC race: concurrent cl.exe TryCompile
-    # sanity checks writing the same default vc140.pdb ("fatal error C1041:
-    # cannot open program database ... if multiple CL.EXE write to the same
-    # .PDB file, please use /FS"). CMake seeds its own compiler flags from
-    # CFLAGS/CXXFLAGS, so this forces per-TU PDBs everywhere in this job.
+    # warms), which hit "fatal error C1041: cannot open program database
+    # ... vc140.pdb" during CMake's own compiler-ABI TryCompile sanity check.
+    # Each TryCompile gets a uniquely-named scratch dir (confirmed via CI
+    # logs), so it isn't genuinely two cl.exe sharing one .pdb; CFLAGS/
+    # CXXFLAGS=/FS (below) reached the compiler invocation but did not fix
+    # it, ruling that out. The Defender exclusion below is the real fix:
+    # a well-documented GH-hosted-Windows-runner issue where real-time
+    # scanning transiently locks a just-written intermediate file.
     env:
       CFLAGS: /FS
       CXXFLAGS: /FS
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # See the job-level comment above: works around Defender locking a
+      # freshly-written CMake TryCompile intermediate file mid-build.
+      - name: Exclude build directory from Windows Defender
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
 
       - name: Cache Vulkan SDK installer (Windows)
         id: vulkan-cache

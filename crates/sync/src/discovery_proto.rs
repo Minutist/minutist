@@ -51,7 +51,11 @@ pub struct DiscoveryEntry {
     pub meeting_id: MeetingId,
     /// The meeting's processing-lifecycle state, read from its `metadata.json`.
     pub processing: ProcessingLifecycle,
-    /// The meeting's trash state, read from its `metadata.json`.
+    /// The meeting's trash state, read from its `metadata.json`. Defaulted
+    /// so a peer still on a build predating this field (sends no `deletion`
+    /// key at all) still decodes, reading as "not deleted" rather than
+    /// aborting the whole discovery exchange.
+    #[serde(default)]
     pub deletion: DeletionState,
 }
 
@@ -249,6 +253,24 @@ mod tests {
     #[test]
     fn decode_rejects_garbage_as_protocol_error() {
         assert!(matches!(decode(b"not json"), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn decode_defaults_deletion_when_peer_predates_the_field() {
+        // A peer still on a build before `deletion` existed sends entries with
+        // no `deletion` key at all — must decode as "not deleted", not fail
+        // the whole exchange (this exact frame, minus the trailing `,"deletion":...}`,
+        // is what an unupgraded phone sends).
+        let id = MeetingId::new();
+        let raw = format!(
+            r#"[{{"meeting_id":"{}","processing":{{"state":"local"}}}}]"#,
+            id.0
+        );
+        let decoded = decode(raw.as_bytes()).expect("decode");
+        assert_eq!(decoded, vec![entry(ProcessingLifecycle::Local)]
+            .into_iter()
+            .map(|mut e| { e.meeting_id = id; e })
+            .collect::<Vec<_>>());
     }
 
     // The UUID-dir scan itself is tested canonically in `notes_crdt::folder`

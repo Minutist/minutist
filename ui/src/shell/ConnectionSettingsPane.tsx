@@ -73,7 +73,7 @@ export function ConnectionSettingsPane() {
 
       <label
         className="settings-drawer__toggle"
-        title="Dial the Minutist relay so an external assistant you have connected (Claude, ChatGPT, Codex) can read this app's meetings over it. This sends meeting content to that assistant's vendor by design — it is not a private channel. Off by default; needs a paired device."
+        title="Pairs this device to your Minutist account. Also starts the sync engine used by the Sync section below. The hosted MCP relay (external assistant read access) is retired — this no longer dials it. Off by default."
       >
         <input
           type="checkbox"
@@ -81,7 +81,7 @@ export function ConnectionSettingsPane() {
           disabled={snapshot === null}
           onChange={(e) => void setEnabled(e.target.checked)}
         />
-        <span>Enable the connector</span>
+        <span>Pair this account (enables device sync)</span>
       </label>
 
       <div className="settings-drawer__field" aria-label="Connection status">
@@ -91,7 +91,17 @@ export function ConnectionSettingsPane() {
         </div>
         {paired && (
           <p className="settings-drawer__hint">
-            Paired to account <code>{account}</code>.
+            Paired to account <code>{account}</code>. Every device paired to
+            this account syncs with this one automatically — see the Sync
+            section below.
+          </p>
+        )}
+        {status === "connecting" && (
+          <p className="settings-drawer__hint settings-drawer__hint--warn">
+            The hosted MCP relay this used to dial has been retired — account
+            pairing and sync work regardless, but this status line may sit at
+            "Connecting…" indefinitely rather than reaching "Online". A
+            local-only MCP connector is planned to replace it.
           </p>
         )}
       </div>

@@ -95,6 +95,11 @@ export function SyncSettingsPane() {
         <div className="settings-drawer__mcp-endpoint">
           <code>{status !== null ? statusLabel(status) : "—"}</code>
         </div>
+        <p className="settings-drawer__hint">
+          Every device paired to your account (Connection, above) syncs with
+          this one automatically — no ticket needed between them. The ticket
+          flow below is a manual fallback, for a device not on your account.
+        </p>
         {inProgress && (
           <p className="settings-drawer__hint" aria-label="Sync progress">
             {inProgress.label}

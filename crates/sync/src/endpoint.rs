@@ -836,7 +836,15 @@ impl SyncEngine {
         let meetings = self.local_meetings();
         tracing::debug!(target: "sync", peer = %peer, count = meetings.len(), "pushing all meetings to peer");
         let mut reconciled = 0usize;
+        let peer_hex = peer.to_string();
         for meeting in meetings {
+            // Cheap early exit, as in `adopt_from_peer`. Returning rather than
+            // breaking also skips the ride-along discovery dial below: `dial` would
+            // refuse it anyway, and `discover_all` re-advertises the lifecycle.
+            if self.backoff.is_suppressed(&peer_hex) {
+                tracing::debug!(target: "sync", peer = %peer, reconciled, "push: peer suppressed mid-pass; abandoning the rest");
+                return Ok(reconciled);
+            }
             if let Err(e) = self.sync_notes(addr.clone(), meeting).await {
                 tracing::warn!(target: "sync", peer = %peer, meeting = %meeting.0, error = %e, "push notes failed");
                 continue;
@@ -930,38 +938,62 @@ impl SyncEngine {
     /// [`Self::sync_artifacts`] / [`Self::discover_with`]), so this stays off the
     /// public API rather than widening it with an iroh-typed return. See
     /// [`Self::connect`] for the test-only public seam.
+    /// Refuses a peer in failed-dial backoff before touching the network, so
+    /// suppression holds for EVERY exchange rather than only the sweeps that
+    /// remember to pre-filter. The refusal is not recorded as a failure: a
+    /// recorded failure re-extends `retry_after` (see
+    /// [`BackoffRegistry::on_dial_outcome`]), which would make suppression
+    /// self-perpetuating and the peer permanently unreachable.
     async fn dial(&self, peer: impl Into<EndpointAddr>) -> Result<Connection> {
         let addr: EndpointAddr = peer.into();
-        let id_hex = addr.id.to_string();
+        let id = addr.id;
+        if self.backoff.is_suppressed(&id.to_string()) {
+            return Err(Error::Suppressed(id.to_string()));
+        }
         let result = self
             .endpoint
             .connect(addr, SYNC_ALPN)
             .await
             .map_err(|e| Error::Endpoint(format!("dialling peer on sync alpn: {e}")));
-        // Universal write side: every dial this device makes — desktop,
-        // headless, and the phone's syncs (which flow through this same engine
-        // dial) — feeds the backoff registry, regardless of the peer's source.
+        // Universal write side: every dial this device makes — desktop, headless,
+        // and the phone's syncs (which flow through this same engine dial) — feeds
+        // the backoff registry, regardless of the peer's source.
         //
         // FAILURE ONLY. A completed QUIC handshake is not a working peer: the
         // protocol exchange on top of it can still fail every time (a decode
-        // error, a truncated stream, an incompatible wire format). Clearing the
-        // backoff here on `is_ok()` would wipe the accumulated failure count —
-        // `on_dial_outcome(_, true)` removes the peer's state entirely — so such
-        // a peer is re-dialled at full rate forever and never suppressed. The
-        // success side is recorded by the caller once the exchange itself
-        // completes: see [`Self::record_exchange_outcome`].
+        // error, a truncated stream, an incompatible wire format). Recording
+        // success here would wipe the accumulated failure count, since
+        // `on_dial_outcome(_, true)` removes the peer's state entirely, leaving
+        // such a peer re-dialled at full rate forever.
         if result.is_err() {
-            self.backoff.on_dial_outcome(&id_hex, false);
+            self.backoff.on_dial_outcome(&id.to_string(), false);
         }
         result
     }
 
-    /// Record the outcome of a completed protocol exchange against the backoff
-    /// registry. This is the success side that [`Self::dial`] deliberately does
-    /// not record: suppression must reflect whether talking to the peer *worked*,
-    /// not merely whether a QUIC connection opened.
-    fn record_exchange_outcome(&self, peer: &EndpointAddr, success: bool) {
-        self.backoff.on_dial_outcome(&peer.id.to_string(), success);
+    /// Record a per-meeting exchange FAILURE against the backoff registry.
+    ///
+    /// Failures only, and deliberately so. A sweep runs three streams per meeting
+    /// (notes, media, artifacts) and clearing on any one success would let a
+    /// working stream mask two broken ones: `on_dial_outcome(_, true)` removes the
+    /// peer's state, so a peer whose notes sync succeeds while its media and
+    /// artifacts consistently fail would reset to zero on every meeting and never
+    /// reach `max_fails`. Only a peer-level health signal clears the count — see
+    /// [`Self::record_peer_reachable`].
+    fn record_exchange_failure(&self, peer: EndpointId) {
+        self.backoff.on_dial_outcome(&peer.to_string(), false);
+    }
+
+    /// Clear a peer's accumulated failures after a successful DISCOVERY exchange.
+    ///
+    /// Discovery is the peer-level probe — one exchange per peer per sweep, not per
+    /// meeting — so its success is evidence the peer itself is healthy, which is
+    /// the granularity suppression is about. Per-meeting streams deliberately do
+    /// not clear (see [`Self::record_exchange_failure`]); without this the count
+    /// would only ever grow and a recovered peer would stay penalised until its
+    /// backoff window elapsed.
+    fn record_peer_reachable(&self, peer: EndpointId) {
+        self.backoff.on_dial_outcome(&peer.to_string(), true);
     }
 
     /// Test-only public seam wrapping [`Self::dial`] (mirrors [`Self::import_media`]
@@ -990,11 +1022,13 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let addr: EndpointAddr = peer.into();
-        let conn = self.dial(addr.clone()).await?;
+        let conn = self.dial(peer).await?;
+        let peer_id = conn.remote_id();
         let result = notes_proto::initiate_notes_sync(&conn, &self.meetings_root, meeting_id).await;
         conn.close(0u32.into(), b"notes-sync-done");
-        self.record_exchange_outcome(&addr, result.is_ok());
+        if result.is_err() {
+            self.record_exchange_failure(peer_id);
+        }
         result
     }
 
@@ -1015,11 +1049,14 @@ impl SyncEngine {
     /// separate round. [`Self::discover_all`] drives it as a standalone recovery
     /// sweep (the hub's periodic re-discovery).
     pub async fn discover_with(&self, peer: impl Into<EndpointAddr>) -> Result<Vec<MeetingId>> {
-        let addr: EndpointAddr = peer.into();
-        let conn = self.dial(addr.clone()).await?;
+        let conn = self.dial(peer).await?;
+        let peer_id = conn.remote_id();
         let result = discovery_proto::initiate_discovery(&conn, &self.meetings_root).await;
         conn.close(0u32.into(), b"discovery-done");
-        self.record_exchange_outcome(&addr, result.is_ok());
+        match &result {
+            Ok(_) => self.record_peer_reachable(peer_id),
+            Err(_) => self.record_exchange_failure(peer_id),
+        }
         let theirs = result?;
         let ids = theirs.iter().map(|e| e.meeting_id).collect();
         for entry in theirs {
@@ -1117,7 +1154,16 @@ impl SyncEngine {
         let mut recompleted = 0usize;
         let mut skipped_complete = 0usize;
         let mut skipped_purged = 0usize;
-        for meeting_id in theirs {
+        let mut abandoned = 0usize;
+        for (i, meeting_id) in theirs.into_iter().enumerate() {
+            // A cheap early exit over the invariant `dial` enforces: once the peer
+            // is suppressed every remaining exchange would be refused in-memory
+            // anyway, so stop instead of logging a warning per meeting.
+            // `peers_to_dial` gates only sweep ENTRY, which is why this re-checks.
+            if self.backoff.is_suppressed(peer_id) {
+                abandoned = discovered - i;
+                break;
+            }
             // Skip a meeting only when it is already FULLY materialised locally —
             // NOT on mere folder existence. sync_notes creates the folder before
             // media and artifacts run, so a meeting whose notes landed but whose
@@ -1166,6 +1212,7 @@ impl SyncEngine {
             recompleted,
             skipped_complete,
             skipped_purged,
+            abandoned,
             "adopt: pass complete for peer"
         );
         Ok(adopted)
@@ -1215,8 +1262,7 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let addr: EndpointAddr = peer.into();
-        let conn = self.dial(addr.clone()).await?;
+        let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
         let result = media_proto::initiate_media_sync(
             &conn,
@@ -1228,7 +1274,9 @@ impl SyncEngine {
         )
         .await;
         conn.close(0u32.into(), b"media-sync-done");
-        self.record_exchange_outcome(&addr, result.is_ok());
+        if result.is_err() {
+            self.record_exchange_failure(peer_id);
+        }
         result
     }
 
@@ -1252,8 +1300,7 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let addr: EndpointAddr = peer.into();
-        let conn = self.dial(addr.clone()).await?;
+        let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
         let result = artifacts_proto::initiate_artifacts_sync(
             &conn,
@@ -1265,7 +1312,9 @@ impl SyncEngine {
         )
         .await;
         conn.close(0u32.into(), b"artifacts-sync-done");
-        self.record_exchange_outcome(&addr, result.is_ok());
+        if result.is_err() {
+            self.record_exchange_failure(peer_id);
+        }
         result
     }
 
@@ -1982,6 +2031,105 @@ mod tests {
             engine.add_account_peer(&other.to_string(), "not a url", &[]),
             Err(Error::Endpoint(_))
         ));
+
+        engine.shutdown().await.expect("shutdown");
+    }
+
+    /// Loopback [`EndpointAddr`] for `engine` — its id plus each bound port
+    /// against `127.0.0.1`, so two in-process engines can dial each other.
+    fn loopback_addr(engine: &SyncEngine) -> EndpointAddr {
+        let mut addr = EndpointAddr::new(engine.endpoint_id());
+        for sock in engine.bound_sockets() {
+            addr = addr.with_ip_addr(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                sock.port(),
+            ));
+        }
+        addr
+    }
+
+    /// The 0062 invariant, stated where it actually lives: a QUIC dial that
+    /// SUCCEEDS must not clear failures accumulated by the protocol exchanges on
+    /// top of it. `on_dial_outcome(_, true)` removes the peer's state outright, so
+    /// recording success on connect resets the count on every attempt and a peer
+    /// whose exchanges always fail is never suppressed.
+    ///
+    /// Two real loopback engines, because the distinguishing case needs a dial that
+    /// genuinely completes — a registry-only test cannot express "connect worked".
+    #[tokio::test]
+    async fn a_successful_dial_does_not_clear_accumulated_exchange_failures() {
+        let dir_a = tempfile::TempDir::new().expect("tempdir a");
+        let dir_b = tempfile::TempDir::new().expect("tempdir b");
+        let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
+        let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
+        let a = SyncEngine::start_direct(id_a, dir_a.path().to_path_buf())
+            .await
+            .expect("engine a");
+        let b = SyncEngine::start_direct(id_b, dir_b.path().to_path_buf())
+            .await
+            .expect("engine b");
+
+        // Mutual pairing so b's accept hook authorises a.
+        let b_addr = loopback_addr(&b);
+        a.add_peer(b_addr.clone());
+        b.add_peer(loopback_addr(&a));
+
+        let b_hex = b.endpoint_id().to_string();
+        let max_fails = crate::backoff::BackoffPolicy::default().max_fails;
+        assert!(max_fails >= 2, "the test needs room below the threshold");
+
+        // One short of suppression.
+        for _ in 0..(max_fails - 1) {
+            a.backoff.on_dial_outcome(&b_hex, false);
+        }
+        assert!(!a.is_suppressed(&b_hex), "not yet at the threshold");
+
+        // A dial that completes at the QUIC layer. Recording it as a success would
+        // wipe the count above.
+        a.dial(b_addr).await.expect("loopback dial must succeed");
+
+        // So the next failure is the one that crosses the threshold.
+        a.backoff.on_dial_outcome(&b_hex, false);
+        assert!(
+            a.is_suppressed(&b_hex),
+            "a successful connect must not have reset the accumulated failures"
+        );
+
+        a.shutdown().await.expect("shutdown a");
+        b.shutdown().await.expect("shutdown b");
+    }
+
+    /// The counterpart: `dial` refuses a suppressed peer before touching the
+    /// network, and does NOT record that refusal as a further failure (which would
+    /// re-extend `retry_after` on every rejection and strand the peer for good).
+    #[tokio::test]
+    async fn dial_refuses_a_suppressed_peer_without_recording_a_failure() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
+        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+            .await
+            .expect("engine");
+
+        let peer = iroh::SecretKey::generate().public();
+        let peer_hex = peer.to_string();
+        for _ in 0..crate::backoff::BackoffPolicy::default().max_fails {
+            engine.backoff.on_dial_outcome(&peer_hex, false);
+        }
+        let before = engine.backoff.fails_for(&peer_hex);
+
+        let err = engine
+            .dial(EndpointAddr::new(peer))
+            .await
+            .expect_err("a suppressed peer must be refused");
+        assert!(
+            matches!(err, Error::Suppressed(ref id) if id == &peer_hex),
+            "expected Error::Suppressed, got {err:?}"
+        );
+        assert_eq!(
+            engine.backoff.fails_for(&peer_hex),
+            before,
+            "refusing a suppressed peer must not count as another failure"
+        );
 
         engine.shutdown().await.expect("shutdown");
     }

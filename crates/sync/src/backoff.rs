@@ -106,6 +106,15 @@ impl BackoffRegistry {
             None => false,
         }
     }
+
+    /// The recorded consecutive-failure count for `endpoint_id` (`0` when unknown).
+    /// Test-only: lets a test assert that an operation did NOT record a failure,
+    /// which `is_suppressed` alone cannot distinguish once the threshold is crossed.
+    #[cfg(test)]
+    pub(crate) fn fails_for(&self, endpoint_id: &str) -> u32 {
+        let states = self.states.lock().expect("backoff registry poisoned");
+        states.get(endpoint_id).map(|s| s.fails).unwrap_or(0)
+    }
 }
 
 /// The exponential-backoff window for `fails` consecutive failures:
@@ -195,43 +204,6 @@ mod tests {
         assert!(
             !reg.is_suppressed("peer"),
             "suppression must expire once retry_after elapses"
-        );
-    }
-
-    /// The registry-side statement of the 0062 defect: a peer whose QUIC dial
-    /// keeps succeeding while the protocol exchange on top of it keeps failing
-    /// must still reach suppression. `EndpointSyncEngine::dial` therefore records
-    /// only failures, leaving the success side to `record_exchange_outcome` once
-    /// the exchange actually completes.
-    #[test]
-    fn connect_ok_but_exchange_fails_still_suppresses() {
-        let reg = BackoffRegistry::new(policy());
-        // Three rounds of "connected fine, exchange failed".
-        for _ in 0..3 {
-            reg.on_dial_outcome("peer", false);
-        }
-        assert!(
-            reg.is_suppressed("peer"),
-            "protocol-level failures must accumulate to suppression even though \
-             every underlying connect succeeded"
-        );
-    }
-
-    /// The converse, and why the success record cannot simply be dropped: one
-    /// recorded success per round removes the peer's state, so the fail count
-    /// never reaches `max_fails` and suppression never engages. Recording success
-    /// on connect rather than on exchange completion produces exactly this.
-    #[test]
-    fn a_success_each_round_prevents_suppression() {
-        let reg = BackoffRegistry::new(policy());
-        for _ in 0..10 {
-            reg.on_dial_outcome("peer", false);
-            reg.on_dial_outcome("peer", true);
-        }
-        assert!(
-            !reg.is_suppressed("peer"),
-            "an interleaved success resets the count, so no number of rounds \
-             suppresses — the reason connect must not report success"
         );
     }
 

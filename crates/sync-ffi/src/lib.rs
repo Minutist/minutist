@@ -93,6 +93,15 @@ impl From<sync::Error> for SyncFfiError {
     fn from(e: sync::Error) -> Self {
         match e {
             sync::Error::Endpoint(msg) => SyncFfiError::Transport { msg },
+            // A locally-refused dial (the peer is in failed-dial backoff) is a
+            // transient, retryable condition from the phone's point of view — the
+            // same category as the peer being offline, which is what the backoff is
+            // reacting to. It deliberately does NOT get its own FFI variant: the
+            // phone has no action to take that differs from any other transport
+            // failure, and a new variant would churn the generated bindings.
+            sync::Error::Suppressed(id) => SyncFfiError::Transport {
+                msg: format!("peer {id} is in failed-dial backoff"),
+            },
             sync::Error::Protocol(msg) => SyncFfiError::Protocol { msg },
             sync::Error::Identity(msg) => SyncFfiError::Identity { msg },
             sync::Error::Io(e) => SyncFfiError::Io { msg: e.to_string() },

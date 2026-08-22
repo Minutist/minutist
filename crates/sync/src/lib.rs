@@ -178,6 +178,13 @@ pub enum Error {
     #[error("protocol: {0}")]
     Protocol(String),
 
+    /// The dial was refused locally: the peer is in failed-dial backoff. Distinct
+    /// from [`Self::Endpoint`] so a caller can tell "we declined to try" from "the
+    /// peer did not answer" — the former is the backoff working as intended and is
+    /// expected traffic, not a fault to escalate.
+    #[error("peer {0} is in failed-dial backoff")]
+    Suppressed(String),
+
     /// A filesystem operation failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

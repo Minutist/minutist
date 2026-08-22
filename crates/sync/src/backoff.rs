@@ -198,6 +198,43 @@ mod tests {
         );
     }
 
+    /// The registry-side statement of the 0062 defect: a peer whose QUIC dial
+    /// keeps succeeding while the protocol exchange on top of it keeps failing
+    /// must still reach suppression. `EndpointSyncEngine::dial` therefore records
+    /// only failures, leaving the success side to `record_exchange_outcome` once
+    /// the exchange actually completes.
+    #[test]
+    fn connect_ok_but_exchange_fails_still_suppresses() {
+        let reg = BackoffRegistry::new(policy());
+        // Three rounds of "connected fine, exchange failed".
+        for _ in 0..3 {
+            reg.on_dial_outcome("peer", false);
+        }
+        assert!(
+            reg.is_suppressed("peer"),
+            "protocol-level failures must accumulate to suppression even though \
+             every underlying connect succeeded"
+        );
+    }
+
+    /// The converse, and why the success record cannot simply be dropped: one
+    /// recorded success per round removes the peer's state, so the fail count
+    /// never reaches `max_fails` and suppression never engages. Recording success
+    /// on connect rather than on exchange completion produces exactly this.
+    #[test]
+    fn a_success_each_round_prevents_suppression() {
+        let reg = BackoffRegistry::new(policy());
+        for _ in 0..10 {
+            reg.on_dial_outcome("peer", false);
+            reg.on_dial_outcome("peer", true);
+        }
+        assert!(
+            !reg.is_suppressed("peer"),
+            "an interleaved success resets the count, so no number of rounds \
+             suppresses — the reason connect must not report success"
+        );
+    }
+
     #[test]
     fn backoff_grows_exponentially_and_saturates_at_the_cap() {
         let p = policy();

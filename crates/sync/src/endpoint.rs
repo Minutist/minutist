@@ -941,8 +941,27 @@ impl SyncEngine {
         // Universal write side: every dial this device makes — desktop,
         // headless, and the phone's syncs (which flow through this same engine
         // dial) — feeds the backoff registry, regardless of the peer's source.
-        self.backoff.on_dial_outcome(&id_hex, result.is_ok());
+        //
+        // FAILURE ONLY. A completed QUIC handshake is not a working peer: the
+        // protocol exchange on top of it can still fail every time (a decode
+        // error, a truncated stream, an incompatible wire format). Clearing the
+        // backoff here on `is_ok()` would wipe the accumulated failure count —
+        // `on_dial_outcome(_, true)` removes the peer's state entirely — so such
+        // a peer is re-dialled at full rate forever and never suppressed. The
+        // success side is recorded by the caller once the exchange itself
+        // completes: see [`Self::record_exchange_outcome`].
+        if result.is_err() {
+            self.backoff.on_dial_outcome(&id_hex, false);
+        }
         result
+    }
+
+    /// Record the outcome of a completed protocol exchange against the backoff
+    /// registry. This is the success side that [`Self::dial`] deliberately does
+    /// not record: suppression must reflect whether talking to the peer *worked*,
+    /// not merely whether a QUIC connection opened.
+    fn record_exchange_outcome(&self, peer: &EndpointAddr, success: bool) {
+        self.backoff.on_dial_outcome(&peer.id.to_string(), success);
     }
 
     /// Test-only public seam wrapping [`Self::dial`] (mirrors [`Self::import_media`]
@@ -971,9 +990,11 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let conn = self.dial(peer).await?;
+        let addr: EndpointAddr = peer.into();
+        let conn = self.dial(addr.clone()).await?;
         let result = notes_proto::initiate_notes_sync(&conn, &self.meetings_root, meeting_id).await;
         conn.close(0u32.into(), b"notes-sync-done");
+        self.record_exchange_outcome(&addr, result.is_ok());
         result
     }
 
@@ -994,9 +1015,11 @@ impl SyncEngine {
     /// separate round. [`Self::discover_all`] drives it as a standalone recovery
     /// sweep (the hub's periodic re-discovery).
     pub async fn discover_with(&self, peer: impl Into<EndpointAddr>) -> Result<Vec<MeetingId>> {
-        let conn = self.dial(peer).await?;
+        let addr: EndpointAddr = peer.into();
+        let conn = self.dial(addr.clone()).await?;
         let result = discovery_proto::initiate_discovery(&conn, &self.meetings_root).await;
         conn.close(0u32.into(), b"discovery-done");
+        self.record_exchange_outcome(&addr, result.is_ok());
         let theirs = result?;
         let ids = theirs.iter().map(|e| e.meeting_id).collect();
         for entry in theirs {
@@ -1192,7 +1215,8 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let conn = self.dial(peer).await?;
+        let addr: EndpointAddr = peer.into();
+        let conn = self.dial(addr.clone()).await?;
         let peer_id = conn.remote_id();
         let result = media_proto::initiate_media_sync(
             &conn,
@@ -1204,6 +1228,7 @@ impl SyncEngine {
         )
         .await;
         conn.close(0u32.into(), b"media-sync-done");
+        self.record_exchange_outcome(&addr, result.is_ok());
         result
     }
 
@@ -1227,7 +1252,8 @@ impl SyncEngine {
         peer: impl Into<EndpointAddr>,
         meeting_id: MeetingId,
     ) -> Result<()> {
-        let conn = self.dial(peer).await?;
+        let addr: EndpointAddr = peer.into();
+        let conn = self.dial(addr.clone()).await?;
         let peer_id = conn.remote_id();
         let result = artifacts_proto::initiate_artifacts_sync(
             &conn,
@@ -1239,6 +1265,7 @@ impl SyncEngine {
         )
         .await;
         conn.close(0u32.into(), b"artifacts-sync-done");
+        self.record_exchange_outcome(&addr, result.is_ok());
         result
     }
 

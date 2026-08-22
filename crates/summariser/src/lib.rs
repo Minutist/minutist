@@ -162,7 +162,9 @@ use llama_cpp_2::mtmd::{
 };
 use llama_cpp_2::sampling::LlamaSampler;
 
-use minutist_common::{AppResult, NoteBlock, Segment, Summariser};
+use minutist_common::{
+    llama_backend::serialize_first_model_load, AppResult, NoteBlock, Segment, Summariser,
+};
 
 mod error;
 pub use error::Error;
@@ -331,13 +333,13 @@ impl LlamaSummariser {
         // `with_n_gpu_layers`, which llama.cpp reads as "offload every layer".
         // See `architecture/cross-cutting.md` — "GPU portability".
         let model_params = LlamaModelParams::default().with_n_gpu_layers(config.n_gpu_layers);
-        let model =
-            LlamaModel::load_from_file(backend, &model_path, &model_params).map_err(|e| {
-                Error::ModelLoad {
-                    path: model_path.display().to_string(),
-                    context: e.to_string(),
-                }
-            })?;
+        let model = serialize_first_model_load(|| {
+            LlamaModel::load_from_file(backend, &model_path, &model_params)
+        })
+        .map_err(|e| Error::ModelLoad {
+            path: model_path.display().to_string(),
+            context: e.to_string(),
+        })?;
 
         tracing::info!(
             target: "summariser",

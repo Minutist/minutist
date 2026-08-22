@@ -87,7 +87,10 @@ use llama_cpp_2::model::LlamaChatMessage;
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText};
 use llama_cpp_2::sampling::LlamaSampler;
-use minutist_common::{AppError, AppResult, AsrBackend, AudioChunk, Segment};
+use minutist_common::{
+    llama_backend::serialize_first_model_load, AppError, AppResult, AsrBackend, AudioChunk,
+    Segment,
+};
 
 // ---------------------------------------------------------------------------
 // Per-crate error
@@ -574,13 +577,15 @@ impl AsrRuntime {
         // portability".
         let model_params =
             LlamaModelParams::default().with_n_gpu_layers(config.n_gpu_layers);
-        let model = LlamaModel::load_from_file(backend, model_path, &model_params)
-            .map_err(|e| {
-                AppError::from(Error::ModelLoad {
-                    path: model_path.display().to_string(),
-                    context: e.to_string(),
-                })
-            })?;
+        let model = serialize_first_model_load(|| {
+            LlamaModel::load_from_file(backend, model_path, &model_params)
+        })
+        .map_err(|e| {
+            AppError::from(Error::ModelLoad {
+                path: model_path.display().to_string(),
+                context: e.to_string(),
+            })
+        })?;
 
         tracing::info!(
             target: "asr-runtime",

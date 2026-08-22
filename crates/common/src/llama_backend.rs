@@ -43,6 +43,44 @@ pub fn shared_llama_backend() -> AppResult<&'static LlamaBackend> {
         .expect("backend was just set under the init lock"))
 }
 
+/// Serialise the FIRST model load in this process, then run every later one
+/// unguarded.
+///
+/// `asr-runtime` and `summariser` each load their own GGUF model, and the app
+/// spawns their prewarm/preload independently at startup
+/// (`src-tauri/src/main.rs`'s `setup()`), so two loads can race on a fresh
+/// process. On the Vulkan backend that race is live, not theoretical:
+/// `ggml_vk_get_device()` (vendored `llama.cpp/ggml/src/ggml-vulkan/
+/// ggml-vulkan.cpp`) publishes a device's `shared_ptr` into the shared
+/// `vk_instance.devices[idx]` slot *before* the object's fields (buffer-type
+/// dispatch table included) are fully populated, with no lock — a second
+/// thread reading that slot mid-populate can observe a null function pointer
+/// and crash (`EXCEPTION_ACCESS_VIOLATION_EXEC`, seen live on an AMD Radeon
+/// 890M iGPU; see `planning/research/vulkan-igpu-crash-investigation-2026-08-22.md`).
+/// The sibling lazy-init `ggml_backend_vk_reg_get_device()` in the same file
+/// already takes a mutex for its analogous one-time init, so this looks like
+/// an upstream oversight rather than deliberate design — not something we can
+/// fix by patching around it cheaply, but we CAN stop triggering the race:
+/// once any one load has completed (crossed the racy window), every later
+/// `ggml_vk_get_device()` call just reads the now-fully-populated slot, no
+/// matter how concurrent. Only the first-ever call needs to be alone.
+pub fn serialize_first_model_load<T>(load: impl FnOnce() -> T) -> T {
+    static DONE: OnceLock<()> = OnceLock::new();
+    if DONE.get().is_some() {
+        return load();
+    }
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if DONE.get().is_some() {
+        // Another thread took the lock first and already finished.
+        drop(_guard);
+        return load();
+    }
+    let result = load();
+    let _ = DONE.set(());
+    result
+}
+
 /// List the ggml backend devices (name/type/memory), or an empty vec when the
 /// GPU backend is not compiled in. The crate-internal entry point behind
 /// [`crate::probe_primary_gpu`]; kept here so the `llama_cpp_2` use stays inside

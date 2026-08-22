@@ -53,7 +53,7 @@ thiserror = { workspace = true }
 # out-of-band addressing (MemoryLookup) for peers learned over the account
 # service. Pinned EXACT; the 1.0 API is a hard floor and bumping is a coordinated
 # change.
-iroh = "=1.0.0"
+iroh = "=1.0.3"
 # Shareable endpoint tickets (manual device pairing). `iroh-tickets` carries the
 # `EndpointTicket` Display/FromStr round-trip that serialises this device's
 # `EndpointAddr` to a string the user copies to another device. Pinned EXACT to
@@ -76,7 +76,7 @@ iroh-blobs = { version = "=0.103.0", features = ["fs-store"] }
 # the test-only constructor. The production safety guarantee is therefore the
 # cfg-gate on the sole `insecure_skip_verify` call site (`start_insecure` is
 # `#[cfg(feature = "test-support")]`), NOT the crate's absence.
-iroh-relay = { version = "=1.0.0", optional = true }
+iroh-relay = { version = "=1.0.3", optional = true }
 # yrs — the Yjs CRDT port. `notes-crdt` owns the authoritative `notes.ydoc` and
 # its projections; `sync` uses yrs only for the wire-level reconciliation math on
 # lib0-v1 update bytes (`encode_state_vector_from_update_v1` / `diff_updates_v1`),
@@ -122,4 +122,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # addressing path without the deployed `sync.minutist.ai` relay. Dev-only: the
 # production build never links this feature. Same exact pin as `[dependencies]`
 # so the two `iroh` builds in a test binary are the same crate.
-iroh = { version = "=1.0.0", features = ["test-utils"] }
+iroh = { version = "=1.0.3", features = ["test-utils"] }

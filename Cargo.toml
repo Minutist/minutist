@@ -270,6 +270,35 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 llama-cpp-2 = { path = "vendor/llama-cpp-2" }
 llama-cpp-sys-2 = { path = "vendor/llama-cpp-sys-2" }
 
+# Carrying our own iroh fix ahead of upstream. `Drop for PathStateSender` in
+# iroh's `remote_map` takes `state.lock().expect("poisoned")`. Seven lock sites in
+# that module share the mutex, so a panic under any of them poisons it and this
+# Drop then panics too — and a panic in a Drop that runs while another panic is
+# unwinding is a DOUBLE panic, which aborts the process outright: no
+# `catch_unwind`, no unwinding to a task boundary. It killed the Android app on
+# retry-sync (SIGABRT via `panic_in_cleanup` out of
+# `RemoteStateActor::handle_msg_add_connection`). The fork makes that Drop tolerate
+# a poisoned lock.
+#
+# REVERT WHEN UPSTREAM FIXES THIS: delete these three lines and drop the `=1.0.3`
+# pins in crates/{sync,headless}/Cargo.toml back to the released version that
+# carries the fix. Nothing else in the workspace depends on the fork. Tracking:
+# github.com/andrewleech/iroh branch `fix/path-state-sender-drop-must-not-panic`
+# Upstream PR: https://github.com/n0-computer/iroh/pull/4482 (open).
+#
+# Pinned by REV, not branch: a branch ref is mutable, so a `cargo update`, force
+# push or branch deletion would silently move or break what the desktop, hub and
+# mobile `sync-ffi` all compile against.
+#
+# All three crates come from the SAME git source deliberately. Patching only
+# `iroh` leaves `iroh-tickets` (published separately, with no 1.0.3 release)
+# pulling `iroh-base` from the registry while the patched `iroh` uses the fork's
+# workspace copy — same version, two sources, so `EndpointAddr` becomes two
+# distinct types and the ticket round-trip stops compiling.
+iroh = { git = "https://github.com/andrewleech/iroh", rev = "8fcabbbd6" }
+iroh-base = { git = "https://github.com/andrewleech/iroh", rev = "8fcabbbd6" }
+iroh-relay = { git = "https://github.com/andrewleech/iroh", rev = "8fcabbbd6" }
+
 [profile.dev]
 # Keep backtraces (file:line) but drop variable-level DWARF. Full debug info was
 # the dominant contributor to a multi-hundred-GB target/debug: every test and bin

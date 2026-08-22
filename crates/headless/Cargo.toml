@@ -59,7 +59,7 @@ tracing-appender = { workspace = true }
 # Validate a peer pairing ticket in `add-peer`, and resolve a ticket to its
 # `EndpointId` for `status`. Same EXACT pin as `sync`, which owns the round-trip.
 iroh-tickets = "=1.0.0"
-iroh = "=1.0.0"
+iroh = "=1.0.3"
 # `status`: parse `{uuid}` meeting-folder names + digest the projected notes.
 uuid = { workspace = true }
 sha2 = { workspace = true }
@@ -97,7 +97,7 @@ minutist-common = { path = "../common" }
 # `test-utils` exposes `iroh::test_utils::run_relay_server`, the in-process relay
 # `hub_e2e` spins for its local-by-default runs (AllowAll access, no token). Same
 # exact pin as `[dependencies]`.
-iroh = { version = "=1.0.0", features = ["test-utils"] }
+iroh = { version = "=1.0.3", features = ["test-utils"] }
 uuid = { workspace = true }
 serde_json = { workspace = true }
 # The ungated create-meeting test digests the notes ydoc to compare A/B status.

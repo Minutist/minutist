@@ -23,3 +23,58 @@ path = ["brand/**", "src-tauri/icons/**"]
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright (C) 2026 Andrew Leech <andrew@alelec.net>"
 SPDX-License-Identifier = "LicenseRef-Minutist-Brand"
+
+# vendor/ (issue 0057) is third-party code, not project-authored: the
+# llama-cpp-rs bindings (patched locally per
+# architecture/cross-cutting.md's "llama.cpp build + version policy") and,
+# inside llama-cpp-sys-2, the full vendored llama.cpp source tree. None of
+# it carries "Copyright (C) 2026 Andrew Leech" or an AGPL licence. The
+# narrower entries below win under "closest" precedence for the paths they
+# cover; this one is the fallback for the rest of vendor/ (the
+# llama-cpp-2/llama-cpp-sys-2 Rust crates themselves, upstream
+# utilityai/llama-cpp-rs, matching each crate's own `license` field).
+[[annotations]]
+path = "vendor/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "the llama-cpp-rs contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# The vendored llama.cpp source tree itself (upstream ggml-org/llama.cpp,
+# MIT-licensed), excluding the third-party libraries it bundles under its
+# own vendor/ directory (each annotated separately below with its actual
+# upstream licence).
+[[annotations]]
+path = "vendor/llama-cpp-sys-2/llama.cpp/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "the ggml / llama.cpp contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "vendor/llama-cpp-sys-2/llama.cpp/vendor/cpp-httplib/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright (c) 2017 yhirose"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "vendor/llama-cpp-sys-2/llama.cpp/vendor/nlohmann/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2013 - 2025 Niels Lohmann <https://nlohmann.me>"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "vendor/llama-cpp-sys-2/llama.cpp/vendor/miniaudio/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "David Reid"
+SPDX-License-Identifier = "MIT-0"
+
+[[annotations]]
+path = "vendor/llama-cpp-sys-2/llama.cpp/vendor/stb/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright (c) 2017 Sean Barrett"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "vendor/llama-cpp-sys-2/llama.cpp/vendor/sheredom/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "the sheredom/subprocess.h contributors"
+SPDX-License-Identifier = "Unlicense"

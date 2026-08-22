@@ -369,8 +369,8 @@ streaming work; not in v1's timeframe).
 **Verified still binding.** #20914 (realtime/streaming ASR) has NOT
 landed — its Phase-1 APIs are absent from llama.cpp master (the original
 monolithic PRs were rejected) — and the audio encoder
-window is still a fixed 30 s everywhere. The pinned `llama-cpp-2 =0.1.146`
-vendors a current llama.cpp (commit `e21cdc11`, build b8783) that includes
+window is still a fixed 30 s everywhere. The pinned `llama-cpp-2 =0.1.154`
+vendors a current llama.cpp (commit `5f55650a78f9`, build b10200) that includes
 Qwen3-ASR mtmd audio, so there is no version lag
 to chase. The silence-preservation and `</asr_text>` early-stop sub-rules
 below remain mandatory.
@@ -619,24 +619,63 @@ chunking internally for audio-bearing prompts.
 ## llama.cpp build + version policy
 
 Both `asr-runtime` (mtmd audio) and `summariser` (text) drive llama.cpp
-through `llama-cpp-2` (workspace pin `=0.1.146`, `features = ["mtmd"]`).
+through `llama-cpp-2` (workspace pin `=0.1.154`, `features = ["mtmd",
+"common"]`).
 The native library is **built from source** by `llama-cpp-sys-2` from its
 vendored llama.cpp submodule (hence `LIBCLANG_PATH` is required for bindgen
 on every clean build, on every platform) — there is no system-lib link.
 
 - **Pin policy.** `llama-cpp-2`/`-sys-2` are pinned with `=EXACT` and bumped
   **deliberately**, never floated — the crate does not follow semver
-  meaningfully, so each bump is a separately-verified change. `=0.1.146`
-  (published 2026-04-30) is the latest published release and
-  vendors llama.cpp build b8783 (commit `e21cdc11`, 2026-04-13), which
+  meaningfully, so each bump is a separately-verified change. `=0.1.154`
+  (published 2026-08-05) is the latest published release and
+  vendors llama.cpp build b10200 (commit `5f55650a78f9`, 2026-07-30), which
   includes the April-2026 audio wave (Qwen3-ASR / Qwen3-Omni,
   Gemma 4 audio). There is no version lag.
+- **Local fork: the restored oaicompat wrapper.** `utilityai/llama-cpp-rs`
+  PR #1037 deleted `llama-cpp-sys-2/wrapper_oai.{cpp,h}` and
+  `llama-cpp-2/src/openai.rs` between our old pin and 0.1.154 — the OpenAI-
+  compatible chat-template/tool-calling layer `chat-agent` depends on
+  (`apply_chat_template_oaicompat`, `ChatTemplateResult`, the `openai`
+  module). `vendor/llama-cpp-sys-2/` + `vendor/llama-cpp-2/` are full local
+  copies of the 0.1.154 crates.io packages with that layer restored: the
+  relocated `common_chat_msg_diff_to_json_oaicompat` re-inlined from the
+  pre-removal source, and the pre-removal wrapper's dead
+  `thinking_end_tag`-based helpers (`ends_with`,
+  `detect_thinking_forced_open`, unused even before removal) dropped rather
+  than adapted to the current `thinking_end_tags` shape — that concept is
+  now derived inside `chat.cpp` from `generation_prompt`. Wired via root
+  `Cargo.toml`'s `[patch.crates-io]`. See
+  `planning/DESIGN_llama-cpp-2-oaicompat-restore.md`
+  for the restoration's verification detail and issue 0057.
+  **The next version bump must diff the upstream 0.1.154→N crates against
+  this fork's changes and reapply them** (re-fetch and re-diff
+  `wrapper_oai.{cpp,h}`/`openai.rs`, re-check for further `common_chat_*`
+  signature drift, re-copy the new crates.io package tree into `vendor/` and
+  reapply the same patch) — do not just bump the version pin. `vendor/llama-cpp-2/Cargo.toml`
+  has its upstream `[lints.*]` tables (`clippy::pedantic`,
+  `missing_debug_implementations`, `missing_docs`) removed, since patching in
+  a path dep drops cargo's implicit `--cap-lints allow` and they'd otherwise
+  fire on every workspace build; re-remove them on the next bump too.
+  Dropping `--cap-lints allow` also unmasks plain `#[warn]`-level lints, not
+  just the removed `[lints]` table: `model.rs`'s own deprecated methods
+  reference the deprecated `Special` enum internally, so `lib.rs` carries a
+  crate-level `#![allow(deprecated)]` for that; re-add it (or re-check
+  whether upstream's methods still trip it) on the next bump.
+  `vendor/llama-cpp-sys-2/llama.cpp/cmake/build-info.cmake` also has
+  `BUILD_NUMBER`/`BUILD_COMMIT` hardcoded to the `5f55650a78f9`/`10200` pin
+  above (upstream derives them via `git rev-parse`, which would otherwise
+  walk up and report the *app repo's* HEAD/commit-count, since the vendored
+  tree has no `.git` of its own) — re-derive these two values from the new
+  llama-cpp-sys-2 submodule SHA and its corresponding llama.cpp `b`-tag on
+  the next bump, do not carry the old values forward.
 - **Going past the latest crate requires a fork.** `llama-cpp-sys-2` has no
   `LLAMA_CPP_SRC`/`PATH` override; to ride a newer llama.cpp than the latest
   crate you must fork `llama-cpp-rs`, bump the submodule, regenerate bindings,
   and reconcile FFI drift (it compiles internal `common_chat_*` C++ with no
-  stability contract), wired via `[patch.crates-io]`. Reserve this for a
-  specific load-bearing upstream fix; it is not warranted now.
+  stability contract), wired via `[patch.crates-io]`. This is now in effect
+  (see "Local fork" above) — restoring the deleted oaicompat wrapper was the
+  specific load-bearing upstream need that warranted it.
 - **Bump/fork verification gotchas.** Re-run the
   gated ASR WER + early-stop tests and the orchestrator pipeline test after
   any crate/submodule change (canary for binding/model drift). Known traps
@@ -870,12 +909,14 @@ rules, binding on the engine:
   text for the turn. `ChatToolCall` / `ChatToolResult` are emitted around each
   tool dispatch; `ChatError` terminates a turn.
 - **Tool calling uses llama-cpp-2's OpenAI-compatible path.** Prompt rendering is
-  `apply_chat_template_with_tools_oaicompat` (the GGUF's own tool template);
+  `apply_chat_template_oaicompat` (the GGUF's own tool template);
   tool-call extraction is the streaming `ChatParseStateOaicompat` parser; a
   lazy GBNF grammar (`json_schema_to_grammar` + `LlamaSampler::grammar_lazy`)
   from each tool's input schema is the reliability backstop for the small model.
   A max-tool-iteration cap bounds the loop; malformed tool calls are recovered by
-  re-prompting, not by crashing the turn.
+  re-prompting, not by crashing the turn. These oaicompat APIs exist only via
+  the local fork described under "llama.cpp build + version policy" — upstream
+  deleted them from `llama-cpp-2`/`-sys-2` before our pinned version.
 - **`Summariser: Send + Sync`.** The held handle crosses threads and is referenced
   concurrently by the summary path and the chat `resummarise` tool, so the trait
   is `Send + Sync` (see `components.md` — `common`).

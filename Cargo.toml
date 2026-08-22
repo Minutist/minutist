@@ -95,8 +95,12 @@ tauri-specta = { version = "=2.0.0-rc.21", features = ["derive", "typescript"] }
 # Phase 2 additions
 
 # llama.cpp text + audio (mtmd) — Phase 0 Spike 1 verified pin. Used by
-# `asr-runtime` (Phase 2) and `summariser` (Phase 5).
-llama-cpp-2 = { version = "=0.1.146", default-features = false, features = ["mtmd"] }
+# `asr-runtime` (Phase 2) and `summariser` (Phase 5). `common` is needed for
+# `LlamaSampler::grammar_lazy` (gated behind this feature; `grammar_lazy_patterns`
+# is available either way, `common` only swaps it to the exception-catching C++
+# shim) and the OpenAI-compat chat-template wrapper `chat-agent` depends on
+# (see [patch.crates-io] below).
+llama-cpp-2 = { version = "=0.1.154", default-features = false, features = ["mtmd", "common"] }
 
 # Silero VAD wrapper — same SHA Handy ships in its Cargo.lock; the Spike 3
 # binding-fidelity finding holds at this commit. Default features
@@ -256,6 +260,15 @@ pdfium-render = { version = "0.9", features = ["image_025"] }
 # rav1e), which doc-convert never uses — it only ENCODES PNG — and which pulls
 # libfuzzer-sys (NCSA licence) into the tree.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp"] }
+
+[patch.crates-io]
+# Local fork restoring `llama-cpp-2`/`llama-cpp-sys-2` 0.1.154's deleted
+# OpenAI-compat wrapper (wrapper_oai.cpp/.h, src/openai.rs — removed upstream
+# by utilityai/llama-cpp-rs#1037 with no replacement), which `chat-agent`'s
+# tool-calling depends on. See planning/DESIGN_llama-cpp-2-oaicompat-restore.md
+# and planning/issues/0057 for the restoration's provenance and rationale.
+llama-cpp-2 = { path = "vendor/llama-cpp-2" }
+llama-cpp-sys-2 = { path = "vendor/llama-cpp-sys-2" }
 
 [profile.dev]
 # Keep backtraces (file:line) but drop variable-level DWARF. Full debug info was

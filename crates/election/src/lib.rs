@@ -62,7 +62,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use minutist_common::{
-    AppError, AppResult, HostRef, MeetingId, ProcessingClaim, ProcessingLifecycle,
+    resolve_audio_path, AppError, AppResult, HostRef, MeetingId, ProcessingClaim,
+    ProcessingLifecycle,
 };
 use persistence::meeting_ops::{apply_own_processing_if_not_superseded, update_metadata_if, MetaUpdate};
 use tokio::sync::Notify;
@@ -137,8 +138,8 @@ pub trait ElectionDriver: Send + Sync {
 
     /// Run the offline pipeline for `meeting_id` (→ `Orchestrator::reprocess`).
     /// The election loop only claims a candidate once its scan has confirmed
-    /// `audio.opus` is present in the meeting folder (F4c), so by the time this
-    /// is called the audio is there to read.
+    /// an audio file is present in the meeting folder (F4c), so by the time
+    /// this is called the audio is there to read.
     async fn process(&self, meeting_id: MeetingId) -> AppResult<()>;
 
     /// Push the derived artifacts for `meeting_id` to peers BEFORE `Processed` is
@@ -213,30 +214,29 @@ fn read_processing(meetings_root: &Path, id: MeetingId) -> Option<ProcessingLife
     persistence::read_metadata(&dir).ok().map(|m| m.processing)
 }
 
-/// Whether `audio.opus` is present in `id`'s meeting folder.
+/// Whether `id`'s meeting folder has an audio file yet, under any
+/// [`minutist_common::SUPPORTED_AUDIO_EXTS`] extension (a phone recording
+/// arrives as `audio.m4a`; a desktop recording as `audio.opus`).
 ///
 /// In the hub topology, `metadata.json`'s lifecycle state propagates over the
 /// Discovery exchange independently of — and typically before — the media blob
 /// pull, so a `PendingProcessing`/reapable meeting may not yet have its audio
-/// synced in locally (F4c). `process()` (→ `Orchestrator::reprocess`) reads
-/// `audio.opus` from disk and has no way to wait for it, so claiming before the
-/// blob has arrived just burns a claim/fail cycle. A blocking `std::fs` check,
-/// run from [`scan_candidates`] on `spawn_blocking`.
+/// synced in locally (F4c). `process()` (→ `Orchestrator::reprocess`) reads the
+/// audio from disk and has no way to wait for it, so claiming before the blob
+/// has arrived just burns a claim/fail cycle. A blocking `std::fs` check, run
+/// from [`scan_candidates`] on `spawn_blocking`.
 fn audio_present(meetings_root: &Path, id: MeetingId) -> bool {
-    meetings_root
-        .join(id.0.to_string())
-        .join("audio.opus")
-        .is_file()
+    resolve_audio_path(&meetings_root.join(id.0.to_string())).is_some()
 }
 
 /// Scan the meetings on disk for candidates this host may claim now: the state
-/// is [`claimable`] AND (F4c) `audio.opus` is already present. A candidate whose
-/// audio has not synced in yet is skipped — it remains claimable for a host that
-/// already has the audio, or for this host once the blob arrives on a later
-/// poll.
+/// is [`claimable`] AND (F4c) its audio file is already present. A candidate
+/// whose audio has not synced in yet is skipped — it remains claimable for a
+/// host that already has the audio, or for this host once the blob arrives on
+/// a later poll.
 ///
 /// Blocking `std::fs` work (the directory scan + a `metadata.json` read + an
-/// `audio.opus` stat per meeting); callers run this on `spawn_blocking`.
+/// audio-file stat per meeting); callers run this on `spawn_blocking`.
 fn scan_candidates(meetings_root: &Path, now: DateTime<Utc>) -> Vec<MeetingId> {
     notes_crdt::folder::list_meeting_ids(meetings_root)
         .into_iter()
@@ -251,7 +251,7 @@ fn scan_candidates(meetings_root: &Path, now: DateTime<Utc>) -> Vec<MeetingId> {
                 tracing::debug!(
                     target: "election",
                     meeting_id = %id.0,
-                    "skipping candidate: audio.opus has not synced in yet"
+                    "skipping candidate: audio has not synced in yet"
                 );
                 return false;
             }
@@ -287,7 +287,7 @@ pub async fn run_election_loop(
         // Scan THEN sleep, so a freshly-eligible host claims an already-pending
         // meeting on startup rather than waiting a full poll interval first. The
         // scan is blocking `std::fs` work (a directory listing plus a
-        // `metadata.json` read + an `audio.opus` stat per meeting), so it runs
+        // `metadata.json` read + an audio-file stat per meeting), so it runs
         // on `spawn_blocking` rather than inline on the async worker.
         let now = Utc::now();
         let scan_root = meetings_root.clone();
@@ -979,9 +979,9 @@ mod tests {
     #[test]
     fn scan_candidates_skips_a_pending_meeting_missing_audio() {
         // F4c: in the hub topology `metadata.json`'s lifecycle state can
-        // propagate before the `audio.opus` blob has synced in. A candidate
-        // missing its audio must be skipped so it stays `PendingProcessing` for a
-        // host that already has the audio (or for this host once it arrives).
+        // propagate before the audio blob has synced in. A candidate missing
+        // its audio must be skipped so it stays `PendingProcessing` for a host
+        // that already has the audio (or for this host once it arrives).
         let tmp = tempfile::TempDir::new().expect("tmp");
         let root = tmp.path();
         let now = Utc::now();
@@ -1007,21 +1007,48 @@ mod tests {
         assert_eq!(
             candidates,
             vec![with_audio],
-            "a candidate missing audio.opus must be skipped"
+            "a candidate missing audio must be skipped"
+        );
+    }
+
+    #[test]
+    fn scan_candidates_admits_a_phone_recording_synced_as_m4a() {
+        // A phone recording syncs in as `audio.m4a` (AAC), not `audio.opus` —
+        // `audio_present` must recognise every `SUPPORTED_AUDIO_EXTS` extension,
+        // not just the desktop's own `.opus`, or a phone-originated meeting
+        // would sit at `PendingProcessing` forever despite its audio already
+        // being on disk.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        let now = Utc::now();
+
+        let id = MeetingId::new();
+        notes_crdt::MeetingFolder::ensure(root, id).expect("ensure");
+        update_metadata(root, id, |m| {
+            m.processing = ProcessingLifecycle::PendingProcessing;
+        })
+        .expect("seed pending");
+        std::fs::write(root.join(id.0.to_string()).join("audio.m4a"), b"m4a")
+            .expect("write audio.m4a");
+
+        assert_eq!(
+            scan_candidates(root, now),
+            vec![id],
+            "a phone recording synced as audio.m4a must be claimable"
         );
     }
 
     #[tokio::test]
     async fn adopts_and_processes_a_synced_in_meeting_once_audio_is_present() {
         // Roadmap 2.9 — the positive adopt-path counterpart to
-        // `scan_candidates_skips_a_pending_meeting_missing_audio`. The phone owns
-        // the AAC→Opus transcode, so a meeting adopted via sync arrives already as
-        // `audio.opus`; the desktop never sees AAC. Drive the real
-        // `run_election_loop` end-to-end: the meeting whose `audio.opus` has synced
-        // in is admitted by the F4c audio gate, claimed, and processed through to
-        // `Processed`, while a sibling still missing its audio is left
-        // `PendingProcessing` — proving the audio gate (not the claim) is what
-        // admits an adopted meeting into processing.
+        // `scan_candidates_skips_a_pending_meeting_missing_audio`. Uses
+        // `audio.opus` here since the gate itself is extension-agnostic (see
+        // `scan_candidates_admits_a_phone_recording_synced_as_m4a`). Drive the
+        // real `run_election_loop` end-to-end: the meeting whose audio has
+        // synced in is admitted by the F4c audio gate, claimed, and processed
+        // through to `Processed`, while a sibling still missing its audio is
+        // left `PendingProcessing` — proving the audio gate (not the claim) is
+        // what admits an adopted meeting into processing.
         let tmp = tempfile::TempDir::new().expect("tmp");
         let root = tmp.path();
 

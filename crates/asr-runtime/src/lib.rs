@@ -607,6 +607,9 @@ impl AsrRuntime {
                     path: mmproj_path.display().to_string(),
                     context: format!("invalid media marker: {e}"),
                 }))?,
+            // -1 = model default visual-token budget; we don't override it.
+            image_min_tokens: -1,
+            image_max_tokens: -1,
         };
 
         let mtmd_ctx = MtmdContext::init_from_file(mmproj_str, &model, &mtmd_params)

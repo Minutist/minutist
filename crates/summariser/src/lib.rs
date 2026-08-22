@@ -539,6 +539,9 @@ impl LlamaSummariser {
                 path: mmproj_path.display().to_string(),
                 context: format!("invalid media marker: {e}"),
             })?,
+            // -1 = model default visual-token budget; we don't override it.
+            image_min_tokens: -1,
+            image_max_tokens: -1,
         };
 
         let mtmd_ctx =
@@ -672,7 +675,7 @@ impl LlamaSummariser {
 
         // Decode the page image (stb_image inside mtmd). Image analogue of the
         // audio-bitmap path in `asr-runtime`.
-        let bitmap = MtmdBitmap::from_buffer(mtmd_ctx, png)
+        let bitmap = MtmdBitmap::from_buffer(mtmd_ctx, png, false)
             .map_err(|e| Error::Inference(format!("MtmdBitmap::from_buffer: {e:?}")))?;
 
         // The OCR prompt carries an explicit `<bos>` (via the chat template,

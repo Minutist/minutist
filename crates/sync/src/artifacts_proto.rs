@@ -255,11 +255,13 @@ pub async fn initiate_artifacts_sync(
 /// meetings `root`, over a bi stream the accept hook has already accepted and whose
 /// leading [`StreamKind`] tag it has already consumed.
 ///
-/// Reads the REQUEST (meeting id + initiator manifest), ensures the meeting folder
-/// exists, imports its own artifacts (staging blobs + the local manifest), replies
-/// with that manifest, then pulls every superseding initiator entry over the blobs
-/// ALPN. Parks on [`Connection::closed`] so the router does not drop the connection
-/// before the initiator has read the manifest.
+/// Reads the REQUEST (meeting id + initiator manifest), imports its own
+/// artifacts (staging blobs + the local manifest — a no-op with nothing to
+/// stage), replies with that manifest, then pulls every superseding initiator
+/// entry over the blobs ALPN; the fs blob store's export creates the meeting
+/// folder itself the moment there is a blob to write. Parks on
+/// [`Connection::closed`] so the router does not drop the connection before
+/// the initiator has read the manifest.
 ///
 /// `peer` is the remote [`EndpointId`] (`conn.remote_id()`), already authorised by
 /// the sync-ALPN accept hook before this runs.
@@ -303,22 +305,11 @@ pub async fn respond_artifacts_sync(
     // pre-created directory — `path.is_file()` is `false` and
     // `read_local_processing` advertises `Local` on an absent folder — and the
     // fs blob store's own export creates the parent directory the moment
-    // there is an actual artifact to write. If this meeting's `notes.ydoc`
-    // already carries the origin's real title/duration (from an earlier or
-    // same-session notes sync), project it over metadata.json now rather than
-    // waiting on the next notes sweep — mirrors `notes_proto::apply_inbound`.
-    // Best-effort: a projection failure must not fail the artifacts sync; the
-    // next notes sweep re-applies it. A no-op when there is no folder yet
-    // (`project_ydoc_meta_into_metadata` reads `notes.ydoc` and returns
-    // `Ok(false)` on a missing file).
-    if let Err(e) = notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, meeting_id) {
-        tracing::warn!(
-            target: "sync",
-            meeting_id = %meeting_id.0,
-            error = %e,
-            "projecting synced metadata over metadata.json failed; will retry next sweep"
-        );
-    }
+    // there is an actual artifact to write. If this meeting's folder already
+    // exists with real `notes.ydoc` content (from an earlier or same-session
+    // notes sync), repair a still-blank metadata.json now rather than waiting
+    // on the next notes sweep.
+    crate::notes_proto::project_meta_best_effort(root, meeting_id);
 
     // Import our own artifacts (stages our blobs for the peer + our manifest).
     let local_manifest = store

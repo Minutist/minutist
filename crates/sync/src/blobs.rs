@@ -251,8 +251,8 @@ impl BlobStore {
     /// concurrent syncs offering different hashes for the same `rel` cannot leave a
     /// torn file at the real path. The returned path is the absolute export target.
     ///
-    /// The caller ensures the meeting folder via `notes_crdt::MeetingFolder`
-    /// before reconciling media; this method writes only the media file itself.
+    /// [`Self::export_atomic`] creates the meeting folder itself if absent —
+    /// no caller needs to pre-create it.
     pub async fn download(
         &self,
         endpoint: &Endpoint,
@@ -403,12 +403,12 @@ impl BlobStore {
     /// the export-and-tag step ([`Self::export_and_tag_downloaded`]) keeps the
     /// downloaded blob continuously GC-rooted through to the deterministic tag
     /// landing and is atomic with respect to the target file
-    /// ([`Self::export_atomic`]): a concurrent reader of `transcript.json` (read
-    /// far more often than `audio.opus`) never observes a partial file and a
-    /// crash cannot commit a truncated one. The caller ensures
-    /// the meeting folder via `notes_crdt::MeetingFolder::ensure` and records the
-    /// received authority (it holds the peer entry's `produced_by`/`produced_at`);
-    /// this writes only the artifact file.
+    /// ([`Self::export_atomic`], which creates the meeting folder itself if
+    /// absent): a concurrent reader of `transcript.json` (read far more often
+    /// than `audio.opus`) never observes a partial file and a crash cannot
+    /// commit a truncated one. The caller records the received authority (it
+    /// holds the peer entry's `produced_by`/`produced_at`); this writes only
+    /// the artifact file.
     pub async fn download_artifact(
         &self,
         endpoint: &Endpoint,
@@ -456,6 +456,14 @@ impl BlobStore {
     /// content or the new complete content, never a partial write. Shared by
     /// [`Self::download`] (media) and [`Self::download_artifact`].
     async fn export_atomic(&self, hash: Hash, target: &Path) -> Result<()> {
+        // Own the meeting folder's existence at this boundary rather than
+        // relying on `iroh-blobs`' internal export creating it — that is a
+        // private implementation detail of a pinned third-party crate, not a
+        // contract this codebase can assert on. Idempotent and cheap.
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Protocol(format!("creating export directory {parent:?}: {e}")))?;
+        }
         let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
         let tmp = target.with_extension(format!("{ext}.{hash}.tmp"));
         self.store
@@ -1791,6 +1799,39 @@ mod tests {
         assert!(
             stray_tmp.is_empty(),
             "no .tmp file must remain after export_atomic, found {stray_tmp:?}"
+        );
+    }
+
+    /// `export_atomic` owns creating its target's parent directory rather than
+    /// relying on the underlying `iroh-blobs` export doing it implicitly — the
+    /// contract `media_proto`/`artifacts_proto`'s responders now depend on
+    /// (they no longer pre-create the meeting folder via `MeetingFolder::ensure`).
+    #[tokio::test]
+    async fn export_atomic_creates_a_missing_parent_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let store = BlobStore::open(root).await.expect("open store");
+
+        let src = root.join("source.bin");
+        std::fs::write(&src, b"fresh-content").expect("write source");
+        let hash = store
+            .import_path(&src, "test/export-atomic-mkdir")
+            .await
+            .expect("import path");
+
+        // The target's parent (a meeting folder) does not exist yet.
+        let target = root.join("11111111-1111-1111-1111-111111111111").join("audio.opus");
+        assert!(!target.parent().unwrap().exists(), "parent must not pre-exist");
+
+        store
+            .export_atomic(hash, &target)
+            .await
+            .expect("atomic export must create the missing parent directory");
+
+        assert_eq!(
+            std::fs::read(&target).expect("read target"),
+            b"fresh-content",
+            "export_atomic must write the file once the parent exists"
         );
     }
 

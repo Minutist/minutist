@@ -207,8 +207,19 @@ fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> 
     // The merged `notes.ydoc` now carries any inbound descriptive-metadata map ops
     // (0052 — the map rides inside the same doc): project them over `metadata.json`
     // so a synced meeting shows the origin's real dates/title/codec instead of the
-    // arrival-time placeholder `MeetingFolder::ensure` wrote. Best-effort — a
-    // projection failure must not fail the notes sync; the next sweep re-applies it.
+    // arrival-time placeholder `MeetingFolder::ensure` wrote.
+    project_meta_best_effort(root, meeting_id);
+    Ok(())
+}
+
+/// Best-effort projection of a meeting's `notes.ydoc` descriptive metadata
+/// over `metadata.json` — shared by every responder that may touch a meeting
+/// whose own notes sync has not (yet) run: `apply_inbound` here, and
+/// `media_proto`/`artifacts_proto`'s responders. A failure must not fail the
+/// caller's sync; the next sweep re-applies it. Cheap to call unconditionally
+/// — `project_ydoc_meta_into_metadata` itself is a no-op read when there is no
+/// `notes.ydoc` yet, or when the projection changes nothing.
+pub(crate) fn project_meta_best_effort(root: &Path, meeting_id: MeetingId) {
     if let Err(e) = notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, meeting_id) {
         tracing::warn!(
             target: "sync",
@@ -217,7 +228,6 @@ fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> 
             "projecting synced metadata over metadata.json failed; will retry next sweep"
         );
     }
-    Ok(())
 }
 
 /// Run the *initiator* (dialling) side of one notes reconciliation for

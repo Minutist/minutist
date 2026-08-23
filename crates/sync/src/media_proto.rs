@@ -177,11 +177,12 @@ pub async fn initiate_media_sync(
 /// meetings `root`, over a bi stream the accept hook has already accepted and
 /// whose leading [`StreamKind`] tag it has already consumed.
 ///
-/// Reads the REQUEST (meeting id + initiator manifest), ensures the meeting folder
-/// exists (a brand-new meeting must have its folder before media lands), replies
-/// with its own manifest, then pulls every initiator blob it lacks over the blobs
-/// ALPN. Parks on [`Connection::closed`] so the router does not drop the
-/// connection before the initiator has read the manifest.
+/// Reads the REQUEST (meeting id + initiator manifest), replies with its own
+/// manifest, then pulls every initiator blob it lacks over the blobs ALPN — the
+/// fs blob store's export creates the meeting folder itself the moment there is
+/// a blob to write, so a brand-new meeting needs no folder pre-created. Parks
+/// on [`Connection::closed`] so the router does not drop the connection before
+/// the initiator has read the manifest.
 ///
 /// `peer` is the remote [`EndpointId`] (`conn.remote_id()`), already authorised by
 /// the notes-ALPN accept hook before this runs.
@@ -225,21 +226,10 @@ pub async fn respond_media_sync(
     // directory — `resolve_audio_path`/`assets_dir.is_dir()` are `None`/`false`
     // on an absent folder, and the fs blob store's own export creates the
     // parent directory the moment there is an actual blob to write. If this
-    // meeting's `notes.ydoc` already carries the origin's real title/duration
-    // (from an earlier or same-session notes sync), project it over
-    // metadata.json now rather than waiting on the next notes sweep — mirrors
-    // `notes_proto::apply_inbound`. Best-effort: a projection failure must not
-    // fail the media sync; the next notes sweep re-applies it. A no-op when
-    // there is no folder yet (`project_ydoc_meta_into_metadata` reads
-    // `notes.ydoc` and returns `Ok(false)` on a missing file).
-    if let Err(e) = notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, meeting_id) {
-        tracing::warn!(
-            target: "sync",
-            meeting_id = %meeting_id.0,
-            error = %e,
-            "projecting synced metadata over metadata.json failed; will retry next sweep"
-        );
-    }
+    // meeting's folder already exists with real `notes.ydoc` content (from an
+    // earlier or same-session notes sync), repair a still-blank metadata.json
+    // now rather than waiting on the next notes sweep.
+    crate::notes_proto::project_meta_best_effort(root, meeting_id);
 
     // Import our own media (stages our blobs for the peer to fetch + our manifest).
     let local_manifest = store.import_meeting(root, meeting_id).await?;

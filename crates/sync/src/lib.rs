@@ -18,9 +18,9 @@
 //! - **Media** ([`media_proto`], tag `2`) — a manifest of
 //!   `(relative-path, BLAKE3 hash)` pairs for `audio.opus` and each note asset,
 //!   then a pull of the missing blobs over the second ALPN ([`blobs`],
-//!   `iroh_blobs::ALPN`), exported to the per-meeting paths `notes-crdt` owns
-//!   (via `MeetingFolder::ensure`). Blobs are immutable and content-addressed,
-//!   so "pull what I lack by hash" is the whole rule.
+//!   `iroh_blobs::ALPN`), exported to the per-meeting paths `BlobStore`'s own
+//!   atomic export creates itself if absent. Blobs are immutable and
+//!   content-addressed, so "pull what I lack by hash" is the whole rule.
 //! - **Discovery** ([`discovery_proto`], tag `3`) — each side advertises the
 //!   `(MeetingId, ProcessingLifecycle)` of every meeting it holds, so a peer
 //!   learns both which meetings exist and their host-authoritative processing

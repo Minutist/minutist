@@ -14,22 +14,21 @@
 //!   has not yet seen ([`yrs::diff_updates_v1`] of the peer's local state against
 //!   the sender's state vector),
 //! - each side merges the inbound diff with
-//!   [`notes_crdt::NotesStore::apply_update`], which re-derives `notes.json` /
-//!   `notes.md` (`notes-crdt` owns projection-writing — sync never touches it).
+//!   [`notes_crdt::NotesStore::apply_update`], which re-derives `notes.json` and
+//!   `notes.md` (`notes-crdt` owns projection-writing; sync never touches it).
 //!
 //! yrs merge is commutative and idempotent, so the exchange is order-independent
 //! and re-running it is a no-op once both sides have converged.
 //!
 //! # Wire protocol
 //!
-//! One reconciliation runs over a single bidirectional QUIC stream and is driven
-//! by the dialling side (the *initiator*); the accepting side is the
-//! *responder*. The exchange strictly alternates so neither side blocks on a
-//! read while the other also blocks — no deadlock on the one stream — and the
-//! **initiator is the last reader**, so it holds the inbound diff in hand before
-//! it closes the connection. The responder parks on [`Connection::closed`] until
-//! that close arrives, so its applied write is never aborted by a premature
-//! teardown:
+//! One reconciliation runs over a single bidirectional QUIC stream, driven by
+//! the dialling side (the *initiator*); the accepting side is the *responder*.
+//! The exchange strictly alternates so neither side blocks on a read while the
+//! other also blocks: no deadlock on the one stream. The **initiator is the
+//! last reader**, so it holds the inbound diff in hand before it closes the
+//! connection. The responder parks on [`Connection::closed`] until that close
+//! arrives, so its applied write is never aborted by a premature teardown.
 //!
 //! ```text
 //! initiator                                   responder
@@ -48,9 +47,9 @@
 //! Every variable-length field is a frame: a `u32` big-endian byte length
 //! followed by that many bytes ([`read_frame`] / [`write_frame`]). The
 //! `meeting_id` is a fixed 16-byte UUID (no prefix). A diff that carries no
-//! changes (the peer had nothing the receiver lacked — the common
-//! already-converged case) is recognised by [`is_noop_update`] and skipped
-//! rather than written, so an up-to-date or empty meeting touches no disk.
+//! changes (the peer had nothing the receiver lacked) is recognised by
+//! [`is_noop_update`] and skipped rather than written, so an up-to-date or
+//! empty meeting touches no disk.
 //!
 //! [state vector]: https://docs.rs/yrs/0.26.0/yrs/struct.StateVector.html
 //! [`Connection::closed`]: iroh::endpoint::Connection::closed
@@ -71,13 +70,13 @@ use crate::{Error, Result};
 
 /// ALPN for the sync-update protocol. Bumping the suffix is a wire break.
 ///
-/// Every sync exchange multiplexes onto this one ALPN — notes reconciliation,
+/// Every sync exchange multiplexes onto this one ALPN: notes reconciliation,
 /// the media-manifest exchange ([`crate::media_proto`]), discovery
 /// ([`crate::discovery_proto`]), and the derived-artifact exchange
-/// ([`crate::artifacts_proto`]): the initiator writes a one-byte [`StreamKind`]
+/// ([`crate::artifacts_proto`]). The initiator writes a one-byte [`StreamKind`]
 /// tag as the first byte of each bidirectional stream, and the accept hook
-/// dispatches on it. Keeping a single ALPN means one paired-peer authorisation
-/// point (the notes-ALPN accept hook) covers all of them.
+/// dispatches on it, so one paired-peer authorisation point (the notes-ALPN
+/// accept hook) covers all of them.
 pub const SYNC_ALPN: &[u8] = b"minutist/sync/notes/1";
 
 /// The first byte of a sync bidirectional stream, selecting the protocol that
@@ -95,16 +94,16 @@ pub enum StreamKind {
     /// `(MeetingId, ProcessingLifecycle)` of every meeting it holds, so a peer
     /// learns both which meetings exist and their host-authoritative processing
     /// state. Appended as tag `3`: the tag is the wire contract, so new variants
-    /// must only ever be added at the end — an older peer rejects an unknown tag
+    /// must only ever be added at the end. An older peer rejects an unknown tag
     /// via [`Self::from_tag`] rather than mis-dispatching.
     Discovery = 3,
     /// Derived-artifact exchange ([`crate::artifacts_proto`]): the
     /// processor→consumer sync of a meeting's `transcript.json` + `summary.md`
-    /// (the outputs processing produces). Mirrors [`Self::Media`] — a manifest of
+    /// (the outputs processing produces). Mirrors [`Self::Media`]: a manifest of
     /// `(relative-path, hash, produced_by, produced_at)` entries, then a
-    /// content-addressed blob pull over the blobs ALPN — but the authority is
-    /// stamped per entry, bound to the bytes, so a stale relay copy can never
-    /// clobber a newer producer copy. Appended as tag `4` (append-only).
+    /// content-addressed blob pull over the blobs ALPN. The authority is stamped
+    /// per entry, bound to the bytes, so a stale relay copy can never clobber a
+    /// newer producer copy. Appended as tag `4` (append-only).
     Artifacts = 4,
 }
 
@@ -138,7 +137,7 @@ fn local_v1_state(root: &Path, meeting_id: MeetingId) -> Result<Vec<u8>> {
     }
 }
 
-/// The lib0-v1 whole-state update of an empty Yjs document — the operand for a
+/// The lib0-v1 whole-state update of an empty Yjs document: the operand for a
 /// meeting whose `notes.ydoc` does not exist yet.
 fn empty_v1_state() -> Vec<u8> {
     // `yrs::Update::default().encode_v1()` is the empty update; deriving it from
@@ -160,8 +159,8 @@ fn diff_against(v1_state: &[u8], peer_sv: &[u8]) -> Result<Vec<u8>> {
         .map_err(|e| Error::Protocol(format!("computing minimal diff: {e}")))
 }
 
-/// Whether a lib0-v1 update carries no changes at all — no inserted blocks and
-/// no deletions. Such a diff is the peer telling us "you are already up to date";
+/// Whether a lib0-v1 update carries no changes: no inserted blocks and no
+/// deletions. Such a diff is the peer saying it is already up to date, so
 /// applying it would be a pure no-op merge.
 fn is_noop_update(diff: &[u8]) -> Result<bool> {
     let update =
@@ -172,24 +171,17 @@ fn is_noop_update(diff: &[u8]) -> Result<bool> {
 /// Merge an inbound v1 diff into the meeting's `notes.ydoc` via `notes-crdt`,
 /// preserving the existing `notes.md` projection.
 ///
-/// `notes_crdt::NotesStore::apply_update` re-derives `notes.json` from the
-/// merged doc but takes the markdown verbatim (rendering markdown needs the
-/// editor's typed schema, which neither `sync` nor `notes-crdt` models). We
-/// therefore carry the meeting's current `notes.md` through unchanged: a CRDT
-/// sync must not blank an existing markdown export, and the editor re-renders it
-/// on next save.
+/// `apply_update` re-derives `notes.json` from the merged doc but takes the
+/// markdown verbatim: rendering markdown needs the editor's typed schema, which
+/// neither `sync` nor `notes-crdt` models, so a CRDT sync must not blank the
+/// existing export (the editor re-renders it on next save).
 ///
-/// A no-op diff (the peer had nothing we lacked) is skipped: there is no merge to
-/// perform, and skipping avoids a `notes.ydoc` rewrite. Only a diff that actually
-/// carries changes reaches `apply_update`.
-///
-/// Before that merge, the meeting folder is ensured on disk via
-/// [`notes_crdt::MeetingFolder::ensure`]: a brand-new meeting syncing to a device
-/// that lacks its folder must not fail for want of the directory. `notes-crdt`
-/// owns the folder/metadata creation (it seeds a placeholder `metadata.json` the
-/// authoritative one later overwrites); `sync` only triggers it. Ensuring runs
-/// only for a change-carrying diff, so an already-converged or empty meeting still
-/// touches no disk.
+/// A no-op diff (nothing the peer had that we lacked) is skipped before
+/// touching disk. A change-carrying diff first ensures the meeting folder via
+/// [`notes_crdt::MeetingFolder::ensure`], so a brand-new meeting syncing to a
+/// device that lacks its folder does not fail for want of the directory;
+/// `notes-crdt` owns the folder/metadata creation (a placeholder `metadata.json`
+/// the authoritative one later overwrites).
 fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> {
     if is_noop_update(diff)? {
         return Ok(());
@@ -205,19 +197,19 @@ fn apply_inbound(root: &Path, meeting_id: MeetingId, diff: &[u8]) -> Result<()> 
         .map_err(|e| Error::Protocol(format!("applying inbound update: {e}")))?;
 
     // The merged `notes.ydoc` now carries any inbound descriptive-metadata map ops
-    // (0052 — the map rides inside the same doc): project them over `metadata.json`
-    // so a synced meeting shows the origin's real dates/title/codec instead of the
-    // arrival-time placeholder `MeetingFolder::ensure` wrote.
+    // (0052: the map rides inside the same doc). Project them over
+    // `metadata.json` so a synced meeting shows real dates, title, and codec
+    // instead of the arrival-time placeholder `MeetingFolder::ensure` wrote.
     project_meta_best_effort(root, meeting_id);
     Ok(())
 }
 
-/// Best-effort projection of a meeting's `notes.ydoc` descriptive metadata
-/// over `metadata.json` — shared by every responder that may touch a meeting
-/// whose own notes sync has not (yet) run: `apply_inbound` here, and
+/// Best-effort projection of a meeting's `notes.ydoc` descriptive metadata over
+/// `metadata.json`. Shared by every responder that may touch a meeting whose
+/// own notes sync has not (yet) run: `apply_inbound` here, and
 /// `media_proto`/`artifacts_proto`'s responders. A failure must not fail the
-/// caller's sync; the next sweep re-applies it. Cheap to call unconditionally
-/// — `project_ydoc_meta_into_metadata` itself is a no-op read when there is no
+/// caller's sync; the next sweep re-applies it. Cheap to call unconditionally,
+/// since `project_ydoc_meta_into_metadata` is a no-op read when there is no
 /// `notes.ydoc` yet, or when the projection changes nothing.
 pub(crate) fn project_meta_best_effort(root: &Path, meeting_id: MeetingId) {
     if let Err(e) = notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, meeting_id) {
@@ -237,7 +229,7 @@ pub(crate) fn project_meta_best_effort(root: &Path, meeting_id: MeetingId) {
 /// (meeting id + local state vector), reads the peer's state vector, sends the
 /// DIFF the peer is missing (so the responder converges), then reads the DIFF we
 /// are missing and applies it (so we converge). The caller closes `conn` after
-/// this returns — the initiator is the last reader, so closing then is safe. See
+/// this returns: the initiator is the last reader, so closing then is safe. See
 /// the module wire-protocol diagram.
 pub async fn initiate_notes_sync(
     conn: &Connection,
@@ -295,9 +287,9 @@ pub async fn respond_notes_sync(
     root: &Path,
 ) -> Result<()> {
     // REQUEST: meeting id then the initiator's state vector. Bounded by
-    // FRAME_IO_TIMEOUT like every other frame read on this stream — this one is
-    // a raw fixed-size read rather than a length-prefixed frame, so it needs its
-    // own explicit bound to stay off the unbounded-await slowloris surface.
+    // FRAME_IO_TIMEOUT like every other frame read on this stream: this one is a
+    // raw fixed-size read rather than a length-prefixed frame, so it needs its own
+    // explicit bound to stay off the unbounded-await slowloris surface.
     let mut id_buf = [0u8; 16];
     tokio::time::timeout(FRAME_IO_TIMEOUT, recv.read_exact(&mut id_buf))
         .await
@@ -358,14 +350,14 @@ mod tests {
 
     #[test]
     fn stream_kind_tags_are_the_wire_contract() {
-        // The tag byte IS the wire contract: 1/2/3/4 are fixed and append-only, so
+        // The tag byte is the wire contract: 1/2/3/4 are fixed and append-only, so
         // this test fails if a future change reorders or renumbers a variant.
         assert_eq!(StreamKind::from_tag(1).unwrap(), StreamKind::Notes);
         assert_eq!(StreamKind::from_tag(2).unwrap(), StreamKind::Media);
         assert_eq!(StreamKind::from_tag(3).unwrap(), StreamKind::Discovery);
         assert_eq!(StreamKind::from_tag(4).unwrap(), StreamKind::Artifacts);
         // An unknown tag (an old peer seeing a future variant, or garbage) is a
-        // protocol error — never a silent mis-dispatch.
+        // protocol error, never a silent mis-dispatch.
         assert!(matches!(StreamKind::from_tag(0), Err(Error::Protocol(_))));
         assert!(matches!(StreamKind::from_tag(5), Err(Error::Protocol(_))));
     }

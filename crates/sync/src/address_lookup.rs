@@ -7,7 +7,7 @@
 //!
 //! [`PeerDirectory`] is a thin wrapper that keeps the naming domain-specific and
 //! hides the iroh type from the rest of the crate. The wrapped [`MemoryLookup`] is
-//! internally shared and cheap to clone — the same backing store is registered on
+//! internally shared and cheap to clone: the same backing store is registered on
 //! the endpoint and held here, so a peer added after binding is visible to the
 //! next dial.
 
@@ -20,12 +20,10 @@ use iroh::{EndpointAddr, EndpointId};
 /// How a [`PeerDirectory`] entry was learned, so eviction can stay path-specific.
 ///
 /// Only `Account`-sourced entries are subject to account-reconcile removal (an
-/// account peer that drops out of the account's device list) — a `Manual` entry
-/// (ticket pairing, a peers-file, or the relay-less direct test path) is never
-/// touched by that reconcile. `Manual` deliberately lumps ticket/peers-file/direct
-/// pairing together: they share removal semantics this batch (none of them are
-/// account-reconciled), so a finer split is a future additive change if a
-/// per-source removal is ever needed for one of them specifically.
+/// account peer that drops out of the account's device list); a `Manual` entry
+/// (ticket pairing, a peers file, or the relay-less direct test path) is never
+/// touched by that reconcile. `Manual` lumps those three together because they
+/// share the same removal semantics: none of them are account-reconciled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerSource {
     /// Learned from the account service's device-directory (`crate::account`).
@@ -37,7 +35,7 @@ pub enum PeerSource {
 
 /// The tracked state of one directory peer: how it was learned, and the exact
 /// [`EndpointAddr`] currently registered for it (so [`PeerDirectory::add`] can
-/// detect a changed address and apply replace — not union — semantics).
+/// detect a changed address and apply replace, not union, semantics).
 #[derive(Debug, Clone)]
 struct Entry {
     source: PeerSource,
@@ -47,14 +45,13 @@ struct Entry {
 /// Holds peers learned out-of-band so the endpoint can resolve and dial them.
 ///
 /// The wrapped [`MemoryLookup`] resolves addresses for the endpoint but exposes
-/// no way to enumerate the ids it holds, so a parallel `id -> Entry` map is kept
-/// alongside it: [`Self::ids`] iterates the registered peers to sync against
-/// each, and the [`PeerSource`] tag lets [`Self::remove`] stay source-aware (an
-/// account-reconcile removal must never evict a manually-paired peer, and vice
-/// versa). The tracked [`EndpointAddr`] gives [`Self::add`] replace semantics
-/// over [`MemoryLookup`]'s merge (see there). Both the lookup and the map are
-/// internally shared and cheap to clone, so an entry added through any clone is
-/// visible to all of them.
+/// no way to enumerate the ids it holds, so a parallel `id -> Entry` map tracks
+/// them alongside it: [`Self::ids`] iterates the registered peers, and the
+/// [`PeerSource`] tag lets [`Self::remove`] stay source-aware. The tracked
+/// [`EndpointAddr`] gives [`Self::add`] replace semantics over
+/// [`MemoryLookup`]'s merge. Both the lookup and the map are internally shared
+/// and cheap to clone, so an entry added through any clone is visible to all
+/// of them.
 #[derive(Debug, Clone, Default)]
 pub struct PeerDirectory {
     lookup: MemoryLookup,
@@ -76,17 +73,17 @@ impl PeerDirectory {
     /// already present (`false`), so a caller can distinguish a genuinely new
     /// peer from a re-advertised one (e.g. to gate a first-contact dial).
     ///
-    /// **Replace, not union.** [`MemoryLookup::add_endpoint_info`] *merges* the
-    /// address set for an already-known id — it never drops an address. So a
-    /// peer whose advertised addrs change between polls (direct addrs first
-    /// appearing after an initial relay-only entry; a new ephemeral UDP port
-    /// after the peer restarts) would otherwise accumulate every address it has
+    /// **Replace, not union.** [`MemoryLookup::add_endpoint_info`] merges the
+    /// address set for an already-known id: it never drops an address. A peer
+    /// whose advertised addrs change between polls (direct addrs first
+    /// appearing after an initial relay-only entry, or a new ephemeral UDP
+    /// port after a restart) would otherwise accumulate every address it has
     /// ever advertised, including dead ones. Those stale entries are extra
     /// dial candidates iroh probes and abandons, aggravating the path churn
-    /// that starves its per-remote actor. To get replace semantics we clear the
-    /// lookup entry first when the address actually changed, so the registered
-    /// set is exactly the latest advertised one. An unchanged re-advert is a
-    /// no-op on the lookup (no needless churn every poll tick).
+    /// that starves its per-remote actor. We clear the lookup entry first
+    /// when the address actually changed, so the registered set is exactly
+    /// the latest advert; an unchanged re-advert is a no-op (no needless
+    /// churn every poll tick).
     pub fn add(&self, addr: EndpointAddr, source: PeerSource) -> bool {
         let id = addr.id;
         let mut entries = self.entries.lock().expect("peer directory entries poisoned");
@@ -107,13 +104,11 @@ impl PeerDirectory {
         was_new
     }
 
-    /// Remove `id` if — and only if — its current tag equals `source`. A
-    /// mismatched or absent id is a no-op. Returns whether an entry was removed.
+    /// Remove `id` only if its current tag equals `source`. A mismatched or
+    /// absent id is a no-op. Returns whether an entry was removed.
     ///
-    /// This is the invariant that keeps the two eviction paths (account-reconcile
-    /// vs a future per-source removal) from clobbering each other's peers: an
-    /// account-reconcile removal (`source = Account`) can never evict a
-    /// manually-paired peer that happens to share an id, and vice versa.
+    /// This keeps account-reconcile removal (`source = Account`) from evicting
+    /// a manually-paired peer that happens to share an id, and vice versa.
     pub fn remove(&self, id: EndpointId, source: PeerSource) -> bool {
         let mut entries = self
             .entries

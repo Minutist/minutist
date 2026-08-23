@@ -1,63 +1,54 @@
-//! Content-addressed media-blob store (WS4-B S4).
+//! Content-addressed media-blob store.
 //!
-//! Wraps an [`iroh_blobs`] [`FsStore`] so a device can import its meeting media —
-//! `audio.opus` and each note asset under `assets/` — into a BLAKE3-addressed
+//! Wraps an [`iroh_blobs`] [`FsStore`] so a device can import its meeting media
+//! (`audio.opus` and each note asset under `assets/`) into a BLAKE3-addressed
 //! store, advertise the resulting [`Hash`]es to a paired peer over the notes
-//! channel, and pull the blobs it is missing from that peer over the blobs ALPN,
-//! exporting each to the correct per-meeting path.
+//! channel, and pull what it is missing over the blobs ALPN, exporting each to the
+//! correct per-meeting path.
 //!
 //! # On-disk location
 //!
-//! The store lives at `{meetings_root}/.blobs`. The meetings root holds the
-//! per-meeting `{uuid}` directories; a meeting UUID's string form never begins
-//! with a dot, so a dot-prefixed sibling cannot collide with any `{uuid}` folder.
-//! Co-locating the store under the meetings root (rather than elsewhere in the
-//! app-data tree) keeps the blob cache in the same XDG data subtree as the
-//! meetings it backs, so a backup or wipe of the meetings tree carries the blob
-//! cache with it. The store is the device's own redb-backed deduplicating cache;
-//! the authoritative media files remain the per-meeting `audio.opus` / `assets/*`
-//! that `persistence` owns — the store is a transport-and-dedup layer beside them.
+//! The store lives at `{meetings_root}/.blobs`. A meeting UUID's string form never
+//! begins with a dot, so the dot-prefixed sibling cannot collide with a `{uuid}`
+//! folder, and keeping it under the meetings root means a backup or wipe of the
+//! meetings tree carries the blob cache with it. The store is a deduplicating
+//! transport cache; the authoritative files remain the per-meeting `audio.opus`
+//! and `assets/*` that `persistence` owns.
 //!
 //! # Retention (GC) and reclamation
 //!
-//! Every payload is pinned with a PERSISTENT, deterministically named tag
+//! Every payload is pinned with a persistent, deterministically named tag
 //! (`meeting/{id}/audio`, `meeting/{id}/asset/{filename}`,
-//! `meeting/{id}/artifact/{rel}`), so an imported or downloaded blob is retained
-//! regardless of GC state and can always be found by meeting id. [`BlobStore::open`]
-//! enables `iroh-blobs`' periodic mark-and-sweep GC ([`GC_INTERVAL`]): the mark
-//! phase roots every blob still referenced by SOME live tag (across every
-//! meeting), so a hash that is content-identical across two meetings (e.g. the
-//! same pasted image) survives as long as either meeting still tags it — the
-//! only reclamation strategy that is safe under content-addressed dedup, since
-//! directly deleting a blob's bytes on one meeting's deletion could not tell
-//! whether another meeting's tag still points at the same hash. Two paths remove
-//! a tag so its blob becomes sweep-eligible:
+//! `meeting/{id}/artifact/{rel}`), so a blob is retained regardless of GC state and
+//! can be found by meeting id. [`BlobStore::open`] enables `iroh-blobs`' periodic
+//! mark-and-sweep ([`GC_INTERVAL`]). The mark phase roots any blob referenced by a
+//! live tag anywhere, so a hash shared across two meetings (the same pasted image,
+//! say) survives while either still tags it. That is the only safe strategy under
+//! content-addressed dedup: deleting bytes on one meeting's removal cannot tell
+//! whether another meeting's tag still points at the same hash.
 //!
-//! - [`BlobStore::delete_meeting_blobs`] unpins every tag for a deleted meeting
-//!   (media + derived artifacts), called from the meeting-deletion path
-//!   (`ipc-bridge`'s `delete_meeting` command, via [`crate::SyncEngine`]).
-//! - re-tagging a superseded derived artifact ([`BlobStore::import_artifacts`])
-//!   overwrites the old tag -> hash mapping with the new one (`tags().set` is a
-//!   single-value-per-name map), so the superseded hash is no longer rooted by
-//!   that tag once the overwrite lands — no separate unpin step is needed.
+//! Two paths make a blob sweep-eligible:
 //!
-//! Named tags survive restart; temp-tags (in-flight import protection) do not.
-//! Every persistent tag this crate ever sets starts with [`meeting_tag_prefix`]
-//! (`meeting/{id}/...`) — never the `auto-` prefix `iroh-blobs`' own
-//! `Tags::create` mints for an un-named tag (see [`Self::import_path`]'s doc for
-//! why this crate never lets that path run). [`BlobStore::open`] therefore
-//! deletes every `auto-`-prefixed tag on load ([`reclaim_stray_auto_tags`]): a
-//! store from before this distinction was enforced could hold one, and the
-//! prefix match can only ever remove that stray kind, never a deterministic
-//! meeting tag.
+//! - [`BlobStore::delete_meeting_blobs`] unpins every tag for a deleted meeting,
+//!   called from `ipc-bridge`'s `delete_meeting` via [`crate::SyncEngine`].
+//! - re-tagging a superseded artifact ([`BlobStore::import_artifacts`]) overwrites
+//!   the old tag-to-hash mapping, since `tags().set` is single-value-per-name, so
+//!   no separate unpin is needed.
+//!
+//! Named tags survive restart; temp tags protecting an in-flight import do not.
+//! Every persistent tag this crate sets starts with [`meeting_tag_prefix`], never
+//! the `auto-` prefix `iroh-blobs` mints for an un-named tag (see
+//! [`Self::import_path`] for why that path never runs here). [`BlobStore::open`]
+//! deletes any `auto-`-prefixed tag on load ([`reclaim_stray_auto_tags`]); the
+//! prefix match cannot remove a deterministic meeting tag.
 //!
 //! # Transport
 //!
-//! [`Self::download`] dials the peer through the SAME [`iroh::Endpoint`] the
-//! [`crate::SyncEngine`] already owns (via `store.downloader(&endpoint)`), so the
-//! relay path is shared and no second socket is opened. The hash is exchanged
-//! out-of-band over the notes channel ([`crate::media_proto`]); there is no blob
-//! discovery — the peer's [`EndpointId`] plus the hash is all the downloader needs.
+//! [`Self::download`] dials through the same [`iroh::Endpoint`]
+//! [`crate::SyncEngine`] owns, so the relay path is shared and no second socket
+//! opens. Hashes are exchanged out-of-band over the notes channel
+//! ([`crate::media_proto`]); there is no blob discovery, since the peer's
+//! [`EndpointId`] plus the hash is all the downloader needs.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -87,7 +78,7 @@ pub use iroh_blobs::Hash;
 const STORE_DIR: &str = ".blobs";
 
 /// Interval between the blob store's periodic mark-and-sweep GC runs (see the
-/// module doc — "Retention (GC) and reclamation"). A few minutes is generous
+/// module doc, "Retention (GC) and reclamation"). A few minutes is generous
 /// enough that GC is never the bottleneck on a busy sync burst, while short
 /// enough that an unpinned meeting's blobs do not linger indefinitely.
 const GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -95,7 +86,7 @@ const GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// Upper bound on a single downloaded blob's size, in bytes. Meeting audio is the
 /// largest legitimate payload; Opus at typical voice bitrates keeps even a
 /// multi-hour meeting well under this. Enforced against the downloader's own
-/// running byte-offset progress ([`download_capped`]), not a self-reported size —
+/// running byte-offset progress ([`download_capped`]), not a self-reported size:
 /// a hostile paired peer fully controls its own advertised manifest (it can
 /// declare any size it likes for a hash it also freely chose), so only real-time
 /// enforcement during the transfer actually bounds the bytes a peer can force
@@ -103,7 +94,7 @@ const GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub(crate) const MAX_BLOB_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// One file's `(size, mtime)` memoised against the [`Hash`] `sync` computed for
-/// it last time — see [`BlobStore::import_path`].
+/// it last time; see [`BlobStore::import_path`].
 #[derive(Debug, Clone, Copy)]
 struct HashMemoEntry {
     size: u64,
@@ -123,16 +114,14 @@ pub struct BlobStore {
     store: FsStore,
     /// `(path, size, mtime)` -> hash memo so [`Self::import_path`] can skip
     /// re-hashing (and re-importing into the `iroh-blobs` store) a file whose
-    /// metadata hasn't changed since the last reconciliation — every peer
-    /// arrival (`push_all_to`) and every `sync_now` re-imports each meeting's
+    /// metadata hasn't changed since the last reconciliation: every peer arrival
+    /// (`push_all_to`) and every `sync_now` re-imports each meeting's
     /// media/artifacts, so an unchanged multi-megabyte `audio.opus` would
     /// otherwise be re-hashed from scratch on each pass. In-memory only, live for
-    /// this `BlobStore`'s process lifetime (a restart re-hashes once, which is
-    /// cheap relative to the reconciliation traffic this saves); grows by one
-    /// entry per distinct path ever imported and is never reclaimed, the same
-    /// bounded-by-meeting-count growth `notes_crdt::metadata_lock`'s registry
-    /// and the artifact-authority lock registry ([`ARTIFACT_AUTHORITY_LOCKS`])
-    /// already accept.
+    /// this `BlobStore`'s process lifetime; grows by one entry per distinct path
+    /// ever imported and is never reclaimed, the same bounded-by-meeting-count
+    /// growth `notes_crdt::metadata_lock`'s registry and the artifact-authority
+    /// lock registry ([`ARTIFACT_AUTHORITY_LOCKS`]) already accept.
     hash_memo: Arc<Mutex<HashMap<PathBuf, HashMemoEntry>>>,
 }
 
@@ -140,7 +129,7 @@ impl BlobStore {
     /// Open (or create) the blob store at `{meetings_root}/.blobs`, with periodic
     /// GC enabled ([`GC_INTERVAL`]) so a tag unpinned via
     /// [`Self::delete_meeting_blobs`] or superseded by a re-tag actually reclaims
-    /// its blob's bytes — see the module doc, "Retention (GC) and reclamation".
+    /// its blob's bytes (see the module doc, "Retention (GC) and reclamation").
     /// Also reconciles away any stray `auto-`-prefixed tag left in the store
     /// ([`reclaim_stray_auto_tags`]).
     ///
@@ -190,11 +179,10 @@ impl BlobStore {
         let mut entries = Vec::new();
 
         // Resolve the meeting's actual audio file rather than assuming a fixed
-        // container: a desktop recording is `audio.opus`, a synced phone one is
-        // `audio.m4a` (AAC-in-MP4, no hardware Opus encoder) — the shared
-        // `minutist_common::resolve_audio_path` contract (0048). The manifest
-        // carries the real filename so the receiving side writes it under the
-        // same name and `persistence` decode-by-extension finds it.
+        // container (desktop: `audio.opus`; synced phone: `audio.m4a`, AAC-in-MP4)
+        // per the shared `minutist_common::resolve_audio_path` contract (0048). The
+        // manifest carries the real filename so `persistence` decode-by-extension
+        // finds it on the receiving side.
         if let Some(audio) = resolve_audio_path(&folder) {
             let rel = audio
                 .file_name()
@@ -238,21 +226,18 @@ impl BlobStore {
     /// Download `hash` from `peer` and export it to `{meetings_root}/{uuid}/{rel}`,
     /// pinning it with the per-meeting persistent tag.
     ///
-    /// `rel` is one of the relative paths a [`Manifest`] carries (`audio.opus` or
-    /// `assets/{filename}`); it is re-validated here (defence in depth — the
-    /// protocol already validated the whole manifest) so it cannot escape the
-    /// meeting folder. The download dials `peer` through the engine's existing
-    /// [`Endpoint`], bounded by [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`]
-    /// ([`download_capped`]) so a stalled or hostile peer cannot pin this call or
-    /// fill the disk. The export-and-tag step ([`Self::export_and_tag_downloaded`])
-    /// keeps the downloaded blob continuously GC-rooted from the moment the
-    /// transfer completes through to the deterministic tag landing, and is atomic
-    /// with respect to the target file ([`Self::export_atomic`]): a crash or two
-    /// concurrent syncs offering different hashes for the same `rel` cannot leave a
-    /// torn file at the real path. The returned path is the absolute export target.
+    /// `rel` is a relative path from a [`Manifest`] (`audio.opus` or
+    /// `assets/{filename}`), re-validated here as defence in depth so it cannot
+    /// escape the meeting folder. The download is bounded by
+    /// [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`] ([`download_capped`]), so a
+    /// stalled or hostile peer can neither pin this call nor fill the disk.
     ///
-    /// [`Self::export_atomic`] creates the meeting folder itself if absent —
-    /// no caller needs to pre-create it.
+    /// [`Self::export_and_tag_downloaded`] keeps the blob continuously GC-rooted
+    /// from transfer completion through to the deterministic tag landing, and
+    /// [`Self::export_atomic`] makes the write atomic against the target: a crash,
+    /// or two syncs offering different hashes for one `rel`, cannot leave a torn
+    /// file. It also creates the meeting folder if absent. Returns the absolute
+    /// export target.
     pub async fn download(
         &self,
         endpoint: &Endpoint,
@@ -290,48 +275,22 @@ impl BlobStore {
         Ok(target)
     }
 
-    /// Import a meeting's derived artifacts (`transcript.json`, `summary.md`) that
-    /// exist on disk into the store — pinning each with a persistent artifact tag —
-    /// and return the [`ArtifactManifest`] this device advertises, every entry
-    /// stamped with the authority (`produced_by` host + `produced_at`) for those
-    /// exact bytes.
+    /// Import a meeting's on-disk artifacts (`transcript.json`, `summary.md`) into
+    /// the store and return the manifest this device advertises. Each entry carries
+    /// the authority for those exact bytes.
     ///
-    /// Authority is content-bound, NEVER re-derived from `metadata.json` at
-    /// exchange time (the relay-clobber — `planning/DESIGN_artifacts.md` §2 C1):
+    /// Authority is bound to the bytes, never re-derived from `metadata.json` at
+    /// exchange time (`planning/DESIGN_artifacts.md` §2 C1). A recorded entry whose
+    /// hash matches the file wins, so a device relays the authority that arrived
+    /// with the bytes rather than re-stamping them. With no record the bytes are
+    /// local and `producer_authority` stamps them. With neither, the artifact is
+    /// not advertised: this device will not date bytes it cannot attribute.
     ///
-    /// - if the per-meeting authority record holds an entry whose hash equals the
-    ///   on-disk file's hash, that recorded `(produced_by, produced_at)` is used —
-    ///   the device faithfully relays the authority that arrived WITH the bytes,
-    ///   and a present `producer_authority` is IGNORED (a received record always
-    ///   wins, so a consumer's own stale `Processed` cannot re-stamp bytes it did
-    ///   not produce);
-    /// - otherwise the bytes were not received over sync (a relay always records on
-    ///   receive — see [`record_artifact_authority`]), so THIS device produced
-    ///   them: `producer_authority` (the local `Processed { processed_by, at }`
-    ///   read from `metadata.json`) supplies the stamp, recorded so a later relay
-    ///   is faithful.
+    /// No artifact files yields an empty manifest, not an error.
     ///
-    /// The producer fallback is byte-coherent only under the single-producer-
-    /// per-meeting topology this cut targets: a producer's own `metadata.json`
-    /// `Processed` matches the bytes it wrote. It rests on the record-on-receive
-    /// invariant — which holds because every sync receive records authority under
-    /// the per-meeting lock (so a consumer's bytes always carry a matching record
-    /// and never reach the fallback). The fully-robust guard (mint only when the
-    /// local `Processed.processed_by` is THIS device's own host) needs the
-    /// producer-gate's `processed_by` convention, which is unbuilt (DESIGN §7) —
-    /// no production path flips a meeting to `Processed` yet, so the fallback is
-    /// exercised only by tests and the future producer-gate.
-    ///
-    /// An artifact present on disk for which neither path establishes authority
-    /// (bytes exist, no matching record, the meeting is not locally `Processed`) is
-    /// NOT advertised — the device will not stamp bytes it cannot date. A meeting
-    /// with no artifact files yields an empty manifest (a zero-segment or
-    /// not-yet-summarised `Processed` meeting has nothing to send — not an error).
-    ///
-    /// The two awaited blob imports run first; the authority read-modify-write then
-    /// runs under the per-meeting artifact-authority lock (off the await points), so
-    /// two concurrent exchanges for the same meeting cannot lose each other's record
-    /// — see [`with_artifact_authority`].
+    /// The authority read-modify-write runs under the per-meeting lock, off the
+    /// await points, so concurrent exchanges cannot lose each other's record. See
+    /// [`with_artifact_authority`].
     pub async fn import_artifacts(
         &self,
         meetings_root: &Path,
@@ -397,18 +356,14 @@ impl BlobStore {
     /// `{meetings_root}/{uuid}/{rel}` (where `rel` is an [`is_artifact_rel`] path),
     /// pinning it with the per-meeting artifact tag.
     ///
-    /// `rel` is re-validated against the artifact allow-list (defence in depth — the
-    /// manifest was validated whole). The download is bounded by
-    /// [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`] ([`download_capped`]), and
-    /// the export-and-tag step ([`Self::export_and_tag_downloaded`]) keeps the
-    /// downloaded blob continuously GC-rooted through to the deterministic tag
-    /// landing and is atomic with respect to the target file
-    /// ([`Self::export_atomic`], which creates the meeting folder itself if
-    /// absent): a concurrent reader of `transcript.json` (read far more often
-    /// than `audio.opus`) never observes a partial file and a crash cannot
-    /// commit a truncated one. The caller records the received authority (it
-    /// holds the peer entry's `produced_by`/`produced_at`); this writes only
-    /// the artifact file.
+    /// `rel` is re-validated against the artifact allow-list as defence in depth.
+    /// Bounded by [`BLOB_DOWNLOAD_TIMEOUT`] and [`MAX_BLOB_BYTES`]
+    /// ([`download_capped`]). [`Self::export_atomic`] makes the write atomic, so a
+    /// concurrent reader of `transcript.json` never sees a partial file and a crash
+    /// cannot commit a truncated one; it creates the meeting folder if absent.
+    ///
+    /// This writes only the artifact file. The caller records the received
+    /// authority, since it holds the peer entry's `produced_by` and `produced_at`.
     pub async fn download_artifact(
         &self,
         endpoint: &Endpoint,
@@ -448,18 +403,18 @@ impl BlobStore {
 
     /// Export `hash`'s content to `target` atomically: write to a hash-suffixed
     /// sibling `{target-name}.{hash}.tmp` (so two concurrent pulls of the same
-    /// target at DIFFERENT hashes never share a tmp and tear each other's export;
+    /// target at differing hashes never share a tmp and tear each other's export;
     /// same-hash concurrent pulls write byte-identical content to one name,
-    /// harmless), fsync it, then atomically rename over `target`. So a crash or
-    /// two concurrent syncs offering different hashes for the same path cannot
-    /// leave a torn file at `target` — it is always either the previous complete
-    /// content or the new complete content, never a partial write. Shared by
+    /// harmless), fsync it, then atomically rename over `target`. A crash or two
+    /// concurrent syncs offering different hashes for the same path therefore
+    /// cannot leave a torn file at `target`: it is always either the previous or
+    /// the new complete content, never a partial write. Shared by
     /// [`Self::download`] (media) and [`Self::download_artifact`].
     async fn export_atomic(&self, hash: Hash, target: &Path) -> Result<()> {
-        // Own the meeting folder's existence at this boundary rather than
-        // relying on `iroh-blobs`' internal export creating it — that is a
-        // private implementation detail of a pinned third-party crate, not a
-        // contract this codebase can assert on. Idempotent and cheap.
+        // Own the meeting folder's existence at this boundary rather than relying
+        // on `iroh-blobs`' internal export creating it: that is a private
+        // implementation detail of a pinned third-party crate, not a contract
+        // this codebase can assert on. Idempotent and cheap.
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::Protocol(format!("creating export directory {parent:?}: {e}")))?;
@@ -472,14 +427,13 @@ impl BlobStore {
             .await
             .map_err(|e| Error::Protocol(format!("exporting blob {hash} to {tmp:?}: {e}")))?;
         // Best-effort fsync of the exported tmp: on a clean host this makes the
-        // rename below commit durable bytes (matching persistence's atomic
-        // writers), but it is NOT required — the authoritative, content-verified
-        // copy lives in the blob store, so a lost export self-heals on the next
-        // media sync. On Windows an antivirus real-time scan of the freshly-written
-        // tmp frequently holds its handle and fails THIS open with a sharing
-        // violation (the observed failure); treat that as best-effort and proceed
-        // to the rename rather than fail the whole media/artifacts connection over
-        // a durability nicety. A genuine (non-lock) fsync error still fails fast.
+        // rename below commit durable bytes, but it isn't required, since the
+        // authoritative, content-verified copy lives in the blob store, so a lost
+        // export self-heals on the next media sync. On Windows an antivirus
+        // real-time scan of the freshly-written tmp frequently holds its handle
+        // and fails this open with a sharing violation; treat that as
+        // best-effort rather than fail the whole connection over a durability
+        // nicety. A genuine (non-lock) fsync error still fails fast.
         match std::fs::File::open(&tmp).and_then(|f| f.sync_all()) {
             Ok(()) => {}
             Err(e) if is_transient_export_lock(&e) => tracing::debug!(
@@ -494,13 +448,11 @@ impl BlobStore {
             }
         }
         // Atomically rename the tmp over `target`, retrying on a transient Windows
-        // sharing violation (an antivirus scan holding the tmp/target handle) with
-        // exponential backoff over a wide (~9.5s) budget — a real-time scan of a
-        // fresh file can hold it for several seconds, and delivering the file a few
-        // seconds late beats tearing down the connection and delivering nothing.
-        // Terminal errors fail fast and leave no tmp residue (the next media sync
-        // re-exports regardless). The retry never fires on non-Windows platforms
-        // (those raw codes are not transient there — see `is_transient_export_lock`).
+        // sharing violation with exponential backoff over a ~9.5s budget: a
+        // real-time AV scan can hold the tmp/target handle for several seconds,
+        // and delivering the file a few seconds late beats delivering nothing.
+        // Terminal errors fail fast and leave no tmp residue. The retry never
+        // fires on non-Windows platforms; see `is_transient_export_lock`.
         const RENAME_RETRY_BACKOFF_MS: [u64; 8] = [50, 100, 200, 400, 800, 1500, 2500, 4000];
         retry_on_transient(
             || std::fs::rename(&tmp, target),
@@ -509,8 +461,8 @@ impl BlobStore {
         )
         .await
         .map_err(|e| {
-            // Terminal or budget-exhausted failure: leave no tmp residue — the next
-            // media sync re-exports regardless.
+            // Terminal or budget-exhausted failure: leave no tmp residue, since the
+            // next media sync re-exports regardless.
             let _ = std::fs::remove_file(&tmp);
             Error::Protocol(format!("renaming export {tmp:?} → {target:?}: {e}"))
         })
@@ -525,7 +477,7 @@ impl BlobStore {
     /// reclaim it. A [`TempTag`] taken on the already-present hash roots it for
     /// the duration of [`Self::export_atomic`]; [`Self::commit_deterministic_tag`]
     /// then sets `tag_name` while that temp tag still holds and only drops it
-    /// once the deterministic tag is live — see the module doc, "Retention (GC)
+    /// once the deterministic tag is live; see the module doc, "Retention (GC)
     /// and reclamation".
     async fn export_and_tag_downloaded(
         &self,
@@ -547,12 +499,12 @@ impl BlobStore {
     }
 
     /// Set `tag_name` on `temp_tag`'s hash while the temp tag still roots it
-    /// against GC, then release the temp tag — so the blob stays continuously
+    /// against GC, then release the temp tag, so the blob stays continuously
     /// GC-rooted across the handoff from iroh-blobs' own ephemeral protection to
     /// this crate's persistent, deterministically-named tag. Shared by
     /// [`Self::import_path`] (a temp tag from an `add_path`) and
     /// [`Self::export_and_tag_downloaded`] (a temp tag taken explicitly on an
-    /// already-downloaded hash) — see the module doc, "Retention (GC) and
+    /// already-downloaded hash); see the module doc, "Retention (GC) and
     /// reclamation".
     async fn commit_deterministic_tag(&self, temp_tag: TempTag, tag_name: &str) -> Result<Hash> {
         let hash = temp_tag.hash();
@@ -561,13 +513,13 @@ impl BlobStore {
         Ok(hash)
     }
 
-    /// Unpin every blob tag this device holds for `meeting_id` — its media
+    /// Unpin every blob tag this device holds for `meeting_id`: its media
     /// (`meeting/{id}/audio`, `meeting/{id}/asset/*`) and any derived-artifact
-    /// tags (`meeting/{id}/artifact/*`) — so the underlying bytes become
+    /// tags (`meeting/{id}/artifact/*`), so the underlying bytes become
     /// GC-eligible on the store's next periodic sweep ([`GC_INTERVAL`]). Does not
     /// force an immediate sweep; a hash still tagged by another meeting (dedup)
-    /// survives regardless, since GC roots from every remaining tag, not just this
-    /// meeting's. Called from the meeting-deletion path
+    /// survives regardless, since GC roots from every remaining tag, not just
+    /// this meeting's. Called from the meeting-deletion path
     /// (`ipc-bridge::delete_meeting` via [`crate::SyncEngine::delete_meeting_blobs`]);
     /// idempotent (deleting an already-untagged prefix is a no-op).
     pub async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> Result<()> {
@@ -585,30 +537,24 @@ impl BlobStore {
     /// Import a single file into the store under the deterministic `tag_name`
     /// and return its [`Hash`].
     ///
-    /// Consults [`Self::hash_memo`] first: when `path`'s current `(size, mtime)`
-    /// matches a memoised entry, the memoised hash is returned WITHOUT re-hashing
-    /// or re-tagging — content-addressing stays correct because a real content
-    /// change almost always changes the size and/or mtime, invalidating the memo
-    /// and falling through to a real re-import. (The residual risk is the same
-    /// one any mtime-based change check accepts — e.g. `rsync`'s quick check,
-    /// `make`'s timestamp rule — a same-size rewrite landing within one
-    /// filesystem mtime tick; not a concern for the audio/artifact files this
-    /// memoises, which are written once by `persistence`/`orchestrator` and never
-    /// rewritten in place.) Skipping the re-tag on a memo hit is sound because
-    /// `path` is unique per (meeting, rel) across every call site, so a memo
-    /// entry can only exist because a PRIOR call already imported and tagged it
-    /// under this exact `tag_name`.
+    /// Consults [`Self::hash_memo`] first: a matching `(size, mtime)` returns the
+    /// memoised hash without re-hashing or re-tagging. This accepts the same
+    /// residual risk as any mtime-based change check, a same-size rewrite inside
+    /// one filesystem tick, which does not arise for the audio and artifact files
+    /// memoised here: `persistence` and `orchestrator` write them once and never
+    /// rewrite in place. Skipping the re-tag is sound because `path` is unique per
+    /// (meeting, rel), so a memo entry can only exist if a prior call already
+    /// tagged it under this same `tag_name`.
     ///
-    /// A memo miss imports via `iroh-blobs`' `add_path(path).temp_tag()` rather
-    /// than awaiting `add_path(path)` bare: a bare await resolves through
-    /// iroh-blobs' `IntoFuture` impl to `with_tag()`, which mints its own
-    /// PERSISTENT, uniquely-named `auto-<timestamp>` tag — a second, permanent
-    /// root for the same hash that this crate never unpins, defeating
+    /// A miss imports via `add_path(path).temp_tag()`, not by awaiting
+    /// `add_path(path)` bare. The bare await resolves to `with_tag()`, which mints
+    /// its own persistent `auto-<timestamp>` tag: a second permanent root for the
+    /// hash that this crate never unpins, which would defeat
     /// [`Self::delete_meeting_blobs`] for every locally-imported blob.
-    /// [`Self::commit_deterministic_tag`] instead sets ONLY `tag_name` while the
-    /// import's own temp tag still roots the blob, then drops the temp tag — so
-    /// the blob is continuously GC-rooted and no auto tag is ever created. See
-    /// the module doc, "Retention (GC) and reclamation".
+    /// [`Self::commit_deterministic_tag`] sets only `tag_name` while the import's
+    /// temp tag still roots the blob, then drops it, so the blob stays
+    /// continuously GC-rooted. See the module doc, "Retention (GC) and
+    /// reclamation".
     async fn import_path(&self, path: &Path, tag_name: &str) -> Result<Hash> {
         let metadata = std::fs::metadata(path)
             .map_err(|e| Error::Protocol(format!("stat-ing {path:?} before import: {e}")))?;
@@ -639,7 +585,7 @@ impl BlobStore {
     }
 
     /// Set a persistent named tag pinning `hash` (as a raw blob) against GC.
-    /// Overwrites any prior value under `name` — a re-tag (e.g. a superseded
+    /// Overwrites any prior value under `name`: a re-tag (e.g. a superseded
     /// derived artifact in [`Self::import_artifacts`]) un-roots the old hash from
     /// this tag in the same call, so the old bytes are reclaimed on the next GC
     /// sweep unless another tag still pins them (dedup-safe).
@@ -669,9 +615,9 @@ impl BlobStore {
     }
 }
 
-/// The tag-name prefix shared by every tag [`BlobStore`] pins for `meeting_id` —
+/// The tag-name prefix shared by every tag [`BlobStore`] pins for `meeting_id`:
 /// media ([`audio_tag`] / [`asset_tag`]) and derived artifacts ([`artifact_tag`])
-/// all start with it — so [`BlobStore::delete_meeting_blobs`] can unpin all of
+/// all start with it, so [`BlobStore::delete_meeting_blobs`] can unpin all of
 /// them in one `delete_prefix` call.
 fn meeting_tag_prefix(meeting_id: MeetingId) -> String {
     format!("meeting/{}/", meeting_id.0)
@@ -679,20 +625,20 @@ fn meeting_tag_prefix(meeting_id: MeetingId) -> String {
 
 /// The tag-name prefix iroh-blobs' own `Tags::create` (reached via `with_tag()`,
 /// `store::util::Tag::auto`) mints for an un-named tag: `auto-<RFC-3339-ish
-/// timestamp>`. This crate never sets a tag under this prefix itself — every
-/// persistent tag it creates starts with [`meeting_tag_prefix`] — so a tag under
-/// it can only be a stray left by an import that (pre-fix) awaited `add_path`
-/// bare instead of going through [`BlobStore::import_path`]'s
+/// timestamp>`. This crate never sets a tag under this prefix itself: every
+/// persistent tag it creates starts with [`meeting_tag_prefix`], so a tag under
+/// it can only be a stray left by an import that awaited `add_path` bare instead
+/// of going through [`BlobStore::import_path`]'s
 /// `temp_tag()`-then-[`BlobStore::commit_deterministic_tag`] path.
 const AUTO_TAG_PREFIX: &str = "auto-";
 
 /// Delete every tag under [`AUTO_TAG_PREFIX`], called once from
-/// [`BlobStore::open`] — see the module doc, "Retention (GC) and reclamation".
+/// [`BlobStore::open`]; see the module doc, "Retention (GC) and reclamation".
 /// Scoped to exactly that prefix via `delete_prefix`, so it can only ever
 /// remove a stray auto-named tag and can never touch a deterministic
 /// `meeting/{id}/...` tag. A no-op (and not an error) when no such tag exists,
-/// which is the steady-state case for a store that has only ever been written
-/// by the fixed [`BlobStore::import_path`].
+/// which is the steady-state case for a store written only by
+/// [`BlobStore::import_path`].
 async fn reclaim_stray_auto_tags(store: &Store) -> Result<()> {
     let removed = store
         .tags()
@@ -713,7 +659,7 @@ async fn reclaim_stray_auto_tags(store: &Store) -> Result<()> {
 /// [`Error::Protocol`] the moment the transfer's running byte offset exceeds
 /// `max_bytes`. Watches the downloader's own progress stream rather than
 /// checking the blob's size only after a (potentially oversized) transfer has
-/// already completed — a hostile peer fully controls the manifest entry it
+/// already completed: a hostile peer fully controls the manifest entry it
 /// advertises (both the hash and any size it claims for it), so only a live
 /// check during the transfer actually bounds what it can write to this device's
 /// disk. Dropping the progress stream on a cap breach stops the downloader's
@@ -761,7 +707,7 @@ async fn download_capped(
 /// Name of the note-assets subdirectory within a meeting folder.
 pub(crate) const ASSETS_DIR: &str = "assets";
 
-/// Whether `rel` names a meeting's audio file — `audio.<ext>` for any ext in
+/// Whether `rel` names a meeting's audio file: `audio.<ext>` for any ext in
 /// [`minutist_common::SUPPORTED_AUDIO_EXTS`] (`opus` for a desktop recording,
 /// `m4a` for a synced phone one). The single-audio-per-meeting invariant means
 /// the stem is always `audio`; only the container differs by capture platform.
@@ -824,18 +770,18 @@ pub(crate) const SUMMARY_REL: &str = "summary.md";
 pub(crate) const ARTIFACT_RELS: [&str; 2] = [TRANSCRIPT_REL, SUMMARY_REL];
 
 /// Whether `rel` names a derived artifact carried on the [`crate::artifacts_proto`]
-/// exchange — exactly `transcript.json` or `summary.md`. An allow-list kept
-/// DISJOINT from [`is_safe_rel`] (media) by construction: a derived file must never
-/// ride the media union path, whose last-write-wins overwrite is correct for
-/// immutable content-addressed media but would clobber a mutable derived output
-/// (`planning/DESIGN_artifacts.md` §2).
+/// exchange: exactly `transcript.json` or `summary.md`. An allow-list kept
+/// disjoint from [`is_safe_rel`] (media) by construction, since a derived file
+/// must never ride the media union path, whose last-write-wins overwrite is
+/// correct for immutable content-addressed media but would clobber a mutable
+/// derived output (`planning/DESIGN_artifacts.md` §2).
 pub(crate) fn is_artifact_rel(rel: &str) -> bool {
     rel == TRANSCRIPT_REL || rel == SUMMARY_REL
 }
 
 /// The persistent tag name pinning one of a meeting's derived-artifact blobs.
 /// `rel` must already be an [`is_artifact_rel`] path. A sub-namespace distinct
-/// from the media tags (`meeting/{id}/audio|asset/...`) — both still share the
+/// from the media tags (`meeting/{id}/audio|asset/...`); both still share the
 /// [`meeting_tag_prefix`] so [`BlobStore::delete_meeting_blobs`] unpins media and
 /// artifacts together for a deleted meeting in one `delete_prefix` call.
 fn artifact_tag(meeting_id: MeetingId, rel: &str) -> String {
@@ -843,8 +789,8 @@ fn artifact_tag(meeting_id: MeetingId, rel: &str) -> String {
 }
 
 /// Upper bound on the number of entries in a manifest received from a peer. A
-/// real meeting carries one `audio.opus` plus its note assets — tens of files in
-/// practice — so this ceiling is far above any legitimate manifest while bounding
+/// real meeting carries one `audio.opus` plus its note assets, tens of files in
+/// practice, so this ceiling is far above any legitimate manifest while bounding
 /// the work a hostile paired peer can force: without it an 8 MiB manifest frame
 /// (the [`crate::frame::MAX_FRAME`] cap) could pack on the order of 10^5 minimal
 /// entries, each driving a download attempt. The frame cap already bounds
@@ -883,7 +829,7 @@ impl Manifest {
     ///   entry per path (audio once, each asset filename once), so a duplicate is
     ///   definitionally malformed; left unchecked, two entries for one path would
     ///   each be pulled and the later export would overwrite the earlier at the
-    ///   same target — a nondeterministic, peer-controlled outcome.
+    ///   same target, a nondeterministic, peer-controlled outcome.
     pub fn validate(&self) -> Result<()> {
         if self.entries.len() > MAX_MANIFEST_ENTRIES {
             return Err(Error::Protocol(format!(
@@ -946,9 +892,9 @@ pub struct ArtifactManifest {
 }
 
 /// One derived artifact's `(relative-path, hash)` plus the authority that produced
-/// those exact bytes. Unlike a media [`ManifestEntry`], the authority travels WITH
-/// the bytes, so the pull decision never consults `metadata.json` (the
-/// relay-clobber — DESIGN §2 C1).
+/// those exact bytes. Unlike a media [`ManifestEntry`], the authority travels
+/// alongside the bytes, so the pull decision never consults `metadata.json`
+/// (the relay-clobber, DESIGN §2 C1).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactEntry {
     /// Path relative to the meeting folder: `transcript.json` or `summary.md`.
@@ -964,26 +910,19 @@ pub struct ArtifactEntry {
 
 impl ArtifactEntry {
     /// Whether `self` should overwrite `other` for the same `rel_path`: strictly
-    /// newer by `produced_at` (parsed to an instant), ties broken by the LOWEST
-    /// `produced_by` HostRef. NEVER `>=` (a same-`produced_at`, different-content
-    /// pair must not pull on both sides — DESIGN §2 C2) and NEVER a raw-string
-    /// compare (mixed fractional precision / offset sorts wrong). A malformed
-    /// timestamp on EITHER side is treated as not-superseding, so a parse glitch
-    /// can only keep local bytes, never clobber them. Callers short-circuit equal
-    /// hashes (identical bytes never need pulling) before consulting this.
+    /// newer by `produced_at`, parsed to an instant, with ties broken by the lowest
+    /// `produced_by`. Strictly newer rather than `>=`, so a same-`produced_at`
+    /// pair with differing content does not pull on both sides
+    /// (`planning/DESIGN_artifacts.md` §2 C2); parsed rather than string-compared,
+    /// since mixed fractional precision and offsets sort wrong. A malformed
+    /// timestamp on either side counts as not-superseding, so a parse glitch can
+    /// only keep local bytes. Callers short-circuit equal hashes first.
     ///
-    /// This is the BYTES order: newest `produced_at` wins, so a reprocess by ANY
-    /// host (even a higher HostRef) supersedes an older copy. It shares only the
-    /// lowest-`HostRef` TIEBREAK with `notes_crdt::merge_processing`'s two-`Processed`
-    /// rule — NOT the whole order: that merge is clock-INDEPENDENT (lowest HostRef
-    /// regardless of timestamp, §7 D2, so the lifecycle state converges without
-    /// trusting clocks), whereas this is clock-dependent by design (newest bytes
-    /// win). Under a single producer per meeting the two never disagree (one host
-    /// stamps both the lifecycle and the bytes); only a cross-host reprocess —
-    /// which the unbuilt producer-gate gates against — could make `metadata.json`'s
-    /// `processed_by` name a different host than the on-disk `produced_by`. The
-    /// pull is byte-authoritative and never consults `metadata.json`, so that
-    /// divergence can never cause a clobber here.
+    /// This orders on the bytes themselves, so a reprocess by any host supersedes
+    /// an older copy. It shares only the lowest-`produced_by` tiebreak with
+    /// `notes_crdt::merge_processing`, which is clock-independent by design (§7 D2)
+    /// where this is deliberately clock-dependent. The pull never consults
+    /// `metadata.json`, so the two orders disagreeing cannot cause a clobber.
     pub(crate) fn supersedes(&self, other: &ArtifactEntry) -> bool {
         match (
             parse_produced_at(&self.produced_at),
@@ -1044,7 +983,7 @@ impl ArtifactManifest {
         Ok(())
     }
 
-    /// The entry for `rel`, if present — the local side the receiver compares a
+    /// The entry for `rel`, if present: the local side the receiver compares a
     /// peer entry against via [`ArtifactEntry::supersedes`].
     pub(crate) fn entry(&self, rel: &str) -> Option<&ArtifactEntry> {
         self.entries.iter().find(|e| e.rel_path == rel)
@@ -1059,7 +998,7 @@ fn parse_produced_at(s: &str) -> Option<DateTime<FixedOffset>> {
 }
 
 /// Subdirectory under the blob store ([`STORE_DIR`]) holding the per-meeting
-/// artifact-authority records. Under `.blobs` (already sync-owned), NOT the
+/// artifact-authority records. Under `.blobs` (already sync-owned), not the
 /// meeting folder, so the authority store never widens the set of files sync
 /// writes into a meeting's visible namespace beyond the two artifact files.
 const ARTIFACT_AUTHORITY_SUBDIR: &str = "artifacts";
@@ -1068,8 +1007,8 @@ const ARTIFACT_AUTHORITY_SUBDIR: &str = "artifacts";
 /// that produced those exact bytes. Persisted at
 /// `{meetings_root}/.blobs/artifacts/{meeting_id}.json`, written whenever an
 /// artifact's bytes are written (received over sync, or first advertised by the
-/// producer), so a device re-advertises the authority that arrived WITH the bytes
-/// rather than one re-derived from `metadata.json` (DESIGN §2 C1). Every
+/// producer), so a device re-advertises the authority that arrived alongside the
+/// bytes rather than one re-derived from `metadata.json` (DESIGN §2 C1). Every
 /// read-modify-write goes through [`with_artifact_authority`] under the per-meeting
 /// lock, so concurrent exchanges for one meeting cannot lose each other's record.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1121,7 +1060,7 @@ fn artifact_authority_path(meetings_root: &Path, meeting_id: MeetingId) -> PathB
 /// Load a meeting's artifact-authority record, defaulting to empty when absent or
 /// unreadable. A corrupt record is logged and treated as empty. The worst case is
 /// that the artifact is not advertised this round (no provable authority); the pull
-/// guard then KEEPS the still-present local bytes rather than overwriting them with
+/// guard then keeps the still-present local bytes rather than overwriting them with
 /// a peer copy it cannot prove is newer (see `artifacts_proto::pull_superseding`),
 /// so a lost record degrades to fetch-pending, never a clobber.
 fn load_artifact_authority(meetings_root: &Path, meeting_id: MeetingId) -> ArtifactAuthority {
@@ -1163,7 +1102,7 @@ fn save_artifact_authority(
         .map_err(|e| Error::Protocol(format!("atomically renaming {tmp:?} -> {path:?}: {e}")))
 }
 
-/// Process-wide registry of per-meeting artifact-authority-store mutexes — the
+/// Process-wide registry of per-meeting artifact-authority-store mutexes: the
 /// `.blobs/artifacts/{id}.json` analogue of `notes_crdt::metadata_lock`'s
 /// `metadata.json` registry. A separate registry (not a reuse of the metadata
 /// lock) so an artifact exchange and a `metadata.json` RMW for the same meeting do
@@ -1193,7 +1132,7 @@ fn artifact_authority_lock(meeting_id: MeetingId) -> Arc<Mutex<()>> {
 /// and returns `(dirty, value)`; the record is saved (atomically) iff `dirty`.
 ///
 /// The lock is a [`std::sync::Mutex`] held only across the synchronous load →
-/// mutate → save — never across an `.await` (the awaited blob download/import
+/// mutate → save, never across an `.await` (the awaited blob download/import
 /// happens before this is called), so it adds no async-runtime entanglement.
 fn with_artifact_authority<R>(
     meetings_root: &Path,
@@ -1210,7 +1149,7 @@ fn with_artifact_authority<R>(
     Ok(value)
 }
 
-/// Record the authority for an artifact's received bytes — called after
+/// Record the authority for an artifact's received bytes. Called after
 /// [`BlobStore::download_artifact`] with the peer entry's `produced_by` /
 /// `produced_at`, so a future [`BlobStore::import_artifacts`] on this device
 /// faithfully re-advertises the authority that arrived with the bytes rather than
@@ -1233,7 +1172,7 @@ pub(crate) fn record_artifact_authority(
 /// Whether an export fsync/rename io error is a transient Windows sharing/access
 /// violation worth retrying (an antivirus scan or indexer briefly holding the
 /// tmp handle): `ERROR_ACCESS_DENIED` (5), `ERROR_SHARING_VIOLATION` (32),
-/// `ERROR_LOCK_VIOLATION` (33). This mitigation is Windows-only — off Windows the
+/// `ERROR_LOCK_VIOLATION` (33). This mitigation is Windows-only: off Windows the
 /// same raw codes mean unrelated, genuine errors (notably `EIO` is also errno 5),
 /// so a fsync/rename failure there is not transient and the export never retries.
 #[cfg(windows)]
@@ -1247,7 +1186,7 @@ fn is_transient_export_lock(_err: &std::io::Error) -> bool {
 }
 
 /// Run a fallible filesystem finalize step (`op`), retrying while `is_retryable`
-/// says its error is transient — sleeping `backoff_ms[attempt]` between tries and
+/// says its error is transient: sleeping `backoff_ms[attempt]` between tries and
 /// giving up once the schedule is exhausted (returning the last error) or the
 /// error is terminal. Used for the export rename under a Windows AV lock; the
 /// retry predicate is injected (rather than calling [`is_transient_export_lock`]
@@ -1288,8 +1227,8 @@ mod tests {
     #[test]
     fn transient_export_lock_is_windows_only() {
         // The three Win32 codes an AV/indexer lock surfaces on the tmp handle are
-        // transient ONLY on Windows; off Windows the same raw codes mean unrelated
-        // genuine errors (e.g. EIO = 5) and must NOT be retried.
+        // transient only on Windows; off Windows the same raw codes mean unrelated
+        // genuine errors (e.g. EIO = 5) and must not be retried.
         #[cfg(windows)]
         for code in [5, 32, 33] {
             assert!(
@@ -1313,7 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_on_transient_succeeds_after_transient_failures() {
-        // Fails twice (transient), then succeeds — the export rename recovering
+        // Fails twice (transient), then succeeds, the export rename recovering
         // once the AV lock releases.
         let calls = std::cell::Cell::new(0u32);
         let res = retry_on_transient(
@@ -1460,7 +1399,7 @@ mod tests {
     #[test]
     fn manifest_validate_rejects_duplicate_rel_path() {
         // Two entries for the same path (here two `audio.opus` rows with different
-        // hashes) is malformed — a local import never produces it — and would
+        // hashes) is malformed, since a local import never produces it, and would
         // otherwise let the peer pick the final on-disk bytes by entry order.
         let m = Manifest {
             entries: vec![
@@ -1521,17 +1460,18 @@ mod tests {
         let newer = art_entry("transcript.json", 2, "b", "2026-06-30T10:05:00Z");
         assert!(newer.supersedes(&older));
         assert!(!older.supersedes(&newer));
-        // Equal produced_at, distinct content: NOT >= — lowest HostRef wins and the
-        // higher HostRef does not supersede, so the same pair never pulls both ways.
+        // Equal produced_at, distinct content: strictly-newer excludes this case, so
+        // the lowest HostRef wins and the higher one does not supersede, meaning the
+        // same pair never pulls both ways.
         let a = art_entry("transcript.json", 3, "a", "2026-06-30T10:00:00Z");
         let b = art_entry("transcript.json", 4, "b", "2026-06-30T10:00:00Z");
         assert!(a.supersedes(&b));
         assert!(!b.supersedes(&a));
-        // Equal produced_at AND host: neither supersedes (no pull either way).
+        // Equal produced_at and host: neither supersedes (no pull either way).
         let a2 = art_entry("transcript.json", 5, "a", "2026-06-30T10:00:00Z");
         assert!(!a.supersedes(&a2));
         assert!(!a2.supersedes(&a));
-        // A malformed timestamp on EITHER side never supersedes (keeps local).
+        // A malformed timestamp on either side never supersedes (keeps local).
         let bad = art_entry("transcript.json", 6, "a", "not-a-time");
         assert!(!bad.supersedes(&newer));
         assert!(!newer.supersedes(&bad));
@@ -1589,8 +1529,8 @@ mod tests {
     }
 
     /// `import_artifacts` establishes authority from the producer fallback on first
-    /// advertise, then faithfully re-advertises the recorded stamp (NOT
-    /// `metadata.json`) even with no producer authority — and refuses to advertise
+    /// advertise, then faithfully re-advertises the recorded stamp, not
+    /// `metadata.json`, even with no producer authority, and refuses to advertise
     /// bytes that change with neither a matching record nor producer authority.
     #[tokio::test]
     async fn import_artifacts_producer_fallback_then_faithful_relay() {
@@ -1603,7 +1543,7 @@ mod tests {
         std::fs::write(folder.join("transcript.json"), b"[]").expect("write transcript");
 
         // No record yet + a local Processed → producer fallback stamps the entry
-        // from the metadata authority AND records it.
+        // from the metadata authority and records it.
         let producer = Some((HostRef("host-a".to_string()), "2026-06-30T10:00:00Z".to_string()));
         let m = store
             .import_artifacts(root, id, producer)
@@ -1613,8 +1553,8 @@ mod tests {
         assert_eq!(m.entries[0].rel_path, "transcript.json");
         assert_eq!(m.entries[0].produced_by, HostRef("host-a".to_string()));
 
-        // A second import with NO producer authority (a relay) still advertises the
-        // SAME stamp — read from the recorded authority, not metadata.
+        // A second import with no producer authority (a relay) still advertises the
+        // same stamp, read from the recorded authority, not metadata.
         let again = store
             .import_artifacts(root, id, None)
             .await
@@ -1636,11 +1576,11 @@ mod tests {
         );
     }
 
-    /// A faithful authority record (the state a device is in after RECEIVING bytes)
+    /// A faithful authority record (the state a device is in after receiving bytes)
     /// overrides a present `producer_authority`. This is the W-2 guard: a consumer
-    /// whose `metadata.json` advanced to `Processed` via discovery must NOT re-stamp
-    /// the bytes it received from its own (stale, not byte-coherent) `Processed` —
-    /// the recorded authority that arrived WITH the bytes wins.
+    /// whose `metadata.json` advanced to `Processed` via discovery must not re-stamp
+    /// the bytes it received from its own (stale, not byte-coherent) `Processed`;
+    /// the recorded authority that arrived alongside the bytes wins.
     #[tokio::test]
     async fn recorded_authority_overrides_producer_authority() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1652,7 +1592,7 @@ mod tests {
         std::fs::write(folder.join("transcript.json"), b"[]").expect("write transcript");
 
         // First import records (host-a, T1) for the on-disk bytes (producer
-        // fallback) — standing in for the authority a receive would have recorded.
+        // fallback), standing in for the authority a receive would have recorded.
         store
             .import_artifacts(
                 root,
@@ -1662,8 +1602,8 @@ mod tests {
             .await
             .expect("seed record");
 
-        // A later import offering a DIFFERENT producer_authority (host-b, T2) — e.g.
-        // a device whose metadata.json advanced via discovery — must NOT re-stamp:
+        // A later import offering a different producer_authority (host-b, T2), e.g.
+        // a device whose metadata.json advanced via discovery, must not re-stamp:
         // the recorded (host-a, T1) wins because it matches the on-disk bytes.
         let m = store
             .import_artifacts(
@@ -1678,8 +1618,8 @@ mod tests {
         assert_eq!(m.entries[0].produced_at, "2026-06-30T10:00:00Z");
     }
 
-    /// F3(a): deleting a meeting unpins every blob tag it holds — media AND
-    /// derived artifacts — so a subsequent GC sweep can reclaim the bytes. A
+    /// F3(a): deleting a meeting unpins every blob tag it holds, media and
+    /// derived artifacts, so a subsequent GC sweep can reclaim the bytes. A
     /// second delete on an already-untagged meeting is a no-op, not an error.
     #[tokio::test]
     async fn delete_meeting_blobs_unpins_media_and_artifact_tags() {
@@ -1759,8 +1699,7 @@ mod tests {
             .expect("second delete is a no-op, not an error");
     }
 
-    /// The minor "media export is non-atomic" fix, unit-tested directly against
-    /// the shared [`BlobStore::export_atomic`] helper (both [`BlobStore::download`]
+    /// Exercises [`BlobStore::export_atomic`] directly (both [`BlobStore::download`]
     /// and [`BlobStore::download_artifact`] route through it): exporting new
     /// content over an existing target file replaces it completely and leaves no
     /// `.tmp` residue, whether or not a stale file was already present.
@@ -1803,9 +1742,9 @@ mod tests {
     }
 
     /// `export_atomic` owns creating its target's parent directory rather than
-    /// relying on the underlying `iroh-blobs` export doing it implicitly — the
-    /// contract `media_proto`/`artifacts_proto`'s responders now depend on
-    /// (they no longer pre-create the meeting folder via `MeetingFolder::ensure`).
+    /// relying on the underlying `iroh-blobs` export doing it implicitly: the
+    /// contract `media_proto`/`artifacts_proto`'s responders depend on, since
+    /// neither pre-creates the meeting folder via `MeetingFolder::ensure`.
     #[tokio::test]
     async fn export_atomic_creates_a_missing_parent_directory() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1836,11 +1775,11 @@ mod tests {
     }
 
     /// The re-hash memo ([`BlobStore::import_path`]) returns the memoised hash
-    /// without re-hashing when a file's `(size, mtime)` is unchanged — proven by
-    /// planting a deliberately WRONG hash under a matching memo entry and
-    /// observing `import_path` returns THAT wrong value (so the skip genuinely
-    /// happens, not just "happens to recompute the same value") — and correctly
-    /// invalidates and re-hashes once the file changes.
+    /// without re-hashing when a file's `(size, mtime)` is unchanged. Proven by
+    /// planting a deliberately wrong hash under a matching memo entry and
+    /// observing that `import_path` returns that wrong value, so the skip
+    /// genuinely happens rather than coincidentally recomputing the same value,
+    /// and correctly invalidates and re-hashes once the file changes.
     #[tokio::test]
     async fn import_path_memo_skips_unchanged_files_and_invalidates_on_change() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1854,7 +1793,7 @@ mod tests {
             .await
             .expect("first import");
 
-        // Plant a deliberately wrong hash under the file's CURRENT (size, mtime).
+        // Plant a deliberately wrong hash under the file's current (size, mtime).
         // If the memo is genuinely consulted (rather than the file re-hashed for
         // real), import_path must return this wrong value.
         let metadata = std::fs::metadata(&path).expect("stat");
@@ -1893,16 +1832,12 @@ mod tests {
         );
     }
 
-    /// The producer-gate merge gate for the auto-tag leak: a LOCALLY-IMPORTED
-    /// blob (via [`BlobStore::import_meeting`], the dominant case — a
-    /// recorded/produced meeting, not a downloaded one) is fully GC-eligible
-    /// after [`BlobStore::delete_meeting_blobs`] — no tag, named or temporary,
-    /// still roots its hash. Before the [`BlobStore::import_path`] fix, a bare
-    /// `add_path(path).await` minted a PERSISTENT `auto-*` tag alongside the
-    /// deterministic `meeting/{id}/audio` tag; `delete_meeting_blobs` only
-    /// deletes the `meeting/{id}/...` prefix, so the `auto-*` tag survived and
-    /// this test's tag-list scan found it — this test fails against that code
-    /// and passes once `import_path` leaves no such orphan.
+    /// A locally-imported blob (via [`BlobStore::import_meeting`], the dominant
+    /// case: a recorded/produced meeting, not a downloaded one) is fully
+    /// GC-eligible after [`BlobStore::delete_meeting_blobs`]: no tag, named or
+    /// temporary, still roots its hash. Guards against [`BlobStore::import_path`]
+    /// minting a persistent `auto-*` tag outside the `meeting/{id}/...` prefix
+    /// that `delete_meeting_blobs` unpins, which would leave the blob rooted.
     #[tokio::test]
     async fn local_import_is_fully_reclaimable_after_meeting_delete() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1924,8 +1859,8 @@ mod tests {
             .await
             .expect("delete meeting blobs");
 
-        // No NAMED tag — including any stray `auto-*` tag a bare
-        // `add_path(...).await` would have left behind — still roots the hash.
+        // No named tag, including any stray `auto-*` tag a bare
+        // `add_path(...).await` would have left behind, still roots the hash.
         let mut tags = store.store.tags().list().await.expect("list tags");
         while let Some(tag) = tags.next().await {
             let info = tag.expect("tag info");
@@ -1936,7 +1871,7 @@ mod tests {
             );
         }
 
-        // No TEMP tag roots the hash either: the transient protection
+        // No temp tag roots the hash either: the transient protection
         // `import_path` holds while it sets the deterministic tag must not
         // outlive that call.
         let mut temp_tags = store
@@ -1954,9 +1889,9 @@ mod tests {
     }
 
     /// [`reclaim_stray_auto_tags`] (run from [`BlobStore::open`]) removes a
-    /// pre-existing `auto-*` tag — the kind a bare `add_path(...).await` used to
-    /// leave behind — while leaving a deterministic `meeting/{id}/...` tag
-    /// untouched, proving the prefix scoping can only ever hit the stray kind.
+    /// pre-existing `auto-*` tag, the kind a bare `add_path(...).await` leaves
+    /// behind, while leaving a deterministic `meeting/{id}/...` tag untouched,
+    /// proving the prefix scoping can only ever hit the stray kind.
     #[tokio::test]
     async fn reclaim_stray_auto_tags_removes_auto_leaves_deterministic() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1964,8 +1899,9 @@ mod tests {
         let store = BlobStore::open(root).await.expect("open store");
         let id = MeetingId::new();
 
-        // Seed a stray auto tag directly (standing in for one left by a pre-fix
-        // import) alongside a legitimate deterministic tag.
+        // Seed a stray auto tag directly (standing in for one a bare
+        // `add_path(...).await` would leave) alongside a legitimate deterministic
+        // tag.
         let stray_hash = Hash::from([0x11u8; 32]);
         let kept_hash = Hash::from([0x22u8; 32]);
         store

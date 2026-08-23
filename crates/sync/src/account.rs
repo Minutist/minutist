@@ -6,12 +6,12 @@
 //! This module adds a second, account-mediated one: an injected
 //! [`AccountEndpointSource`] periodically fetches the other devices on the
 //! signed-in account and feeds each into a refresh loop. The two sources are
-//! additive — both feed the same [`crate::address_lookup::PeerDirectory`].
+//! additive: both feed the same [`crate::address_lookup::PeerDirectory`].
 //!
 //! `crates/sync` takes **no** HTTP or account-service dependency of its own: the
 //! consumer (app-main / sync-ffi) supplies an [`AccountEndpointSource`]
 //! implementation bound to the device's account credential. This module defines
-//! only the trait, the pure reconciliation logic, and the loop that drives it —
+//! only the trait, the pure reconciliation logic, and the loop that drives it,
 //! mirroring the `election` crate's collaborator-behind-a-trait seam.
 //!
 //! [`run_account_refresh_loop_v2`] drives the loop, built once around
@@ -38,8 +38,8 @@ pub struct AccountEndpoint {
     pub relay_url: String,
     /// The device's published direct socket addresses ("ip:port"), so a
     /// same-tailnet/LAN peer dials it without the relay or any DNS (0049).
-    /// Empty when the device published none (off-network / older client) — the
-    /// peer then reaches it relay-only, as before.
+    /// Empty when the device published none (off-network or an older client);
+    /// the peer then reaches it relay-only.
     pub direct_addrs: Vec<String>,
 }
 
@@ -71,7 +71,7 @@ pub fn peers_to_add(list: &[AccountEndpoint], own_endpoint_id: &str) -> Vec<Acco
         .collect()
 }
 
-/// The consumer-provided sink [`run_account_refresh_loop_v2`] drives — the one
+/// The consumer-provided sink [`run_account_refresh_loop_v2`] drives: the one
 /// object a consumer implements to wire up account-mediated peer discovery, so
 /// each new loop capability lands as a trait-method addition instead of a
 /// signature change (`planning/DESIGN_account-refresh-loop-v2.md`).
@@ -86,7 +86,7 @@ pub trait RefreshSink: Send + Sync {
     fn upsert_account_peer(&self, ep: &AccountEndpoint) -> bool;
 
     /// Remove an `Account`-sourced peer no longer present in the directory
-    /// list (reconcile — it left the account). Source-aware: must never remove
+    /// list (reconcile: it left the account). Source-aware: must never remove
     /// a manually-paired peer.
     fn remove_account_peer(&self, endpoint_id: &str);
 
@@ -97,8 +97,8 @@ pub trait RefreshSink: Send + Sync {
 
     /// First-contact dial of a genuinely new peer, so first-sync is not gated
     /// on the poll cadence. The loop never calls this when [`Self::is_suppressed`]
-    /// holds; an implementation MUST also treat it as a no-op if suppressed, as
-    /// a second guard. Runs under the loop's cancel scope — dropped on cancel.
+    /// holds; an implementation must also treat it as a no-op if suppressed, as
+    /// a second guard. Runs under the loop's cancel scope, dropped on cancel.
     async fn on_new_peer(&self, endpoint_id: &str);
 
     /// The directory's current `Account`-sourced endpoint ids. Read once at loop
@@ -112,21 +112,20 @@ pub trait RefreshSink: Send + Sync {
 /// Run the account-peer-discovery loop until `cancel` is cancelled.
 ///
 /// On start, registers `self_endpoint` with `source` (best-effort: a failure is
-/// logged at `warn` and does NOT abort the loop). The reconcile-removal state is
-/// then seeded from
-/// `sink.account_peer_ids()` — not empty — so a peer that left the account while
-/// this loop was not running (a live `set_enabled(false -> true)` restart, not a
-/// full process restart) is still removed on the loop's first tick rather than
-/// becoming a zombie entry no future diff ever catches (`sink.account_peer_ids`'s
-/// doc; `remove_account_peer` clears on success only, so a missed removal never
-/// self-heals).
+/// logged at `warn` and does not abort the loop). The reconcile-removal state
+/// is then seeded from `sink.account_peer_ids()`, which is not empty, so a peer
+/// that left the account while this loop was not running (a live
+/// `set_enabled(false -> true)` restart, not a full process restart) is still
+/// removed on the loop's first tick rather than becoming a zombie entry no
+/// future diff ever catches (`sink.account_peer_ids`'s doc; `remove_account_peer`
+/// clears on success only, so a missed removal never self-heals).
 ///
 /// Each `interval` tick (the first immediate, `MissedTickBehavior::Delay`
 /// thereafter): fetches the account's endpoint list (a failure is logged at
 /// `warn` and retried next tick); removes every previously-seen `Account` id
 /// absent from the new list; then, for each non-self peer in the list, upserts
-/// it and — only for a genuinely new, non-suppressed id — first-contact-dials it
-/// via [`RefreshSink::on_new_peer`] under the loop's cancel scope (a cancel
+/// it and, only for a genuinely new and non-suppressed id, first-contact-dials
+/// it via [`RefreshSink::on_new_peer`] under the loop's cancel scope (a cancel
 /// during the dial ends the loop immediately, dropping the in-flight dial).
 pub async fn run_account_refresh_loop_v2(
     source: Arc<dyn AccountEndpointSource>,
@@ -174,18 +173,12 @@ pub async fn run_account_refresh_loop_v2(
                 for ep in &peers {
                     let was_new = sink.upsert_account_peer(ep);
                     if was_new && !sink.is_suppressed(&ep.endpoint_id) {
-                        // SPAWN the first-contact dial rather than awaiting it in
-                        // line: a dead or slow peer (e.g. a backgrounded phone whose
-                        // dial runs the full timeout) must not block the dial-kick of
-                        // the other peers in this pass. Awaiting serially let one
-                        // unreachable peer at the front of the account list starve a
-                        // live one behind it. Each spawned dial races the loop's
-                        // cancel token, preserving on_new_peer's "runs under the
-                        // loop's cancel scope, dropped on cancel" contract. It is
-                        // fire-and-forget: a first-contact dial is best-effort (it
-                        // warms the path; a failure just retries on the next poll
-                        // tick), and the was_new gate kicks it once per peer, so the
-                        // spawns are bounded.
+                        // Spawned rather than awaited inline, so a dead or slow peer
+                        // can't block the dial-kick of the others in this pass. Each
+                        // spawn races the loop's cancel token, matching on_new_peer's
+                        // "dropped on cancel" contract, and is fire-and-forget: a
+                        // failure just retries next poll tick. The was_new gate bounds
+                        // it to once per peer.
                         let sink = Arc::clone(&sink);
                         let cancel = cancel.clone();
                         let endpoint_id = ep.endpoint_id.clone();
@@ -259,7 +252,7 @@ mod tests {
         list: Vec<AccountEndpoint>,
         register_calls: AtomicUsize,
         list_calls: AtomicUsize,
-        /// When true, the NEXT `list_endpoints` call fails once, then clears.
+        /// When true, the next `list_endpoints` call fails once, then clears.
         fail_next_list: AtomicBool,
     }
 
@@ -489,7 +482,7 @@ mod tests {
     }
 
     /// (e) A cancel raised while `on_new_peer` is in-flight (blocked forever,
-    /// never notified) still stops the loop promptly — the dial is dropped, not
+    /// never notified) still stops the loop promptly; the dial is dropped, not
     /// awaited to completion.
     #[tokio::test]
     async fn refresh_loop_v2_cancel_interrupts_an_in_flight_on_new_peer_dial() {
@@ -506,7 +499,7 @@ mod tests {
         ));
 
         // Let the loop tick and enter `on_new_peer`'s blocking wait (never
-        // notified — `block` is deliberately never signalled).
+        // notified; `block` is deliberately never signalled).
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(
             !sink.on_new_peer_calls.lock().unwrap().is_empty(),

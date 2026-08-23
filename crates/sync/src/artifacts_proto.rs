@@ -1,19 +1,19 @@
 //! The derived-artifact exchange protocol ([`StreamKind::Artifacts`], WS4-B).
 //!
-//! Two paired devices reconcile a meeting's DERIVED outputs — `transcript.json`
-//! (ASR + diarization labels) and `summary.md` — the files processing produces.
-//! It mirrors [`crate::media_proto`]: a [`ArtifactManifest`] is exchanged over a
+//! Two paired devices reconcile a meeting's derived outputs: `transcript.json`
+//! (ASR + diarization labels) and `summary.md`, the files processing produces.
+//! It mirrors [`crate::media_proto`]: an [`ArtifactManifest`] is exchanged over a
 //! fresh bidirectional stream on the sync ALPN ([`crate::notes_proto::SYNC_ALPN`]),
 //! then each side pulls the entries it should take over the blobs ALPN
-//! ([`iroh_blobs::ALPN`]). It differs from media in ONE load-bearing way: a media
+//! ([`iroh_blobs::ALPN`]). It differs from media in one load-bearing way: a media
 //! blob is immutable and content-addressed, so "pull what I lack by hash" is the
-//! whole rule; a derived artifact is MUTABLE (a meeting can be reprocessed), so the
+//! whole rule; a derived artifact is mutable (a meeting can be reprocessed), so the
 //! manifest stamps each entry with the authority that produced those exact bytes
 //! (`produced_by` host + `produced_at`), and the pull takes a peer's entry only
-//! when it **strictly supersedes** the local one (`planning/DESIGN_artifacts.md`
-//! §2). The authority travels WITH the bytes and is never re-derived from
-//! `metadata.json` (whose `Processed` stamp propagates over Discovery independently
-//! of the bytes — the relay-clobber, §2 C1).
+//! when it strictly supersedes the local one (`planning/DESIGN_artifacts.md` §2).
+//! The authority travels with the bytes and is never re-derived from
+//! `metadata.json`, whose `Processed` stamp propagates over Discovery
+//! independently of the bytes (the relay-clobber, §2 C1).
 //!
 //! # Wire protocol
 //!
@@ -51,10 +51,10 @@
 //!
 //! A device advertises an artifact entry only for a file present on disk
 //! ([`BlobStore::import_artifacts`]), so a relay that learned `Processed` over
-//! Discovery but lacks the bytes contributes NO entry and never offers a
-//! `Processed`-with-no-transcript copy. A consumer in that position simply receives
-//! nothing this round (fetch-pending) and pulls on a later sync once a holder is
-//! reachable — not an error (§4).
+//! Discovery but lacks the bytes contributes no entry and never offers a
+//! `Processed`-with-no-transcript copy. A consumer in that position simply
+//! receives nothing this round (fetch-pending) and pulls on a later sync once
+//! a holder is reachable: not an error (§4).
 
 use std::path::Path;
 
@@ -70,7 +70,7 @@ use crate::timeouts::{FRAME_IO_TIMEOUT, PEER_PULL_TIMEOUT, RESPONDER_CLOSE_TIMEO
 use crate::{discovery_proto, Error, Result};
 
 /// The completion-handshake byte exchanged after both sides finish pulling.
-/// Distinct from the media handshake byte purely as a debugging aid — it rides a
+/// Distinct from the media handshake byte purely as a debugging aid: it rides a
 /// separate stream, so no collision is possible.
 const DONE: u8 = 0xA4;
 
@@ -90,13 +90,13 @@ fn encode_manifest(manifest: &ArtifactManifest) -> Result<Vec<u8>> {
 /// local `Processed { processed_by, at }`, or `None` when the meeting is not
 /// locally `Processed` (a capture-only device, or a consumer that has not received
 /// the derived state). Used only as the byte-coherent fallback when the
-/// authority store holds no record for the on-disk bytes — see
+/// authority store holds no record for the on-disk bytes; see
 /// [`BlobStore::import_artifacts`].
 ///
 /// The underlying `metadata.json` read is intentionally lock-free: its failure
-/// mode is conservative — a torn/absent/corrupt read yields `Local` → `None` →
+/// mode is conservative. A torn/absent/corrupt read yields `Local` → `None` →
 /// the artifact simply is not advertised this round (fetch-pending, self-heals on
-/// the next sync), never a clobber — so it does not need the metadata lock.
+/// the next sync), never a clobber, so it does not need the metadata lock.
 fn producer_authority(root: &Path, meeting_id: MeetingId) -> Option<(HostRef, String)> {
     match discovery_proto::read_local_processing(root, meeting_id) {
         ProcessingLifecycle::Processed { processed_by, at } => Some((processed_by, at)),
@@ -109,12 +109,12 @@ fn producer_authority(root: &Path, meeting_id: MeetingId) -> Option<(HostRef, St
 /// bytes.
 ///
 /// For each peer entry: if we advertise a provable copy, take the peer's only when
-/// its bytes differ AND it strictly supersedes ours
-/// ([`crate::blobs::ArtifactEntry::supersedes`] — strict `>` on `produced_at`, ties
-/// to the lowest `produced_by` HostRef). If we advertise NO provable copy, pull only
+/// its bytes differ and it strictly supersedes ours
+/// ([`crate::blobs::ArtifactEntry::supersedes`]: strict `>` on `produced_at`, ties
+/// to the lowest `produced_by` HostRef). If we advertise no provable copy, pull only
 /// when we genuinely lack the file on disk: a file present but unstampable (bytes
-/// produced before a `Processed` flip, or a lost/corrupt authority record) is NOT
-/// overwritten with a peer copy we cannot prove is newer — that would silently lose
+/// produced before a `Processed` flip, or a lost/corrupt authority record) is not
+/// overwritten with a peer copy we cannot prove is newer, which would silently lose
 /// possibly-newer local bytes. The local file is kept (stuck until its authority is
 /// re-established) and the situation logged. `peer_manifest` has been validated
 /// before this runs.
@@ -130,10 +130,10 @@ async fn pull_superseding(
     for entry in &peer_manifest.entries {
         let should_pull = match local_manifest.entry(&entry.rel_path) {
             // We advertise a provable copy: take the peer's only if its bytes differ
-            // AND it strictly supersedes ours (byte-identical → nothing to do).
+            // and it strictly supersedes ours (byte-identical → nothing to do).
             Some(ours) => ours.hash != entry.hash && entry.supersedes(ours),
-            // We advertise no provable copy. Pull ONLY if we genuinely lack the file
-            // on disk; if a file IS present but we could not stamp it, refuse to
+            // We advertise no provable copy. Pull only if we genuinely lack the file
+            // on disk; if a file is present but we could not stamp it, refuse to
             // overwrite it with a copy we cannot prove is newer (silent-loss guard).
             None => {
                 let local_path = meetings_root
@@ -167,9 +167,9 @@ async fn pull_superseding(
             )
             .await?;
 
-        // Record the authority that arrived WITH these bytes so a later import on
+        // Record the authority that arrived with these bytes so a later import on
         // this device re-advertises it faithfully (never re-derived from
-        // metadata.json — DESIGN §2 C1).
+        // metadata.json, DESIGN §2 C1).
         record_artifact_authority(
             meetings_root,
             meeting_id,
@@ -179,15 +179,15 @@ async fn pull_superseding(
             entry.produced_at.clone(),
         )?;
 
-        // TODO(DESIGN §4, build-order step 5 — consumer read-sync): a received
+        // TODO(DESIGN §4, build-order step 5: consumer read-sync): a received
         // transcript.json bypasses persistence's `write_transcript`, which clears
         // the per-device `translations.json`; reconcile (clear/regenerate) the
         // stale translations and emit a reload signal so an open UI re-reads. Both
         // land with the consumer read-sync slice; `sync` has no UI/persistence edge
-        // to drive them here. This is a content-correctness gap (a stale translation
-        // would key to the wrong segments), NOT polish — it is a RELEASE GATE: the
-        // consumer read-sync slice must land before artifact sync + translations are
-        // both enabled in a shipping build.
+        // to drive them here. This is a content-correctness gap, not polish (a
+        // stale translation would key to the wrong segments): it is a release gate,
+        // and the consumer read-sync slice must land before artifact sync and
+        // translations are both enabled in a shipping build.
     }
     Ok(())
 }
@@ -199,7 +199,7 @@ async fn pull_superseding(
 /// store and producing the local manifest, each entry authority-stamped), opens a
 /// bi stream, writes the [`StreamKind::Artifacts`] tag, sends the REQUEST (meeting
 /// id + local manifest), reads the peer's manifest, then pulls every superseding
-/// peer entry over the blobs ALPN. The caller closes `conn` after this returns —
+/// peer entry over the blobs ALPN. The caller closes `conn` after this returns:
 /// the initiator is the last reader on this stream.
 ///
 /// `peer` is the remote [`EndpointId`] the downloader dials; it must equal
@@ -256,7 +256,7 @@ pub async fn initiate_artifacts_sync(
 /// leading [`StreamKind`] tag it has already consumed.
 ///
 /// Reads the REQUEST (meeting id + initiator manifest), imports its own
-/// artifacts (staging blobs + the local manifest — a no-op with nothing to
+/// artifacts (staging blobs + the local manifest; a no-op with nothing to
 /// stage), replies with that manifest, then pulls every superseding initiator
 /// entry over the blobs ALPN; the fs blob store's export creates the meeting
 /// folder itself the moment there is a blob to write. Parks on
@@ -277,9 +277,9 @@ pub async fn respond_artifacts_sync(
     root: &Path,
 ) -> Result<()> {
     // REQUEST: meeting id then the initiator's manifest. Bounded by
-    // FRAME_IO_TIMEOUT like every other frame read on this stream — this one is
-    // a raw fixed-size read rather than a length-prefixed frame, so it needs its
-    // own explicit bound to stay off the unbounded-await slowloris surface.
+    // FRAME_IO_TIMEOUT like every other frame read on this stream: this one is a
+    // raw fixed-size read rather than a length-prefixed frame, so it needs its own
+    // explicit bound to stay off the unbounded-await slowloris surface.
     let mut id_buf = [0u8; 16];
     tokio::time::timeout(FRAME_IO_TIMEOUT, recv.read_exact(&mut id_buf))
         .await
@@ -300,15 +300,14 @@ pub async fn respond_artifacts_sync(
     peer_manifest.validate()?;
 
     // No `MeetingFolder::ensure` here: a content-less peer meeting must not
-    // materialise a blank-placeholder folder just because its id was named in
-    // a stream header. `import_artifacts`/`producer_authority` need no
-    // pre-created directory — `path.is_file()` is `false` and
-    // `read_local_processing` advertises `Local` on an absent folder — and the
-    // fs blob store's own export creates the parent directory the moment
-    // there is an actual artifact to write. If this meeting's folder already
-    // exists with real `notes.ydoc` content (from an earlier or same-session
-    // notes sync), repair a still-blank metadata.json now rather than waiting
-    // on the next notes sweep.
+    // materialise a blank-placeholder folder just because its id was named in a
+    // stream header. `import_artifacts`/`producer_authority` need no pre-created
+    // directory: `path.is_file()` returns `false` and `read_local_processing`
+    // advertises `Local` on an absent folder, and the fs blob store's own export
+    // creates the parent directory once there is an actual artifact to write. If
+    // the folder already exists with real `notes.ydoc` content (from an earlier
+    // or same-session notes sync), repair a still-blank metadata.json now rather
+    // than waiting on the next notes sweep.
     crate::notes_proto::project_meta_best_effort(root, meeting_id);
 
     // Import our own artifacts (stages our blobs for the peer + our manifest).

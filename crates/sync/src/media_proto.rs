@@ -1,7 +1,7 @@
 //! The media-manifest exchange protocol (WS4-B S4).
 //!
 //! After (or alongside) the notes reconciliation, two paired devices reconcile a
-//! meeting's MEDIA — `audio.opus` and each note asset — by exchanging a
+//! meeting's media (`audio.opus` and each note asset) by exchanging a
 //! [`Manifest`] of `(relative-path, BLAKE3 hash)` pairs over a fresh bidirectional
 //! stream on the existing notes ALPN ([`crate::notes_proto::SYNC_ALPN`]), then each
 //! side pulls the blobs it is missing from the other over the blobs ALPN
@@ -16,8 +16,8 @@
 //! side imports its own meeting media first (which both yields its manifest and
 //! stages its blobs in the store so the peer can fetch them), exchanges manifests,
 //! then pulls every peer entry it does not already hold by content hash over the
-//! blobs ALPN. Because the pulls run over a SEPARATE ALPN connection, both sides
-//! pull concurrently; a final one-byte DONE handshake on the manifest stream makes
+//! blobs ALPN. The pulls run over a separate ALPN connection, so both sides pull
+//! concurrently; a final one-byte DONE handshake on the manifest stream makes
 //! each side wait for the other to finish before the connection is torn down, so
 //! the initiator does not return (and the caller does not observe) before the
 //! responder's pull has landed:
@@ -44,8 +44,8 @@
 //! responder side is reached only after [`crate::endpoint`]'s `AcceptHook` has
 //! confirmed the remote is paired. The blob pulls go over the blobs ALPN, whose
 //! own accept side is guarded by the same [`PeerDirectory`] check
-//! (`AuthorizedBlobs` in [`crate::endpoint`]) — an unpaired peer can neither push
-//! a manifest nor serve a blob.
+//! (`AuthorizedBlobs` in [`crate::endpoint`]), so an unpaired peer can neither
+//! push a manifest nor serve a blob.
 //!
 //! [`Manifest`]: crate::blobs::Manifest
 //! [`PeerDirectory`]: crate::address_lookup::PeerDirectory
@@ -80,8 +80,8 @@ fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
 /// (by `(rel_path, hash)`) from `peer`, exporting each to its per-meeting path.
 ///
 /// `local_manifest` is this device's own manifest for the meeting (the media it
-/// just imported); an entry already present in it — same relative path AND same
-/// content hash — is skipped. `peer_manifest` has been validated against path
+/// just imported); an entry already present in it, with the same relative path
+/// and content hash, is skipped. `peer_manifest` has been validated against path
 /// traversal before this runs.
 async fn pull_missing(
     store: &BlobStore,
@@ -123,7 +123,7 @@ async fn pull_missing(
 /// and producing the local manifest), opens a bi stream, writes the
 /// [`StreamKind::Media`] tag, sends the REQUEST (meeting id + local manifest),
 /// reads the peer's manifest, then pulls every peer blob it lacks over the blobs
-/// ALPN. The caller closes `conn` after this returns — the initiator is the last
+/// ALPN. The caller closes `conn` after this returns: the initiator is the last
 /// reader on this stream.
 ///
 /// `peer` is the remote [`EndpointId`] the downloader dials over the shared
@@ -178,7 +178,7 @@ pub async fn initiate_media_sync(
 /// whose leading [`StreamKind`] tag it has already consumed.
 ///
 /// Reads the REQUEST (meeting id + initiator manifest), replies with its own
-/// manifest, then pulls every initiator blob it lacks over the blobs ALPN — the
+/// manifest, then pulls every initiator blob it lacks over the blobs ALPN. The
 /// fs blob store's export creates the meeting folder itself the moment there is
 /// a blob to write, so a brand-new meeting needs no folder pre-created. Parks
 /// on [`Connection::closed`] so the router does not drop the connection before
@@ -198,9 +198,9 @@ pub async fn respond_media_sync(
     root: &Path,
 ) -> Result<()> {
     // REQUEST: meeting id then the initiator's manifest. Bounded by
-    // FRAME_IO_TIMEOUT like every other frame read on this stream — this one is
-    // a raw fixed-size read rather than a length-prefixed frame, so it needs its
-    // own explicit bound to stay off the unbounded-await slowloris surface.
+    // FRAME_IO_TIMEOUT like every other frame read on this stream: this one is a
+    // raw fixed-size read rather than a length-prefixed frame, so it needs its own
+    // explicit bound to stay off the unbounded-await slowloris surface.
     let mut id_buf = [0u8; 16];
     tokio::time::timeout(FRAME_IO_TIMEOUT, recv.read_exact(&mut id_buf))
         .await
@@ -221,14 +221,14 @@ pub async fn respond_media_sync(
     peer_manifest.validate()?;
 
     // No `MeetingFolder::ensure` here: a content-less peer meeting must not
-    // materialise a blank-placeholder folder just because its id was named in
-    // a stream header. `import_meeting`/`pull_missing` need no pre-created
-    // directory — `resolve_audio_path`/`assets_dir.is_dir()` are `None`/`false`
-    // on an absent folder, and the fs blob store's own export creates the
-    // parent directory the moment there is an actual blob to write. If this
-    // meeting's folder already exists with real `notes.ydoc` content (from an
-    // earlier or same-session notes sync), repair a still-blank metadata.json
-    // now rather than waiting on the next notes sweep.
+    // materialise a blank-placeholder folder just because its id was named in a
+    // stream header. `import_meeting`/`pull_missing` need no pre-created
+    // directory: `resolve_audio_path`/`assets_dir.is_dir()` return `None`/`false`
+    // on an absent folder, and the fs blob store's own export creates the parent
+    // directory once there is an actual blob to write. If the folder already
+    // exists with real `notes.ydoc` content (from an earlier or same-session
+    // notes sync), repair a still-blank metadata.json now rather than waiting
+    // on the next notes sweep.
     crate::notes_proto::project_meta_best_effort(root, meeting_id);
 
     // Import our own media (stages our blobs for the peer to fetch + our manifest).
@@ -274,7 +274,7 @@ pub async fn respond_media_sync(
 }
 
 /// The completion handshake: write a one-byte DONE, finish the send direction,
-/// then read the peer's one-byte DONE. The write and read do not deadlock — a
+/// then read the peer's one-byte DONE. The write and read do not deadlock: a
 /// single byte fits the QUIC send buffer, so both sides write before either
 /// blocks on the read.
 ///

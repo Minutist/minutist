@@ -1,19 +1,17 @@
 //! Failed-dial backoff for out-of-band peers.
 //!
-//! Decouples "stop dialling an unreachable peer" from "re-add it from the
-//! directory": [`BackoffRegistry`] tracks per-peer dial failures and, once a
-//! threshold is crossed, suppresses further dials for an exponentially growing
-//! window — independent of whether the peer is still present in a
-//! [`crate::address_lookup::PeerDirectory`] (account-reconcile add/remove is a
-//! separate concern; the two must never fight over the same peer).
+//! [`BackoffRegistry`] tracks per-peer dial failures and, once a threshold is
+//! crossed, suppresses further dials for an exponentially growing window. This
+//! is independent of whether the peer is still present in a
+//! [`crate::address_lookup::PeerDirectory`]; account-reconcile add/remove is a
+//! separate concern that must never fight over the same peer.
 //!
 //! The dial site ([`crate::endpoint::SyncEngine::dial`]) feeds every outcome via
-//! [`BackoffRegistry::on_dial_outcome`], so all consumers' dials — desktop,
-//! headless, and the phone's syncs (which flow through the same engine dial) —
-//! participate automatically. `is_suppressed` is read by
-//! [`crate::account::RefreshSink::is_suppressed`] (gating the loop's
-//! first-contact dial-kick) and, via [`crate::endpoint::SyncEngine::is_suppressed`],
-//! by `sync-ffi` for the phone's own TS discovery loop.
+//! [`BackoffRegistry::on_dial_outcome`], so desktop, headless, and the phone's
+//! syncs (all routed through the same engine dial) participate automatically.
+//! `is_suppressed` gates [`crate::account::RefreshSink::is_suppressed`]'s
+//! first-contact dial-kick and, via [`crate::endpoint::SyncEngine::is_suppressed`],
+//! `sync-ffi`'s phone-side TS discovery loop.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,7 +34,7 @@ pub struct BackoffPolicy {
 }
 
 impl Default for BackoffPolicy {
-    /// Placeholder values — the desktop/headless owner overrides these via
+    /// Placeholder values: the desktop/headless owner overrides these via
     /// [`crate::SyncConfig::with_backoff_policy`] once the product-level policy
     /// is set.
     fn default() -> Self {
@@ -49,7 +47,7 @@ impl Default for BackoffPolicy {
 }
 
 /// Per-peer backoff state. `retry_after` is only set once `fails` crosses
-/// `policy.max_fails` — below the threshold a peer is never suppressed, however
+/// `policy.max_fails`: below the threshold a peer is never suppressed, however
 /// many times it has failed.
 #[derive(Debug, Clone, Default)]
 struct State {
@@ -81,7 +79,7 @@ impl BackoffRegistry {
     /// A success clears the entry entirely (fail count and any suppression
     /// reset). A failure increments the fail count; once it reaches
     /// [`BackoffPolicy::max_fails`], `retry_after` is set to `now +
-    /// backoff(fails)` — recomputed (and extended) on every further failure
+    /// backoff(fails)`, recomputed (and extended) on every further failure
     /// while still suppressed.
     pub fn on_dial_outcome(&self, endpoint_id: &str, success: bool) {
         let mut states = self.states.lock().expect("backoff registry poisoned");

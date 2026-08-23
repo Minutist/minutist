@@ -1,4 +1,4 @@
-//! Peers-file pairing persistence — the shared mechanism both frontends use to
+//! Peers-file pairing persistence: the shared mechanism both frontends use to
 //! persist and reload paired-device tickets outside the in-memory
 //! [`PeerDirectory`](crate::endpoint).
 //!
@@ -15,7 +15,7 @@
 //! [`append`] adds one validated, deduplicated ticket; [`reload_into`] authorises
 //! every not-yet-applied ticket against a bound engine. An external writer (an
 //! operator's `add-peer`, or an agent appending a line) is picked up by the next
-//! [`reload_into`] the caller runs — at startup and, if the caller polls, while
+//! [`reload_into`] the caller runs, at startup and, if the caller polls, while
 //! running.
 
 use std::collections::HashSet;
@@ -33,7 +33,7 @@ pub fn peers_path(root: &Path) -> PathBuf {
 
 /// Parse `{root}/peers`: one pairing ticket per line; blank lines and
 /// `#`-prefixed comments are ignored. A missing (or unreadable) file yields an
-/// empty list — the absence of any paired peer is the normal initial state.
+/// empty list: the absence of any paired peer is the normal initial state.
 pub fn read_peer_tickets(root: &Path) -> Vec<String> {
     let contents = match std::fs::read_to_string(peers_path(root)) {
         Ok(c) => c,
@@ -57,7 +57,7 @@ pub enum AppendOutcome {
 
 /// Validate `ticket` and append it to `{root}/peers` unless it is already
 /// present (line-exact, after trimming). A malformed ticket is rejected as
-/// [`Error::Protocol`] BEFORE any write, so the file never accumulates a line the
+/// [`Error::Protocol`] before any write, so the file never accumulates a line the
 /// engine would later reject; a filesystem failure is [`Error::Io`].
 pub fn append(root: &Path, ticket: &str) -> Result<AppendOutcome> {
     let ticket = ticket.trim();
@@ -87,20 +87,21 @@ pub enum RemoveOutcome {
 }
 
 /// Remove `ticket` from `{root}/peers`, the inverse of [`append`]. Every line
-/// whose trimmed content equals `ticket` is dropped; all other lines — including
-/// `#`-comments, blank lines, and other peers — are preserved verbatim, and the
-/// rewrite is atomic (temp-file + rename via the shared [`minutist_common::fs::write_atomic`]),
-/// so a crash never leaves the peers file truncated. A missing file or an absent
-/// ticket yields [`RemoveOutcome::NotPresent`] without writing.
+/// whose trimmed content equals `ticket` is dropped; all other lines
+/// (`#`-comments, blank lines, other peers) are preserved verbatim, and the
+/// rewrite is atomic (temp-file + rename via the shared
+/// [`minutist_common::fs::write_atomic`]), so a crash never leaves the peers
+/// file truncated. A missing file or an absent ticket yields
+/// [`RemoveOutcome::NotPresent`] without writing.
 ///
-/// This is the file side of an EXPLICIT, consumer-driven unpair (a Settings
-/// "remove device" action): dropping a peer's ticket here — together with
-/// removing it from the engine's in-memory `PeerDirectory` — un-pairs it durably,
-/// so the next [`reload_into`] does not re-authorise it. It is NOT the failed-dial
-/// path: a transiently-offline paired device is suppressed with backoff (the
-/// engine's unreachable registry) and re-dialled when it returns, never silently
-/// unpaired. Account-sourced peers never live in this file, so they are untouched
-/// here (their removal is the engine's account-reconcile).
+/// This is the file side of an explicit, consumer-driven unpair (a Settings
+/// "remove device" action): dropping a peer's ticket here, together with
+/// removing it from the engine's in-memory `PeerDirectory`, un-pairs it
+/// durably so the next [`reload_into`] does not re-authorise it. It differs
+/// from the failed-dial path, where a transiently-offline paired device is
+/// suppressed with backoff and re-dialled when it returns, never silently
+/// unpaired. Account-sourced peers never live in this file, so they are
+/// untouched here (their removal is the engine's account-reconcile).
 pub fn remove(root: &Path, ticket: &str) -> Result<RemoveOutcome> {
     let ticket = ticket.trim();
     let path = peers_path(root);
@@ -191,7 +192,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = append(dir.path(), "not-a-ticket").unwrap_err();
         assert!(matches!(err, Error::Protocol(_)));
-        // Nothing was written — the file must not exist after a rejected append.
+        // Nothing was written: the file must not exist after a rejected append.
         assert!(!peers_path(dir.path()).exists());
     }
 
@@ -284,7 +285,7 @@ mod tests {
         assert!(residue.is_empty(), "expected no .tmp residue, found: {residue:?}");
     }
 
-    /// A valid `EndpointTicket` string built from a freshly generated key — enough
+    /// A valid `EndpointTicket` string built from a freshly generated key: enough
     /// to pass [`append`]'s parse guard (no network / bound engine needed).
     fn sample_ticket() -> String {
         let id = iroh::SecretKey::generate().public();

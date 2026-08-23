@@ -2,7 +2,7 @@
 //!
 //! Each side of a paired connection advertises the `(MeetingId,
 //! ProcessingLifecycle)` of every meeting it holds; both learn the other's
-//! meeting list AND each meeting's host-authoritative processing state. This
+//! meeting list and each meeting's host-authoritative processing state. This
 //! completes the deferred meeting-list discovery (a device learns *which*
 //! meetings a peer has, not only notes for meetings it already knows) and carries
 //! the processing lifecycle the capture-but-unprocessed workstream consumes
@@ -25,11 +25,11 @@
 //! close connection ----------------> conn.closed() resolves; responder returns
 //! ```
 //!
-//! Each side returns the PEER's entries; the caller emits them on the
+//! Each side returns the peer's entries; the caller emits them on the
 //! [`SyncEngine`](crate::SyncEngine) lifecycle-event surface so a consumer in a
 //! crate that depends on both `sync` and `persistence` (ipc-bridge / headless)
 //! can persist them via `persistence::apply_processing_lifecycle`. `sync` itself
-//! never writes `metadata.json` (it has no `persistence` dependency edge) — it
+//! never writes `metadata.json` (it has no `persistence` dependency edge); it
 //! only *reads* the local `processing` to advertise, and emits the received ones.
 
 use std::path::Path;
@@ -43,8 +43,8 @@ use crate::notes_proto::StreamKind;
 use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
 use crate::{Error, Result};
 
-/// One meeting's identity + its host-authoritative processing AND deletion
-/// state, as carried on a [`StreamKind::Discovery`] stream.
+/// One meeting's identity, its host-authoritative processing state, and its
+/// deletion state, as carried on a [`StreamKind::Discovery`] stream.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryEntry {
     /// The meeting id.
@@ -59,7 +59,7 @@ pub struct DiscoveryEntry {
     pub deletion: DeletionState,
 }
 
-/// Enumerate the meeting ids this device holds on disk — delegates to the canonical
+/// Enumerate the meeting ids this device holds on disk: delegates to the canonical
 /// [`notes_crdt::folder::list_meeting_ids`] (the scan lives beside the meeting-folder
 /// layout it reads). Used by
 /// [`SyncEngine::local_meetings`](crate::SyncEngine::local_meetings) and the
@@ -69,7 +69,7 @@ pub(crate) fn list_meeting_ids(root: &Path) -> Vec<MeetingId> {
 }
 
 /// Read a meeting's `processing` from its `metadata.json`, defaulting to
-/// [`ProcessingLifecycle::Local`] when the file is absent or unparseable — the
+/// [`ProcessingLifecycle::Local`] when the file is absent or unparseable, the
 /// same conservative default the inbound placeholder uses (§7 Q4: a meeting we
 /// cannot classify is treated as local, never guessed adoptable). `sync` reads
 /// `metadata.json` only to learn the local state to advertise; the authoritative
@@ -81,7 +81,7 @@ pub(crate) fn read_local_processing(root: &Path, id: MeetingId) -> ProcessingLif
         Ok(bytes) => match serde_json::from_slice::<MeetingMeta>(&bytes) {
             Ok(meta) => meta.processing,
             Err(error) => {
-                // A corrupt/truncated metadata.json advertises Local (§7 Q4 —
+                // A corrupt/truncated metadata.json advertises Local (§7 Q4:
                 // never guess an adoptable state), but surface it: every other
                 // metadata reader treats a parse failure as an error, so a silent
                 // Local here would hide a corrupt local file.
@@ -120,7 +120,7 @@ fn local_entries(root: &Path) -> Vec<DiscoveryEntry> {
 
 /// Read a meeting's `metadata.json` once and return both its `processing` and
 /// `deletion` state, defaulting each to its conservative default (`Local`,
-/// not-deleted) when the file is absent or unparseable — the same
+/// not-deleted) when the file is absent or unparseable; the same
 /// never-guess-adoptable rule [`read_local_processing`] follows, combined so a
 /// caller needing both fields parses the file once rather than twice.
 fn read_local_state(root: &Path, id: MeetingId) -> (ProcessingLifecycle, DeletionState) {
@@ -156,8 +156,8 @@ fn decode(bytes: &[u8]) -> Result<Vec<DiscoveryEntry>> {
 
 /// Run the *initiator* (dialling) side of a discovery exchange over `conn`: open
 /// a bi stream, tag it [`StreamKind::Discovery`], advertise our entries, then
-/// read the peer's. Returns the PEER's entries (the caller emits them). The
-/// caller closes `conn` after this returns — the initiator is the last reader.
+/// read and return the peer's (the caller emits them). The caller closes
+/// `conn` after this returns; the initiator is the last reader.
 pub async fn initiate_discovery(conn: &Connection, root: &Path) -> Result<Vec<DiscoveryEntry>> {
     let ours = local_entries(root);
 
@@ -197,7 +197,7 @@ pub async fn respond_discovery(
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing discovery send: {e}")))?;
 
-    // Bounded by RESPONDER_CLOSE_TIMEOUT, mirroring the notes/media responders —
+    // Bounded by RESPONDER_CLOSE_TIMEOUT, mirroring the notes/media responders:
     // a stalled or hostile initiator that never closes cannot pin this task
     // forever.
     tokio::time::timeout(RESPONDER_CLOSE_TIMEOUT, conn.closed())
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn decode_defaults_deletion_when_peer_predates_the_field() {
         // A peer still on a build before `deletion` existed sends entries with
-        // no `deletion` key at all — must decode as "not deleted", not fail
+        // no `deletion` key at all; it must decode as "not deleted", not fail
         // the whole exchange (this exact frame, minus the trailing `,"deletion":...}`,
         // is what an unupgraded phone sends).
         let id = MeetingId::new();

@@ -1,8 +1,8 @@
 //! Length-prefixed framing shared by the sync protocols.
 //!
 //! Every variable-length field on a sync stream is a frame: a `u32` big-endian
-//! byte length followed by that many bytes. A frame's declared length is checked
-//! against [`MAX_FRAME`] BEFORE any buffer is allocated, so a hostile or buggy
+//! byte length followed by that many bytes. The declared length is validated
+//! against [`MAX_FRAME`] before any buffer is allocated, so a hostile or buggy
 //! peer cannot trigger a multi-gigabyte allocation. The notes protocol
 //! ([`crate::notes_proto`]) and the media protocol ([`crate::media_proto`]) both
 //! frame their payloads this way.
@@ -14,15 +14,13 @@ use crate::{Error, Result};
 
 /// Upper bound on a single length-prefixed frame, in bytes. A whole-document Yjs
 /// update or state vector, and a media manifest, are far smaller than this; the
-/// cap bounds a hostile/buggy peer's allocation. Blob payloads themselves do NOT
-/// transit a frame — they travel over the blobs ALPN — so this cap is unaffected
-/// by media size.
+/// cap bounds a hostile/buggy peer's allocation. Blob payloads travel over the
+/// blobs ALPN, not a frame, so this cap does not affect media size.
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 
 /// Validate a frame's big-endian `u32` length prefix against [`MAX_FRAME`],
-/// returning the length as a `usize` to allocate. A length over the cap is an
-/// [`Error::Protocol`] — the guard that bounds a hostile/buggy peer's allocation,
-/// checked BEFORE any buffer is allocated.
+/// returning the length as a `usize` to allocate. A length over the cap is
+/// rejected as [`Error::Protocol`] before anything is allocated.
 pub fn checked_frame_len(len_buf: [u8; 4]) -> Result<usize> {
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME {
@@ -37,7 +35,7 @@ pub fn checked_frame_len(len_buf: [u8; 4]) -> Result<usize> {
 /// that many bytes. Rejects a length over [`MAX_FRAME`] before allocating.
 ///
 /// Bounded by [`FRAME_IO_TIMEOUT`]: a peer that stops writing mid-frame (the
-/// length prefix or the body) cannot pin the stream — and the task behind it —
+/// length prefix or the body) cannot pin the stream, or the task behind it,
 /// indefinitely. Applies on both the initiator and responder side, since both
 /// call this to read a peer's frame.
 pub async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {

@@ -22,7 +22,7 @@ use crate::{Error, Result};
 /// on Unix.
 const KEY_FILE: &str = "sync_node_key";
 
-/// A device's persistent sync identity — the ed25519 key whose public half is the
+/// A device's persistent sync identity: the ed25519 key whose public half is the
 /// iroh `EndpointId` peers dial.
 #[derive(Clone)]
 pub struct DeviceIdentity {
@@ -77,7 +77,7 @@ impl DeviceIdentity {
         self.secret_key.public()
     }
 
-    /// The iroh `EndpointId` — an alias for [`Self::public_key`], the form the
+    /// The iroh `EndpointId`: an alias for [`Self::public_key`], the form the
     /// account service publishes for out-of-band peer addressing.
     pub fn endpoint_id(&self) -> iroh::EndpointId {
         self.secret_key.public()
@@ -98,7 +98,7 @@ fn write_key_file(path: &Path, bytes: &[u8; 32]) -> std::io::Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         // Create with 0600 so the key is never momentarily world-readable. `mode`
-        // applies only when the file is CREATED; re-assert below for the
+        // only applies on creation, so it's re-asserted below for the
         // pre-existing-file case.
         opts.mode(0o600);
     }

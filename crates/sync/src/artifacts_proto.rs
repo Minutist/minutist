@@ -302,6 +302,22 @@ pub async fn respond_artifacts_sync(
     notes_crdt::MeetingFolder::ensure(root, meeting_id)
         .map_err(|e| Error::Protocol(format!("ensuring inbound meeting folder: {e}")))?;
 
+    // `ensure` only wrote the arrival-time placeholder; if this meeting's
+    // notes.ydoc already carries the origin's real title/duration (from an
+    // earlier or same-session notes sync), project it over metadata.json now
+    // rather than leaving artifacts attached to a blank placeholder
+    // indefinitely — mirrors `notes_proto::apply_inbound`. Best-effort: a
+    // projection failure must not fail the artifacts sync; the next notes
+    // sweep re-applies it.
+    if let Err(e) = notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, meeting_id) {
+        tracing::warn!(
+            target: "sync",
+            meeting_id = %meeting_id.0,
+            error = %e,
+            "projecting synced metadata over metadata.json failed; will retry next sweep"
+        );
+    }
+
     // Import our own artifacts (stages our blobs for the peer + our manifest).
     let local_manifest = store
         .import_artifacts(root, meeting_id, producer_authority(root, meeting_id))

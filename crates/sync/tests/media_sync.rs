@@ -247,3 +247,82 @@ async fn an_unpaired_peer_is_rejected_on_the_blobs_alpn() {
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }
+
+/// Media sync must not leave a meeting stuck on `MeetingFolder::ensure`'s blank
+/// placeholder metadata when the receiving side's own `notes.ydoc` already
+/// carries the real title/duration (issue 0062 finding 2). B starts with no
+/// meeting folder at all; its notes.ydoc is seeded with real descriptive
+/// metadata directly (standing in for a notes-sync that already ran), but its
+/// `metadata.json` is never touched — so at the moment media sync runs, B's
+/// only on-disk metadata is whatever `ensure()` writes. `respond_media_sync`
+/// must project the real values over that placeholder, not leave it blank.
+#[tokio::test]
+async fn media_sync_projects_already_known_descriptive_metadata_over_the_placeholder() {
+    use minutist_common::{AudioFormat, MeetingMeta, ProcessingLifecycle};
+
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+
+    let meeting = MeetingId::new();
+    let audio = b"OggS-fake-opus-audio-payload".repeat(64);
+    write_audio(root_a, meeting, &audio);
+
+    // B knows the meeting's real metadata (as if notes-sync already ran) but
+    // has never received the audio, and critically never had this projected
+    // over metadata.json — ensure() is the only thing that will touch it.
+    MeetingFolder::ensure(root_b, meeting).expect("ensure b's placeholder folder");
+    let real = MeetingMeta {
+        uuid: meeting,
+        title: "Kickoff".to_string(),
+        started_at: "2026-08-01T09:00:00Z".to_string(),
+        ended_at: Some("2026-08-01T10:00:00Z".to_string()),
+        duration_ms: 3_600_000,
+        speaker_count: 0,
+        audio_format: AudioFormat {
+            codec: "opus".to_string(),
+            sample_rate: 16_000,
+            channels: 1,
+            bitrate_kbps: Some(32),
+        },
+        asr_model: None,
+        llm_model: None,
+        diarizer: None,
+        speaker_names: Default::default(),
+        notes_format: 0,
+        processing: ProcessingLifecycle::PendingProcessing,
+        collection_id: None,
+        recording_started: true,
+        deletion: Default::default(),
+        app_version: "0.1.0".to_string(),
+    };
+    notes_crdt::meta_crdt::initialise_notes_with_meta(root_b, meeting, None, "", &real)
+        .expect("seed b's notes.ydoc with the real metadata");
+
+    let before = notes_crdt::read_metadata(&root_b.join(meeting.0.to_string()))
+        .expect("read b's placeholder metadata");
+    assert_eq!(
+        before.title, "",
+        "B's metadata.json must still be ensure()'s blank placeholder before sync"
+    );
+
+    let (a, b) = paired_engines(root_a, root_b).await;
+    a.sync_media(direct_addr(&b), meeting)
+        .await
+        .expect("reconcile media a -> b");
+
+    let after = notes_crdt::read_metadata(&root_b.join(meeting.0.to_string()))
+        .expect("read b's metadata after sync");
+    assert_eq!(
+        after.title, "Kickoff",
+        "media sync must project B's already-known real title over the placeholder"
+    );
+    assert_eq!(
+        after.duration_ms, 3_600_000,
+        "media sync must project B's already-known real duration over the placeholder"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}

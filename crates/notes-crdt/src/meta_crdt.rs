@@ -271,14 +271,15 @@ pub fn project_ydoc_meta_into_metadata(meetings_root: &Path, id: MeetingId) -> A
     if !has_descriptive(&doc) {
         return Ok(false);
     }
-    // RMW under the per-meeting metadata lock, mutating only descriptive fields.
-    let mut applied = false;
-    crate::metadata::update_metadata_if_present(meetings_root, id, |meta| {
-        applied = project_into_meta(&doc, meta);
-        // A short state label for the RMW helper's logging; unused otherwise.
-        "meta-projected"
+    // Guarded RMW under the per-meeting metadata lock: `project_into_meta`'s
+    // changed/unchanged answer decides whether to write at all, so a
+    // converged, already-projected meeting costs a read with no rewrite —
+    // this runs on every media/artifacts/notes exchange for a meeting, not
+    // just once.
+    let applied = crate::metadata::update_metadata_if(meetings_root, id, |meta| {
+        project_into_meta(&doc, meta).then_some(())
     })?;
-    Ok(applied)
+    Ok(matches!(applied, crate::metadata::MetaUpdate::Applied(())))
 }
 
 // --- disk helpers (load / mutate / save the meta map on notes.ydoc) ----------

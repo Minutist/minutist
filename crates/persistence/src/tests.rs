@@ -1836,6 +1836,78 @@ async fn test_reconcile_orphans_missing_root_is_empty() {
     );
 }
 
+/// A meeting that is ALREADY indexed with a degenerate placeholder
+/// (`duration_ms: 0`, e.g. from `MeetingFolder::ensure` or an earlier
+/// `synthesize_metadata` run) must have its duration/speaker_count backfilled
+/// from `transcript.json` once one exists — issue 0064. Unlike the
+/// no-metadata orphan-recovery path, this must NOT touch the title or any
+/// other already-authored field.
+#[tokio::test]
+async fn test_reconcile_orphans_backfills_degenerate_duration_for_an_already_indexed_meeting() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = MeetingId::new();
+    let folder_dir = root.join(id.0.to_string());
+    std::fs::create_dir_all(&folder_dir).expect("create folder");
+    let mut meta = dummy_meta(id, 0);
+    meta.title = "Kept title".to_string();
+    meta.speaker_count = 0;
+    notes_crdt::write_metadata(&folder_dir, &meta).expect("write placeholder metadata");
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    assert_eq!(index.rebuild_from_disk(root).await.expect("seed"), 1);
+    assert_eq!(
+        index.list_meetings().await.expect("list")[0].duration_ms,
+        0,
+        "seeded as the degenerate placeholder"
+    );
+
+    // The meeting gets processed after it was indexed: a real transcript
+    // lands with two distinct speakers.
+    crate::write_transcript(
+        &folder_dir,
+        &[
+            make_segment(0, 1_000, "hello"),
+            {
+                let mut s = make_segment(1_000, 4_500, "world");
+                s.speaker_id = Some("spk_1".to_string());
+                s
+            },
+        ],
+    )
+    .expect("write transcript.json");
+
+    let added = index.reconcile_orphans(root).await.expect("reconcile");
+    assert_eq!(
+        added, 0,
+        "backfilling an already-indexed meeting must not count as a newly-indexed orphan"
+    );
+
+    let listed = index.list_meetings().await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].duration_ms, 4_500,
+        "duration must be backfilled from the transcript's last segment"
+    );
+    assert_eq!(
+        listed[0].title, "Kept title",
+        "the already-authored title must not be touched"
+    );
+
+    // Durable on disk, not just the index row.
+    let on_disk = reader::read_metadata(&folder_dir).expect("re-read metadata");
+    assert_eq!(on_disk.duration_ms, 4_500);
+    assert_eq!(on_disk.speaker_count, 1);
+    assert_eq!(on_disk.title, "Kept title");
+
+    // Idempotent: a second reconcile finds nothing left to backfill.
+    assert_eq!(
+        index.reconcile_orphans(root).await.expect("reconcile 2"),
+        0
+    );
+}
+
 /// A concurrent reader must never observe a half-rebuilt table
 /// (TIMELINE-DRIFT #7): `rebuild_from_disk` wraps the DELETE + repopulate in a
 /// single transaction, so a `list_meetings` racing the rebuild sees either the

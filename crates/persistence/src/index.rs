@@ -400,13 +400,15 @@ impl MeetingIndex {
                 continue;
             };
             let path = entry.path();
-            // Skip already-indexed folders before any (more expensive)
-            // metadata read.
             let id = meeting_id.0.to_string();
-            if known.contains(&id) {
-                continue;
-            }
+            let already_known = known.contains(&id);
+
             if !path.join("metadata.json").exists() {
+                if already_known {
+                    // Indexed, but metadata.json has since vanished — not
+                    // this reconciler's concern; leave the stale row alone.
+                    continue;
+                }
                 let has_recording_data = minutist_common::resolve_audio_path(&path).is_some()
                     || path.join("transcript.json").exists();
                 if !has_recording_data {
@@ -430,17 +432,49 @@ impl MeetingIndex {
                     meeting_id = %id,
                     "recovered incomplete recording (self-heal)"
                 );
+            } else {
+                // metadata.json exists — an already-indexed folder is
+                // otherwise skipped before any (more expensive) read, EXCEPT
+                // to backfill a degenerate placeholder's duration/speaker
+                // count now that a transcript may exist since it was last
+                // indexed (issue 0064).
+                match backfill_degenerate_duration(meetings_root, &path, meeting_id) {
+                    Ok(true) => tracing::info!(
+                        target: "persistence",
+                        meeting_id = %id,
+                        "backfilled duration/speaker_count from transcript (self-heal)"
+                    ),
+                    Ok(false) if already_known => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "persistence",
+                            folder = %path.display(),
+                            error = %e,
+                            "duration backfill failed during orphan reconcile"
+                        );
+                        if already_known {
+                            continue;
+                        }
+                    }
+                }
             }
 
             match entry_from_folder(&path).await {
                 Ok(list_entry) => {
                     self.upsert_inner(&list_entry).await?;
-                    indexed += 1;
-                    tracing::info!(
-                        target: "persistence",
-                        meeting_id = %id,
-                        "indexed orphan meeting folder (self-heal)"
-                    );
+                    // A backfilled-but-already-known row is a refresh, not a
+                    // newly-indexed orphan — the return value documents "newly
+                    // indexed", and the caller's own already-known count must
+                    // not be double-counted.
+                    if !already_known {
+                        indexed += 1;
+                        tracing::info!(
+                            target: "persistence",
+                            meeting_id = %id,
+                            "indexed orphan meeting folder (self-heal)"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -573,6 +607,44 @@ fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error
     };
 
     crate::metadata::write_metadata_to_path(&folder.join("metadata.json"), &meta)
+}
+
+/// Backfill `duration_ms`/`speaker_count` from `transcript.json` for a
+/// meeting whose `metadata.json` already exists but is degenerate (issue
+/// 0064) — unlike [`synthesize_metadata`], `metadata.json` is present here,
+/// so every other field (title, `processing`, `deletion`, ...) must be left
+/// untouched. This is the same derivation `synthesize_metadata` uses, just
+/// gated on "duration still zero, transcript now has segments" instead of
+/// "metadata.json absent": a meeting stuck on `MeetingFolder::ensure`'s or
+/// `synthesize_metadata`'s own placeholder never revisits it once processed,
+/// because `duration_ms == 0` alone does not disqualify a `metadata.json`
+/// from "existing" for the orphan-recovery gate. Returns `Ok(true)` if a
+/// backfill was applied, `Ok(false)` if there was nothing to do (already has
+/// a real duration, or no transcript segments yet).
+fn backfill_degenerate_duration(
+    meetings_root: &Path,
+    folder: &Path,
+    meeting_id: MeetingId,
+) -> AppResult<bool> {
+    let meta = reader::read_metadata_inner(folder)?;
+    if meta.duration_ms != 0 {
+        return Ok(false);
+    }
+    let segments = reader::read_transcript_inner(folder)?;
+    let Some(last) = segments.last() else {
+        return Ok(false);
+    };
+    let duration_ms = last.end_ms;
+    let speaker_count = segments
+        .iter()
+        .filter_map(|s| s.speaker_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u32;
+    notes_crdt::update_metadata_if_present(meetings_root, meeting_id, |m| {
+        m.duration_ms = duration_ms;
+        m.speaker_count = speaker_count;
+    })?;
+    Ok(true)
 }
 
 /// Derive a recovered folder's `started_at`, preferring the earlier of

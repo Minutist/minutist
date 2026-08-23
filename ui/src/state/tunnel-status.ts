@@ -36,6 +36,12 @@ export type TunnelStatusStore = {
    * is in progress. `null` when not pairing.
    */
   userCode: string | null;
+  /**
+   * Whether the code still needs to be typed by hand — false when the opened
+   * URL already carries it pre-filled (`verification_uri_complete`), in which
+   * case the pane must not show the code or claim it needs confirming.
+   */
+  codeRequired: boolean;
   /** A human-readable error from the last pairing/toggle action, or `null`. */
   lastError: string | null;
   /** Re-fetch the snapshot via `tunnel_status`. */
@@ -68,6 +74,7 @@ function withStatus(
 export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
   snapshot: null,
   userCode: null,
+  codeRequired: false,
   lastError: null,
 
   refresh: async () => {
@@ -103,6 +110,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
     // tunnel_status_changed(Pairing) event and the poll loop below.
     set((s) => ({
       userCode: prompt.user_code,
+      codeRequired: prompt.code_required,
       snapshot: withStatus(s.snapshot, "pairing"),
     }));
 
@@ -129,6 +137,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
         set({
           lastError: err instanceof Error ? err.message : String(err),
           userCode: null,
+          codeRequired: false,
         });
         return;
       }
@@ -138,7 +147,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
       } else {
         // Terminal: clear the displayed code and refresh the full snapshot so
         // the account label appears.
-        set({ userCode: null });
+        set({ userCode: null, codeRequired: false });
         void get().refresh();
       }
     };
@@ -152,6 +161,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
       set({
         snapshot: { enabled: false, status: "disconnected", account_id: null },
         userCode: null,
+        codeRequired: false,
         lastError: null,
       });
     } catch (err) {

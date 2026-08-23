@@ -31,8 +31,9 @@ use tauri::State;
 use crate::IpcState;
 
 /// The codes + URL to show the user when a pairing begins. Returned by
-/// [`tunnel_begin_pairing`]. The webview displays `user_code` and opens
-/// `verification_uri` in the browser (via `tauri-plugin-opener`).
+/// [`tunnel_begin_pairing`]. The webview opens `verification_uri` in the
+/// browser (via `tauri-plugin-opener`) and displays `user_code` only when
+/// `code_required` is true.
 ///
 /// Carries no credential — the issued device credential is stored securely by
 /// `app-main` on a successful poll and never crosses to the webview.
@@ -43,6 +44,11 @@ pub struct PairingPrompt {
     /// The URL to open in the browser — the pre-filled one when the server
     /// provided it, else the bare verification URL.
     pub verification_uri: String,
+    /// Whether `verification_uri` still requires the user to type
+    /// `user_code` themselves. False when the URL already carries the code
+    /// pre-filled (the server sent `verification_uri_complete`) — showing the
+    /// code in that case describes a step that never happens.
+    pub code_required: bool,
 }
 
 /// A snapshot of the connector for the Settings → Connection pane. Returned by

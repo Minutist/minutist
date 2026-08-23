@@ -30,7 +30,11 @@ const tunnelBeginPairing = vi.fn(
   async () =>
     ({
       status: "ok",
-      data: { user_code: "ABCD-1234", verification_uri: "https://auth.example/device?code=ABCD-1234" },
+      data: {
+        user_code: "ABCD-1234",
+        verification_uri: "https://auth.example/device",
+        code_required: true,
+      },
     }) as const,
 );
 const tunnelPollPairing = vi.fn(
@@ -65,6 +69,7 @@ function resetStore() {
     useTunnelStatusStore.setState({
       snapshot: null,
       userCode: null,
+      codeRequired: false,
       lastError: null,
     });
   });
@@ -88,14 +93,14 @@ describe("ConnectionSettingsPane", () => {
     render(<ConnectionSettingsPane />);
     await screen.findByText("Not connected");
     const toggle = screen
-      .getByText("Enable the connector")
+      .getByText("Pair this account (enables device sync)")
       .closest("label")!
       .querySelector("input") as HTMLInputElement;
     fireEvent.click(toggle);
     await waitFor(() => expect(setConnectorEnabled).toHaveBeenCalledWith(true));
   });
 
-  it("pairing shows the user code and opens the verification URL", async () => {
+  it("pairing shows the user code and opens the verification URL when a code must be typed", async () => {
     vi.useFakeTimers();
     render(<ConnectionSettingsPane />);
     // Let the on-mount status fetch settle.
@@ -113,9 +118,36 @@ describe("ConnectionSettingsPane", () => {
     });
     expect(tunnelBeginPairing).toHaveBeenCalledOnce();
     expect(screen.getByText("ABCD-1234")).toBeInTheDocument();
-    expect(openUrl).toHaveBeenCalledWith(
-      "https://auth.example/device?code=ABCD-1234",
-    );
+    expect(openUrl).toHaveBeenCalledWith("https://auth.example/device");
+    vi.useRealTimers();
+  });
+
+  it("pairing does not show the code when the opened URL already carries it", async () => {
+    tunnelBeginPairing.mockResolvedValueOnce({
+      status: "ok",
+      data: {
+        user_code: "ABCD-1234",
+        verification_uri: "https://auth.example/device?code=ABCD-1234",
+        code_required: false,
+      },
+    });
+    vi.useFakeTimers();
+    render(<ConnectionSettingsPane />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const button = screen.getByRole("button", { name: /Pair this device/ });
+    fireEvent.click(button);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("ABCD-1234")).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/already filled in/i),
+    ).toBeInTheDocument();
     vi.useRealTimers();
   });
 

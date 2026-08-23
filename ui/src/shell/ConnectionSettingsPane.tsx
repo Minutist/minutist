@@ -37,6 +37,7 @@ function statusLabel(status: TunnelStatus): string {
 export function ConnectionSettingsPane() {
   const snapshot = useTunnelStatusStore((s) => s.snapshot);
   const userCode = useTunnelStatusStore((s) => s.userCode);
+  const codeRequired = useTunnelStatusStore((s) => s.codeRequired);
   const lastError = useTunnelStatusStore((s) => s.lastError);
   const refresh = useTunnelStatusStore((s) => s.refresh);
   const setEnabled = useTunnelStatusStore((s) => s.setEnabled);
@@ -106,7 +107,7 @@ export function ConnectionSettingsPane() {
         )}
       </div>
 
-      {status === "pairing" && userCode && (
+      {status === "pairing" && userCode && codeRequired && (
         <div className="settings-drawer__field" aria-label="Pairing code">
           <label>Pairing code</label>
           <div className="settings-drawer__mcp-endpoint">
@@ -114,7 +115,16 @@ export function ConnectionSettingsPane() {
           </div>
           <p className="settings-drawer__hint">
             A browser window should have opened. Sign in to your Minutist account
-            and confirm the code above to finish pairing.
+            and enter the code above to finish pairing.
+          </p>
+        </div>
+      )}
+
+      {status === "pairing" && userCode && !codeRequired && (
+        <div className="settings-drawer__field" aria-label="Pairing in progress">
+          <p className="settings-drawer__hint">
+            A browser window should have opened with the pairing already filled
+            in. Sign in to your Minutist account to finish pairing.
           </p>
         </div>
       )}

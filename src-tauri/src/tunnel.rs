@@ -399,6 +399,7 @@ impl TunnelControl for ConnectedTunnel {
         let prompt = PairingPrompt {
             user_code: start.user_code.clone(),
             verification_uri: start.open_url().to_string(),
+            code_required: start.verification_uri_complete.is_none(),
         };
         {
             let mut rt = self.runtime.lock().expect("tunnel runtime poisoned");

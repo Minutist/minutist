@@ -292,6 +292,7 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
 
     let mut pcm = Vec::<f32>::new();
     let mut frame_buf = vec![0.0f32; MAX_FRAME_SAMPLES];
+    let mut decoded_any_audio = false;
 
     // Pre-skip samples (16 kHz) still to be trimmed off the head of the audio.
     let mut pre_skip_remaining: u64 = 0;
@@ -300,6 +301,22 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
         let pkt = match reader.read_packet() {
             Ok(Some(p)) => p,
             Ok(None) => break,
+            // A recording killed mid-write (crash, force-quit) never gets its
+            // final EOS-flagged page, which trips the `ogg` crate's own I/O
+            // error here even though everything up to this point decoded fine
+            // (ffmpeg's demuxer tolerates exactly this). Once real audio has
+            // already decoded, treat this as an abrupt-but-recoverable end of
+            // stream rather than discarding the whole recording; before any
+            // audio has decoded this is a genuinely unreadable file and stays
+            // fatal.
+            Err(e) if decoded_any_audio => {
+                tracing::warn!(
+                    target: "persistence",
+                    error = %e,
+                    "ogg stream ended without a final EOS page (recording likely crashed mid-write); keeping the audio decoded so far"
+                );
+                break;
+            }
             Err(e) => return Err(format!("ogg read error: {e}")),
         };
 
@@ -323,6 +340,7 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
         let decoded = decoder
             .decode_float(Some(input), output, false)
             .map_err(|e| format!("decode error: {e}"))?;
+        decoded_any_audio = true;
 
         let mut frame = &frame_buf[..decoded];
         if pre_skip_remaining > 0 {

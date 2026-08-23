@@ -1166,6 +1166,39 @@ fn test_decode_opus_ogg_extra_tags_packet_skipped() {
     );
 }
 
+/// A recording killed mid-write (crash/force-quit) never gets its final
+/// EOS-flagged page — the file just stops mid-page. `decode_opus_ogg` must
+/// still return the audio decoded up to that point rather than discarding the
+/// whole recording (a real crash produced exactly this: a live "Recovered
+/// recording" backlog file with a valid header and 45 s of decodable audio,
+/// rejected outright before this fix even though ffmpeg reads it cleanly).
+#[test]
+fn test_decode_opus_ogg_tolerates_a_truncated_final_page() {
+    use crate::opus_encoder::OggOpusEncoder;
+
+    // Long enough that the `ogg` crate's own page-size cap forces it to flush
+    // at least one complete audio page on its own, without `finalise()` ever
+    // being called — a short push stays buffered internally and is lost on
+    // drop, which would truncate back to nothing but headers.
+    let mut buf = Vec::<u8>::new();
+    let mut enc = OggOpusEncoder::new(std::io::Cursor::new(&mut buf)).expect("encoder");
+    enc.push_samples(&sine_samples(20.0)).expect("push");
+    // No `finalise()` — simulates the process dying mid-recording, before the
+    // final EOS page is ever written.
+    drop(enc);
+
+    // Cut off the tail so the last page is mid-write, not just missing its
+    // EOS flag on an otherwise-complete page.
+    buf.truncate(buf.len() - 50);
+
+    let pcm = reader::decode_opus_ogg_for_test(&buf)
+        .expect("a truncated-but-real stream must still decode");
+    assert!(
+        !pcm.is_empty(),
+        "audio decoded before the truncation point must be kept"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test 11/12/13: reader round-trips
 // ---------------------------------------------------------------------------

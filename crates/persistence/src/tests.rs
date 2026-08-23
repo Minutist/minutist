@@ -1869,10 +1869,9 @@ async fn test_reconcile_orphans_backfills_degenerate_duration_for_an_already_ind
         &folder_dir,
         &[
             make_segment(0, 1_000, "hello"),
-            {
-                let mut s = make_segment(1_000, 4_500, "world");
-                s.speaker_id = Some("spk_1".to_string());
-                s
+            Segment {
+                speaker_id: Some("spk_1".to_string()),
+                ..make_segment(1_000, 4_500, "world")
             },
         ],
     )

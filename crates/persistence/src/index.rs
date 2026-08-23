@@ -20,7 +20,9 @@
 use std::path::{Path, PathBuf};
 
 use libsql::{Builder, Connection, Database};
-use minutist_common::{AppResult, AudioFormat, CollectionId, MeetingId, MeetingListEntry, MeetingMeta};
+use minutist_common::{
+    AppResult, AudioFormat, CollectionId, MeetingId, MeetingListEntry, MeetingMeta, Segment,
+};
 
 use crate::error::Error;
 use crate::{migrations, reader};
@@ -356,7 +358,9 @@ impl MeetingIndex {
 
     /// Self-heal: index any on-disk meeting folder missing from the index,
     /// WITHOUT touching existing rows. Cheap in the common case — one directory
-    /// read plus a set-diff; only folders not already indexed incur a
+    /// read plus a set-diff; a folder already indexed with a real (non-zero)
+    /// duration incurs no file read at all, only a folder already indexed with
+    /// a degenerate `duration_ms` (issue 0064) or not indexed yet incurs a
     /// metadata/transcript read + `upsert`.
     ///
     /// Guards in-session visibility against any missed `upsert` (e.g. the
@@ -375,14 +379,19 @@ impl MeetingIndex {
     /// stays a derived cache, but `metadata.json` is now guaranteed to exist for
     /// every folder that holds recording data. A folder with neither file is
     /// unrelated clutter and is left alone. Returns the number of orphan
-    /// meetings newly indexed (including recovered ones).
+    /// meetings newly indexed (including recovered ones) — a backfilled but
+    /// already-indexed meeting does not count (it is a refresh, not an orphan).
     pub async fn reconcile_orphans(&self, meetings_root: &Path) -> AppResult<usize> {
         Ok(self.reconcile_orphans_inner(meetings_root).await?)
     }
 
     async fn reconcile_orphans_inner(&self, meetings_root: &Path) -> Result<usize, Error> {
-        // Ids already indexed — the cheap half of the diff.
-        let known = self.existing_ids().await?;
+        // Indexed ids and their stored duration — the cheap half of the diff,
+        // and enough to skip a disk read entirely for any already-indexed
+        // meeting whose duration is not degenerate (the index is derived from
+        // metadata.json, so a non-zero indexed duration implies a
+        // non-degenerate file).
+        let known = self.indexed_durations().await?;
 
         let dirs = match std::fs::read_dir(meetings_root) {
             Ok(rd) => rd,
@@ -401,7 +410,11 @@ impl MeetingIndex {
             };
             let path = entry.path();
             let id = meeting_id.0.to_string();
-            let already_known = known.contains(&id);
+            let indexed_duration = known.get(&id).copied();
+            if indexed_duration.is_some_and(|d| d != 0) {
+                continue;
+            }
+            let already_known = indexed_duration.is_some();
 
             if !path.join("metadata.json").exists() {
                 if already_known {
@@ -433,19 +446,12 @@ impl MeetingIndex {
                     "recovered incomplete recording (self-heal)"
                 );
             } else {
-                // metadata.json exists — an already-indexed folder is
-                // otherwise skipped before any (more expensive) read, EXCEPT
-                // to backfill a degenerate placeholder's duration/speaker
-                // count now that a transcript may exist since it was last
-                // indexed (issue 0064).
-                match backfill_degenerate_duration(meetings_root, &path, meeting_id) {
-                    Ok(true) => tracing::info!(
-                        target: "persistence",
-                        meeting_id = %id,
-                        "backfilled duration/speaker_count from transcript (self-heal)"
-                    ),
-                    Ok(false) if already_known => continue,
-                    Ok(false) => {}
+                // metadata.json exists but the indexed (or on-disk, if not yet
+                // indexed) duration is degenerate — backfill it from the
+                // transcript now that one may exist since it was last checked
+                // (issue 0064).
+                let backfilled = match backfill_degenerate_duration(meetings_root, meeting_id) {
+                    Ok(applied) => applied,
                     Err(e) => {
                         tracing::warn!(
                             target: "persistence",
@@ -453,10 +459,17 @@ impl MeetingIndex {
                             error = %e,
                             "duration backfill failed during orphan reconcile"
                         );
-                        if already_known {
-                            continue;
-                        }
+                        false
                     }
+                };
+                if backfilled {
+                    tracing::info!(
+                        target: "persistence",
+                        meeting_id = %id,
+                        "backfilled duration/speaker_count from transcript (self-heal)"
+                    );
+                } else if already_known {
+                    continue;
                 }
             }
 
@@ -490,16 +503,23 @@ impl MeetingIndex {
         Ok(indexed)
     }
 
-    /// The set of meeting ids currently in the index (string form, matching the
-    /// on-disk folder names). Used by [`Self::reconcile_orphans`] for the diff.
-    async fn existing_ids(&self) -> Result<std::collections::HashSet<String>, Error> {
-        let mut rows = self.conn.query("SELECT id FROM meetings", ()).await?;
-        let mut ids = std::collections::HashSet::new();
+    /// The ids currently in the index and their stored `duration_ms` (string
+    /// id form, matching the on-disk folder names). Used by
+    /// [`Self::reconcile_orphans`] for the new-vs-known diff and to skip a
+    /// disk read for any already-indexed meeting whose duration is not
+    /// degenerate.
+    async fn indexed_durations(&self) -> Result<std::collections::HashMap<String, u64>, Error> {
+        let mut rows = self
+            .conn
+            .query("SELECT id, duration_ms FROM meetings", ())
+            .await?;
+        let mut out = std::collections::HashMap::new();
         while let Some(row) = rows.next().await? {
             let id: String = row.get(0)?;
-            ids.insert(id);
+            let duration_ms: i64 = row.get(1)?;
+            out.insert(id, duration_ms as u64);
         }
-        Ok(ids)
+        Ok(out)
     }
 }
 
@@ -558,12 +578,7 @@ fn entry_from_folder_blocking(folder: &Path) -> Result<MeetingListEntry, Error> 
 fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error> {
     let segments = reader::read_transcript_inner(folder).unwrap_or_default();
     let started_at = recovered_started_at(folder);
-    let duration_ms = segments.last().map(|s| s.end_ms).unwrap_or(0);
-    let speaker_count = segments
-        .iter()
-        .filter_map(|s| s.speaker_id.as_deref())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len() as u32;
+    let (duration_ms, speaker_count) = duration_and_speaker_count(&segments);
     let title = recovered_title(&started_at);
     let codec = match minutist_common::resolve_audio_path(folder)
         .and_then(|p| p.extension().and_then(|e| e.to_str()).map(str::to_string))
@@ -609,42 +624,55 @@ fn synthesize_metadata(folder: &Path, meeting_id: MeetingId) -> Result<(), Error
     crate::metadata::write_metadata_to_path(&folder.join("metadata.json"), &meta)
 }
 
-/// Backfill `duration_ms`/`speaker_count` from `transcript.json` for a
-/// meeting whose `metadata.json` already exists but is degenerate (issue
-/// 0064) — unlike [`synthesize_metadata`], `metadata.json` is present here,
-/// so every other field (title, `processing`, `deletion`, ...) must be left
-/// untouched. This is the same derivation `synthesize_metadata` uses, just
-/// gated on "duration still zero, transcript now has segments" instead of
-/// "metadata.json absent": a meeting stuck on `MeetingFolder::ensure`'s or
-/// `synthesize_metadata`'s own placeholder never revisits it once processed,
-/// because `duration_ms == 0` alone does not disqualify a `metadata.json`
-/// from "existing" for the orphan-recovery gate. Returns `Ok(true)` if a
-/// backfill was applied, `Ok(false)` if there was nothing to do (already has
-/// a real duration, or no transcript segments yet).
-fn backfill_degenerate_duration(
-    meetings_root: &Path,
-    folder: &Path,
-    meeting_id: MeetingId,
-) -> AppResult<bool> {
-    let meta = reader::read_metadata_inner(folder)?;
-    if meta.duration_ms != 0 {
-        return Ok(false);
-    }
-    let segments = reader::read_transcript_inner(folder)?;
-    let Some(last) = segments.last() else {
-        return Ok(false);
-    };
-    let duration_ms = last.end_ms;
+/// `(duration_ms, speaker_count)` implied by a folder's transcript segments —
+/// the last segment's end offset (`0` when there are no segments), and the
+/// count of distinct `speaker_id`s. Shared by [`synthesize_metadata`] (no
+/// `metadata.json` at all) and [`backfill_degenerate_duration`] (`metadata.json`
+/// exists but is degenerate) — the same derivation, two different triggers.
+fn duration_and_speaker_count(segments: &[Segment]) -> (u64, u32) {
+    let duration_ms = segments.last().map(|s| s.end_ms).unwrap_or(0);
     let speaker_count = segments
         .iter()
         .filter_map(|s| s.speaker_id.as_deref())
         .collect::<std::collections::BTreeSet<_>>()
         .len() as u32;
-    notes_crdt::update_metadata_if_present(meetings_root, meeting_id, |m| {
-        m.duration_ms = duration_ms;
-        m.speaker_count = speaker_count;
+    (duration_ms, speaker_count)
+}
+
+/// Backfill `duration_ms`/`speaker_count` from `transcript.json` for a
+/// meeting whose `metadata.json` already exists but is degenerate (issue
+/// 0064) — unlike [`synthesize_metadata`], `metadata.json` is present here,
+/// so every other field (title, `processing`, `deletion`, ...) must be left
+/// untouched. Gated on "duration still zero, transcript now has segments with
+/// a real end offset" instead of "metadata.json absent": a meeting stuck on
+/// `MeetingFolder::ensure`'s or `synthesize_metadata`'s own placeholder never
+/// revisits it once processed, because `duration_ms == 0` alone does not
+/// disqualify a `metadata.json` from "existing" for the orphan-recovery gate.
+///
+/// The predicate-and-mutate run in one `update_metadata_if` closure under one
+/// lock acquisition, so there is no read-then-write window a concurrent
+/// authoritative writer (lifecycle, `meeting_ops`) could land in between —
+/// and re-checking `duration_ms == 0` inside the closure means a transcript
+/// whose last segment's `end_ms` is itself `0` returns `Ok(false)` rather
+/// than writing `0` and re-triggering this backfill on every future call.
+///
+/// Returns `Ok(true)` if a backfill was applied, `Ok(false)` if there was
+/// nothing to do (already has a real duration, or no transcript segments
+/// with a real end offset yet).
+fn backfill_degenerate_duration(meetings_root: &Path, meeting_id: MeetingId) -> AppResult<bool> {
+    let folder = meetings_root.join(meeting_id.0.to_string());
+    let segments = reader::read_transcript_inner(&folder)?;
+    let (duration_ms, speaker_count) = duration_and_speaker_count(&segments);
+    if duration_ms == 0 {
+        return Ok(false);
+    }
+    let applied = notes_crdt::update_metadata_if(meetings_root, meeting_id, |m| {
+        (m.duration_ms == 0).then(|| {
+            m.duration_ms = duration_ms;
+            m.speaker_count = speaker_count;
+        })
     })?;
-    Ok(true)
+    Ok(matches!(applied, notes_crdt::MetaUpdate::Applied(())))
 }
 
 /// Derive a recovered folder's `started_at`, preferring the earlier of

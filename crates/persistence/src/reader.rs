@@ -292,7 +292,7 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
 
     let mut pcm = Vec::<f32>::new();
     let mut frame_buf = vec![0.0f32; MAX_FRAME_SAMPLES];
-    let mut decoded_any_audio = false;
+    let mut decoded_any_packet = false;
 
     // Pre-skip samples (16 kHz) still to be trimmed off the head of the audio.
     let mut pre_skip_remaining: u64 = 0;
@@ -309,7 +309,7 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
             // stream rather than discarding the whole recording; before any
             // audio has decoded this is a genuinely unreadable file and stays
             // fatal.
-            Err(e) if decoded_any_audio => {
+            Err(e) if decoded_any_packet => {
                 tracing::warn!(
                     target: "persistence",
                     error = %e,
@@ -317,6 +317,10 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
                 );
                 break;
             }
+            // Also keeps a mislabelled AAC-under-`.opus` file (issue 0051)
+            // failing at packet 0, so `read_audio_pcm`'s AAC fallback stays
+            // reachable — a broader tolerance here would mask that case as a
+            // zero-length "successful" Opus decode instead.
             Err(e) => return Err(format!("ogg read error: {e}")),
         };
 
@@ -340,7 +344,7 @@ fn decode_opus_ogg(data: &[u8]) -> Result<Vec<f32>, String> {
         let decoded = decoder
             .decode_float(Some(input), output, false)
             .map_err(|e| format!("decode error: {e}"))?;
-        decoded_any_audio = true;
+        decoded_any_packet = true;
 
         let mut frame = &frame_buf[..decoded];
         if pre_skip_remaining > 0 {

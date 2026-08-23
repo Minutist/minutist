@@ -1853,6 +1853,11 @@ async fn test_reconcile_orphans_backfills_degenerate_duration_for_an_already_ind
     let mut meta = dummy_meta(id, 0);
     meta.title = "Kept title".to_string();
     meta.speaker_count = 0;
+    // Realistic target population: a synced-in placeholder (or any meeting
+    // no longer actively recording locally) has already left `Local` by the
+    // time anything calls `list_meetings` on it — never touch a still-`Local`
+    // meeting, since that is what an active recording looks like.
+    meta.processing = minutist_common::ProcessingLifecycle::PendingProcessing;
     notes_crdt::write_metadata(&folder_dir, &meta).expect("write placeholder metadata");
 
     let index = MeetingIndex::open(":memory:").await.expect("open");
@@ -1905,6 +1910,47 @@ async fn test_reconcile_orphans_backfills_degenerate_duration_for_an_already_ind
         index.reconcile_orphans(root).await.expect("reconcile 2"),
         0
     );
+}
+
+/// A meeting still at `ProcessingLifecycle::Local` must NEVER be backfilled,
+/// even with `duration_ms == 0` and real transcript segments on disk — that
+/// combination is exactly what an actively-recording meeting with live
+/// per-segment transcription looks like (`MeetingWriter::write_transcript_segment`
+/// runs mid-recording; `duration_ms`/`processing` only change at `finalise`,
+/// which writes `metadata.json` directly, bypassing the metadata lock).
+/// Backfilling from a live, still-growing transcript would derive a premature
+/// duration that a losing race against `finalise` could leave permanently
+/// wrong, since no later call revisits a non-zero `duration_ms`.
+#[tokio::test]
+async fn test_reconcile_orphans_never_backfills_a_still_recording_local_meeting() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let root = tempdir.path();
+
+    let id = MeetingId::new();
+    let folder_dir = root.join(id.0.to_string());
+    std::fs::create_dir_all(&folder_dir).expect("create folder");
+    let mut meta = dummy_meta(id, 0);
+    meta.title = "Live meeting".to_string();
+    meta.processing = minutist_common::ProcessingLifecycle::Local;
+    notes_crdt::write_metadata(&folder_dir, &meta).expect("write draft metadata");
+
+    // Live per-segment transcription has already produced real segments,
+    // exactly as it would mid-recording.
+    crate::write_transcript(
+        &folder_dir,
+        &[make_segment(0, 1_000, "hello"), make_segment(1_000, 4_500, "world")],
+    )
+    .expect("write transcript.json");
+
+    let index = MeetingIndex::open(":memory:").await.expect("open");
+    index.reconcile_orphans(root).await.expect("reconcile");
+
+    let on_disk = reader::read_metadata(&folder_dir).expect("re-read metadata");
+    assert_eq!(
+        on_disk.duration_ms, 0,
+        "a still-recording (Local) meeting's duration must not be backfilled from a partial transcript"
+    );
+    assert_eq!(on_disk.speaker_count, 0);
 }
 
 /// A concurrent reader must never observe a half-rebuilt table

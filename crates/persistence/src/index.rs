@@ -656,9 +656,28 @@ fn duration_and_speaker_count(segments: &[Segment]) -> (u64, u32) {
 /// whose last segment's `end_ms` is itself `0` returns `Ok(false)` rather
 /// than writing `0` and re-triggering this backfill on every future call.
 ///
+/// Also refuses a meeting still at `ProcessingLifecycle::Local` — `list_meetings`
+/// (this function's caller) runs during ordinary use, including while a
+/// meeting is actively recording with live per-segment transcription
+/// (`orchestrator::asr_worker` calls `MeetingWriter::write_transcript_segment`
+/// mid-recording, so `transcript.json` can carry real segments well before the
+/// recording stops). `create_draft`/`MeetingWriter::finalise`
+/// (`crates/persistence/src/writer.rs`) write `metadata.json` directly,
+/// bypassing `metadata_lock` entirely — a live recording's `duration_ms` stays
+/// `0` and its `processing` stays the `Local` default for its whole duration,
+/// only changing at `finalise`. Backfilling from a live, still-growing
+/// transcript would derive a premature "final" duration that a losing race
+/// against `finalise`'s unguarded write could leave permanently wrong (no
+/// later call would ever revisit a non-zero `duration_ms`). Every population
+/// this backfill actually targets (a synced placeholder, a crash-recovered
+/// folder, a legacy processed meeting) has already left `Local` for
+/// `PendingProcessing`/`Claimed`/`Processed` by the time anything calls
+/// `list_meetings` on it, so this excludes only the live-recording case it
+/// must exclude.
+///
 /// Returns `Ok(true)` if a backfill was applied, `Ok(false)` if there was
-/// nothing to do (already has a real duration, or no transcript segments
-/// with a real end offset yet).
+/// nothing to do (already has a real duration, no transcript segments with a
+/// real end offset yet, or the meeting is still `Local`).
 fn backfill_degenerate_duration(meetings_root: &Path, meeting_id: MeetingId) -> AppResult<bool> {
     let folder = meetings_root.join(meeting_id.0.to_string());
     let segments = reader::read_transcript_inner(&folder)?;
@@ -667,7 +686,8 @@ fn backfill_degenerate_duration(meetings_root: &Path, meeting_id: MeetingId) -> 
         return Ok(false);
     }
     let applied = notes_crdt::update_metadata_if(meetings_root, meeting_id, |m| {
-        (m.duration_ms == 0).then(|| {
+        let still_recording = matches!(m.processing, minutist_common::ProcessingLifecycle::Local);
+        (m.duration_ms == 0 && !still_recording).then(|| {
             m.duration_ms = duration_ms;
             m.speaker_count = speaker_count;
         })

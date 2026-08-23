@@ -3516,9 +3516,17 @@ fn diarize_timeout(recording_duration_ms: u64) -> Duration {
 ///
 /// Like [`diarize_timeout`] but sized for ASR, which re-runs the model over the
 /// full audio and is slower than diarization: ~3x real-time, floored at 5 min,
-/// capped at 30 min. Deliberately generous so a legitimate long re-transcribe is
-/// not cut short; the bound exists so a wedged ASR run cannot hold the offline
-/// claim (and block the next recording) forever.
+/// capped at 6 hours. Deliberately generous so a legitimate long re-transcribe
+/// is not cut short; the bound exists so a wedged ASR run cannot hold the
+/// offline claim (and block the next recording) *forever*, not so it can only
+/// run for as long as a short meeting needs. A flat 30-minute cap (the
+/// original value) is well under 3x real-time for anything past ~10 minutes of
+/// audio, so on modest hardware (e.g. an integrated GPU) it guaranteed a
+/// permanent timeout — not a rare "wedged" case, but every sufficiently long
+/// recording, forever (`election`'s F4a releases the claim for immediate
+/// retry on any failure, so this repeats indefinitely rather than giving up).
+/// Confirmed live: a 7151454 ms (~119 min) recording retried every ~30-45 min
+/// for 2.5+ hours before this was raised.
 ///
 /// `None` (duration unknown, e.g. a meeting whose authoritative metadata
 /// hasn't synced in yet — see [`recording_duration_for_budget`]) sizes to the
@@ -3533,7 +3541,7 @@ fn diarize_timeout(recording_duration_ms: u64) -> Duration {
 /// neither rare nor self-limiting.
 fn retranscribe_timeout(recording_duration_ms: Option<u64>) -> Duration {
     const FLOOR_SECS: u64 = 300; // 5 min
-    const CAP_SECS: u64 = 1800; // 30 min
+    const CAP_SECS: u64 = 21_600; // 6 hours
     let Some(recording_duration_ms) = recording_duration_ms else {
         return Duration::from_secs(CAP_SECS);
     };

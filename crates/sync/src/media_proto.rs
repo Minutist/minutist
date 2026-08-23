@@ -219,17 +219,19 @@ pub async fn respond_media_sync(
     let peer_manifest = decode_manifest(&read_frame(recv).await?)?;
     peer_manifest.validate()?;
 
-    // A meeting syncing media to a device that lacks its folder must not fail for
-    // want of the directory; `notes-crdt` owns the folder/metadata creation.
-    notes_crdt::MeetingFolder::ensure(root, meeting_id)
-        .map_err(|e| Error::Protocol(format!("ensuring inbound meeting folder: {e}")))?;
-
-    // `ensure` only wrote the arrival-time placeholder; if this meeting's
-    // notes.ydoc already carries the origin's real title/duration (from an
-    // earlier or same-session notes sync), project it over metadata.json now
-    // rather than leaving audio attached to a blank placeholder indefinitely —
-    // mirrors `notes_proto::apply_inbound`. Best-effort: a projection failure
-    // must not fail the media sync; the next notes sweep re-applies it.
+    // No `MeetingFolder::ensure` here: a content-less peer meeting must not
+    // materialise a blank-placeholder folder just because its id was named in
+    // a stream header. `import_meeting`/`pull_missing` need no pre-created
+    // directory — `resolve_audio_path`/`assets_dir.is_dir()` are `None`/`false`
+    // on an absent folder, and the fs blob store's own export creates the
+    // parent directory the moment there is an actual blob to write. If this
+    // meeting's `notes.ydoc` already carries the origin's real title/duration
+    // (from an earlier or same-session notes sync), project it over
+    // metadata.json now rather than waiting on the next notes sweep — mirrors
+    // `notes_proto::apply_inbound`. Best-effort: a projection failure must not
+    // fail the media sync; the next notes sweep re-applies it. A no-op when
+    // there is no folder yet (`project_ydoc_meta_into_metadata` reads
+    // `notes.ydoc` and returns `Ok(false)` on a missing file).
     if let Err(e) = notes_crdt::meta_crdt::project_ydoc_meta_into_metadata(root, meeting_id) {
         tracing::warn!(
             target: "sync",

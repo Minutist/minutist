@@ -248,6 +248,42 @@ async fn an_unpaired_peer_is_rejected_on_the_blobs_alpn() {
     b.shutdown().await.expect("shutdown b");
 }
 
+/// A meeting id with nothing behind it on either side (no audio, no notes,
+/// no folder at all) must not materialise a folder just because it was named
+/// in a media-sync stream header — the source of the "blank Untitled, 0 min"
+/// junk-folder generator this issue class was originally filed against.
+/// `respond_media_sync` no longer calls `MeetingFolder::ensure`; the fs blob
+/// store's own export is what creates a directory, and only once there is an
+/// actual blob to write into it.
+#[tokio::test]
+async fn media_sync_creates_no_placeholder_for_a_content_less_meeting() {
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+
+    // Neither side has ever heard of this meeting — no `MeetingFolder::create`
+    // or `ensure` call for it on either root.
+    let meeting = MeetingId::new();
+
+    let (a, b) = paired_engines(root_a, root_b).await;
+    a.sync_media(direct_addr(&b), meeting)
+        .await
+        .expect("reconcile media a -> b");
+
+    assert!(
+        !root_a.join(meeting.0.to_string()).exists(),
+        "A must not gain a placeholder folder for a meeting neither side holds"
+    );
+    assert!(
+        !root_b.join(meeting.0.to_string()).exists(),
+        "B must not gain a placeholder folder for a meeting neither side holds"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}
+
 /// Media sync must not leave a meeting stuck on `MeetingFolder::ensure`'s blank
 /// placeholder metadata when the receiving side's own `notes.ydoc` already
 /// carries the real title/duration (issue 0062 finding 2). B starts with no

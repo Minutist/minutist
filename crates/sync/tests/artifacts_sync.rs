@@ -284,3 +284,36 @@ async fn sync_is_noop_when_both_already_hold_the_artifacts() {
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }
+
+/// A meeting id with nothing behind it on either side must not materialise a
+/// folder just because it was named in an artifacts-sync stream header —
+/// `respond_artifacts_sync` no longer calls `MeetingFolder::ensure`;
+/// `import_artifacts` is a no-op (`path.is_file()` is false for every
+/// artifact rel) and the fs blob store's own export is what creates a
+/// directory, only once there is an actual artifact to write.
+#[tokio::test]
+async fn artifacts_sync_creates_no_placeholder_for_a_content_less_meeting() {
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+
+    let meeting = MeetingId::new();
+
+    let (a, b) = paired_engines(root_a, root_b).await;
+    a.sync_artifacts(direct_addr(&b), meeting)
+        .await
+        .expect("reconcile artifacts a -> b");
+
+    assert!(
+        !root_a.join(meeting.0.to_string()).exists(),
+        "A must not gain a placeholder folder for a meeting neither side holds"
+    );
+    assert!(
+        !root_b.join(meeting.0.to_string()).exists(),
+        "B must not gain a placeholder folder for a meeting neither side holds"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}

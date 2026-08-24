@@ -70,6 +70,7 @@ export function SyncSettingsPane() {
   const myTicket = useSyncStatusStore((s) => s.myTicket);
   const lastError = useSyncStatusStore((s) => s.lastError);
   const refresh = useSyncStatusStore((s) => s.refresh);
+  const enableSync = useSyncStatusStore((s) => s.enable);
   const fetchTicket = useSyncStatusStore((s) => s.fetchTicket);
   const addPeer = useSyncStatusStore((s) => s.addPeer);
   const syncNow = useSyncStatusStore((s) => s.syncNow);
@@ -80,6 +81,7 @@ export function SyncSettingsPane() {
   const [peerTicket, setPeerTicket] = useState("");
   const [addPeerPending, setAddPeerPending] = useState(false);
   const [syncNowPending, setSyncNowPending] = useState(false);
+  const [enablePending, setEnablePending] = useState(false);
 
   // Fetch status on mount so the pane opens with the live state. The ticket is
   // expensive to fetch (it involves the iroh endpoint); defer it to the user
@@ -113,6 +115,18 @@ export function SyncSettingsPane() {
       await syncNow(openMeetingId);
     } finally {
       setSyncNowPending(false);
+    }
+  };
+
+  // Sync starts automatically once signed in; a device that only wants
+  // manual ticket pairing (never signs in) needs its own way to turn it on.
+  const handleEnableSync = async () => {
+    setEnablePending(true);
+    try {
+      await enableSync();
+      await fetchTicket();
+    } finally {
+      setEnablePending(false);
     }
   };
 
@@ -213,6 +227,22 @@ export function SyncSettingsPane() {
               ? ` ${Math.round(inProgress.fraction * 100)}%`
               : ""}
           </p>
+        )}
+        {status?.kind === "disabled" && (
+          <>
+            <button
+              type="button"
+              className="settings-drawer__about"
+              disabled={enablePending}
+              onClick={() => void handleEnableSync()}
+            >
+              {enablePending ? "Turning on…" : "Turn on sync"}
+            </button>
+            <p className="settings-drawer__hint">
+              Only needed if you want the ticket exchange below without
+              signing in above.
+            </p>
+          </>
         )}
       </div>
 

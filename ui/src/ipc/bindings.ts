@@ -1002,7 +1002,11 @@ async accountBeginPairing() : Promise<Result<PairingPrompt, AppError>> {
  * Poll the in-progress pairing once, returning the current [`AccountStatus`].
  * The UI polls this on the server's `interval` until the status leaves
  * `Pairing` (reaching `SignedIn` on success, or `SignedOut` on a
- * declined/expired pairing).
+ * declined/expired pairing). On `SignedIn`, also starts the sync engine
+ * (best-effort) so sync is live immediately rather than only from the next
+ * app launch — `AccountControl::poll_pairing` only persists
+ * `settings.connector_enabled = true`, it does not touch the separate
+ * `SyncControl`.
  */
 async accountPollPairing() : Promise<Result<AccountStatus, AppError>> {
     try {
@@ -1046,6 +1050,24 @@ async deleteAccount() : Promise<Result<null, AppError>> {
 async syncStatus() : Promise<Result<SyncStatus, AppError>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("sync_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Turn sync on WITHOUT signing in — the escape valve for a device that only
+ * ever wants manual ticket pairing with its own other devices. Signing in
+ * (`account_poll_pairing`) already turns sync on for that path; this command
+ * exists because the Sync pane's ticket exchange is documented to work for a
+ * device "not on your account" at all, so it must have its own way to start
+ * the engine rather than depending on the account flow. Persists
+ * `settings.connector_enabled = true` (see `SyncControl::set_enabled`), so it
+ * survives a restart same as the sign-in path.
+ */
+async enableSync() : Promise<Result<SyncStatus, AppError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("enable_sync") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

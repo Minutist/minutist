@@ -64,6 +64,12 @@ const syncAddPeer = vi.fn(
 const syncNow = vi.fn(
   async (_meetingId: string) => ({ status: "ok", data: null }) as const,
 );
+const enableSync = vi.fn(
+  async (): Promise<{ status: "ok"; data: SyncStatus }> => ({
+    status: "ok",
+    data: { kind: "idle" },
+  }),
+);
 
 vi.mock("../ipc/client", () => ({
   commands: {
@@ -72,6 +78,7 @@ vi.mock("../ipc/client", () => ({
     accountPollPairing: () => accountPollPairing(),
     deleteAccount: () => deleteAccount(),
     syncStatus: () => syncStatus(),
+    enableSync: () => enableSync(),
     syncGetMyTicket: () => syncGetMyTicket(),
     syncAddPeer: (ticket: string) => syncAddPeer(ticket),
     syncNow: (meetingId: string) => syncNow(meetingId),
@@ -160,6 +167,36 @@ describe("SyncSettingsPane", () => {
     });
     render(<SyncSettingsPane />);
     await screen.findByText(/Error: endpoint bind failed/);
+  });
+
+  it("shows 'Turn on sync' only when sync is disabled", async () => {
+    syncStatus.mockResolvedValueOnce({ status: "ok", data: { kind: "disabled" } });
+    render(<SyncSettingsPane />);
+    await screen.findByText("Disabled");
+    expect(
+      screen.getByRole("button", { name: "Turn on sync" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not show 'Turn on sync' once sync is already on", async () => {
+    render(<SyncSettingsPane />);
+    await screen.findByText("Ready");
+    expect(
+      screen.queryByRole("button", { name: "Turn on sync" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("'Turn on sync' calls enable_sync and re-fetches the ticket, without signing in", async () => {
+    syncStatus.mockResolvedValueOnce({ status: "ok", data: { kind: "disabled" } });
+    render(<SyncSettingsPane />);
+    await screen.findByText("Disabled");
+    vi.clearAllMocks();
+
+    fireEvent.click(screen.getByRole("button", { name: "Turn on sync" }));
+
+    await waitFor(() => expect(enableSync).toHaveBeenCalledOnce());
+    await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalledOnce());
+    expect(accountBeginPairing).not.toHaveBeenCalled();
   });
 
   it("add-peer button calls sync_add_peer and clears the field", async () => {

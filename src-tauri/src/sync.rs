@@ -635,22 +635,29 @@ impl SyncControl for ConnectedSync {
     }
 
     async fn set_enabled(&self, enabled: bool) -> AppResult<()> {
-        // F5: request the engine start on a successful sign-in.
-        // `request_start` is idempotent (an atomic-guarded one-shot), so this
-        // is safe whether the engine is already running, already starting, or
-        // has never been requested.
+        // F5: request the engine start. Two callers: a successful sign-in
+        // (`account_poll_pairing`) and the Sync pane's own "Turn on sync"
+        // fallback for a device that wants manual ticket pairing without ever
+        // signing in (`enable_sync`) — persisting the setting here, not just
+        // in the account path, keeps both self-contained: whichever caller
+        // turns sync on, it survives a restart. `request_start` is idempotent
+        // (an atomic-guarded one-shot), so this is safe whether the engine is
+        // already running, already starting, or has never been requested.
         //
         // `enabled = false` (only ever called from `delete_account`, alongside
         // `AccountControl::delete_account` persisting
-        // `settings.connector_enabled = false`) does NOT tear down an
+        // `settings.connector_enabled = false` itself) does NOT tear down an
         // already-started engine: `SyncEngine` offers only an owning
         // `shutdown(self)`, and the engine `Arc` here is shared with the
         // spawned election loop and the lifecycle subscriber, so a clean stop
         // would need a cancellation path threaded through both — a known
         // follow-up, not a behaviour this call regresses (the app is about to
         // erase the local credential regardless; a lingering engine has
-        // nothing account-scoped left to do until the next launch).
+        // nothing account-scoped left to do until the next launch). So this
+        // method only ever persists on the `true` branch; the `false` caller
+        // already persisted its own reason for disabling.
         if enabled {
+            let _ = self.settings.update(|s| s.connector_enabled = true).await;
             self.request_start().await;
         }
         Ok(())
@@ -875,6 +882,50 @@ mod tests {
             super::credential_relay_token(paired.path()).as_deref(),
             Some(mdc)
         );
+    }
+
+    /// `set_enabled(true)` must persist `settings.connector_enabled` and move
+    /// the status off `Disabled` WITHOUT needing network access — regression
+    /// coverage for the account-free manual-pairing escape valve
+    /// (`enable_sync`): before this, nothing but a successful sign-in could
+    /// ever flip `connector_enabled`, so a device that never signs in had no
+    /// way to turn sync on at all despite the Sync pane's own copy promising
+    /// the ticket exchange works "for a device not on your account". Does not
+    /// use `bound_device()` (which polls for a real network bind) — this only
+    /// asserts the synchronous, local-only part of `request_start`.
+    #[tokio::test]
+    async fn set_enabled_true_persists_the_setting_and_requests_start() {
+        let app_data = tempfile::TempDir::new().expect("app-data tempdir");
+        let meetings = tempfile::TempDir::new().expect("meetings tempdir");
+        let store = JsonFileStore::new(app_data.path().join("settings.store"));
+        let settings = SettingsHandle::new(store).expect("build settings handle");
+        assert!(!settings.current().connector_enabled, "starts disabled");
+
+        let (event_tx, _events) = broadcast::channel(256);
+        let index = Arc::new(
+            ipc_bridge::MeetingIndex::open(":memory:")
+                .await
+                .expect("open in-memory index"),
+        );
+        let sync = ConnectedSync::new(
+            settings.clone(),
+            event_tx,
+            app_data.path().to_path_buf(),
+            meetings.path().to_path_buf(),
+            None,
+            index,
+        );
+        assert_eq!(sync.status().await, SyncStatus::Disabled);
+
+        sync.set_enabled(true).await.expect("enable");
+
+        assert!(
+            settings.current().connector_enabled,
+            "connector_enabled must be persisted, not just flipped in memory"
+        );
+        // `request_start` marks `Connecting` synchronously, before any network
+        // I/O — no need to wait for (or gate on) a real bind here.
+        assert_ne!(sync.status().await, SyncStatus::Disabled);
     }
 
     /// A handle to a built `ConnectedSync` plus its event receiver and the temp

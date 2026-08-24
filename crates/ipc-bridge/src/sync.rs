@@ -163,6 +163,21 @@ pub async fn sync_status(state: State<'_, IpcState>) -> AppResult<SyncStatus> {
     Ok(state.connected.sync.status().await)
 }
 
+/// Turn sync on WITHOUT signing in — the escape valve for a device that only
+/// ever wants manual ticket pairing with its own other devices. Signing in
+/// (`account_poll_pairing`) already turns sync on for that path; this command
+/// exists because the Sync pane's ticket exchange is documented to work for a
+/// device "not on your account" at all, so it must have its own way to start
+/// the engine rather than depending on the account flow. Persists
+/// `settings.connector_enabled = true` (see `SyncControl::set_enabled`), so it
+/// survives a restart same as the sign-in path.
+#[tauri::command]
+#[specta::specta]
+pub async fn enable_sync(state: State<'_, IpcState>) -> AppResult<SyncStatus> {
+    state.connected.sync.set_enabled(true).await?;
+    Ok(state.connected.sync.status().await)
+}
+
 /// This device's shareable ticket string. The UI shows it (and/or a QR) so the
 /// user can pair another of their devices, which calls [`sync_add_peer`] with it.
 ///

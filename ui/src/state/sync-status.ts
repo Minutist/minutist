@@ -61,6 +61,13 @@ export type SyncStatusStore = {
   pendingReadyNotifications: MeetingId[];
   /** Re-fetch `sync_status`. */
   refresh: () => Promise<void>;
+  /**
+   * Turn sync on without signing in, via `enable_sync` — the escape valve for
+   * a device that only wants manual ticket pairing with its own other
+   * devices. Signing in already turns sync on for that path; this exists so
+   * the ticket exchange below works on its own, unsigned-in.
+   */
+  enable: () => Promise<void>;
   /** Fetch (and cache) this device's ticket via `sync_get_my_ticket`. */
   fetchTicket: () => Promise<void>;
   /** Register a peer device from its shareable ticket. */
@@ -84,6 +91,15 @@ export const useSyncStatusStore = create<SyncStatusStore>((set) => ({
     try {
       const status = unwrap(await commands.syncStatus());
       set({ status });
+    } catch (err) {
+      set({ lastError: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  enable: async () => {
+    try {
+      const status = unwrap(await commands.enableSync());
+      set({ status, lastError: null });
     } catch (err) {
       set({ lastError: err instanceof Error ? err.message : String(err) });
     }

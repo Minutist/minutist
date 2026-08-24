@@ -164,11 +164,25 @@ pub async fn account_begin_pairing(state: State<'_, IpcState>) -> AppResult<Pair
 /// Poll the in-progress pairing once, returning the current [`AccountStatus`].
 /// The UI polls this on the server's `interval` until the status leaves
 /// `Pairing` (reaching `SignedIn` on success, or `SignedOut` on a
-/// declined/expired pairing).
+/// declined/expired pairing). On `SignedIn`, also starts the sync engine
+/// (best-effort) so sync is live immediately rather than only from the next
+/// app launch — `AccountControl::poll_pairing` only persists
+/// `settings.connector_enabled = true`, it does not touch the separate
+/// `SyncControl`.
 #[tauri::command]
 #[specta::specta]
 pub async fn account_poll_pairing(state: State<'_, IpcState>) -> AppResult<AccountStatus> {
-    state.connected.account.poll_pairing().await
+    let status = state.connected.account.poll_pairing().await?;
+    if status == AccountStatus::SignedIn {
+        if let Err(e) = state.connected.sync.set_enabled(true).await {
+            tracing::warn!(
+                target: "ipc-bridge",
+                error = ?e,
+                "account_poll_pairing: starting the sync engine failed (best-effort)"
+            );
+        }
+    }
+    Ok(status)
 }
 
 /// The account snapshot for the Settings → Sync pane: the live sign-in status

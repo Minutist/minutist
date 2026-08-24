@@ -174,16 +174,14 @@ export const commands: Commands = {
   // pre-fills into a GitHub issue. No telemetry — the user reviews + submits it
   // from their own browser. The dev shim returns sample data for visual QA.
   getDiagnosticReport: () => callCommand("getDiagnosticReport", []),
-  // WS4-A S5b: the connected-tier relay tunnel surface. `tunnelBeginPairing`
-  // returns the user code + verification URL; `tunnelPollPairing` advances the
-  // device-code pairing; `setConnectorEnabled` toggles the connector (starting/
-  // stopping the tunnel); `tunnelStatus` reads the snapshot. In the free build
-  // (or the dev shim) these are unsupported / inert.
-  tunnelBeginPairing: () => callCommand("tunnelBeginPairing", []),
-  tunnelPollPairing: () => callCommand("tunnelPollPairing", []),
-  setConnectorEnabled: (enabled) =>
-    callCommand("setConnectorEnabled", [enabled]),
-  tunnelStatus: () => callCommand("tunnelStatus", []),
+  // WS4-A S5b: the connected-tier account sign-in surface. `accountBeginPairing`
+  // returns the user code + verification URL; `accountPollPairing` advances the
+  // device-code pairing (a successful pairing also turns sync on — there is no
+  // separate enable toggle); `accountStatus` reads the snapshot. In the free
+  // build (or the dev shim) these are unsupported / inert.
+  accountBeginPairing: () => callCommand("accountBeginPairing", []),
+  accountPollPairing: () => callCommand("accountPollPairing", []),
+  accountStatus: () => callCommand("accountStatus", []),
   // Erase the paired account (email + credentials + every device) server-side
   // and forget the local credential. In the free build (or the dev shim) it is
   // unsupported / inert.

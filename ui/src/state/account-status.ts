@@ -1,36 +1,36 @@
 /**
- * Connector (relay tunnel) live-state store (WS4-A S5b).
+ * Account sign-in live-state store (WS4-A S5b).
  *
- * Holds the connector snapshot (enabled flag + live `TunnelStatus` + paired
- * account) sourced from the `tunnel_status` command, and drives the device-code
+ * Holds the account snapshot (live `AccountStatus` + signed-in account, if
+ * any) sourced from the `account_status` command, and drives the device-code
  * pairing flow:
  *
- *  - `beginPairing()` calls `tunnel_begin_pairing`, surfaces the `user_code`,
+ *  - `beginPairing()` calls `account_begin_pairing`, surfaces the `user_code`,
  *    opens the verification URL in the browser (via `tauri-plugin-opener`), and
- *    starts polling `tunnel_poll_pairing` until the status leaves `pairing`.
- *  - `setEnabled(enabled)` calls `set_connector_enabled` (which starts/stops the
- *    tunnel lifecycle and persists the setting) and stores the resulting
- *    snapshot.
- *  - `refresh()` re-reads `tunnel_status`.
+ *    starts polling `account_poll_pairing` until the status leaves `pairing`.
+ *    A successful pairing also turns sync on — there is no separate enable
+ *    toggle.
+ *  - `refresh()` re-reads `account_status`.
+ *  - `deleteAccount()` erases the account and signs this device out.
  *
- * The backend emits `AppEvent::TunnelStatusChanged { status }` as the reconnect
- * loop / lifecycle transitions; routing that through the global dispatcher into
- * this store lets the pane reflect `Connecting → Online` (and `NeedsRepair`)
- * live without polling. The event carries only the status — the account label
- * comes from `tunnel_status` (it is the non-secret rauthy `sub`); the device
- * credential never crosses to the webview.
+ * The backend emits `AppEvent::AccountStatusChanged { status }` as the pairing
+ * transitions; routing that through the global dispatcher into this store lets
+ * the pane reflect `pairing → signed_in` live without polling. The event
+ * carries only the status — the account label comes from `account_status` (it
+ * is the non-secret rauthy `sub`); the device credential never crosses to the
+ * webview.
  */
 import { create } from "zustand";
 import { commands, unwrap } from "../ipc/client";
-import type { TunnelSnapshot, TunnelStatus } from "../ipc/bindings";
+import type { AccountSnapshot, AccountStatus } from "../ipc/bindings";
 import type { AppEvent } from "../ipc/app-event";
 
 /** Default poll interval (ms) while a pairing is in progress (RFC 8628 floor). */
 const PAIRING_POLL_INTERVAL_MS = 5000;
 
-export type TunnelStatusStore = {
-  /** The live connector snapshot, or `null` before the first fetch. */
-  snapshot: TunnelSnapshot | null;
+export type AccountStatusStore = {
+  /** The live account snapshot, or `null` before the first fetch. */
+  snapshot: AccountSnapshot | null;
   /**
    * The short code the user enters at the verification page, set while a pairing
    * is in progress. `null` when not pairing.
@@ -42,36 +42,34 @@ export type TunnelStatusStore = {
    * case the pane must not show the code or claim it needs confirming.
    */
   codeRequired: boolean;
-  /** A human-readable error from the last pairing/toggle action, or `null`. */
+  /** A human-readable error from the last pairing/delete action, or `null`. */
   lastError: string | null;
-  /** Re-fetch the snapshot via `tunnel_status`. */
+  /** Re-fetch the snapshot via `account_status`. */
   refresh: () => Promise<void>;
-  /** Enable/disable the connector via `set_connector_enabled`. */
-  setEnabled: (enabled: boolean) => Promise<void>;
   /** Begin device pairing: show the code, open the URL, and poll to completion. */
   beginPairing: () => Promise<void>;
   /**
    * Erase the paired account and sign this device out via `delete_account`.
    * On success the account is gone server-side and the local credential is
-   * forgotten; the snapshot flips to the signed-out (unpaired) state.
+   * forgotten; the snapshot flips to the signed-out state.
    */
   deleteAccount: () => Promise<void>;
   /** Dispatcher called by the global event listener. */
   handleEvent: (event: AppEvent) => void;
 };
 
-/** Patch the snapshot's `status` in place (preserving enabled/account). */
+/** Patch the snapshot's `status` in place (preserving the account label). */
 function withStatus(
-  snapshot: TunnelSnapshot | null,
-  status: TunnelStatus,
-): TunnelSnapshot {
+  snapshot: AccountSnapshot | null,
+  status: AccountStatus,
+): AccountSnapshot {
   if (snapshot === null) {
-    return { enabled: false, status, account_id: null };
+    return { status, account_id: null };
   }
   return { ...snapshot, status };
 }
 
-export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
+export const useAccountStatusStore = create<AccountStatusStore>((set, get) => ({
   snapshot: null,
   userCode: null,
   codeRequired: false,
@@ -79,17 +77,8 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
 
   refresh: async () => {
     try {
-      const snapshot = unwrap(await commands.tunnelStatus());
+      const snapshot = unwrap(await commands.accountStatus());
       set({ snapshot });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
-  },
-
-  setEnabled: async (enabled) => {
-    try {
-      const snapshot = unwrap(await commands.setConnectorEnabled(enabled));
-      set({ snapshot, lastError: null });
     } catch (err) {
       set({ lastError: err instanceof Error ? err.message : String(err) });
     }
@@ -99,7 +88,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
     set({ lastError: null });
     let prompt;
     try {
-      prompt = unwrap(await commands.tunnelBeginPairing());
+      prompt = unwrap(await commands.accountBeginPairing());
     } catch (err) {
       set({ lastError: err instanceof Error ? err.message : String(err) });
       return;
@@ -107,7 +96,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
 
     // Optimistically reflect the pairing state so the pane shows the code +
     // instructions immediately; the backend confirms via the
-    // tunnel_status_changed(Pairing) event and the poll loop below.
+    // account_status_changed(Pairing) event and the poll loop below.
     set((s) => ({
       userCode: prompt.user_code,
       codeRequired: prompt.code_required,
@@ -122,17 +111,17 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
       await openUrl(prompt.verification_uri);
     } catch (err) {
       // Non-fatal — surface a hint but keep polling.
-      console.warn("[connector] failed to open verification URL:", err);
+      console.warn("[account] failed to open verification URL:", err);
     }
 
     // Poll until the status leaves `pairing`. A bounded, self-terminating loop:
-    // it stops when authorised (Connecting/Online), declined/expired
-    // (Disconnected), or NeedsRepair. The status events also flow through
-    // handleEvent, but polling is what advances the backend pairing state.
+    // it stops when authorised (signed_in) or declined/expired (signed_out).
+    // The status events also flow through handleEvent, but polling is what
+    // advances the backend pairing state.
     const poll = async () => {
-      let status: TunnelStatus;
+      let status: AccountStatus;
       try {
-        status = unwrap(await commands.tunnelPollPairing());
+        status = unwrap(await commands.accountPollPairing());
       } catch (err) {
         set({
           lastError: err instanceof Error ? err.message : String(err),
@@ -159,7 +148,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
       unwrap(await commands.deleteAccount());
       // Erased server-side and locally forgotten: reflect the signed-out state.
       set({
-        snapshot: { enabled: false, status: "disconnected", account_id: null },
+        snapshot: { status: "signed_out", account_id: null },
         userCode: null,
         codeRequired: false,
         lastError: null,
@@ -170,7 +159,7 @@ export const useTunnelStatusStore = create<TunnelStatusStore>((set, get) => ({
   },
 
   handleEvent: (event) => {
-    if (event.kind !== "tunnel_status_changed") return;
+    if (event.kind !== "account_status_changed") return;
     set((s) => ({ snapshot: withStatus(s.snapshot, event.status) }));
   },
 }));

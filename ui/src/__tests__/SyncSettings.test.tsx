@@ -1,18 +1,54 @@
 /**
- * Sync settings pane tests (WS4-B S5).
+ * Sync settings pane tests (WS4-B S5), including account sign-in (WS4-A S5b).
  *
- * Covers the pane's own behaviour: status display, ticket reveal + copy,
- * add-peer field + button routing through `sync_add_peer`, and `sync_now` for
- * the open meeting. The store's event-handler is tested separately (describe
- * "useSyncStatusStore event handling"). The "absent in the free build / no pane"
- * property is verified by the free-build grep in CI (VITE_CONNECTED is baked at
- * transform time, so it cannot be toggled from vitest — same as the MCP pane).
+ * Covers the pane's own behaviour: account status display, the device-code
+ * pairing flow (code shown/opened URL), sign-in/delete-account, sync status
+ * display, ticket reveal + copy, add-peer field + button routing through
+ * `sync_add_peer`, and `sync_now` for the open meeting. The stores' own
+ * event-handler tests live in their own `describe` blocks below. The "absent
+ * in the free build / no pane" property is verified by the free-build grep in
+ * CI (VITE_CONNECTED is baked at transform time, so it cannot be toggled from
+ * vitest — same as the MCP pane).
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
-import type { SyncStatus } from "../ipc/bindings";
+import type {
+  AccountSnapshot,
+  AccountStatus,
+  PairingPrompt,
+  SyncStatus,
+} from "../ipc/bindings";
 
-// IPC client mock: the four sync commands.
+// The opener plugin — assert we open the verification URL during pairing.
+const { openUrl } = vi.hoisted(() => ({
+  openUrl: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl }));
+
+// IPC client mock: the account + sync commands.
+type AccountStatusResult = { status: "ok"; data: AccountSnapshot };
+const accountStatus = vi.fn(
+  async (): Promise<AccountStatusResult> => ({
+    status: "ok",
+    data: { status: "signed_out", account_id: null },
+  }),
+);
+type PairingPromptResult = { status: "ok"; data: PairingPrompt };
+const accountBeginPairing = vi.fn(
+  async (): Promise<PairingPromptResult> => ({
+    status: "ok",
+    data: {
+      user_code: "ABCD-1234",
+      verification_uri: "https://auth.example/device",
+      code_required: true,
+    },
+  }),
+);
+const accountPollPairing = vi.fn(
+  async () => ({ status: "ok", data: "signed_in" as AccountStatus }) as const,
+);
+const deleteAccount = vi.fn(async () => ({ status: "ok", data: null }) as const);
+
 const syncStatus = vi.fn(
   async (): Promise<{ status: "ok"; data: SyncStatus }> => ({
     status: "ok",
@@ -31,6 +67,10 @@ const syncNow = vi.fn(
 
 vi.mock("../ipc/client", () => ({
   commands: {
+    accountStatus: () => accountStatus(),
+    accountBeginPairing: () => accountBeginPairing(),
+    accountPollPairing: () => accountPollPairing(),
+    deleteAccount: () => deleteAccount(),
     syncStatus: () => syncStatus(),
     syncGetMyTicket: () => syncGetMyTicket(),
     syncAddPeer: (ticket: string) => syncAddPeer(ticket),
@@ -56,11 +96,18 @@ vi.mock("../ipc/meetings", () => ({
 }));
 
 import { SyncSettingsPane } from "../shell/SyncSettingsPane";
+import { useAccountStatusStore } from "../state/account-status";
 import { useSyncStatusStore } from "../state/sync-status";
 import { useMeetingsStore } from "../state/meetings";
 
 function resetStores() {
   act(() => {
+    useAccountStatusStore.setState({
+      snapshot: null,
+      userCode: null,
+      codeRequired: false,
+      lastError: null,
+    });
     useSyncStatusStore.setState({
       status: null,
       inProgress: null,
@@ -75,13 +122,21 @@ function resetStores() {
 describe("SyncSettingsPane", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
     resetStores();
   });
 
-  it("fetches status and ticket on mount", async () => {
+  it("fetches account + sync status and ticket on mount", async () => {
     render(<SyncSettingsPane />);
+    await waitFor(() => expect(accountStatus).toHaveBeenCalledOnce());
     await waitFor(() => expect(syncStatus).toHaveBeenCalledOnce());
     await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalledOnce());
+  });
+
+  it("shows 'Not signed in' and a Log in button by default", async () => {
+    render(<SyncSettingsPane />);
+    await screen.findByText("Not signed in");
+    expect(screen.getByRole("button", { name: "Log in" })).toBeInTheDocument();
   });
 
   it("shows the live status from sync_status", async () => {
@@ -164,12 +219,163 @@ describe("SyncSettingsPane", () => {
     );
   });
 
-  it("surfaces lastError from the store", () => {
+  it("surfaces lastError from the sync store", () => {
     act(() => {
       useSyncStatusStore.setState({ lastError: "dial timed out" });
     });
     render(<SyncSettingsPane />);
     expect(screen.getByText("dial timed out")).toBeInTheDocument();
+  });
+});
+
+describe("SyncSettingsPane account section", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useRealTimers();
+    resetStores();
+  });
+
+  it("pairing shows the user code and opens the verification URL when a code must be typed", async () => {
+    vi.useFakeTimers();
+    render(<SyncSettingsPane />);
+    // Let the on-mount status fetch settle.
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const button = screen.getByRole("button", { name: "Log in" });
+    fireEvent.click(button);
+
+    // begin_pairing resolves: the code is shown and the URL is opened.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(accountBeginPairing).toHaveBeenCalledOnce();
+    expect(screen.getByText("ABCD-1234")).toBeInTheDocument();
+    expect(openUrl).toHaveBeenCalledWith("https://auth.example/device");
+    vi.useRealTimers();
+  });
+
+  it("pairing does not show the code when the opened URL already carries it", async () => {
+    accountBeginPairing.mockResolvedValueOnce({
+      status: "ok",
+      data: {
+        user_code: "ABCD-1234",
+        verification_uri: "https://auth.example/device?code=ABCD-1234",
+        code_required: false,
+      },
+    });
+    vi.useFakeTimers();
+    render(<SyncSettingsPane />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const button = screen.getByRole("button", { name: "Log in" });
+    fireEvent.click(button);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("ABCD-1234")).not.toBeInTheDocument();
+    expect(screen.getByText(/already filled in/i)).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("reflects a live account_status_changed event", () => {
+    act(() => {
+      useAccountStatusStore.setState({
+        snapshot: { status: "pairing", account_id: null },
+      });
+    });
+    render(<SyncSettingsPane />);
+    expect(
+      screen.getByText("Signing in — approve in your browser"),
+    ).toBeInTheDocument();
+
+    // A status event flips it to signed_in without a remount.
+    act(() => {
+      useAccountStatusStore
+        .getState()
+        .handleEvent({ kind: "account_status_changed", status: "signed_in" });
+    });
+    expect(screen.getByText("Signed in")).toBeInTheDocument();
+  });
+
+  it("shows the signed-in account and a Delete account button", async () => {
+    accountStatus.mockResolvedValueOnce({
+      status: "ok",
+      data: { status: "signed_in", account_id: "sub-abc123" },
+    });
+    render(<SyncSettingsPane />);
+    await screen.findByText("Signed in");
+    expect(screen.getByText("sub-abc123")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Delete account" }),
+    ).toBeInTheDocument();
+  });
+
+  it("Delete account calls delete_account after confirmation", async () => {
+    accountStatus.mockResolvedValueOnce({
+      status: "ok",
+      data: { status: "signed_in", account_id: "sub-abc123" },
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<SyncSettingsPane />);
+    await screen.findByText("Signed in");
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete account" }));
+    await waitFor(() => expect(deleteAccount).toHaveBeenCalledOnce());
+  });
+
+  it("surfaces lastError from the account store", () => {
+    act(() => {
+      useAccountStatusStore.setState({ lastError: "pairing expired" });
+    });
+    render(<SyncSettingsPane />);
+    expect(screen.getByText("pairing expired")).toBeInTheDocument();
+  });
+});
+
+describe("useAccountStatusStore event handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetStores();
+  });
+
+  it("account_status_changed patches the status, preserving the account id", () => {
+    act(() => {
+      useAccountStatusStore.setState({
+        snapshot: { status: "pairing", account_id: "acct-1" },
+      });
+    });
+    act(() => {
+      useAccountStatusStore
+        .getState()
+        .handleEvent({ kind: "account_status_changed", status: "signed_in" });
+    });
+    const snap = useAccountStatusStore.getState().snapshot!;
+    expect(snap.status).toBe("signed_in");
+    expect(snap.account_id).toBe("acct-1");
+  });
+
+  it("a non-account event does not touch the snapshot", () => {
+    act(() => {
+      useAccountStatusStore.setState({
+        snapshot: { status: "signed_in", account_id: "acct-1" },
+      });
+    });
+    act(() => {
+      useAccountStatusStore.getState().handleEvent({
+        kind: "state_changed",
+        state: { kind: "idle" },
+      });
+    });
+    expect(useAccountStatusStore.getState().snapshot!.status).toBe(
+      "signed_in",
+    );
   });
 });
 

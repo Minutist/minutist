@@ -1395,18 +1395,14 @@ revision 2025-11-25). Binding controls:
   phone's `getStoredCredential() ?? RELAY_AUTH_TOKEN`. The
   account-directory `AccountEndpoint` it advertises to other paired devices
   carries `SyncConfig::DEFAULT_RELAY_URL` (the sync relay it actually homes
-  on), not `settings.relay_url` — that setting is the separate connector
-  tunnel's WSS rendezvous URL. Advertising `settings.relay_url` here points
-  peers at the wrong host to dial the desktop.
+  on) — the sync engine's own iroh relay, unrelated to the MCP bearer token
+  below or to the account-service base URL (`settings.relay_api_url`).
 
-  **Token lifetime and the connected-relay path.** The token is stable across
-  restarts: `app-main` reads the existing file on start and reuses it so that
-  a saved external MCP-client config stays valid. To rotate the token, delete
-  the file and restart the app; the next start generates and persists a fresh
-  256-bit token. In the paid connected tier the token doubles as the
-  relay↔app shared secret (the hosted proxy authenticates the in-app endpoint
-  with the same bearer); rotation therefore also invalidates any active relay
-  session. The token is never logged and never on the event bus — it is
+  **Token lifetime.** The token is stable across restarts: `app-main` reads
+  the existing file on start and reuses it so that a saved external
+  MCP-client config stays valid. To rotate the token, delete the file and
+  restart the app; the next start generates and persists a fresh 256-bit
+  token. The token is never logged and never on the event bus — it is
   revealed only via the `get_mcp_server_info` command on explicit user
   request.
 
@@ -1462,10 +1458,13 @@ revision 2025-11-25). Binding controls:
   serves the single `/mcp` endpoint (no `axum`); tool dispatch is the same async
   `ToolRegistry::dispatch` the chat loop uses.*
 
-External MCP clients reach the loopback Streamable HTTP endpoint directly.
-Account-based connectivity — a hosted proxy that fronts this endpoint, enabling
-Claude web alongside Desktop, plus cross-device meeting sync and calendar
-integration — is the planned direction and is out of scope here.
+External MCP clients reach the loopback Streamable HTTP endpoint directly —
+self-configured by the user (issue 0044, D15). A hosted relay/proxy fronting
+this endpoint (to reach Claude web, not just Desktop/Code) was the earlier
+plan; it was built, then retired without ever being deployed (D15 supersedes
+D14/issues/0032) — self-hosting it again is not the current direction.
+Cross-device meeting sync (unrelated to this endpoint) stays a paid,
+account-gated feature; see `sync` / `tunnel-client` above.
 
 ## Configuration
 
@@ -2671,27 +2670,27 @@ Two shipping artifacts are produced from one source tree:
 
 | Artifact | Cargo invocation | Vite | Contents |
 |---|---|---|---|
-| **Connected** (default) | `cargo build` (or `--features connected`) | `VITE_CONNECTED=1` | MCP server, bearer-token generation, MCP settings pane, the relay tunnel (device pairing + connector) + Connection settings pane |
-| **Free** | `cargo build --no-default-features [--features <gpu>]` | `VITE_CONNECTED` unset | No MCP server, no rmcp, no listening socket, no tunnel-client, no MCP/Connection panes in the UI bundle |
+| **Connected** (default) | `cargo build` (or `--features connected`) | `VITE_CONNECTED=1` | MCP server, bearer-token generation, MCP settings pane, account sign-in (device pairing) + cross-device sync, folded into the Sync settings pane |
+| **Free** | `cargo build --no-default-features [--features <gpu>]` | `VITE_CONNECTED` unset | No MCP server, no rmcp, no listening socket, no account/sync, no MCP/Sync panes in the UI bundle |
 
 **Single identifier.** Both artifacts share `ai.minutist` as the bundle identifier and product name. Artifact names in CI are distinguished by a `-free` suffix on the artifact upload name only — no `productName` change.
 
 **Cargo feature.** `connected` is a default feature in `src-tauri/Cargo.toml`. It gates:
-- `dep:mcp-server` — the entire MCP server crate + rmcp transitive stack.
-- `dep:tunnel-client` — the app-side relay tunnel (pairing + reconnect + lifecycle).
-- `dep:async-trait` — the `ConnectedTunnel` impl of `ipc_bridge::TunnelControl`.
+- `dep:mcp-server` — the entire MCP server crate + rmcp transitive stack. **Pending removal from this list** — issue 0044 (D15) makes the MCP server free/always-on; not yet done, tracked there.
+- `dep:tunnel-client` — the app-side account client (device-code pairing + the account-directory HTTP client). No longer a relay tunnel — see issue 0044's 2026-08-24 landing, which deleted the outbound-dial/frame-relay machinery entirely.
+- `dep:async-trait` — the `ConnectedAccount` impl of `ipc_bridge::AccountControl`.
 - `dep:rand` and `dep:hex` — CSPRNG bearer-token generation (`resolve_mcp_token` in `app-main`).
-- The MCP spawn block AND the `ConnectedTunnel` construction + `src-tauri/src/tunnel.rs` module in `app-main`'s `setup()` (`#[cfg(feature = "connected")]`).
+- The MCP spawn block AND the `ConnectedAccount` construction + `src-tauri/src/account.rs` module in `app-main`'s `setup()` (`#[cfg(feature = "connected")]`).
 
-The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server_info` returns `None` unconditionally. `IpcState.tunnel` is `ipc_bridge::disabled_tunnel()` (reports `Disconnected`, rejects pairing as `Unsupported`), so the four tunnel commands compile and behave gracefully with no relay present. The `mcp_*` and `connector_enabled` / `relay_url` / `relay_api_url` fields in `Settings` remain (serde compatibility across tier switches — a user who switches from connected to free keeps their settings file intact with the connected fields as inert no-ops).
+The free build compiles `mcp_info` to a permanently-`None` slot; `get_mcp_server_info` returns `None` unconditionally. `IpcState.connected.account` is `ipc_bridge::disabled_account()` (reports `SignedOut`, rejects pairing as `Unsupported`), so the account commands compile and behave gracefully with no account service present. The `mcp_*` and `connector_enabled` / `relay_api_url` fields in `Settings` remain (serde compatibility across tier switches — a user who switches from connected to free keeps their settings file intact with the connected fields as inert no-ops). `relay_url` (the dead WSS rendezvous URL) was deleted outright rather than kept inert — nothing ever read it again once the relay dial was removed.
 
-**Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` and `ConnectionSettingsPane` render in the UI. `vite.config.ts` injects this as a `define`-replaced constant: in the free build the false branch of each `React.lazy()` dynamic import is dead-code-eliminated, dropping `McpSettingsPane` / `mcp-settings.ts` AND `ConnectionSettingsPane` / `connector-settings.ts` from the output bundle. (The live-status stores `mcp-server-info.ts` / `tunnel-status.ts` are imported by the always-mounted global event dispatcher, so they stay in the free bundle as inert no-op handlers — they only react to `mcp_*` / `tunnel_*` events the free build never emits.) The default is `"1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour without any explicit flag. Verification: `VITE_CONNECTED= npm run build && grep -r "Enable MCP server" dist/` must return no matches.
+**Vite flag.** `VITE_CONNECTED` (string `"1"` / unset) controls whether `McpSettingsPane` and `SyncSettingsPane` render in the UI. `vite.config.ts` injects this as a `define`-replaced constant: in the free build the false branch of each `React.lazy()` dynamic import is dead-code-eliminated, dropping `McpSettingsPane` / `mcp-settings.ts` AND `SyncSettingsPane` / `account-status.ts` / `sync-status.ts` from the output bundle. (The live-status stores `mcp-server-info.ts` / `account-status.ts` are imported by the always-mounted global event dispatcher, so they stay in the free bundle as inert no-op handlers — they only react to `mcp_*` / `account_*` events the free build never emits.) The default is `"1"` when the env var is absent, so `npm run dev` and `vitest` keep current behaviour without any explicit flag. Verification: `VITE_CONNECTED= npm run build && grep -r "Enable MCP server" dist/` must return no matches.
 
 **Windows build script.** `scripts/build-windows-app.ps1 -Features vulkan` builds the **connected** Vulkan artifact (the `connected` feature is default, so `--features vulkan` implicitly includes it). The free Windows Vulkan build would require `--no-default-features --features vulkan` passed via `$Features`. The `Makefile` `build-free` / `build-free-vulkan` targets show the canonical free invocation on Linux/macOS.
 
-**Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper".
+**Honest scope of the free-build claim.** The free artifact excludes `mcp-server`, `rmcp`, and any listening socket. It does NOT guarantee the absence of `hyper` — `hyper` remains via `model-registry → reqwest → hyper`. The claim is "no MCP server / no rmcp / no listening socket", not "no hyper". (This claim is scoped to change once issue 0044's remaining `mcp-server`-ungating work lands — the free build will then include the MCP server too.)
 
-**Connected-tier tunnel (`tunnel-client`).** The `connected`-feature gating extends to the app-side relay tunnel: `tunnel-client` is part of the connected surface (the free build has no relay), so `app-main`'s optional edge on it is gated by the same `connected` feature as `mcp-server`. The crate itself lives in the workspace unconditionally (compiled by the workspace build / `cargo test`) and is simply not pulled into the free binary — the same pattern `mcp-server` follows. The tunnel does **not** add a listening socket: it dials OUTBOUND to the relay (no inbound port), and replays relayed requests against the existing loopback `mcp-server`. The internal `mcp_token` bearer doubles as the relay↔app secret here, applied app-side to the loopback replay only and never sent outbound to the relay (see the "Token storage and file permissions" / "Token lifetime and the connected-relay path" notes above). The tunnel **device credential** secret (`tunnel_device.json`, 0600) is issued at pairing (see above), distinct from the bearer token.
+**Connected-tier account client (`tunnel-client`).** `tunnel-client` is part of the connected surface (the free build has no account/sync tier), so `app-main`'s optional edge on it is gated by the same `connected` feature as `mcp-server`. The crate itself lives in the workspace unconditionally (compiled by the workspace build / `cargo test`) and is simply not pulled into the free binary — the same pattern `mcp-server` follows. It adds no listening socket and dials nothing continuously: `DeviceCodeClient` makes two short-lived HTTP calls during pairing (`/pair/start`, polled `/pair/poll`), and `AccountDirectoryClient` calls the account-service on the sync engine's own refresh interval once signed in. The **device credential** secret (`tunnel_device.json`, 0600) is issued at pairing, distinct from the MCP bearer token and unrelated to it — there is no loopback replay of any kind any more.
 
 ## Headless server daemon
 

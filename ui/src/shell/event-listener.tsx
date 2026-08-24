@@ -7,7 +7,7 @@ import { useMeetingsStore } from "../state/meetings";
 import { useChatStore } from "../state/chat";
 import { useAttachmentsStore } from "../state/attachments";
 import { useMcpServerInfoStore } from "../state/mcp-server-info";
-import { useTunnelStatusStore } from "../state/tunnel-status";
+import { useAccountStatusStore } from "../state/account-status";
 import { useSyncStatusStore } from "../state/sync-status";
 import { useOperationProgressStore } from "../state/operation-progress";
 import { useTranslationsStore } from "../state/translations";
@@ -33,7 +33,7 @@ export function useAppEventBridge(): void {
   const handleChatEvent = useChatStore((s) => s.handleEvent);
   const handleAttachmentsEvent = useAttachmentsStore((s) => s.handleEvent);
   const handleMcpServerInfoEvent = useMcpServerInfoStore((s) => s.handleEvent);
-  const handleTunnelStatusEvent = useTunnelStatusStore((s) => s.handleEvent);
+  const handleAccountStatusEvent = useAccountStatusStore((s) => s.handleEvent);
   const handleSyncStatusEvent = useSyncStatusStore((s) => s.handleEvent);
   const handleOperationProgressEvent = useOperationProgressStore(
     (s) => s.handleEvent,
@@ -61,7 +61,7 @@ export function useAppEventBridge(): void {
       handleChatEvent(event);
       handleAttachmentsEvent(event);
       handleMcpServerInfoEvent(event);
-      handleTunnelStatusEvent(event);
+      handleAccountStatusEvent(event);
       handleSyncStatusEvent(event);
       handleOperationProgressEvent(event);
       handleTranslationsEvent(event);
@@ -93,7 +93,7 @@ export function useAppEventBridge(): void {
     handleChatEvent,
     handleAttachmentsEvent,
     handleMcpServerInfoEvent,
-    handleTunnelStatusEvent,
+    handleAccountStatusEvent,
     handleSyncStatusEvent,
     handleOperationProgressEvent,
     handleTranslationsEvent,

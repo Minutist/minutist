@@ -21,10 +21,10 @@
 //! directly by this crate) and no `diarizer` edge (diarization runs inside
 //! `Orchestrator::reprocess`). `tunnel-client` and `sync` are likewise NOT
 //! Cargo edges even though this crate exposes their surfaces: `ipc-bridge`
-//! defines the `TunnelControl` / `SyncControl` trait seams (plus
-//! [`DisabledTunnel`] / [`DisabledSync`], the free-build / not-yet-configured
+//! defines the `AccountControl` / `SyncControl` trait seams (plus
+//! [`DisabledAccount`] / [`DisabledSync`], the free-build / not-yet-configured
 //! no-ops) and `app-main` injects the connected implementation, keeping the
-//! relay/transport stacks out of this crate's dependency tree entirely (see
+//! account/sync stacks out of this crate's dependency tree entirely (see
 //! "Connected-tier injection seams" below).
 //!
 //! ## Commands (61 total)
@@ -79,10 +79,9 @@
 //! | `translate_meeting` | `()` | translation |
 //! | `get_translations` | `HashMap<usize, String>` | translation |
 //! | `get_diagnostic_report` | `DiagnosticReport` | report (#0014) |
-//! | `tunnel_begin_pairing` | `PairingPrompt` | WS4-A S5b |
-//! | `tunnel_poll_pairing` | `TunnelStatus` | WS4-A S5b |
-//! | `set_connector_enabled` | `TunnelSnapshot` | WS4-A S5b |
-//! | `tunnel_status` | `TunnelSnapshot` | WS4-A S5b |
+//! | `account_begin_pairing` | `PairingPrompt` | WS4-A S5b |
+//! | `account_poll_pairing` | `AccountStatus` | WS4-A S5b |
+//! | `account_status` | `AccountSnapshot` | WS4-A S5b |
 //! | `sync_status` | `SyncStatus` | WS4-B S5 |
 //! | `sync_get_my_ticket` | `String` | WS4-B S5 |
 //! | `sync_add_peer` | `()` | WS4-B S5 |
@@ -304,20 +303,19 @@
 //!
 //! ## Connected-tier injection seams
 //!
-//! The tunnel (device pairing / relay account) and sync (device-to-device
-//! CRDT sync) surfaces are wired through trait objects `ipc-bridge` defines
-//! and holds on `IpcState` — `TunnelControl` and `SyncControl` — rather than
-//! through direct `tunnel-client` / `sync` Cargo edges, keeping those
-//! transport stacks out of this crate's dependency tree (and out of the
-//! free build) entirely. `app-main` injects the connected implementation
-//! behind the `connected` Cargo feature; the free build (or a connected
-//! build before a credential is stored) gets [`disabled_tunnel`] /
-//! [`disabled_sync`], which report a disconnected/disabled status and
-//! reject actions as `AppError::Unsupported`. `delete_account` performs
-//! GDPR Art. 17 erasure: it forgets the local device credential and stops
-//! the tunnel only after the account-service confirms the server-side erase
-//! (or reports it already gone), so a failed call leaves the device paired
-//! and the operation retryable.
+//! Account (device sign-in) and sync (device-to-device CRDT sync) surfaces
+//! are wired through trait objects `ipc-bridge` defines and holds on
+//! `IpcState` — `AccountControl` and `SyncControl` — rather than through
+//! direct `tunnel-client` / `sync` Cargo edges, keeping those stacks out of
+//! this crate's dependency tree (and out of the free build) entirely.
+//! `app-main` injects the connected implementation behind the `connected`
+//! Cargo feature; the free build (or a connected build before a credential
+//! is stored) gets [`disabled_account`] / [`disabled_sync`], which report a
+//! signed-out/disabled status and reject actions as `AppError::Unsupported`.
+//! `delete_account` performs GDPR Art. 17 erasure: it forgets the local
+//! device credential only after the account-service confirms the
+//! server-side erase (or reports it already gone), so a failed call leaves
+//! the device signed in and the operation retryable.
 //!
 //! ## Diagnostics
 //!
@@ -400,6 +398,7 @@
 //!
 //! All log calls use `target: "ipc-bridge"`.
 
+pub mod account;
 pub mod attachments;
 pub mod chat;
 pub mod chat_runtime;
@@ -414,11 +413,11 @@ pub mod live_agent;
 pub mod output_language;
 pub mod rag_index;
 pub mod sync;
-pub mod tunnel;
 
 use orchestrator::Orchestrator;
 use tauri_specta::{collect_commands, collect_events, Builder};
 
+pub use account::{disabled_account, AccountControl, AccountSnapshot, DisabledAccount, PairingPrompt};
 pub use attachments::{
     requeue_pending, spawn_attachment_convert_worker, ConvertJob, GemmaVlm,
     ATTACHMENT_CONVERT_QUEUE_BOUND,
@@ -442,7 +441,6 @@ pub use live_agent::{spawn_live_agent, LiveAgentHandles, LiveCopilotHandle};
 pub use persistence::MeetingIndex;
 pub use summariser::LlamaSummariser;
 pub use sync::{disabled_sync, DisabledSync, SyncControl};
-pub use tunnel::{disabled_tunnel, DisabledTunnel, PairingPrompt, TunnelControl, TunnelSnapshot};
 
 // ---------------------------------------------------------------------------
 // Note-image asset serving — the `meetingasset:` URI scheme resolver
@@ -883,11 +881,10 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             commands::delete_voiceprint_identity,
             commands::forget_meeting_voiceprints,
             diagnostics::get_diagnostic_report,
-            tunnel::tunnel_begin_pairing,
-            tunnel::tunnel_poll_pairing,
-            tunnel::set_connector_enabled,
-            tunnel::tunnel_status,
-            tunnel::delete_account,
+            account::account_begin_pairing,
+            account::account_poll_pairing,
+            account::account_status,
+            account::delete_account,
             sync::sync_status,
             sync::sync_get_my_ticket,
             sync::sync_add_peer,

@@ -84,12 +84,12 @@ serde_json = { workspace = true }
 # Optional: only compiled in the `connected` build.
 rand = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
-# WS4-A S5b: the ConnectedTunnel impl of ipc_bridge::TunnelControl is an
-# async-trait. Optional — only the connected build builds the tunnel module.
+# WS4-A S5b: the ConnectedAccount impl of ipc_bridge::AccountControl is an
+# async-trait. Optional — only the connected build builds the account module.
 async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Unit tests for the connected tunnel module (credential 0600 round-trip).
+# Unit tests for the connected account module (credential 0600 round-trip).
 tempfile = "3"
 # E2E test for the connected sync module (`sync.rs`): seeds meetings on disk and
 # projects the converged notes/media for comparison, mirroring the engine-level

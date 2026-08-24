@@ -985,61 +985,40 @@ async getDiagnosticReport() : Promise<Result<DiagnosticReport, AppError>> {
 /**
  * Begin device pairing. Returns the `user_code` + verification URL for the UI
  * to display and open in the browser. The user approves in rauthy; the UI then
- * calls [`tunnel_poll_pairing`] until the status is terminal.
+ * calls [`account_poll_pairing`] until the status is terminal.
  * 
- * In the free build (or before any relay wiring) this returns an `Unsupported`
- * error — the Connection pane is absent from that bundle, so the command is
- * never invoked there.
+ * In the free build this returns an `Unsupported` error — the account UI is
+ * absent from that bundle, so the command is never invoked there.
  */
-async tunnelBeginPairing() : Promise<Result<PairingPrompt, AppError>> {
+async accountBeginPairing() : Promise<Result<PairingPrompt, AppError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("tunnel_begin_pairing") };
+    return { status: "ok", data: await TAURI_INVOKE("account_begin_pairing") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Poll the in-progress pairing once, returning the current [`TunnelStatus`].
+ * Poll the in-progress pairing once, returning the current [`AccountStatus`].
  * The UI polls this on the server's `interval` until the status leaves
- * `Pairing` (reaching `Connecting`/`Online` on success, or `Disconnected` on a
+ * `Pairing` (reaching `SignedIn` on success, or `SignedOut` on a
  * declined/expired pairing).
  */
-async tunnelPollPairing() : Promise<Result<TunnelStatus, AppError>> {
+async accountPollPairing() : Promise<Result<AccountStatus, AppError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("tunnel_poll_pairing") };
+    return { status: "ok", data: await TAURI_INVOKE("account_poll_pairing") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Enable or disable the connector. Enabling with a stored credential starts the
- * tunnel; disabling stops it cleanly. Returns the resulting snapshot.
- * 
- * Also flips the sync engine (F5): before this fix, enabling the connector at
- * runtime started the relay tunnel but never the sync engine (or its
- * producer-gate election loop), so `sync_status` stayed `Disabled` and every
- * engine-backed sync call kept failing even after the toggle. The sync flip
- * rides alongside the tunnel's own — it is best-effort and never fails this
- * command: a start failure is logged and reflected in a later `sync_status`
- * read, exactly like the tunnel's own asynchronous connect.
+ * The account snapshot for the Settings → Sync pane: the live sign-in status
+ * and the signed-in account (if any).
  */
-async setConnectorEnabled(enabled: boolean) : Promise<Result<TunnelSnapshot, AppError>> {
+async accountStatus() : Promise<Result<AccountSnapshot, AppError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_connector_enabled", { enabled }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * The connector snapshot for the Settings → Connection pane: the enabled flag,
- * the live tunnel status, and the paired account (if any).
- */
-async tunnelStatus() : Promise<Result<TunnelSnapshot, AppError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("tunnel_status") };
+    return { status: "ok", data: await TAURI_INVOKE("account_status") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1049,9 +1028,9 @@ async tunnelStatus() : Promise<Result<TunnelSnapshot, AppError>> {
  * Erase the paired account and sign out (GDPR Art 17). `DELETE /v1/account` on
  * the account-service erases the rauthy identity (email + credentials) and
  * every device row; the local device credential is then forgotten. The sync
- * engine is stopped alongside (best-effort, like [`set_connector_enabled`]). On
- * success the device is fully unpaired and the account is gone server-side; a
- * failure leaves the device paired and the call retryable.
+ * engine is stopped alongside (best-effort). On success the device is fully
+ * signed out and the account is gone server-side; a failure leaves the device
+ * signed in and the call retryable.
  */
 async deleteAccount() : Promise<Result<null, AppError>> {
     try {
@@ -1129,6 +1108,46 @@ appEventPayload: "app-event-payload"
 
 /** user-defined types **/
 
+/**
+ * A snapshot of this device's sign-in state for the Settings → Sync pane.
+ * Returned by [`account_status`]. `account_id` is shown so the user can
+ * confirm which account the device is signed in to; it is not a secret (it is
+ * the rauthy `sub`).
+ */
+export type AccountSnapshot = { 
+/**
+ * The live sign-in state.
+ */
+status: AccountStatus; 
+/**
+ * The account this device is signed in to, if any. `None` when signed
+ * out. Never carries the credential itself.
+ */
+account_id: string | null }
+/**
+ * This device's account sign-in state, surfaced to the Settings → Sync pane.
+ * A pure status enum — it carries no credential or account material (those
+ * cross only the pairing command's return / secure storage, never the event
+ * bus). Signing in exists to enable cross-device sync (D4, end-to-end between
+ * the user's own devices); it is unrelated to the local MCP server, which is
+ * the channel that actually transits meeting content to an external agent's
+ * vendor (D5) and is not gated on an account at all.
+ */
+export type AccountStatus = 
+/**
+ * No device credential stored (or it was erased). The app works fully
+ * locally; nothing syncs.
+ */
+"signed_out" | 
+/**
+ * A device-code pairing is in progress (the user is approving in a browser).
+ */
+"pairing" | 
+/**
+ * A credential is stored; this device is signed in and syncs with every
+ * other device on the account.
+ */
+"signed_in"
 /**
  * The shared error type that crosses crate boundaries.
  * 
@@ -1380,14 +1399,13 @@ export type AppEvent =
  */
 { kind: "mcp_server_start_failed"; reason: string } | 
 /**
- * The relay tunnel's live state changed. `app-main` (connected build only)
- * emits this from the reconnect loop's state callback and the pairing /
- * lifecycle transitions, so the Settings → Connection pane reflects the live
- * status without polling. Carries no credential / account material — the
- * account label and pairing codes cross only the pairing command's return
- * value, never the bus.
+ * This device's account sign-in state changed. `app-main` (connected build
+ * only) emits this from the pairing transitions, so the Settings → Sync
+ * pane reflects the live status without polling. Carries no credential /
+ * account material — the account label and pairing codes cross only the
+ * pairing command's return value, never the bus.
  */
-{ kind: "tunnel_status_changed"; status: TunnelStatus } | 
+{ kind: "account_status_changed"; status: AccountStatus } | 
 /**
  * A notes-sync transfer for a meeting made progress. The UI renders a
  * per-meeting indicator: a determinate bar when `fraction` is `Some`
@@ -2040,7 +2058,7 @@ export type OperationKind =
 "translate"
 /**
  * The codes + URL to show the user when a pairing begins. Returned by
- * [`tunnel_begin_pairing`]. The webview opens `verification_uri` in the
+ * [`account_begin_pairing`]. The webview opens `verification_uri` in the
  * browser (via `tauri-plugin-opener`) and displays `user_code` only when
  * `code_required` is true.
  * 
@@ -2450,26 +2468,17 @@ preload_summariser?: boolean;
  */
 output_language?: string; 
 /**
- * Whether the connected-tier relay connector is enabled (WS4-A S5b).
- * **Off by default**, mirroring `mcp_enabled`. When `true` AND a device
- * credential is stored (the device is paired), `app-main` (connected build
- * only) starts the tunnel lifecycle: it dials the relay so an external MCP
- * client (Claude web/Desktop, ChatGPT, Codex) can reach this app's tools
- * over the relay. The connector channel transits meeting content to the AI
- * vendor BY DESIGN (the user asked for it) — it is never described as
- * private (D5). `#[serde(default)]` defaults to `false`; an older store
- * deserialises to `false`. The free build ignores this field entirely (no
+ * Whether this device is signed in to a Minutist account and syncing
+ * (WS4-A S5b). **Off by default**, mirroring `mcp_enabled`. Set to `true`
+ * by a successful device-code pairing and back to `false` by
+ * `delete_account` — there is no separate manual toggle; signing in is
+ * what turns sync on. `app-main` (connected build only) reads this at
+ * startup to auto-start the sync engine for an already-signed-in device.
+ * `#[serde(default)]` defaults to `false`; an older store deserialises to
+ * `false`. The free build ignores this field entirely (no
  * `tunnel-client`). See `architecture/cross-cutting.md` — "Build variants".
  */
 connector_enabled?: boolean; 
-/**
- * The relay tunnel WSS rendezvous URL (WS4-A S5b). User-overridable for
- * self-hosting / testing; defaults to the minutist.ai endpoint. Must be
- * `wss://` for an off-machine host (`ws://` only for a loopback host, the
- * tunnel-client scheme check). `#[serde(default = ...)]` defaults to the
- * minutist.ai endpoint; an older store deserialises to it.
- */
-relay_url?: string; 
 /**
  * The account-service API base URL the device-code pairing client posts
  * `/pair/start` + `/pair/poll` against (WS4-A S5b). User-overridable;
@@ -2592,8 +2601,9 @@ export type SummaryPreset =
  * S5). A pure status enum carrying no peer ticket or device-key material —
  * those cross only the sync commands' return values / secure storage, never the
  * event bus. The sync channel is end-to-end between the user's own paired
- * devices (D4); it is distinct from the connector channel ([`TunnelStatus`]),
- * which transits content to the AI vendor by design.
+ * devices (D4); it is distinct from the local MCP server, which transits
+ * content to an external agent's vendor by design (D5) and is not
+ * account-gated.
  */
 export type SyncStatus = 
 /**
@@ -2649,55 +2659,6 @@ name: string;
  * The tool arguments as a JSON-object string.
  */
 arguments_json: string }
-/**
- * A snapshot of the connector for the Settings → Connection pane. Returned by
- * [`tunnel_status`]. The `account_id` is shown so the user can confirm which
- * account the device is paired to; it is not a secret (it is the rauthy `sub`).
- */
-export type TunnelSnapshot = { 
-/**
- * Whether the user has enabled the connector (`settings.connector_enabled`).
- */
-enabled: boolean; 
-/**
- * The live tunnel state.
- */
-status: TunnelStatus; 
-/**
- * The account the device is paired to, if a credential is stored. `None`
- * when unpaired. Never carries the credential itself.
- */
-account_id: string | null }
-/**
- * The connected-tier relay tunnel's live state, surfaced to the Settings →
- * Connection pane (WS4-A S5b). A pure status enum — it carries no credential or
- * account material (those cross only the pairing command's return / secure
- * storage, never the event bus). The connector channel transits meeting content
- * to the AI vendor by design and is never described as private (D5).
- */
-export type TunnelStatus = 
-/**
- * No device credential stored, or the connector is disabled. The app works
- * fully locally; nothing is reachable over the relay.
- */
-"disconnected" | 
-/**
- * A device-code pairing is in progress (the user is approving in a browser).
- */
-"pairing" | 
-/**
- * A credential is stored and the tunnel is dialing / handshaking the relay.
- */
-"connecting" | 
-/**
- * The tunnel is established — the account is reachable over the relay.
- */
-"online" | 
-/**
- * The stored credential was rejected after having worked: the device was
- * revoked (or rotated). The user must re-pair; the loop is not retrying.
- */
-"needs_repair"
 /**
  * Stable identifier for a speaker identity in the voiceprint library. UUIDv4.
  * Mirrors [`MeetingId`].

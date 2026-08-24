@@ -10,15 +10,16 @@
 //! `mcp-server`, `tunnel-client`, `sync`, `election`, and `account-directory`
 //! are all optional dependency edges gated behind the single Cargo feature
 //! `connected`. Building without it produces the free, fully local artifact
-//! (no MCP server, no sync/tunnel/relay code compiled in at all — verified by
+//! (no MCP server, no sync/account code compiled in at all — verified by
 //! `cargo build -p minutist --no-default-features`); building with it adds
-//! the paid connected tier (MCP-over-tunnel relay access and cross-device
-//! sync). The feature gate is checked at compile time throughout this crate
-//! (`#[cfg(feature = "connected")]` on `sync.rs` / `tunnel.rs` and the code
+//! the paid connected tier (account sign-in and cross-device sync). The
+//! feature gate is checked at compile time throughout this crate
+//! (`#[cfg(feature = "connected")]` on `sync.rs` / `account.rs` and the code
 //! paths that construct their state), so the split is enforced by the
-//! compiler, not by a runtime flag alone. In the free build, `IpcState.tunnel`
-//! is filled with `ipc_bridge::disabled_tunnel()` so `ipc-bridge`'s surface is
-//! identical either way and callers do not need their own `cfg`.
+//! compiler, not by a runtime flag alone. In the free build,
+//! `IpcState.connected.account` is filled with `ipc_bridge::disabled_account()`
+//! so `ipc-bridge`'s surface is identical either way and callers do not need
+//! their own `cfg`.
 //!
 //! # Startup wiring
 //!
@@ -74,16 +75,16 @@
 //! desired setting value, so a failed start leaves it retryable on the next
 //! toggle.
 //!
-//! # Connected-tier tunnel (feature `connected`)
+//! # Connected-tier account sign-in (feature `connected`)
 //!
-//! `tunnel.rs` builds a `ConnectedTunnel` implementing `ipc_bridge::TunnelControl`,
-//! owning device pairing, reconnect, and lifecycle against the relay
-//! (`settings.relay_url` / `relay_api_url`, user-overridable, defaulting to
-//! the hosted minutist.ai endpoints). It replays relayed requests against the
-//! loopback MCP server using the app's own internal bearer — never the
-//! caller's — so the relay never sees a credential that could reach the local
-//! server directly. The issued device credential is stored with owner-only
-//! permissions via the same helper that protects the MCP bearer token.
+//! `account.rs` builds a `ConnectedAccount` implementing
+//! `ipc_bridge::AccountControl`, owning device-code pairing against the
+//! account-service (`settings.relay_api_url`, user-overridable, defaulting to
+//! the hosted minutist.ai endpoint). Signing in exists to enable cross-device
+//! sync (D4); it is unrelated to the local MCP server, which is a separate,
+//! non-account-gated feature. The issued device credential is stored with
+//! owner-only permissions via the same helper that protects the MCP bearer
+//! token.
 //!
 //! # Bindings harness
 //!
@@ -106,11 +107,11 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Manager, WindowEvent};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+#[cfg(feature = "connected")]
+mod account;
 mod crash;
 #[cfg(feature = "connected")]
 mod sync;
-#[cfg(feature = "connected")]
-mod tunnel;
 mod updater;
 
 /// The bundle identifier, mirrored from `tauri.conf.json`. Used for the
@@ -1073,30 +1074,26 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
             let mcp_info: Arc<std::sync::Mutex<Option<ipc_bridge::McpServerInfo>>> =
                 Arc::new(std::sync::Mutex::new(None));
 
-            // The connected-tier tunnel control (WS4-A S5b). In the connected
-            // build this is the ConnectedTunnel (pairing + reconnect + lifecycle,
-            // backed by tunnel-client) and it auto-starts if the connector is
-            // enabled AND a credential is stored AND the loopback MCP server is
-            // up; in the free build it is the no-op DisabledTunnel. A clone of the
-            // connected control is held so the MCP-server boot path can retry the
-            // tunnel start once the loopback target exists.
+            // The connected-tier account sign-in control (WS4-A S5b). In the
+            // connected build this is the ConnectedAccount (device-code pairing,
+            // backed by tunnel-client); its initial status is derived from
+            // whether a device credential is already stored. In the free build
+            // it is the no-op DisabledAccount.
             #[cfg(feature = "connected")]
-            let connected_tunnel = tunnel::ConnectedTunnel::new(
+            let account_control: Arc<dyn ipc_bridge::AccountControl> = account::ConnectedAccount::new(
                 settings_handle.clone(),
                 ipc_event_tx.clone(),
                 app_data_dir.clone(),
-                mcp_info.clone(),
             );
-            #[cfg(feature = "connected")]
-            let tunnel_control: Arc<dyn ipc_bridge::TunnelControl> = connected_tunnel.clone();
             #[cfg(not(feature = "connected"))]
-            let tunnel_control: Arc<dyn ipc_bridge::TunnelControl> = ipc_bridge::disabled_tunnel();
+            let account_control: Arc<dyn ipc_bridge::AccountControl> =
+                ipc_bridge::disabled_account();
 
             // The peer-to-peer notes-sync control (WS4-B S5). In the connected
             // build this is the ConnectedSync (iroh endpoint + the notes-update
             // protocol, backed by the `sync` crate); it spawns engine startup in
             // the background when the connector is enabled. In the free build it
-            // is the no-op DisabledSync. Mirrors the tunnel wiring above.
+            // is the no-op DisabledSync. Mirrors the account wiring above.
             #[cfg(feature = "connected")]
             let sync_control: Arc<dyn ipc_bridge::SyncControl> = sync::ConnectedSync::new(
                 settings_handle.clone(),
@@ -1159,7 +1156,7 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                     std::collections::HashSet::new(),
                 )),
                 connected: ConnectedState {
-                    tunnel: tunnel_control,
+                    account: account_control,
                     sync: sync_control,
                     mcp_info: mcp_info.clone(),
                 },
@@ -1271,10 +1268,6 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                 let watcher_app_data_dir = app_data_dir.clone();
                 let watcher_mcp_info = mcp_info.clone();
                 let watcher_shutdown = shutdown_state.clone();
-                // The connected tunnel control, so the watcher can (re)start the
-                // tunnel once the loopback MCP server has bound (the tunnel
-                // replays relayed requests against it).
-                let watcher_tunnel = connected_tunnel.clone();
 
                 // Whether the server is desired on at the point the watcher
                 // last acted. Seeded to `false` so a boot with `mcp_enabled =
@@ -1318,10 +1311,6 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                             shutdown_state: watcher_shutdown.clone(),
                         })
                         .await;
-                        // The loopback target now exists (if the bind
-                        // succeeded); start the tunnel if the connector is
-                        // enabled + paired.
-                        watcher_tunnel.retry_start_if_enabled();
                     }
 
                     // Watch for `mcp_enabled` changes and start/stop the server
@@ -1361,7 +1350,6 @@ fn run(_log_guard: tracing_appender::non_blocking::WorkerGuard) {
                                 shutdown_state: watcher_shutdown.clone(),
                             })
                             .await;
-                            watcher_tunnel.retry_start_if_enabled();
                         } else {
                             // desired=off. Take the handles (if any) and stop.
                             let maybe_handles = watcher_shutdown

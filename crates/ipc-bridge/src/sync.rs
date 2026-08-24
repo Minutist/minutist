@@ -19,8 +19,7 @@
 //!
 //! The trait object lives in [`IpcState::sync`](crate::IpcState). The commands
 //! never touch `sync` types directly — only [`SyncControl`] and the IPC-facing
-//! shapes below. This mirrors the connector tunnel seam in
-//! [`crate::tunnel`].
+//! shapes below. This mirrors the account seam in [`crate::account`].
 
 use std::sync::Arc;
 
@@ -76,24 +75,21 @@ pub trait SyncControl: Send + Sync {
     /// either way and there is nothing more this call could accomplish.
     async fn delete_meeting_blobs(&self, meeting_id: MeetingId) -> AppResult<()>;
 
-    /// Enable or disable the connector's sync engine (and, transitively, the
-    /// producer-gate election loop it starts once bound). Called from
-    /// [`crate::tunnel::set_connector_enabled`] alongside `TunnelControl::set_enabled`
-    /// (F5): before this, enabling the connector at runtime started the relay
-    /// tunnel but never the sync engine, so `sync_status` stayed `Disabled` and
-    /// every engine-backed call kept failing even after the user turned the
-    /// connector on.
+    /// Enable or disable the sync engine (and, transitively, the producer-gate
+    /// election loop it starts once bound). Called alongside a successful
+    /// pairing (`true`) or account deletion (`false`) from
+    /// [`crate::account`] — signing in is what turns sync on, there is no
+    /// separate manual toggle.
     ///
     /// `true` starts the engine if it is not already running or starting
     /// (idempotent — a re-enable, or a race between two calls, never
-    /// double-spawns it). `false` persists the disabled setting via the SAME
-    /// `settings.connector_enabled` field `TunnelControl::set_enabled` already
-    /// writes; an implementation MAY leave an already-started engine running
-    /// (there is no requirement here to tear one down — see [`DisabledSync`] and
-    /// the connected implementation's doc for what each actually does).
-    /// Never errors: a start failure is logged and reflected in
-    /// [`Self::status`], mirroring how [`Self::my_ticket`] et al. surface a
-    /// still-starting or failed engine.
+    /// double-spawns it). `false` persists the disabled setting via
+    /// `settings.connector_enabled`; an implementation MAY leave an
+    /// already-started engine running (there is no requirement here to tear
+    /// one down — see [`DisabledSync`] and the connected implementation's doc
+    /// for what each actually does). Never errors: a start failure is logged
+    /// and reflected in [`Self::status`], mirroring how [`Self::my_ticket`]
+    /// et al. surface a still-starting or failed engine.
     async fn set_enabled(&self, enabled: bool) -> AppResult<()>;
 }
 

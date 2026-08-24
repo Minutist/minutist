@@ -44,12 +44,12 @@ vi.mock("../ipc/client", () => ({
     })),
     updateSettings: vi.fn(async () => ({ status: "ok", data: null })),
     getSettings: vi.fn(async () => ({ status: "ok", data: null })),
-    // The lazy ConnectionSettingsPane calls tunnel_status on mount.
-    tunnelStatus: vi.fn(async () => ({
+    // The lazy SyncSettingsPane calls account_status + sync_status +
+    // sync_get_my_ticket on mount.
+    accountStatus: vi.fn(async () => ({
       status: "ok",
-      data: { enabled: false, status: "disconnected", account_id: null },
+      data: { status: "signed_out", account_id: null },
     })),
-    // The lazy SyncSettingsPane calls sync_status + sync_get_my_ticket on mount.
     syncStatus: vi.fn(async () => ({
       status: "ok",
       data: { kind: "idle" },
@@ -165,16 +165,8 @@ describe("MCP pane lazy wiring", () => {
     await screen.findByText("Enable MCP server (loopback)");
   });
 
-  // The Connection (connector / relay tunnel) pane is gated the same way; verify
-  // it resolves via the lazy path in the connected build. The free-build absence
-  // is verified by the CI grep, not here (VITE_CONNECTED is baked at transform
-  // time, so vi.stubEnv cannot toggle it after module load).
-  it("renders the Connection pane via the lazy path in the connected build", async () => {
-    render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);
-    await screen.findByText("Enable the connector");
-  });
-
-  // The Sync pane is gated the same way; verify it resolves via the lazy path in
+  // The Sync pane (which also carries account sign-in) is gated the same way;
+  // verify it resolves via the lazy path in
   // the connected build. The free-build absence is verified by the CI grep.
   it("renders the Sync pane via the lazy path in the connected build", async () => {
     render(<SettingsDrawer open onClose={() => {}} onAbout={() => {}} />);

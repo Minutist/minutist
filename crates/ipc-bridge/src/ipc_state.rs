@@ -23,8 +23,8 @@ use tokio::sync::{broadcast, mpsc, OnceCell};
 use crate::attachments::ConvertJob;
 use crate::chat_runtime::ChatHandles;
 use crate::live_agent::LiveCopilotHandle;
+use crate::account::AccountControl;
 use crate::sync::SyncControl;
-use crate::tunnel::TunnelControl;
 
 /// Adapts `orchestrator::Orchestrator` to `agent_tools::RecordingControl`.
 ///
@@ -34,8 +34,8 @@ use crate::tunnel::TunnelControl;
 /// (which owns both edges) provides this one. Every `ToolContext::new` call
 /// site in this crate (and in `app-main`, which depends on `ipc-bridge`) wraps
 /// its `Arc<Orchestrator>` in this before constructing the context — the same
-/// pattern [`crate::tunnel::DisabledTunnel`] / the `connected`-tier
-/// `ConnectedTunnel` use for `TunnelControl`.
+/// pattern [`crate::account::DisabledAccount`] / the `connected`-tier
+/// `ConnectedAccount` use for `AccountControl`.
 pub struct OrchestratorRecordingControl(pub Arc<Orchestrator>);
 
 #[async_trait]
@@ -127,22 +127,22 @@ pub struct ChatRuntimeState {
     >,
 }
 
-/// The connected-tier (WS4-A / WS4-B) control surfaces: relay tunnel, notes
+/// The connected-tier (WS4-A / WS4-B) control surfaces: account sign-in, notes
 /// sync, and the live MCP endpoint. Grouped together because all three are
 /// injected as one unit by `app-main` — a free build gets the disabled
-/// implementations for `tunnel`/`sync` and a permanently-`None` `mcp_info`;
-/// a connected build wires all three to the real relay/sync/MCP-server
+/// implementations for `account`/`sync` and a permanently-`None` `mcp_info`;
+/// a connected build wires all three to the real account/sync/MCP-server
 /// state.
 pub struct ConnectedState {
-    /// The connected-tier relay tunnel control surface (WS4-A S5b). `app-main`
-    /// injects a `connected`-gated implementation (holding the `tunnel-client`
-    /// pairing + lifecycle types); the free build (and a connected build with no
-    /// relay wiring) gets [`crate::tunnel::DisabledTunnel`], which reports
-    /// `Disconnected` and rejects pairing as unsupported. The tunnel IPC commands
-    /// (`tunnel_begin_pairing`, `tunnel_poll_pairing`, `set_connector_enabled`,
-    /// `tunnel_status`) call through this trait so `ipc-bridge` takes no
+    /// The connected-tier account sign-in control surface (WS4-A S5b).
+    /// `app-main` injects a `connected`-gated implementation (holding the
+    /// `tunnel-client` pairing types); the free build (and a connected build
+    /// with no account wiring) gets [`crate::account::DisabledAccount`], which
+    /// reports `SignedOut` and rejects pairing as unsupported. The account IPC
+    /// commands (`account_begin_pairing`, `account_poll_pairing`,
+    /// `account_status`) call through this trait so `ipc-bridge` takes no
     /// `tunnel-client` dependency edge.
-    pub tunnel: Arc<dyn TunnelControl>,
+    pub account: Arc<dyn AccountControl>,
     /// The peer-to-peer notes-sync control surface (WS4-B S5). `app-main` injects
     /// a `connected`-gated implementation (holding the `sync` engine: iroh
     /// endpoint + pairing + notes-sync protocol); the free build (and a connected
@@ -150,7 +150,7 @@ pub struct ConnectedState {
     /// reports `Disabled` and rejects ticket / peer / sync operations as
     /// unsupported. The sync IPC commands (`sync_status`, `sync_get_my_ticket`,
     /// `sync_add_peer`, `sync_now`) call through this trait so `ipc-bridge` takes
-    /// no `sync` dependency edge — the same seam as [`Self::tunnel`].
+    /// no `sync` dependency edge — the same seam as [`Self::account`].
     pub sync: Arc<dyn SyncControl>,
     /// The live MCP server endpoint, set by `app-main` after `mcp_server::serve`
     /// binds (Phase 10). `None` when the MCP server is disabled or not yet
@@ -234,7 +234,7 @@ pub struct IpcState {
     /// (not async) because every access is a brief, non-awaiting insert/remove.
     pub translate_in_flight:
         Arc<std::sync::Mutex<std::collections::HashSet<(minutist_common::MeetingId, String)>>>,
-    /// The connected-tier (relay tunnel + notes sync + MCP endpoint) control
+    /// The connected-tier (account sign-in + notes sync + MCP endpoint) control
     /// surfaces. See [`ConnectedState`].
     pub connected: ConnectedState,
     /// The voiceprint library (`voiceprints.db`), opened at startup by `app-main`

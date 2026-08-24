@@ -2,8 +2,14 @@
  * MCP server settings pane (Phase 10).
  *
  * Lets the user enable the in-process loopback MCP server, set the fixed port,
- * toggle write-tool exposure, and reveal/copy the bearer token + endpoint URL to
- * paste into an external MCP client's config.
+ * toggle write-tool exposure, and reveal/copy the bearer token, plus a
+ * ready-to-run `claude mcp add` command for Claude Code. Claude Desktop has no
+ * equivalent path today: its Settings → Connectors only accepts a publicly
+ * reachable URL, not a loopback one, and there is currently no desktop
+ * extension bridging to a local server (one existed once — `mcpb` — but was
+ * removed when external connectivity moved to a hosted relay; that relay is
+ * now retired too, and whether to rebuild a bridge is an open question, not
+ * something this pane should imply already works).
  *
  * The toggles round-trip through `update_settings` (via the recording store).
  * Enabling/disabling the server takes effect immediately (the backend watches
@@ -27,6 +33,11 @@ import {
   DEFAULT_MCP_PORT,
 } from "../state/mcp-settings";
 import { useMcpServerInfoStore } from "../state/mcp-server-info";
+
+/** The `claude mcp add` command that registers this server with Claude Code. */
+function claudeCodeCommand(url: string, token: string): string {
+  return `claude mcp add --transport http minutist ${url} --header "Authorization: Bearer ${token}"`;
+}
 
 export function McpSettingsPane() {
   const settings = useRecordingStore((s) => s.settings);
@@ -161,11 +172,28 @@ export function McpSettingsPane() {
               Copy token
             </button>
           </div>
+          <label>Claude Code</label>
+          <div className="settings-drawer__mcp-endpoint">
+            <code className="settings-drawer__mcp-url">
+              {claudeCodeCommand(info.url, revealed ? info.token : "•".repeat(24))}
+            </code>
+            <button
+              type="button"
+              className="settings-drawer__about"
+              onClick={() => copy(claudeCodeCommand(info.url, info.token))}
+            >
+              Copy command
+            </button>
+          </div>
           <p className="settings-drawer__hint">
-            Paste the URL and token into the Minutist bridge in Claude Desktop
-            (Settings &rarr; Extensions). To rotate the token, delete the{" "}
-            <code>mcp_token</code> file in the app-data directory and restart the
-            app; a new token is generated on the next launch.
+            Run that in a terminal to add this server. Claude Desktop cannot
+            reach a local server like this one yet — its Settings &rarr;
+            Connectors expects a publicly reachable URL, and there is no
+            desktop extension bridging to it at the moment.
+          </p>
+          <p className="settings-drawer__hint">
+            To rotate the token, delete <code>mcp_token</code> in the app-data
+            directory and restart the app.
           </p>
         </div>
       )}

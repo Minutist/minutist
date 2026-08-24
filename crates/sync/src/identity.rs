@@ -3,15 +3,15 @@
 //! iroh identifies an endpoint by its ed25519 key, so each device holds a stable
 //! [`iroh::SecretKey`] whose public half is its `EndpointId`. The key is persisted
 //! at `{app-data}/sync_node_key` (the raw 32 secret bytes) with owner-only `0600`
-//! on Unix, mirroring the credential-file discipline `src-tauri/src/tunnel.rs` uses
-//! for `tunnel_device.json` (which itself delegates to `app-main`'s
+//! on Unix, mirroring the credential-file discipline `src-tauri/src/account.rs`
+//! uses for `tunnel_device.json` (which itself delegates to `app-main`'s
 //! `write_secret_file`). That helper is private to `app-main` and not reachable
 //! from this crate, so the atomic-create-0600 write is replicated here against the
 //! raw key bytes.
 //!
 //! The account/device ids that scope the iroh `EndpointId` to a user's account
 //! are the existing `StoredCredential.{account_id, device_id}` (issued during
-//! tunnel pairing); S2 reuses those rather than minting separate ids here.
+//! account pairing); S2 reuses those rather than minting separate ids here.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

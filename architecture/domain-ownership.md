@@ -32,7 +32,7 @@ role when work is parallel.
 | `agent-tools` | systems-engineer | `crates/agent-tools/**` | Same | `common`, `persistence`, `notes-crdt`, `rag-retrieval` |
 | `chat-agent` | ml-runtime-engineer | `crates/chat-agent/**` | Same | `common`, `summariser`, `agent-tools` |
 | `mcp-server` | systems-engineer | `crates/mcp-server/**` | Same | `common`, `agent-tools` |
-| `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (re-implements the relay wire frames; takes config, not workspace edges) |
+| `tunnel-client` | systems-engineer | `crates/tunnel-client/**` | Same | Nothing — it's a near-leaf (device-code pairing + the account-directory HTTP client; takes config, not workspace edges) |
 | `account-directory` | systems-engineer | `crates/account-directory/**` | Same | `common`, `sync`, `tunnel-client` (the `AccountEndpointSource` adapter shared by `app-main` and `headless`, so neither carries its own copy) |
 | `sync` | systems-engineer | `crates/sync/**` | Same | `common`, `notes-crdt` |
 | `sync-ffi` | systems-engineer | `crates/sync-ffi/**` | This file too if changing the FFI wrapper contract. | `common`, `sync` (mobile-only UniFFI wrapper — see the `¶` footnote in `components.md`) |
@@ -139,12 +139,12 @@ stay leaf-shaped.
 
 `tunnel-client` (WS4-A) is systems-engineer for the same reason as
 `mcp-server`: it is transport/IPC-adjacent connective tissue (the app-side
-relay tunnel that bridges to the loopback `mcp-server`), it shares the
-`connected`-feature gating and the internal-bearer handoff with `mcp-server`,
-and `app-main` (systems-engineer) is the assembler that injects its config and
-wires it behind the feature in S5. It owns no domain logic of another crate — it
-re-implements the relay's wire frames and forwards HTTP — so it stays a near-leaf
-under one role.
+account client — device-code pairing plus the account-directory HTTP client;
+it stopped being a relay tunnel 2026-08-24, see issue 0044), it shares the
+`connected`-feature gating with `mcp-server`, and `app-main` (systems-engineer)
+is the assembler that injects its config and wires it behind the feature in
+S5. It owns no domain logic of another crate, so it stays a near-leaf under
+one role.
 
 `sync` (WS4-B) is systems-engineer for the same reason: it is transport
 connective tissue (the device-to-device iroh sync engine), it shares the

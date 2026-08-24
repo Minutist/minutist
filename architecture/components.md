@@ -617,23 +617,25 @@ See `crates/doc-convert/src/lib.rs` for implementation detail.
 
 ### `tunnel-client`
 **Crate:** `crates/tunnel-client`
-**Owns:** the app-side half of the connected-tier relay tunnel — the outbound
-WSS dial, device handshake, and request/response demux that replays relayed
-MCP requests against the app's own loopback `mcp-server` — plus the account
-device-directory HTTP client (`AccountDirectoryClient`), kept here (not in
-`sync`) so this crate stays a `sync`-free near-leaf; `app-main` and `headless`
-both adapt it onto `sync::AccountEndpointSource` via the `account-directory`
-crate.
+**Owns:** the app-side account client for the connected tier — the RFC 8628
+device-code pairing client (`DeviceCodeClient`) used to sign a device in, plus
+the account device-directory HTTP client (`AccountDirectoryClient`, `GET
+/v1/account/devices`, `PUT .../self/endpoint`, `DELETE /v1/account`). Kept
+here (not in `sync`) so this crate stays a `sync`-free near-leaf; `app-main`
+and `headless` both adapt it onto `sync::AccountEndpointSource` via the
+`account-directory` crate. No outbound relay dial lives here any more — the
+former WSS-tunnel/frame-relay machinery (that let a hosted relay reach the
+local `mcp-server`) was removed 2026-08-24 when that hosted relay was retired
+(D15); see issue 0044.
 
 **Dependency edges:** none in the workspace — a near-leaf over third-party
-crates only (`tokio-tungstenite`, `postcard`, `reqwest`). Part of the
-connected feature surface (D5): compiles unconditionally as a workspace
-member, wired into `app-main` only behind the `connected` Cargo feature. The
-relay lives in a separate private repo, so the wire frames are re-implemented
-here byte-for-byte rather than shared as a crate.
+crates only (`reqwest`). Part of the connected feature surface: compiles
+unconditionally as a workspace member; `app-main`'s edge to it is wired only
+behind the `connected` Cargo feature, `headless`'s edge is unconditional (a
+seeded hub is always account-capable).
 
-See `crates/tunnel-client/src/lib.rs` for implementation detail (wire
-contract, handshake/demux, security invariants).
+See `crates/tunnel-client/src/lib.rs` for implementation detail (the account
+client's wire contract and security invariants).
 
 ### `account-directory`
 **Crate:** `crates/account-directory`
@@ -767,7 +769,7 @@ no other crate can own that wiring without leaking `tauri::*` into the
 domain crate. It deliberately has **no** `model-registry` or `diarizer`
 edge (both are reached only through `Orchestrator`), and **no**
 `tunnel-client` / `sync` edge — those connected-tier surfaces are exposed
-through `TunnelControl` / `SyncControl` trait seams (`DisabledTunnel` /
+through `AccountControl` / `SyncControl` trait seams (`DisabledAccount` /
 `DisabledSync` in the free build), with `app-main` injecting the concrete
 implementation.
 
@@ -816,8 +818,8 @@ free-vs-paid artifact split — `mcp-server`, `tunnel-client`, `sync`,
 single feature, enforced at compile time
 (`cargo build -p minutist --no-default-features` produces the free
 artifact with none of that code compiled in). The free build injects
-`ipc_bridge::disabled_tunnel()` into `IpcState.tunnel` so `ipc-bridge`'s
-surface is identical either way.
+`ipc_bridge::disabled_account()` into `IpcState.connected.account` so
+`ipc-bridge`'s surface is identical either way.
 
 See `src-tauri/src/main.rs` for implementation detail.
 

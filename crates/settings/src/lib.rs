@@ -149,14 +149,6 @@ const fn default_mcp_port() -> u16 {
     8765
 }
 
-/// Default connector relay tunnel URL (WS4-A S5b). The hosted relay's WSS
-/// rendezvous endpoint the device dials. User-overridable (for self-hosting /
-/// testing); defaults to the minutist.ai endpoint. An older store deserialises
-/// to this via `#[serde(default = ...)]`.
-fn default_relay_url() -> String {
-    "wss://mcp.minutist.ai/tunnel".to_string()
-}
-
 /// Default connector account-service API base URL (WS4-A S5b). The base the
 /// device-code pairing client posts `/pair/start` + `/pair/poll` against.
 /// User-overridable; defaults to the minutist.ai endpoint.
@@ -696,26 +688,17 @@ pub struct Settings {
     #[serde(default = "default_output_language")]
     pub output_language: String,
 
-    /// Whether the connected-tier relay connector is enabled (WS4-A S5b).
-    /// **Off by default**, mirroring `mcp_enabled`. When `true` AND a device
-    /// credential is stored (the device is paired), `app-main` (connected build
-    /// only) starts the tunnel lifecycle: it dials the relay so an external MCP
-    /// client (Claude web/Desktop, ChatGPT, Codex) can reach this app's tools
-    /// over the relay. The connector channel transits meeting content to the AI
-    /// vendor BY DESIGN (the user asked for it) — it is never described as
-    /// private (D5). `#[serde(default)]` defaults to `false`; an older store
-    /// deserialises to `false`. The free build ignores this field entirely (no
+    /// Whether this device is signed in to a Minutist account and syncing
+    /// (WS4-A S5b). **Off by default**, mirroring `mcp_enabled`. Set to `true`
+    /// by a successful device-code pairing and back to `false` by
+    /// `delete_account` — there is no separate manual toggle; signing in is
+    /// what turns sync on. `app-main` (connected build only) reads this at
+    /// startup to auto-start the sync engine for an already-signed-in device.
+    /// `#[serde(default)]` defaults to `false`; an older store deserialises to
+    /// `false`. The free build ignores this field entirely (no
     /// `tunnel-client`). See `architecture/cross-cutting.md` — "Build variants".
     #[serde(default)]
     pub connector_enabled: bool,
-
-    /// The relay tunnel WSS rendezvous URL (WS4-A S5b). User-overridable for
-    /// self-hosting / testing; defaults to the minutist.ai endpoint. Must be
-    /// `wss://` for an off-machine host (`ws://` only for a loopback host, the
-    /// tunnel-client scheme check). `#[serde(default = ...)]` defaults to the
-    /// minutist.ai endpoint; an older store deserialises to it.
-    #[serde(default = "default_relay_url")]
-    pub relay_url: String,
 
     /// The account-service API base URL the device-code pairing client posts
     /// `/pair/start` + `/pair/poll` against (WS4-A S5b). User-overridable;
@@ -856,7 +839,6 @@ impl Default for Settings {
             preload_summariser: default_preload_summariser(),
             output_language: default_output_language(),
             connector_enabled: false,
-            relay_url: default_relay_url(),
             relay_api_url: default_relay_api_url(),
             live_agent_mode: default_live_agent_mode(),
             live_agent_min_segments: default_live_agent_min_segments(),
@@ -921,7 +903,6 @@ mod tests {
             preload_summariser: false,
             output_language: "German".to_string(),
             connector_enabled: true,
-            relay_url: "wss://relay.example/tunnel".to_string(),
             relay_api_url: "https://api.example".to_string(),
             live_agent_mode: LiveAgentMode::On,
             live_agent_min_segments: 5,
@@ -941,7 +922,6 @@ mod tests {
         assert_eq!(restored.transcription_language, "Japanese");
         assert_eq!(restored.output_language, "German");
         assert!(restored.connector_enabled);
-        assert_eq!(restored.relay_url, "wss://relay.example/tunnel");
         assert_eq!(restored.live_agent_mode, LiveAgentMode::On);
         assert_eq!(restored.live_agent_min_segments, 5);
         assert_eq!(restored.live_agent_min_seconds, 30);

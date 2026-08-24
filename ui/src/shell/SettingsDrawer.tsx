@@ -70,23 +70,11 @@ const LazyMcpSettingsPane =
       )
     : null;
 
-// ConnectionSettingsPane (the connector / relay tunnel) is likewise present only
-// in the connected build, gated by the same VITE_CONNECTED literal so the false
-// branch (and its `import()`) is dead-code-eliminated, dropping the pane and its
-// state modules (connector-settings.ts, tunnel-status.ts) from the free bundle.
-const LazyConnectionSettingsPane =
-  import.meta.env.VITE_CONNECTED === "1"
-    ? lazy(() =>
-        import("./ConnectionSettingsPane").then((m) => ({
-          default: m.ConnectionSettingsPane,
-        })),
-      )
-    : null;
-
-// SyncSettingsPane (the peer-to-peer notes sync) is likewise present only in the
-// connected build, gated by the same VITE_CONNECTED literal. The false branch and
-// its `import()` are dead-code-eliminated, dropping the pane and its state module
-// (sync-status.ts) from the free bundle.
+// SyncSettingsPane (account sign-in + the peer-to-peer notes sync) is likewise
+// present only in the connected build, gated by the same VITE_CONNECTED
+// literal. The false branch and its `import()` are dead-code-eliminated,
+// dropping the pane and its state modules (account-status.ts, sync-status.ts)
+// from the free bundle.
 //
 // Verification: VITE_CONNECTED= npm run build && grep -r "Sync this meeting now" dist/
 // → no matches expected in the free bundle.
@@ -313,14 +301,6 @@ export function SettingsDrawer({ open, onClose, onAbout }: SettingsDrawerProps) 
           </label>
           <OutputLanguagePicker />
         </section>
-
-        {LazyConnectionSettingsPane && (
-          <McpPaneErrorBoundary>
-            <Suspense fallback={null}>
-              <LazyConnectionSettingsPane />
-            </Suspense>
-          </McpPaneErrorBoundary>
-        )}
 
         {LazySyncSettingsPane && (
           <McpPaneErrorBoundary>

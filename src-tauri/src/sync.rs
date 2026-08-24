@@ -4,21 +4,21 @@
 //! with the `sync` crate's [`SyncEngine`] (iroh endpoint + the notes-update
 //! protocol). `app-main` injects a [`ConnectedSync`] into `IpcState.sync`; the
 //! free build never builds this module and uses `ipc_bridge::disabled_sync()`
-//! instead. This mirrors the connector tunnel wiring in [`crate::tunnel`].
+//! instead. This mirrors the account wiring in [`crate::account`].
 //!
 //! # Lifecycle
 //!
 //! [`ConnectedSync::new`] returns immediately and spawns engine startup in the
 //! background (binding the iroh endpoint is async and `setup` has no entered
-//! runtime to block on) when the connector is enabled at construction time
-//! (`settings.connector_enabled` — sync is part of the same connected tier as
-//! the relay tunnel). A connector disabled at launch leaves the engine unbuilt
-//! and the status [`SyncStatus::Disabled`] until [`SyncControl::set_enabled`] is
-//! called (F5) — the runtime toggle in Settings, wired alongside the tunnel's own
-//! enable/disable in `ipc_bridge::tunnel::set_connector_enabled`. Both paths
-//! converge on the same idempotent [`ConnectedSync::request_start`]: a start is
+//! runtime to block on) when `settings.connector_enabled` is already set at
+//! construction time (a device that was signed in on a previous run). A
+//! signed-out launch leaves the engine unbuilt and the status
+//! [`SyncStatus::Disabled`] until [`SyncControl::set_enabled`] is called (F5) —
+//! from [`crate::account::ConnectedAccount::poll_pairing`] on a successful
+//! sign-in, or from `delete_account` to turn it back off. Both paths converge
+//! on the same idempotent [`ConnectedSync::request_start`]: a start is
 //! requested at most once (guarded by an atomic flag), so construction-time
-//! auto-start and a later runtime enable can never double-spawn the engine.
+//! auto-start and a later sign-in can never double-spawn the engine.
 //! Startup:
 //!
 //! 1. loads (or generates) the device [`DeviceIdentity`] under the app-data BASE
@@ -331,7 +331,7 @@ impl ConnectedSync {
                 // (the account source is primary when signed-in; the peers file
                 // stays a local fallback). Shares `stop` with the peers poll so a
                 // re-bind cancels both together.
-                if let Some(cred) = crate::tunnel::load_device_credential(&app_data_base) {
+                if let Some(cred) = crate::account::load_device_credential(&app_data_base) {
                     let settings = self.settings.current();
                     match tunnel_client::AccountDirectoryClient::new(
                         settings.relay_api_url,
@@ -343,10 +343,9 @@ impl ConnectedSync {
                             let self_endpoint = AccountEndpoint {
                                 device_id: cred.device_id,
                                 endpoint_id: engine.endpoint_id().to_string(),
-                                // The engine homes on SyncConfig::DEFAULT_RELAY_URL, not
-                                // settings.relay_url (the connector tunnel's WSS
-                                // endpoint, a separate setting) — advertising the
-                                // latter here told peers to dial the wrong relay.
+                                // The engine homes on SyncConfig::DEFAULT_RELAY_URL —
+                                // the sync engine's own iroh relay, unrelated to
+                                // settings.relay_api_url (the account-service base).
                                 relay_url: SyncConfig::DEFAULT_RELAY_URL.to_string(),
                                 // Filtered direct addrs (0049) so a same-tailnet/
                                 // LAN peer dials this device directly, no relay/DNS.
@@ -636,23 +635,21 @@ impl SyncControl for ConnectedSync {
     }
 
     async fn set_enabled(&self, enabled: bool) -> AppResult<()> {
-        // F5: request the engine start when the connector is turned on at
-        // runtime. `request_start` is idempotent (an atomic-guarded one-shot),
-        // so this is safe whether the engine is already running, already
-        // starting, or has never been requested.
+        // F5: request the engine start on a successful sign-in.
+        // `request_start` is idempotent (an atomic-guarded one-shot), so this
+        // is safe whether the engine is already running, already starting, or
+        // has never been requested.
         //
-        // Disabling does NOT tear down an already-started engine: `SyncEngine`
-        // offers only an owning `shutdown(self)`, and the engine `Arc` here is
-        // shared with the spawned election loop and the lifecycle subscriber, so
-        // a clean stop would need a cancellation path threaded through both —
-        // out of scope for this fix, which targets the enable path the report
-        // describes (status staying `Disabled` after enabling). Turning the
-        // connector back off still persists `settings.connector_enabled = false`
-        // (via `TunnelControl::set_enabled`, called alongside this) and stops
-        // the RELAY TUNNEL; a lingering sync engine after a runtime disable is a
-        // known follow-up, not a behaviour this call regresses (before this fix
-        // the engine could only ever be started at launch, so "disable after a
-        // runtime enable" was not a reachable state at all).
+        // `enabled = false` (only ever called from `delete_account`, alongside
+        // `AccountControl::delete_account` persisting
+        // `settings.connector_enabled = false`) does NOT tear down an
+        // already-started engine: `SyncEngine` offers only an owning
+        // `shutdown(self)`, and the engine `Arc` here is shared with the
+        // spawned election loop and the lifecycle subscriber, so a clean stop
+        // would need a cancellation path threaded through both — a known
+        // follow-up, not a behaviour this call regresses (the app is about to
+        // erase the local credential regardless; a lingering engine has
+        // nothing account-scoped left to do until the next launch).
         if enabled {
             self.request_start().await;
         }
@@ -681,7 +678,7 @@ fn resolve_relay_token(app_data_base: &Path, _settings: &SettingsHandle) -> Opti
 /// Factored out of [`resolve_relay_token`] so the credential-fallback path is
 /// testable without touching the process-global `MINUTIST_SYNC_TOKEN` env.
 fn credential_relay_token(app_data_base: &Path) -> Option<String> {
-    crate::tunnel::load_device_credential(app_data_base).map(|cred| cred.device_credential)
+    crate::account::load_device_credential(app_data_base).map(|cred| cred.device_credential)
 }
 
 /// The desktop's [`ElectionDriver`] (producer-gate S4): drives the election loop's

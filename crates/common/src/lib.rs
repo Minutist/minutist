@@ -1272,35 +1272,34 @@ pub enum OperationKind {
     Translate,
 }
 
-/// The connected-tier relay tunnel's live state, surfaced to the Settings →
-/// Connection pane (WS4-A S5b). A pure status enum — it carries no credential or
-/// account material (those cross only the pairing command's return / secure
-/// storage, never the event bus). The connector channel transits meeting content
-/// to the AI vendor by design and is never described as private (D5).
+/// This device's account sign-in state, surfaced to the Settings → Sync pane.
+/// A pure status enum — it carries no credential or account material (those
+/// cross only the pairing command's return / secure storage, never the event
+/// bus). Signing in exists to enable cross-device sync (D4, end-to-end between
+/// the user's own devices); it is unrelated to the local MCP server, which is
+/// the channel that actually transits meeting content to an external agent's
+/// vendor (D5) and is not gated on an account at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
-pub enum TunnelStatus {
-    /// No device credential stored, or the connector is disabled. The app works
-    /// fully locally; nothing is reachable over the relay.
-    Disconnected,
+pub enum AccountStatus {
+    /// No device credential stored (or it was erased). The app works fully
+    /// locally; nothing syncs.
+    SignedOut,
     /// A device-code pairing is in progress (the user is approving in a browser).
     Pairing,
-    /// A credential is stored and the tunnel is dialing / handshaking the relay.
-    Connecting,
-    /// The tunnel is established — the account is reachable over the relay.
-    Online,
-    /// The stored credential was rejected after having worked: the device was
-    /// revoked (or rotated). The user must re-pair; the loop is not retrying.
-    NeedsRepair,
+    /// A credential is stored; this device is signed in and syncs with every
+    /// other device on the account.
+    SignedIn,
 }
 
 /// The peer-to-peer notes-sync engine's live state, surfaced to the UI (WS4-B
 /// S5). A pure status enum carrying no peer ticket or device-key material —
 /// those cross only the sync commands' return values / secure storage, never the
 /// event bus. The sync channel is end-to-end between the user's own paired
-/// devices (D4); it is distinct from the connector channel ([`TunnelStatus`]),
-/// which transits content to the AI vendor by design.
+/// devices (D4); it is distinct from the local MCP server, which transits
+/// content to an external agent's vendor by design (D5) and is not
+/// account-gated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
@@ -1591,14 +1590,13 @@ pub enum AppEvent {
     /// a serialised `AppError` variant (the pane shows it verbatim).
     McpServerStartFailed { reason: String },
 
-    // --- Connected-tier relay tunnel (WS4-A S5b) -------------------------
-    /// The relay tunnel's live state changed. `app-main` (connected build only)
-    /// emits this from the reconnect loop's state callback and the pairing /
-    /// lifecycle transitions, so the Settings → Connection pane reflects the live
-    /// status without polling. Carries no credential / account material — the
-    /// account label and pairing codes cross only the pairing command's return
-    /// value, never the bus.
-    TunnelStatusChanged { status: TunnelStatus },
+    // --- Connected-tier account sign-in (WS4-A S5b) ----------------------
+    /// This device's account sign-in state changed. `app-main` (connected build
+    /// only) emits this from the pairing transitions, so the Settings → Sync
+    /// pane reflects the live status without polling. Carries no credential /
+    /// account material — the account label and pairing codes cross only the
+    /// pairing command's return value, never the bus.
+    AccountStatusChanged { status: AccountStatus },
 
     // --- Peer-to-peer notes sync (WS4-B S5) ------------------------------
     // These ride the existing `AppEventPayload` newtype + the single

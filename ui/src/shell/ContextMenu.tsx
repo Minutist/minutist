@@ -59,12 +59,16 @@ export function ContextMenu({ x, y, entries, onClose }: ContextMenuProps) {
 
   // Move focus into the menu on open, and restore it to whatever had focus
   // beforehand (the row) on close, so keyboard/screen-reader users land back
-  // where they started.
+  // where they started. `preventScroll: true` on both calls: the menu is
+  // `position: fixed` at the cursor, but its DOM node is still a descendant
+  // of the scrollable meeting list — a plain `.focus()` has the browser
+  // scroll that ancestor to bring the (already visually positioned) node
+  // "into view", which in practice snaps the list back to the top.
   useEffect(() => {
     const previouslyFocused = document.activeElement as HTMLElement | null;
-    itemRefs.current.find((el) => el !== null)?.focus();
+    itemRefs.current.find((el) => el !== null)?.focus({ preventScroll: true });
     return () => {
-      previouslyFocused?.focus();
+      previouslyFocused?.focus({ preventScroll: true });
     };
   }, []);
 
@@ -83,10 +87,12 @@ export function ContextMenu({ x, y, entries, onClose }: ContextMenuProps) {
       const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        items[(currentIndex + 1) % items.length].focus();
+        items[(currentIndex + 1) % items.length].focus({ preventScroll: true });
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
-        items[(currentIndex - 1 + items.length) % items.length].focus();
+        items[(currentIndex - 1 + items.length) % items.length].focus({
+          preventScroll: true,
+        });
       }
     }
     document.addEventListener("keydown", onKeyDown, true);

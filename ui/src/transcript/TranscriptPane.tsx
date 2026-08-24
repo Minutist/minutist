@@ -22,6 +22,8 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { MeetingId, Segment } from "../ipc/bindings";
 import "./TranscriptPane.css";
 import { AudioMeter } from "../shell/AudioMeter";
+import { ContextMenu } from "../shell/ContextMenu";
+import { buildTranscriptMenuEntries } from "./transcript-context-menu";
 
 /**
  * Custom URI scheme for serving a transcript window's audio to the webview.
@@ -461,6 +463,14 @@ type TranscriptRowProps = {
   isPlaying: boolean;
   onPlay: (idx: number, seg: Segment) => void;
   onRowClick: (seg: Segment) => void;
+  // Themed right-click menu (#0034) — lifted to `TranscriptPane` (see its own
+  // doc comment for why: rows are virtualised/recycled, so per-row local
+  // state would attach a stale menu to whichever segment scrolls into a
+  // reused row, exactly the bug `MeetingList.tsx` had for the same reason).
+  menuOpen: boolean;
+  menuPos: { x: number; y: number; selectedText: string | null } | null;
+  onOpenMenu: (idx: number, x: number, y: number, selectedText: string | null) => void;
+  onCloseMenu: () => void;
 };
 
 /**
@@ -503,6 +513,10 @@ const TranscriptRow = memo(
       isPlaying,
       onPlay,
       onRowClick,
+      menuOpen,
+      menuPos,
+      onOpenMenu,
+      onCloseMenu,
     },
     ref,
   ) {
@@ -532,6 +546,15 @@ const TranscriptRow = memo(
         }
         aria-current={highlighted ? "true" : undefined}
         onClick={() => onRowClick(seg)}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          // Captured now, before the menu steals focus — see the module doc
+          // comment on `buildTranscriptMenuEntries`.
+          const selection = window.getSelection();
+          const selectedText =
+            selection && !selection.isCollapsed ? selection.toString() : null;
+          onOpenMenu(idx, e.clientX, e.clientY, selectedText);
+        }}
       >
         {/*
           The timestamp is the drag handle (FR-24): only it is `draggable`, so
@@ -648,6 +671,21 @@ const TranscriptRow = memo(
           >
             {isPlaying ? <StopGlyph /> : <PlayGlyph />}
           </button>
+        )}
+        {menuOpen && menuPos && (
+          <ContextMenu
+            x={menuPos.x}
+            y={menuPos.y}
+            entries={buildTranscriptMenuEntries({
+              selectedText: menuPos.selectedText,
+              canPlay: speakerEditable,
+              isPlaying,
+              onCopy: (text) => void navigator.clipboard?.writeText(text),
+              onJump: () => onRowClick(seg),
+              onPlayToggle: () => onPlay(idx, seg),
+            })}
+            onClose={onCloseMenu}
+          />
         )}
       </li>
     );
@@ -866,6 +904,22 @@ export function TranscriptPane() {
     [playSegment],
   );
 
+  // The open row context menu, if any (#0034) — lifted here rather than kept
+  // as local state on each row; see `TranscriptRowProps.menuOpen`'s doc
+  // comment for why (virtualised rows are recycled across segments).
+  const [menuRow, setMenuRow] = useState<{
+    idx: number;
+    x: number;
+    y: number;
+    selectedText: string | null;
+  } | null>(null);
+  const handleOpenMenu = useCallback(
+    (idx: number, x: number, y: number, selectedText: string | null) =>
+      setMenuRow({ idx, x, y, selectedText }),
+    [],
+  );
+  const handleCloseMenu = useCallback(() => setMenuRow(null), []);
+
   return (
     <div className="transcript-pane">
       {isLive && (
@@ -931,6 +985,10 @@ export function TranscriptPane() {
                   isPlaying={playingIdx === idx}
                   onPlay={handlePlay}
                   onRowClick={handleRowClick}
+                  menuOpen={menuRow?.idx === idx}
+                  menuPos={menuRow?.idx === idx ? menuRow : null}
+                  onOpenMenu={handleOpenMenu}
+                  onCloseMenu={handleCloseMenu}
                 />
               );
             })}

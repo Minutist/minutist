@@ -650,3 +650,114 @@ describe("SpeakerChip rename (issue #0001)", () => {
     expect(screen.queryByRole("button", { name: "Speaker A" })).not.toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Row context menu (issue #0034)
+// ---------------------------------------------------------------------------
+
+describe("TranscriptPane row context menu (#0034)", () => {
+  const SEGMENTS: Segment[] = [
+    makeSegment(0, "first"),
+    makeSegment(5_000, "second"),
+    makeSegment(10_000, "third"),
+  ];
+
+  beforeEach(() => {
+    act(() => {
+      useRecordingStore.setState({ state: { kind: "idle" }, transcript: SEGMENTS });
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    act(() => {
+      useMeetingsStore.setState({ openMeetingId: null, openMeetingState: null });
+    });
+  });
+
+  it("right-click opens the themed menu and suppresses the native one", () => {
+    render(<TranscriptPane />);
+    const rows = screen.getAllByRole("listitem");
+
+    const notCancelled = fireEvent.contextMenu(rows[0], { clientX: 30, clientY: 40 });
+    expect(notCancelled).toBe(false);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "Jump to linked paragraph" }),
+    ).toBeInTheDocument();
+  });
+
+  it("right-clicking a second row closes the first row's menu instead of stacking both", () => {
+    render(<TranscriptPane />);
+    const rows = screen.getAllByRole("listitem");
+
+    fireEvent.contextMenu(rows[0], { clientX: 10, clientY: 10 });
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+
+    fireEvent.contextMenu(rows[2], { clientX: 200, clientY: 200 });
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+  });
+
+  it("Copy is disabled without a text selection", () => {
+    render(<TranscriptPane />);
+    const rows = screen.getAllByRole("listitem");
+    fireEvent.contextMenu(rows[0], { clientX: 10, clientY: 10 });
+    expect(screen.getByRole("menuitem", { name: "Copy" })).toBeDisabled();
+  });
+
+  it("Jump to linked paragraph publishes a scroll request for the row's segment", () => {
+    render(<TranscriptPane />);
+    const rows = screen.getAllByRole("listitem");
+    fireEvent.contextMenu(rows[1], { clientX: 10, clientY: 10 });
+
+    act(() => {
+      fireEvent.click(
+        screen.getByRole("menuitem", { name: "Jump to linked paragraph" }),
+      );
+    });
+    expect(useCrossRefStore.getState().scrollRequest?.anchorMs).toBe(5_000);
+    // Choosing an entry dismisses the menu.
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
+  it("omits the play entry on a live recording (no saved meeting open)", () => {
+    render(<TranscriptPane />);
+    const rows = screen.getAllByRole("listitem");
+    fireEvent.contextMenu(rows[0], { clientX: 10, clientY: 10 });
+    expect(
+      screen.queryByRole("menuitem", { name: "Play this segment’s audio" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers Play this segment’s audio on a saved, idle meeting", () => {
+    act(() => {
+      useMeetingsStore.setState({
+        openMeetingId: "saved-ctx-menu",
+        openMeetingState: {
+          transcript: SEGMENTS,
+          meta: { speaker_names: {} },
+        } as unknown as MeetingState,
+      });
+    });
+    render(<TranscriptPane />);
+    const rows = screen.getAllByRole("listitem");
+    fireEvent.contextMenu(rows[0], { clientX: 10, clientY: 10 });
+    expect(
+      screen.getByRole("menuitem", { name: "Play this segment’s audio" }),
+    ).toBeInTheDocument();
+  });
+
+  it("dismisses on Escape", () => {
+    render(<TranscriptPane />);
+    fireEvent.contextMenu(screen.getAllByRole("listitem")[0], {
+      clientX: 10,
+      clientY: 10,
+    });
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    act(() => {
+      fireEvent.keyDown(document, { key: "Escape" });
+    });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+});

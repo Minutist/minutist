@@ -14,9 +14,11 @@
  *     calls — local-only, no network (B6 WU7). The legacy `save_notes` JSON path
  *     remains as the single writer only when no collaboration doc is bound,
  *   - copy that writes an HTML clipboard payload so paste into Word retains
- *     formatting.
+ *     formatting,
+ *   - a themed right-click context menu (issue #0034) for cut/copy/paste and
+ *     the common formatting toggles, replacing the native WebView2 menu.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useEditor, EditorContent } from "@tiptap/react";
 import type { Editor as TiptapEditor } from "@tiptap/core";
 import { useRecordingStore } from "../state/recording";
@@ -34,6 +36,8 @@ import { shouldUseDevShim } from "../ipc/dev-shim-guard";
 import { loadNotes } from "../ipc/notes";
 import { openAttachmentById } from "../ipc/attachments";
 import { readNotesPaperRules } from "../state/notes-paper-settings";
+import { ContextMenu } from "../shell/ContextMenu";
+import { buildEditorMenuEntries } from "./editor-context-menu";
 import "./Editor.css";
 
 /**
@@ -84,6 +88,12 @@ export function Editor() {
   // active so edits to a finished/opened meeting persist (#0012). Reactive so
   // the autosave interval re-binds when the open meeting changes.
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
+
+  // The themed right-click menu's position, or `null` when closed (#0034).
+  // Entries are computed at render time from the live editor, so a toggle's
+  // checked state (e.g. Bold) always reflects the selection under the cursor
+  // when the menu opened.
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
 
   // Holds the live editor instance for DOM-event handlers wired at construction
   // time (the `drop` handler), which cannot close over `editor` before it is
@@ -184,6 +194,13 @@ export function Editor() {
       handleDOMEvents: {
         copy: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
         cut: (view, event) => writeClipboard(view.dom, event as ClipboardEvent),
+        // Themed right-click menu (#0034), replacing the native WebView2 one.
+        contextmenu: (_view, event) => {
+          const mouseEvent = event as MouseEvent;
+          mouseEvent.preventDefault();
+          setMenuPos({ x: mouseEvent.clientX, y: mouseEvent.clientY });
+          return true;
+        },
         // File paste: only intercept when the clipboard carries files and no
         // text payload (returns false otherwise, so text / markdown paste
         // flows through the existing tiptap-markdown handling untouched).
@@ -361,6 +378,15 @@ export function Editor() {
           <EditorContent editor={editor} />
         </div>
       </div>
+
+      {menuPos && editor && (
+        <ContextMenu
+          x={menuPos.x}
+          y={menuPos.y}
+          entries={buildEditorMenuEntries(editor)}
+          onClose={() => setMenuPos(null)}
+        />
+      )}
     </div>
   );
 }

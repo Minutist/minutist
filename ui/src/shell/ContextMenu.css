@@ -75,6 +75,25 @@
   cursor: default;
 }
 
+/* Checkable items (a formatting toggle's current state) reserve a fixed
+   leading column for the check mark so unchecked/checked labels stay aligned. */
+.context-menu__item[role="menuitemcheckbox"] {
+  padding-left: 1.5rem;
+  position: relative;
+}
+
+.context-menu__item[role="menuitemcheckbox"][aria-checked="true"]::before {
+  content: "✓";
+  position: absolute;
+  left: 0.6rem;
+}
+
+.context-menu__divider {
+  height: 1px;
+  margin: 0.25rem 0.3rem;
+  background: var(--rule);
+}
+
 .context-menu__item--danger {
   color: var(--accent);
 }

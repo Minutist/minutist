@@ -154,13 +154,18 @@ type MeetingRowProps = {
   onRestore: () => void;
   onPurge: () => void;
   onMove: (collectionId: CollectionId | null) => void;
+  // The context menu is single-instance across the whole list (lifted to
+  // MeetingList — see its own doc comment for why a per-row menu orphans).
+  menuOpen: boolean;
+  menuPos: { x: number; y: number } | null;
+  onOpenMenu: (x: number, y: number) => void;
+  onCloseMenu: () => void;
 };
 
 function MeetingRow(props: MeetingRowProps) {
   const { meeting } = props;
   const [renaming, setRenaming] = useState(false);
   const [draftTitle, setDraftTitle] = useState(meeting.title);
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   // A meeting that was never named (empty title in metadata) would otherwise
   // render an invisible, zero-height heading — the row loses its anchor and
@@ -247,7 +252,7 @@ function MeetingRow(props: MeetingRowProps) {
         // surface gets the themed menu (per-surface suppression, not global).
         if ((e.target as HTMLElement).closest("input, textarea")) return;
         e.preventDefault();
-        setMenu({ x: e.clientX, y: e.clientY });
+        props.onOpenMenu(e.clientX, e.clientY);
       }}
     >
       {/* Double-click anywhere in the meeting's text opens it (the row's
@@ -374,12 +379,12 @@ function MeetingRow(props: MeetingRowProps) {
         )}
       </div>
 
-      {menu && (
+      {props.menuOpen && props.menuPos && (
         <ContextMenu
-          x={menu.x}
-          y={menu.y}
+          x={props.menuPos.x}
+          y={props.menuPos.y}
           entries={menuEntries}
-          onClose={() => setMenu(null)}
+          onClose={props.onCloseMenu}
         />
       )}
     </li>
@@ -396,6 +401,18 @@ export function MeetingList() {
   const restore = useMeetingsStore((s) => s.restore);
   const purge = useMeetingsStore((s) => s.purge);
   const setCollection = useMeetingsStore((s) => s.setCollection);
+
+  // The open row context menu, if any — lifted here rather than kept as local
+  // state on each row. A per-row `useState` let every row that was ever
+  // right-clicked keep its own menu mounted forever (nothing closed it when a
+  // DIFFERENT row's contextmenu event fired), so right-clicking down the list
+  // orphaned one open menu per row. One piece of state for the whole list
+  // means opening a new row's menu implicitly replaces any other.
+  const [openMenu, setOpenMenu] = useState<{
+    meetingId: string;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const collections = useCollectionsStore((s) => s.collections);
   const filter = useCollectionsStore((s) => s.filter);
@@ -480,6 +497,16 @@ export function MeetingList() {
                   onPurge={() => void purge(meeting.id)}
                   onMove={(collectionId) =>
                     void setCollection(meeting.id, collectionId)
+                  }
+                  menuOpen={openMenu?.meetingId === meeting.id}
+                  menuPos={openMenu?.meetingId === meeting.id ? openMenu : null}
+                  onOpenMenu={(x, y) =>
+                    setOpenMenu({ meetingId: meeting.id, x, y })
+                  }
+                  onCloseMenu={() =>
+                    setOpenMenu((cur) =>
+                      cur?.meetingId === meeting.id ? null : cur,
+                    )
                   }
                 />
               ))}

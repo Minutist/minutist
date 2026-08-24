@@ -278,6 +278,32 @@ describe("MeetingList row context menu (#0034 meeting-list slice)", () => {
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
   });
 
+  it("right-clicking a second row closes the first row's menu instead of stacking both", async () => {
+    await renderList();
+    fireEvent.contextMenu(getRow("Launch sync — Tuesday"), {
+      clientX: 50,
+      clientY: 50,
+    });
+    expect(screen.getAllByRole("menu")).toHaveLength(1);
+
+    fireEvent.contextMenu(getRow("Quick standup"), { clientX: 200, clientY: 300 });
+
+    // Exactly one menu exists — the second row's, not both.
+    const menus = screen.getAllByRole("menu");
+    expect(menus).toHaveLength(1);
+    expect(
+      screen.getByRole("menuitem", { name: "Open storage folder" }),
+    ).toBeInTheDocument();
+    // The first row's own menu instance is gone, not just hidden behind a
+    // second one — confirms the state is single, not per-row-and-stacked.
+    act(() => {
+      fireEvent.click(screen.getByRole("menuitem", { name: "Open storage folder" }));
+    });
+    await waitFor(() =>
+      expect(meetingsIpc.openMeetingFolder).toHaveBeenCalledWith("meeting-0002"),
+    );
+  });
+
   it("does not suppress the native menu on the inline-rename input", async () => {
     await renderList();
     const renameButtons = screen.getAllByRole("button", { name: "Rename" });

@@ -1,5 +1,5 @@
 /**
- * Themed right-click context menu (issue #0034 — meeting-list slice).
+ * Themed right-click context menu (issue #0034).
  *
  * A small floating menu anchored at an arbitrary viewport point (typically a
  * `contextmenu` event's cursor position). Replaces the native WebView2 menu on
@@ -7,12 +7,21 @@
  * native menu (`preventDefault()` on `contextmenu`) on that surface only — this
  * component has no opinion about where it is invoked from.
  *
+ * Rendered via a portal into `document.body`, NOT inline where it's invoked:
+ * `position: fixed` is anchored to the viewport only as long as no ancestor
+ * establishes its own containing block for fixed descendants (a `transform`,
+ * `filter`, `contain`, or `will-change` on any ancestor does exactly that,
+ * silently). A menu invoked from deep inside a scrolled list is exactly the
+ * case that bites — the portal makes correctness independent of whatever CSS
+ * the invoking surface (or its ancestors) has today or grows tomorrow.
+ *
  * Entries are one level deep: a leaf action, or a submenu that expands inline
  * (used for "Move to…"'s folder list). Dismisses on outside click, Escape, or
  * after any leaf entry is chosen. Renders with `theme.css` tokens only, so it
  * matches the light/dark theme automatically.
  */
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import "./ContextMenu.css";
 
 export type ContextMenuEntry =
@@ -22,12 +31,18 @@ export type ContextMenuEntry =
       onSelect: () => void;
       danger?: boolean;
       disabled?: boolean;
+      /** Renders as a checkable item (a leading check mark) when set — a
+       * formatting toggle's current state (e.g. "Bold" while active). */
+      checked?: boolean;
     }
   | {
       kind: "submenu";
       label: string;
       items: { label: string; onSelect: () => void; current?: boolean }[];
       emptyLabel?: string;
+    }
+  | {
+      kind: "divider";
     };
 
 export type ContextMenuProps = {
@@ -99,7 +114,7 @@ export function ContextMenu({ x, y, entries, onClose }: ContextMenuProps) {
     return () => document.removeEventListener("keydown", onKeyDown, true);
   }, [onClose]);
 
-  return (
+  return createPortal(
     <>
       {/* Full-viewport transparent backdrop, behind the menu, that closes it on
           any outside click — mirrors `MeetingList.tsx`'s `MoveMenu` popover. */}
@@ -117,7 +132,18 @@ export function ContextMenu({ x, y, entries, onClose }: ContextMenuProps) {
         style={{ left: pos.x, top: pos.y }}
       >
         {entries.map((entry, i) =>
-          entry.kind === "submenu" ? (
+          entry.kind === "divider" ? (
+            // Not focusable — explicitly clears any stale ref from a previous
+            // render's entry at this index so keyboard nav never lands on it.
+            <div
+              key={`divider-${i}`}
+              className="context-menu__divider"
+              role="separator"
+              ref={() => {
+                itemRefs.current[i] = null;
+              }}
+            />
+          ) : entry.kind === "submenu" ? (
             <div key={entry.label} className="context-menu__submenu-wrap">
               <button
                 type="button"
@@ -162,7 +188,8 @@ export function ContextMenu({ x, y, entries, onClose }: ContextMenuProps) {
             <button
               key={entry.label}
               type="button"
-              role="menuitem"
+              role={entry.checked !== undefined ? "menuitemcheckbox" : "menuitem"}
+              aria-checked={entry.checked}
               ref={(el) => {
                 itemRefs.current[i] = el;
               }}
@@ -182,6 +209,7 @@ export function ContextMenu({ x, y, entries, onClose }: ContextMenuProps) {
           ),
         )}
       </div>
-    </>
+    </>,
+    document.body,
   );
 }

@@ -1,18 +1,16 @@
 /**
  * Sync settings pane (WS4-B S5), including account sign-in (WS4-A S5b).
  *
- * Signing in to a Minutist account is what turns cross-device sync on — a
- * "Log in" button drives a device-code pairing and a status line reflects
- * whether this device is signed in. There is no separate enable toggle, and
- * no pairing code is shown when the browser URL that opens already carries
- * it (`code_required`). Once signed in, every device on the account syncs
- * with this one automatically; the ticket exchange below is a manual
- * fallback for a device not on the account.
+ * Signing in to a Minutist account is the ONLY way cross-device sync turns
+ * on — a "Log in" button drives a device-code pairing and a status line
+ * reflects whether this device is signed in. There is no separate enable
+ * toggle, no pairing code shown when the browser URL that opens already
+ * carries it (`code_required`), and no manual device-to-device ticket
+ * pairing — every device on the account syncs with this one automatically
+ * once signed in.
  *
- * Also shows this device's shareable pairing ticket (copyable), a field +
- * button to paste a peer's ticket and call `sync_add_peer`, and a 'Sync now'
- * action (scoped to the open meeting when available, or a global trigger
- * otherwise). The live engine status comes from `sync_status` via the store.
+ * Also shows the live sync engine status (from `sync_status`) and a 'Sync
+ * now' action (scoped to the open meeting when available).
  *
  * Honest about the channel (D4): sync is end-to-end between the user's own
  * devices. It is unrelated to the local MCP server (a separate,
@@ -67,46 +65,20 @@ export function SyncSettingsPane() {
 
   const status = useSyncStatusStore((s) => s.status);
   const inProgress = useSyncStatusStore((s) => s.inProgress);
-  const myTicket = useSyncStatusStore((s) => s.myTicket);
   const lastError = useSyncStatusStore((s) => s.lastError);
   const refresh = useSyncStatusStore((s) => s.refresh);
-  const enableSync = useSyncStatusStore((s) => s.enable);
-  const fetchTicket = useSyncStatusStore((s) => s.fetchTicket);
-  const addPeer = useSyncStatusStore((s) => s.addPeer);
   const syncNow = useSyncStatusStore((s) => s.syncNow);
 
   // The currently open meeting, for the per-meeting 'Sync now' action.
   const openMeetingId = useMeetingsStore((s) => s.openMeetingId);
 
-  const [peerTicket, setPeerTicket] = useState("");
-  const [addPeerPending, setAddPeerPending] = useState(false);
   const [syncNowPending, setSyncNowPending] = useState(false);
-  const [enablePending, setEnablePending] = useState(false);
 
-  // Fetch status on mount so the pane opens with the live state. The ticket is
-  // expensive to fetch (it involves the iroh endpoint); defer it to the user
-  // explicitly revealing this section.
+  // Fetch status on mount so the pane opens with the live state.
   useEffect(() => {
     void refreshAccount();
     void refresh();
-    void fetchTicket();
-  }, [refreshAccount, refresh, fetchTicket]);
-
-  const copy = (text: string) => {
-    void navigator.clipboard?.writeText(text);
-  };
-
-  const handleAddPeer = async () => {
-    const t = peerTicket.trim();
-    if (!t) return;
-    setAddPeerPending(true);
-    try {
-      await addPeer(t);
-      setPeerTicket("");
-    } finally {
-      setAddPeerPending(false);
-    }
-  };
+  }, [refreshAccount, refresh]);
 
   const handleSyncNow = async () => {
     if (!openMeetingId) return;
@@ -115,18 +87,6 @@ export function SyncSettingsPane() {
       await syncNow(openMeetingId);
     } finally {
       setSyncNowPending(false);
-    }
-  };
-
-  // Sync starts automatically once signed in; a device that only wants
-  // manual ticket pairing (never signs in) needs its own way to turn it on.
-  const handleEnableSync = async () => {
-    setEnablePending(true);
-    try {
-      await enableSync();
-      await fetchTicket();
-    } finally {
-      setEnablePending(false);
     }
   };
 
@@ -217,8 +177,7 @@ export function SyncSettingsPane() {
         </div>
         <p className="settings-drawer__hint">
           Every device signed in to your account (above) syncs with this one
-          automatically — no ticket needed between them. The ticket flow below
-          is a manual fallback, for a device not on your account.
+          automatically.
         </p>
         {inProgress && (
           <p className="settings-drawer__hint" aria-label="Sync progress">
@@ -228,67 +187,6 @@ export function SyncSettingsPane() {
               : ""}
           </p>
         )}
-        {status?.kind === "disabled" && (
-          <>
-            <button
-              type="button"
-              className="settings-drawer__about"
-              disabled={enablePending}
-              onClick={() => void handleEnableSync()}
-            >
-              {enablePending ? "Turning on…" : "Turn on sync"}
-            </button>
-            <p className="settings-drawer__hint">
-              Only needed if you want the ticket exchange below without
-              signing in above.
-            </p>
-          </>
-        )}
-      </div>
-
-      {myTicket && (
-        <div className="settings-drawer__field" aria-label="This device's ticket">
-          <label>This device's ticket</label>
-          <div className="settings-drawer__mcp-endpoint">
-            <code className="settings-drawer__mcp-url">{myTicket}</code>
-            <button
-              type="button"
-              className="settings-drawer__about"
-              onClick={() => copy(myTicket)}
-            >
-              Copy
-            </button>
-          </div>
-          <p className="settings-drawer__hint">
-            On another device, open Settings → Sync and paste this ticket into
-            the "Add a peer device" field. Sync is end-to-end between your own
-            devices.
-          </p>
-        </div>
-      )}
-
-      <div className="settings-drawer__field" aria-label="Add a peer device">
-        <label htmlFor="settings-sync-peer-ticket">Add a peer device</label>
-        <div className="settings-drawer__mcp-endpoint">
-          <input
-            id="settings-sync-peer-ticket"
-            type="text"
-            className="settings-drawer__mcp-url"
-            placeholder="Paste ticket from the other device"
-            value={peerTicket}
-            onChange={(e) => setPeerTicket(e.target.value)}
-            disabled={addPeerPending}
-            aria-label="Peer ticket"
-          />
-          <button
-            type="button"
-            className="settings-drawer__about"
-            disabled={!peerTicket.trim() || addPeerPending}
-            onClick={() => void handleAddPeer()}
-          >
-            {addPeerPending ? "Adding…" : "Add"}
-          </button>
-        </div>
       </div>
 
       {openMeetingId && (

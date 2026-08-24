@@ -1056,52 +1056,6 @@ async syncStatus() : Promise<Result<SyncStatus, AppError>> {
 }
 },
 /**
- * Turn sync on WITHOUT signing in — the escape valve for a device that only
- * ever wants manual ticket pairing with its own other devices. Signing in
- * (`account_poll_pairing`) already turns sync on for that path; this command
- * exists because the Sync pane's ticket exchange is documented to work for a
- * device "not on your account" at all, so it must have its own way to start
- * the engine rather than depending on the account flow. Persists
- * `settings.connector_enabled = true` (see `SyncControl::set_enabled`), so it
- * survives a restart same as the sign-in path.
- */
-async enableSync() : Promise<Result<SyncStatus, AppError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("enable_sync") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * This device's shareable ticket string. The UI shows it (and/or a QR) so the
- * user can pair another of their devices, which calls [`sync_add_peer`] with it.
- * 
- * In the free build (or before any sync wiring) this returns an `Unsupported`
- * error — the Sync pane is absent from that bundle, so the command is never
- * invoked there.
- */
-async syncGetMyTicket() : Promise<Result<string, AppError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sync_get_my_ticket") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Register a peer device from its shareable ticket (produced by
- * [`sync_get_my_ticket`] on the other device).
- */
-async syncAddPeer(ticket: string) : Promise<Result<null, AppError>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("sync_add_peer", { ticket }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
  * Trigger a notes sync for one meeting with the paired peers. Progress and
  * completion arrive on the event bus (`AppEvent::SyncProgress` / `SyncReady`).
  */

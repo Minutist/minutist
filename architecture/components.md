@@ -842,12 +842,15 @@ account-capable. A post-launch GPU processing-node role adds `orchestrator`
 plus the ML-runtime crates (`asr-runtime` / `asr-parakeet` / `diarizer` /
 `summariser` / `model-registry`) as a separate table-update commit.
 
-**CLI surface:** the daemon runs by default; `print-ticket` briefly binds the
-sync engine to print this device's pairing ticket, minting a device identity
-as a side effect on a fresh data root; `add-peer <ticket>` authorises a peer
-without a restart; `status` prints the hub's state as JSON from a pure
-filesystem read with no engine bind, so an automated harness uses it as a
-read-only convergence oracle.
+**CLI surface:** the daemon runs by default; `login` signs the hub in to a
+Minutist account via the same RFC 8628 device-code flow the desktop uses
+(prints a URL to open, polls until approved, persists the credential) — the
+ONLY way the hub discovers peers now (manual ticket pairing removed; `sync`'s
+underlying `my_ticket`/`add_peer_from_ticket` primitives stay, since the
+phone client still uses them via `sync-ffi`, but neither the hub nor the
+desktop expose them any more); `status` prints the hub's state (including
+sign-in status) as JSON from a pure filesystem read with no engine bind, so
+an automated harness uses it as a read-only convergence oracle.
 
 Convergence behaviour, tracing, configuration, and packaging are documented
 in `cross-cutting.md` — "Headless server daemon". See

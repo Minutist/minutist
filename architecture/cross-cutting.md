@@ -1507,10 +1507,6 @@ change.
 │                               build only); owned by `app-main`; 0600
 ├── sync_node_key               0600 ed25519 sync device identity (connected build);
 │                               owned by `sync` — see "Device pairing" in components.md
-├── peers                       paired-device tickets, one per line; durable pairing
-│                               store, shared with the hub via `sync::peers`
-├── my_ticket                   this device's own pairing ticket, rewritten on each
-│                               sync bind (public addressing only); owned by `app-main`
 │
 │   The four entries below are placed at {app-data} by default.
 │   When settings.data_directory is set to a valid absolute path they move
@@ -1622,7 +1618,9 @@ absolute path at startup (`--data-dir`), entirely separate from any desktop's
 ```
 {data-dir}/                     absolute; supplied via --data-dir
 ├── sync_node_key               0600 ed25519 device identity; owned by `sync`
-├── peers                       paired-device tickets (one per line); via `add-peer`
+├── tunnel_device.json          0600 account credential, written by `minutist-hub
+│                               login` (device-code flow, same as desktop's
+│                               `app-main` — see "Device pairing" in components.md)
 ├── logs/                       rolling tracing appender (minutist-hub.log)
 └── meetings/                   owned by `persistence`, reached through `sync`
     ├── {uuid}/                 per-meeting folders (notes.ydoc, audio.opus, …;
@@ -1630,8 +1628,8 @@ absolute path at startup (`--data-dir`), entirely separate from any desktop's
     └── .blobs/                 iroh-blobs content store (redb); owned by `sync`
 ```
 
-It has no `settings.store` / `mcp_token` / `tunnel_device.json` / `models/` — the
-hub neither serves the UI nor, in the sync-hub role, runs models. The
+It has no `settings.store` / `mcp_token` / `models/` — the hub neither serves
+the UI nor, in the sync-hub role, runs models. The
 single-writer rule applies per data root: the daemon must be the sole process
 over its root, and must never point at a desktop's `{app-data}`.
 
@@ -2712,35 +2710,35 @@ to it as follows:
   (captured by journald under systemd) honouring `RUST_LOG`, defaulting to
   `info`, plus a rolling file appender under `{data_dir}/logs/` once the data
   root resolves. No `println!` / `eprintln!` for logging — the one-shot CLI
-  subcommands (`print-ticket` / `add-peer`) do write their result to stdout via
-  `println!`, but that is command output, not logging, and they do not initialise
-  the subscriber so stdout stays clean. The relay access token is never logged
-  (only whether one is set), mirroring the redacted `SyncConfig` Debug.
+  subcommands (`login` / `status` / `create-meeting`) do write their result to
+  stdout via `println!`, but that is command output, not logging, and they do
+  not initialise the subscriber so stdout stays clean. The relay access token
+  and account credential are never logged (only whether one is set), mirroring
+  the redacted `SyncConfig` Debug.
 - **Configuration + data root.** The data root is an absolute path supplied at
   startup (CLI `--data-dir` / config file / env), resolved BEFORE settings load —
   it is a startup argument, not a settings field. Other settings read from a
   `settings.store` under the daemon's own root.
-- **Operator surface.** The daemon has no GUI; pairing is via one-shot CLI
-  subcommands. `print-ticket` binds the engine briefly and prints this device's
-  pairing ticket to stdout (paste it into a desktop's Sync settings). `add-peer
-  <ticket>` validates a peer's ticket and appends it to `{data_dir}/peers` (one
-  ticket per line; `#` comments and blank lines ignored). The running daemon
-  re-reads `peers` on a fixed interval, so a peer added while it runs is authorised
-  without a restart — sync is mutual, so the peer must also add the hub's ticket. A
-  Unix-domain-socket admin API is the eventual production surface; this CLI/file
-  surface is the first cut.
+- **Operator surface.** The daemon has no GUI; pairing is account-mediated, via
+  a one-shot CLI subcommand. `login` runs the same RFC 8628 device-code flow as
+  desktop's account sign-in (prints a verification URL, and the code too when the
+  URL doesn't already carry it), and on approval writes `{data_dir}/tunnel_device.json`
+  (0600). The running daemon discovers peers on the account automatically —
+  see "Device pairing" in components.md; there is no separate device-to-device
+  pairing step or peer file. A Unix-domain-socket admin API is the eventual
+  production surface; this CLI surface is the first cut.
 - **Observability (test/CI instrumentation).** `status` prints the hub's state as
-  JSON to stdout (endpoint id, relay, authorised peers, held meetings each with a
-  content digest of their notes) — a pure filesystem read, no engine bind, no
-  contact with the running daemon, so an automated harness uses it as a convergence
-  oracle without `docker exec`'ing into the data dir. The digest is sha256 of the
-  notes `ydoc` PROJECTED to canonical JSON, so it is stable across converged
-  replicas (the raw CRDT encoding is not). The daemon emits a stable
+  JSON to stdout (endpoint id, relay, signed-in account id, held meetings each
+  with a content digest of their notes) — a pure filesystem read, no engine
+  bind, no contact with the running daemon, so an automated harness uses it as a
+  convergence oracle without `docker exec`'ing into the data dir. The digest is
+  sha256 of the notes `ydoc` PROJECTED to canonical JSON, so it is stable across
+  converged replicas (the raw CRDT encoding is not). The daemon emits a stable
   `minutist-hub ready` log marker once bound (a harness waits on it instead of
   sleeping). The timing constants are env-overridable in milliseconds
-  (`MINUTIST_HUB_POLL_MS` / `MINUTIST_HUB_PUSH_DEBOUNCE_MS` /
-  `MINUTIST_HUB_DISCOVERY_MS` / `MINUTIST_HUB_SHUTDOWN_GRACE_MS`) for a sub-second
-  test mode, and
+  (`MINUTIST_HUB_PUSH_DEBOUNCE_MS` / `MINUTIST_HUB_DISCOVERY_MS` /
+  `MINUTIST_HUB_TRASH_SWEEP_MS` / `MINUTIST_HUB_SHUTDOWN_GRACE_MS`) for a
+  sub-second test mode, and
   `MINUTIST_HUB_LOG_JSON=1` switches tracing to a structured JSON formatter for
   field-level event assertions. Production defaults are unchanged.
 - **Convergence (push-on-reconnect).** `SyncEngine` fires a bounded "peer arrived"

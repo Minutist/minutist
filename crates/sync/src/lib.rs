@@ -38,9 +38,11 @@
 //! Peers are learned two ways, both additive into one
 //! [`address_lookup::PeerDirectory`] backing iroh's `MemoryLookup`: manual ticket
 //! exchange ([`SyncEngine::my_ticket`] / [`SyncEngine::add_peer_from_ticket`],
-//! mutual, each side adds the other's) and account-mediated discovery
-//! ([`account`], a periodic loop fed by a consumer-supplied
-//! [`account::AccountEndpointSource`], so this crate takes no HTTP dependency).
+//! mutual, each side adds the other's — the phone client's only pairing path,
+//! via `sync-ffi`) and account-mediated discovery ([`account`], a periodic loop
+//! fed by a consumer-supplied [`account::AccountEndpointSource`], so this crate
+//! takes no HTTP dependency — desktop and the hub's exclusive path; neither
+//! frontend exposes manual ticket pairing to its own user any more).
 //!
 //! A re-advertised peer's address set replaces rather than unions with the tracked
 //! one, so a stale direct address cannot linger as a dead dial candidate that
@@ -85,7 +87,6 @@ pub mod frame;
 pub mod identity;
 pub mod media_proto;
 pub mod notes_proto;
-pub mod peers;
 pub(crate) mod timeouts;
 
 use std::path::PathBuf;

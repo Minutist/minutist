@@ -10,16 +10,16 @@ within the same trust boundary as your desktop. It is **not** the hosted relay
 It needs the connected-tier relay access token (`MINUTIST_SYNC_TOKEN`) — the same
 token the desktop's connected build uses.
 
-Pairing is mutual and the same on every platform:
+Sign the hub in to your Minutist account — the same device-code flow desktop's
+Connection pane uses. It prints a URL (and a code, if the URL doesn't already
+carry one); approve it in a browser signed in to the account:
 
 ```
-minutist-hub --data-dir <dir> print-ticket        # this hub's ticket -> paste into a desktop's Sync settings
-minutist-hub --data-dir <dir> add-peer <ticket>    # a desktop's ticket -> authorise it on the hub
+minutist-hub --data-dir <dir> login
 ```
 
-A running hub re-reads its `<dir>/peers` file periodically, so `add-peer` is
-honoured without a restart. Each desktop must also add the hub's ticket (sync is
-mutual).
+Every device signed in to that account, including this hub, then discovers and
+syncs with each other automatically — no separate per-device pairing step.
 
 ## Linux — container (Docker / Podman)
 
@@ -39,9 +39,8 @@ docker run -d --name minutist-hub --restart unless-stopped --network host \
   -v minutist-hub-data:/var/lib/minutist-hub \
   minutist-hub:latest
 
-# pair:
-docker exec minutist-hub minutist-hub --data-dir /var/lib/minutist-hub print-ticket
-docker exec minutist-hub minutist-hub --data-dir /var/lib/minutist-hub add-peer <desktop ticket>
+# sign in:
+docker exec -it minutist-hub minutist-hub --data-dir /var/lib/minutist-hub login
 ```
 
 To deploy to a host that has Docker but no Rust toolchain, build on a build host

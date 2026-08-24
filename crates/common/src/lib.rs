@@ -1601,8 +1601,8 @@ pub enum AppEvent {
     // --- Peer-to-peer notes sync (WS4-B S5) ------------------------------
     // These ride the existing `AppEventPayload` newtype + the single
     // `collect_events![AppEventPayload]` registration in `ipc-bridge` — no new
-    // event registration. They carry no peer ticket / device-key material; the
-    // shareable ticket crosses only the `sync_get_my_ticket` command's return.
+    // event registration. They carry no peer ticket / device-key material —
+    // sync turns on only via account sign-in, with no manual device pairing.
     /// A notes-sync transfer for a meeting made progress. The UI renders a
     /// per-meeting indicator: a determinate bar when `fraction` is `Some`
     /// (0.0..=1.0), an indeterminate spinner when `None`. A terminal

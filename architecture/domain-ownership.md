@@ -179,9 +179,10 @@ architecture-owner decision at that time.
 The `status` subcommand is a read-only filesystem oracle: it reports
 `endpoint_id: null` on a data root with no persisted `sync_node_key` rather
 than generating (and persisting) one just to fill the field, so pointing it at
-an unused root cannot silently mint device state. `print-ticket` mints an
-identity on first run when one is needed — that side effect is the point of
-the command, since a pairing ticket requires an identity to address.
+an unused root cannot silently mint device state. `login` never touches it
+either — a device-code sign-in identifies the device to the account service
+independently of the local iroh identity, which is minted only when the sync
+engine actually binds (the next `run_daemon`).
 
 ### `frontend-engineer`
 Owns everything under `ui/src/`. Knowledge expected: React 19, Tiptap +

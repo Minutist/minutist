@@ -17,21 +17,20 @@
 //! ## Commands
 //!
 //! - (no subcommand) — run the daemon: resolve the data root, start the sync
-//!   engine bound to the relay, load paired peers from `{data-dir}/peers`, and run
-//!   until `SIGTERM` / `SIGINT`.
-//! - `print-ticket` — print this device's pairing ticket to stdout and exit (paste
-//!   it into a desktop's Sync settings to pair). Unlike `status`, this briefly
-//!   binds the sync engine to obtain the addressed ticket, so on a fresh data
-//!   root it mints a device identity (an 0600 ed25519 key) as a side effect —
-//!   `status` never does this, which is why it is safe to poll as a read-only
-//!   oracle.
-//! - `add-peer <ticket>` — register a peer device by its pairing ticket, appending
-//!   it to `{data-dir}/peers`. A running daemon re-reads that file periodically, so
-//!   the new peer is authorised without a restart.
+//!   engine bound to the relay, and run until `SIGTERM` / `SIGINT`. Peers are
+//!   discovered exclusively via the signed-in account (see `login` below) — an
+//!   unauthenticated hub binds and serves but discovers no peers at all.
+//! - `login` — sign this hub in to a Minutist account via the same RFC 8628
+//!   device-code flow the desktop uses: prints a URL (and a code, when the
+//!   server doesn't pre-fill it) to open in any browser, polls until approved,
+//!   and persists the issued credential to `{data-dir}/tunnel_device.json`
+//!   (0600). This is now the ONLY way a hub gets peers — there is no manual
+//!   ticket exchange any more (removed; it existed only as an interim
+//!   mechanism before this flow was built).
 //! - `status` — print the hub's state as JSON to stdout and exit: endpoint id,
-//!   relay, authorised peers, and held meetings each with a content digest of their
-//!   notes. A read-only filesystem oracle for automated tests (it does not contact
-//!   the running daemon).
+//!   whether it's signed in (and to which account), and held meetings each
+//!   with a content digest of their notes. A read-only filesystem oracle for
+//!   automated tests (it does not contact the running daemon).
 //!
 //! Timing constants (poll / push-debounce / shutdown-grace) are overridable via
 //! env vars in milliseconds (a sub-second test mode) — see the constants below.
@@ -62,7 +61,7 @@
 //! ML-runtime crates (`asr-runtime`, `asr-parakeet`, `diarizer`, `summariser`,
 //! `model-registry`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -70,7 +69,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use iroh_tickets::endpoint::EndpointTicket;
 use minutist_common::{AppError, AppResult, DeletionState, MeetingId, ProcessingLifecycle};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -83,10 +81,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Default shutdown drain window; override `MINUTIST_HUB_SHUTDOWN_GRACE_MS`.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-
-/// Default peers-file re-read interval (honours `add-peer` without a restart);
-/// override `MINUTIST_HUB_POLL_MS`.
-const PEER_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Default minimum gap between reciprocal pushes to the same peer (so a rapidly
 /// reconnecting peer is not re-pushed every time); override
@@ -112,22 +106,19 @@ const ACCOUNT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// The default account API base URL. Overridable via `--relay-api-url`.
 const DEFAULT_API_URL: &str = "https://api.minutist.ai";
 
-/// The filename under `{data-dir}` that holds the seeded device credential.
-/// Written by an operator (or the e2e harness) — the hub never runs the
-/// interactive device-code flow.
+/// The filename under `{data-dir}` that holds the device credential issued by
+/// `login`. Also accepted if seeded directly by an operator or a test harness
+/// (the JSON shape is a stable contract — see [`StoredCredential`]).
 const CREDENTIAL_FILE: &str = "tunnel_device.json";
 
 /// The persisted device credential for account-mediated peer discovery
-/// (`{data-dir}/tunnel_device.json`). Seeded by the operator; the headless
-/// daemon reads it on startup but never writes it (no interactive pairing).
-///
-/// The three-field JSON shape is a contract with the seeding harness: the same
-/// file the desktop's `app-main` writes on successful pairing. A headless instance
-/// is seeded directly from the operator tooling rather than running the
-/// device-code flow.
+/// (`{data-dir}/tunnel_device.json`), written by [`login`] on a successful
+/// device-code pairing (or seeded directly — e.g. by a test harness — since
+/// the three-field JSON shape is the same file the desktop's `app-main`
+/// writes).
 ///
 /// `device_credential` is the long-lived `mdc_` bearer — never logged.
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct StoredCredential {
     device_credential: String,
     account_id: String,
@@ -136,9 +127,9 @@ struct StoredCredential {
 
 impl StoredCredential {
     /// Load the stored credential, or `None` when absent / unreadable / corrupt.
-    /// A missing file is the normal unauthenticated case; a corrupt file is
-    /// treated the same way (the operator can re-seed). Both paths leave the hub
-    /// running with peers-file pairing only — no panic, no startup failure.
+    /// A missing file is the normal not-signed-in case; a corrupt file is
+    /// treated the same way (re-run `login`). Both paths leave the hub running
+    /// with no peer discovery at all — no panic, no startup failure.
     fn load(data_dir: &Path) -> Option<Self> {
         let raw = std::fs::read_to_string(data_dir.join(CREDENTIAL_FILE)).ok()?;
         match serde_json::from_str::<Self>(&raw) {
@@ -152,6 +143,37 @@ impl StoredCredential {
                 );
                 None
             }
+        }
+    }
+
+    /// Persist the credential at `0600` (atomic create; owner-only mode
+    /// asserted for the pre-existing-file case too). Mirrors
+    /// `sync::identity`'s `write_key_file` discipline — the same reasoning
+    /// applies: `app-main`'s `write_secret_file` is private to that binary.
+    fn store(&self, data_dir: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        let path = data_dir.join(CREDENTIAL_FILE);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path)?;
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(json.as_bytes())?;
+            file.flush()
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::Write;
+            file.write_all(json.as_bytes())?;
+            file.flush()
         }
     }
 }
@@ -209,15 +231,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Print this device's pairing ticket to stdout and exit.
-    PrintTicket,
-    /// Register a peer device by its pairing ticket (append to `{data-dir}/peers`).
-    AddPeer {
-        /// The peer's pairing ticket, produced by `print-ticket` on that device
-        /// (or shown in a desktop's Sync settings).
-        ticket: String,
-    },
-    /// Print the hub's state as JSON (endpoint id, relay, authorised peers, held
+    /// Sign this hub in to a Minutist account (RFC 8628 device-code flow):
+    /// prints a URL to open in any browser, polls until approved, and
+    /// persists the issued credential to `{data-dir}/tunnel_device.json`.
+    Login,
+    /// Print the hub's state as JSON (endpoint id, sign-in status, held
     /// meetings + a content digest of each). A read-only oracle for tests.
     Status,
     /// Originate a new meeting in the hub's data directory and print its UUID to
@@ -237,15 +255,14 @@ async fn main() -> AppResult<()> {
 
     match cli.command {
         None => run_daemon(&data_dir, cli.relay_url, cli.relay_token, cli.relay_api_url).await,
-        Some(Command::PrintTicket) => print_ticket(&data_dir, cli.relay_url, cli.relay_token).await,
-        Some(Command::AddPeer { ticket }) => add_peer(&data_dir, &ticket),
+        Some(Command::Login) => login(&data_dir, &cli.relay_api_url).await,
         Some(Command::Status) => print_status(&data_dir, cli.relay_url),
         Some(Command::CreateMeeting { title }) => create_meeting(&data_dir, &title),
     }
 }
 
-/// Run the always-on daemon: start the engine, load paired peers, and serve until
-/// asked to stop.
+/// Run the always-on daemon: start the engine, start account-mediated peer
+/// discovery if signed in, and serve until asked to stop.
 async fn run_daemon(
     data_dir: &Path,
     relay_url: String,
@@ -274,21 +291,22 @@ async fn run_daemon(
     let engine = Arc::new(engine);
 
     tracing::info!(target: "hub", endpoint_id = %engine.endpoint_id(), "sync engine started");
-    // Log the pairing ticket so an operator can pair a desktop with this hub
-    // (`journalctl` surfaces it). The ticket carries only public addressing.
-    tracing::info!(target: "hub", ticket = %engine.my_ticket(), "pairing ticket");
+    if account_args.is_none() {
+        tracing::warn!(
+            target: "hub",
+            "not signed in (no {CREDENTIAL_FILE}); no peers will be discovered until `minutist-hub login` is run"
+        );
+    }
 
     // Stable readiness marker for an automated harness / `docker logs`: the hub is
     // bound and accepting. Relay homing follows lazily; an inbound dial that beats
     // it simply retries.
     tracing::info!(target: "hub", "minutist-hub ready");
 
-    // Authorise paired peers from the `peers` file and (if seeded) from the account
-    // directory; keep re-reading the peers file so an `add-peer` made while the
-    // daemon runs is picked up without a restart. Both discovery mechanisms stop
-    // on the daemon's shutdown signal inside serve_until_shutdown.
-    let mut seen: HashSet<String> = HashSet::new();
-    serve_until_shutdown(Arc::clone(&engine), data_dir, &mut seen, account_args).await;
+    // Peers are discovered exclusively via the account-directory loop (when
+    // signed in); it stops on the daemon's shutdown signal inside
+    // serve_until_shutdown.
+    serve_until_shutdown(Arc::clone(&engine), data_dir, account_args).await;
 
     tracing::info!(target: "hub", "shutdown signal received; draining in-flight sync");
     // Bound the drain: a systemd `stop` must see the process exit promptly. If the
@@ -325,50 +343,80 @@ async fn run_daemon(
     Ok(())
 }
 
-/// Print this device's pairing ticket to stdout and exit. No tracing is
-/// initialised so stdout carries only the ticket (suitable for scripting); the
-/// engine is bound briefly to obtain the addressed ticket, then shut down.
-async fn print_ticket(
-    data_dir: &Path,
-    relay_url: String,
-    relay_token: Option<String>,
-) -> AppResult<()> {
-    // `print-ticket` never runs the account-refresh loop; pass a dummy api_url.
-    let (engine, _account_args) =
-        start_engine(data_dir, relay_url, relay_token, DEFAULT_API_URL.to_string()).await?;
-    let ticket = engine.my_ticket();
-    // Command output (the purpose of this subcommand), not logging — println is
-    // the right channel here, distinct from the daemon's tracing.
-    println!("{ticket}");
-    let grace = dur_or_env("MINUTIST_HUB_SHUTDOWN_GRACE_MS", SHUTDOWN_GRACE);
-    let _ = tokio::time::timeout(grace, engine.shutdown()).await;
-    Ok(())
+/// Sign this hub in to a Minutist account via the RFC 8628 device-code flow —
+/// the same protocol `src-tauri/src/account.rs` drives for the desktop, here
+/// driven as a blocking CLI loop instead of a polled IPC command (there is no
+/// UI to poll from). Prints the URL to open (and the code, only when the
+/// server didn't pre-fill it — see `PairingStart::open_url` /
+/// `code_required`'s reasoning on the desktop side) and blocks until the user
+/// approves, is declined, or the code expires. On success, persists the
+/// credential and exits 0; the next `run_daemon` picks it up.
+async fn login(data_dir: &Path, api_url: &str) -> AppResult<()> {
+    let client = tunnel_client::DeviceCodeClient::new(api_url.to_string())
+        .map_err(map_pairing_err)?;
+    let start = client
+        .start(Some("Minutist hub"))
+        .await
+        .map_err(map_pairing_err)?;
+
+    println!("Open this URL to sign in: {}", start.open_url());
+    if start.verification_uri_complete.is_none() {
+        println!("Then enter this code: {}", start.user_code);
+    }
+
+    let mut interval = start.initial_interval();
+    loop {
+        tokio::time::sleep(interval).await;
+        match client.poll_once(&start.device_code).await {
+            Ok(tunnel_client::PollOutcome::Pending) => {}
+            Ok(tunnel_client::PollOutcome::SlowDown) => {
+                interval = tunnel_client::next_interval(interval);
+            }
+            Ok(tunnel_client::PollOutcome::Authorised(issued)) => {
+                let credential = StoredCredential {
+                    device_credential: issued.device_credential,
+                    account_id: issued.account_id,
+                    device_id: issued.device_id,
+                };
+                credential.store(data_dir).map_err(|e| AppError::Io {
+                    context: format!("writing {CREDENTIAL_FILE}: {e}"),
+                })?;
+                println!("Signed in as account {}.", credential.account_id);
+                return Ok(());
+            }
+            Err(e) => return Err(map_pairing_err(e)),
+        }
+    }
 }
 
-/// Register a peer by its pairing ticket: validate it, then append it to
-/// `{data-dir}/peers` (deduplicated). A running daemon picks it up on its next
-/// poll; otherwise it is loaded at the next start.
-fn add_peer(data_dir: &Path, ticket: &str) -> AppResult<()> {
-    let path = sync::peers::peers_path(data_dir);
-    match sync::peers::append(data_dir, ticket) {
-        Ok(sync::peers::AppendOutcome::Added) => {
-            println!("registered peer in {}", path.display());
-            Ok(())
-        }
-        Ok(sync::peers::AppendOutcome::AlreadyPresent) => {
-            println!("peer already registered in {}", path.display());
-            Ok(())
-        }
-        // A malformed ticket is bad operator input; keep the InvalidInput variant
-        // (the parse guard in `sync::peers::append` surfaces it as `Protocol`).
-        Err(sync::Error::Protocol(msg)) => Err(AppError::InvalidInput { context: msg }),
-        // Keep the Io variant + the peers-file path so an operator sees WHICH
-        // write failed; the blanket `From` would flatten this to `Internal` and
-        // drop the path.
-        Err(sync::Error::Io(e)) => Err(AppError::Io {
-            context: format!("writing peers file {}: {e}", path.display()),
-        }),
-        Err(e) => Err(AppError::from(e)),
+/// Map a `tunnel-client` pairing error to the CLI's error type. Mirrors
+/// `src-tauri/src/account.rs::map_pairing_err` (duplicated rather than shared
+/// — `headless` and `src-tauri` are separate binaries with no edge between
+/// them, and the mapping is a few lines).
+fn map_pairing_err(e: tunnel_client::PairingError) -> AppError {
+    use tunnel_client::PairingError;
+    match e {
+        PairingError::Config => AppError::InvalidInput {
+            context: "the relay api URL must be https:// (or a loopback http://)".to_string(),
+        },
+        PairingError::Transport(_) => AppError::Io {
+            context: "could not reach the account service".to_string(),
+        },
+        PairingError::Status { status } => AppError::Internal {
+            context: format!("the account service returned status {status}"),
+        },
+        PairingError::Decode(_) => AppError::Internal {
+            context: "the account service returned an unexpected response".to_string(),
+        },
+        PairingError::Expired => AppError::InvalidInput {
+            context: "the pairing code expired; run login again".to_string(),
+        },
+        PairingError::AccessDenied => AppError::InvalidInput {
+            context: "pairing was declined".to_string(),
+        },
+        PairingError::MalformedAuthorisation => AppError::Internal {
+            context: "the account service returned a malformed authorisation".to_string(),
+        },
     }
 }
 
@@ -397,8 +445,9 @@ struct HubStatus {
     /// reports that state rather than minting one just to fill this field.
     endpoint_id: Option<String>,
     relay_url: String,
-    /// Authorised peers (their `EndpointId`s), resolved from the peers file.
-    peers: Vec<String>,
+    /// The signed-in account, or `None` when `login` has not been run (or the
+    /// stored credential is corrupt) — the hub then discovers no peers at all.
+    account_id: Option<String>,
     /// Meetings the hub holds, each with a content digest of its notes.
     meetings: Vec<MeetingStatus>,
 }
@@ -414,9 +463,9 @@ struct MeetingStatus {
 
 /// Print the hub's state as JSON to stdout and exit. A pure filesystem read (no
 /// tracing init, no engine bind, and no identity generation; it does NOT contact
-/// the running daemon), so an automated harness can use it as an oracle: which
-/// peers are authorised and which meetings the hub holds, with a per-meeting
-/// notes digest for convergence assertions.
+/// the running daemon), so an automated harness can use it as an oracle:
+/// sign-in state and which meetings the hub holds, with a per-meeting notes
+/// digest for convergence assertions.
 fn print_status(data_dir: &Path, relay_url: String) -> AppResult<()> {
     let status = build_status(data_dir, relay_url)?;
     let json = serde_json::to_string_pretty(&status).map_err(|e| AppError::Internal {
@@ -441,11 +490,7 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
         None
     };
 
-    let peers: Vec<String> = sync::peers::read_peer_tickets(data_dir)
-        .iter()
-        .filter_map(|t| t.parse::<EndpointTicket>().ok())
-        .map(|t| iroh::EndpointAddr::from(t).id.to_string())
-        .collect();
+    let account_id = StoredCredential::load(data_dir).map(|c| c.account_id);
 
     let meetings_root = data_dir.join("meetings");
     let mut meetings: Vec<MeetingStatus> = notes_crdt::folder::list_meeting_ids(&meetings_root)
@@ -464,7 +509,7 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
     Ok(HubStatus {
         endpoint_id,
         relay_url,
-        peers,
+        account_id,
         meetings,
     })
 }
@@ -498,8 +543,8 @@ fn meeting_digest(meetings_root: &Path, meeting: MeetingId) -> Option<String> {
 
 /// Arguments for the account-refresh loop, built by `start_engine` when a seeded
 /// device credential is present. Consumed by `serve_until_shutdown`, which drives
-/// [`run_account_refresh_loop_v2`] as a third select! arm alongside the peers-file
-/// poll and the discovery sweep, cancelling it on the daemon's shutdown signal.
+/// [`run_account_refresh_loop_v2`] as a select! arm alongside the discovery sweep,
+/// cancelling it on the daemon's shutdown signal.
 struct AccountRefreshArgs {
     source: Arc<dyn AccountEndpointSource>,
     self_endpoint: AccountEndpoint,
@@ -535,14 +580,43 @@ async fn bind_sync_engine(
     SyncEngine::start(config, identity).await
 }
 
+/// Adds every ticket in `MINUTIST_HUB_TEST_PEERS` (comma-separated) directly to
+/// the engine's peer directory via [`SyncEngine::add_peer_from_ticket`] — the
+/// same primitive `sync-ffi`'s manual pairing calls, here driven from an env var
+/// instead of a UI.
+///
+/// Exists solely for `hub_e2e`'s local, account-free runs, which have no
+/// account service to discover peers through. Gated behind `test-support`: this
+/// whole function — env var included — compiles only in a test build, so it
+/// cannot exist in a shipped binary regardless of the environment it runs in.
+#[cfg(feature = "test-support")]
+fn seed_test_peers(engine: &SyncEngine) {
+    let Some(raw) = std::env::var_os("MINUTIST_HUB_TEST_PEERS") else {
+        return;
+    };
+    for ticket in raw
+        .to_string_lossy()
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        if let Err(e) = engine.add_peer_from_ticket(ticket) {
+            tracing::warn!(target: "hub", error = %e, "MINUTIST_HUB_TEST_PEERS: invalid ticket");
+        }
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn seed_test_peers(_engine: &SyncEngine) {}
+
 /// Build and start the sync engine for `data_dir` against the given relay.
 ///
 /// When a seeded device credential is present at
 /// `{data_dir}/tunnel_device.json`, also prepares the `AccountRefreshArgs`
 /// needed by the account-mediated peer-discovery loop. If the credential is
 /// absent or the account-directory client cannot be built, logs at `info` and
-/// returns `None` — the daemon falls back to peers-file pairing only, with no
-/// startup failure.
+/// returns `None` — the daemon then discovers no peers at all until
+/// `minutist-hub login` provisions one, with no startup failure.
 async fn start_engine(
     data_dir: &Path,
     relay_url: String,
@@ -569,17 +643,18 @@ async fn start_engine(
     // is dialled lazily, so the engine starts even if the relay is momentarily
     // unreachable.
     let engine = bind_sync_engine(config, identity).await?;
+    seed_test_peers(&engine);
 
     // Account-mediated peer discovery (5.5b / B4): when a seeded device credential
     // is present, build the account-directory source so serve_until_shutdown can run
-    // the refresh loop as a third select! arm alongside the peers-file poll and the
-    // discovery sweep. When absent, the daemon falls back to peers-file pairing only.
+    // the refresh loop as a select! arm alongside the discovery sweep. When absent,
+    // the daemon discovers no peers at all.
     let account_args = match StoredCredential::load(data_dir) {
         None => {
             tracing::info!(
                 target: "hub",
                 "no device credential found; account-mediated peer discovery disabled \
-                 (seed {CREDENTIAL_FILE} to enable)"
+                 (run `minutist-hub login` to enable)"
             );
             None
         }
@@ -622,21 +697,18 @@ async fn start_engine(
     Ok((engine, account_args))
 }
 
-/// Serve until `SIGTERM` / `SIGINT`. The peers file is re-read on a fixed interval
-/// (so `add-peer` is honoured without a restart, and the interval's immediate
-/// first tick performs the initial load); on each "peer arrived" event the hub
+/// Serve until `SIGTERM` / `SIGINT`. On each "peer arrived" event the hub
 /// reciprocally pushes every meeting it holds to that peer (debounced per peer) —
 /// so a device that reconnects both deposits and collects, converging through the
 /// hub — and that push rides a lifecycle discovery in the same flow (§7); and a
 /// periodic discovery sweep re-advertises so a lifecycle state a consumer dropped
 /// or skipped is re-applied (the recovery driver).
 ///
-/// When `account_args` is `Some`, the account-refresh loop runs as a THIRD select!
-/// arm alongside the peers-file poll and the discovery sweep. Both discovery
-/// mechanisms (peers-file + account-directory) are additive — they feed the same
-/// `PeerDirectory` — and both stop on this function's shutdown signal. The loop is
-/// NOT detached: running it inline here means it cannot outlive this function and
-/// cannot race `engine.shutdown()` after this returns.
+/// When `account_args` is `Some`, the account-refresh loop runs as a select! arm
+/// alongside the discovery sweep — the ONLY peer-discovery mechanism now (manual
+/// ticket pairing removed). The loop is NOT detached: running it inline here
+/// means it cannot outlive this function and cannot race `engine.shutdown()`
+/// after this returns.
 ///
 /// The lifecycle-event CONSUMER runs in a dedicated spawned task
 /// ([`apply_lifecycle_events`]), NOT in this select loop: the loop awaits the
@@ -647,10 +719,8 @@ async fn start_engine(
 async fn serve_until_shutdown(
     engine: Arc<SyncEngine>,
     data_dir: &Path,
-    seen: &mut HashSet<String>,
     account_args: Option<AccountRefreshArgs>,
 ) {
-    let mut poll = tokio::time::interval(dur_or_env("MINUTIST_HUB_POLL_MS", PEER_POLL_INTERVAL));
     let debounce = dur_or_env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", PEER_PUSH_DEBOUNCE);
     let mut discovery_poll =
         tokio::time::interval(dur_or_env("MINUTIST_HUB_DISCOVERY_MS", DISCOVERY_INTERVAL));
@@ -714,11 +784,10 @@ async fn serve_until_shutdown(
     'serve: loop {
         tokio::select! {
             _ = &mut shutdown => break 'serve,
-            // Third arm: account-mediated peer discovery. Runs alongside the peers-file
-            // poll. Both feed the same PeerDirectory. This arm fires only when the loop
-            // exits (on cancel); under normal operation it parks here.
+            // Account-mediated peer discovery, the only discovery mechanism now.
+            // This arm fires only when the loop exits (on cancel); under normal
+            // operation it parks here.
             _ = &mut account_refresh => {}
-            _ = poll.tick() => { sync::peers::reload_into(&engine, data_dir, seen); },
             _ = trash_sweep_poll.tick() => {
                 // Purge this hub's own expired trash. Blocking `std::fs` work run
                 // directly (not `spawn_blocking`): the hub has no dedicated worker
@@ -947,19 +1016,6 @@ mod tests {
         assert!(target.is_dir(), "the data dir must be created");
     }
 
-    // Peers-file parsing (comment/blank skipping, missing-file → empty) is tested
-    // in `sync::peers`, the shared implementation this binary now delegates to.
-
-    #[test]
-    fn add_peer_rejects_a_malformed_ticket() {
-        let base = tempfile::tempdir().expect("tempdir");
-        let err = add_peer(base.path(), "not-a-real-ticket")
-            .expect_err("a malformed ticket must be rejected");
-        assert!(matches!(err, AppError::InvalidInput { .. }));
-        // Nothing should have been written.
-        assert!(!sync::peers::peers_path(base.path()).exists());
-    }
-
     #[test]
     fn status_helpers_list_and_digest_meetings() {
         let base = tempfile::tempdir().expect("tempdir");
@@ -1065,5 +1121,45 @@ mod tests {
 
         let result = StoredCredential::load(base.path());
         assert_eq!(result, None, "corrupt JSON returns None");
+    }
+
+    #[test]
+    fn stored_credential_store_round_trips_at_0600() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let cred = StoredCredential {
+            device_credential: "mdc_dev.secret".to_string(),
+            account_id: "acct-1".to_string(),
+            device_id: "dev-1".to_string(),
+        };
+        cred.store(base.path()).expect("store");
+        let loaded = StoredCredential::load(base.path()).expect("load");
+        assert_eq!(loaded, cred);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(base.path().join(CREDENTIAL_FILE))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "credential file must be owner-only");
+        }
+    }
+
+    #[test]
+    fn pairing_errors_map_without_leaking() {
+        assert!(matches!(
+            map_pairing_err(tunnel_client::PairingError::Expired),
+            AppError::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            map_pairing_err(tunnel_client::PairingError::AccessDenied),
+            AppError::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            map_pairing_err(tunnel_client::PairingError::Status { status: 500 }),
+            AppError::Internal { .. }
+        ));
     }
 }

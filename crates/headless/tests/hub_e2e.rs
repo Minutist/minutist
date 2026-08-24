@@ -62,11 +62,16 @@ fn projected(root: &std::path::Path, meeting: MeetingId) -> serde_json::Value {
 /// `insecure_relay_tls` sets `MINUTIST_HUB_INSECURE_RELAY_TLS` so the daemon
 /// trusts that relay's self-signed certificate instead of verifying it — the
 /// `test-support`-gated escape hatch in `src/main.rs`'s `bind_sync_engine`.
+/// `test_peers` are the peers' own tickets (`SyncEngine::my_ticket`), fed to the
+/// daemon via `MINUTIST_HUB_TEST_PEERS` (`src/main.rs`'s `seed_test_peers`,
+/// also `test-support`-gated) since the daemon has no account to discover them
+/// through in this local test.
 fn spawn_hub(
     hub_dir: &std::path::Path,
     relay_url: &str,
     token: Option<&str>,
     insecure_relay_tls: bool,
+    test_peers: &[String],
 ) -> (tokio::process::Child, tokio::sync::oneshot::Receiver<()>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"));
@@ -80,7 +85,6 @@ fn spawn_hub(
         .env("RUST_LOG", "hub=info,iroh=error,iroh_relay=error")
         // Collapse the hub's timers so reconnect/push/discovery scenarios run
         // sub-second.
-        .env("MINUTIST_HUB_POLL_MS", "200")
         .env("MINUTIST_HUB_PUSH_DEBOUNCE_MS", "200")
         .env("MINUTIST_HUB_DISCOVERY_MS", "500")
         .stdout(Stdio::null())
@@ -91,6 +95,9 @@ fn spawn_hub(
     }
     if insecure_relay_tls {
         command.env("MINUTIST_HUB_INSECURE_RELAY_TLS", "1");
+    }
+    if !test_peers.is_empty() {
+        command.env("MINUTIST_HUB_TEST_PEERS", test_peers.join(","));
     }
     let mut child = command.spawn().expect("spawn minutist-hub");
     let stderr = child.stderr.take().expect("hub stderr piped");
@@ -234,8 +241,9 @@ async fn notes_converge_through_a_running_hub() {
         (a, b)
     };
 
-    // The hub must authorise A and B on startup — write their tickets to its peers
-    // file before launching it (the daemon loads the file as it comes up).
+    // The hub must authorise A and B on startup — feed their tickets in via
+    // MINUTIST_HUB_TEST_PEERS (see `spawn_hub`'s doc); the daemon has no account
+    // to discover them through here.
     //
     // These are FULL tickets (`my_ticket()` carries direct socket addrs), so the hub
     // learns A/B's direct addrs. This test's relay-requirement rests on the hub NEVER
@@ -247,17 +255,19 @@ async fn notes_converge_through_a_running_hub() {
     // could fetch over a direct localhost path with the relay down — a false positive.
     // relay_live is the structurally relay-only proof (both ends withhold direct
     // addrs); this test's role is the local-relay + hub-binary integration.
-    std::fs::write(
-        hub_dir.path().join("peers"),
-        format!("{}\n{}\n", engine_a.my_ticket(), engine_b.my_ticket()),
-    )
-    .expect("write hub peers file");
+    let test_peers = [engine_a.my_ticket(), engine_b.my_ticket()];
 
     // Launch the real daemon (collapsed timers; readiness via its stderr marker).
-    // It reloads `hub_id` and the peers; kill_on_drop cleans up on panic. On the
-    // local path it is told (via `insecure`) to trust the relay's self-signed
-    // certificate the same way the in-process engines above do.
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, token.as_deref(), insecure);
+    // It reloads `hub_id` and adds the seeded peers; kill_on_drop cleans up on
+    // panic. On the local path it is told (via `insecure`) to trust the relay's
+    // self-signed certificate the same way the in-process engines above do.
+    let (mut hub, ready) = spawn_hub(
+        hub_dir.path(),
+        &relay_url,
+        token.as_deref(),
+        insecure,
+        &test_peers,
+    );
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")
@@ -371,13 +381,9 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     .await
     .expect("engine B");
 
-    std::fs::write(
-        hub_dir.path().join("peers"),
-        format!("{}\n{}\n", engine_a.my_ticket(), engine_b.my_ticket()),
-    )
-    .expect("write hub peers");
+    let test_peers = [engine_a.my_ticket(), engine_b.my_ticket()];
 
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false);
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false, &test_peers);
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")
@@ -479,13 +485,9 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
     .await
     .expect("engine A");
 
-    std::fs::write(
-        hub_dir.path().join("peers"),
-        format!("{}\n", engine_a.my_ticket()),
-    )
-    .expect("write hub peers");
+    let test_peers = [engine_a.my_ticket()];
 
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false);
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false, &test_peers);
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")

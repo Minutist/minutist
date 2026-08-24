@@ -3195,7 +3195,6 @@ dependencies = [
  "clap",
  "headless",
  "iroh",
- "iroh-tickets",
  "minutist-common",
  "notes-crdt",
  "persistence",

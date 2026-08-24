@@ -1,21 +1,21 @@
 /**
  * Sync engine live-state store (WS4-B S5).
  *
- * Holds the sync engine's current status (sourced from `sync_status`), this
- * device's shareable ticket, a pending-add-peer field, and the live in-flight
- * transfer (label + fraction). The backend emits `AppEvent::SyncProgress /
- * SyncReady / SyncError` while a transfer is running: `SyncProgress` updates
- * the in-flight state (the Sync pane renders "Syncing…" from it), and a
- * terminal `SyncReady` / `SyncError` clears it. `SyncReady` also queues a
- * toast the `MainWindow` chrome strip renders, and reloads the meeting list +
- * the open meeting so synced-in content surfaces without a manual refresh.
+ * Holds the sync engine's current status (sourced from `sync_status`) and
+ * the live in-flight transfer (label + fraction). The backend emits
+ * `AppEvent::SyncProgress / SyncReady / SyncError` while a transfer is
+ * running: `SyncProgress` updates the in-flight state (the Sync pane renders
+ * "Syncing…" from it), and a terminal `SyncReady` / `SyncError` clears it.
+ * `SyncReady` also queues a toast the `MainWindow` chrome strip renders, and
+ * reloads the meeting list + the open meeting so synced-in content surfaces
+ * without a manual refresh.
  *
  * `refresh()` re-reads `sync_status`; called on mount so the pane opens with
- * the live state rather than the initial `null`. `fetchTicket()` fetches
- * `sync_get_my_ticket` on demand (once per session; cached thereafter).
- * `addPeer(ticket)` calls `sync_add_peer` and surfaces any error.
- * `syncNow(meetingId)` calls `sync_now`; progress + completion arrive on the
- * event bus, not in the return value.
+ * the live state rather than the initial `null`. `syncNow(meetingId)` calls
+ * `sync_now`; progress + completion arrive on the event bus, not in the
+ * return value. Sync turns on automatically once the device signs in
+ * (`account-status.ts`) — there is no separate enable action and no manual
+ * device pairing.
  *
  * The sync channel is end-to-end between the user's own paired devices. It is
  * distinct from the connector channel, which transits content to the AI vendor
@@ -46,11 +46,6 @@ export type SyncStatusStore = {
    * `SyncError` clears it. The Sync pane shows a "Syncing…" state from this.
    */
   inProgress: SyncInProgress | null;
-  /**
-   * This device's shareable ticket string (the `sync_get_my_ticket` result),
-   * or `null` when it has not been fetched yet.
-   */
-  myTicket: string | null;
   /** A human-readable error from the last action, or `null`. */
   lastError: string | null;
   /**
@@ -61,17 +56,6 @@ export type SyncStatusStore = {
   pendingReadyNotifications: MeetingId[];
   /** Re-fetch `sync_status`. */
   refresh: () => Promise<void>;
-  /**
-   * Turn sync on without signing in, via `enable_sync` — the escape valve for
-   * a device that only wants manual ticket pairing with its own other
-   * devices. Signing in already turns sync on for that path; this exists so
-   * the ticket exchange below works on its own, unsigned-in.
-   */
-  enable: () => Promise<void>;
-  /** Fetch (and cache) this device's ticket via `sync_get_my_ticket`. */
-  fetchTicket: () => Promise<void>;
-  /** Register a peer device from its shareable ticket. */
-  addPeer: (ticket: string) => Promise<void>;
   /** Trigger a notes sync for one meeting with paired peers. */
   syncNow: (meetingId: MeetingId) => Promise<void>;
   /** Dismiss a pending sync-ready toast by meeting id. */
@@ -83,7 +67,6 @@ export type SyncStatusStore = {
 export const useSyncStatusStore = create<SyncStatusStore>((set) => ({
   status: null,
   inProgress: null,
-  myTicket: null,
   lastError: null,
   pendingReadyNotifications: [],
 
@@ -91,33 +74,6 @@ export const useSyncStatusStore = create<SyncStatusStore>((set) => ({
     try {
       const status = unwrap(await commands.syncStatus());
       set({ status });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
-  },
-
-  enable: async () => {
-    try {
-      const status = unwrap(await commands.enableSync());
-      set({ status, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
-  },
-
-  fetchTicket: async () => {
-    try {
-      const ticket = unwrap(await commands.syncGetMyTicket());
-      set({ myTicket: ticket, lastError: null });
-    } catch (err) {
-      set({ lastError: err instanceof Error ? err.message : String(err) });
-    }
-  },
-
-  addPeer: async (ticket) => {
-    try {
-      unwrap(await commands.syncAddPeer(ticket));
-      set({ lastError: null });
     } catch (err) {
       set({ lastError: err instanceof Error ? err.message : String(err) });
     }

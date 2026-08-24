@@ -145,12 +145,12 @@ pub struct ConnectedState {
     pub account: Arc<dyn AccountControl>,
     /// The peer-to-peer notes-sync control surface (WS4-B S5). `app-main` injects
     /// a `connected`-gated implementation (holding the `sync` engine: iroh
-    /// endpoint + pairing + notes-sync protocol); the free build (and a connected
-    /// build with no sync wiring) gets [`crate::sync::DisabledSync`], which
-    /// reports `Disabled` and rejects ticket / peer / sync operations as
-    /// unsupported. The sync IPC commands (`sync_status`, `sync_get_my_ticket`,
-    /// `sync_add_peer`, `sync_now`) call through this trait so `ipc-bridge` takes
-    /// no `sync` dependency edge — the same seam as [`Self::account`].
+    /// endpoint + account-mediated discovery + notes-sync protocol); the free
+    /// build (and a connected build with no sync wiring) gets
+    /// [`crate::sync::DisabledSync`], which reports `Disabled` and rejects sync
+    /// operations as unsupported. The sync IPC commands (`sync_status`,
+    /// `sync_now`) call through this trait so `ipc-bridge` takes no `sync`
+    /// dependency edge — the same seam as [`Self::account`].
     pub sync: Arc<dyn SyncControl>,
     /// The live MCP server endpoint, set by `app-main` after `mcp_server::serve`
     /// binds (Phase 10). `None` when the MCP server is disabled or not yet

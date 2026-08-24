@@ -67,20 +67,8 @@ use tokio_util::sync::CancellationToken;
 /// `AccessControl`; it is never logged.
 const RELAY_TOKEN_ENV: &str = "MINUTIST_SYNC_TOKEN";
 
-/// The file under `{app-data}` where the desktop writes its OWN pairing ticket on
-/// each engine bind, so another device can be paired out-of-band without reading
-/// it from the Sync pane. Public addressing only (no secret) — a sibling of the
-/// device key (`sync_node_key`).
-const MY_TICKET_FILE: &str = "my_ticket";
-
-/// How often the bound engine re-reads `{app-data}/peers`, so a ticket appended
-/// while the app is running is authorised without a restart (the load on bind
-/// covers the already-present peers).
-const PEERS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// How often the account-refresh loop (B4) re-fetches the account's device
-/// directory to discover newly-registered peers. Coarser than the peers-file
-/// poll — account membership changes rarely, and each tick is a relay round-trip.
+/// directory to discover newly-registered peers.
 const ACCOUNT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The mutable runtime state, guarded by one async mutex held only briefly. A
@@ -282,55 +270,21 @@ impl ConnectedSync {
                 let engine = Arc::new(engine);
 
                 // One cancellation token shared by this bind's background loops
-                // (the peers-file poll and, when account-paired, the account-
-                // refresh loop v2). Stored in `Runtime` below; a prior bind's
-                // token is `cancel()`-led before we replace it. The single shared
-                // token that closes issue 0029 item 1 on the desktop; latching, so
-                // a mid-loop cancel is never missed.
+                // (the account-refresh loop v2, when account-paired). Stored in
+                // `Runtime` below; a prior bind's token is `cancel()`-led before we
+                // replace it. The single shared token that closes issue 0029 item 1
+                // on the desktop; latching, so a mid-loop cancel is never missed.
                 let stop = CancellationToken::new();
 
-                // Peers-file pairing (shared with the headless hub via
-                // `sync::peers`). The engine's `PeerDirectory` is in-memory and
-                // forgets peers on exit; the `{app-data}/peers` file gives the
-                // desktop peer PERSISTENCE across restarts AND a filesystem pairing
-                // surface an external tool can drive without the Sync pane. Load
-                // the already-paired peers on bind, then poll so a ticket appended
-                // while running is authorised without a restart.
-                let mut seen = std::collections::HashSet::new();
-                sync::peers::reload_into(&engine, &app_data_base, &mut seen);
-                // Expose this device's own ticket for out-of-band pairing. Written
-                // on every bind (the addressed ticket can change across binds).
-                // Best-effort: a failure only means it must be read from the Sync
-                // pane instead.
-                match std::fs::write(app_data_base.join(MY_TICKET_FILE), engine.my_ticket()) {
-                    Ok(()) => tracing::info!(target: "app-main", "sync: wrote pairing ticket to {MY_TICKET_FILE}"),
-                    Err(e) => tracing::warn!(target: "app-main", error = %e, "sync: could not write pairing ticket file"),
-                }
-                {
-                    let engine = Arc::clone(&engine);
-                    let root = app_data_base.clone();
-                    let stop = stop.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let mut poll = tokio::time::interval(PEERS_POLL_INTERVAL);
-                        poll.tick().await; // immediate first tick — the bind load already ran.
-                        loop {
-                            tokio::select! {
-                                _ = stop.cancelled() => break,
-                                _ = poll.tick() => {
-                                    sync::peers::reload_into(&engine, &root, &mut seen);
-                                }
-                            }
-                        }
-                    });
-                }
-
-                // Account-mediated peer discovery (B4): when the device is
-                // account-paired, publish this device's endpoint to the account
-                // directory and add every other account device's endpoint as a
-                // peer, refreshing on an interval. Additive to peers-file pairing
-                // (the account source is primary when signed-in; the peers file
-                // stays a local fallback). Shares `stop` with the peers poll so a
-                // re-bind cancels both together.
+                // Account-mediated peer discovery (B4) is the desktop's ONLY
+                // peer-discovery mechanism now: when the device is signed in,
+                // publish this device's endpoint to the account directory and add
+                // every other account device's endpoint as a peer, refreshing on
+                // an interval. (Manual ticket pairing — the peers file, `my_ticket`
+                // — existed only as an interim mechanism before this shipped, and
+                // has been removed; `sync::SyncEngine::my_ticket`/
+                // `add_peer_from_ticket` still exist for the phone client, which
+                // has no account-mediated path of its own yet.)
                 if let Some(cred) = crate::account::load_device_credential(&app_data_base) {
                     let settings = self.settings.current();
                     match tunnel_client::AccountDirectoryClient::new(
@@ -502,26 +456,6 @@ impl SyncControl for ConnectedSync {
         }
     }
 
-    async fn my_ticket(&self) -> AppResult<String> {
-        Ok(self.engine().await?.my_ticket())
-    }
-
-    async fn add_peer(&self, ticket: String) -> AppResult<()> {
-        let engine = self.engine().await?;
-        let peer = engine
-            .add_peer_from_ticket(&ticket)
-            .map_err(minutist_common::AppError::from)?;
-        // Persist the pairing so it survives a restart and stays consistent with a
-        // filesystem-driven add-peer. Best-effort: the in-memory registration above
-        // already succeeded, so a peers-file write failure must not fail the
-        // command — the peer is paired for this session regardless.
-        if let Err(e) = sync::peers::append(&self.app_data_base, &ticket) {
-            tracing::warn!(target: "app-main", error = %e, "sync: peer registered in-memory but not persisted to peers file");
-        }
-        tracing::info!(target: "app-main", peer = %peer, "sync: registered peer from ticket");
-        Ok(())
-    }
-
     async fn sync_now(&self, meeting_id: MeetingId) -> AppResult<()> {
         let engine = self.engine().await?;
         let peers = engine.peer_ids();
@@ -635,12 +569,10 @@ impl SyncControl for ConnectedSync {
     }
 
     async fn set_enabled(&self, enabled: bool) -> AppResult<()> {
-        // F5: request the engine start. Two callers: a successful sign-in
-        // (`account_poll_pairing`) and the Sync pane's own "Turn on sync"
-        // fallback for a device that wants manual ticket pairing without ever
-        // signing in (`enable_sync`) — persisting the setting here, not just
-        // in the account path, keeps both self-contained: whichever caller
-        // turns sync on, it survives a restart. `request_start` is idempotent
+        // F5: request the engine start. The only caller is a successful
+        // sign-in (`account_poll_pairing`) — persisting the setting here, not
+        // just in the account path, means it survives a restart regardless of
+        // which sign-in path called it. `request_start` is idempotent
         // (an atomic-guarded one-shot), so this is safe whether the engine is
         // already running, already starting, or has never been requested.
         //
@@ -885,14 +817,11 @@ mod tests {
     }
 
     /// `set_enabled(true)` must persist `settings.connector_enabled` and move
-    /// the status off `Disabled` WITHOUT needing network access — regression
-    /// coverage for the account-free manual-pairing escape valve
-    /// (`enable_sync`): before this, nothing but a successful sign-in could
-    /// ever flip `connector_enabled`, so a device that never signs in had no
-    /// way to turn sync on at all despite the Sync pane's own copy promising
-    /// the ticket exchange works "for a device not on your account". Does not
-    /// use `bound_device()` (which polls for a real network bind) — this only
-    /// asserts the synchronous, local-only part of `request_start`.
+    /// the status off `Disabled` WITHOUT needing network access, so the setting
+    /// survives a restart regardless of when the engine itself finishes
+    /// binding. Does not use `bound_device()` (which polls for a real network
+    /// bind) — this only asserts the synchronous, local-only part of
+    /// `request_start`.
     #[tokio::test]
     async fn set_enabled_true_persists_the_setting_and_requests_start() {
         let app_data = tempfile::TempDir::new().expect("app-data tempdir");
@@ -1054,10 +983,12 @@ mod tests {
     }
 
     /// Two paired `ConnectedSync`s reconcile a meeting (notes + media) through the
-    /// deployed relay, driven entirely through the `SyncControl` trait — the exact
-    /// methods the `sync_get_my_ticket` / `sync_add_peer` / `sync_now` commands
-    /// delegate to. Proves: pairing via tickets, notes convergence, byte-identical
-    /// media, and the `SyncReady` bus event on the initiator.
+    /// deployed relay. Pairing goes directly through the underlying
+    /// `SyncEngine::my_ticket` / `add_peer_from_ticket` (the same primitives the
+    /// phone client's `sync-ffi` calls — desktop no longer exposes them itself);
+    /// `syncNow`/`sync_now` still goes through `SyncControl`, the exact method the
+    /// `sync_now` command delegates to. Proves: pairing, notes convergence,
+    /// byte-identical media, and the `SyncReady` bus event on the initiator.
     #[tokio::test]
     async fn connected_sync_e2e_through_the_relay() {
         let Some(_token) = relay_token() else {
@@ -1074,14 +1005,34 @@ mod tests {
         let device_a = bound_device().await;
         let device_b = bound_device().await;
 
-        // Mutual pairing THROUGH the trait: each side adds the other's ticket via
-        // `my_ticket` + `add_peer`. Sync requires it — B's accept side rejects an
-        // inbound connection from an unpaired peer, so A must be in B's directory
-        // (and vice versa) for the reconciliation below to be served.
-        let ticket_a = device_a.sync.my_ticket().await.expect("A ticket");
-        let ticket_b = device_b.sync.my_ticket().await.expect("B ticket");
-        device_a.sync.add_peer(ticket_b).await.expect("A pairs B");
-        device_b.sync.add_peer(ticket_a).await.expect("B pairs A");
+        // Mutual pairing: each side adds the other's ticket directly on the
+        // underlying engine (bypassing `SyncControl`, which no longer exposes
+        // manual pairing — desktop's production path is account-mediated
+        // discovery only now; this test's subject is `sync_now`/relay
+        // reconciliation, and pairing is just its setup). Sync requires it —
+        // B's accept side rejects an inbound connection from an unpaired peer,
+        // so A must be in B's directory (and vice versa) for the
+        // reconciliation below to be served.
+        let engine_a = device_a
+            .sync
+            .runtime
+            .lock()
+            .await
+            .engine
+            .clone()
+            .expect("A must be bound");
+        let engine_b = device_b
+            .sync
+            .runtime
+            .lock()
+            .await
+            .engine
+            .clone()
+            .expect("B must be bound");
+        let ticket_a = engine_a.my_ticket();
+        let ticket_b = engine_b.my_ticket();
+        engine_a.add_peer_from_ticket(&ticket_b).expect("A pairs B");
+        engine_b.add_peer_from_ticket(&ticket_a).expect("B pairs A");
 
         // Let both endpoints home to the relay (the token-gated relay handshake)
         // before the first dial.

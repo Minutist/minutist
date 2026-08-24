@@ -83,9 +83,6 @@
 //! | `account_poll_pairing` | `AccountStatus` | WS4-A S5b |
 //! | `account_status` | `AccountSnapshot` | WS4-A S5b |
 //! | `sync_status` | `SyncStatus` | WS4-B S5 |
-//! | `enable_sync` | `SyncStatus` | account-free manual pairing |
-//! | `sync_get_my_ticket` | `String` | WS4-B S5 |
-//! | `sync_add_peer` | `()` | WS4-B S5 |
 //! | `sync_now` | `()` | WS4-B S5 |
 //! | `reject_match` | `()` | #0003 WU8 |
 //! | `clear_all_voiceprints` | `()` | #0003 WU8 (§4 privacy) |
@@ -887,9 +884,6 @@ pub fn bindings_builder() -> Builder<tauri::Wry> {
             account::account_status,
             account::delete_account,
             sync::sync_status,
-            sync::enable_sync,
-            sync::sync_get_my_ticket,
-            sync::sync_add_peer,
             sync::sync_now,
         ])
         .events(collect_events![AppEventPayload])

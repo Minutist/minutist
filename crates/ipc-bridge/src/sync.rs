@@ -1,9 +1,12 @@
 //! The peer-to-peer notes-sync IPC surface (WS4-B S5).
 //!
-//! The webview drives device pairing (exchanging shareable tickets) and manual
-//! sync through these commands; the sync engine's live state and per-meeting
-//! transfer progress ride `AppEvent::{SyncProgress, SyncReady, SyncError}` on
-//! the existing event bus (no second event registration).
+//! The webview drives manual sync through these commands; the sync engine's
+//! live state and per-meeting transfer progress ride
+//! `AppEvent::{SyncProgress, SyncReady, SyncError}` on the existing event bus
+//! (no second event registration). Sync turns on automatically once the
+//! device signs in ([`crate::account`]) — there is no separate enable
+//! toggle and no manual device pairing exposed here; that existed only as
+//! an interim mechanism before account sign-in shipped.
 //!
 //! # Why a trait seam
 //!
@@ -14,8 +17,8 @@
 //! the command handlers call — and `app-main` injects a connected implementation
 //! that holds the `sync` types. The free build (and any connected build before a
 //! sync engine is started) gets [`DisabledSync`], a no-op that reports `Disabled`
-//! and rejects ticket/peer/sync operations as unsupported, so the commands
-//! compile and behave gracefully with no sync engine present.
+//! and rejects sync operations as unsupported, so the commands compile and
+//! behave gracefully with no sync engine present.
 //!
 //! The trait object lives in [`IpcState::sync`](crate::IpcState). The commands
 //! never touch `sync` types directly — only [`SyncControl`] and the IPC-facing
@@ -24,7 +27,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use minutist_common::{AppError, AppResult, HostRef, MeetingId, SyncStatus};
+use minutist_common::{AppResult, HostRef, MeetingId, SyncStatus};
 
 use crate::IpcState;
 use tauri::State;
@@ -52,16 +55,6 @@ pub trait SyncControl: Send + Sync {
     /// implementation whose engine has not yet bound does the same.
     async fn host_ref(&self) -> HostRef;
 
-    /// This device's shareable endpoint ticket: a string the user copies to
-    /// another of their devices so it can dial this one. Carries this device's
-    /// public addressing only — not its secret key. The peer feeds it to
-    /// [`Self::add_peer`].
-    async fn my_ticket(&self) -> AppResult<String>;
-
-    /// Register a peer device from the ticket it produced via [`Self::my_ticket`].
-    /// After this, the two devices can sync notes with each other.
-    async fn add_peer(&self, ticket: String) -> AppResult<()>;
-
     /// Trigger a notes sync for one meeting with the paired peers. Progress and
     /// completion arrive on the event bus (`SyncProgress` / `SyncReady`), not the
     /// return value; an error here means the sync could not be started.
@@ -77,9 +70,8 @@ pub trait SyncControl: Send + Sync {
 
     /// Enable or disable the sync engine (and, transitively, the producer-gate
     /// election loop it starts once bound). Called alongside a successful
-    /// pairing (`true`) or account deletion (`false`) from
-    /// [`crate::account`] — signing in is what turns sync on, there is no
-    /// separate manual toggle.
+    /// sign-in (`true`) or account deletion (`false`) from [`crate::account`]
+    /// — signing in is the only thing that turns sync on.
     ///
     /// `true` starts the engine if it is not already running or starting
     /// (idempotent — a re-enable, or a race between two calls, never
@@ -88,15 +80,13 @@ pub trait SyncControl: Send + Sync {
     /// already-started engine running (there is no requirement here to tear
     /// one down — see [`DisabledSync`] and the connected implementation's doc
     /// for what each actually does). Never errors: a start failure is logged
-    /// and reflected in [`Self::status`], mirroring how [`Self::my_ticket`]
-    /// et al. surface a still-starting or failed engine.
+    /// and reflected in [`Self::status`].
     async fn set_enabled(&self, enabled: bool) -> AppResult<()>;
 }
 
 /// The no-op sync control used by the free build and by a connected build with
-/// no sync engine wired. Always reports `Disabled` and rejects ticket / peer /
-/// sync operations as unsupported, so the commands behave gracefully with no
-/// engine present.
+/// no sync engine wired. Always reports `Disabled` and rejects sync operations
+/// as unsupported, so the commands behave gracefully with no engine present.
 pub struct DisabledSync;
 
 /// The message every rejecting [`DisabledSync`] method returns, so the UI shows a
@@ -114,20 +104,8 @@ impl SyncControl for DisabledSync {
         HostRef("local".to_string())
     }
 
-    async fn my_ticket(&self) -> AppResult<String> {
-        Err(AppError::Unsupported {
-            context: SYNC_UNAVAILABLE.to_string(),
-        })
-    }
-
-    async fn add_peer(&self, _ticket: String) -> AppResult<()> {
-        Err(AppError::Unsupported {
-            context: SYNC_UNAVAILABLE.to_string(),
-        })
-    }
-
     async fn sync_now(&self, _meeting_id: MeetingId) -> AppResult<()> {
-        Err(AppError::Unsupported {
+        Err(minutist_common::AppError::Unsupported {
             context: SYNC_UNAVAILABLE.to_string(),
         })
     }
@@ -163,41 +141,6 @@ pub async fn sync_status(state: State<'_, IpcState>) -> AppResult<SyncStatus> {
     Ok(state.connected.sync.status().await)
 }
 
-/// Turn sync on WITHOUT signing in — the escape valve for a device that only
-/// ever wants manual ticket pairing with its own other devices. Signing in
-/// (`account_poll_pairing`) already turns sync on for that path; this command
-/// exists because the Sync pane's ticket exchange is documented to work for a
-/// device "not on your account" at all, so it must have its own way to start
-/// the engine rather than depending on the account flow. Persists
-/// `settings.connector_enabled = true` (see `SyncControl::set_enabled`), so it
-/// survives a restart same as the sign-in path.
-#[tauri::command]
-#[specta::specta]
-pub async fn enable_sync(state: State<'_, IpcState>) -> AppResult<SyncStatus> {
-    state.connected.sync.set_enabled(true).await?;
-    Ok(state.connected.sync.status().await)
-}
-
-/// This device's shareable ticket string. The UI shows it (and/or a QR) so the
-/// user can pair another of their devices, which calls [`sync_add_peer`] with it.
-///
-/// In the free build (or before any sync wiring) this returns an `Unsupported`
-/// error — the Sync pane is absent from that bundle, so the command is never
-/// invoked there.
-#[tauri::command]
-#[specta::specta]
-pub async fn sync_get_my_ticket(state: State<'_, IpcState>) -> AppResult<String> {
-    state.connected.sync.my_ticket().await
-}
-
-/// Register a peer device from its shareable ticket (produced by
-/// [`sync_get_my_ticket`] on the other device).
-#[tauri::command]
-#[specta::specta]
-pub async fn sync_add_peer(state: State<'_, IpcState>, ticket: String) -> AppResult<()> {
-    state.connected.sync.add_peer(ticket).await
-}
-
 /// Trigger a notes sync for one meeting with the paired peers. Progress and
 /// completion arrive on the event bus (`AppEvent::SyncProgress` / `SyncReady`).
 #[tauri::command]
@@ -209,19 +152,12 @@ pub async fn sync_now(state: State<'_, IpcState>, meeting_id: MeetingId) -> AppR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minutist_common::AppError;
 
     #[tokio::test]
     async fn disabled_sync_reports_disabled_and_rejects_operations() {
         let s = DisabledSync;
         assert_eq!(s.status().await, SyncStatus::Disabled);
-        assert!(matches!(
-            s.my_ticket().await,
-            Err(AppError::Unsupported { .. })
-        ));
-        assert!(matches!(
-            s.add_peer("ticket".to_string()).await,
-            Err(AppError::Unsupported { .. })
-        ));
         assert!(matches!(
             s.sync_now(MeetingId::new()).await,
             Err(AppError::Unsupported { .. })

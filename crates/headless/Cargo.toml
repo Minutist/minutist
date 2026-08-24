@@ -56,10 +56,6 @@ tracing = { workspace = true }
 # `json` adds the opt-in structured tracing formatter (MINUTIST_HUB_LOG_JSON=1).
 tracing-subscriber = { workspace = true, features = ["json"] }
 tracing-appender = { workspace = true }
-# Validate a peer pairing ticket in `add-peer`, and resolve a ticket to its
-# `EndpointId` for `status`. Same EXACT pin as `sync`, which owns the round-trip.
-iroh-tickets = "=1.0.0"
-iroh = "=1.0.3"
 # `status`: parse `{uuid}` meeting-folder names + digest the projected notes.
 uuid = { workspace = true }
 sha2 = { workspace = true }

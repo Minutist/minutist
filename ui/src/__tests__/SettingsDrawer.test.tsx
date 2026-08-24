@@ -44,8 +44,7 @@ vi.mock("../ipc/client", () => ({
     })),
     updateSettings: vi.fn(async () => ({ status: "ok", data: null })),
     getSettings: vi.fn(async () => ({ status: "ok", data: null })),
-    // The lazy SyncSettingsPane calls account_status + sync_status +
-    // sync_get_my_ticket on mount.
+    // The lazy SyncSettingsPane calls account_status + sync_status on mount.
     accountStatus: vi.fn(async () => ({
       status: "ok",
       data: { status: "signed_out", account_id: null },
@@ -53,10 +52,6 @@ vi.mock("../ipc/client", () => ({
     syncStatus: vi.fn(async () => ({
       status: "ok",
       data: { kind: "idle" },
-    })),
-    syncGetMyTicket: vi.fn(async () => ({
-      status: "ok",
-      data: "test-ticket-abc123",
     })),
   },
   unwrap: <T,>(r: { status: string; data: T }) => {

@@ -187,15 +187,11 @@ export const commands: Commands = {
   // unsupported / inert.
   deleteAccount: () => callCommand("deleteAccount", []),
   // WS4-B S5: the connected-tier peer-to-peer notes sync surface. `syncStatus`
-  // reads the engine's live state; `enableSync` turns sync on WITHOUT signing
-  // in (the escape valve for manual-only ticket pairing); `syncGetMyTicket`
-  // returns the shareable ticket for pairing another device; `syncAddPeer`
-  // registers a peer from its ticket; `syncNow` triggers a notes sync for a
-  // meeting. In the free build (or the dev shim) these are unsupported / inert.
+  // reads the engine's live state; `syncNow` triggers a notes sync for a
+  // meeting. Sync turns on automatically once signed in — there is no manual
+  // enable/pairing surface. In the free build (or the dev shim) these are
+  // unsupported / inert.
   syncStatus: () => callCommand("syncStatus", []),
-  enableSync: () => callCommand("enableSync", []),
-  syncGetMyTicket: () => callCommand("syncGetMyTicket", []),
-  syncAddPeer: (ticket) => callCommand("syncAddPeer", [ticket]),
   syncNow: (meetingId) => callCommand("syncNow", [meetingId]),
   // Issue #0003 voiceprint correction path (§2.4). `rejectMatch` clears the
   // speaker-name overlay for a label in a meeting and drops the contributing

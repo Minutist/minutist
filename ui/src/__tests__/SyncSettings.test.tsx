@@ -3,12 +3,12 @@
  *
  * Covers the pane's own behaviour: account status display, the device-code
  * pairing flow (code shown/opened URL), sign-in/delete-account, sync status
- * display, ticket reveal + copy, add-peer field + button routing through
- * `sync_add_peer`, and `sync_now` for the open meeting. The stores' own
- * event-handler tests live in their own `describe` blocks below. The "absent
- * in the free build / no pane" property is verified by the free-build grep in
- * CI (VITE_CONNECTED is baked at transform time, so it cannot be toggled from
- * vitest — same as the MCP pane).
+ * display, and `sync_now` for the open meeting. There is no manual
+ * device-pairing UI any more — sync turns on exclusively via sign-in. The
+ * stores' own event-handler tests live in their own `describe` blocks below.
+ * The "absent in the free build / no pane" property is verified by the
+ * free-build grep in CI (VITE_CONNECTED is baked at transform time, so it
+ * cannot be toggled from vitest — same as the MCP pane).
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act, waitFor } from "@testing-library/react";
@@ -55,20 +55,8 @@ const syncStatus = vi.fn(
     data: { kind: "idle" },
   }),
 );
-const syncGetMyTicket = vi.fn(
-  async () => ({ status: "ok", data: "test-ticket-abc123" }) as const,
-);
-const syncAddPeer = vi.fn(
-  async (_ticket: string) => ({ status: "ok", data: null }) as const,
-);
 const syncNow = vi.fn(
   async (_meetingId: string) => ({ status: "ok", data: null }) as const,
-);
-const enableSync = vi.fn(
-  async (): Promise<{ status: "ok"; data: SyncStatus }> => ({
-    status: "ok",
-    data: { kind: "idle" },
-  }),
 );
 
 vi.mock("../ipc/client", () => ({
@@ -78,9 +66,6 @@ vi.mock("../ipc/client", () => ({
     accountPollPairing: () => accountPollPairing(),
     deleteAccount: () => deleteAccount(),
     syncStatus: () => syncStatus(),
-    enableSync: () => enableSync(),
-    syncGetMyTicket: () => syncGetMyTicket(),
-    syncAddPeer: (ticket: string) => syncAddPeer(ticket),
     syncNow: (meetingId: string) => syncNow(meetingId),
   },
   unwrap: <T,>(r: { status: string; data: T }) => {
@@ -118,7 +103,6 @@ function resetStores() {
     useSyncStatusStore.setState({
       status: null,
       inProgress: null,
-      myTicket: null,
       lastError: null,
       pendingReadyNotifications: [],
     });
@@ -133,11 +117,10 @@ describe("SyncSettingsPane", () => {
     resetStores();
   });
 
-  it("fetches account + sync status and ticket on mount", async () => {
+  it("fetches account + sync status on mount", async () => {
     render(<SyncSettingsPane />);
     await waitFor(() => expect(accountStatus).toHaveBeenCalledOnce());
     await waitFor(() => expect(syncStatus).toHaveBeenCalledOnce());
-    await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalledOnce());
   });
 
   it("shows 'Not signed in' and a Log in button by default", async () => {
@@ -155,11 +138,6 @@ describe("SyncSettingsPane", () => {
     await screen.findByText("Connecting…");
   });
 
-  it("shows the ticket returned by sync_get_my_ticket", async () => {
-    render(<SyncSettingsPane />);
-    await screen.findByText("test-ticket-abc123");
-  });
-
   it("shows an error message on status from a kind=error engine", async () => {
     syncStatus.mockResolvedValueOnce({
       status: "ok",
@@ -169,64 +147,9 @@ describe("SyncSettingsPane", () => {
     await screen.findByText(/Error: endpoint bind failed/);
   });
 
-  it("shows 'Turn on sync' only when sync is disabled", async () => {
-    syncStatus.mockResolvedValueOnce({ status: "ok", data: { kind: "disabled" } });
-    render(<SyncSettingsPane />);
-    await screen.findByText("Disabled");
-    expect(
-      screen.getByRole("button", { name: "Turn on sync" }),
-    ).toBeInTheDocument();
-  });
-
-  it("does not show 'Turn on sync' once sync is already on", async () => {
-    render(<SyncSettingsPane />);
-    await screen.findByText("Ready");
-    expect(
-      screen.queryByRole("button", { name: "Turn on sync" }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("'Turn on sync' calls enable_sync and re-fetches the ticket, without signing in", async () => {
-    syncStatus.mockResolvedValueOnce({ status: "ok", data: { kind: "disabled" } });
-    render(<SyncSettingsPane />);
-    await screen.findByText("Disabled");
-    vi.clearAllMocks();
-
-    fireEvent.click(screen.getByRole("button", { name: "Turn on sync" }));
-
-    await waitFor(() => expect(enableSync).toHaveBeenCalledOnce());
-    await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalledOnce());
-    expect(accountBeginPairing).not.toHaveBeenCalled();
-  });
-
-  it("add-peer button calls sync_add_peer and clears the field", async () => {
-    render(<SyncSettingsPane />);
-    // Wait for mount fetch to settle.
-    await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalled());
-
-    const input = screen.getByLabelText("Peer ticket") as HTMLInputElement;
-    fireEvent.change(input, { target: { value: "some-peer-ticket" } });
-    fireEvent.click(screen.getByRole("button", { name: /Add$/ }));
-
-    await waitFor(() =>
-      expect(syncAddPeer).toHaveBeenCalledWith("some-peer-ticket"),
-    );
-    // Field clears after the add RESOLVES — an async state update that lands after
-    // the call is made, so wait for it rather than asserting synchronously (the
-    // issue-0026 flake: the bare assertion raced the resolve+clear).
-    await waitFor(() => expect(input.value).toBe(""));
-  });
-
-  it("add-peer button is disabled when the field is empty", async () => {
-    render(<SyncSettingsPane />);
-    await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalled());
-    const button = screen.getByRole("button", { name: /Add$/ });
-    expect(button).toBeDisabled();
-  });
-
   it("shows 'Sync this meeting now' only when a meeting is open", async () => {
     render(<SyncSettingsPane />);
-    await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalled());
+    await waitFor(() => expect(syncStatus).toHaveBeenCalled());
     // No meeting open → button absent.
     expect(
       screen.queryByRole("button", { name: /Sync this meeting now/ }),
@@ -246,7 +169,7 @@ describe("SyncSettingsPane", () => {
       useMeetingsStore.setState({ openMeetingId: "meeting-abc" });
     });
     render(<SyncSettingsPane />);
-    await waitFor(() => expect(syncGetMyTicket).toHaveBeenCalled());
+    await waitFor(() => expect(syncStatus).toHaveBeenCalled());
 
     fireEvent.click(
       screen.getByRole("button", { name: /Sync this meeting now/ }),

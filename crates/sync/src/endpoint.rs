@@ -531,7 +531,7 @@ impl SyncEngine {
             target: "sync",
             endpoint_id = %endpoint.id(),
             relay = %config.relay_url,
-            "sync endpoint bound (insecure relay TLS — test relay only)"
+            "sync endpoint bound (insecure relay TLS, test relay only)"
         );
 
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);

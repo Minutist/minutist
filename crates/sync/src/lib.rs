@@ -37,18 +37,17 @@
 //!
 //! Peers are learned two ways, both additive into one
 //! [`address_lookup::PeerDirectory`] backing iroh's `MemoryLookup`:
-//! account-mediated discovery ([`account`], a periodic loop fed by a
-//! consumer-supplied [`account::AccountEndpointSource`], so this crate takes no
-//! HTTP dependency) and manual ticket exchange
-//! ([`SyncEngine::my_ticket`] / [`SyncEngine::add_peer_from_ticket`], mutual,
-//! each side adds the other's). Account-mediated discovery is the live path
-//! for all three frontends — desktop and the hub drive this crate's own
-//! periodic loop; the phone (`sync-ffi`) runs its own list-and-add loop in TS
-//! against the same `/v1/account/devices` endpoints, calling
-//! [`SyncEngine::add_account_peer`] per device rather than this crate's loop.
-//! Manual ticket exchange has no caller left in any frontend — `my_ticket` /
-//! `add_peer_from_ticket` stay on `SyncEngine` and in the `sync-ffi` API
-//! surface, unused, pending a coordinated removal.
+//!
+//! - Account-mediated discovery ([`account`]), a periodic loop fed by a
+//!   consumer-supplied [`account::AccountEndpointSource`], so this crate takes no
+//!   HTTP dependency. The live path for all three frontends. Desktop and the hub
+//!   drive this crate's loop; the phone (`sync-ffi`) runs its own list-and-add
+//!   loop in TS against the same `/v1/account/devices` endpoints, calling
+//!   [`SyncEngine::add_account_peer`] per device instead.
+//! - Manual ticket exchange ([`SyncEngine::my_ticket`] /
+//!   [`SyncEngine::add_peer_from_ticket`]), mutual: each side adds the other's.
+//!   No caller left in any frontend. Both stay on `SyncEngine` and in the
+//!   `sync-ffi` API surface, unused, pending a coordinated removal.
 //!
 //! A re-advertised peer's address set replaces rather than unions with the tracked
 //! one, so a stale direct address cannot linger as a dead dial candidate that

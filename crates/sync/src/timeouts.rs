@@ -6,8 +6,8 @@
 //! returns [`crate::Error::Protocol`], so the connection drops exactly as it would
 //! for a malformed frame.
 //!
-//! [`FRAME_IO_TIMEOUT`] applies inside [`crate::frame::read_frame`] and
-//! [`crate::frame::write_frame`], so it covers both sides of every protocol.
+//! [`FRAME_IO_TIMEOUT`] applies inside `crate::frame::Framer`'s read and write,
+//! so it covers both sides of every protocol.
 
 use std::time::Duration;
 

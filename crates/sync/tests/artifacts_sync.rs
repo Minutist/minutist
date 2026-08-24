@@ -19,6 +19,7 @@ use iroh::EndpointAddr;
 use minutist_common::{HostRef, MeetingId, ProcessingLifecycle};
 use notes_crdt::MeetingFolder;
 use sync::identity::DeviceIdentity;
+use sync::ContentKey;
 use sync::SyncEngine;
 
 /// Loopback `EndpointAddr` for `engine` (its id + each bound port against
@@ -37,10 +38,10 @@ fn direct_addr(engine: &SyncEngine) -> EndpointAddr {
 async fn paired_engines(root_a: &Path, root_b: &Path) -> (SyncEngine, SyncEngine) {
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), root_b.to_path_buf())
         .await
         .expect("engine b");
     a.add_peer(direct_addr(&b));
@@ -142,7 +143,15 @@ async fn reprocess_newer_copy_supersedes_and_stale_does_not_clobber() {
     let meeting = MeetingId::new();
     let v1 = br#"[{"v":1}]"#.to_vec();
     let summary = b"# Summary v1".to_vec();
-    seed_processed(root_a, meeting, &v1, &summary, "host-a", "2026-06-30T10:00:00Z").await;
+    seed_processed(
+        root_a,
+        meeting,
+        &v1,
+        &summary,
+        "host-a",
+        "2026-06-30T10:00:00Z",
+    )
+    .await;
     MeetingFolder::ensure(root_b, meeting).expect("ensure folder b");
 
     let (a, b) = paired_engines(root_a, root_b).await;
@@ -207,7 +216,15 @@ async fn peer_copy_does_not_overwrite_unprovable_local_bytes() {
     let meeting = MeetingId::new();
     // A: an older, stamped transcript.
     let a_bytes = br#"[{"v":"a-older"}]"#.to_vec();
-    seed_processed(root_a, meeting, &a_bytes, b"# A", "host-a", "2026-06-30T10:00:00Z").await;
+    seed_processed(
+        root_a,
+        meeting,
+        &a_bytes,
+        b"# A",
+        "host-a",
+        "2026-06-30T10:00:00Z",
+    )
+    .await;
     // B: a newer transcript on disk, but NOT Processed and with no authority record
     // (ensure seeds metadata as Local). B will not advertise it.
     let b_bytes = br#"[{"v":"b-newer-unprovable"}]"#.to_vec();
@@ -276,8 +293,14 @@ async fn sync_is_noop_when_both_already_hold_the_artifacts() {
         .expect("no-op artifact reconcile a -> b");
 
     // Both files unchanged and still byte-identical on both sides.
-    assert_eq!(read_artifact(root_a, meeting, "transcript.json"), transcript);
-    assert_eq!(read_artifact(root_b, meeting, "transcript.json"), transcript);
+    assert_eq!(
+        read_artifact(root_a, meeting, "transcript.json"),
+        transcript
+    );
+    assert_eq!(
+        read_artifact(root_b, meeting, "transcript.json"),
+        transcript
+    );
     assert_eq!(read_artifact(root_a, meeting, "summary.md"), summary);
     assert_eq!(read_artifact(root_b, meeting, "summary.md"), summary);
 

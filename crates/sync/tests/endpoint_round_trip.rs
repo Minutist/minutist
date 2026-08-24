@@ -15,6 +15,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use iroh::EndpointAddr;
 use minutist_common::MeetingId;
 use sync::identity::DeviceIdentity;
+use sync::ContentKey;
 use sync::SyncEngine;
 
 /// Build the peer's direct `EndpointAddr` from its id plus a loopback rewrite of
@@ -40,12 +41,14 @@ async fn two_engines_reconcile_over_sync_alpn() {
 
     // Each engine's meetings root is its own temp dir; the empty meeting has no
     // notes on either side, so the exchange completes with empty diffs.
-    let engine_a = SyncEngine::start_direct(id_a, dir_a.path().to_path_buf())
-        .await
-        .expect("engine a");
-    let engine_b = SyncEngine::start_direct(id_b, dir_b.path().to_path_buf())
-        .await
-        .expect("engine b");
+    let engine_a =
+        SyncEngine::start_direct(id_a, ContentKey::for_tests(), dir_a.path().to_path_buf())
+            .await
+            .expect("engine a");
+    let engine_b =
+        SyncEngine::start_direct(id_b, ContentKey::for_tests(), dir_b.path().to_path_buf())
+            .await
+            .expect("engine b");
 
     // Inject each other's direct address (the out-of-band step the account
     // service performs in production).

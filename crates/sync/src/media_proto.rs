@@ -51,15 +51,13 @@
 //! [`PeerDirectory`]: crate::address_lookup::PeerDirectory
 
 use std::collections::HashSet;
-use std::path::Path;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointId};
 use minutist_common::MeetingId;
 use uuid::Uuid;
 
-use crate::blobs::{BlobStore, Manifest};
-use crate::frame::{read_frame, write_frame};
+use crate::blobs::BlobExchange;
+use crate::blobs::Manifest;
 use crate::notes_proto::StreamKind;
 use crate::timeouts::{FRAME_IO_TIMEOUT, PEER_PULL_TIMEOUT, RESPONDER_CLOSE_TIMEOUT};
 use crate::{Error, Result};
@@ -84,10 +82,7 @@ fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
 /// and content hash, is skipped. `peer_manifest` has been validated against path
 /// traversal before this runs.
 async fn pull_missing(
-    store: &BlobStore,
-    endpoint: &Endpoint,
-    peer: EndpointId,
-    meetings_root: &Path,
+    ex: BlobExchange<'_>,
     meeting_id: MeetingId,
     local_manifest: &Manifest,
     peer_manifest: &Manifest,
@@ -102,11 +97,11 @@ async fn pull_missing(
         if held.contains(&(entry.rel_path.as_str(), *entry.hash.as_bytes())) {
             continue;
         }
-        store
+        ex.store
             .download(
-                endpoint,
-                peer,
-                meetings_root,
+                ex.endpoint,
+                ex.peer,
+                ex.root,
                 meeting_id,
                 &entry.rel_path,
                 entry.hash,
@@ -128,15 +123,13 @@ async fn pull_missing(
 ///
 /// `peer` is the remote [`EndpointId`] the downloader dials over the shared
 /// endpoint. It must equal `conn.remote_id()`; the caller passes the id it dialled.
-pub async fn initiate_media_sync(
+pub(crate) async fn initiate_media_sync(
     conn: &Connection,
-    store: &BlobStore,
-    endpoint: &Endpoint,
-    peer: EndpointId,
-    root: &Path,
+    ex: BlobExchange<'_>,
     meeting_id: MeetingId,
 ) -> Result<()> {
-    let local_manifest = store.import_meeting(root, meeting_id).await?;
+    let framer = ex.framer(StreamKind::Media);
+    let local_manifest = ex.store.import_meeting(ex.root, meeting_id).await?;
 
     let (mut send, mut recv) = conn
         .open_bi()
@@ -152,21 +145,14 @@ pub async fn initiate_media_sync(
     send.write_all(meeting_id.0.as_bytes())
         .await
         .map_err(|e| Error::Protocol(format!("writing meeting id: {e}")))?;
-    write_frame(&mut send, &encode_manifest(&local_manifest)?).await?;
+    framer
+        .write(&mut send, &encode_manifest(&local_manifest)?)
+        .await?;
 
     // Read the peer's manifest and pull what we lack over the blobs ALPN.
-    let peer_manifest = decode_manifest(&read_frame(&mut recv).await?)?;
+    let peer_manifest = decode_manifest(&framer.read(&mut recv).await?)?;
     peer_manifest.validate()?;
-    pull_missing(
-        store,
-        endpoint,
-        peer,
-        root,
-        meeting_id,
-        &local_manifest,
-        &peer_manifest,
-    )
-    .await?;
+    pull_missing(ex, meeting_id, &local_manifest, &peer_manifest).await?;
 
     // Signal our pull is complete, then wait for the responder's DONE so we do not
     // return (tearing down the connection) before its pull has landed.
@@ -188,15 +174,13 @@ pub async fn initiate_media_sync(
 /// the notes-ALPN accept hook before this runs.
 ///
 /// [`Connection::closed`]: iroh::endpoint::Connection::closed
-pub async fn respond_media_sync(
+pub(crate) async fn respond_media_sync(
     conn: &Connection,
+    ex: BlobExchange<'_>,
     send: &mut SendStream,
     recv: &mut RecvStream,
-    store: &BlobStore,
-    endpoint: &Endpoint,
-    peer: EndpointId,
-    root: &Path,
 ) -> Result<()> {
+    let framer = ex.framer(StreamKind::Media);
     // REQUEST: meeting id then the initiator's manifest. Bounded by
     // FRAME_IO_TIMEOUT like every other frame read on this stream: this one is a
     // raw fixed-size read rather than a length-prefixed frame, so it needs its own
@@ -207,7 +191,7 @@ pub async fn respond_media_sync(
         .map_err(|_| {
             tracing::warn!(
                 target: "sync",
-                peer = %peer,
+                peer = %ex.peer,
                 timeout = ?FRAME_IO_TIMEOUT,
                 "reading the media-sync meeting id timed out"
             );
@@ -217,7 +201,7 @@ pub async fn respond_media_sync(
         })?
         .map_err(|e| Error::Protocol(format!("reading meeting id: {e}")))?;
     let meeting_id = MeetingId(Uuid::from_bytes(id_buf));
-    let peer_manifest = decode_manifest(&read_frame(recv).await?)?;
+    let peer_manifest = decode_manifest(&framer.read(recv).await?)?;
     peer_manifest.validate()?;
 
     // No `MeetingFolder::ensure` here: a content-less peer meeting must not
@@ -229,25 +213,18 @@ pub async fn respond_media_sync(
     // exists with real `notes.ydoc` content (from an earlier or same-session
     // notes sync), repair a still-blank metadata.json now rather than waiting
     // on the next notes sweep.
-    crate::notes_proto::project_meta_best_effort(root, meeting_id);
+    crate::notes_proto::project_meta_best_effort(ex.root, meeting_id);
 
     // Import our own media (stages our blobs for the peer to fetch + our manifest).
-    let local_manifest = store.import_meeting(root, meeting_id).await?;
+    let local_manifest = ex.store.import_meeting(ex.root, meeting_id).await?;
 
     // Reply with our manifest so the initiator can pull what it lacks.
-    write_frame(send, &encode_manifest(&local_manifest)?).await?;
+    framer
+        .write(send, &encode_manifest(&local_manifest)?)
+        .await?;
 
     // Pull what we lack from the initiator over the blobs ALPN.
-    pull_missing(
-        store,
-        endpoint,
-        peer,
-        root,
-        meeting_id,
-        &local_manifest,
-        &peer_manifest,
-    )
-    .await?;
+    pull_missing(ex, meeting_id, &local_manifest, &peer_manifest).await?;
 
     // Signal our pull is complete, then wait for the initiator's DONE so neither
     // side observes completion before both pulls have landed.
@@ -262,7 +239,7 @@ pub async fn respond_media_sync(
         .map_err(|_| {
             tracing::warn!(
                 target: "sync",
-                peer = %peer,
+                peer = %ex.peer,
                 timeout = ?RESPONDER_CLOSE_TIMEOUT,
                 "media-sync responder timed out waiting for the initiator to close"
             );

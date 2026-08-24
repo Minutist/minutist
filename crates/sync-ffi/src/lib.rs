@@ -49,7 +49,7 @@ use minutist_common::{
     AppError, AudioFormat, DeletionState, MeetingId, MeetingMeta, ProcessingLifecycle, Segment,
 };
 use notes_crdt::{MeetingFolder, NotesStore};
-use sync::{DeviceIdentity, SyncConfig, SyncEngine};
+use sync::{ContentKey, DeviceIdentity, SyncConfig, SyncEngine};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast::{self, error::RecvError};
 use uuid::Uuid;
@@ -103,6 +103,15 @@ impl From<sync::Error> for SyncFfiError {
                 msg: format!("peer {id} is in failed-dial backoff"),
             },
             sync::Error::Protocol(msg) => SyncFfiError::Protocol { msg },
+            // A frame the peer could not authenticate: it holds a different
+            // content key, so it is not enrolled on this account. Mapped to
+            // `Protocol` rather than a new variant for the same reason
+            // `Suppressed` maps to `Transport`: the phone's only action is to
+            // surface it, and a new variant would churn the generated bindings.
+            // The message says which condition it is.
+            sync::Error::Unauthenticated(msg) => SyncFfiError::Protocol {
+                msg: format!("unauthenticated: {msg}"),
+            },
             sync::Error::Identity(msg) => SyncFfiError::Identity { msg },
             sync::Error::Io(e) => SyncFfiError::Io { msg: e.to_string() },
         }
@@ -297,6 +306,7 @@ impl FfiSyncEngine {
             })?;
 
         let identity = DeviceIdentity::load_or_generate(Path::new(&app_data_dir))?;
+        let content_key = ContentKey::load_or_mint(Path::new(&app_data_dir))?;
         let meetings_root = PathBuf::from(meetings_root);
         let config = SyncConfig {
             relay_url,
@@ -305,7 +315,7 @@ impl FfiSyncEngine {
             backoff_policy: Default::default(),
             relay_ips,
         };
-        let engine = rt.block_on(SyncEngine::start(config, identity))?;
+        let engine = rt.block_on(SyncEngine::start(config, identity, content_key))?;
 
         Ok(Arc::new(Self {
             inner: Mutex::new(Some(Arc::new(engine))),

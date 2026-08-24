@@ -30,6 +30,7 @@ use iroh::{EndpointAddr, RelayUrl};
 use minutist_common::MeetingId;
 use notes_crdt::MeetingFolder;
 use persistence::save_note_asset;
+use sync::ContentKey;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 
 #[tokio::test]
@@ -61,10 +62,10 @@ async fn media_converges_through_the_deployed_relay() {
         relay_ips: Vec::new(),
     };
 
-    let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a)
+    let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a, ContentKey::for_tests())
         .await
         .expect("engine A binds");
-    let engine_b = SyncEngine::start(cfg(dir_b.path()), id_b)
+    let engine_b = SyncEngine::start(cfg(dir_b.path()), id_b, ContentKey::for_tests())
         .await
         .expect("engine B binds");
     eprintln!(

@@ -91,6 +91,25 @@ uuid = { workspace = true }
 # precision / offsets wrong, so a real parse is required. Same workspace pin
 # `notes-crdt` already uses for the lifecycle merge, so the two agree.
 chrono = { workspace = true }
+# Payload AEAD for everything the sync protocols put on a frame
+# (`planning/DESIGN_sync-encryption.md` §4). XChaCha20-Poly1305 specifically, for
+# its 192-bit nonce: frames are sealed from several tasks across several
+# connections, so a random nonce per frame is safe at that width and needs no
+# shared counter, whereas a 96-bit nonce would want one and a counter is one
+# shared-state bug away from reuse. Pure Rust, so the aarch64-linux-android
+# cross-build for `sync-ffi` is unaffected.
+chacha20poly1305 = "0.11"
+# HKDF-SHA256 for the frame subkey, so the account content key is never used as
+# an AEAD key directly and a later second use of it gets its own subkey.
+hkdf = "0.13"
+# `Sha256` for the HKDF instantiation above. NOT the workspace `sha2 = "0.10"`
+# pin: `hkdf` 0.13 is built on the `digest` 0.11 line, so it needs 0.11 here.
+# Both majors are already in the tree, so this adds no crate that was absent.
+sha2 = "0.11"
+# OS randomness for the content key and each frame nonce. Used directly rather
+# than through a `rand`/`rand_core` adapter so nothing has to reconcile which
+# `rand_core` major each crypto crate expects.
+getrandom = "0.4"
 # futures-util — `StreamExt::next()` over `iroh_blobs`' download-progress stream
 # (`blobs::download_capped`), so a blob pull can be watched byte-by-byte and cut
 # off once it crosses the per-blob size cap, rather than only checked after the

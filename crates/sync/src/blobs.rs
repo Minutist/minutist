@@ -102,6 +102,30 @@ struct HashMemoEntry {
     hash: Hash,
 }
 
+/// The collaborators both blob-backed exchanges need: the frame cipher, the blob
+/// store, the endpoint to dial the peer back on, the peer's id, and the meetings
+/// root.
+///
+/// Bundled because `media_proto` and `artifacts_proto` each need exactly this
+/// set on both their initiator and responder sides, and on their internal pull
+/// helpers, so the alternative is the same five parameters threaded through six
+/// signatures.
+#[derive(Clone, Copy)]
+pub(crate) struct BlobExchange<'a> {
+    pub(crate) cipher: &'a crate::content_key::FrameCipher,
+    pub(crate) store: &'a BlobStore,
+    pub(crate) endpoint: &'a Endpoint,
+    pub(crate) peer: EndpointId,
+    pub(crate) root: &'a Path,
+}
+
+impl<'a> BlobExchange<'a> {
+    /// A [`Framer`](crate::frame::Framer) for this exchange bound to `kind`.
+    pub(crate) fn framer(&self, kind: crate::notes_proto::StreamKind) -> crate::frame::Framer<'a> {
+        crate::frame::Framer::new(self.cipher, kind)
+    }
+}
+
 /// A content-addressed store for a device's meeting media, backed by an
 /// [`iroh_blobs`] [`FsStore`] at `{meetings_root}/.blobs`.
 ///

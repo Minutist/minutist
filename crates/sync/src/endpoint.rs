@@ -29,7 +29,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use iroh::endpoint::presets;
+use iroh::endpoint::{presets, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{
     endpoint::Connection, Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode,
@@ -44,7 +44,8 @@ use crate::address_lookup::{PeerDirectory, PeerSource};
 #[cfg(feature = "test-support")]
 use crate::backoff::BackoffPolicy;
 use crate::backoff::BackoffRegistry;
-use crate::blobs::BlobStore;
+use crate::blobs::{BlobExchange, BlobStore};
+use crate::content_key::{ContentKey, FrameCipher};
 use crate::identity::DeviceIdentity;
 use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
 use crate::timeouts::ACCEPT_HANDSHAKE_TIMEOUT;
@@ -70,6 +71,11 @@ pub struct SyncEngine {
     /// Meetings root the protocols read/write through `persistence`
     /// (`{root}/{meeting_id}/...`). The inbound [`AcceptHook`] shares it.
     meetings_root: PathBuf,
+    /// Seals and opens every frame on the sync ALPN, derived once from the
+    /// account content key (`planning/DESIGN_sync-encryption.md` §4). A peer that
+    /// passes the ed25519 membership check but holds a different key gets
+    /// [`Error::Unauthenticated`] on its first frame and reads nothing.
+    cipher: FrameCipher,
     /// The configured relay URL, kept so [`Self::push_all_to`] can address a peer
     /// relay-only (id + relay) without a stored direct address.
     relay_url: String,
@@ -337,6 +343,63 @@ fn is_rfc1918_v4(addr: &std::net::SocketAddr) -> bool {
     }
 }
 
+/// QUIC application close code the responder uses when a frame fails to
+/// authenticate, so the initiator can tell a wrong content key from a dropped
+/// connection.
+///
+/// The responder is the side that detects it: in every one of the four protocols
+/// the initiator writes first, so the initiator's own next read would otherwise
+/// surface only "connection lost". Without this the one symptom a user's device
+/// reports for an unenrolled peer would be indistinguishable from a flaky
+/// network, which defeats the point of a distinct
+/// [`Error::Unauthenticated`](crate::Error::Unauthenticated).
+const CLOSE_UNAUTHENTICATED: u32 = 0x4d55; // "MU": Minutist, Unauthenticated.
+
+/// Classify an exchange's outcome, then close the connection.
+///
+/// Order matters and is the reason this is one function rather than two lines at
+/// each call site: `Connection::close` overwrites `close_reason()`, so the peer's
+/// [`CLOSE_UNAUTHENTICATED`] has to be read off the connection before we close.
+///
+/// The close code is chosen from the outcome, so an authentication failure is
+/// reported symmetrically: whichever side detects it tells the other, rather than
+/// only the responder doing so and an initiator that could not open a reply
+/// signalling a clean `…-done`.
+fn finish_exchange<T>(conn: &Connection, done_reason: &[u8], result: Result<T>) -> Result<T> {
+    let result = result.map_err(|e| classify_exchange_error(conn, e));
+    match &result {
+        Err(Error::Unauthenticated(_)) => {
+            conn.close(CLOSE_UNAUTHENTICATED.into(), b"unauthenticated frame")
+        }
+        _ => conn.close(0u32.into(), done_reason),
+    }
+    result
+}
+
+/// Reclassify an exchange error as [`Error::Unauthenticated`] when the peer
+/// closed the connection with [`CLOSE_UNAUTHENTICATED`].
+///
+/// The initiator's error is whatever its next stream operation produced (usually
+/// a read failing with the connection gone), so the verdict has to be read off
+/// the connection rather than the error.
+fn classify_exchange_error(conn: &Connection, err: Error) -> Error {
+    if matches!(err, Error::Unauthenticated(_)) {
+        return err;
+    }
+    match conn.close_reason() {
+        Some(ConnectionError::ApplicationClosed(close))
+            if close.error_code.into_inner() == u64::from(CLOSE_UNAUTHENTICATED) =>
+        {
+            Error::Unauthenticated(
+                "the peer could not authenticate our frames: it holds a different content key, \
+                 so it is not enrolled on this account"
+                    .to_string(),
+            )
+        }
+        _ => err,
+    }
+}
+
 impl SyncEngine {
     /// Build the endpoint from `config` and the device `identity`, pinning the
     /// configured relay (with the access token when set), registering the
@@ -345,7 +408,11 @@ impl SyncEngine {
     ///
     /// Binding opens the QUIC socket; no peer dial happens here. The spawned
     /// router runs the inbound accept loop until [`Self::shutdown`].
-    pub async fn start(config: SyncConfig, identity: DeviceIdentity) -> Result<Self> {
+    pub async fn start(
+        config: SyncConfig,
+        identity: DeviceIdentity,
+        content_key: ContentKey,
+    ) -> Result<Self> {
         let relay_mode = Self::relay_mode(&config)?;
         let peers = PeerDirectory::new();
         let meetings_root = config.meetings_root.clone();
@@ -388,31 +455,78 @@ impl SyncEngine {
             "sync endpoint bound"
         );
 
+        Ok(Self::assemble(
+            endpoint,
+            peers,
+            blobs,
+            meetings_root,
+            &content_key,
+            BackoffRegistry::new(config.backoff_policy),
+            config.relay_url,
+        ))
+    }
+
+    /// Assemble the engine from an already-bound endpoint: derive the frame
+    /// cipher, open the two broadcast channels, and spawn the router.
+    ///
+    /// Shared by all three `start*` paths, which differ only in how they bind and
+    /// in their backoff policy and relay URL. Keeping it in one place means the
+    /// `AcceptHook` and `Self` field lists exist once, so a new field is one edit
+    /// rather than three that can silently drift.
+    fn assemble(
+        endpoint: Endpoint,
+        peers: PeerDirectory,
+        blobs: BlobStore,
+        meetings_root: PathBuf,
+        content_key: &ContentKey,
+        backoff: BackoffRegistry,
+        relay_url: String,
+    ) -> Self {
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
         let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
-        // Owned solely by the router's `AcceptHook`; `SyncEngine` itself never
-        // queries arrival state, only the events `AcceptHook` derives from it.
+        let cipher = content_key.frame_cipher();
         let router = Self::build_router(
             &endpoint,
             &blobs,
             &peers,
-            &meetings_root,
-            peer_events.clone(),
-            PeerArrivalTracker::new(),
-            lifecycle_events.clone(),
+            // `peer_arrivals` is owned solely by the hook; `SyncEngine` never
+            // queries arrival state, only the events the hook derives from it.
+            AcceptHook {
+                meetings_root: meetings_root.clone(),
+                peers: peers.clone(),
+                blobs: blobs.clone(),
+                cipher: cipher.clone(),
+                endpoint: endpoint.clone(),
+                peer_events: peer_events.clone(),
+                peer_arrivals: PeerArrivalTracker::new(),
+                lifecycle_events: lifecycle_events.clone(),
+            },
         );
-
-        Ok(Self {
+        Self {
             endpoint,
             router,
             peers,
-            backoff: BackoffRegistry::new(config.backoff_policy),
+            backoff,
             blobs,
             meetings_root,
-            relay_url: config.relay_url,
+            cipher,
+            relay_url,
             peer_events,
             lifecycle_events,
-        })
+        }
+    }
+
+    /// The blob-exchange collaborators for one peer: the frame cipher, blob
+    /// store, endpoint, peer id and meetings root that `media_proto` and
+    /// `artifacts_proto` both need on their initiator side.
+    fn blob_exchange(&self, peer: EndpointId) -> BlobExchange<'_> {
+        BlobExchange {
+            cipher: &self.cipher,
+            store: &self.blobs,
+            endpoint: &self.endpoint,
+            peer,
+            root: &self.meetings_root,
+        }
     }
 
     /// Build the [`Router`] accepting both the sync ALPN ([`AcceptHook`]) and the
@@ -424,25 +538,11 @@ impl SyncEngine {
         endpoint: &Endpoint,
         blobs: &BlobStore,
         peers: &PeerDirectory,
-        meetings_root: &Path,
-        peer_events: broadcast::Sender<String>,
-        peer_arrivals: PeerArrivalTracker,
-        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
+        hook: AcceptHook,
     ) -> Router {
         let blobs_protocol = iroh_blobs::BlobsProtocol::new(blobs.inner(), None);
         Router::builder(endpoint.clone())
-            .accept(
-                SYNC_ALPN,
-                AcceptHook::new(
-                    meetings_root.to_path_buf(),
-                    peers.clone(),
-                    blobs.clone(),
-                    endpoint.clone(),
-                    peer_events,
-                    peer_arrivals,
-                    lifecycle_events,
-                ),
-            )
+            .accept(SYNC_ALPN, hook)
             .accept(
                 iroh_blobs::ALPN,
                 AuthorizedBlobs::new(blobs_protocol, peers.clone()),
@@ -456,7 +556,11 @@ impl SyncEngine {
     /// involved. Gated behind `test-support`: it is a test/local-only path, not
     /// part of the production sync surface (which always pins the relay).
     #[cfg(feature = "test-support")]
-    pub async fn start_direct(identity: DeviceIdentity, meetings_root: PathBuf) -> Result<Self> {
+    pub async fn start_direct(
+        identity: DeviceIdentity,
+        content_key: ContentKey,
+        meetings_root: PathBuf,
+    ) -> Result<Self> {
         let peers = PeerDirectory::new();
         let blobs = BlobStore::open(&meetings_root).await?;
         let endpoint = Endpoint::builder(presets::N0)
@@ -467,30 +571,17 @@ impl SyncEngine {
             .bind()
             .await
             .map_err(|e| Error::Endpoint(format!("binding iroh endpoint: {e}")))?;
-        let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
-        let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
-        let router = Self::build_router(
-            &endpoint,
-            &blobs,
-            &peers,
-            &meetings_root,
-            peer_events.clone(),
-            PeerArrivalTracker::new(),
-            lifecycle_events.clone(),
-        );
-        Ok(Self {
+        Ok(Self::assemble(
             endpoint,
-            router,
             peers,
-            backoff: BackoffRegistry::new(BackoffPolicy::default()),
             blobs,
             meetings_root,
-            // The relay-less test path never addresses a peer relay-only, so it has
-            // no relay URL; `push_all_to` is unused here.
-            relay_url: String::new(),
-            peer_events,
-            lifecycle_events,
-        })
+            &content_key,
+            BackoffRegistry::new(BackoffPolicy::default()),
+            // The relay-less test path never addresses a peer relay-only, so it
+            // has no relay URL; `push_all_to` is unused here.
+            String::new(),
+        ))
     }
 
     /// The bound socket addresses, used to build a direct [`EndpointAddr`] without
@@ -511,7 +602,11 @@ impl SyncEngine {
     /// always verifies the real relay's certificate; this path is gated behind
     /// `test-support` and never reachable from the production build.
     #[cfg(feature = "test-support")]
-    pub async fn start_insecure(config: SyncConfig, identity: DeviceIdentity) -> Result<Self> {
+    pub async fn start_insecure(
+        config: SyncConfig,
+        identity: DeviceIdentity,
+        content_key: ContentKey,
+    ) -> Result<Self> {
         let relay_mode = Self::relay_mode(&config)?;
         let peers = PeerDirectory::new();
         let meetings_root = config.meetings_root.clone();
@@ -534,29 +629,15 @@ impl SyncEngine {
             "sync endpoint bound (insecure relay TLS, test relay only)"
         );
 
-        let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
-        let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
-        let router = Self::build_router(
-            &endpoint,
-            &blobs,
-            &peers,
-            &meetings_root,
-            peer_events.clone(),
-            PeerArrivalTracker::new(),
-            lifecycle_events.clone(),
-        );
-
-        Ok(Self {
+        Ok(Self::assemble(
             endpoint,
-            router,
             peers,
-            backoff: BackoffRegistry::new(config.backoff_policy),
             blobs,
             meetings_root,
-            relay_url: config.relay_url,
-            peer_events,
-            lifecycle_events,
-        })
+            &content_key,
+            BackoffRegistry::new(config.backoff_policy),
+            config.relay_url,
+        ))
     }
 
     /// The configured relay as a [`RelayMode::Custom`], carrying the access token
@@ -982,7 +1063,7 @@ impl SyncEngine {
 
     /// Reconcile one meeting's notes with `peer`: dial it on the [`SYNC_ALPN`]
     /// and run the initiator side of the notes-sync protocol
-    /// ([`notes_proto::initiate_notes_sync`]) against this device's
+    /// (`notes_proto::initiate_notes_sync`) against this device's
     /// [`Self::meetings_root`]. On return both sides have merged each other's
     /// missing updates into their `notes.ydoc` (via `persistence`).
     ///
@@ -998,8 +1079,14 @@ impl SyncEngine {
     ) -> Result<()> {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
-        let result = notes_proto::initiate_notes_sync(&conn, &self.meetings_root, meeting_id).await;
-        conn.close(0u32.into(), b"notes-sync-done");
+        let result = notes_proto::initiate_notes_sync(
+            &conn,
+            &self.cipher,
+            &self.meetings_root,
+            meeting_id,
+        )
+        .await;
+        let result = finish_exchange(&conn, b"notes-sync-done", result);
         if result.is_err() {
             self.record_exchange_failure(peer_id);
         }
@@ -1007,7 +1094,7 @@ impl SyncEngine {
     }
 
     /// Run a discovery exchange with `peer`: dial it on the [`SYNC_ALPN`] and run
-    /// the initiator side ([`discovery_proto::initiate_discovery`]), learning the
+    /// the initiator side (`discovery_proto::initiate_discovery`), learning the
     /// peer's `(MeetingId, ProcessingLifecycle, DeletionState)` for every meeting
     /// it holds. Each received state is emitted on
     /// [`Self::subscribe_lifecycle_events`] for the `ipc-bridge` or `headless`
@@ -1023,8 +1110,9 @@ impl SyncEngine {
     pub async fn discover_with(&self, peer: impl Into<EndpointAddr>) -> Result<Vec<MeetingId>> {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
-        let result = discovery_proto::initiate_discovery(&conn, &self.meetings_root).await;
-        conn.close(0u32.into(), b"discovery-done");
+        let result =
+            discovery_proto::initiate_discovery(&conn, &self.cipher, &self.meetings_root).await;
+        let result = finish_exchange(&conn, b"discovery-done", result);
         match &result {
             Ok(_) => self.record_peer_reachable(peer_id),
             Err(_) => self.record_exchange_failure(peer_id),
@@ -1214,7 +1302,7 @@ impl SyncEngine {
 
     /// Reconcile one meeting's media (`audio.opus` + note assets) with `peer`:
     /// dial it on the [`SYNC_ALPN`] and run the initiator side of the
-    /// media-manifest protocol ([`media_proto::initiate_media_sync`]) against this
+    /// media-manifest protocol (`media_proto::initiate_media_sync`) against this
     /// device's [`Self::meetings_root`]. Each side imports its own media into the
     /// blob store, exchanges a manifest of `(relative-path, hash)` pairs, and
     /// pulls the blobs it is missing over the blobs ALPN, exporting each to the
@@ -1232,16 +1320,9 @@ impl SyncEngine {
     ) -> Result<()> {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
-        let result = media_proto::initiate_media_sync(
-            &conn,
-            &self.blobs,
-            &self.endpoint,
-            peer_id,
-            &self.meetings_root,
-            meeting_id,
-        )
-        .await;
-        conn.close(0u32.into(), b"media-sync-done");
+        let result =
+            media_proto::initiate_media_sync(&conn, self.blob_exchange(peer_id), meeting_id).await;
+        let result = finish_exchange(&conn, b"media-sync-done", result);
         if result.is_err() {
             self.record_exchange_failure(peer_id);
         }
@@ -1250,7 +1331,7 @@ impl SyncEngine {
 
     /// Reconcile one meeting's derived artifacts (`transcript.json` + `summary.md`)
     /// with `peer`: dial it on the [`SYNC_ALPN`] and run the initiator side of the
-    /// artifact-manifest protocol ([`artifacts_proto::initiate_artifacts_sync`])
+    /// artifact-manifest protocol (`artifacts_proto::initiate_artifacts_sync`)
     /// against this device's [`Self::meetings_root`]. Each side imports its own
     /// artifacts into the blob store (stamping each entry with the authority for
     /// those exact bytes), exchanges a manifest, and pulls every entry that
@@ -1270,16 +1351,10 @@ impl SyncEngine {
     ) -> Result<()> {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
-        let result = artifacts_proto::initiate_artifacts_sync(
-            &conn,
-            &self.blobs,
-            &self.endpoint,
-            peer_id,
-            &self.meetings_root,
-            meeting_id,
-        )
-        .await;
-        conn.close(0u32.into(), b"artifacts-sync-done");
+        let result =
+            artifacts_proto::initiate_artifacts_sync(&conn, self.blob_exchange(peer_id), meeting_id)
+                .await;
+        let result = finish_exchange(&conn, b"artifacts-sync-done", result);
         if result.is_err() {
             self.record_exchange_failure(peer_id);
         }
@@ -1463,6 +1538,10 @@ struct AcceptHook {
     peers: PeerDirectory,
     /// The blob store, for the media responder.
     blobs: BlobStore,
+    /// The frame cipher, shared with [`SyncEngine`]. Every responder seals and
+    /// opens its frames under it, so an inbound peer holding a different content
+    /// key gets [`Error::Unauthenticated`] on its first frame.
+    cipher: FrameCipher,
     /// The endpoint, for the media responder's blob pulls.
     endpoint: Endpoint,
     /// Fires the remote's hex id the first time it is authorised in a
@@ -1476,28 +1555,6 @@ struct AcceptHook {
     /// Fires each `(MeetingId, ProcessingLifecycle, DeletionState)` received on an inbound
     /// discovery exchange (see [`SyncEngine::subscribe_lifecycle_events`]).
     lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
-}
-
-impl AcceptHook {
-    fn new(
-        meetings_root: PathBuf,
-        peers: PeerDirectory,
-        blobs: BlobStore,
-        endpoint: Endpoint,
-        peer_events: broadcast::Sender<String>,
-        peer_arrivals: PeerArrivalTracker,
-        lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
-    ) -> Self {
-        Self {
-            meetings_root,
-            peers,
-            blobs,
-            endpoint,
-            peer_events,
-            peer_arrivals,
-            lifecycle_events,
-        }
-    }
 }
 
 impl ProtocolHandler for AcceptHook {
@@ -1529,13 +1586,36 @@ impl ProtocolHandler for AcceptHook {
             let _ = self.peer_events.send(peer.to_string());
         }
 
-        self.dispatch(&connection, peer)
-            .await
-            .map_err(AcceptError::from_err)
+        let outcome = self.dispatch(&connection, peer).await;
+        if let Err(Error::Unauthenticated(ref reason)) = outcome {
+            tracing::warn!(
+                target: "sync",
+                peer = %peer,
+                %reason,
+                "inbound sync frame failed to authenticate; peer holds a different content key"
+            );
+        }
+        // Closes with `CLOSE_UNAUTHENTICATED` on an authentication failure, so the
+        // initiator learns why instead of seeing a bare "connection lost". The
+        // responder never sends a `…-done`: the initiator is the side that closes
+        // a healthy exchange.
+        finish_exchange(&connection, b"", outcome).map_err(AcceptError::from_err)
     }
 }
 
 impl AcceptHook {
+    /// The blob-exchange collaborators for one inbound peer, mirroring
+    /// [`SyncEngine::blob_exchange`].
+    fn blob_exchange(&self, peer: EndpointId) -> BlobExchange<'_> {
+        BlobExchange {
+            cipher: &self.cipher,
+            store: &self.blobs,
+            endpoint: &self.endpoint,
+            peer,
+            root: &self.meetings_root,
+        }
+    }
+
     /// Accept the initiator's bidirectional stream, read its leading
     /// [`StreamKind`] tag, and run the matching responder. The accept + tag read
     /// are bounded by [`ACCEPT_HANDSHAKE_TIMEOUT`]: this is the very first
@@ -1578,6 +1658,7 @@ impl AcceptHook {
             StreamKind::Notes => {
                 notes_proto::respond_notes_sync(
                     connection,
+                    &self.cipher,
                     &mut send,
                     &mut recv,
                     &self.meetings_root,
@@ -1587,18 +1668,16 @@ impl AcceptHook {
             StreamKind::Media => {
                 media_proto::respond_media_sync(
                     connection,
+                    self.blob_exchange(peer),
                     &mut send,
                     &mut recv,
-                    &self.blobs,
-                    &self.endpoint,
-                    peer,
-                    &self.meetings_root,
                 )
                 .await
             }
             StreamKind::Discovery => {
                 let theirs = discovery_proto::respond_discovery(
                     connection,
+                    &self.cipher,
                     &mut send,
                     &mut recv,
                     &self.meetings_root,
@@ -1618,12 +1697,9 @@ impl AcceptHook {
             StreamKind::Artifacts => {
                 artifacts_proto::respond_artifacts_sync(
                     connection,
+                    self.blob_exchange(peer),
                     &mut send,
                     &mut recv,
-                    &self.blobs,
-                    &self.endpoint,
-                    peer,
-                    &self.meetings_root,
                 )
                 .await
             }
@@ -1841,10 +1917,18 @@ mod tests {
         let dir_b = tempfile::TempDir::new().expect("tempdir b");
         let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
         let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
-        let engine_a = SyncEngine::start_direct(id_a, dir_a.path().to_path_buf())
+        let engine_a = SyncEngine::start_direct(
+            id_a,
+            ContentKey::for_tests(),
+            dir_a.path().to_path_buf(),
+        )
             .await
             .expect("engine a");
-        let engine_b = SyncEngine::start_direct(id_b, dir_b.path().to_path_buf())
+        let engine_b = SyncEngine::start_direct(
+            id_b,
+            ContentKey::for_tests(),
+            dir_b.path().to_path_buf(),
+        )
             .await
             .expect("engine b");
 
@@ -1873,7 +1957,11 @@ mod tests {
         rt.block_on(async {
             let dir = tempfile::TempDir::new().expect("tempdir");
             let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-            let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+            let engine = SyncEngine::start_direct(
+                id,
+                ContentKey::for_tests(),
+                dir.path().to_path_buf(),
+            )
                 .await
                 .expect("engine");
             assert!(matches!(
@@ -1888,7 +1976,11 @@ mod tests {
     async fn add_account_peer_registers_a_valid_id_and_relay() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+        let engine = SyncEngine::start_direct(
+            id,
+            ContentKey::for_tests(),
+            dir.path().to_path_buf(),
+        )
             .await
             .expect("engine");
 
@@ -1905,7 +1997,11 @@ mod tests {
     async fn add_account_peer_accepts_direct_addrs_and_skips_unparseable() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+        let engine = SyncEngine::start_direct(
+            id,
+            ContentKey::for_tests(),
+            dir.path().to_path_buf(),
+        )
             .await
             .expect("engine");
 
@@ -1965,7 +2061,11 @@ mod tests {
     async fn add_account_peer_rejects_a_malformed_endpoint_id() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+        let engine = SyncEngine::start_direct(
+            id,
+            ContentKey::for_tests(),
+            dir.path().to_path_buf(),
+        )
             .await
             .expect("engine");
 
@@ -1981,7 +2081,11 @@ mod tests {
     async fn add_account_peer_rejects_a_malformed_relay_url() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+        let engine = SyncEngine::start_direct(
+            id,
+            ContentKey::for_tests(),
+            dir.path().to_path_buf(),
+        )
             .await
             .expect("engine");
 
@@ -2022,10 +2126,10 @@ mod tests {
         let dir_b = tempfile::TempDir::new().expect("tempdir b");
         let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
         let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
-        let a = SyncEngine::start_direct(id_a, dir_a.path().to_path_buf())
+        let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), dir_a.path().to_path_buf())
             .await
             .expect("engine a");
-        let b = SyncEngine::start_direct(id_b, dir_b.path().to_path_buf())
+        let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), dir_b.path().to_path_buf())
             .await
             .expect("engine b");
 
@@ -2066,7 +2170,11 @@ mod tests {
     async fn dial_refuses_a_suppressed_peer_without_recording_a_failure() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+        let engine = SyncEngine::start_direct(
+            id,
+            ContentKey::for_tests(),
+            dir.path().to_path_buf(),
+        )
             .await
             .expect("engine");
 
@@ -2098,7 +2206,11 @@ mod tests {
     async fn peers_to_dial_excludes_dial_suppressed_peers() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(id, dir.path().to_path_buf())
+        let engine = SyncEngine::start_direct(
+            id,
+            ContentKey::for_tests(),
+            dir.path().to_path_buf(),
+        )
             .await
             .expect("engine");
 

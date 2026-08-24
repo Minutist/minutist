@@ -54,7 +54,7 @@ use ipc_bridge::{ChatHandles, SyncControl};
 use minutist_common::{AppError, AppEvent, AppResult, HostRef, MeetingId, SyncStatus};
 use settings::SettingsHandle;
 use sync::{
-    run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, BackoffPolicy,
+    run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, BackoffPolicy, ContentKey,
     DeviceIdentity, RefreshSink, SyncConfig, SyncEngine, SyncEngineRefreshSink,
 };
 use tokio::sync::broadcast;
@@ -265,6 +265,19 @@ impl ConnectedSync {
             }
         };
 
+        // The account content key every enrolled device holds; each frame on the
+        // sync ALPN is sealed under it. Minted on first run, which assumes this
+        // device is the first on the account: if it is not, the user-confirmed
+        // enrolment exchange replaces it (see `sync::content_key`).
+        let content_key = match ContentKey::load_or_mint(&app_data_base) {
+            Ok(key) => key,
+            Err(e) => {
+                self.fail(format!("loading the sync content key: {e}"))
+                    .await;
+                return;
+            }
+        };
+
         // Clone the meetings root for the lifecycle subscriber + the election loop
         // before the config consumes it.
         let subscriber_meetings_dir = meetings_dir.clone();
@@ -284,7 +297,7 @@ impl ConnectedSync {
             cap: std::time::Duration::from_secs(3600),
         });
 
-        match SyncEngine::start(config, identity).await {
+        match SyncEngine::start(config, identity, content_key).await {
             Ok(engine) => {
                 let engine = Arc::new(engine);
 

@@ -10,6 +10,7 @@ use iroh::{EndpointAddr, RelayUrl};
 use minutist_common::MeetingId;
 use notes_crdt::{MeetingFolder, NotesStore};
 use serde_json::json;
+use sync::ContentKey;
 use sync::{DeviceIdentity, SyncConfig, SyncEngine};
 use uuid::Uuid;
 
@@ -53,10 +54,10 @@ async fn adopt_pulls_lacked_meetings_and_skips_held() {
         backoff_policy: Default::default(),
         relay_ips: Vec::new(),
     };
-    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a)
+    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, ContentKey::for_tests())
         .await
         .expect("engine A binds");
-    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b)
+    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, ContentKey::for_tests())
         .await
         .expect("engine B binds");
 
@@ -82,7 +83,10 @@ async fn adopt_pulls_lacked_meetings_and_skips_held() {
     .await
     .expect("adopt timed out")
     .expect("adopt failed");
-    assert_eq!(adopted, 1, "adopts only the meeting B lacks (m2), skips the held m1");
+    assert_eq!(
+        adopted, 1,
+        "adopts only the meeting B lacks (m2), skips the held m1"
+    );
     assert_eq!(
         projected(dir_b.path(), m2),
         projected(dir_a.path(), m2),
@@ -94,7 +98,10 @@ async fn adopt_pulls_lacked_meetings_and_skips_held() {
         .adopt_from_peer(&a.endpoint_id().to_string(), &never_purged)
         .await
         .expect("second adopt failed");
-    assert_eq!(again, 0, "a second adopt pulls nothing once B holds all of A's meetings");
+    assert_eq!(
+        again, 0,
+        "a second adopt pulls nothing once B holds all of A's meetings"
+    );
 
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
@@ -123,10 +130,10 @@ async fn adopt_never_resurrects_a_locally_purged_meeting() {
         backoff_policy: Default::default(),
         relay_ips: Vec::new(),
     };
-    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a)
+    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, ContentKey::for_tests())
         .await
         .expect("engine A binds");
-    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b)
+    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, ContentKey::for_tests())
         .await
         .expect("engine B binds");
 

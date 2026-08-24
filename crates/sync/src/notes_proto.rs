@@ -44,8 +44,9 @@
 //! close connection ------------------> conn.closed() resolves; responder returns
 //! ```
 //!
-//! Every variable-length field is a frame: a `u32` big-endian byte length
-//! followed by that many bytes ([`read_frame`] / [`write_frame`]). The
+//! Every variable-length field is a sealed frame: a `u32` big-endian byte length
+//! then that many bytes, opened under the account content key
+//! (`crate::frame::Framer`). The
 //! `meeting_id` is a fixed 16-byte UUID (no prefix). A diff that carries no
 //! changes (the peer had nothing the receiver lacked) is recognised by
 //! [`is_noop_update`] and skipped rather than written, so an up-to-date or
@@ -64,7 +65,8 @@ use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::Update;
 
-use crate::frame::{read_frame, write_frame};
+use crate::content_key::FrameCipher;
+use crate::frame::Framer;
 use crate::timeouts::{FRAME_IO_TIMEOUT, RESPONDER_CLOSE_TIMEOUT};
 use crate::{Error, Result};
 
@@ -77,7 +79,7 @@ use crate::{Error, Result};
 /// tag as the first byte of each bidirectional stream, and the accept hook
 /// dispatches on it, so one paired-peer authorisation point (the notes-ALPN
 /// accept hook) covers all of them.
-pub const SYNC_ALPN: &[u8] = b"minutist/sync/notes/1";
+pub const SYNC_ALPN: &[u8] = b"minutist/sync/notes/2";
 
 /// The first byte of a sync bidirectional stream, selecting the protocol that
 /// runs over it. Lets notes and media reconciliation share one ALPN and one
@@ -85,7 +87,7 @@ pub const SYNC_ALPN: &[u8] = b"minutist/sync/notes/1";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StreamKind {
-    /// Yjs notes reconciliation ([`initiate_notes_sync`] / [`respond_notes_sync`]).
+    /// Yjs notes reconciliation (`initiate_notes_sync` / `respond_notes_sync`).
     Notes = 1,
     /// Media-manifest exchange ([`crate::media_proto`]).
     Media = 2,
@@ -231,11 +233,13 @@ pub(crate) fn project_meta_best_effort(root: &Path, meeting_id: MeetingId) {
 /// are missing and applies it (so we converge). The caller closes `conn` after
 /// this returns: the initiator is the last reader, so closing then is safe. See
 /// the module wire-protocol diagram.
-pub async fn initiate_notes_sync(
+pub(crate) async fn initiate_notes_sync(
     conn: &Connection,
+    cipher: &FrameCipher,
     root: &Path,
     meeting_id: MeetingId,
 ) -> Result<()> {
+    let framer = Framer::new(cipher, StreamKind::Notes);
     let local_state = local_v1_state(root, meeting_id)?;
     let local_sv = state_vector_of(&local_state)?;
 
@@ -253,17 +257,17 @@ pub async fn initiate_notes_sync(
     send.write_all(meeting_id.0.as_bytes())
         .await
         .map_err(|e| Error::Protocol(format!("writing meeting id: {e}")))?;
-    write_frame(&mut send, &local_sv).await?;
+    framer.write(&mut send, &local_sv).await?;
 
     // Learn the peer's state vector, then send it the diff it is missing.
-    let peer_sv = read_frame(&mut recv).await?;
+    let peer_sv = framer.read(&mut recv).await?;
     let diff_for_peer = diff_against(&local_state, &peer_sv)?;
-    write_frame(&mut send, &diff_for_peer).await?;
+    framer.write(&mut send, &diff_for_peer).await?;
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing notes-sync send: {e}")))?;
 
     // Read the diff we are missing and merge it last (initiator is last reader).
-    let diff_for_us = read_frame(&mut recv).await?;
+    let diff_for_us = framer.read(&mut recv).await?;
     apply_inbound(root, meeting_id, &diff_for_us)?;
     Ok(())
 }
@@ -280,12 +284,14 @@ pub async fn initiate_notes_sync(
 /// diagram.
 ///
 /// [`Connection::closed`]: iroh::endpoint::Connection::closed
-pub async fn respond_notes_sync(
+pub(crate) async fn respond_notes_sync(
     conn: &Connection,
+    cipher: &FrameCipher,
     send: &mut SendStream,
     recv: &mut RecvStream,
     root: &Path,
 ) -> Result<()> {
+    let framer = Framer::new(cipher, StreamKind::Notes);
     // REQUEST: meeting id then the initiator's state vector. Bounded by
     // FRAME_IO_TIMEOUT like every other frame read on this stream: this one is a
     // raw fixed-size read rather than a length-prefixed frame, so it needs its own
@@ -306,20 +312,20 @@ pub async fn respond_notes_sync(
         })?
         .map_err(|e| Error::Protocol(format!("reading meeting id: {e}")))?;
     let meeting_id = MeetingId(Uuid::from_bytes(id_buf));
-    let init_sv = read_frame(recv).await?;
+    let init_sv = framer.read(recv).await?;
 
     let local_state = local_v1_state(root, meeting_id)?;
     let local_sv = state_vector_of(&local_state)?;
 
     // Reply with our state vector so the initiator can diff against it.
-    write_frame(send, &local_sv).await?;
+    framer.write(send, &local_sv).await?;
 
     // Apply the initiator's diff (we converge), then send the diff it is missing.
-    let diff_for_us = read_frame(recv).await?;
+    let diff_for_us = framer.read(recv).await?;
     apply_inbound(root, meeting_id, &diff_for_us)?;
 
     let diff_for_init = diff_against(&local_state, &init_sv)?;
-    write_frame(send, &diff_for_init).await?;
+    framer.write(send, &diff_for_init).await?;
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing notes-sync send: {e}")))?;
 

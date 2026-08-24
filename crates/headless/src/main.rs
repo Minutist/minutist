@@ -73,7 +73,8 @@ use minutist_common::{AppError, AppResult, DeletionState, MeetingId, ProcessingL
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sync::{
-    run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, DeviceIdentity,
+    run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, ContentKey,
+    DeviceIdentity,
     RefreshSink, SyncConfig, SyncEngine, SyncEngineRefreshSink,
 };
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -634,11 +635,12 @@ struct AccountRefreshArgs {
 async fn bind_sync_engine(
     config: SyncConfig,
     identity: DeviceIdentity,
+    content_key: ContentKey,
 ) -> sync::Result<SyncEngine> {
     if std::env::var_os("MINUTIST_HUB_INSECURE_RELAY_TLS").is_some() {
-        SyncEngine::start_insecure(config, identity).await
+        SyncEngine::start_insecure(config, identity, content_key).await
     } else {
-        SyncEngine::start(config, identity).await
+        SyncEngine::start(config, identity, content_key).await
     }
 }
 
@@ -647,8 +649,9 @@ async fn bind_sync_engine(
 async fn bind_sync_engine(
     config: SyncConfig,
     identity: DeviceIdentity,
+    content_key: ContentKey,
 ) -> sync::Result<SyncEngine> {
-    SyncEngine::start(config, identity).await
+    SyncEngine::start(config, identity, content_key).await
 }
 
 /// Adds every ticket in `MINUTIST_HUB_TEST_PEERS` (comma-separated) directly to
@@ -698,6 +701,12 @@ async fn start_engine(
     // and reloaded thereafter — the stable identity peers pair against.
     let identity = DeviceIdentity::load_or_generate(data_dir)?;
 
+    // The account content key every enrolled device holds; each frame on the
+    // sync ALPN is sealed under it. Minted on first run, which assumes this hub
+    // is the first device on the account: if it is not, the user-confirmed
+    // enrolment exchange replaces it (see `sync::content_key`).
+    let content_key = ContentKey::load_or_mint(data_dir)?;
+
     // The sync engine reads/writes per-meeting folders under `{data_dir}/meetings`.
     let meetings_root = data_dir.join("meetings");
     std::fs::create_dir_all(&meetings_root).map_err(|e| AppError::Io {
@@ -713,7 +722,7 @@ async fn start_engine(
     // Binding opens the QUIC socket and spawns the inbound accept loop; the relay
     // is dialled lazily, so the engine starts even if the relay is momentarily
     // unreachable.
-    let engine = bind_sync_engine(config, identity).await?;
+    let engine = bind_sync_engine(config, identity, content_key).await?;
     seed_test_peers(&engine);
 
     // Account-mediated peer discovery (5.5b / B4): when a seeded device credential

@@ -59,12 +59,10 @@
 use std::path::Path;
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointId};
 use minutist_common::{HostRef, MeetingId, ProcessingLifecycle};
 use uuid::Uuid;
 
-use crate::blobs::{record_artifact_authority, ArtifactManifest, BlobStore};
-use crate::frame::{read_frame, write_frame};
+use crate::blobs::{record_artifact_authority, ArtifactManifest, BlobExchange};
 use crate::notes_proto::StreamKind;
 use crate::timeouts::{FRAME_IO_TIMEOUT, PEER_PULL_TIMEOUT, RESPONDER_CLOSE_TIMEOUT};
 use crate::{discovery_proto, Error, Result};
@@ -119,10 +117,7 @@ fn producer_authority(root: &Path, meeting_id: MeetingId) -> Option<(HostRef, St
 /// re-established) and the situation logged. `peer_manifest` has been validated
 /// before this runs.
 async fn pull_superseding(
-    store: &BlobStore,
-    endpoint: &Endpoint,
-    peer: EndpointId,
-    meetings_root: &Path,
+    ex: BlobExchange<'_>,
     meeting_id: MeetingId,
     local_manifest: &ArtifactManifest,
     peer_manifest: &ArtifactManifest,
@@ -136,9 +131,7 @@ async fn pull_superseding(
             // on disk; if a file is present but we could not stamp it, refuse to
             // overwrite it with a copy we cannot prove is newer (silent-loss guard).
             None => {
-                let local_path = meetings_root
-                    .join(meeting_id.0.to_string())
-                    .join(&entry.rel_path);
+                let local_path = ex.root.join(meeting_id.0.to_string()).join(&entry.rel_path);
                 if local_path.exists() {
                     tracing::warn!(
                         target: "sync",
@@ -156,11 +149,11 @@ async fn pull_superseding(
             continue;
         }
 
-        store
+        ex.store
             .download_artifact(
-                endpoint,
-                peer,
-                meetings_root,
+                ex.endpoint,
+                ex.peer,
+                ex.root,
                 meeting_id,
                 &entry.rel_path,
                 entry.hash,
@@ -171,7 +164,7 @@ async fn pull_superseding(
         // this device re-advertises it faithfully (never re-derived from
         // metadata.json, DESIGN §2 C1).
         record_artifact_authority(
-            meetings_root,
+            ex.root,
             meeting_id,
             &entry.rel_path,
             entry.hash,
@@ -204,16 +197,15 @@ async fn pull_superseding(
 ///
 /// `peer` is the remote [`EndpointId`] the downloader dials; it must equal
 /// `conn.remote_id()` (the caller passes the id it dialled).
-pub async fn initiate_artifacts_sync(
+pub(crate) async fn initiate_artifacts_sync(
     conn: &Connection,
-    store: &BlobStore,
-    endpoint: &Endpoint,
-    peer: EndpointId,
-    root: &Path,
+    ex: BlobExchange<'_>,
     meeting_id: MeetingId,
 ) -> Result<()> {
-    let local_manifest = store
-        .import_artifacts(root, meeting_id, producer_authority(root, meeting_id))
+    let framer = ex.framer(StreamKind::Artifacts);
+    let local_manifest = ex
+        .store
+        .import_artifacts(ex.root, meeting_id, producer_authority(ex.root, meeting_id))
         .await?;
 
     let (mut send, mut recv) = conn
@@ -230,21 +222,14 @@ pub async fn initiate_artifacts_sync(
     send.write_all(meeting_id.0.as_bytes())
         .await
         .map_err(|e| Error::Protocol(format!("writing meeting id: {e}")))?;
-    write_frame(&mut send, &encode_manifest(&local_manifest)?).await?;
+    framer
+        .write(&mut send, &encode_manifest(&local_manifest)?)
+        .await?;
 
     // Read the peer's manifest and pull what supersedes ours over the blobs ALPN.
-    let peer_manifest = decode_manifest(&read_frame(&mut recv).await?)?;
+    let peer_manifest = decode_manifest(&framer.read(&mut recv).await?)?;
     peer_manifest.validate()?;
-    pull_superseding(
-        store,
-        endpoint,
-        peer,
-        root,
-        meeting_id,
-        &local_manifest,
-        &peer_manifest,
-    )
-    .await?;
+    pull_superseding(ex, meeting_id, &local_manifest, &peer_manifest).await?;
 
     // Signal our pull is complete, then wait for the responder's DONE so we do not
     // return (tearing down the connection) before its pull has landed.
@@ -267,15 +252,13 @@ pub async fn initiate_artifacts_sync(
 /// the sync-ALPN accept hook before this runs.
 ///
 /// [`Connection::closed`]: iroh::endpoint::Connection::closed
-pub async fn respond_artifacts_sync(
+pub(crate) async fn respond_artifacts_sync(
     conn: &Connection,
+    ex: BlobExchange<'_>,
     send: &mut SendStream,
     recv: &mut RecvStream,
-    store: &BlobStore,
-    endpoint: &Endpoint,
-    peer: EndpointId,
-    root: &Path,
 ) -> Result<()> {
+    let framer = ex.framer(StreamKind::Artifacts);
     // REQUEST: meeting id then the initiator's manifest. Bounded by
     // FRAME_IO_TIMEOUT like every other frame read on this stream: this one is a
     // raw fixed-size read rather than a length-prefixed frame, so it needs its own
@@ -286,7 +269,7 @@ pub async fn respond_artifacts_sync(
         .map_err(|_| {
             tracing::warn!(
                 target: "sync",
-                peer = %peer,
+                peer = %ex.peer,
                 timeout = ?FRAME_IO_TIMEOUT,
                 "reading the artifacts-sync meeting id timed out"
             );
@@ -296,7 +279,7 @@ pub async fn respond_artifacts_sync(
         })?
         .map_err(|e| Error::Protocol(format!("reading meeting id: {e}")))?;
     let meeting_id = MeetingId(Uuid::from_bytes(id_buf));
-    let peer_manifest = decode_manifest(&read_frame(recv).await?)?;
+    let peer_manifest = decode_manifest(&framer.read(recv).await?)?;
     peer_manifest.validate()?;
 
     // No `MeetingFolder::ensure` here: a content-less peer meeting must not
@@ -308,27 +291,21 @@ pub async fn respond_artifacts_sync(
     // the folder already exists with real `notes.ydoc` content (from an earlier
     // or same-session notes sync), repair a still-blank metadata.json now rather
     // than waiting on the next notes sweep.
-    crate::notes_proto::project_meta_best_effort(root, meeting_id);
+    crate::notes_proto::project_meta_best_effort(ex.root, meeting_id);
 
     // Import our own artifacts (stages our blobs for the peer + our manifest).
-    let local_manifest = store
-        .import_artifacts(root, meeting_id, producer_authority(root, meeting_id))
+    let local_manifest = ex
+        .store
+        .import_artifacts(ex.root, meeting_id, producer_authority(ex.root, meeting_id))
         .await?;
 
     // Reply with our manifest so the initiator can pull what supersedes its copy.
-    write_frame(send, &encode_manifest(&local_manifest)?).await?;
+    framer
+        .write(send, &encode_manifest(&local_manifest)?)
+        .await?;
 
     // Pull what supersedes our copy from the initiator over the blobs ALPN.
-    pull_superseding(
-        store,
-        endpoint,
-        peer,
-        root,
-        meeting_id,
-        &local_manifest,
-        &peer_manifest,
-    )
-    .await?;
+    pull_superseding(ex, meeting_id, &local_manifest, &peer_manifest).await?;
 
     // Signal our pull is complete, then wait for the initiator's DONE so neither
     // side observes completion before both pulls have landed.
@@ -343,7 +320,7 @@ pub async fn respond_artifacts_sync(
         .map_err(|_| {
             tracing::warn!(
                 target: "sync",
-                peer = %peer,
+                peer = %ex.peer,
                 timeout = ?RESPONDER_CLOSE_TIMEOUT,
                 "artifacts-sync responder timed out waiting for the initiator to close"
             );

@@ -13,6 +13,7 @@ use iroh::EndpointAddr;
 use minutist_common::MeetingId;
 use notes_crdt::MeetingFolder;
 use sync::identity::DeviceIdentity;
+use sync::ContentKey;
 use sync::SyncEngine;
 
 /// Loopback `EndpointAddr` for `engine` (its id + each bound port against
@@ -29,10 +30,10 @@ fn direct_addr(engine: &SyncEngine) -> EndpointAddr {
 async fn paired_engines(root_a: &Path, root_b: &Path) -> (SyncEngine, SyncEngine) {
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), root_b.to_path_buf())
         .await
         .expect("engine b");
     a.add_peer(direct_addr(&b));

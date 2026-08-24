@@ -7,7 +7,7 @@
 //! ([`notes_proto::SYNC_ALPN`]) multiplexes four request/response protocols over a
 //! single bidirectional stream, dispatched by a leading
 //! [`notes_proto::StreamKind`] tag, so one paired-peer authorisation point (the
-//! inbound `AcceptHook`) covers all four. Framing is shared ([`frame`]).
+//! inbound `AcceptHook`) covers all four. Framing is shared (`frame`).
 //!
 //! - **Notes** ([`notes_proto`], tag 1): Yjs state-vector/diff exchange. The
 //!   authoritative document is `notes-crdt`'s `notes.ydoc`; this crate never
@@ -32,6 +32,21 @@
 //! The blobs ALPN ([`blobs`]) moves bytes for media and artifacts. Its accept side
 //! takes the same paired-peer check as the primary ALPN, which `iroh-blobs`' own
 //! handler would not apply.
+//!
+//! # Payload encryption
+//!
+//! Every frame on the sync ALPN is sealed with XChaCha20-Poly1305 under a subkey
+//! of the account [`ContentKey`], at the one `frame::Framer` chokepoint all
+//! four protocols pass through, with the stream's [`notes_proto::StreamKind`] tag
+//! as AEAD additional data. A peer that passes the ed25519 membership check but
+//! holds a different key therefore reads nothing and gets
+//! [`Error::Unauthenticated`] on its first frame. [`SyncEngine::start`] requires
+//! a key, so there is no way to bind an unencrypted engine.
+//!
+//! Blob bytes are not sealed and do not need to be: `iroh-blobs`' provider
+//! answers by hash with no enumeration, and a hash reaches a peer only inside a
+//! sealed manifest. **A blob hash on any unsealed path is a confidentiality
+//! bug**, not untidiness. See `planning/DESIGN_sync-encryption.md` §4.
 //!
 //! # Peer addressing
 //!
@@ -86,10 +101,12 @@ pub mod address_lookup;
 pub mod artifacts_proto;
 pub mod backoff;
 pub mod blobs;
+pub mod content_key;
 pub mod discovery_proto;
 pub mod endpoint;
-pub mod frame;
+pub(crate) mod frame;
 pub mod identity;
+pub(crate) mod key_file;
 pub mod media_proto;
 pub mod notes_proto;
 pub(crate) mod timeouts;
@@ -101,6 +118,7 @@ pub use account::{
 };
 pub use address_lookup::PeerSource;
 pub use backoff::{BackoffPolicy, BackoffRegistry};
+pub use content_key::ContentKey;
 pub use endpoint::{SyncEngine, SyncEngineRefreshSink};
 pub use identity::DeviceIdentity;
 
@@ -120,6 +138,14 @@ pub enum Error {
     /// A sync protocol exchange failed.
     #[error("protocol: {0}")]
     Protocol(String),
+
+    /// A frame failed to authenticate under this device's content key. The peer
+    /// holds a different key, the bytes were tampered with, or the frame came
+    /// from another protocol. Kept distinct from [`Self::Protocol`] so a key
+    /// mismatch is diagnosable rather than looking like a malformed peer, and
+    /// from [`Self::Suppressed`] because this one warrants attention.
+    #[error("unauthenticated: {0}")]
+    Unauthenticated(String),
 
     /// The dial was refused locally: the peer is in failed-dial backoff. Distinct
     /// from [`Self::Endpoint`] so a caller can tell "we declined to try" from "the

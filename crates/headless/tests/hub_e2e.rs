@@ -47,8 +47,9 @@ use iroh::{EndpointAddr, RelayUrl};
 use minutist_common::{HostRef, MeetingId, ProcessingLifecycle};
 use notes_crdt::NotesStore;
 use sha2::Digest;
-use sync::{DeviceIdentity, SyncConfig, SyncEngine};
+use sync::{ContentKey, DeviceIdentity, SyncConfig, SyncEngine};
 use uuid::Uuid;
+
 
 /// Project a meeting's authoritative `notes.ydoc` to ProseMirror JSON via public
 /// `persistence` APIs, so the two devices' converged state compares independent of
@@ -114,6 +115,14 @@ fn spawn_hub(
     if let Some(url) = account_api_url {
         command.env("MINUTIST_HUB_API_URL", url);
     }
+
+    // Co-enrol the daemon with the test's own engines: it would otherwise mint
+    // its own key, fail to authenticate the client's frames, and dial-suppress
+    // it. `seed_for_tests` is the crate's own writer, so the test does not need
+    // to know the file's name or format. In production the user-confirmed
+    // enrolment exchange does this.
+    ContentKey::seed_for_tests(hub_dir).expect("seed the hub's content key");
+
     let mut child = command.spawn().expect("spawn minutist-hub");
     let stderr = child.stderr.take().expect("hub stderr piped");
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -239,18 +248,18 @@ async fn notes_converge_through_a_running_hub() {
     // `start_insecure` trusts the local relay's self-signed certificate instead
     // of verifying it; the live path verifies normally via `start`.
     let (engine_a, engine_b) = if insecure {
-        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a)
+        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, ContentKey::for_tests())
             .await
             .expect("engine A binds");
-        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b)
+        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, ContentKey::for_tests())
             .await
             .expect("engine B binds");
         (a, b)
     } else {
-        let a = SyncEngine::start(cfg(dir_a.path()), id_a)
+        let a = SyncEngine::start(cfg(dir_a.path()), id_a, ContentKey::for_tests())
             .await
             .expect("engine A binds");
-        let b = SyncEngine::start(cfg(dir_b.path()), id_b)
+        let b = SyncEngine::start(cfg(dir_b.path()), id_b, ContentKey::for_tests())
             .await
             .expect("engine B binds");
         (a, b)
@@ -387,12 +396,14 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     let engine_a = SyncEngine::start(
         cfg(dir_a.path()),
         DeviceIdentity::load_or_generate(dir_a.path()).expect("id a"),
+        ContentKey::for_tests(),
     )
     .await
     .expect("engine A");
     let engine_b = SyncEngine::start(
         cfg(dir_b.path()),
         DeviceIdentity::load_or_generate(dir_b.path()).expect("id b"),
+        ContentKey::for_tests(),
     )
     .await
     .expect("engine B");
@@ -497,6 +508,7 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
     let engine_a = SyncEngine::start(
         cfg(dir_a.path()),
         DeviceIdentity::load_or_generate(dir_a.path()).expect("id a"),
+        ContentKey::for_tests(),
     )
     .await
     .expect("engine A");
@@ -609,11 +621,13 @@ async fn hub_discovers_and_syncs_an_account_listed_peer() {
     };
     let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
     let engine_a = if insecure {
-        SyncEngine::start_insecure(cfg, id_a)
+        SyncEngine::start_insecure(cfg, id_a, ContentKey::for_tests())
             .await
             .expect("engine A binds")
     } else {
-        SyncEngine::start(cfg, id_a).await.expect("engine A binds")
+        SyncEngine::start(cfg, id_a, ContentKey::for_tests())
+            .await
+            .expect("engine A binds")
     };
 
     // The mock account-service: `GET /v1/account/devices` lists A's endpoint;

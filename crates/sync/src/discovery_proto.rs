@@ -12,7 +12,7 @@
 //!
 //! One exchange runs over a single bidirectional QUIC stream tagged
 //! [`StreamKind::Discovery`], driven by the initiator. A single length-prefixed
-//! frame ([`crate::frame`]) in each direction carries the JSON-encoded entry
+//! frame (`crate::frame`) in each direction carries the JSON-encoded entry
 //! list:
 //!
 //! ```text
@@ -38,7 +38,8 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use minutist_common::{DeletionState, MeetingId, MeetingMeta, ProcessingLifecycle};
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{read_frame, write_frame};
+use crate::content_key::FrameCipher;
+use crate::frame::Framer;
 use crate::notes_proto::StreamKind;
 use crate::timeouts::RESPONDER_CLOSE_TIMEOUT;
 use crate::{Error, Result};
@@ -158,7 +159,12 @@ fn decode(bytes: &[u8]) -> Result<Vec<DiscoveryEntry>> {
 /// a bi stream, tag it [`StreamKind::Discovery`], advertise our entries, then
 /// read and return the peer's (the caller emits them). The caller closes
 /// `conn` after this returns; the initiator is the last reader.
-pub async fn initiate_discovery(conn: &Connection, root: &Path) -> Result<Vec<DiscoveryEntry>> {
+pub(crate) async fn initiate_discovery(
+    conn: &Connection,
+    cipher: &FrameCipher,
+    root: &Path,
+) -> Result<Vec<DiscoveryEntry>> {
+    let framer = Framer::new(cipher, StreamKind::Discovery);
     let ours = local_entries(root);
 
     let (mut send, mut recv) = conn
@@ -169,11 +175,11 @@ pub async fn initiate_discovery(conn: &Connection, root: &Path) -> Result<Vec<Di
     send.write_all(&[StreamKind::Discovery as u8])
         .await
         .map_err(|e| Error::Protocol(format!("writing discovery stream tag: {e}")))?;
-    write_frame(&mut send, &encode(&ours)?).await?;
+    framer.write(&mut send, &encode(&ours)?).await?;
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing discovery send: {e}")))?;
 
-    let theirs = decode(&read_frame(&mut recv).await?)?;
+    let theirs = decode(&framer.read(&mut recv).await?)?;
     Ok(theirs)
 }
 
@@ -184,16 +190,18 @@ pub async fn initiate_discovery(conn: &Connection, root: &Path) -> Result<Vec<Di
 /// initiator has read it. Returns the initiator's entries (the caller emits).
 ///
 /// [`Connection::closed`]: iroh::endpoint::Connection::closed
-pub async fn respond_discovery(
+pub(crate) async fn respond_discovery(
     conn: &Connection,
+    cipher: &FrameCipher,
     send: &mut SendStream,
     recv: &mut RecvStream,
     root: &Path,
 ) -> Result<Vec<DiscoveryEntry>> {
-    let theirs = decode(&read_frame(recv).await?)?;
+    let framer = Framer::new(cipher, StreamKind::Discovery);
+    let theirs = decode(&framer.read(recv).await?)?;
 
     let ours = local_entries(root);
-    write_frame(send, &encode(&ours)?).await?;
+    framer.write(send, &encode(&ours)?).await?;
     send.finish()
         .map_err(|e| Error::Protocol(format!("finishing discovery send: {e}")))?;
 

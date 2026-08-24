@@ -20,6 +20,7 @@ use minutist_common::MeetingId;
 use notes_crdt::{MeetingFolder, NotesData, NotesStore};
 use serde_json::{json, Value};
 use sync::identity::DeviceIdentity;
+use sync::ContentKey;
 use sync::{SyncConfig, SyncEngine};
 
 /// Loopback `EndpointAddr` for `engine` (its id + each bound port against
@@ -51,13 +52,31 @@ fn projected_json(root: &Path, id: MeetingId) -> Value {
 
 /// Start two relay-less engines bound to `root_a` / `root_b` and cross-inject
 /// their loopback addresses (the out-of-band pairing the account service does).
+/// Both hold the same content key, which is what an enrolled pair looks like.
 async fn paired_engines(root_a: &Path, root_b: &Path) -> (SyncEngine, SyncEngine) {
+    keyed_engines(
+        root_a,
+        root_b,
+        ContentKey::for_tests(),
+        ContentKey::for_tests(),
+    )
+    .await
+}
+
+/// As [`paired_engines`], with each side's content key given explicitly, so a
+/// test can pair two devices that are addressable but not co-enrolled.
+async fn keyed_engines(
+    root_a: &Path,
+    root_b: &Path,
+    key_a: ContentKey,
+    key_b: ContentKey,
+) -> (SyncEngine, SyncEngine) {
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, key_a, root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, key_b, root_b.to_path_buf())
         .await
         .expect("engine b");
     a.add_peer(direct_addr(&b));
@@ -348,10 +367,10 @@ async fn sync_resolves_notes_under_the_meetings_root_not_the_app_data_base() {
     );
 
     // Engines bind their MEETINGS root (mirrors SyncConfig::new(meetings_root)).
-    let a = SyncEngine::start_direct(id_a, meetings_a.clone())
+    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), meetings_a.clone())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, meetings_b.clone())
+    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), meetings_b.clone())
         .await
         .expect("engine b");
     a.add_peer(direct_addr(&b));
@@ -400,10 +419,10 @@ async fn an_unpaired_peer_is_rejected_and_leaves_the_meeting_untouched() {
 
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), root_b.to_path_buf())
         .await
         .expect("engine b");
 
@@ -445,4 +464,56 @@ async fn config_new_targets_the_meetings_root() {
         "Debug must redact the relay token"
     );
     assert!(dbg.contains("<redacted>"));
+}
+
+/// Two devices the account directory has introduced to each other, but which are
+/// not co-enrolled: each holds its own content key. This is the shape of the
+/// threat issue 0054 gap 3 describes, a rogue endpoint the directory published
+/// that passes the ed25519 membership check.
+///
+/// The exchange must fail as `Unauthenticated` rather than converge, and B's
+/// notes must be untouched. Both halves matter: the error type is what
+/// distinguishes a wrong key from a malformed peer in a log, and the untouched
+/// document is the actual confidentiality claim.
+#[tokio::test]
+async fn a_peer_with_a_different_content_key_learns_nothing() {
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let root_a = dir_a.path();
+    let root_b = dir_b.path();
+    let meeting = MeetingId::new();
+
+    seed_notes(
+        root_a,
+        meeting,
+        &seed_doc("commercially sensitive"),
+        "sensitive",
+    );
+    let (a, b) = keyed_engines(
+        root_a,
+        root_b,
+        ContentKey::for_tests(),
+        // A key no enrolled device holds: the rogue-endpoint case.
+        ContentKey::from_bytes([0xff; 32]),
+    )
+    .await;
+
+    let err = a
+        .sync_notes(b.endpoint_id(), meeting)
+        .await
+        .expect_err("a mismatched content key must not converge");
+    assert!(
+        matches!(err, sync::Error::Unauthenticated(_)),
+        "a wrong content key must be Unauthenticated, not Protocol: {err:?}"
+    );
+
+    // Nothing arrived: B has no notes for the meeting at all, so the payload
+    // never reached a peer that could not authenticate it.
+    assert!(
+        NotesStore::load(root_b, meeting).expect("load b").is_none(),
+        "B must hold no notes after a failed exchange"
+    );
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
 }

@@ -690,6 +690,20 @@ section below) drive this crate's periodic refresh loop; the phone
 it has no caller left in any frontend today; the primitives stay on
 `SyncEngine` and in the `sync-ffi` API surface pending a coordinated removal.
 
+**Payload encryption:** every frame on the sync ALPN is sealed with
+XChaCha20-Poly1305 under a subkey of the account content key
+(`sync::content_key`), keyed per stream by its `StreamKind` tag as AEAD
+additional data. The seal is applied at the single `frame::Framer` chokepoint,
+so all four protocols get it without protocol-specific work. Blob bytes on the
+blobs ALPN are NOT sealed and do not need to be: a peer can only fetch a hash it
+knows, and hashes travel only inside sealed manifests, so a blob hash on any
+unsealed path is a confidentiality bug. New external dependencies for this:
+`chacha20poly1305`, `hkdf`, `sha2` (the 0.11 line, which `hkdf` 0.13 requires,
+not the workspace 0.10 pin), `getrandom`; all pure Rust, so the
+`aarch64-linux-android` cross-build is unaffected. `SyncEngine::start` takes a
+`ContentKey` alongside the `DeviceIdentity`, so a consumer cannot bind an
+unencrypted engine. See `planning/DESIGN_sync-encryption.md`.
+
 See `crates/sync/src/lib.rs` for implementation detail: the four wire
 protocols, the `PeerDirectory` replace-not-union addressing semantics, the
 peer-addressing mechanisms above, blob GC/tagging, the artifact-authority

@@ -81,11 +81,11 @@ struct Runtime {
     /// connector is disabled or before the background bind completes.
     engine: Option<Arc<SyncEngine>>,
     status: SyncStatus,
-    /// The shared cancellation token for the current bind's background loops —
-    /// the peers-file poll and (when account-paired) the account-refresh loop v2.
-    /// Both `select!` on `cancelled()`. It is the single shared token that closes
-    /// issue 0029 item 1's shared-cancel on the desktop, and being latching, a
-    /// cancel fired mid-loop-body (between `select!` iterations) is not missed.
+    /// The cancellation token for the current bind's account-refresh loop v2,
+    /// which `select!`s on `cancelled()`. It is the single shared token that
+    /// closes issue 0029 item 1's shared-cancel on the desktop, and being
+    /// latching, a cancel fired mid-loop-body (between `select!` iterations)
+    /// is not missed.
     ///
     /// The `replace()` below `cancel()`s a prior token before adopting the new
     /// one, but that path is NOT reachable today: `start_requested` is a one-shot
@@ -160,7 +160,20 @@ impl ConnectedSync {
         election: Option<ElectionDeps>,
         index: Arc<ipc_bridge::MeetingIndex>,
     ) -> Arc<Self> {
-        let enabled = settings.current().connector_enabled;
+        // `connector_enabled` is the sole gate for auto-starting, but it can drift
+        // from the real signed-in state: e.g. `delete_account`'s best-effort
+        // credential-file removal can fail (the account is erased server-side but
+        // a leftover `tunnel_device.json` survives), leaving a future launch
+        // re-derive `AccountStatus::SignedIn` (`ConnectedAccount::new` checks the
+        // file, not this setting) while `connector_enabled` stays the `false`
+        // `delete_account` persisted — the UI would then show "Signed in" with no
+        // way back to an active connector, since nothing but a fresh sign-in ever
+        // flips this flag. Treat a present credential as an independent,
+        // authoritative "should be enabled" signal, and self-heal the persisted
+        // setting to match rather than leaving it silently wrong forever.
+        let signed_in = crate::account::load_device_credential(&app_data_base).is_some();
+        let persisted_enabled = settings.current().connector_enabled;
+        let enabled = persisted_enabled || signed_in;
         let this = Arc::new(Self {
             event_tx,
             runtime: Arc::new(Mutex::new(Runtime {
@@ -182,6 +195,12 @@ impl ConnectedSync {
             let starter = Arc::clone(&this);
             tauri::async_runtime::spawn(async move {
                 starter.request_start().await;
+            });
+        }
+        if signed_in && !persisted_enabled {
+            let healer = Arc::clone(&this);
+            tauri::async_runtime::spawn(async move {
+                let _ = healer.settings.update(|s| s.connector_enabled = true).await;
             });
         }
 
@@ -726,10 +745,11 @@ mod tests {
     //! construction. Where the engine-level `crates/sync/tests/{relay_live,
     //! blobs_live}.rs` drive `SyncEngine` directly, these tests exercise the
     //! app-main lifecycle and the exact methods the Tauri commands delegate to:
-    //! two real [`ConnectedSync`] instances, paired and reconciled THROUGH the
-    //! [`SyncControl`] trait (`my_ticket` / `add_peer` / `sync_now` / `status`),
-    //! proving the IPC surface plus the `SyncReady`/`SyncProgress` bus events on
-    //! top of the engine-level coverage.
+    //! two real [`ConnectedSync`] instances, paired directly through the
+    //! underlying `SyncEngine` (`my_ticket` / `add_peer_from_ticket` — desktop no
+    //! longer exposes these itself) and reconciled THROUGH the [`SyncControl`]
+    //! trait's `sync_now` / `status`, proving the IPC surface plus the
+    //! `SyncReady`/`SyncProgress` bus events on top of the engine-level coverage.
     //!
     //! GATED: skips (with an `eprintln!`) unless `MINUTIST_SYNC_TOKEN` is set, so
     //! a normal `cargo test` and CI never touch the network. The `sync` module is
@@ -855,6 +875,77 @@ mod tests {
         // `request_start` marks `Connecting` synchronously, before any network
         // I/O — no need to wait for (or gate on) a real bind here.
         assert_ne!(sync.status().await, SyncStatus::Disabled);
+    }
+
+    /// Construction with a signed-in credential (`tunnel_device.json` present)
+    /// but `connector_enabled = false` (the drifted state a failed
+    /// `delete_account` file removal can leave behind) must both start the
+    /// engine anyway AND self-heal the persisted setting, rather than leaving
+    /// the device permanently signed-in-but-disabled with no way back short of
+    /// hand-editing the settings store.
+    #[tokio::test]
+    async fn construction_self_heals_a_signed_in_but_disabled_drift() {
+        let app_data = tempfile::TempDir::new().expect("app-data tempdir");
+        let meetings = tempfile::TempDir::new().expect("meetings tempdir");
+        std::fs::write(
+            app_data.path().join("tunnel_device.json"),
+            r#"{"device_credential":"mdc_dev.secret","account_id":"acct-1","device_id":"dev-1"}"#,
+        )
+        .expect("seed a signed-in credential");
+
+        let store = JsonFileStore::new(app_data.path().join("settings.store"));
+        let settings = SettingsHandle::new(store).expect("build settings handle");
+        assert!(
+            !settings.current().connector_enabled,
+            "drifted state starts with the flag false despite being signed in"
+        );
+
+        let (event_tx, _events) = broadcast::channel(256);
+        let index = Arc::new(
+            ipc_bridge::MeetingIndex::open(":memory:")
+                .await
+                .expect("open in-memory index"),
+        );
+        let sync = ConnectedSync::new(
+            settings.clone(),
+            event_tx,
+            app_data.path().to_path_buf(),
+            meetings.path().to_path_buf(),
+            None,
+            index,
+        );
+
+        // Both the engine-start request and the settings self-heal are spawned,
+        // fire-and-forget tasks (construction itself is synchronous and returns
+        // before either has necessarily run) — poll for both rather than
+        // assuming a particular scheduling order.
+        let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if sync.status().await != SyncStatus::Disabled {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            started.is_ok(),
+            "engine start must be requested for a signed-in device despite connector_enabled=false"
+        );
+
+        let healed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if settings.current().connector_enabled {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            healed.is_ok(),
+            "connector_enabled must be self-healed to true for a signed-in device"
+        );
     }
 
     /// A handle to a built `ConnectedSync` plus its event receiver and the temp

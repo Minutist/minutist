@@ -21,15 +21,15 @@ use iroh::{EndpointAddr, EndpointId};
 ///
 /// Only `Account`-sourced entries are subject to account-reconcile removal (an
 /// account peer that drops out of the account's device list); a `Manual` entry
-/// (ticket pairing, a peers file, or the relay-less direct test path) is never
-/// touched by that reconcile. `Manual` lumps those three together because they
-/// share the same removal semantics: none of them are account-reconciled.
+/// (ticket pairing, or the relay-less direct test path) is never touched by
+/// that reconcile. `Manual` lumps those two together because they share the
+/// same removal semantics: neither is account-reconciled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerSource {
     /// Learned from the account service's device-directory (`crate::account`).
     Account,
-    /// Learned any other way: ticket pairing, a peers file, or the relay-less
-    /// direct test path.
+    /// Learned any other way: ticket pairing, or the relay-less direct test
+    /// path.
     Manual,
 }
 

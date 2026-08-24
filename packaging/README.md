@@ -19,7 +19,10 @@ minutist-hub --data-dir <dir> login
 ```
 
 Every device signed in to that account, including this hub, then discovers and
-syncs with each other automatically — no separate per-device pairing step.
+syncs with each other automatically — no separate per-device pairing step. The
+daemon reads the credential once at startup, so **restart the hub after
+signing in** (or after re-running `login` for any reason) — see each
+platform's section below for the exact restart command.
 
 ## Linux — container (Docker / Podman)
 
@@ -39,8 +42,9 @@ docker run -d --name minutist-hub --restart unless-stopped --network host \
   -v minutist-hub-data:/var/lib/minutist-hub \
   minutist-hub:latest
 
-# sign in:
+# sign in, then restart so the daemon picks up the credential:
 docker exec -it minutist-hub minutist-hub --data-dir /var/lib/minutist-hub login
+docker restart minutist-hub
 ```
 
 To deploy to a host that has Docker but no Rust toolchain, build on a build host
@@ -57,18 +61,25 @@ id=$(docker create minutist-hub-builder)
 docker cp "$id:/src/target/release/minutist-hub" ./minutist-hub
 docker rm "$id"
 
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin minutist-hub
 sudo install -m 0755 minutist-hub /usr/local/bin/minutist-hub
 sudo install -m 0644 packaging/minutist-hub.service /etc/systemd/system/minutist-hub.service
 sudo install -d -m 0700 /etc/minutist-hub
 printf 'MINUTIST_SYNC_TOKEN=%s\n' "<relay token>" | sudo tee /etc/minutist-hub/minutist-hub.env >/dev/null
 sudo chmod 0600 /etc/minutist-hub/minutist-hub.env
 sudo systemctl daemon-reload && sudo systemctl enable --now minutist-hub
+
+# sign in as the fixed service user (so the credential is owned by the same
+# user the running daemon reads it as), then restart:
+sudo -u minutist-hub minutist-hub --data-dir /var/lib/minutist-hub login
+sudo systemctl restart minutist-hub
 ```
 
-The unit runs as a `DynamicUser` with a managed `StateDirectory`
-(`/var/lib/minutist-hub`). systemd sends `SIGTERM` on stop; the daemon drains
-within a bounded grace window and exits. A bare host also needs `ca-certificates`
-and (if the binary linked libopus dynamically) `libopus0`.
+The unit runs as the fixed `minutist-hub` system user (created above) with a
+managed `StateDirectory` (`/var/lib/minutist-hub`, created on first start).
+systemd sends `SIGTERM` on stop; the daemon drains within a bounded grace
+window and exits. A bare host also needs `ca-certificates` and (if the binary
+linked libopus dynamically) `libopus0`.
 
 ## Windows (service via WinSW)
 
@@ -80,11 +91,21 @@ registers it as a real Windows service through [WinSW](https://github.com/winsw/
 packaging\windows\install-service.ps1 -BinaryPath C:\path\to\minutist-hub.exe -RelayToken <relay token>
 ```
 
-It stages the binary + WinSW under `%ProgramFiles%\minutist-hub`, writes the
-service config (token file locked to SYSTEM/Administrators), and starts the
-service (data dir `%ProgramData%\minutist-hub`). On stop WinSW sends Ctrl+C and
-the daemon drains gracefully. Remove with `uninstall-service.ps1`
-(`-PurgeData` also deletes the data dir).
+It stages the binary + WinSW under `%ProgramFiles%\minutist-hub`, locks the
+data dir (`%ProgramData%\minutist-hub`, which will hold the account
+credential once signed in) and the service config (which holds the relay
+token) down to SYSTEM/Administrators, and starts the service. On stop WinSW
+sends Ctrl+C and the daemon drains gracefully. Remove with
+`uninstall-service.ps1` (`-PurgeData` also deletes the data dir).
+
+Sign in (from an elevated PowerShell, so the write to the locked-down data
+dir succeeds), then restart the service so the daemon picks up the
+credential:
+
+```powershell
+& 'C:\Program Files\minutist-hub\minutist-hub.exe' --data-dir 'C:\ProgramData\minutist-hub' login
+Restart-Service minutist-hub
+```
 
 > Build `minutist-hub.exe` from the Windows build pipeline (the same MSVC
 > toolchain used for the desktop app); the service scripts are verified on a

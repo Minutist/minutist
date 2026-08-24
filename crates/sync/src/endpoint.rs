@@ -617,11 +617,11 @@ impl SyncEngine {
             .collect()
     }
 
-    /// Register a peer learned out-of-band (manually: a ticket, a peers file,
-    /// or the relay-less direct test path) so the endpoint can resolve and dial
-    /// it. Tagged [`PeerSource::Manual`]. The [`PeerDirectory`] is shared with
-    /// the bound endpoint, so a peer added after binding is picked up on the
-    /// next dial.
+    /// Register a peer learned out-of-band (manually: a ticket, or the
+    /// relay-less direct test path) so the endpoint can resolve and dial it.
+    /// Tagged [`PeerSource::Manual`]. The [`PeerDirectory`] is shared with the
+    /// bound endpoint, so a peer added after binding is picked up on the next
+    /// dial.
     pub fn add_peer(&self, addr: EndpointAddr) {
         self.peers.add(addr, PeerSource::Manual);
     }

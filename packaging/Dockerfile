@@ -42,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /src/target/release/minutist-hub /usr/local/bin/minutist-hub
 
-# The data root (device key, peers, meetings, logs) lives on a mounted volume so
+# The data root (device key, account credential, meetings, logs) lives on a mounted volume so
 # the device identity survives container recreation.
 VOLUME ["/var/lib/minutist-hub"]
 # Relay token is supplied at run time: `-e MINUTIST_SYNC_TOKEN=...`.

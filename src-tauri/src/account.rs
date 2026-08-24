@@ -92,7 +92,8 @@ impl StoredCredential {
 /// `sync.rs` needs it: the `mdc_` bearer for the account-directory client and the
 /// account-service `device_id` for the self-endpoint registration. Returns `None`
 /// when the device is not signed in (no credential file) — the caller then
-/// skips the account-discovery loop (local peers-file pairing still works).
+/// skips the account-discovery loop entirely (there is no other peer-discovery
+/// mechanism on desktop any more).
 pub(crate) struct DeviceCredentialParts {
     pub device_credential: String,
     pub device_id: String,

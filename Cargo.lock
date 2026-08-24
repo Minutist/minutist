@@ -3210,6 +3210,7 @@ dependencies = [
  "tracing-subscriber",
  "tunnel-client",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

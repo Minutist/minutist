@@ -99,3 +99,9 @@ serde_json = { workspace = true }
 # The ungated create-meeting test digests the notes ydoc to compare A/B status.
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
+# A local mock account-service (no live dependency) for hub_e2e's coverage of
+# the REAL account-mediated discovery path (StoredCredential -> AccountDirectoryClient
+# -> the account-refresh loop -> add_peer), as opposed to the other cases' direct
+# MINUTIST_HUB_TEST_PEERS seeding. Same crate `tunnel-client` already uses for its
+# own account-directory tests.
+wiremock = "0.6"

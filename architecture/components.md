@@ -676,16 +676,23 @@ crate is an unconditional workspace member, but the `app-main -> sync` edge
 build wires a no-op implementation instead. See `cross-cutting.md` — "Build
 variants".
 
-**Account-mediated peer discovery:** `sync::account` defines an
-`AccountEndpointSource` trait the consumer implements (the account-service
-HTTP fetcher bound to the device's credential); `sync` itself takes no
-HTTP/account dependency, so this adds no new dependency-table edge — the
-trait is the boundary, mirroring `election::ElectionDriver`. Account-sourced
-and manually-paired peers are additive, both feeding the one `PeerDirectory`.
+**Device pairing:** two additive mechanisms feed the one `PeerDirectory`.
+`sync::account` defines an `AccountEndpointSource` trait the consumer
+implements (the account-service HTTP fetcher bound to the device's
+credential); `sync` itself takes no HTTP/account dependency, so this adds no
+new dependency-table edge — the trait is the boundary, mirroring
+`election::ElectionDriver`. This is the LIVE path for every frontend: desktop
+and the hub (`headless`, via its `login` subcommand — see `headless`'s own
+section below) drive this crate's periodic refresh loop; the phone
+(`sync-ffi`) runs its own list-and-add loop in TS against the same
+`/v1/account/devices` endpoints. Manual ticket exchange
+(`SyncEngine::my_ticket` / `add_peer_from_ticket`) is the second mechanism —
+it has no caller left in any frontend today; the primitives stay on
+`SyncEngine` and in the `sync-ffi` API surface pending a coordinated removal.
 
 See `crates/sync/src/lib.rs` for implementation detail: the four wire
 protocols, the `PeerDirectory` replace-not-union addressing semantics, the
-ticket-based pairing lifecycle, blob GC/tagging, the artifact-authority
+peer-addressing mechanisms above, blob GC/tagging, the artifact-authority
 supersession rule, and the Android relay-DNS pre-resolution mechanism
 (`SyncConfig::relay_ips`).
 
@@ -741,7 +748,7 @@ See `crates/embedder/src/lib.rs` for implementation detail.
 
 ### `ipc-bridge`
 **Crate:** `crates/ipc-bridge`
-**Owns:** the Tauri command + event surface (60 commands) and three custom
+**Owns:** the Tauri command + event surface (61 commands) and three custom
 URI-scheme resolvers (`meetingasset:`, `attachment:`, `meetingrecording:`).
 tauri-specta generates the TypeScript bindings the webview consumes.
 
@@ -846,11 +853,12 @@ plus the ML-runtime crates (`asr-runtime` / `asr-parakeet` / `diarizer` /
 Minutist account via the same RFC 8628 device-code flow the desktop uses
 (prints a URL to open, polls until approved, persists the credential) — the
 ONLY way the hub discovers peers now (manual ticket pairing removed; `sync`'s
-underlying `my_ticket`/`add_peer_from_ticket` primitives stay, since the
-phone client still uses them via `sync-ffi`, but neither the hub nor the
-desktop expose them any more); `status` prints the hub's state (including
-sign-in status) as JSON from a pure filesystem read with no engine bind, so
-an automated harness uses it as a read-only convergence oracle.
+underlying `my_ticket`/`add_peer_from_ticket` primitives stay on `SyncEngine`
+and in the `sync-ffi` API surface — see "Device pairing" under `sync` above —
+but neither the hub nor the desktop expose them any more); `status` prints
+the hub's state (including sign-in status) as JSON from a pure filesystem
+read with no engine bind, so an automated harness uses it as a read-only
+convergence oracle.
 
 Convergence behaviour, tracing, configuration, and packaging are documented
 in `cross-cutting.md` — "Headless server daemon". See

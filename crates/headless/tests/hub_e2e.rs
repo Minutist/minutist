@@ -28,6 +28,14 @@
 //! skip unless `MINUTIST_SYNC_TOKEN` is set, so a normal `cargo test` and CI
 //! never touch the network for them.
 //!
+//! `hub_discovers_and_syncs_an_account_listed_peer` is LOCAL-BY-DEFAULT like
+//! `notes_converge_through_a_running_hub`, but covers the production
+//! account-mediated discovery path instead of the `MINUTIST_HUB_TEST_PEERS`
+//! seam the other cases use: a local mock account-service (`wiremock`) serves
+//! a peer's endpoint, and the hub (seeded with a credential, no test peers)
+//! must acquire it purely through `StoredCredential` -> `AccountDirectoryClient`
+//! -> the account-refresh loop.
+//!
 //! `create_meeting_seeds_a_meeting_folder_with_notes` is a local, ungated
 //! one-shot that invokes the built binary's `create-meeting` and asserts the
 //! on-disk meeting + its status digest; it needs no network and always runs.
@@ -65,13 +73,17 @@ fn projected(root: &std::path::Path, meeting: MeetingId) -> serde_json::Value {
 /// `test_peers` are the peers' own tickets (`SyncEngine::my_ticket`), fed to the
 /// daemon via `MINUTIST_HUB_TEST_PEERS` (`src/main.rs`'s `seed_test_peers`,
 /// also `test-support`-gated) since the daemon has no account to discover them
-/// through in this local test.
+/// through in this local test. `account_api_url`, when `Some`, points the
+/// daemon's account-mediated discovery at a mock account-service instead of
+/// the real one (see `hub_discovers_and_syncs_an_account_listed_peer`); `None`
+/// leaves the default, irrelevant for a test that never seeds a credential.
 fn spawn_hub(
     hub_dir: &std::path::Path,
     relay_url: &str,
     token: Option<&str>,
     insecure_relay_tls: bool,
     test_peers: &[String],
+    account_api_url: Option<&str>,
 ) -> (tokio::process::Child, tokio::sync::oneshot::Receiver<()>) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"));
@@ -98,6 +110,9 @@ fn spawn_hub(
     }
     if !test_peers.is_empty() {
         command.env("MINUTIST_HUB_TEST_PEERS", test_peers.join(","));
+    }
+    if let Some(url) = account_api_url {
+        command.env("MINUTIST_HUB_API_URL", url);
     }
     let mut child = command.spawn().expect("spawn minutist-hub");
     let stderr = child.stderr.take().expect("hub stderr piped");
@@ -267,6 +282,7 @@ async fn notes_converge_through_a_running_hub() {
         token.as_deref(),
         insecure,
         &test_peers,
+        None,
     );
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
@@ -383,7 +399,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
 
     let test_peers = [engine_a.my_ticket(), engine_b.my_ticket()];
 
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false, &test_peers);
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false, &test_peers, None);
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")
@@ -487,7 +503,7 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
 
     let test_peers = [engine_a.my_ticket()];
 
-    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false, &test_peers);
+    let (mut hub, ready) = spawn_hub(hub_dir.path(), &relay_url, Some(&token), false, &test_peers, None);
     tokio::time::timeout(Duration::from_secs(20), ready)
         .await
         .expect("hub did not become ready within 20s")
@@ -544,6 +560,131 @@ async fn wait_for_processing(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     false
+}
+
+/// Production discovery-path coverage: unlike every other case in this file
+/// (which seed the hub's peer directory directly via `MINUTIST_HUB_TEST_PEERS`,
+/// a test-only escape hatch), this drives the REAL chain a deployed hub uses:
+/// `StoredCredential::load` -> `AccountDirectoryClient` -> the account-refresh
+/// loop -> `upsert_account_peer`. A's endpoint is served from a local mock
+/// account-service (`wiremock`, no live dependency); the hub is seeded with a
+/// credential and pointed at the mock via `MINUTIST_HUB_API_URL`, with an EMPTY
+/// `test_peers` list, so A pushing successfully to the hub can only mean the
+/// account-refresh loop actually authorised it.
+///
+/// LOCAL-BY-DEFAULT like `notes_converge_through_a_running_hub`: an in-process
+/// test relay when `MINUTIST_SYNC_TOKEN`/`MINUTIST_SYNC_RELAY` are unset, the
+/// deployed relay otherwise.
+#[tokio::test]
+async fn hub_discovers_and_syncs_an_account_listed_peer() {
+    let live_token = std::env::var("MINUTIST_SYNC_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let live_relay = std::env::var("MINUTIST_SYNC_RELAY")
+        .ok()
+        .filter(|r| !r.is_empty());
+    let (relay_url, token, insecure, _relay_guard) = match (live_token, live_relay) {
+        (Some(token), Some(relay_url)) => (relay_url, Some(token), false, None),
+        _ => {
+            let (_relay_map, relay_url, guard) = iroh::test_utils::run_relay_server()
+                .await
+                .expect("spawn local test relay");
+            (relay_url.to_string(), None, true, Some(guard))
+        }
+    };
+
+    let hub_dir = tempfile::TempDir::new().expect("hub tempdir");
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+
+    let hub_id = DeviceIdentity::load_or_generate(hub_dir.path())
+        .expect("hub identity")
+        .endpoint_id();
+
+    let cfg = SyncConfig {
+        relay_url: relay_url.clone(),
+        relay_auth_token: token.clone(),
+        meetings_root: dir_a.path().to_path_buf(),
+        backoff_policy: Default::default(),
+        relay_ips: Vec::new(),
+    };
+    let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
+    let engine_a = if insecure {
+        SyncEngine::start_insecure(cfg, id_a)
+            .await
+            .expect("engine A binds")
+    } else {
+        SyncEngine::start(cfg, id_a).await.expect("engine A binds")
+    };
+
+    // The mock account-service: `GET /v1/account/devices` lists A's endpoint;
+    // `PUT .../self/endpoint` (the hub registering itself) just needs to succeed.
+    let mock = wiremock::MockServer::start().await;
+    let devices = serde_json::json!([{
+        "device_id": "device-a",
+        "endpoint_id": engine_a.endpoint_id().to_string(),
+        "relay_url": relay_url,
+        "direct_addrs": Vec::<String>::new(),
+    }]);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/account/devices"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&devices))
+        .mount(&mock)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .and(wiremock::matchers::path("/v1/account/devices/self/endpoint"))
+        .respond_with(wiremock::ResponseTemplate::new(204))
+        .mount(&mock)
+        .await;
+
+    // Seed the hub's credential so `start_engine` wires up account-mediated
+    // discovery against the mock (`spawn_hub`'s `account_api_url`) instead of
+    // logging "no device credential found" and discovering nothing.
+    std::fs::write(
+        hub_dir.path().join("tunnel_device.json"),
+        r#"{"device_credential":"mdc_test.secret","account_id":"acct-test","device_id":"hub-test"}"#,
+    )
+    .expect("seed hub credential");
+
+    let (mut hub, ready) = spawn_hub(
+        hub_dir.path(),
+        &relay_url,
+        token.as_deref(),
+        insecure,
+        &[], // no MINUTIST_HUB_TEST_PEERS: peer acquisition must come from discovery
+        Some(&mock.uri()),
+    );
+    tokio::time::timeout(Duration::from_secs(20), ready)
+        .await
+        .expect("hub did not become ready within 20s")
+        .expect("hub ready signal dropped");
+
+    let relay: RelayUrl = relay_url.parse().expect("relay url parses");
+    let hub_addr = EndpointAddr::new(hub_id).with_relay_url(relay);
+    // A must still authorise the hub to dial it back; the hub authorising A is
+    // exactly the property under test (via the account-refresh loop, not this).
+    engine_a.add_peer(hub_addr.clone());
+
+    let meeting = MeetingId(Uuid::new_v4());
+    let json = serde_json::json!({"type":"doc","content":[{"type":"paragraph",
+        "content":[{"type":"text","text":"discovered via the account service"}]}]});
+    notes_crdt::MeetingFolder::ensure(dir_a.path(), meeting).expect("ensure A meeting folder");
+    NotesStore::save(dir_a.path(), meeting, &json, "discovered via the account service")
+        .expect("seed A");
+
+    // Succeeds only if the hub's PeerDirectory already authorises A inbound —
+    // which the account-refresh loop's first (immediate) tick must have done.
+    sync_with_retry(&engine_a, &hub_addr, meeting, "A->hub via account discovery").await;
+
+    assert!(
+        status_digest(hub_dir.path(), &relay_url, meeting).is_some(),
+        "the hub must hold the meeting pushed by an account-discovered peer"
+    );
+
+    engine_a.shutdown().await.expect("shutdown a");
+    let _ = hub.kill().await;
+    eprintln!(
+        "hub_e2e account-discovery: PASS — A synced to the hub purely via account-mediated discovery"
+    );
 }
 
 /// `create-meeting` subcommand test: originate a meeting in a data directory,

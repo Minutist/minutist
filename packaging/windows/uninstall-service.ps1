@@ -4,7 +4,8 @@
   Stop and remove the Minutist sync hub Windows service.
 .DESCRIPTION
   Stops + unregisters the WinSW service. Leaves the data directory (device key,
-  peers, meetings) in place by default; pass -PurgeData to remove it too.
+  account credential, meetings) in place by default; pass -PurgeData to remove
+  it too.
 #>
 param(
     [string]$InstallDir = "$env:ProgramFiles\minutist-hub",

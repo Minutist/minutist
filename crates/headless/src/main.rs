@@ -118,20 +118,46 @@ const CREDENTIAL_FILE: &str = "tunnel_device.json";
 /// writes).
 ///
 /// `device_credential` is the long-lived `mdc_` bearer — never logged.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, PartialEq)]
 struct StoredCredential {
     device_credential: String,
     account_id: String,
     device_id: String,
 }
 
+impl std::fmt::Debug for StoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the bearer; mirrors `sync::SyncConfig`'s hand-rolled Debug.
+        f.debug_struct("StoredCredential")
+            .field("device_credential", &"<redacted>")
+            .field("account_id", &self.account_id)
+            .field("device_id", &self.device_id)
+            .finish()
+    }
+}
+
 impl StoredCredential {
     /// Load the stored credential, or `None` when absent / unreadable / corrupt.
-    /// A missing file is the normal not-signed-in case; a corrupt file is
-    /// treated the same way (re-run `login`). Both paths leave the hub running
-    /// with no peer discovery at all — no panic, no startup failure.
+    /// A missing file is the normal not-signed-in case, logged as such; a
+    /// present-but-unreadable file (permission denied is the practical case —
+    /// e.g. `login` was run as the wrong user against a fixed-user systemd
+    /// deployment) is distinct enough to warn about explicitly, since it means
+    /// the operator DID provision a credential and it is silently not being
+    /// used. Both, like a corrupt file, leave the hub running with no peer
+    /// discovery at all — no panic, no startup failure.
     fn load(data_dir: &Path) -> Option<Self> {
-        let raw = std::fs::read_to_string(data_dir.join(CREDENTIAL_FILE)).ok()?;
+        let raw = match std::fs::read_to_string(data_dir.join(CREDENTIAL_FILE)) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(
+                    target: "hub",
+                    error = %e,
+                    "tunnel_device.json exists but could not be read; skipping account-mediated discovery"
+                );
+                return None;
+            }
+        };
         match serde_json::from_str::<Self>(&raw) {
             Ok(c) if !c.device_credential.is_empty() => Some(c),
             Ok(_) => None,
@@ -146,35 +172,50 @@ impl StoredCredential {
         }
     }
 
-    /// Persist the credential at `0600` (atomic create; owner-only mode
-    /// asserted for the pre-existing-file case too). Mirrors
-    /// `sync::identity`'s `write_key_file` discipline — the same reasoning
-    /// applies: `app-main`'s `write_secret_file` is private to that binary.
+    /// Persist the credential atomically: written to a sibling temp file, then
+    /// renamed over `{data-dir}/tunnel_device.json` (the rename is the sole
+    /// commit point, so a crash or `ENOSPC` mid-write never leaves a
+    /// truncated or partial file readable as valid JSON). On unix the temp
+    /// file — and so the renamed target, since rename preserves the source's
+    /// mode — is created `0600`.
+    ///
+    /// On other platforms the file carries no per-file ACL of its own: the
+    /// only real protection is restricting `{data-dir}`'s own ACL, which is
+    /// the installer's job (`packaging/windows/install-service.ps1` locks
+    /// `%ProgramData%\minutist-hub` down to SYSTEM/Administrators before the
+    /// service ever runs) — the same reliance `app-main`'s `write_secret_file`
+    /// has on the desktop's per-user `AppData` rather than a per-file mode.
     fn store(&self, data_dir: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+
         let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
         let path = data_dir.join(CREDENTIAL_FILE);
+        let tmp_path = data_dir.join(format!("{CREDENTIAL_FILE}.{}.tmp", uuid::Uuid::new_v4()));
+
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = opts.open(&tmp_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             file.write_all(json.as_bytes())?;
-            file.flush()
+            file.flush()?;
+            file.sync_all()
+        })();
+
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
         }
-        #[cfg(not(unix))]
-        {
-            use std::io::Write;
-            file.write_all(json.as_bytes())?;
-            file.flush()
-        }
+        std::fs::rename(&tmp_path, &path)
     }
 }
 
@@ -194,7 +235,7 @@ fn dur_or_env(var: &str, default: Duration) -> Duration {
 }
 
 /// Command-line surface for the daemon.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "minutist-hub",
     version,
@@ -202,9 +243,10 @@ fn dur_or_env(var: &str, default: Duration) -> Duration {
 )]
 struct Cli {
     /// Absolute path to the daemon's own data directory. Its meetings, logs,
-    /// device key, and `peers` file all live under this root, entirely separate
-    /// from any desktop's `{app-data}` — the single-writer rule applies per data
-    /// root, so the daemon must never share a root with another process.
+    /// device key, and account credential (`tunnel_device.json`) all live under
+    /// this root, entirely separate from any desktop's `{app-data}` — the
+    /// single-writer rule applies per data root, so the daemon must never share
+    /// a root with another process.
     #[arg(long)]
     data_dir: PathBuf,
 
@@ -222,11 +264,24 @@ struct Cli {
     /// Used to publish this device's endpoint and to fetch the account's other
     /// device endpoints (`GET /v1/account/devices`). Only active when a seeded
     /// device credential is present at `{data-dir}/tunnel_device.json`.
-    #[arg(long, default_value = DEFAULT_API_URL)]
+    #[arg(long, env = "MINUTIST_HUB_API_URL", default_value = DEFAULT_API_URL)]
     relay_api_url: String,
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+impl std::fmt::Debug for Cli {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the relay token; mirrors `sync::SyncConfig`'s hand-rolled Debug.
+        f.debug_struct("Cli")
+            .field("data_dir", &self.data_dir)
+            .field("relay_url", &self.relay_url)
+            .field("relay_token", &self.relay_token.as_ref().map(|_| "<redacted>"))
+            .field("relay_api_url", &self.relay_api_url)
+            .field("command", &self.command)
+            .finish()
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -292,9 +347,13 @@ async fn run_daemon(
 
     tracing::info!(target: "hub", endpoint_id = %engine.endpoint_id(), "sync engine started");
     if account_args.is_none() {
+        // `start_engine` already logged the specific reason (no credential file,
+        // a corrupt one, or an account-directory client that failed to build) —
+        // don't restate a guessed cause here, since telling an operator who IS
+        // signed in to "run login" again would be actively misleading.
         tracing::warn!(
             target: "hub",
-            "not signed in (no {CREDENTIAL_FILE}); no peers will be discovered until `minutist-hub login` is run"
+            "account-mediated peer discovery is not active; see the preceding log line for why"
         );
     }
 
@@ -363,10 +422,15 @@ async fn login(data_dir: &Path, api_url: &str) -> AppResult<()> {
     if start.verification_uri_complete.is_none() {
         println!("Then enter this code: {}", start.user_code);
     }
+    println!("This code expires in {} minute(s).", start.expires_in.div_ceil(60));
 
+    // Enforced client-side too, not just left to the server's own
+    // `expired_token` response: a CLI run unattended (a provisioning script,
+    // `docker exec`) should not be able to block forever on a server that
+    // answers `pending` past its own stated expiry.
+    let deadline = Instant::now() + Duration::from_secs(start.expires_in);
     let mut interval = start.initial_interval();
     loop {
-        tokio::time::sleep(interval).await;
         match client.poll_once(&start.device_code).await {
             Ok(tunnel_client::PollOutcome::Pending) => {}
             Ok(tunnel_client::PollOutcome::SlowDown) => {
@@ -386,6 +450,13 @@ async fn login(data_dir: &Path, api_url: &str) -> AppResult<()> {
             }
             Err(e) => return Err(map_pairing_err(e)),
         }
+        if Instant::now() >= deadline {
+            return Err(AppError::InvalidInput {
+                context: "the pairing code expired before it was approved; run login again"
+                    .to_string(),
+            });
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -785,14 +856,22 @@ async fn serve_until_shutdown(
         tokio::select! {
             _ = &mut shutdown => break 'serve,
             // Account-mediated peer discovery, the only discovery mechanism now.
-            // This arm fires only when the loop exits (on cancel); under normal
-            // operation it parks here.
-            _ = &mut account_refresh => {}
+            // `run_account_refresh_loop_v2` runs until `account_cancel` fires
+            // (below, on every shutdown path), so under normal operation this
+            // arm never actually resolves — it just parks here. If it ever DID
+            // resolve on its own (e.g. a future fatal-auth early return), continuing
+            // to poll the same pinned future again next iteration would panic
+            // ("resumed after completion"), so treat an unexpected completion as
+            // fatal rather than silently re-polling it.
+            _ = &mut account_refresh => {
+                tracing::error!(target: "hub", "account-refresh loop exited unexpectedly; stopping");
+                break 'serve;
+            }
             _ = trash_sweep_poll.tick() => {
                 // Purge this hub's own expired trash. Blocking `std::fs` work run
                 // directly (not `spawn_blocking`): the hub has no dedicated worker
                 // pool and every other filesystem scan on this loop (`list_meeting_ids`
-                // via discovery, `reload_into`) is already called the same way.
+                // via discovery, account-directory refresh) is already called the same way.
                 match persistence::meeting_ops::sweep_expired_deletions_no_index(
                     &meetings_root,
                     data_dir,
@@ -1145,6 +1224,32 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600, "credential file must be owner-only");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stored_credential_store_tightens_a_pre_existing_looser_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        let path = base.path().join(CREDENTIAL_FILE);
+        std::fs::write(&path, b"stale").expect("seed a pre-existing file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen mode");
+
+        let cred = StoredCredential {
+            device_credential: "mdc_dev.secret".to_string(),
+            account_id: "acct-1".to_string(),
+            device_id: "dev-1".to_string(),
+        };
+        cred.store(base.path()).expect("store over the looser-mode file");
+
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the atomic rename must replace a pre-existing looser-mode file with a 0600 one"
+        );
+        assert_eq!(StoredCredential::load(base.path()).expect("load"), cred);
     }
 
     #[test]

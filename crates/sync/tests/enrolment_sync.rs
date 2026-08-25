@@ -392,3 +392,58 @@ async fn a_decision_written_by_another_process_reaches_the_running_engine() {
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }
+
+/// The engine's view and a CLI's view of what needs deciding are the same
+/// derivation, so they cannot drift.
+///
+/// The engine passes peer ids from its in-memory directory; a one-shot CLI
+/// passes them from its own `/v1/account/devices` call. Both go through
+/// `pending_from`, and this asserts they agree on the same inputs.
+#[tokio::test]
+async fn the_engine_and_a_cli_derive_the_same_pending_list() {
+    use sync::{pending_from, EnrolmentStore, Verdict};
+
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let (root_a, root_b) = (dir_a.path(), dir_b.path());
+    let (a, b) = unenrolled_pair(root_a, root_b).await;
+    let b_id = b.endpoint_id().to_string();
+
+    // What a CLI has: its own identity from a file, the peer ids from its own
+    // directory call, and the record from disk. No engine.
+    let own = DeviceIdentity::load_or_generate(root_a).expect("identity");
+    let cli_view = |ids: &[String]| {
+        pending_from(
+            own.public_key().as_bytes(),
+            ids,
+            &EnrolmentStore::load(root_a),
+        )
+    };
+
+    assert_eq!(cli_view(std::slice::from_ref(&b_id)), a.pending_enrolments());
+
+    // A decision made through the CLI path drops the peer from both views.
+    EnrolmentStore::load(root_a)
+        .record(&b_id, Verdict::Refused, None)
+        .expect("decide");
+    assert!(cli_view(std::slice::from_ref(&b_id)).is_empty());
+    assert!(a.pending_enrolments().is_empty());
+
+    // A malformed directory entry is skipped, not fatal: one bad row must not
+    // hide the real devices from the user.
+    let mixed = vec![
+        "not-an-endpoint-id".to_string(),
+        b.endpoint_id().to_string(),
+    ];
+    let fresh = tempfile::TempDir::new().expect("tempdir c");
+    let view = pending_from(
+        own.public_key().as_bytes(),
+        &mixed,
+        &EnrolmentStore::load(fresh.path()),
+    );
+    assert_eq!(view.len(), 1, "the parseable peer must survive: {view:?}");
+    assert_eq!(view[0].peer_id, b_id);
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}

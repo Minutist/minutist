@@ -46,7 +46,7 @@ use crate::backoff::BackoffPolicy;
 use crate::backoff::BackoffRegistry;
 use crate::blobs::{BlobExchange, BlobStore};
 use crate::content_key::{ContentKey, FrameCipher};
-use crate::enrolment::{EnrolmentStore, Verdict};
+use crate::enrolment::{EnrolmentStore, PendingEnrolment, Verdict};
 use crate::enrolment_proto;
 use crate::identity::DeviceIdentity;
 use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
@@ -155,20 +155,6 @@ impl KeyState {
             key,
         }
     }
-}
-
-/// A peer the account directory has offered that the user has not decided about,
-/// with the code to compare against the other device's screen.
-///
-/// Deliberately plain: hex string and digits, no `iroh` or crypto type, so the
-/// FFI boundary and the hub CLI consume it without either learning about
-/// `EndpointId`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingEnrolment {
-    /// The peer's hex endpoint id, as [`SyncEngine::peer_ids`] reports it.
-    pub peer_id: String,
-    /// The six digits both devices show. Zero-padded, so it compares as text.
-    pub safety_code: String,
 }
 
 /// Capacity of the peer-arrived broadcast channel. Small by design: a lagging hub
@@ -1056,17 +1042,8 @@ impl SyncEngine {
     /// A peer already confirmed or already refused is absent: the decision
     /// persists, so the user is asked once rather than every poll.
     pub fn pending_enrolments(&self) -> Vec<PendingEnrolment> {
-        let store = self.enrolment();
-        let own = *self.endpoint.id().as_bytes();
-        self.peers
-            .ids()
-            .into_iter()
-            .filter(|id| store.verdict(&id.to_string()).is_none())
-            .map(|id| PendingEnrolment {
-                safety_code: crate::enrolment::safety_code(&own, id.as_bytes()),
-                peer_id: id.to_string(),
-            })
-            .collect()
+        let peer_ids: Vec<String> = self.peers.ids().iter().map(|id| id.to_string()).collect();
+        crate::enrolment::pending_from(self.endpoint.id().as_bytes(), &peer_ids, &self.enrolment())
     }
 
     /// The code to compare for one specific peer, whatever its current verdict.

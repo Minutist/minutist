@@ -121,8 +121,8 @@ pub use account::{
 pub use address_lookup::PeerSource;
 pub use backoff::{BackoffPolicy, BackoffRegistry};
 pub use content_key::ContentKey;
-pub use enrolment::{safety_code, EnrolmentStore, Verdict};
-pub use endpoint::{PendingEnrolment, SyncEngine, SyncEngineRefreshSink};
+pub use enrolment::{pending_from, safety_code, EnrolmentStore, PendingEnrolment, Verdict};
+pub use endpoint::{SyncEngine, SyncEngineRefreshSink};
 pub use identity::DeviceIdentity;
 
 /// Errors raised by the sync crate. Converted to [`minutist_common::AppError`] at

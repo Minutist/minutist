@@ -119,6 +119,49 @@ pub fn safety_code(a: &[u8; 32], b: &[u8; 32]) -> String {
     format!("{:0width$}", n % modulus, width = SAS_DIGITS as usize)
 }
 
+/// A peer the account directory has offered that the user has not decided about,
+/// with the code to compare against the other device's screen.
+///
+/// Deliberately plain: hex string and digits, no `iroh` or crypto type, so the
+/// FFI boundary and the hub CLI consume it without either learning about
+/// `EndpointId`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEnrolment {
+    /// The peer's hex endpoint id.
+    pub peer_id: String,
+    /// The six digits both devices show. Zero-padded, so it compares as text.
+    pub safety_code: String,
+}
+
+/// Which of `peer_ids` still need a decision, each with its code.
+///
+/// Free function rather than a method because the two callers reach it from
+/// different places and must not drift: a running engine passes the peer ids
+/// from its directory, while a one-shot CLI passes the ids from its own
+/// `/v1/account/devices` call. Neither needs the other's state, and both get the
+/// same answer by construction.
+///
+/// A peer id that does not parse as an endpoint id is skipped rather than
+/// failing the batch: one malformed directory entry should not hide every other
+/// device from the user.
+pub fn pending_from(
+    own_endpoint_id: &[u8; 32],
+    peer_ids: &[String],
+    store: &EnrolmentStore,
+) -> Vec<PendingEnrolment> {
+    peer_ids
+        .iter()
+        .filter(|id| store.verdict(id).is_none())
+        .filter_map(|id| {
+            let parsed: iroh::EndpointId = id.parse().ok()?;
+            Some(PendingEnrolment {
+                safety_code: safety_code(own_endpoint_id, parsed.as_bytes()),
+                peer_id: id.clone(),
+            })
+        })
+        .collect()
+}
+
 /// The persisted per-peer verdicts, at `{app-data}/enrolled_peers.json`.
 ///
 /// Loaded whole and rewritten whole: the file holds one small entry per device

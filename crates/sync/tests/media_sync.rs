@@ -36,10 +36,10 @@ fn direct_addr(engine: &SyncEngine) -> EndpointAddr {
 async fn paired_engines(root_a: &Path, root_b: &Path) -> (SyncEngine, SyncEngine) {
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), root_b.to_path_buf())
         .await
         .expect("engine b");
     a.add_peer(direct_addr(&b));
@@ -108,10 +108,10 @@ async fn identical_bytes_dedupe_to_one_hash_on_both_sides() {
 
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), root_b.to_path_buf())
         .await
         .expect("engine b");
 
@@ -207,10 +207,10 @@ async fn an_unpaired_peer_is_rejected_on_the_blobs_alpn() {
 
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), root_b.to_path_buf())
         .await
         .expect("engine b");
 

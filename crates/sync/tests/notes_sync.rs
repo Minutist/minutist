@@ -57,8 +57,8 @@ async fn paired_engines(root_a: &Path, root_b: &Path) -> (SyncEngine, SyncEngine
     keyed_engines(
         root_a,
         root_b,
-        ContentKey::for_tests(),
-        ContentKey::for_tests(),
+        Some(ContentKey::for_tests()),
+        Some(ContentKey::for_tests()),
     )
     .await
 }
@@ -68,8 +68,8 @@ async fn paired_engines(root_a: &Path, root_b: &Path) -> (SyncEngine, SyncEngine
 async fn keyed_engines(
     root_a: &Path,
     root_b: &Path,
-    key_a: ContentKey,
-    key_b: ContentKey,
+    key_a: Option<ContentKey>,
+    key_b: Option<ContentKey>,
 ) -> (SyncEngine, SyncEngine) {
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
@@ -367,10 +367,10 @@ async fn sync_resolves_notes_under_the_meetings_root_not_the_app_data_base() {
     );
 
     // Engines bind their MEETINGS root (mirrors SyncConfig::new(meetings_root)).
-    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), meetings_a.clone())
+    let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), meetings_a.clone())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), meetings_b.clone())
+    let b = SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), meetings_b.clone())
         .await
         .expect("engine b");
     a.add_peer(direct_addr(&b));
@@ -419,10 +419,10 @@ async fn an_unpaired_peer_is_rejected_and_leaves_the_meeting_untouched() {
 
     let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
     let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
-    let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), root_a.to_path_buf())
+    let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), root_a.to_path_buf())
         .await
         .expect("engine a");
-    let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), root_b.to_path_buf())
+    let b = SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), root_b.to_path_buf())
         .await
         .expect("engine b");
 
@@ -453,8 +453,13 @@ async fn an_unpaired_peer_is_rejected_and_leaves_the_meeting_untouched() {
 async fn config_new_targets_the_meetings_root() {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let meetings_root = dir.path().join("meetings");
-    let cfg = SyncConfig::new(meetings_root.clone());
+    let cfg = SyncConfig::new(dir.path().to_path_buf(), meetings_root.clone());
     assert_eq!(cfg.meetings_root, meetings_root);
+    assert_eq!(
+        cfg.app_data_dir,
+        dir.path(),
+        "the secrets live at the app-data base, not under meetings"
+    );
     // The redacting Debug must not print a token when none is set.
     assert!(format!("{cfg:?}").contains("relay_auth_token: None"));
     let cfg = cfg.with_relay_auth_token("super-secret");
@@ -492,9 +497,9 @@ async fn a_peer_with_a_different_content_key_learns_nothing() {
     let (a, b) = keyed_engines(
         root_a,
         root_b,
-        ContentKey::for_tests(),
+        Some(ContentKey::for_tests()),
         // A key no enrolled device holds: the rogue-endpoint case.
-        ContentKey::from_bytes([0xff; 32]),
+        Some(ContentKey::from_bytes([0xff; 32])),
     )
     .await;
 

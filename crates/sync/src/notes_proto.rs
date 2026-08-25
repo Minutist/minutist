@@ -107,6 +107,16 @@ pub enum StreamKind {
     /// per entry, bound to the bytes, so a stale relay copy can never clobber a
     /// newer producer copy. Appended as tag `4` (append-only).
     Artifacts = 4,
+    /// Account content-key transfer to a user-confirmed device
+    /// ([`crate::enrolment_proto`]). Appended as tag `5` (append-only).
+    ///
+    /// The one stream NOT sealed under the account content key, because its
+    /// whole purpose is delivering that key to a device which does not yet hold
+    /// it. That is an explicit exception, not an omission: it is protected by
+    /// QUIC/TLS, the ed25519 paired-peer check, and a locally recorded user
+    /// confirmation for this exact peer, and the responder refuses it outright
+    /// without that confirmation. See `planning/DESIGN_sync-encryption.md` §5.
+    Enrolment = 5,
 }
 
 impl StreamKind {
@@ -118,6 +128,7 @@ impl StreamKind {
             2 => Ok(Self::Media),
             3 => Ok(Self::Discovery),
             4 => Ok(Self::Artifacts),
+            5 => Ok(Self::Enrolment),
             other => Err(Error::Protocol(format!("unknown sync stream kind {other}"))),
         }
     }
@@ -356,16 +367,34 @@ mod tests {
 
     #[test]
     fn stream_kind_tags_are_the_wire_contract() {
-        // The tag byte is the wire contract: 1/2/3/4 are fixed and append-only, so
+        // The tag byte is the wire contract: these are fixed and append-only, so
         // this test fails if a future change reorders or renumbers a variant.
         assert_eq!(StreamKind::from_tag(1).unwrap(), StreamKind::Notes);
         assert_eq!(StreamKind::from_tag(2).unwrap(), StreamKind::Media);
         assert_eq!(StreamKind::from_tag(3).unwrap(), StreamKind::Discovery);
         assert_eq!(StreamKind::from_tag(4).unwrap(), StreamKind::Artifacts);
+        assert_eq!(StreamKind::from_tag(5).unwrap(), StreamKind::Enrolment);
         // An unknown tag (an old peer seeing a future variant, or garbage) is a
         // protocol error, never a silent mis-dispatch.
         assert!(matches!(StreamKind::from_tag(0), Err(Error::Protocol(_))));
-        assert!(matches!(StreamKind::from_tag(5), Err(Error::Protocol(_))));
+        assert!(matches!(StreamKind::from_tag(6), Err(Error::Protocol(_))));
+
+        // The tag doubles as the AEAD additional data that binds a frame to its
+        // protocol (`crate::frame::Framer`), so two variants sharing a byte would
+        // silently let a frame from one be replayed into the other.
+        let tags = [
+            StreamKind::Notes as u8,
+            StreamKind::Media as u8,
+            StreamKind::Discovery as u8,
+            StreamKind::Artifacts as u8,
+            StreamKind::Enrolment as u8,
+        ];
+        let unique: std::collections::BTreeSet<u8> = tags.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            tags.len(),
+            "stream kind tags must be distinct"
+        );
     }
 
     #[test]

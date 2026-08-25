@@ -690,6 +690,21 @@ section below) drive this crate's periodic refresh loop; the phone
 it has no caller left in any frontend today; the primitives stay on
 `SyncEngine` and in the `sync-ffi` API surface pending a coordinated removal.
 
+**Enrolment:** a peer the account directory publishes is not trusted on the
+directory's say-so. `sync::enrolment` derives a six-digit code from the two
+devices' sorted ed25519 identity keys (so both compute the same value), the user
+compares it across the two screens, and each side persists its own verdict at
+`{app-data}/enrolled_peers.json`. `StreamKind::Enrolment` (tag 5) then carries
+the content key to a confirmed peer; it is the ONE stream not sealed under that
+key, since it delivers it, and the responder refuses unless it holds its own
+user confirmation for the sender. Both directions check: a device that adopts a
+key from a rogue seals its own outbound frames under it. A device with no key
+serves enrolment and nothing else. `SyncEngine::pending_enrolments` /
+`confirm_enrolment` / `refuse_enrolment` are the frontend and hub-CLI surface,
+carrying no `iroh` or crypto type. Minting is decided by the account-refresh
+loop rather than at startup, because only a directory poll knows whether this
+device is the first on its account.
+
 **Payload encryption:** every frame on the sync ALPN is sealed with
 XChaCha20-Poly1305 under a subkey of the account content key
 (`sync::content_key`), keyed per stream by its `StreamKind` tag as AEAD

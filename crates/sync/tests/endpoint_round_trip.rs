@@ -42,11 +42,11 @@ async fn two_engines_reconcile_over_sync_alpn() {
     // Each engine's meetings root is its own temp dir; the empty meeting has no
     // notes on either side, so the exchange completes with empty diffs.
     let engine_a =
-        SyncEngine::start_direct(id_a, ContentKey::for_tests(), dir_a.path().to_path_buf())
+        SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), dir_a.path().to_path_buf())
             .await
             .expect("engine a");
     let engine_b =
-        SyncEngine::start_direct(id_b, ContentKey::for_tests(), dir_b.path().to_path_buf())
+        SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), dir_b.path().to_path_buf())
             .await
             .expect("engine b");
 

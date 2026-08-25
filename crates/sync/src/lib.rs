@@ -104,6 +104,8 @@ pub mod blobs;
 pub mod content_key;
 pub mod discovery_proto;
 pub mod endpoint;
+pub mod enrolment;
+pub(crate) mod enrolment_proto;
 pub(crate) mod frame;
 pub mod identity;
 pub(crate) mod key_file;
@@ -119,7 +121,8 @@ pub use account::{
 pub use address_lookup::PeerSource;
 pub use backoff::{BackoffPolicy, BackoffRegistry};
 pub use content_key::ContentKey;
-pub use endpoint::{SyncEngine, SyncEngineRefreshSink};
+pub use enrolment::{safety_code, EnrolmentStore, Verdict};
+pub use endpoint::{PendingEnrolment, SyncEngine, SyncEngineRefreshSink};
 pub use identity::DeviceIdentity;
 
 /// Errors raised by the sync crate. Converted to [`minutist_common::AppError`] at
@@ -190,9 +193,18 @@ pub struct SyncConfig {
     /// The directory holding the per-meeting `{uuid}` folders: the meetings root
     /// the app uses (`{app-data}/meetings`), not the app-data base. The
     /// notes protocol resolves `{meetings_root}/{uuid}/notes.ydoc` through
-    /// `persistence`. The device key is persisted at the app-data BASE
-    /// (see [`identity`]), which the caller loads separately.
+    /// `persistence`.
     pub meetings_root: PathBuf,
+
+    /// The app-data BASE, where this device's secrets live: the ed25519 device
+    /// key ([`identity`]), the account content key ([`content_key`]) and the
+    /// enrolment record ([`enrolment`]).
+    ///
+    /// Distinct from [`Self::meetings_root`], which is `{app-data}/meetings`.
+    /// The caller loads the identity and key from here itself, but the engine
+    /// needs the path too: adopting a key from a confirmed peer writes it, and
+    /// that happens inside the inbound accept path rather than at construction.
+    pub app_data_dir: PathBuf,
 
     /// The failed-dial backoff policy (threshold + exponential window) the
     /// [`SyncEngine`]'s [`BackoffRegistry`] applies to every dial. Carries no
@@ -226,6 +238,7 @@ impl std::fmt::Debug for SyncConfig {
             .field("relay_url", &self.relay_url)
             .field("relay_auth_token", &redacted)
             .field("meetings_root", &self.meetings_root)
+            .field("app_data_dir", &self.app_data_dir)
             .field("backoff_policy", &self.backoff_policy)
             .field("relay_ips", &self.relay_ips)
             .finish()
@@ -236,15 +249,17 @@ impl SyncConfig {
     /// The default relay endpoint for the connected tier.
     pub const DEFAULT_RELAY_URL: &'static str = "https://sync.minutist.ai";
 
-    /// Build a config for `meetings_root` (the directory holding the per-meeting
+    /// Build a config for `app_data_dir` (the base holding this device's
+    /// secrets) and `meetings_root` (the directory holding the per-meeting
     /// `{uuid}` folders), pinning [`Self::DEFAULT_RELAY_URL`] with no relay auth
     /// token. The token is set later via [`Self::with_relay_auth_token`] once the
     /// account service issues one.
-    pub fn new(meetings_root: PathBuf) -> Self {
+    pub fn new(app_data_dir: PathBuf, meetings_root: PathBuf) -> Self {
         Self {
             relay_url: Self::DEFAULT_RELAY_URL.to_string(),
             relay_auth_token: None,
             meetings_root,
+            app_data_dir,
             backoff_policy: BackoffPolicy::default(),
             relay_ips: Vec::new(),
         }

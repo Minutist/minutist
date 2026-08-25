@@ -237,6 +237,7 @@ async fn notes_converge_through_a_running_hub() {
         .endpoint_id();
 
     let cfg = |dir: &std::path::Path| SyncConfig {
+        app_data_dir: dir.to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: token.clone(),
         meetings_root: dir.to_path_buf(),
@@ -248,18 +249,18 @@ async fn notes_converge_through_a_running_hub() {
     // `start_insecure` trusts the local relay's self-signed certificate instead
     // of verifying it; the live path verifies normally via `start`.
     let (engine_a, engine_b) = if insecure {
-        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, ContentKey::for_tests())
+        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, Some(ContentKey::for_tests()))
             .await
             .expect("engine A binds");
-        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, ContentKey::for_tests())
+        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, Some(ContentKey::for_tests()))
             .await
             .expect("engine B binds");
         (a, b)
     } else {
-        let a = SyncEngine::start(cfg(dir_a.path()), id_a, ContentKey::for_tests())
+        let a = SyncEngine::start(cfg(dir_a.path()), id_a, Some(ContentKey::for_tests()))
             .await
             .expect("engine A binds");
-        let b = SyncEngine::start(cfg(dir_b.path()), id_b, ContentKey::for_tests())
+        let b = SyncEngine::start(cfg(dir_b.path()), id_b, Some(ContentKey::for_tests()))
             .await
             .expect("engine B binds");
         (a, b)
@@ -387,6 +388,7 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
         .endpoint_id();
 
     let cfg = |dir: &std::path::Path| SyncConfig {
+        app_data_dir: dir.to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: Some(token.clone()),
         meetings_root: dir.to_path_buf(),
@@ -396,14 +398,14 @@ async fn hub_pushes_a_meeting_to_an_arriving_peer() {
     let engine_a = SyncEngine::start(
         cfg(dir_a.path()),
         DeviceIdentity::load_or_generate(dir_a.path()).expect("id a"),
-        ContentKey::for_tests(),
+        Some(ContentKey::for_tests()),
     )
     .await
     .expect("engine A");
     let engine_b = SyncEngine::start(
         cfg(dir_b.path()),
         DeviceIdentity::load_or_generate(dir_b.path()).expect("id b"),
-        ContentKey::for_tests(),
+        Some(ContentKey::for_tests()),
     )
     .await
     .expect("engine B");
@@ -499,6 +501,7 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
         .endpoint_id();
 
     let cfg = |dir: &std::path::Path| SyncConfig {
+        app_data_dir: dir.to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: Some(token.clone()),
         meetings_root: dir.to_path_buf(),
@@ -508,7 +511,7 @@ async fn hub_records_a_peers_processing_lifecycle_via_discovery() {
     let engine_a = SyncEngine::start(
         cfg(dir_a.path()),
         DeviceIdentity::load_or_generate(dir_a.path()).expect("id a"),
-        ContentKey::for_tests(),
+        Some(ContentKey::for_tests()),
     )
     .await
     .expect("engine A");
@@ -613,6 +616,7 @@ async fn hub_discovers_and_syncs_an_account_listed_peer() {
         .endpoint_id();
 
     let cfg = SyncConfig {
+        app_data_dir: dir_a.path().to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: token.clone(),
         meetings_root: dir_a.path().to_path_buf(),
@@ -621,11 +625,11 @@ async fn hub_discovers_and_syncs_an_account_listed_peer() {
     };
     let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
     let engine_a = if insecure {
-        SyncEngine::start_insecure(cfg, id_a, ContentKey::for_tests())
+        SyncEngine::start_insecure(cfg, id_a, Some(ContentKey::for_tests()))
             .await
             .expect("engine A binds")
     } else {
-        SyncEngine::start(cfg, id_a, ContentKey::for_tests())
+        SyncEngine::start(cfg, id_a, Some(ContentKey::for_tests()))
             .await
             .expect("engine A binds")
     };

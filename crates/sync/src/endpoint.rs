@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use iroh::endpoint::{presets, ConnectionError};
@@ -46,6 +46,8 @@ use crate::backoff::BackoffPolicy;
 use crate::backoff::BackoffRegistry;
 use crate::blobs::{BlobExchange, BlobStore};
 use crate::content_key::{ContentKey, FrameCipher};
+use crate::enrolment::{EnrolmentStore, Verdict};
+use crate::enrolment_proto;
 use crate::identity::DeviceIdentity;
 use crate::notes_proto::{self, StreamKind, SYNC_ALPN};
 use crate::timeouts::ACCEPT_HANDSHAKE_TIMEOUT;
@@ -71,11 +73,23 @@ pub struct SyncEngine {
     /// Meetings root the protocols read/write through `persistence`
     /// (`{root}/{meeting_id}/...`). The inbound [`AcceptHook`] shares it.
     meetings_root: PathBuf,
-    /// Seals and opens every frame on the sync ALPN, derived once from the
-    /// account content key (`planning/DESIGN_sync-encryption.md` §4). A peer that
-    /// passes the ed25519 membership check but holds a different key gets
+    /// Seals and opens every frame on the sync ALPN, derived from the account
+    /// content key (`planning/DESIGN_sync-encryption.md` §4). A peer that passes
+    /// the ed25519 membership check but holds a different key gets
     /// [`Error::Unauthenticated`] on its first frame and reads nothing.
-    cipher: FrameCipher,
+    ///
+    /// Behind a lock because enrolment replaces it at runtime: adopting a key
+    /// from a confirmed peer re-derives the cipher, and every in-flight exchange
+    /// must pick up the new one. Read out by value rather than held as a guard,
+    /// since the frame operations that use it are `async` and holding a guard
+    /// across an await is how that deadlocks.
+    keys: Arc<RwLock<Option<KeyState>>>,
+    /// The app-data base, for writing a key adopted during enrolment and for the
+    /// enrolment record. See [`SyncConfig::app_data_dir`].
+    app_data_dir: PathBuf,
+    /// Which peers the user has confirmed. Consulted before this device hands
+    /// the content key over, and before it accepts one.
+    enrolment: Arc<RwLock<EnrolmentStore>>,
     /// The configured relay URL, kept so [`Self::push_all_to`] can address a peer
     /// relay-only (id + relay) without a stored direct address.
     relay_url: String,
@@ -101,6 +115,63 @@ pub struct SyncEngine {
     /// edge, so it emits rather than writes. Bounded; a consumer that hits
     /// [`broadcast::error::RecvError::Lagged`] recovers by re-running discovery.
     lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
+}
+
+/// The two directories a [`SyncEngine`] works in.
+///
+/// Bundled because they are easy to confuse and the consequences differ: writing
+/// a secret under `meetings` would put it in the tree that syncs, and looking for
+/// one under it would silently find nothing and mint a fresh key.
+#[derive(Debug, Clone)]
+struct Roots {
+    /// `{app-data}/meetings`, holding the per-meeting `{uuid}` folders.
+    meetings: PathBuf,
+    /// The app-data base, holding this device's secrets.
+    app_data: PathBuf,
+}
+
+/// The error a device that holds no content key gives for anything but
+/// enrolment. Its own state, not the peer's: nothing is wrong with the peer, this
+/// device simply has not been enrolled yet.
+fn not_enrolled() -> Error {
+    Error::Unauthenticated(
+        "this device holds no account content key: confirm it from a device that does".to_string(),
+    )
+}
+
+/// The account content key and the frame cipher derived from it.
+///
+/// Held together under one lock so they cannot drift: the key is what enrolment
+/// hands to a confirmed peer, the cipher is what seals every other frame, and a
+/// device offering one key while sealing under another would be a silent,
+/// baffling failure. Enrolment replaces both at once.
+#[derive(Debug, Clone)]
+struct KeyState {
+    key: ContentKey,
+    cipher: FrameCipher,
+}
+
+impl KeyState {
+    fn new(key: ContentKey) -> Self {
+        Self {
+            cipher: key.frame_cipher(),
+            key,
+        }
+    }
+}
+
+/// A peer the account directory has offered that the user has not decided about,
+/// with the code to compare against the other device's screen.
+///
+/// Deliberately plain: hex string and digits, no `iroh` or crypto type, so the
+/// FFI boundary and the hub CLI consume it without either learning about
+/// `EndpointId`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEnrolment {
+    /// The peer's hex endpoint id, as [`SyncEngine::peer_ids`] reports it.
+    pub peer_id: String,
+    /// The six digits both devices show. Zero-padded, so it compares as text.
+    pub safety_code: String,
 }
 
 /// Capacity of the peer-arrived broadcast channel. Small by design: a lagging hub
@@ -411,7 +482,7 @@ impl SyncEngine {
     pub async fn start(
         config: SyncConfig,
         identity: DeviceIdentity,
-        content_key: ContentKey,
+        content_key: Option<ContentKey>,
     ) -> Result<Self> {
         let relay_mode = Self::relay_mode(&config)?;
         let peers = PeerDirectory::new();
@@ -459,8 +530,11 @@ impl SyncEngine {
             endpoint,
             peers,
             blobs,
-            meetings_root,
-            &content_key,
+            Roots {
+                meetings: meetings_root,
+                app_data: config.app_data_dir,
+            },
+            content_key,
             BackoffRegistry::new(config.backoff_policy),
             config.relay_url,
         ))
@@ -477,14 +551,19 @@ impl SyncEngine {
         endpoint: Endpoint,
         peers: PeerDirectory,
         blobs: BlobStore,
-        meetings_root: PathBuf,
-        content_key: &ContentKey,
+        roots: Roots,
+        content_key: Option<ContentKey>,
         backoff: BackoffRegistry,
         relay_url: String,
     ) -> Self {
+        let Roots {
+            meetings: meetings_root,
+            app_data: app_data_dir,
+        } = roots;
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
         let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
-        let cipher = content_key.frame_cipher();
+        let keys = Arc::new(RwLock::new(content_key.map(KeyState::new)));
+        let enrolment = Arc::new(RwLock::new(EnrolmentStore::load(&app_data_dir)));
         let router = Self::build_router(
             &endpoint,
             &blobs,
@@ -495,11 +574,13 @@ impl SyncEngine {
                 meetings_root: meetings_root.clone(),
                 peers: peers.clone(),
                 blobs: blobs.clone(),
-                cipher: cipher.clone(),
+                keys: keys.clone(),
                 endpoint: endpoint.clone(),
                 peer_events: peer_events.clone(),
                 peer_arrivals: PeerArrivalTracker::new(),
                 lifecycle_events: lifecycle_events.clone(),
+                app_data_dir: app_data_dir.clone(),
+                enrolment: enrolment.clone(),
             },
         );
         Self {
@@ -509,19 +590,92 @@ impl SyncEngine {
             backoff,
             blobs,
             meetings_root,
-            cipher,
+            keys,
+            app_data_dir,
+            enrolment,
             relay_url,
             peer_events,
             lifecycle_events,
         }
     }
 
+    /// The current frame cipher, by value.
+    ///
+    /// Cloned out of the lock rather than borrowed: the frame operations that
+    /// use it are `async`, and holding a `RwLock` guard across an await is how
+    /// that deadlocks. A `FrameCipher` is a 32-byte key, so the clone is free.
+    fn cipher(&self) -> Result<FrameCipher> {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|k| k.cipher.clone())
+            .ok_or_else(not_enrolled)
+    }
+
+    /// The current account content key, by value. Only enrolment wants this;
+    /// everything else wants [`Self::cipher`].
+    fn content_key(&self) -> Result<ContentKey> {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|k| k.key.clone())
+            .ok_or_else(not_enrolled)
+    }
+
+    /// Mint the account content key if this device turns out to be the first on
+    /// its account, now that the directory has been polled
+    /// (`planning/DESIGN_sync-encryption.md` §3.1).
+    ///
+    /// A no-op once a key is held, which is the steady state: this fires on
+    /// every directory poll and does nothing on all but the first.
+    ///
+    /// Minting is deferred to here rather than done at startup because startup
+    /// cannot know the answer. A device that minted before polling would guess,
+    /// and a device joining an existing account guesses wrong every time, ending
+    /// up with a key no peer holds and failing every exchange while looking like
+    /// a network fault.
+    fn resolve_first_device(&self, has_other_devices: bool) {
+        if self.is_enrolled_self() {
+            return;
+        }
+        if has_other_devices {
+            tracing::debug!(
+                target: "sync",
+                "no content key and the account has other devices; waiting to be enrolled"
+            );
+            return;
+        }
+        match ContentKey::load_or_mint(&self.app_data_dir, Some(false)) {
+            Ok(Some(key)) => {
+                *self.keys.write().unwrap_or_else(|e| e.into_inner()) = Some(KeyState::new(key));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                target: "sync",
+                error = %e,
+                "could not mint the account content key"
+            ),
+        }
+    }
+
+    /// Whether this device holds the account content key, i.e. has been enrolled.
+    /// A device that has not been syncs nothing until a confirmed peer sends it
+    /// the key.
+    pub fn is_enrolled_self(&self) -> bool {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// The blob-exchange collaborators for one peer: the frame cipher, blob
     /// store, endpoint, peer id and meetings root that `media_proto` and
     /// `artifacts_proto` both need on their initiator side.
-    fn blob_exchange(&self, peer: EndpointId) -> BlobExchange<'_> {
+    fn blob_exchange<'a>(&'a self, peer: EndpointId, cipher: &'a FrameCipher) -> BlobExchange<'a> {
         BlobExchange {
-            cipher: &self.cipher,
+            cipher,
             store: &self.blobs,
             endpoint: &self.endpoint,
             peer,
@@ -558,7 +712,7 @@ impl SyncEngine {
     #[cfg(feature = "test-support")]
     pub async fn start_direct(
         identity: DeviceIdentity,
-        content_key: ContentKey,
+        content_key: Option<ContentKey>,
         meetings_root: PathBuf,
     ) -> Result<Self> {
         let peers = PeerDirectory::new();
@@ -575,8 +729,12 @@ impl SyncEngine {
             endpoint,
             peers,
             blobs,
-            meetings_root,
-            &content_key,
+            // The relay-less test path keeps both under one tempdir.
+            Roots {
+                meetings: meetings_root.clone(),
+                app_data: meetings_root,
+            },
+            content_key,
             BackoffRegistry::new(BackoffPolicy::default()),
             // The relay-less test path never addresses a peer relay-only, so it
             // has no relay URL; `push_all_to` is unused here.
@@ -605,7 +763,7 @@ impl SyncEngine {
     pub async fn start_insecure(
         config: SyncConfig,
         identity: DeviceIdentity,
-        content_key: ContentKey,
+        content_key: Option<ContentKey>,
     ) -> Result<Self> {
         let relay_mode = Self::relay_mode(&config)?;
         let peers = PeerDirectory::new();
@@ -633,8 +791,11 @@ impl SyncEngine {
             endpoint,
             peers,
             blobs,
-            meetings_root,
-            &content_key,
+            Roots {
+                meetings: meetings_root,
+                app_data: config.app_data_dir,
+            },
+            content_key,
             BackoffRegistry::new(config.backoff_policy),
             config.relay_url,
         ))
@@ -842,6 +1003,166 @@ impl SyncEngine {
             .into_iter()
             .map(|id| id.to_string())
             .collect()
+    }
+
+    /// Peers the account directory has offered that the user has not decided
+    /// about yet, each with the six-digit code to compare
+    /// (`planning/DESIGN_sync-encryption.md` §5).
+    ///
+    /// This is the list a frontend prompts on, and what `minutist-hub confirm`
+    /// prints. Carries no `iroh` or crypto type, so the FFI boundary and the CLI
+    /// both consume it directly.
+    ///
+    /// A peer already confirmed or already refused is absent: the decision
+    /// persists, so the user is asked once rather than every poll.
+    pub fn pending_enrolments(&self) -> Vec<PendingEnrolment> {
+        let store = self.enrolment.read().unwrap_or_else(|e| e.into_inner());
+        let own = *self.endpoint.id().as_bytes();
+        self.peers
+            .ids()
+            .into_iter()
+            .filter(|id| store.verdict(&id.to_string()).is_none())
+            .map(|id| PendingEnrolment {
+                safety_code: crate::enrolment::safety_code(&own, id.as_bytes()),
+                peer_id: id.to_string(),
+            })
+            .collect()
+    }
+
+    /// The code to compare for one specific peer, whatever its current verdict.
+    ///
+    /// [`Self::pending_enrolments`] covers the prompt; this covers a settings
+    /// screen that shows the code for an already-enrolled device, so a user can
+    /// re-verify one without un-enrolling it first.
+    pub fn safety_code_for(&self, peer_id: &str) -> Result<String> {
+        let id: EndpointId = peer_id
+            .parse()
+            .map_err(|e| Error::Protocol(format!("invalid endpoint id {peer_id:?}: {e}")))?;
+        Ok(crate::enrolment::safety_code(
+            self.endpoint.id().as_bytes(),
+            id.as_bytes(),
+        ))
+    }
+
+    /// Record that the user confirmed `peer_id` is a device they own.
+    ///
+    /// Records only: no dial, no network, returns immediately. Handing the peer
+    /// the key is [`Self::offer_content_key`], deliberately separate. A user
+    /// confirming a device that happens to be asleep must not sit through a dial
+    /// timeout to have their decision recorded, and the decision is what has to
+    /// be durable, and the transfer is retryable against it for as long as it
+    /// stands.
+    ///
+    /// A caller that wants both in one step calls
+    /// [`Self::confirm_and_offer`].
+    ///
+    /// `decided_at` is an RFC 3339 timestamp from the caller; this crate keeps no
+    /// clock.
+    pub fn confirm_enrolment(&self, peer_id: &str, decided_at: Option<String>) -> Result<()> {
+        self.record_verdict(peer_id, Verdict::Confirmed, decided_at)?;
+        tracing::info!(
+            target: "sync",
+            peer = %peer_id,
+            "user confirmed a peer; it may now receive the account content key"
+        );
+        Ok(())
+    }
+
+    /// [`Self::confirm_enrolment`] followed by [`Self::offer_content_key`].
+    ///
+    /// The confirmation is recorded even when the transfer fails, so an
+    /// unreachable peer costs a retry rather than the user's decision.
+    pub async fn confirm_and_offer(
+        &self,
+        peer_id: &str,
+        decided_at: Option<String>,
+    ) -> Result<()> {
+        self.confirm_enrolment(peer_id, decided_at)?;
+        self.offer_content_key(peer_id).await
+    }
+
+    /// Confirmed peers that have not yet been handed the key, so a sweep can
+    /// retry [`Self::offer_content_key`] for a device that was unreachable when
+    /// the user confirmed it.
+    ///
+    /// Derived rather than tracked: a confirmed peer whose exchanges still fail
+    /// to authenticate is one that never received the key. Callers treat this as
+    /// "worth retrying", not as proof.
+    pub fn confirmed_peers(&self) -> Vec<String> {
+        let store = self.enrolment.read().unwrap_or_else(|e| e.into_inner());
+        store
+            .all()
+            .into_iter()
+            .filter(|(_, v)| *v == Verdict::Confirmed)
+            .map(|(peer, _)| peer)
+            .collect()
+    }
+
+    /// Record that the user rejected `peer_id`, and suppress it.
+    ///
+    /// The refusal persists, so the user is not re-prompted for an endpoint they
+    /// have already rejected: re-asking every poll is how a prompt gets trained
+    /// into a reflex. Suppression stops this device dialling it in the meantime.
+    pub fn refuse_enrolment(&self, peer_id: &str, decided_at: Option<String>) -> Result<()> {
+        self.record_verdict(peer_id, Verdict::Refused, decided_at)?;
+        self.backoff.on_dial_outcome(peer_id, false);
+        tracing::warn!(
+            target: "sync",
+            peer = %peer_id,
+            "user refused an endpoint the account directory offered"
+        );
+        Ok(())
+    }
+
+    /// Whether the user has confirmed `peer_id`.
+    pub fn is_enrolled(&self, peer_id: &str) -> bool {
+        self.enrolment
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_confirmed(peer_id)
+    }
+
+    fn record_verdict(
+        &self,
+        peer_id: &str,
+        verdict: Verdict,
+        decided_at: Option<String>,
+    ) -> Result<()> {
+        self.enrolment
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(peer_id, verdict, decided_at)
+    }
+
+    /// Dial `peer_id` on the enrolment stream and send it the content key.
+    ///
+    /// Separate from [`Self::confirm_enrolment`] so a caller can retry the
+    /// transfer for a peer that is already confirmed but was unreachable when the
+    /// user decided.
+    pub async fn offer_content_key(&self, peer_id: &str) -> Result<()> {
+        let id: EndpointId = peer_id
+            .parse()
+            .map_err(|e| Error::Protocol(format!("invalid endpoint id {peer_id:?}: {e}")))?;
+        let key = self.content_key()?;
+        let store = self
+            .enrolment
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        // Prefer the relay-addressed form the other `*_to_peer` methods use; on
+        // the relay-less path (`start_direct`) there is no relay URL, and the
+        // directory's own lookup resolves a bare id from what it was told.
+        let addr = self
+            .peer_relay_addr(peer_id)
+            .unwrap_or_else(|_| EndpointAddr::new(id));
+        let conn = self.dial(addr).await?;
+        let result = enrolment_proto::offer_key(&conn, &store, &key).await;
+        let result = finish_exchange(&conn, b"enrolment-done", result);
+        if result.is_err() {
+            self.record_exchange_failure(id);
+        }
+        result
     }
 
     /// Subscribe to "peer arrived" events: a peer's hex endpoint id, fired at most
@@ -1081,7 +1402,7 @@ impl SyncEngine {
         let peer_id = conn.remote_id();
         let result = notes_proto::initiate_notes_sync(
             &conn,
-            &self.cipher,
+            &self.cipher()?,
             &self.meetings_root,
             meeting_id,
         )
@@ -1111,7 +1432,7 @@ impl SyncEngine {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
         let result =
-            discovery_proto::initiate_discovery(&conn, &self.cipher, &self.meetings_root).await;
+            discovery_proto::initiate_discovery(&conn, &self.cipher()?, &self.meetings_root).await;
         let result = finish_exchange(&conn, b"discovery-done", result);
         match &result {
             Ok(_) => self.record_peer_reachable(peer_id),
@@ -1320,8 +1641,10 @@ impl SyncEngine {
     ) -> Result<()> {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
+        let cipher = self.cipher()?;
         let result =
-            media_proto::initiate_media_sync(&conn, self.blob_exchange(peer_id), meeting_id).await;
+            media_proto::initiate_media_sync(&conn, self.blob_exchange(peer_id, &cipher), meeting_id)
+                .await;
         let result = finish_exchange(&conn, b"media-sync-done", result);
         if result.is_err() {
             self.record_exchange_failure(peer_id);
@@ -1351,9 +1674,13 @@ impl SyncEngine {
     ) -> Result<()> {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
-        let result =
-            artifacts_proto::initiate_artifacts_sync(&conn, self.blob_exchange(peer_id), meeting_id)
-                .await;
+        let cipher = self.cipher()?;
+        let result = artifacts_proto::initiate_artifacts_sync(
+            &conn,
+            self.blob_exchange(peer_id, &cipher),
+            meeting_id,
+        )
+        .await;
         let result = finish_exchange(&conn, b"artifacts-sync-done", result);
         if result.is_err() {
             self.record_exchange_failure(peer_id);
@@ -1460,6 +1787,10 @@ impl SyncEngineRefreshSink {
 
 #[async_trait::async_trait]
 impl RefreshSink for SyncEngineRefreshSink {
+    fn on_account_size(&self, has_other_devices: bool) {
+        self.engine.resolve_first_device(has_other_devices);
+    }
+
     fn upsert_account_peer(&self, ep: &AccountEndpoint) -> bool {
         self.engine
             .upsert_account_peer(&ep.endpoint_id, &ep.relay_url, &ep.direct_addrs)
@@ -1538,10 +1869,16 @@ struct AcceptHook {
     peers: PeerDirectory,
     /// The blob store, for the media responder.
     blobs: BlobStore,
-    /// The frame cipher, shared with [`SyncEngine`]. Every responder seals and
-    /// opens its frames under it, so an inbound peer holding a different content
-    /// key gets [`Error::Unauthenticated`] on its first frame.
-    cipher: FrameCipher,
+    /// The content key and frame cipher, shared with [`SyncEngine`] (the same
+    /// lock, so a key adopted during enrolment is picked up by both sides).
+    /// Every responder seals and opens its frames under the cipher, so an
+    /// inbound peer holding a different content key gets
+    /// [`Error::Unauthenticated`] on its first frame.
+    keys: Arc<RwLock<Option<KeyState>>>,
+    /// The app-data base, for persisting a key adopted during enrolment.
+    app_data_dir: PathBuf,
+    /// Which peers the user has confirmed, shared with [`SyncEngine`].
+    enrolment: Arc<RwLock<EnrolmentStore>>,
     /// The endpoint, for the media responder's blob pulls.
     endpoint: Endpoint,
     /// Fires the remote's hex id the first time it is authorised in a
@@ -1604,11 +1941,21 @@ impl ProtocolHandler for AcceptHook {
 }
 
 impl AcceptHook {
+    /// The current frame cipher by value, mirroring [`SyncEngine::cipher`].
+    fn cipher(&self) -> Result<FrameCipher> {
+        self.keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|k| k.cipher.clone())
+            .ok_or_else(not_enrolled)
+    }
+
     /// The blob-exchange collaborators for one inbound peer, mirroring
     /// [`SyncEngine::blob_exchange`].
-    fn blob_exchange(&self, peer: EndpointId) -> BlobExchange<'_> {
+    fn blob_exchange<'a>(&'a self, peer: EndpointId, cipher: &'a FrameCipher) -> BlobExchange<'a> {
         BlobExchange {
-            cipher: &self.cipher,
+            cipher,
             store: &self.blobs,
             endpoint: &self.endpoint,
             peer,
@@ -1658,7 +2005,7 @@ impl AcceptHook {
             StreamKind::Notes => {
                 notes_proto::respond_notes_sync(
                     connection,
-                    &self.cipher,
+                    &self.cipher()?,
                     &mut send,
                     &mut recv,
                     &self.meetings_root,
@@ -1668,7 +2015,7 @@ impl AcceptHook {
             StreamKind::Media => {
                 media_proto::respond_media_sync(
                     connection,
-                    self.blob_exchange(peer),
+                    self.blob_exchange(peer, &self.cipher()?),
                     &mut send,
                     &mut recv,
                 )
@@ -1677,7 +2024,7 @@ impl AcceptHook {
             StreamKind::Discovery => {
                 let theirs = discovery_proto::respond_discovery(
                     connection,
-                    &self.cipher,
+                    &self.cipher()?,
                     &mut send,
                     &mut recv,
                     &self.meetings_root,
@@ -1697,11 +2044,31 @@ impl AcceptHook {
             StreamKind::Artifacts => {
                 artifacts_proto::respond_artifacts_sync(
                     connection,
-                    self.blob_exchange(peer),
+                    self.blob_exchange(peer, &self.cipher()?),
                     &mut send,
                     &mut recv,
                 )
                 .await
+            }
+            StreamKind::Enrolment => {
+                // The one stream not sealed under the content key: it delivers
+                // that key. `accept_key` refuses unless this device's user has
+                // confirmed the sender, and on acceptance the adopted key
+                // re-derives the shared cipher so every subsequent exchange, on
+                // both sides of this engine, uses it.
+                let store = self.enrolment.read().unwrap_or_else(|e| e.into_inner()).clone();
+                let offered =
+                    enrolment_proto::read_offered_key(connection, &mut recv, &store).await?;
+                if let Some(bytes) = offered {
+                    // Persist and swap BEFORE replying: the initiator treats
+                    // ACCEPTED as "enrolled" and returns at once, so any work
+                    // left after the reply is a window where it believes an
+                    // enrolment that has not landed.
+                    let adopted = ContentKey::replace(&self.app_data_dir, bytes)?;
+                    *self.keys.write().unwrap_or_else(|e| e.into_inner()) =
+                        Some(KeyState::new(adopted));
+                }
+                enrolment_proto::send_verdict(connection, &mut send, offered.is_some()).await
             }
         }
     }
@@ -1758,14 +2125,14 @@ mod tests {
 
     #[test]
     fn relay_mode_without_token_is_custom() {
-        let config = SyncConfig::new(std::env::temp_dir());
+        let config = SyncConfig::new(std::env::temp_dir(), std::env::temp_dir());
         let mode = SyncEngine::relay_mode(&config).expect("default relay url must parse");
         assert!(matches!(mode, RelayMode::Custom(_)));
     }
 
     #[test]
     fn relay_mode_with_token_is_custom() {
-        let config = SyncConfig::new(std::env::temp_dir()).with_relay_auth_token("secret");
+        let config = SyncConfig::new(std::env::temp_dir(), std::env::temp_dir()).with_relay_auth_token("secret");
         let mode = SyncEngine::relay_mode(&config).expect("relay url must parse");
         assert!(matches!(mode, RelayMode::Custom(_)));
     }
@@ -1856,7 +2223,7 @@ mod tests {
 
     #[test]
     fn empty_relay_url_is_rejected() {
-        let mut config = SyncConfig::new(std::env::temp_dir());
+        let mut config = SyncConfig::new(std::env::temp_dir(), std::env::temp_dir());
         config.relay_url = String::new();
         assert!(SyncEngine::relay_mode(&config).is_err());
     }
@@ -1919,14 +2286,14 @@ mod tests {
         let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
         let engine_a = SyncEngine::start_direct(
             id_a,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir_a.path().to_path_buf(),
         )
             .await
             .expect("engine a");
         let engine_b = SyncEngine::start_direct(
             id_b,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir_b.path().to_path_buf(),
         )
             .await
@@ -1959,7 +2326,7 @@ mod tests {
             let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
             let engine = SyncEngine::start_direct(
                 id,
-                ContentKey::for_tests(),
+                Some(ContentKey::for_tests()),
                 dir.path().to_path_buf(),
             )
                 .await
@@ -1978,7 +2345,7 @@ mod tests {
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
         let engine = SyncEngine::start_direct(
             id,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir.path().to_path_buf(),
         )
             .await
@@ -1999,7 +2366,7 @@ mod tests {
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
         let engine = SyncEngine::start_direct(
             id,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir.path().to_path_buf(),
         )
             .await
@@ -2063,7 +2430,7 @@ mod tests {
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
         let engine = SyncEngine::start_direct(
             id,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir.path().to_path_buf(),
         )
             .await
@@ -2083,7 +2450,7 @@ mod tests {
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
         let engine = SyncEngine::start_direct(
             id,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir.path().to_path_buf(),
         )
             .await
@@ -2126,10 +2493,10 @@ mod tests {
         let dir_b = tempfile::TempDir::new().expect("tempdir b");
         let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
         let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
-        let a = SyncEngine::start_direct(id_a, ContentKey::for_tests(), dir_a.path().to_path_buf())
+        let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), dir_a.path().to_path_buf())
             .await
             .expect("engine a");
-        let b = SyncEngine::start_direct(id_b, ContentKey::for_tests(), dir_b.path().to_path_buf())
+        let b = SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), dir_b.path().to_path_buf())
             .await
             .expect("engine b");
 
@@ -2172,7 +2539,7 @@ mod tests {
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
         let engine = SyncEngine::start_direct(
             id,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir.path().to_path_buf(),
         )
             .await
@@ -2208,7 +2575,7 @@ mod tests {
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
         let engine = SyncEngine::start_direct(
             id,
-            ContentKey::for_tests(),
+            Some(ContentKey::for_tests()),
             dir.path().to_path_buf(),
         )
             .await

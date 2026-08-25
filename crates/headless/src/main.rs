@@ -635,7 +635,7 @@ struct AccountRefreshArgs {
 async fn bind_sync_engine(
     config: SyncConfig,
     identity: DeviceIdentity,
-    content_key: ContentKey,
+    content_key: Option<ContentKey>,
 ) -> sync::Result<SyncEngine> {
     if std::env::var_os("MINUTIST_HUB_INSECURE_RELAY_TLS").is_some() {
         SyncEngine::start_insecure(config, identity, content_key).await
@@ -649,7 +649,7 @@ async fn bind_sync_engine(
 async fn bind_sync_engine(
     config: SyncConfig,
     identity: DeviceIdentity,
-    content_key: ContentKey,
+    content_key: Option<ContentKey>,
 ) -> sync::Result<SyncEngine> {
     SyncEngine::start(config, identity, content_key).await
 }
@@ -701,11 +701,12 @@ async fn start_engine(
     // and reloaded thereafter — the stable identity peers pair against.
     let identity = DeviceIdentity::load_or_generate(data_dir)?;
 
-    // The account content key every enrolled device holds; each frame on the
-    // sync ALPN is sealed under it. Minted on first run, which assumes this hub
-    // is the first device on the account: if it is not, the user-confirmed
-    // enrolment exchange replaces it (see `sync::content_key`).
-    let content_key = ContentKey::load_or_mint(data_dir)?;
+    // The account content key every enrolled device holds; each frame on the sync
+    // ALPN is sealed under it. Absent on a device that has not been enrolled yet:
+    // the account-refresh loop mints one if this turns out to be the first device
+    // on the account, and otherwise the device waits to be confirmed from one that
+    // already holds it (see `sync::content_key`, DESIGN §3.1).
+    let content_key = ContentKey::load(data_dir)?;
 
     // The sync engine reads/writes per-meeting folders under `{data_dir}/meetings`.
     let meetings_root = data_dir.join("meetings");
@@ -713,7 +714,7 @@ async fn start_engine(
         context: format!("creating meetings root {}: {e}", meetings_root.display()),
     })?;
 
-    let mut config = SyncConfig::new(meetings_root);
+    let mut config = SyncConfig::new(data_dir.to_path_buf(), meetings_root);
     config.relay_url = relay_url.clone();
     if let Some(token) = relay_token {
         config = config.with_relay_auth_token(token);

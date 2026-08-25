@@ -266,10 +266,11 @@ impl ConnectedSync {
         };
 
         // The account content key every enrolled device holds; each frame on the
-        // sync ALPN is sealed under it. Minted on first run, which assumes this
-        // device is the first on the account: if it is not, the user-confirmed
-        // enrolment exchange replaces it (see `sync::content_key`).
-        let content_key = match ContentKey::load_or_mint(&app_data_base) {
+        // sync ALPN is sealed under it. Absent on a device that has not been
+        // enrolled yet: the account-refresh loop mints one if this turns out to
+        // be the first device on the account, and otherwise the device waits to
+        // be confirmed from one that already holds it (DESIGN §3.1).
+        let content_key = match ContentKey::load(&app_data_base) {
             Ok(key) => key,
             Err(e) => {
                 self.fail(format!("loading the sync content key: {e}"))
@@ -282,7 +283,7 @@ impl ConnectedSync {
         // before the config consumes it.
         let subscriber_meetings_dir = meetings_dir.clone();
         let election_meetings_dir = meetings_dir.clone();
-        let mut config = SyncConfig::new(meetings_dir);
+        let mut config = SyncConfig::new(app_data_base.clone(), meetings_dir);
         if let Some(token) = relay_token {
             config = config.with_relay_auth_token(token);
         }

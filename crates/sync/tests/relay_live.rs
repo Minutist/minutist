@@ -75,6 +75,7 @@ async fn notes_converge_through_the_relay() {
     let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
 
     let cfg = |dir: &std::path::Path| SyncConfig {
+        app_data_dir: dir.to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: token.clone(),
         // The test conflates the device-key base and the meetings root onto one
@@ -88,18 +89,18 @@ async fn notes_converge_through_the_relay() {
     // `start_insecure` trusts the local relay's self-signed certificate instead
     // of verifying it; the live path verifies normally via `start`.
     let (engine_a, engine_b) = if insecure {
-        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, ContentKey::for_tests())
+        let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, Some(ContentKey::for_tests()))
             .await
             .expect("engine A binds");
-        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, ContentKey::for_tests())
+        let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, Some(ContentKey::for_tests()))
             .await
             .expect("engine B binds");
         (a, b)
     } else {
-        let a = SyncEngine::start(cfg(dir_a.path()), id_a, ContentKey::for_tests())
+        let a = SyncEngine::start(cfg(dir_a.path()), id_a, Some(ContentKey::for_tests()))
             .await
             .expect("engine A binds");
-        let b = SyncEngine::start(cfg(dir_b.path()), id_b, ContentKey::for_tests())
+        let b = SyncEngine::start(cfg(dir_b.path()), id_b, Some(ContentKey::for_tests()))
             .await
             .expect("engine B binds");
         (a, b)

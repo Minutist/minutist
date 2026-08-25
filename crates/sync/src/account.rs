@@ -101,6 +101,16 @@ pub trait RefreshSink: Send + Sync {
     /// a second guard. Runs under the loop's cancel scope, dropped on cancel.
     async fn on_new_peer(&self, endpoint_id: &str);
 
+    /// Called each poll with whether the account holds any device other than
+    /// this one, so a device with no content key can decide whether to mint one
+    /// or wait to be enrolled (`planning/DESIGN_sync-encryption.md` §3.1).
+    ///
+    /// Driven from the loop rather than from startup because that is where the
+    /// answer lives: the directory has to be polled to know, and a device that
+    /// minted at startup would have guessed. A no-op once this device holds a
+    /// key, which is the steady state.
+    fn on_account_size(&self, _has_other_devices: bool) {}
+
     /// The directory's current `Account`-sourced endpoint ids. Read once at loop
     /// (re)start to seed the reconcile-removal state, so a peer that left the
     /// account during a disabled window (the directory survives a live-process
@@ -163,6 +173,10 @@ pub async fn run_account_refresh_loop_v2(
                 };
 
                 let peers = peers_to_add(&list, &self_endpoint.endpoint_id);
+                // Before touching peer state: a device with no content key needs
+                // to know whether it is the first on this account (mint) or is
+                // joining one that already has a key (wait to be enrolled).
+                sink.on_account_size(!peers.is_empty());
                 let current: HashSet<String> =
                     peers.iter().map(|ep| ep.endpoint_id.clone()).collect();
 

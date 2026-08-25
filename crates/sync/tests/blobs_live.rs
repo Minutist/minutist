@@ -52,6 +52,7 @@ async fn media_converges_through_the_deployed_relay() {
     let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
 
     let cfg = |dir: &std::path::Path| SyncConfig {
+        app_data_dir: dir.to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: Some(token.clone()),
         // Live test conflates the device-key base and the meetings root onto one
@@ -62,10 +63,10 @@ async fn media_converges_through_the_deployed_relay() {
         relay_ips: Vec::new(),
     };
 
-    let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a, ContentKey::for_tests())
+    let engine_a = SyncEngine::start(cfg(dir_a.path()), id_a, Some(ContentKey::for_tests()))
         .await
         .expect("engine A binds");
-    let engine_b = SyncEngine::start(cfg(dir_b.path()), id_b, ContentKey::for_tests())
+    let engine_b = SyncEngine::start(cfg(dir_b.path()), id_b, Some(ContentKey::for_tests()))
         .await
         .expect("engine B binds");
     eprintln!(

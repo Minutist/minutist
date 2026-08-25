@@ -306,9 +306,15 @@ impl FfiSyncEngine {
             })?;
 
         let identity = DeviceIdentity::load_or_generate(Path::new(&app_data_dir))?;
-        let content_key = ContentKey::load_or_mint(Path::new(&app_data_dir))?;
+    // The account content key every enrolled device holds; each frame on the sync
+    // ALPN is sealed under it. Absent on a device that has not been enrolled yet:
+    // the account-refresh loop mints one if this turns out to be the first device
+    // on the account, and otherwise the device waits to be confirmed from one that
+    // already holds it (see `sync::content_key`, DESIGN §3.1).
+        let content_key = ContentKey::load(Path::new(&app_data_dir))?;
         let meetings_root = PathBuf::from(meetings_root);
         let config = SyncConfig {
+            app_data_dir: PathBuf::from(&app_data_dir),
             relay_url,
             relay_auth_token,
             meetings_root: meetings_root.clone(),

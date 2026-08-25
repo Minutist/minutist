@@ -48,16 +48,17 @@ async fn adopt_pulls_lacked_meetings_and_skips_held() {
     let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
 
     let cfg = |dir: &Path| SyncConfig {
+        app_data_dir: dir.to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: None,
         meetings_root: dir.to_path_buf(),
         backoff_policy: Default::default(),
         relay_ips: Vec::new(),
     };
-    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, ContentKey::for_tests())
+    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, Some(ContentKey::for_tests()))
         .await
         .expect("engine A binds");
-    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, ContentKey::for_tests())
+    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, Some(ContentKey::for_tests()))
         .await
         .expect("engine B binds");
 
@@ -124,16 +125,17 @@ async fn adopt_never_resurrects_a_locally_purged_meeting() {
     let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
 
     let cfg = |dir: &Path| SyncConfig {
+        app_data_dir: dir.to_path_buf(),
         relay_url: relay_url.clone(),
         relay_auth_token: None,
         meetings_root: dir.to_path_buf(),
         backoff_policy: Default::default(),
         relay_ips: Vec::new(),
     };
-    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, ContentKey::for_tests())
+    let a = SyncEngine::start_insecure(cfg(dir_a.path()), id_a, Some(ContentKey::for_tests()))
         .await
         .expect("engine A binds");
-    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, ContentKey::for_tests())
+    let b = SyncEngine::start_insecure(cfg(dir_b.path()), id_b, Some(ContentKey::for_tests()))
         .await
         .expect("engine B binds");
 

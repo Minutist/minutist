@@ -87,9 +87,6 @@ pub struct SyncEngine {
     /// The app-data base, for writing a key adopted during enrolment and for the
     /// enrolment record. See [`SyncConfig::app_data_dir`].
     app_data_dir: PathBuf,
-    /// Which peers the user has confirmed. Consulted before this device hands
-    /// the content key over, and before it accepts one.
-    enrolment: Arc<RwLock<EnrolmentStore>>,
     /// The configured relay URL, kept so [`Self::push_all_to`] can address a peer
     /// relay-only (id + relay) without a stored direct address.
     relay_url: String,
@@ -251,26 +248,58 @@ impl iroh::dns::Resolver for StaticRelayResolver {
     fn lookup_ipv4(
         &self,
         host: String,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<iroh::dns::BoxIter<std::net::Ipv4Addr>, iroh::dns::DnsError>> + Send>>
-    {
-        let addrs: Vec<_> = if self.matches(&host) { self.v4.clone() } else { Vec::new() };
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        iroh::dns::BoxIter<std::net::Ipv4Addr>,
+                        iroh::dns::DnsError,
+                    >,
+                > + Send,
+        >,
+    > {
+        let addrs: Vec<_> = if self.matches(&host) {
+            self.v4.clone()
+        } else {
+            Vec::new()
+        };
         Box::pin(async move { Ok(Box::new(addrs.into_iter()) as iroh::dns::BoxIter<_>) })
     }
 
     fn lookup_ipv6(
         &self,
         host: String,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<iroh::dns::BoxIter<std::net::Ipv6Addr>, iroh::dns::DnsError>> + Send>>
-    {
-        let addrs: Vec<_> = if self.matches(&host) { self.v6.clone() } else { Vec::new() };
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        iroh::dns::BoxIter<std::net::Ipv6Addr>,
+                        iroh::dns::DnsError,
+                    >,
+                > + Send,
+        >,
+    > {
+        let addrs: Vec<_> = if self.matches(&host) {
+            self.v6.clone()
+        } else {
+            Vec::new()
+        };
         Box::pin(async move { Ok(Box::new(addrs.into_iter()) as iroh::dns::BoxIter<_>) })
     }
 
     fn lookup_txt(
         &self,
         _host: String,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<iroh::dns::BoxIter<iroh::dns::TxtRecordData>, iroh::dns::DnsError>> + Send>>
-    {
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = std::result::Result<
+                        iroh::dns::BoxIter<iroh::dns::TxtRecordData>,
+                        iroh::dns::DnsError,
+                    >,
+                > + Send,
+        >,
+    > {
         // Addressing is account-directory based, not pkarr/TXT discovery, so serve
         // no TXT records, so a pkarr lookup simply finds nothing rather than erroring.
         Box::pin(async move { Ok(Box::new(std::iter::empty()) as iroh::dns::BoxIter<_>) })
@@ -331,11 +360,15 @@ fn android_relay_resolver(relay_host: &str, relay_ips: &[String]) -> iroh::dns::
     tracing::info!(target: "sync", "no usable injected relay IP; falling back to public DoH resolver");
     iroh::dns::DnsResolver::builder()
         .with_nameserver(
-            "1.1.1.1:443".parse().expect("valid DoH nameserver socket addr"),
+            "1.1.1.1:443"
+                .parse()
+                .expect("valid DoH nameserver socket addr"),
             DnsProtocol::Https,
         )
         .with_nameserver(
-            "1.0.0.1:443".parse().expect("valid DoH nameserver socket addr"),
+            "1.0.0.1:443"
+                .parse()
+                .expect("valid DoH nameserver socket addr"),
             DnsProtocol::Https,
         )
         .build()
@@ -563,7 +596,6 @@ impl SyncEngine {
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
         let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
         let keys = Arc::new(RwLock::new(content_key.map(KeyState::new)));
-        let enrolment = Arc::new(RwLock::new(EnrolmentStore::load(&app_data_dir)));
         let router = Self::build_router(
             &endpoint,
             &blobs,
@@ -580,7 +612,6 @@ impl SyncEngine {
                 peer_arrivals: PeerArrivalTracker::new(),
                 lifecycle_events: lifecycle_events.clone(),
                 app_data_dir: app_data_dir.clone(),
-                enrolment: enrolment.clone(),
             },
         );
         Self {
@@ -592,7 +623,6 @@ impl SyncEngine {
             meetings_root,
             keys,
             app_data_dir,
-            enrolment,
             relay_url,
             peer_events,
             lifecycle_events,
@@ -622,6 +652,16 @@ impl SyncEngine {
             .as_ref()
             .map(|k| k.key.clone())
             .ok_or_else(not_enrolled)
+    }
+
+    /// The enrolment record, read fresh from disk.
+    ///
+    /// Not cached: the decision is made by a human in whatever process is in
+    /// front of them, which on a headless hub is a one-shot CLI running
+    /// alongside this daemon. See [`crate::enrolment`], "Why it is read from
+    /// disk every time".
+    fn enrolment(&self) -> EnrolmentStore {
+        EnrolmentStore::load(&self.app_data_dir)
     }
 
     /// Mint the account content key if this device turns out to be the first on
@@ -946,9 +986,9 @@ impl SyncEngine {
     /// (returns `false`) if `endpoint_id` is absent or was registered any other
     /// way (e.g. [`Self::add_peer_from_ticket`]).
     pub fn remove_account_peer(&self, endpoint_id: &str) -> Result<bool> {
-        let id: EndpointId = endpoint_id
-            .parse()
-            .map_err(|e| Error::Protocol(format!("parsing account endpoint id {endpoint_id:?}: {e}")))?;
+        let id: EndpointId = endpoint_id.parse().map_err(|e| {
+            Error::Protocol(format!("parsing account endpoint id {endpoint_id:?}: {e}"))
+        })?;
         Ok(self.peers.remove(id, PeerSource::Account))
     }
 
@@ -1016,7 +1056,7 @@ impl SyncEngine {
     /// A peer already confirmed or already refused is absent: the decision
     /// persists, so the user is asked once rather than every poll.
     pub fn pending_enrolments(&self) -> Vec<PendingEnrolment> {
-        let store = self.enrolment.read().unwrap_or_else(|e| e.into_inner());
+        let store = self.enrolment();
         let own = *self.endpoint.id().as_bytes();
         self.peers
             .ids()
@@ -1072,30 +1112,48 @@ impl SyncEngine {
     ///
     /// The confirmation is recorded even when the transfer fails, so an
     /// unreachable peer costs a retry rather than the user's decision.
-    pub async fn confirm_and_offer(
-        &self,
-        peer_id: &str,
-        decided_at: Option<String>,
-    ) -> Result<()> {
+    pub async fn confirm_and_offer(&self, peer_id: &str, decided_at: Option<String>) -> Result<()> {
         self.confirm_enrolment(peer_id, decided_at)?;
         self.offer_content_key(peer_id).await
     }
 
-    /// Confirmed peers that have not yet been handed the key, so a sweep can
-    /// retry [`Self::offer_content_key`] for a device that was unreachable when
-    /// the user confirmed it.
-    ///
-    /// Derived rather than tracked: a confirmed peer whose exchanges still fail
-    /// to authenticate is one that never received the key. Callers treat this as
-    /// "worth retrying", not as proof.
+    /// Every peer the user has confirmed.
     pub fn confirmed_peers(&self) -> Vec<String> {
-        let store = self.enrolment.read().unwrap_or_else(|e| e.into_inner());
-        store
+        self.enrolment()
             .all()
             .into_iter()
             .filter(|(_, v)| *v == Verdict::Confirmed)
             .map(|(peer, _)| peer)
             .collect()
+    }
+
+    /// Hand the content key to every confirmed peer that has not received it,
+    /// returning how many succeeded.
+    ///
+    /// This is what lets a confirmation be made anywhere and still take effect:
+    /// a one-shot CLI (or a UI on a device whose peer is asleep) records the
+    /// decision to disk, and the running engine finishes the job on its next
+    /// pass. Failures are logged and left for the next sweep, since the decision
+    /// stands until the user changes it.
+    ///
+    /// A no-op for a device that holds no key itself, which cannot hand one out.
+    pub async fn deliver_pending_keys(&self) -> usize {
+        if !self.is_enrolled_self() {
+            return 0;
+        }
+        let mut delivered = 0;
+        for peer in self.enrolment().awaiting_key() {
+            match self.offer_content_key(&peer).await {
+                Ok(()) => delivered += 1,
+                Err(e) => tracing::debug!(
+                    target: "sync",
+                    %peer,
+                    error = %e,
+                    "could not deliver the content key yet; will retry"
+                ),
+            }
+        }
+        delivered
     }
 
     /// Record that the user rejected `peer_id`, and suppress it.
@@ -1116,10 +1174,7 @@ impl SyncEngine {
 
     /// Whether the user has confirmed `peer_id`.
     pub fn is_enrolled(&self, peer_id: &str) -> bool {
-        self.enrolment
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_confirmed(peer_id)
+        self.enrolment().is_confirmed(peer_id)
     }
 
     fn record_verdict(
@@ -1128,10 +1183,7 @@ impl SyncEngine {
         verdict: Verdict,
         decided_at: Option<String>,
     ) -> Result<()> {
-        self.enrolment
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .record(peer_id, verdict, decided_at)
+        self.enrolment().record(peer_id, verdict, decided_at)
     }
 
     /// Dial `peer_id` on the enrolment stream and send it the content key.
@@ -1144,11 +1196,7 @@ impl SyncEngine {
             .parse()
             .map_err(|e| Error::Protocol(format!("invalid endpoint id {peer_id:?}: {e}")))?;
         let key = self.content_key()?;
-        let store = self
-            .enrolment
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let store = self.enrolment();
 
         // Prefer the relay-addressed form the other `*_to_peer` methods use; on
         // the relay-less path (`start_direct`) there is no relay URL, and the
@@ -1159,8 +1207,9 @@ impl SyncEngine {
         let conn = self.dial(addr).await?;
         let result = enrolment_proto::offer_key(&conn, &store, &key).await;
         let result = finish_exchange(&conn, b"enrolment-done", result);
-        if result.is_err() {
-            self.record_exchange_failure(id);
+        match &result {
+            Ok(()) => self.enrolment().mark_key_delivered(peer_id)?,
+            Err(_) => self.record_exchange_failure(id),
         }
         result
     }
@@ -1441,9 +1490,9 @@ impl SyncEngine {
         let theirs = result?;
         let ids = theirs.iter().map(|e| e.meeting_id).collect();
         for entry in theirs {
-            let _ = self
-                .lifecycle_events
-                .send((entry.meeting_id, entry.processing, entry.deletion));
+            let _ =
+                self.lifecycle_events
+                    .send((entry.meeting_id, entry.processing, entry.deletion));
         }
         Ok(ids)
     }
@@ -1600,7 +1649,10 @@ impl SyncEngine {
     /// [`Self::discover_all`]. A per-peer failure is logged and skipped; returns
     /// the total meetings newly adopted across all peers this sweep. `is_purged`
     /// is threaded through to every [`Self::adopt_from_peer`] call: see its doc.
-    pub async fn adopt_all(&self, is_purged: &(impl Fn(MeetingId) -> bool + Sync)) -> Result<usize> {
+    pub async fn adopt_all(
+        &self,
+        is_purged: &(impl Fn(MeetingId) -> bool + Sync),
+    ) -> Result<usize> {
         // Adopt from every peer concurrently: a dead or slow peer (e.g. a
         // backgrounded phone whose dial runs the full timeout) must not delay
         // the sweep for the peers behind it; serialising the sweep let one
@@ -1642,9 +1694,12 @@ impl SyncEngine {
         let conn = self.dial(peer).await?;
         let peer_id = conn.remote_id();
         let cipher = self.cipher()?;
-        let result =
-            media_proto::initiate_media_sync(&conn, self.blob_exchange(peer_id, &cipher), meeting_id)
-                .await;
+        let result = media_proto::initiate_media_sync(
+            &conn,
+            self.blob_exchange(peer_id, &cipher),
+            meeting_id,
+        )
+        .await;
         let result = finish_exchange(&conn, b"media-sync-done", result);
         if result.is_err() {
             self.record_exchange_failure(peer_id);
@@ -1791,6 +1846,10 @@ impl RefreshSink for SyncEngineRefreshSink {
         self.engine.resolve_first_device(has_other_devices);
     }
 
+    async fn deliver_pending_keys(&self) {
+        self.engine.deliver_pending_keys().await;
+    }
+
     fn upsert_account_peer(&self, ep: &AccountEndpoint) -> bool {
         self.engine
             .upsert_account_peer(&ep.endpoint_id, &ep.relay_url, &ep.direct_addrs)
@@ -1877,8 +1936,6 @@ struct AcceptHook {
     keys: Arc<RwLock<Option<KeyState>>>,
     /// The app-data base, for persisting a key adopted during enrolment.
     app_data_dir: PathBuf,
-    /// Which peers the user has confirmed, shared with [`SyncEngine`].
-    enrolment: Arc<RwLock<EnrolmentStore>>,
     /// The endpoint, for the media responder's blob pulls.
     endpoint: Endpoint,
     /// Fires the remote's hex id the first time it is authorised in a
@@ -1941,6 +1998,16 @@ impl ProtocolHandler for AcceptHook {
 }
 
 impl AcceptHook {
+    /// The enrolment record, read fresh from disk.
+    ///
+    /// Not cached: the decision is made by a human in whatever process is in
+    /// front of them, which on a headless hub is a one-shot CLI running
+    /// alongside this daemon. See [`crate::enrolment`], "Why it is read from
+    /// disk every time".
+    fn enrolment(&self) -> EnrolmentStore {
+        EnrolmentStore::load(&self.app_data_dir)
+    }
+
     /// The current frame cipher by value, mirroring [`SyncEngine::cipher`].
     fn cipher(&self) -> Result<FrameCipher> {
         self.keys
@@ -2035,9 +2102,11 @@ impl AcceptHook {
                 // errors only when there is no receiver (the desktop with no
                 // subscriber), which is fine.
                 for entry in theirs {
-                    let _ = self
-                        .lifecycle_events
-                        .send((entry.meeting_id, entry.processing, entry.deletion));
+                    let _ = self.lifecycle_events.send((
+                        entry.meeting_id,
+                        entry.processing,
+                        entry.deletion,
+                    ));
                 }
                 Ok(())
             }
@@ -2056,7 +2125,7 @@ impl AcceptHook {
                 // confirmed the sender, and on acceptance the adopted key
                 // re-derives the shared cipher so every subsequent exchange, on
                 // both sides of this engine, uses it.
-                let store = self.enrolment.read().unwrap_or_else(|e| e.into_inner()).clone();
+                let store = self.enrolment();
                 let offered =
                     enrolment_proto::read_offered_key(connection, &mut recv, &store).await?;
                 if let Some(bytes) = offered {
@@ -2132,7 +2201,8 @@ mod tests {
 
     #[test]
     fn relay_mode_with_token_is_custom() {
-        let config = SyncConfig::new(std::env::temp_dir(), std::env::temp_dir()).with_relay_auth_token("secret");
+        let config = SyncConfig::new(std::env::temp_dir(), std::env::temp_dir())
+            .with_relay_auth_token("secret");
         let mode = SyncEngine::relay_mode(&config).expect("relay url must parse");
         assert!(matches!(mode, RelayMode::Custom(_)));
     }
@@ -2143,12 +2213,12 @@ mod tests {
     #[test]
     fn android_relay_resolver_builds_for_all_ip_shapes() {
         let cases: &[&[&str]] = &[
-            &[],                                        // empty → DoH fallback
-            &["220.233.46.218"],                        // IPv4
-            &["220.233.46.218", "104.16.0.1"],          // multiple IPv4 (CF-proxied)
-            &["2606:4700::6810:1"],                     // IPv6
-            &["not-an-ip"],                             // all unparseable → fallback
-            &["not-an-ip", "220.233.46.218"],           // mix → keeps the valid one
+            &[],                               // empty → DoH fallback
+            &["220.233.46.218"],               // IPv4
+            &["220.233.46.218", "104.16.0.1"], // multiple IPv4 (CF-proxied)
+            &["2606:4700::6810:1"],            // IPv6
+            &["not-an-ip"],                    // all unparseable → fallback
+            &["not-an-ip", "220.233.46.218"],  // mix → keeps the valid one
         ];
         for case in cases {
             let ips: Vec<String> = case.iter().map(|s| s.to_string()).collect();
@@ -2172,16 +2242,35 @@ mod tests {
         };
 
         // Relay host (with a trailing dot + odd case) → the seeded v4.
-        let v4: Vec<_> = r.lookup_ipv4("SYNC.minutist.ai.".to_string()).await.unwrap().collect();
+        let v4: Vec<_> = r
+            .lookup_ipv4("SYNC.minutist.ai.".to_string())
+            .await
+            .unwrap()
+            .collect();
         assert_eq!(v4, vec![Ipv4Addr::new(220, 233, 46, 218)]);
         // The v6 lookup returns the seeded v6, not the v4.
-        let v6: Vec<_> = r.lookup_ipv6("sync.minutist.ai".to_string()).await.unwrap().collect();
-        assert_eq!(v6, vec![Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0x6810, 0x1)]);
+        let v6: Vec<_> = r
+            .lookup_ipv6("sync.minutist.ai".to_string())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(
+            v6,
+            vec![Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0x6810, 0x1)]
+        );
         // A different host (e.g. a pkarr `dns.iroh.link` lookup) → nothing.
-        let other: Vec<_> = r.lookup_ipv4("dns.iroh.link".to_string()).await.unwrap().collect();
+        let other: Vec<_> = r
+            .lookup_ipv4("dns.iroh.link".to_string())
+            .await
+            .unwrap()
+            .collect();
         assert!(other.is_empty());
         // No TXT records are ever served.
-        let txt = r.lookup_txt("sync.minutist.ai".to_string()).await.unwrap().count();
+        let txt = r
+            .lookup_txt("sync.minutist.ai".to_string())
+            .await
+            .unwrap()
+            .count();
         assert_eq!(txt, 0);
     }
 
@@ -2200,7 +2289,10 @@ mod tests {
         };
 
         // Absent dir → not materialised.
-        assert!(!meeting_is_materialised(root.path(), MeetingId(uuid::Uuid::new_v4())));
+        assert!(!meeting_is_materialised(
+            root.path(),
+            MeetingId(uuid::Uuid::new_v4())
+        ));
 
         // Audio only (media landed, notes/metadata did not) → not materialised.
         let a = MeetingId(uuid::Uuid::new_v4());
@@ -2289,15 +2381,15 @@ mod tests {
             Some(ContentKey::for_tests()),
             dir_a.path().to_path_buf(),
         )
-            .await
-            .expect("engine a");
+        .await
+        .expect("engine a");
         let engine_b = SyncEngine::start_direct(
             id_b,
             Some(ContentKey::for_tests()),
             dir_b.path().to_path_buf(),
         )
-            .await
-            .expect("engine b");
+        .await
+        .expect("engine b");
 
         // A exports its ticket; B parses it back and registers A as a peer. The
         // parsed id must equal A's endpoint id, and the peer must appear in B's
@@ -2329,8 +2421,8 @@ mod tests {
                 Some(ContentKey::for_tests()),
                 dir.path().to_path_buf(),
             )
-                .await
-                .expect("engine");
+            .await
+            .expect("engine");
             assert!(matches!(
                 engine.add_peer_from_ticket("not-a-ticket"),
                 Err(Error::Protocol(_))
@@ -2343,13 +2435,10 @@ mod tests {
     async fn add_account_peer_registers_a_valid_id_and_relay() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(
-            id,
-            Some(ContentKey::for_tests()),
-            dir.path().to_path_buf(),
-        )
-            .await
-            .expect("engine");
+        let engine =
+            SyncEngine::start_direct(id, Some(ContentKey::for_tests()), dir.path().to_path_buf())
+                .await
+                .expect("engine");
 
         let other = iroh::SecretKey::generate().public();
         engine
@@ -2364,13 +2453,10 @@ mod tests {
     async fn add_account_peer_accepts_direct_addrs_and_skips_unparseable() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(
-            id,
-            Some(ContentKey::for_tests()),
-            dir.path().to_path_buf(),
-        )
-            .await
-            .expect("engine");
+        let engine =
+            SyncEngine::start_direct(id, Some(ContentKey::for_tests()), dir.path().to_path_buf())
+                .await
+                .expect("engine");
 
         let other = iroh::SecretKey::generate().public();
         // A good direct addr and an unparseable one: the peer still registers
@@ -2428,13 +2514,10 @@ mod tests {
     async fn add_account_peer_rejects_a_malformed_endpoint_id() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(
-            id,
-            Some(ContentKey::for_tests()),
-            dir.path().to_path_buf(),
-        )
-            .await
-            .expect("engine");
+        let engine =
+            SyncEngine::start_direct(id, Some(ContentKey::for_tests()), dir.path().to_path_buf())
+                .await
+                .expect("engine");
 
         assert!(matches!(
             engine.add_account_peer("not-hex", "https://sync.example/relay", &[]),
@@ -2448,13 +2531,10 @@ mod tests {
     async fn add_account_peer_rejects_a_malformed_relay_url() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(
-            id,
-            Some(ContentKey::for_tests()),
-            dir.path().to_path_buf(),
-        )
-            .await
-            .expect("engine");
+        let engine =
+            SyncEngine::start_direct(id, Some(ContentKey::for_tests()), dir.path().to_path_buf())
+                .await
+                .expect("engine");
 
         let other = iroh::SecretKey::generate().public();
         assert!(matches!(
@@ -2493,12 +2573,20 @@ mod tests {
         let dir_b = tempfile::TempDir::new().expect("tempdir b");
         let id_a = DeviceIdentity::load_or_generate(dir_a.path()).expect("identity a");
         let id_b = DeviceIdentity::load_or_generate(dir_b.path()).expect("identity b");
-        let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), dir_a.path().to_path_buf())
-            .await
-            .expect("engine a");
-        let b = SyncEngine::start_direct(id_b, Some(ContentKey::for_tests()), dir_b.path().to_path_buf())
-            .await
-            .expect("engine b");
+        let a = SyncEngine::start_direct(
+            id_a,
+            Some(ContentKey::for_tests()),
+            dir_a.path().to_path_buf(),
+        )
+        .await
+        .expect("engine a");
+        let b = SyncEngine::start_direct(
+            id_b,
+            Some(ContentKey::for_tests()),
+            dir_b.path().to_path_buf(),
+        )
+        .await
+        .expect("engine b");
 
         // Mutual pairing so b's accept hook authorises a.
         let b_addr = loopback_addr(&b);
@@ -2537,13 +2625,10 @@ mod tests {
     async fn dial_refuses_a_suppressed_peer_without_recording_a_failure() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(
-            id,
-            Some(ContentKey::for_tests()),
-            dir.path().to_path_buf(),
-        )
-            .await
-            .expect("engine");
+        let engine =
+            SyncEngine::start_direct(id, Some(ContentKey::for_tests()), dir.path().to_path_buf())
+                .await
+                .expect("engine");
 
         let peer = iroh::SecretKey::generate().public();
         let peer_hex = peer.to_string();
@@ -2573,13 +2658,10 @@ mod tests {
     async fn peers_to_dial_excludes_dial_suppressed_peers() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let id = DeviceIdentity::load_or_generate(dir.path()).expect("identity");
-        let engine = SyncEngine::start_direct(
-            id,
-            Some(ContentKey::for_tests()),
-            dir.path().to_path_buf(),
-        )
-            .await
-            .expect("engine");
+        let engine =
+            SyncEngine::start_direct(id, Some(ContentKey::for_tests()), dir.path().to_path_buf())
+                .await
+                .expect("engine");
 
         let reachable = iroh::SecretKey::generate().public();
         let stale = iroh::SecretKey::generate().public();
@@ -2595,7 +2677,11 @@ mod tests {
             engine.backoff.on_dial_outcome(&stale.to_string(), false);
         }
         let to_dial = engine.peers_to_dial();
-        assert_eq!(to_dial, vec![reachable], "only the un-suppressed peer is dialled");
+        assert_eq!(
+            to_dial,
+            vec![reachable],
+            "only the un-suppressed peer is dialled"
+        );
         assert!(
             !to_dial.contains(&stale),
             "a dial-suppressed peer must be excluded from the sweep"

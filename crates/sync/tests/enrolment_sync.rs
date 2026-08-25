@@ -326,3 +326,69 @@ async fn a_keyless_device_serves_enrolment_but_syncs_nothing() {
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
 }
+
+/// A confirmation recorded by a DIFFERENT process reaches an already-running
+/// engine, and the engine finishes the transfer on its own.
+///
+/// This is the headless-hub deployment: the daemon runs continuously and holds
+/// the engine, while `minutist-hub confirm` is a one-shot invocation beside it.
+/// The file is the channel between them, so the test writes through a bare
+/// `EnrolmentStore` (what the CLI has) rather than through the engine, and never
+/// lets the two share memory.
+#[tokio::test]
+async fn a_decision_written_by_another_process_reaches_the_running_engine() {
+    use sync::{EnrolmentStore, Verdict};
+
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let (root_a, root_b) = (dir_a.path(), dir_b.path());
+    let meeting = MeetingId::new();
+    seed_notes(root_a, meeting, "written out of band");
+
+    let id_a = DeviceIdentity::load_or_generate(root_a).expect("identity a");
+    let id_b = DeviceIdentity::load_or_generate(root_b).expect("identity b");
+    let a = SyncEngine::start_direct(id_a, Some(ContentKey::for_tests()), root_a.to_path_buf())
+        .await
+        .expect("engine a");
+    let b = SyncEngine::start_direct(id_b, None, root_b.to_path_buf())
+        .await
+        .expect("engine b");
+    a.add_peer(direct_addr(&b));
+    b.add_peer(direct_addr(&a));
+
+    let (a_id, b_id) = (a.endpoint_id().to_string(), b.endpoint_id().to_string());
+
+    // Neither engine is told anything. Both decisions are written the way a
+    // one-shot CLI would write them, against the same data dirs.
+    EnrolmentStore::load(root_a)
+        .record(&b_id, Verdict::Confirmed, None)
+        .expect("A's operator confirms B out of band");
+    EnrolmentStore::load(root_b)
+        .record(&a_id, Verdict::Confirmed, None)
+        .expect("B's operator confirms A out of band");
+
+    // The running engines see it without being restarted or notified.
+    assert!(a.is_enrolled(&b_id), "A must read the decision from disk");
+    assert!(b.is_enrolled(&a_id), "B must read the decision from disk");
+
+    // And the sweep the refresh loop drives finishes the transfer.
+    assert_eq!(a.deliver_pending_keys().await, 1);
+    assert!(b.is_enrolled_self(), "B holds the key after the sweep");
+
+    // A second sweep is a no-op: delivery is recorded, so it does not re-offer.
+    assert_eq!(
+        a.deliver_pending_keys().await,
+        0,
+        "a delivered key must not be re-offered every poll"
+    );
+
+    a.sync_notes(b.endpoint_id(), meeting)
+        .await
+        .expect("enrolled by file alone");
+    assert!(notes_text(root_b, meeting)
+        .expect("B has the meeting")
+        .contains("written out of band"));
+
+    a.shutdown().await.expect("shutdown a");
+    b.shutdown().await.expect("shutdown b");
+}

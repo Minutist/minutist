@@ -28,6 +28,21 @@
 //! forgotten: it is the alarm state for an endpoint the directory offered and
 //! the user rejected, and re-prompting for it every poll would train the user to
 //! dismiss the prompt.
+//!
+//! # Why it is read from disk every time
+//!
+//! The store is deliberately NOT cached in the running engine. The decision is
+//! made by a human, in whatever process is in front of them, and on a headless
+//! hub that is a one-shot CLI invocation running alongside a daemon that already
+//! holds the engine (`minutist-hub confirm`, over `docker exec` or `sudo -u`).
+//! A cached copy would mean the daemon never saw the operator's decision.
+//!
+//! Reading the file at each decision point makes the file itself the channel
+//! between those processes, so no admin socket or IPC is needed. It costs one
+//! small read on an operation a user performs by hand, which is nothing. Last
+//! writer wins, which is correct here: two humans racing to decide the same peer
+//! is not a case worth locking for, and the outcome is one of the two decisions
+//! they actually made.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,6 +80,17 @@ pub enum Verdict {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Record {
     verdict: Verdict,
+    /// Whether this device has successfully handed that peer the content key.
+    ///
+    /// Lets a sweep finish what a confirmation started: the user can confirm a
+    /// device that is asleep, and the transfer is retried against the standing
+    /// decision until it lands. Only meaningful for [`Verdict::Confirmed`].
+    ///
+    /// `#[serde(default)]` so a record written before this field existed reads
+    /// as "not yet delivered", which costs one redundant offer and never a
+    /// missed one.
+    #[serde(default)]
+    key_delivered: bool,
     /// When the user decided, RFC 3339. Recorded for the UI and for support: a
     /// refusal months ago and one from this morning warrant different reactions.
     /// Not load-bearing, so a missing value does not invalidate the verdict.
@@ -139,6 +165,10 @@ impl EnrolmentStore {
 
     /// Record a decision and persist it.
     ///
+    /// Re-reads the file first, so a decision made in another process (the hub's
+    /// one-shot CLI writing while the daemon runs) is not clobbered by this
+    /// one's older view.
+    ///
     /// `decided_at` is an RFC 3339 timestamp supplied by the caller: this crate
     /// has no clock dependency and does not want one for a display field.
     pub fn record(
@@ -147,14 +177,45 @@ impl EnrolmentStore {
         verdict: Verdict,
         decided_at: Option<String>,
     ) -> Result<()> {
+        self.reload();
         self.records.insert(
             peer.to_string(),
             Record {
                 verdict,
                 decided_at,
+                key_delivered: false,
             },
         );
         self.persist()
+    }
+
+    /// Note that `peer` has received the content key, so a sweep stops offering.
+    pub fn mark_key_delivered(&mut self, peer: &str) -> Result<()> {
+        self.reload();
+        if let Some(record) = self.records.get_mut(peer) {
+            record.key_delivered = true;
+        }
+        self.persist()
+    }
+
+    /// Confirmed peers this device has not yet successfully handed the key to.
+    ///
+    /// The retry list: a user can confirm a device that is asleep, and the
+    /// transfer is attempted against the standing decision until it lands.
+    pub fn awaiting_key(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .filter(|(_, r)| r.verdict == Verdict::Confirmed && !r.key_delivered)
+            .map(|(peer, _)| peer.clone())
+            .collect()
+    }
+
+    /// Re-read the file, discarding this in-memory view.
+    fn reload(&mut self) {
+        self.records = std::fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
     }
 
     /// Every peer the user has decided about, with the decision.

@@ -111,6 +111,16 @@ pub trait RefreshSink: Send + Sync {
     /// key, which is the steady state.
     fn on_account_size(&self, _has_other_devices: bool) {}
 
+    /// Hand the content key to any peer the user has confirmed but that has not
+    /// received it, once per poll.
+    ///
+    /// The seam that lets a confirmation be recorded by a DIFFERENT process from
+    /// the one running the engine: a headless hub's `confirm` CLI writes the
+    /// decision to disk while the daemon runs, and this is where the daemon acts
+    /// on it. Also the retry for a device that was asleep when its user
+    /// confirmed it.
+    async fn deliver_pending_keys(&self) {}
+
     /// The directory's current `Account`-sourced endpoint ids. Read once at loop
     /// (re)start to seed the reconcile-removal state, so a peer that left the
     /// account during a disabled window (the directory survives a live-process
@@ -177,6 +187,9 @@ pub async fn run_account_refresh_loop_v2(
                 // to know whether it is the first on this account (mint) or is
                 // joining one that already has a key (wait to be enrolled).
                 sink.on_account_size(!peers.is_empty());
+                // Act on any decision recorded since the last pass, including
+                // one written by another process.
+                sink.deliver_pending_keys().await;
                 let current: HashSet<String> =
                     peers.iter().map(|ep| ep.endpoint_id.clone()).collect();
 

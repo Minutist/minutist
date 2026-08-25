@@ -39,6 +39,12 @@
 //! `create_meeting_seeds_a_meeting_folder_with_notes` is a local, ungated
 //! one-shot that invokes the built binary's `create-meeting` and asserts the
 //! on-disk meeting + its status digest; it needs no network and always runs.
+//!
+//! The `confirm_*`/`refuse_*` cases cover the `confirm`/`refuse` subcommands
+//! (0054 gap 3's CLI half) against the same kind of local mock account-service,
+//! piping the operator's "y"/"n" to the spawned process's stdin and asserting
+//! `enrolled_peers.json` directly — none of them bind a `SyncEngine`, matching
+//! the commands' own engine-free design (see `sync::enrolment`'s module doc).
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -703,6 +709,204 @@ async fn hub_discovers_and_syncs_an_account_listed_peer() {
     eprintln!(
         "hub_e2e account-discovery: PASS — A synced to the hub purely via account-mediated discovery"
     );
+}
+
+/// Stand up a mock account-service listing exactly one peer (a throwaway
+/// `DeviceIdentity`'s endpoint id) and seed `data_dir` with a credential
+/// pointed at it. Shared by the `confirm`/`refuse` CLI tests below, none of
+/// which bind a `SyncEngine` — they only need the account-directory HTTP
+/// call `account_peer_ids` makes.
+async fn mock_account_with_one_peer(
+    data_dir: &std::path::Path,
+) -> (wiremock::MockServer, String) {
+    let peer_dir = tempfile::TempDir::new().expect("peer tempdir");
+    let peer_id = DeviceIdentity::load_or_generate(peer_dir.path())
+        .expect("peer identity")
+        .endpoint_id()
+        .to_string();
+
+    let mock = wiremock::MockServer::start().await;
+    let devices = serde_json::json!([{
+        "device_id": "peer-device",
+        "endpoint_id": peer_id,
+        "relay_url": "https://sync.example",
+        "direct_addrs": Vec::<String>::new(),
+    }]);
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/account/devices"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&devices))
+        .mount(&mock)
+        .await;
+
+    std::fs::write(
+        data_dir.join("tunnel_device.json"),
+        r#"{"device_credential":"mdc_test.secret","account_id":"acct-test","device_id":"hub-test"}"#,
+    )
+    .expect("seed hub credential");
+
+    (mock, peer_id)
+}
+
+/// Run `minutist-hub --data-dir <dir> --relay-api-url <url> <args...>`,
+/// writing `stdin_line` (if any) to the child's stdin before reading output —
+/// the one-shot equivalent of the operator typing "y" at the confirm/refuse
+/// prompt. Returns the exit status and both streams as UTF-8.
+fn run_hub_cli(
+    dir: &std::path::Path,
+    api_url: &str,
+    args: &[&str],
+    stdin_line: Option<&str>,
+) -> (bool, String, String) {
+    use std::io::Write;
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_minutist-hub"));
+    command
+        .args([
+            "--data-dir",
+            dir.to_str().expect("utf8 data dir"),
+            "--relay-api-url",
+            api_url,
+        ])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn minutist-hub");
+    if let Some(line) = stdin_line {
+        writeln!(child.stdin.take().expect("piped stdin"), "{line}").expect("write stdin");
+    }
+    let output = child.wait_with_output().expect("wait for minutist-hub");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Read `{data_dir}/enrolled_peers.json`'s recorded verdict for `peer`, or
+/// `None` if the file or the entry is absent. A thin JSON read rather than
+/// pulling in `sync::EnrolmentStore` here, so the test is an independent
+/// check of the CLI's on-disk effect, not a mirror of the code under test.
+fn recorded_verdict(data_dir: &std::path::Path, peer: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(data_dir.join("enrolled_peers.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    json.get(peer)?
+        .get("verdict")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `confirm` with no peer lists every undecided device with its safety code,
+/// and touches neither the network beyond the one directory call nor
+/// `enrolled_peers.json`.
+#[tokio::test]
+async fn confirm_with_no_peer_lists_pending_devices() {
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
+    let (mock, peer_id) = mock_account_with_one_peer(data_dir.path()).await;
+
+    let (ok, stdout, stderr) = run_hub_cli(data_dir.path(), &mock.uri(), &["confirm"], None);
+    assert!(ok, "confirm must exit cleanly; stderr: {stderr}");
+    assert!(
+        stdout.contains(&peer_id),
+        "listing must name the pending peer; stdout: {stdout}"
+    );
+    assert!(
+        recorded_verdict(data_dir.path(), &peer_id).is_none(),
+        "listing must not itself record a decision"
+    );
+}
+
+/// `confirm <peer>` shows the safety code, and on "y" records `Confirmed` —
+/// the whole point: the operator, not the CLI, decides.
+#[tokio::test]
+async fn confirm_with_peer_and_yes_records_confirmed() {
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
+    let (mock, peer_id) = mock_account_with_one_peer(data_dir.path()).await;
+
+    let (ok, stdout, stderr) =
+        run_hub_cli(data_dir.path(), &mock.uri(), &["confirm", &peer_id], Some("y"));
+    assert!(ok, "confirm <peer> must exit cleanly; stderr: {stderr}");
+    assert!(
+        stdout.contains("Confirmed"),
+        "stdout must report the confirmation; stdout: {stdout}"
+    );
+    assert_eq!(
+        recorded_verdict(data_dir.path(), &peer_id),
+        Some("confirmed".to_string())
+    );
+}
+
+/// `confirm <peer>` on anything other than "y" must NOT record a decision —
+/// the default is refuse-to-decide, never confirm-by-default.
+#[tokio::test]
+async fn confirm_with_peer_and_no_records_nothing() {
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
+    let (mock, peer_id) = mock_account_with_one_peer(data_dir.path()).await;
+
+    let (ok, stdout, stderr) =
+        run_hub_cli(data_dir.path(), &mock.uri(), &["confirm", &peer_id], Some("n"));
+    assert!(ok, "declining must still exit cleanly; stderr: {stderr}");
+    assert!(stdout.contains("Not confirmed"), "stdout: {stdout}");
+    assert_eq!(
+        recorded_verdict(data_dir.path(), &peer_id),
+        None,
+        "declining must leave the peer undecided, not confirmed or refused"
+    );
+}
+
+/// `refuse <peer>` on "y" records `Refused`.
+#[tokio::test]
+async fn refuse_with_yes_records_refused() {
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
+    let (mock, peer_id) = mock_account_with_one_peer(data_dir.path()).await;
+
+    let (ok, stdout, stderr) =
+        run_hub_cli(data_dir.path(), &mock.uri(), &["refuse", &peer_id], Some("y"));
+    assert!(ok, "refuse must exit cleanly; stderr: {stderr}");
+    assert!(stdout.contains("Refused"), "stdout: {stdout}");
+    assert_eq!(
+        recorded_verdict(data_dir.path(), &peer_id),
+        Some("refused".to_string())
+    );
+}
+
+/// `confirm`/`refuse` on a peer id the account directory does not list must
+/// error rather than silently recording a decision about a device that, as
+/// far as this call can tell, does not exist.
+#[tokio::test]
+async fn confirm_rejects_a_peer_not_on_the_account() {
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
+    let (mock, _peer_id) = mock_account_with_one_peer(data_dir.path()).await;
+    let bogus = DeviceIdentity::load_or_generate(
+        tempfile::TempDir::new().expect("bogus tempdir").path(),
+    )
+    .expect("bogus identity")
+    .endpoint_id()
+    .to_string();
+
+    let (ok, _stdout, stderr) =
+        run_hub_cli(data_dir.path(), &mock.uri(), &["confirm", &bogus], Some("y"));
+    assert!(!ok, "confirming an unlisted peer must fail");
+    assert!(
+        stderr.contains("not a device on this account"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(recorded_verdict(data_dir.path(), &bogus), None);
+}
+
+/// `confirm`/`refuse` before `login` (no stored credential) must error with a
+/// clear instruction rather than an obscure account-service failure.
+#[tokio::test]
+async fn confirm_without_a_credential_errors_clearly() {
+    let data_dir = tempfile::TempDir::new().expect("tempdir");
+    let (ok, _stdout, stderr) = run_hub_cli(
+        data_dir.path(),
+        "https://unused.example",
+        &["confirm"],
+        None,
+    );
+    assert!(!ok, "confirm with no credential must fail");
+    assert!(stderr.contains("minutist-hub login"), "stderr: {stderr}");
 }
 
 /// `create-meeting` subcommand test: originate a meeting in a data directory,

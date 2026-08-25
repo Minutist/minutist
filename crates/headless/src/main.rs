@@ -26,11 +26,30 @@
 //!   and persists the issued credential to `{data-dir}/tunnel_device.json`
 //!   (0600). This is now the ONLY way a hub gets peers — there is no manual
 //!   ticket exchange any more (removed; it existed only as an interim
-//!   mechanism before this flow was built).
+//!   mechanism before this flow was built). Signing in alone does not enrol
+//!   this hub for the account's content key (see `confirm` below); on success
+//!   it prints a hint to run `confirm` if this device is joining an account
+//!   that already has others on it.
+//! - `confirm [peer]` / `refuse <peer>` — decide whether a device the account
+//!   directory lists is one the operator actually owns, before it may hold or
+//!   be sent the account's shared content key
+//!   (`planning/DESIGN_sync-encryption.md` §5). With no peer, `confirm` lists
+//!   every undecided device and the six-digit safety code to compare against
+//!   that device's own screen; given a peer id, it shows the code, asks for
+//!   an explicit y/N, and records the decision. Neither command binds the
+//!   sync engine or touches the network beyond the one `GET
+//!   /v1/account/devices` call already needed to list peers — the decision is
+//!   written to `{data-dir}/enrolled_peers.json`, which is the channel to the
+//!   separately-running daemon (see `sync::enrolment`'s module doc): if it's
+//!   running, its next account-directory poll delivers (or stops offering)
+//!   the key; if not, the decision still stands once it starts. `refuse` does
+//!   not revoke a key already delivered — there is no key rotation — it only
+//!   stops this device dealing with that peer from now on.
 //! - `status` — print the hub's state as JSON to stdout and exit: endpoint id,
-//!   whether it's signed in (and to which account), and held meetings each
-//!   with a content digest of their notes. A read-only filesystem oracle for
-//!   automated tests (it does not contact the running daemon).
+//!   whether it's signed in (and to which account), whether this device holds
+//!   the account's content key, and held meetings each with a content digest
+//!   of their notes. A read-only filesystem oracle for automated tests (it
+//!   does not contact the running daemon).
 //!
 //! Timing constants (poll / push-debounce / shutdown-grace) are overridable via
 //! env vars in milliseconds (a sub-second test mode) — see the constants below.
@@ -73,9 +92,9 @@ use minutist_common::{AppError, AppResult, DeletionState, MeetingId, ProcessingL
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use sync::{
-    run_account_refresh_loop_v2, AccountEndpoint, AccountEndpointSource, ContentKey,
-    DeviceIdentity,
-    RefreshSink, SyncConfig, SyncEngine, SyncEngineRefreshSink,
+    pending_from, run_account_refresh_loop_v2, safety_code, AccountEndpoint,
+    AccountEndpointSource, ContentKey, DeviceIdentity, EnrolmentStore, RefreshSink, SyncConfig,
+    SyncEngine, SyncEngineRefreshSink, Verdict,
 };
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio_util::sync::CancellationToken;
@@ -294,6 +313,20 @@ enum Command {
     /// Print the hub's state as JSON (endpoint id, sign-in status, held
     /// meetings + a content digest of each). A read-only oracle for tests.
     Status,
+    /// List every account device pending an enrolment decision (with no
+    /// `peer`), or record `peer` as a device the operator owns (with one) —
+    /// see the module doc's `## Commands` section.
+    Confirm {
+        /// The peer's hex endpoint id (from a prior `confirm` listing, or
+        /// `status`). Omit to list pending devices instead of deciding one.
+        peer: Option<String>,
+    },
+    /// Record `peer` as a device the operator does NOT own — see the module
+    /// doc's `## Commands` section. Does not revoke a key already delivered.
+    Refuse {
+        /// The peer's hex endpoint id.
+        peer: String,
+    },
     /// Originate a new meeting in the hub's data directory and print its UUID to
     /// stdout. Used by the e2e harness to seed a meeting on device-A so the hub
     /// can push it to device-B.
@@ -314,6 +347,8 @@ async fn main() -> AppResult<()> {
         Some(Command::Login) => login(&data_dir, &cli.relay_api_url).await,
         Some(Command::Status) => print_status(&data_dir, cli.relay_url),
         Some(Command::CreateMeeting { title }) => create_meeting(&data_dir, &title),
+        Some(Command::Confirm { peer }) => confirm(&data_dir, &cli.relay_api_url, peer).await,
+        Some(Command::Refuse { peer }) => refuse(&data_dir, &cli.relay_api_url, &peer).await,
     }
 }
 
@@ -447,6 +482,22 @@ async fn login(data_dir: &Path, api_url: &str) -> AppResult<()> {
                     context: format!("writing {CREDENTIAL_FILE}: {e}"),
                 })?;
                 println!("Signed in as account {}.", credential.account_id);
+                // Signing in only gets peers discovered; it does not hand this
+                // device the account's content key. A lone first device mints
+                // its own once the daemon starts (no confirmation needed — it
+                // has no one to confirm). A device joining an account that
+                // already has others on it needs one of them to confirm it,
+                // which needs this hub to confirm ITS OWN pick of an existing
+                // device first (confirmation is required in both directions —
+                // see `sync::enrolment`'s module doc). `ContentKey::load` here
+                // is a pure file check, not a mint.
+                if ContentKey::load(data_dir)?.is_none() {
+                    println!(
+                        "If this hub is joining an account that already has other devices, \
+                         run `minutist-hub confirm` to see them and compare safety codes. \
+                         The key transfer completes once the service is running on both sides."
+                    );
+                }
                 return Ok(());
             }
             Err(e) => return Err(map_pairing_err(e)),
@@ -492,6 +543,150 @@ fn map_pairing_err(e: tunnel_client::PairingError) -> AppError {
     }
 }
 
+/// Map an `AccountDirectoryClient` request failure to the CLI's error type.
+/// Mirrors `src-tauri/src/account.rs::map_account_err` (duplicated for the
+/// same reason `map_pairing_err` is).
+fn map_account_err(e: tunnel_client::AccountDirectoryError) -> AppError {
+    use tunnel_client::AccountDirectoryError;
+    match e {
+        AccountDirectoryError::Config => AppError::InvalidInput {
+            context: "the relay api URL must be https:// (or a loopback http://)".to_string(),
+        },
+        AccountDirectoryError::Transport(_) => AppError::Io {
+            context: "could not reach the account service".to_string(),
+        },
+        AccountDirectoryError::Unauthorised => AppError::Internal {
+            context: "the account service rejected the device credential".to_string(),
+        },
+        AccountDirectoryError::Status { status } => AppError::Internal {
+            context: format!("the account service returned status {status}"),
+        },
+        AccountDirectoryError::Decode(_) => AppError::Internal {
+            context: "the account service returned an unexpected response".to_string(),
+        },
+    }
+}
+
+/// This device's own endpoint id, and every OTHER device the account
+/// directory lists (self filtered out) — the two inputs `confirm`/`refuse`
+/// share. Requires a stored credential (from `login`); does not bind the sync
+/// engine, only the identity file read and one `GET /v1/account/devices`.
+async fn account_peer_ids(data_dir: &Path, api_url: &str) -> AppResult<(iroh::EndpointId, Vec<String>)> {
+    let Some(cred) = StoredCredential::load(data_dir) else {
+        return Err(AppError::InvalidInput {
+            context: "not signed in; run `minutist-hub login` first".to_string(),
+        });
+    };
+    let own_id = DeviceIdentity::load_or_generate(data_dir)?.endpoint_id();
+    let client = tunnel_client::AccountDirectoryClient::new(api_url, cred.device_credential)
+        .map_err(map_account_err)?;
+    let devices = client.list_devices().await.map_err(map_account_err)?;
+    let own_id_str = own_id.to_string();
+    let peer_ids = devices
+        .into_iter()
+        .map(|d| d.endpoint_id)
+        .filter(|id| *id != own_id_str)
+        .collect();
+    Ok((own_id, peer_ids))
+}
+
+/// RFC 3339 timestamp for an `EnrolmentStore` decision. `sync` carries no
+/// clock dependency by design (see `sync::enrolment`'s module doc), so the
+/// caller supplies "now"; this is that caller, for both `confirm`/`refuse`.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Read a single line from stdin, trimmed, lower-cased. Used only for the
+/// explicit y/N the operator types to confirm or refuse a peer — this CLI
+/// never decides on its own (see the module doc: no auto-confirm anywhere in
+/// this design, headless included).
+fn read_yes_no_prompt() -> AppResult<bool> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| AppError::Io {
+            context: format!("reading the confirmation prompt: {e}"),
+        })?;
+    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
+/// List devices pending a decision (no `peer`), or record `peer` as one the
+/// operator owns (with one) — see the module doc's `## Commands` section for
+/// the full behaviour and why this binds no engine.
+async fn confirm(data_dir: &Path, api_url: &str, peer: Option<String>) -> AppResult<()> {
+    let (own_id, peer_ids) = account_peer_ids(data_dir, api_url).await?;
+    let own_bytes = own_id.as_bytes();
+
+    let Some(peer) = peer else {
+        let store = EnrolmentStore::load(data_dir);
+        let pending = pending_from(own_bytes, &peer_ids, &store);
+        if pending.is_empty() {
+            println!("No devices are pending a decision.");
+            return Ok(());
+        }
+        println!("Devices pending a decision (compare the code against that device's own screen):");
+        for p in &pending {
+            println!("  {}  code: {}", p.peer_id, p.safety_code);
+        }
+        println!("Run `minutist-hub confirm <peer id>` to confirm one.");
+        return Ok(());
+    };
+
+    if !peer_ids.contains(&peer) {
+        return Err(AppError::InvalidInput {
+            context: format!("{peer} is not a device on this account"),
+        });
+    }
+    let peer_id: iroh::EndpointId = peer.parse().map_err(|e| AppError::InvalidInput {
+        context: format!("{peer} is not a valid endpoint id: {e}"),
+    })?;
+    let code = safety_code(own_bytes, peer_id.as_bytes());
+    println!("Safety code for {peer}: {code}");
+    println!("Compare this against the code shown on that device. Confirm it is yours? [y/N]");
+    if !read_yes_no_prompt()? {
+        println!("Not confirmed.");
+        return Ok(());
+    }
+
+    let mut store = EnrolmentStore::load(data_dir);
+    store.record(&peer, Verdict::Confirmed, Some(now_rfc3339()))?;
+    println!(
+        "Confirmed {peer}. If the daemon is running (on either side), the key transfer \
+         completes on its next account poll; otherwise it completes once it starts."
+    );
+    Ok(())
+}
+
+/// Record `peer` as a device the operator does NOT own. Does not revoke a key
+/// already delivered (there is no key rotation) — see the module doc.
+async fn refuse(data_dir: &Path, api_url: &str, peer: &str) -> AppResult<()> {
+    let (own_id, peer_ids) = account_peer_ids(data_dir, api_url).await?;
+    if !peer_ids.contains(&peer.to_string()) {
+        return Err(AppError::InvalidInput {
+            context: format!("{peer} is not a device on this account"),
+        });
+    }
+    let peer_id: iroh::EndpointId = peer.parse().map_err(|e| AppError::InvalidInput {
+        context: format!("{peer} is not a valid endpoint id: {e}"),
+    })?;
+    let code = safety_code(own_id.as_bytes(), peer_id.as_bytes());
+    println!("Safety code for {peer}: {code}");
+    println!("Refuse this device? [y/N]");
+    if !read_yes_no_prompt()? {
+        println!("Not refused.");
+        return Ok(());
+    }
+
+    let mut store = EnrolmentStore::load(data_dir);
+    store.record(peer, Verdict::Refused, Some(now_rfc3339()))?;
+    println!(
+        "Refused {peer}. This device will not deal with it going forward. If it already \
+         holds the account content key, that is unaffected — refusing does not revoke it."
+    );
+    Ok(())
+}
+
 /// Originate a new meeting in `{data_dir}/meetings/`: create the folder,
 /// seed placeholder metadata, write the first `notes.ydoc`, and print the
 /// meeting UUID to stdout. The UUID is the only output — suitable for capture
@@ -520,6 +715,13 @@ struct HubStatus {
     /// The signed-in account, or `None` when `login` has not been run (or the
     /// stored credential is corrupt) — the hub then discovers no peers at all.
     account_id: Option<String>,
+    /// Whether this device holds the account's content key — the third state
+    /// 0056 asked `status` to distinguish, alongside `account_id: None`
+    /// (never signed in) and an unreachable relay: signed in but NOT enrolled
+    /// means the daemon binds and serves discovery, but refuses every content
+    /// exchange until `confirm` completes it in one direction or the other. A
+    /// pure file check (`ContentKey::load`), never a mint.
+    enrolled: bool,
     /// Meetings the hub holds, each with a content digest of its notes.
     meetings: Vec<MeetingStatus>,
 }
@@ -534,10 +736,11 @@ struct MeetingStatus {
 }
 
 /// Print the hub's state as JSON to stdout and exit. A pure filesystem read (no
-/// tracing init, no engine bind, and no identity generation; it does NOT contact
-/// the running daemon), so an automated harness can use it as an oracle:
-/// sign-in state and which meetings the hub holds, with a per-meeting notes
-/// digest for convergence assertions.
+/// tracing init, no engine bind, and no identity or key generation; it does NOT
+/// contact the running daemon), so an automated harness can use it as an
+/// oracle: sign-in state, whether this device holds the account content key,
+/// and which meetings the hub holds, with a per-meeting notes digest for
+/// convergence assertions.
 fn print_status(data_dir: &Path, relay_url: String) -> AppResult<()> {
     let status = build_status(data_dir, relay_url)?;
     let json = serde_json::to_string_pretty(&status).map_err(|e| AppError::Internal {
@@ -563,6 +766,7 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
     };
 
     let account_id = StoredCredential::load(data_dir).map(|c| c.account_id);
+    let enrolled = ContentKey::load(data_dir)?.is_some();
 
     let meetings_root = data_dir.join("meetings");
     let mut meetings: Vec<MeetingStatus> = notes_crdt::folder::list_meeting_ids(&meetings_root)
@@ -582,6 +786,7 @@ fn build_status(data_dir: &Path, relay_url: String) -> AppResult<HubStatus> {
         endpoint_id,
         relay_url,
         account_id,
+        enrolled,
         meetings,
     })
 }
@@ -1276,5 +1481,47 @@ mod tests {
             map_pairing_err(tunnel_client::PairingError::Status { status: 500 }),
             AppError::Internal { .. }
         ));
+    }
+
+    #[test]
+    fn account_errors_map_without_leaking() {
+        assert!(matches!(
+            map_account_err(tunnel_client::AccountDirectoryError::Unauthorised),
+            AppError::Internal { .. }
+        ));
+        assert!(matches!(
+            map_account_err(tunnel_client::AccountDirectoryError::Config),
+            AppError::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            map_account_err(tunnel_client::AccountDirectoryError::Status { status: 503 }),
+            AppError::Internal { .. }
+        ));
+    }
+
+    #[test]
+    fn now_rfc3339_parses_as_rfc3339() {
+        let s = now_rfc3339();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&s).is_ok(),
+            "not RFC 3339: {s}"
+        );
+    }
+
+    #[test]
+    fn status_reports_not_enrolled_when_no_content_key_exists() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let status = build_status(base.path(), "wss://relay.example".to_string())
+            .expect("build status");
+        assert!(!status.enrolled, "a fresh root holds no content key");
+    }
+
+    #[test]
+    fn status_reports_enrolled_once_a_content_key_is_present() {
+        let base = tempfile::tempdir().expect("tempdir");
+        ContentKey::load_or_mint(base.path()).expect("mint a content key");
+        let status = build_status(base.path(), "wss://relay.example".to_string())
+            .expect("build status");
+        assert!(status.enrolled, "a present content key must report enrolled");
     }
 }

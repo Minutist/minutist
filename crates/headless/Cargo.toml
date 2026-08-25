@@ -61,6 +61,16 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `confirm`/`refuse` stamp `EnrolmentStore` decisions with an RFC 3339
+# `decided_at`; `sync` deliberately carries no clock (see `sync::enrolment`'s
+# module doc), so the caller supplies "now". Same workspace line `election`
+# already uses.
+chrono = { workspace = true }
+# `confirm`/`refuse` name `iroh::EndpointId` directly (parsing a peer id
+# argument, reading `DeviceIdentity::endpoint_id()`'s own type) without
+# binding a `SyncEngine`. Same pin `sync` itself uses; the workspace
+# `[patch.crates-io]` redirects it to the fork.
+iroh = "=1.0.3"
 
 [features]
 # Compiles `bind_sync_engine`'s `MINUTIST_HUB_INSECURE_RELAY_TLS` escape hatch

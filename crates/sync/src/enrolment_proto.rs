@@ -4,7 +4,7 @@
 //! whose user has confirmed the far side sends it the key. The receiver stores
 //! it only if its own user independently confirmed the sender. Both halves of
 //! that are load-bearing, and the two confirmations are separate records on
-//! separate devices — neither side takes the other's word for having asked.
+//! separate devices: neither side takes the other's word for having asked.
 //!
 //! ```text
 //! holder (initiator)                        joiner (responder)
@@ -23,7 +23,7 @@
 //! Every other stream kind is sealed under the account content key. This one
 //! cannot be: it exists to deliver that key to a device which by definition does
 //! not hold it yet. The exception is deliberate and is protected by three other
-//! things — QUIC/TLS mutual authentication to both ed25519 identity keys, the
+//! things: QUIC/TLS mutual authentication to both ed25519 identity keys, the
 //! paired-peer membership check the accept hook already applies, and a locally
 //! recorded user confirmation for this exact peer on BOTH sides.
 //!
@@ -47,7 +47,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use crate::content_key::ContentKey;
 use crate::enrolment::EnrolmentStore;
 use crate::notes_proto::StreamKind;
-use crate::timeouts::{FRAME_IO_TIMEOUT, RESPONDER_CLOSE_TIMEOUT};
+use crate::timeouts::{park_until_closed, FRAME_IO_TIMEOUT};
 use crate::{Error, Result};
 
 /// The responder's verdict byte.
@@ -182,28 +182,5 @@ pub(crate) async fn send_verdict(
             "adopted the account content key from a confirmed peer"
         );
     }
-    park_until_closed(conn).await
-}
-
-/// Hold the connection open until the initiator has read our verdict and closed.
-///
-/// Returning before then lets the router drop the connection and abort the
-/// stream, so the initiator sees "connection lost" instead of the verdict. Every
-/// other responder in this crate parks the same way; bounded by
-/// [`RESPONDER_CLOSE_TIMEOUT`] so a peer that never closes cannot pin the task.
-async fn park_until_closed(conn: &Connection) -> Result<()> {
-    tokio::time::timeout(RESPONDER_CLOSE_TIMEOUT, conn.closed())
-        .await
-        .map(|_| ())
-        .map_err(|_| {
-            tracing::warn!(
-                target: "sync",
-                peer = %conn.remote_id(),
-                timeout = ?RESPONDER_CLOSE_TIMEOUT,
-                "initiator never closed the enrolment connection"
-            );
-            Error::Protocol(format!(
-                "enrolment initiator did not close within {RESPONDER_CLOSE_TIMEOUT:?}"
-            ))
-        })
+    park_until_closed(conn, "enrolment").await
 }

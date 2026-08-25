@@ -306,11 +306,14 @@ impl FfiSyncEngine {
             })?;
 
         let identity = DeviceIdentity::load_or_generate(Path::new(&app_data_dir))?;
-    // The account content key every enrolled device holds; each frame on the sync
-    // ALPN is sealed under it. Absent on a device that has not been enrolled yet:
-    // the account-refresh loop mints one if this turns out to be the first device
-    // on the account, and otherwise the device waits to be confirmed from one that
-    // already holds it (see `sync::content_key`, DESIGN §3.1).
+        // The account content key every enrolled device holds; each frame on the
+        // sync ALPN is sealed under it. Absent until this device is enrolled, so
+        // `None` here is normal on a first run rather than an error.
+        //
+        // The phone does NOT run this crate's account-refresh loop (it polls the
+        // directory from TypeScript), so nothing mints on its behalf: the caller
+        // must drive [`Self::note_account_peers`] from that same loop, or this
+        // device never gets a key and every sync fails as unauthenticated.
         let content_key = ContentKey::load(Path::new(&app_data_dir))?;
         let meetings_root = PathBuf::from(meetings_root);
         let config = SyncConfig {
@@ -377,6 +380,33 @@ impl FfiSyncEngine {
         Ok(self
             .engine()?
             .add_account_peer(&endpoint_id, &relay_url, &direct_addrs)?)
+    }
+
+    /// Report what the directory listing contained, once per poll of the phone's
+    /// own `listDevices` loop: `true` if it returned any device other than this
+    /// one.
+    ///
+    /// Required, not optional. Desktop and the hub get this from the Rust
+    /// account-refresh loop, which the phone does not run. Without it a device
+    /// holding no content key never mints one and every sync fails with a
+    /// protocol error reading "unauthenticated", with no way to recover.
+    ///
+    /// Two things happen, in order: a keyless device mints if it is the first on
+    /// the account, and any peer the user has confirmed but that has not
+    /// received the key is handed it. Cheap and idempotent once a key is held,
+    /// which is the steady state, so calling it every poll is correct.
+    pub async fn note_account_peers(&self, has_other_devices: bool) -> Result<(), SyncFfiError> {
+        let engine = self.engine()?;
+        engine.note_account_peers(has_other_devices);
+        engine.deliver_pending_keys().await;
+        Ok(())
+    }
+
+    /// Whether this device holds the account content key, i.e. has been
+    /// enrolled. `false` means it can sync nothing until a device that holds the
+    /// key confirms it.
+    pub fn is_enrolled(&self) -> Result<bool, SyncFfiError> {
+        Ok(self.engine()?.is_enrolled_self())
     }
 
     /// This device's own publishable direct socket addresses ("ip:port"), for
@@ -464,10 +494,11 @@ impl FfiSyncEngine {
     /// Every meeting this device holds, projected to the phone model, newest
     /// first (by start time). A folder that fails to read is skipped, not fatal.
     pub fn list_meetings(&self) -> Result<Vec<FfiMeeting>, SyncFfiError> {
-        let mut meetings: Vec<FfiMeeting> = notes_crdt::folder::list_meeting_ids(&self.meetings_root)
-            .into_iter()
-            .filter_map(|id| project_meeting(&self.meetings_root, id))
-            .collect();
+        let mut meetings: Vec<FfiMeeting> =
+            notes_crdt::folder::list_meeting_ids(&self.meetings_root)
+                .into_iter()
+                .filter_map(|id| project_meeting(&self.meetings_root, id))
+                .collect();
         meetings.sort_by_key(|m| std::cmp::Reverse(started_at_ms_of(m)));
         Ok(meetings)
     }
@@ -1028,7 +1059,9 @@ fn project_meeting(meetings_root: &Path, id: MeetingId) -> Option<FfiMeeting> {
             let transcript = read_transcript(&folder);
             let (segments, speakers) = project_speakers(&transcript, &meta.speaker_names);
             let summary = std::fs::read_to_string(folder.join("summary.md")).ok();
-            let notes = NotesStore::read_ydoc_state(meetings_root, id).ok().flatten();
+            let notes = NotesStore::read_ydoc_state(meetings_root, id)
+                .ok()
+                .flatten();
             Some(FfiMeeting::Synced {
                 id: id_str,
                 title: meta.title,
@@ -1103,7 +1136,11 @@ mod tests {
         std::fs::write(&mp4, b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00isomiso2").unwrap();
         let (ext, codec, rate, ch) = sniff_captured_audio(&mp4).unwrap();
         assert_eq!((ext, codec.as_str()), ("m4a", "aac"));
-        assert_eq!((rate, ch), (44_100, 1), "fallback when the mp4a box is absent");
+        assert_eq!(
+            (rate, ch),
+            (44_100, 1),
+            "fallback when the mp4a box is absent"
+        );
         // An unknown container is refused rather than mislabelled.
         let junk = dir.path().join("a.bin");
         std::fs::write(&junk, b"RIFFxxxxWAVEfmt ").unwrap();
@@ -1277,9 +1314,15 @@ mod tests {
     fn save_captured_projects_as_pending() {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        let id_str =
-            save_captured_to(root, "My meeting", 1_700_000_000_000, 5_000, None, "hello notes")
-                .expect("save");
+        let id_str = save_captured_to(
+            root,
+            "My meeting",
+            1_700_000_000_000,
+            5_000,
+            None,
+            "hello notes",
+        )
+        .expect("save");
         let id = MeetingId(Uuid::parse_str(&id_str).unwrap());
         match project_meeting(root, id).expect("present") {
             FfiMeeting::Captured {
@@ -1348,7 +1391,9 @@ mod tests {
             Err(SyncFfiError::InvalidArg { .. })
         ));
         assert_eq!(
-            notes_crdt::read_metadata(&root.join(&id_str)).unwrap().title,
+            notes_crdt::read_metadata(&root.join(&id_str))
+                .unwrap()
+                .title,
             "keep me",
             "a rejected rename must not have written anything"
         );
@@ -1397,7 +1442,10 @@ mod tests {
                 // A → 1 (named "Alice"), B → 2 (fallback "Speaker 2").
                 assert_eq!(speakers, vec!["Alice".to_string(), "Speaker 2".to_string()]);
                 assert_eq!(
-                    transcript.iter().map(|s| s.speaker_index).collect::<Vec<_>>(),
+                    transcript
+                        .iter()
+                        .map(|s| s.speaker_index)
+                        .collect::<Vec<_>>(),
                     vec![1, 2, 1, 0],
                 );
                 assert_eq!(transcript[0].text, "hi");
@@ -1492,7 +1540,8 @@ mod tests {
                 changed_at: "2026-06-30T00:00:00Z".into(),
             },
         );
-        let meta = notes_crdt::read_metadata(&root.join(id.0.to_string())).expect("read after apply");
+        let meta =
+            notes_crdt::read_metadata(&root.join(id.0.to_string())).expect("read after apply");
         assert!(meta.deletion.deleted, "version 1 delete must apply");
 
         // A stale lower-version advertisement must not walk it backwards.
@@ -1506,8 +1555,12 @@ mod tests {
                 changed_at: "2026-06-30T00:00:01Z".into(),
             },
         );
-        let meta = notes_crdt::read_metadata(&root.join(id.0.to_string())).expect("read after stale apply");
-        assert!(meta.deletion.deleted, "a lower-version restore must not regress the delete");
+        let meta = notes_crdt::read_metadata(&root.join(id.0.to_string()))
+            .expect("read after stale apply");
+        assert!(
+            meta.deletion.deleted,
+            "a lower-version restore must not regress the delete"
+        );
 
         // A meeting we do not hold at all: must not panic or create the folder.
         let absent = MeetingId::new();

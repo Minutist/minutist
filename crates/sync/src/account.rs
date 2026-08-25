@@ -101,25 +101,27 @@ pub trait RefreshSink: Send + Sync {
     /// a second guard. Runs under the loop's cancel scope, dropped on cancel.
     async fn on_new_peer(&self, endpoint_id: &str);
 
-    /// Called each poll with whether the account holds any device other than
-    /// this one, so a device with no content key can decide whether to mint one
-    /// or wait to be enrolled (`planning/DESIGN_sync-encryption.md` §3.1).
+    /// Called once per directory poll with whether the account holds any device
+    /// other than this one.
     ///
-    /// Driven from the loop rather than from startup because that is where the
-    /// answer lives: the directory has to be polled to know, and a device that
-    /// minted at startup would have guessed. A no-op once this device holds a
-    /// key, which is the steady state.
-    fn on_account_size(&self, _has_other_devices: bool) {}
-
-    /// Hand the content key to any peer the user has confirmed but that has not
-    /// received it, once per poll.
+    /// Two things ride on it, in this order: a device with no content key mints
+    /// one if it is the first on the account
+    /// (`planning/DESIGN_sync-encryption.md` §3.1), and any peer the user has
+    /// confirmed but that has not received the key is handed it. The order is
+    /// load-bearing, which is why this is one method rather than two.
     ///
-    /// The seam that lets a confirmation be recorded by a DIFFERENT process from
-    /// the one running the engine: a headless hub's `confirm` CLI writes the
-    /// decision to disk while the daemon runs, and this is where the daemon acts
-    /// on it. Also the retry for a device that was asleep when its user
-    /// confirmed it.
-    async fn deliver_pending_keys(&self) {}
+    /// The delivery half is also the seam that lets a confirmation be recorded
+    /// by a DIFFERENT process from the one running the engine: a headless hub's
+    /// `confirm` CLI writes the decision to disk while the daemon runs, and this
+    /// is where the daemon acts on it.
+    ///
+    /// A consumer that does NOT drive this loop (the phone, which polls the
+    /// directory above the FFI) must call
+    /// [`SyncEngine::note_account_peers`](crate::SyncEngine::note_account_peers)
+    /// and
+    /// [`SyncEngine::deliver_pending_keys`](crate::SyncEngine::deliver_pending_keys)
+    /// itself, or its device never mints a key and never enrols.
+    async fn on_account_poll(&self, _has_other_devices: bool) {}
 
     /// The directory's current `Account`-sourced endpoint ids. Read once at loop
     /// (re)start to seed the reconcile-removal state, so a peer that left the
@@ -186,10 +188,24 @@ pub async fn run_account_refresh_loop_v2(
                 // Before touching peer state: a device with no content key needs
                 // to know whether it is the first on this account (mint) or is
                 // joining one that already has a key (wait to be enrolled).
-                sink.on_account_size(!peers.is_empty());
-                // Act on any decision recorded since the last pass, including
-                // one written by another process.
-                sink.deliver_pending_keys().await;
+                // Spawned, not awaited inline, for the same reason the
+                // first-contact dial below is: the delivery half dials each
+                // pending peer, and a slow or unreachable one would otherwise
+                // hold up this tick's removals, upserts and dial-kicks. Races
+                // the cancel token, and is fire-and-forget because a failure
+                // simply retries on the next poll against a decision that
+                // stands.
+                {
+                    let sink = Arc::clone(&sink);
+                    let cancel = cancel.clone();
+                    let has_others = !peers.is_empty();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {}
+                            _ = sink.on_account_poll(has_others) => {}
+                        }
+                    });
+                }
                 let current: HashSet<String> =
                     peers.iter().map(|ep| ep.endpoint_id.clone()).collect();
 

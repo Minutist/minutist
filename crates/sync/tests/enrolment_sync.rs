@@ -420,7 +420,10 @@ async fn the_engine_and_a_cli_derive_the_same_pending_list() {
         )
     };
 
-    assert_eq!(cli_view(std::slice::from_ref(&b_id)), a.pending_enrolments());
+    assert_eq!(
+        cli_view(std::slice::from_ref(&b_id)),
+        a.pending_enrolments()
+    );
 
     // A decision made through the CLI path drops the peer from both views.
     EnrolmentStore::load(root_a)
@@ -446,4 +449,56 @@ async fn the_engine_and_a_cli_derive_the_same_pending_list() {
 
     a.shutdown().await.expect("shutdown a");
     b.shutdown().await.expect("shutdown b");
+}
+
+/// Refusing a peer drops it from the directory, so it is neither dialled nor
+/// admitted, and the account-refresh loop's upsert does not put it back.
+///
+/// The earlier refusal test asserted the record and that the key is withheld;
+/// this asserts the refusal actually bites on the transport.
+#[tokio::test]
+async fn a_refused_peer_is_dropped_from_the_directory_and_stays_out() {
+    use std::sync::Arc;
+    use sync::{AccountEndpoint, RefreshSink, SyncEngineRefreshSink};
+
+    let dir_a = tempfile::TempDir::new().expect("tempdir a");
+    let dir_b = tempfile::TempDir::new().expect("tempdir b");
+    let (a, b) = unenrolled_pair(dir_a.path(), dir_b.path()).await;
+    let b_id = b.endpoint_id().to_string();
+    let a = Arc::new(a);
+
+    assert!(a.peer_ids().contains(&b_id), "B starts in A's directory");
+
+    a.refuse_enrolment(&b_id, None).expect("refuse");
+    assert!(
+        !a.peer_ids().contains(&b_id),
+        "a refused peer must leave the directory, which is what stops both the \
+         outbound dial and the inbound accept"
+    );
+    assert!(a.is_refused(&b_id));
+    assert!(!a.is_enrolled(&b_id));
+
+    // The next directory poll re-offers it. Driven through the real sink the
+    // refresh loop uses, not a test seam, so this covers the actual path.
+    let was_new = {
+        let sink = SyncEngineRefreshSink::new(Arc::clone(&a));
+        sink.upsert_account_peer(&AccountEndpoint {
+            device_id: "device-b".to_string(),
+            endpoint_id: b_id.clone(),
+            relay_url: "https://example.invalid".to_string(),
+            direct_addrs: Vec::new(),
+        })
+    };
+    assert!(!was_new, "a refused peer must not read as newly added");
+    assert!(
+        !a.peer_ids().contains(&b_id),
+        "the next directory poll must not re-add a refused peer"
+    );
+
+    b.shutdown().await.expect("shutdown b");
+    Arc::try_unwrap(a)
+        .unwrap_or_else(|_| panic!("sink still holds the engine"))
+        .shutdown()
+        .await
+        .expect("shutdown a");
 }

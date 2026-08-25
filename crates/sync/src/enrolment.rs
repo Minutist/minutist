@@ -65,6 +65,10 @@ const SAS_LABEL: &[u8] = b"minutist/sync/sas/v1";
 const SAS_DIGITS: u32 = 6;
 
 /// What the user decided about a peer.
+///
+/// A verdict can be changed, but changing [`Self::Confirmed`] to
+/// [`Self::Refused`] does not take back a key the peer already holds: see
+/// [`SyncEngine::refuse_enrolment`](crate::SyncEngine::refuse_enrolment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Verdict {
@@ -162,6 +166,18 @@ pub fn pending_from(
         .collect()
 }
 
+/// Read the records, treating an absent, unreadable or corrupt file as empty.
+///
+/// Empty rather than an error because the effect is re-prompting the user, which
+/// is safe, where refusing to start is not: [`EnrolmentStore::verdict`] returns
+/// `None` for an unknown peer and every caller treats `None` as "not confirmed".
+fn read_records(path: &Path) -> BTreeMap<String, Record> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
 /// The persisted per-peer verdicts, at `{app-data}/enrolled_peers.json`.
 ///
 /// Loaded whole and rewritten whole: the file holds one small entry per device
@@ -187,10 +203,7 @@ impl EnrolmentStore {
     /// peer and every caller treats `None` as "not confirmed".
     pub fn load(app_data_dir: &Path) -> Self {
         let path = Self::path(app_data_dir);
-        let records = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let records = read_records(&path);
         Self { path, records }
     }
 
@@ -255,10 +268,7 @@ impl EnrolmentStore {
 
     /// Re-read the file, discarding this in-memory view.
     fn reload(&mut self) {
-        self.records = std::fs::read(&self.path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        self.records = read_records(&self.path);
     }
 
     /// Every peer the user has decided about, with the decision.
@@ -269,10 +279,18 @@ impl EnrolmentStore {
             .collect()
     }
 
+    /// Write the whole store, atomically.
+    ///
+    /// Atomic because this file is a cross-process channel (see the module doc):
+    /// a truncate-then-write leaves a window in which the daemon reads a partial
+    /// file, and a partial file is invalid JSON, which [`Self::load`] treats as
+    /// empty. That would silently demote every confirmed peer to undecided and
+    /// stop key delivery, on a file the user never touched. The rename makes a
+    /// reader see either the old contents or the new, never a mixture.
     fn persist(&self) -> Result<()> {
         let json = serde_json::to_vec_pretty(&self.records)
             .map_err(|e| Error::Identity(format!("serialising the enrolment store: {e}")))?;
-        std::fs::write(&self.path, json).map_err(|e| {
+        minutist_common::fs::write_atomic(&self.path, &json).map_err(|e| {
             Error::Identity(format!(
                 "writing the enrolment store to {:?}: {e}",
                 self.path

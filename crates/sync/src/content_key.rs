@@ -78,37 +78,18 @@ impl ContentKey {
         Ok(key_file::read(&Self::path(app_data_dir), "content key")?.map(|bytes| Self { bytes }))
     }
 
-    /// Load the key, minting one only when this device is the first on its
-    /// account (`planning/DESIGN_sync-encryption.md` §3.1).
+    /// Mint and persist a fresh key, or return the existing one.
     ///
-    /// `account_has_other_devices` is what the caller learned from the account
-    /// directory. `Some(false)` means this device is alone, so it mints.
-    /// `Some(true)` means it is joining an account that already has a key, so it
-    /// returns `None` and waits to be enrolled: a key minted for itself would be
-    /// guaranteed wrong, and syncing under it would fail every exchange while
-    /// looking like a network fault. `None` means the caller could not ask (no
-    /// credential, directory unreachable), which is also a wait: a device that
-    /// cannot see the account cannot know it is the first on it.
-    ///
-    /// The directory is not trusted with key material here, only with a device
-    /// count it already has, and a lie is fail-safe: claiming "you are alone" to
-    /// a joining device makes it mint a key nobody else holds, so it cannot sync
-    /// until a real device enrols it. That is a visible denial of service, not a
-    /// leak.
-    pub fn load_or_mint(
-        app_data_dir: &Path,
-        account_has_other_devices: Option<bool>,
-    ) -> Result<Option<Self>> {
+    /// The CALLER decides this device is the first on its account; see
+    /// [`SyncEngine::note_account_peers`](crate::SyncEngine::note_account_peers),
+    /// which owns that policy and is the only production caller. Minting on a
+    /// device that is not first is not a leak, only a wasted key that no peer
+    /// holds, but it strands the device until enrolment replaces it, so the
+    /// decision belongs at the one place that has the directory's answer rather
+    /// than being re-expressed here.
+    pub fn load_or_mint(app_data_dir: &Path) -> Result<Self> {
         if let Some(key) = Self::load(app_data_dir)? {
-            return Ok(Some(key));
-        }
-        if account_has_other_devices != Some(false) {
-            tracing::info!(
-                target: "sync",
-                "no content key yet and this device is not the first on its account; \
-                 waiting to be enrolled rather than minting a key no peer holds"
-            );
-            return Ok(None);
+            return Ok(key);
         }
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes)
@@ -119,7 +100,7 @@ impl ContentKey {
             target: "sync",
             "minted a new account content key (first device on this account)"
         );
-        Ok(Some(key))
+        Ok(key)
     }
 
     /// Adopt a key received from an enrolled peer, overwriting any local one.
@@ -295,57 +276,12 @@ mod tests {
     #[test]
     fn mints_once_and_reloads_the_same_key() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let first = ContentKey::load_or_mint(dir.path(), Some(false))
-            .expect("mint")
-            .expect("first device mints");
-        let reloaded = ContentKey::load_or_mint(dir.path(), Some(false))
-            .expect("reload")
-            .expect("present");
+        let first = ContentKey::load_or_mint(dir.path()).expect("mint");
+        let reloaded = ContentKey::load_or_mint(dir.path()).expect("reload");
         assert_eq!(
             first.bytes, reloaded.bytes,
             "a minted key must persist, not be re-minted on the next load"
         );
-    }
-
-    #[test]
-    fn a_joining_device_waits_instead_of_minting() {
-        // The account already has devices, so a key minted here would be one no
-        // peer holds. §3.1: wait for enrolment instead.
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        assert!(ContentKey::load_or_mint(dir.path(), Some(true))
-            .expect("no error")
-            .is_none());
-        assert!(
-            !ContentKey::path(dir.path()).exists(),
-            "waiting must not leave a key file behind"
-        );
-    }
-
-    #[test]
-    fn a_device_that_cannot_ask_the_directory_also_waits() {
-        // No credential, or the directory was unreachable. A device that cannot
-        // see the account cannot know it is the first on it.
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        assert!(ContentKey::load_or_mint(dir.path(), None)
-            .expect("no error")
-            .is_none());
-        assert!(!ContentKey::path(dir.path()).exists());
-    }
-
-    #[test]
-    fn an_existing_key_is_returned_whatever_the_directory_says() {
-        // Once enrolled, the directory's device count is irrelevant: the key on
-        // disk is the account's key.
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        let minted = ContentKey::load_or_mint(dir.path(), Some(false))
-            .expect("mint")
-            .expect("present");
-        for answer in [Some(true), Some(false), None] {
-            let again = ContentKey::load_or_mint(dir.path(), answer)
-                .expect("load")
-                .expect("present");
-            assert_eq!(minted.bytes, again.bytes);
-        }
     }
 
     #[test]
@@ -360,9 +296,7 @@ mod tests {
     #[test]
     fn key_file_is_owner_only_and_32_bytes() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        ContentKey::load_or_mint(dir.path(), Some(false))
-            .expect("mint")
-            .expect("first device mints");
+        ContentKey::load_or_mint(dir.path()).expect("mint");
         let meta = std::fs::metadata(ContentKey::path(dir.path())).expect("stat");
         assert_eq!(meta.len(), 32);
         #[cfg(unix)]
@@ -383,15 +317,13 @@ mod tests {
         // Not a silent remint: that would strand the device from every peer
         // while looking like a fresh install.
         assert!(ContentKey::load(dir.path()).is_err());
-        assert!(ContentKey::load_or_mint(dir.path(), Some(false)).is_err());
+        assert!(ContentKey::load_or_mint(dir.path()).is_err());
     }
 
     #[test]
     fn replace_overwrites_at_0600() {
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let minted = ContentKey::load_or_mint(dir.path(), Some(false))
-            .expect("mint")
-            .expect("first device mints");
+        let minted = ContentKey::load_or_mint(dir.path()).expect("mint");
         let adopted = ContentKey::replace(dir.path(), [7u8; 32]).expect("replace");
         assert_ne!(minted.bytes, adopted.bytes);
         assert_eq!(

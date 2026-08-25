@@ -83,7 +83,7 @@ pub struct SyncEngine {
     /// must pick up the new one. Read out by value rather than held as a guard,
     /// since the frame operations that use it are `async` and holding a guard
     /// across an await is how that deadlocks.
-    keys: Arc<RwLock<Option<KeyState>>>,
+    keys: KeyStore,
     /// The app-data base, for writing a key adopted during enrolment and for the
     /// enrolment record. See [`SyncConfig::app_data_dir`].
     app_data_dir: PathBuf,
@@ -114,19 +114,6 @@ pub struct SyncEngine {
     lifecycle_events: broadcast::Sender<(MeetingId, ProcessingLifecycle, DeletionState)>,
 }
 
-/// The two directories a [`SyncEngine`] works in.
-///
-/// Bundled because they are easy to confuse and the consequences differ: writing
-/// a secret under `meetings` would put it in the tree that syncs, and looking for
-/// one under it would silently find nothing and mint a fresh key.
-#[derive(Debug, Clone)]
-struct Roots {
-    /// `{app-data}/meetings`, holding the per-meeting `{uuid}` folders.
-    meetings: PathBuf,
-    /// The app-data base, holding this device's secrets.
-    app_data: PathBuf,
-}
-
 /// The error a device that holds no content key gives for anything but
 /// enrolment. Its own state, not the peer's: nothing is wrong with the peer, this
 /// device simply has not been enrolled yet.
@@ -136,24 +123,55 @@ fn not_enrolled() -> Error {
     )
 }
 
-/// The account content key and the frame cipher derived from it.
+/// The account content key, shared between the engine and the router-owned
+/// accept hook.
 ///
-/// Held together under one lock so they cannot drift: the key is what enrolment
-/// hands to a confirmed peer, the cipher is what seals every other frame, and a
-/// device offering one key while sealing under another would be a silent,
-/// baffling failure. Enrolment replaces both at once.
-#[derive(Debug, Clone)]
-struct KeyState {
-    key: ContentKey,
-    cipher: FrameCipher,
-}
+/// `Arc` because both hold it; `RwLock` because enrolment replaces it on a live
+/// engine; `Option` because a device that has not been enrolled holds none and
+/// must still bind and serve. Named rather than written out at each use so the
+/// poison recovery and the not-enrolled error exist once.
+#[derive(Debug, Clone, Default)]
+struct KeyStore(Arc<RwLock<Option<ContentKey>>>);
 
-impl KeyState {
-    fn new(key: ContentKey) -> Self {
-        Self {
-            cipher: key.frame_cipher(),
-            key,
-        }
+impl KeyStore {
+    fn new(key: Option<ContentKey>) -> Self {
+        Self(Arc::new(RwLock::new(key)))
+    }
+
+    /// The frame cipher, or [`not_enrolled`].
+    ///
+    /// Derived per call rather than cached: one HKDF-SHA256 expand, on a path
+    /// that runs a handful of times per connection and never per frame (the
+    /// protocols take a `&FrameCipher` and `frame::Framer` reuses it). Caching
+    /// it would mean storing a value derived from another value in the same
+    /// struct, with an invariant that they never drift.
+    fn cipher(&self) -> Result<FrameCipher> {
+        self.read()
+            .as_ref()
+            .map(ContentKey::frame_cipher)
+            .ok_or_else(not_enrolled)
+    }
+
+    /// The content key itself. Only enrolment wants this; everything else wants
+    /// [`Self::cipher`].
+    fn content_key(&self) -> Result<ContentKey> {
+        self.read().clone().ok_or_else(not_enrolled)
+    }
+
+    fn is_present(&self) -> bool {
+        self.read().is_some()
+    }
+
+    fn set(&self, key: ContentKey) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some(key);
+    }
+
+    /// A poisoned key lock is recovered rather than propagated: the guarded
+    /// value is a key, not an invariant a panicking writer could have left
+    /// half-updated, and refusing to read it would take sync down for the
+    /// process lifetime.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<ContentKey>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -549,10 +567,8 @@ impl SyncEngine {
             endpoint,
             peers,
             blobs,
-            Roots {
-                meetings: meetings_root,
-                app_data: config.app_data_dir,
-            },
+            meetings_root,
+            config.app_data_dir,
             content_key,
             BackoffRegistry::new(config.backoff_policy),
             config.relay_url,
@@ -566,22 +582,25 @@ impl SyncEngine {
     /// in their backoff policy and relay URL. Keeping it in one place means the
     /// `AcceptHook` and `Self` field lists exist once, so a new field is one edit
     /// rather than three that can silently drift.
+    // Eight collaborators, all distinct and all needed exactly once here. The
+    // alternative is a parameter bundle that only ever exists to be destructured
+    // on the next line, which is a lint workaround wearing an abstraction's
+    // clothes. `meetings_root` and `app_data_dir` are the pair worth not
+    // confusing; `SyncConfig::app_data_dir`'s doc is where that is said.
+    #[allow(clippy::too_many_arguments)]
     fn assemble(
         endpoint: Endpoint,
         peers: PeerDirectory,
         blobs: BlobStore,
-        roots: Roots,
+        meetings_root: PathBuf,
+        app_data_dir: PathBuf,
         content_key: Option<ContentKey>,
         backoff: BackoffRegistry,
         relay_url: String,
     ) -> Self {
-        let Roots {
-            meetings: meetings_root,
-            app_data: app_data_dir,
-        } = roots;
         let (peer_events, _rx) = broadcast::channel(PEER_EVENTS_CAP);
         let (lifecycle_events, _lrx) = broadcast::channel(LIFECYCLE_EVENTS_CAP);
-        let keys = Arc::new(RwLock::new(content_key.map(KeyState::new)));
+        let keys = KeyStore::new(content_key);
         let router = Self::build_router(
             &endpoint,
             &blobs,
@@ -621,23 +640,13 @@ impl SyncEngine {
     /// use it are `async`, and holding a `RwLock` guard across an await is how
     /// that deadlocks. A `FrameCipher` is a 32-byte key, so the clone is free.
     fn cipher(&self) -> Result<FrameCipher> {
-        self.keys
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|k| k.cipher.clone())
-            .ok_or_else(not_enrolled)
+        self.keys.cipher()
     }
 
     /// The current account content key, by value. Only enrolment wants this;
     /// everything else wants [`Self::cipher`].
     fn content_key(&self) -> Result<ContentKey> {
-        self.keys
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|k| k.key.clone())
-            .ok_or_else(not_enrolled)
+        self.keys.content_key()
     }
 
     /// The enrolment record, read fresh from disk.
@@ -650,19 +659,24 @@ impl SyncEngine {
         EnrolmentStore::load(&self.app_data_dir)
     }
 
-    /// Mint the account content key if this device turns out to be the first on
-    /// its account, now that the directory has been polled
-    /// (`planning/DESIGN_sync-encryption.md` §3.1).
+    /// Tell the engine what the account directory just reported, so a device
+    /// with no content key can mint one if it turns out to be the first on its
+    /// account (`planning/DESIGN_sync-encryption.md` §3.1).
     ///
-    /// A no-op once a key is held, which is the steady state: this fires on
-    /// every directory poll and does nothing on all but the first.
+    /// **Every consumer that discovers peers must call this**, once per poll,
+    /// or a device that holds no key never gets one and every content operation
+    /// fails with [`Error::Unauthenticated`] forever. Desktop and the hub reach
+    /// it through [`crate::RefreshSink::on_account_poll`]; the phone drives its
+    /// own directory loop above the FFI and calls this directly.
     ///
-    /// Minting is deferred to here rather than done at startup because startup
+    /// A no-op once a key is held, which is the steady state.
+    ///
+    /// Minting is deferred to a poll rather than done at startup because startup
     /// cannot know the answer. A device that minted before polling would guess,
     /// and a device joining an existing account guesses wrong every time, ending
     /// up with a key no peer holds and failing every exchange while looking like
     /// a network fault.
-    fn resolve_first_device(&self, has_other_devices: bool) {
+    pub fn note_account_peers(&self, has_other_devices: bool) {
         if self.is_enrolled_self() {
             return;
         }
@@ -673,11 +687,8 @@ impl SyncEngine {
             );
             return;
         }
-        match ContentKey::load_or_mint(&self.app_data_dir, Some(false)) {
-            Ok(Some(key)) => {
-                *self.keys.write().unwrap_or_else(|e| e.into_inner()) = Some(KeyState::new(key));
-            }
-            Ok(None) => {}
+        match ContentKey::load_or_mint(&self.app_data_dir) {
+            Ok(key) => self.keys.set(key),
             Err(e) => tracing::warn!(
                 target: "sync",
                 error = %e,
@@ -690,10 +701,7 @@ impl SyncEngine {
     /// A device that has not been syncs nothing until a confirmed peer sends it
     /// the key.
     pub fn is_enrolled_self(&self) -> bool {
-        self.keys
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+        self.keys.is_present()
     }
 
     /// The blob-exchange collaborators for one peer: the frame cipher, blob
@@ -755,11 +763,9 @@ impl SyncEngine {
             endpoint,
             peers,
             blobs,
-            // The relay-less test path keeps both under one tempdir.
-            Roots {
-                meetings: meetings_root.clone(),
-                app_data: meetings_root,
-            },
+            meetings_root.clone(),
+            // The relay-less test path keeps the secrets under the same tempdir.
+            meetings_root,
             content_key,
             BackoffRegistry::new(BackoffPolicy::default()),
             // The relay-less test path never addresses a peer relay-only, so it
@@ -817,10 +823,8 @@ impl SyncEngine {
             endpoint,
             peers,
             blobs,
-            Roots {
-                meetings: meetings_root,
-                app_data: config.app_data_dir,
-            },
+            meetings_root,
+            config.app_data_dir,
             content_key,
             BackoffRegistry::new(config.backoff_policy),
             config.relay_url,
@@ -1050,7 +1054,7 @@ impl SyncEngine {
     ///
     /// [`Self::pending_enrolments`] covers the prompt; this covers a settings
     /// screen that shows the code for an already-enrolled device, so a user can
-    /// re-verify one without un-enrolling it first.
+    /// re-check one against its screen.
     pub fn safety_code_for(&self, peer_id: &str) -> Result<String> {
         let id: EndpointId = peer_id
             .parse()
@@ -1133,18 +1137,44 @@ impl SyncEngine {
         delivered
     }
 
-    /// Record that the user rejected `peer_id`, and suppress it.
+    /// Record that the user rejected `peer_id`, and drop it.
     ///
     /// The refusal persists, so the user is not re-prompted for an endpoint they
     /// have already rejected: re-asking every poll is how a prompt gets trained
-    /// into a reflex. Suppression stops this device dialling it in the meantime.
+    /// into a reflex.
+    ///
+    /// **Refusing a peer that already received the key does not revoke its
+    /// access to content it can already decrypt.** Dropping it stops this device
+    /// talking to it, but the key it holds stays valid, because nothing rotates
+    /// the account content key. Real revocation needs that rotation plus
+    /// re-delivery to the remaining confirmed devices; until it exists, treat
+    /// this as "stop dealing with that endpoint", not as un-enrolment.
+    ///
+    /// Dropping it from the peer directory is what makes the refusal bite, and
+    /// it does so in both directions at once, because directory membership is
+    /// what the inbound accept hook authorises on and what an outbound dial
+    /// needs an address from. A refused endpoint is therefore neither dialled
+    /// nor admitted. The account-refresh loop will see it again on its next poll
+    /// and must not re-add it, which
+    /// [`SyncEngineRefreshSink::upsert_account_peer`] enforces by consulting the
+    /// same record.
+    ///
+    /// Deliberately NOT expressed through the dial-failure backoff. That counter
+    /// suppresses only after several consecutive failures and is cleared by any
+    /// later success, so one refusal through it would suppress nothing and would
+    /// evaporate on the next successful dial. A standing human verdict and a
+    /// transient network-health counter have different lifetimes and must not
+    /// share a mechanism.
     pub fn refuse_enrolment(&self, peer_id: &str, decided_at: Option<String>) -> Result<()> {
         self.record_verdict(peer_id, Verdict::Refused, decided_at)?;
-        self.backoff.on_dial_outcome(peer_id, false);
+        if let Ok(id) = peer_id.parse::<EndpointId>() {
+            self.peers.remove(id, PeerSource::Account);
+            self.peers.remove(id, PeerSource::Manual);
+        }
         tracing::warn!(
             target: "sync",
             peer = %peer_id,
-            "user refused an endpoint the account directory offered"
+            "user refused an endpoint the account directory offered; dropped from the peer directory"
         );
         Ok(())
     }
@@ -1152,6 +1182,12 @@ impl SyncEngine {
     /// Whether the user has confirmed `peer_id`.
     pub fn is_enrolled(&self, peer_id: &str) -> bool {
         self.enrolment().is_confirmed(peer_id)
+    }
+
+    /// Whether the user has refused `peer_id`. Distinct from "not confirmed":
+    /// an undecided peer is still prompted for, a refused one never is.
+    pub fn is_refused(&self, peer_id: &str) -> bool {
+        self.enrolment().verdict(peer_id) == Some(Verdict::Refused)
     }
 
     fn record_verdict(
@@ -1185,7 +1221,17 @@ impl SyncEngine {
         let result = enrolment_proto::offer_key(&conn, &store, &key).await;
         let result = finish_exchange(&conn, b"enrolment-done", result);
         match &result {
-            Ok(()) => self.enrolment().mark_key_delivered(peer_id)?,
+            Ok(()) => {
+                self.record_peer_reachable(id);
+                self.enrolment().mark_key_delivered(peer_id)?;
+            }
+            // The peer answered and declined. It is reachable and healthy; it
+            // simply has not confirmed this device yet, which is the normal
+            // window between the two halves of a mutual confirmation. Charging
+            // that as a dial failure would suppress a good peer after a few
+            // polls and stop its real notes and media syncs, for doing exactly
+            // what it should.
+            Err(Error::Unauthenticated(_)) => self.record_peer_reachable(id),
             Err(_) => self.record_exchange_failure(id),
         }
         result
@@ -1819,15 +1865,26 @@ impl SyncEngineRefreshSink {
 
 #[async_trait::async_trait]
 impl RefreshSink for SyncEngineRefreshSink {
-    fn on_account_size(&self, has_other_devices: bool) {
-        self.engine.resolve_first_device(has_other_devices);
-    }
-
-    async fn deliver_pending_keys(&self) {
+    async fn on_account_poll(&self, has_other_devices: bool) {
+        // Order matters: a key minted by the first call is what the second has
+        // to hand out, so a first-device engine can enrol a peer in the same
+        // pass rather than waiting for the next.
+        self.engine.note_account_peers(has_other_devices);
         self.engine.deliver_pending_keys().await;
     }
 
     fn upsert_account_peer(&self, ep: &AccountEndpoint) -> bool {
+        // A refused endpoint stays out, however often the directory re-offers
+        // it. Without this the next poll would undo `refuse_enrolment`, and the
+        // user's decision would last until the following tick.
+        if self.engine.is_refused(&ep.endpoint_id) {
+            tracing::debug!(
+                target: "sync",
+                endpoint_id = %ep.endpoint_id,
+                "skipping an account peer the user refused"
+            );
+            return false;
+        }
         self.engine
             .upsert_account_peer(&ep.endpoint_id, &ep.relay_url, &ep.direct_addrs)
             .unwrap_or_else(|e| {
@@ -1910,7 +1967,7 @@ struct AcceptHook {
     /// Every responder seals and opens its frames under the cipher, so an
     /// inbound peer holding a different content key gets
     /// [`Error::Unauthenticated`] on its first frame.
-    keys: Arc<RwLock<Option<KeyState>>>,
+    keys: KeyStore,
     /// The app-data base, for persisting a key adopted during enrolment.
     app_data_dir: PathBuf,
     /// The endpoint, for the media responder's blob pulls.
@@ -1987,12 +2044,7 @@ impl AcceptHook {
 
     /// The current frame cipher by value, mirroring [`SyncEngine::cipher`].
     fn cipher(&self) -> Result<FrameCipher> {
-        self.keys
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|k| k.cipher.clone())
-            .ok_or_else(not_enrolled)
+        self.keys.cipher()
     }
 
     /// The blob-exchange collaborators for one inbound peer, mirroring
@@ -2110,9 +2162,8 @@ impl AcceptHook {
                     // ACCEPTED as "enrolled" and returns at once, so any work
                     // left after the reply is a window where it believes an
                     // enrolment that has not landed.
-                    let adopted = ContentKey::replace(&self.app_data_dir, bytes)?;
-                    *self.keys.write().unwrap_or_else(|e| e.into_inner()) =
-                        Some(KeyState::new(adopted));
+                    self.keys
+                        .set(ContentKey::replace(&self.app_data_dir, bytes)?);
                 }
                 enrolment_proto::send_verdict(connection, &mut send, offered.is_some()).await
             }

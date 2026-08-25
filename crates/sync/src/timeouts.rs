@@ -32,3 +32,35 @@ pub(crate) const BLOB_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 /// long the peer takes to pull every blob it lacks, and a manifest may list
 /// several, so it sits well above [`BLOB_DOWNLOAD_TIMEOUT`].
 pub(crate) const PEER_PULL_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// Hold a responder's connection open until the initiator has finished reading
+/// and closed it.
+///
+/// Returning before then lets the router drop the connection and abort the
+/// stream, so the initiator sees a bare "connection lost" instead of whatever
+/// the responder just wrote. Every responder in this crate needs it, so the
+/// policy lives here beside the budget it spends: bounded by
+/// [`RESPONDER_CLOSE_TIMEOUT`] so an initiator that never closes cannot pin the
+/// task.
+///
+/// `what` names the exchange in the log and error, e.g. `"notes"`.
+pub(crate) async fn park_until_closed(
+    conn: &iroh::endpoint::Connection,
+    what: &str,
+) -> crate::Result<()> {
+    tokio::time::timeout(RESPONDER_CLOSE_TIMEOUT, conn.closed())
+        .await
+        .map(|_| ())
+        .map_err(|_| {
+            tracing::warn!(
+                target: "sync",
+                peer = %conn.remote_id(),
+                timeout = ?RESPONDER_CLOSE_TIMEOUT,
+                exchange = %what,
+                "initiator never closed the connection"
+            );
+            crate::Error::Protocol(format!(
+                "{what} initiator did not close within {RESPONDER_CLOSE_TIMEOUT:?}"
+            ))
+        })
+}

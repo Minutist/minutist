@@ -502,3 +502,52 @@ async fn a_refused_peer_is_dropped_from_the_directory_and_stays_out() {
         .await
         .expect("shutdown a");
 }
+
+/// A mint that fails is reported, not swallowed.
+///
+/// A device that has just established it is the only one on its account, and
+/// then cannot write the key, is permanently unable to sync. `is_enrolled_self()`
+/// is `false` in that state and also `false` in the ordinary "waiting to be
+/// enrolled" state, so a caller that is only told the boolean would prompt the
+/// user to go and confirm on a device that does not exist.
+#[tokio::test]
+async fn a_failed_mint_is_reported_rather_than_leaving_a_silently_dead_device() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = dir.path();
+    let id = DeviceIdentity::load_or_generate(root).expect("identity");
+    let engine = SyncEngine::start_direct(id, None, root.to_path_buf())
+        .await
+        .expect("keyless engine binds");
+    assert!(!engine.is_enrolled_self());
+
+    // A key file of the wrong length: `load` refuses it rather than minting
+    // over it, because reminting would strand the device from every peer while
+    // looking like a first run.
+    std::fs::write(ContentKey::path(root), b"truncated").expect("seed a bad key file");
+
+    let outcome = engine.note_account_peers(false);
+    assert!(
+        outcome.is_err(),
+        "the caller must learn the mint failed, not just see is_enrolled_self() stay false"
+    );
+    assert!(!engine.is_enrolled_self());
+
+    // The healthy path still reports success, so a caller can tell the two apart.
+    std::fs::remove_file(ContentKey::path(root)).expect("clear the bad key file");
+    engine
+        .note_account_peers(false)
+        .expect("a lone device mints and says so");
+    assert!(
+        engine.is_enrolled_self(),
+        "minting made this device the founder"
+    );
+
+    // And once enrolled it is a no-op whatever the flag says, so a caller that
+    // gets the flag wrong later cannot undo it.
+    engine
+        .note_account_peers(true)
+        .expect("no-op once enrolled");
+    assert!(engine.is_enrolled_self());
+
+    engine.shutdown().await.expect("shutdown");
+}

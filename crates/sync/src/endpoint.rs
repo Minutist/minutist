@@ -676,25 +676,28 @@ impl SyncEngine {
     /// and a device joining an existing account guesses wrong every time, ending
     /// up with a key no peer holds and failing every exchange while looking like
     /// a network fault.
-    pub fn note_account_peers(&self, has_other_devices: bool) {
+    pub fn note_account_peers(&self, has_other_devices: bool) -> Result<()> {
         if self.is_enrolled_self() {
-            return;
+            return Ok(());
         }
         if has_other_devices {
             tracing::debug!(
                 target: "sync",
                 "no content key and the account has other devices; waiting to be enrolled"
             );
-            return;
+            return Ok(());
         }
-        match ContentKey::load_or_mint(&self.app_data_dir) {
-            Ok(key) => self.keys.set(key),
-            Err(e) => tracing::warn!(
-                target: "sync",
-                error = %e,
-                "could not mint the account content key"
-            ),
-        }
+        // Propagated, not swallowed. A mint that fails (unwritable data
+        // directory, a key file of the wrong length) leaves this device
+        // permanently keyless with `is_enrolled_self()` false and nothing
+        // syncing, which is indistinguishable from "waiting to be enrolled"
+        // unless the caller is told. A consumer that has just established it is
+        // the only device on the account needs to be able to say "minting
+        // failed" rather than tell the user to go and confirm on a device that
+        // does not exist.
+        let key = ContentKey::load_or_mint(&self.app_data_dir)?;
+        self.keys.set(key);
+        Ok(())
     }
 
     /// Whether this device holds the account content key, i.e. has been enrolled.
@@ -1869,7 +1872,15 @@ impl RefreshSink for SyncEngineRefreshSink {
         // Order matters: a key minted by the first call is what the second has
         // to hand out, so a first-device engine can enrol a peer in the same
         // pass rather than waiting for the next.
-        self.engine.note_account_peers(has_other_devices);
+        if let Err(e) = self.engine.note_account_peers(has_other_devices) {
+            // The loop keeps running: the next poll retries, and a transient
+            // cause (a full disk that gets cleared) then resolves it.
+            tracing::warn!(
+                target: "sync",
+                error = %e,
+                "could not mint the account content key; this device stays unenrolled"
+            );
+        }
         self.engine.deliver_pending_keys().await;
     }
 

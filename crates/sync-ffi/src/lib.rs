@@ -397,7 +397,12 @@ impl FfiSyncEngine {
     /// which is the steady state, so calling it every poll is correct.
     pub async fn note_account_peers(&self, has_other_devices: bool) -> Result<(), SyncFfiError> {
         let engine = self.engine()?;
-        engine.note_account_peers(has_other_devices);
+        // Errors rather than logging: a mint failure leaves this device
+        // permanently unable to sync, and `is_enrolled()` alone cannot tell that
+        // apart from the normal "waiting to be enrolled" state. The caller needs
+        // to be able to show a fault instead of prompting the user to confirm on
+        // another device.
+        engine.note_account_peers(has_other_devices)?;
         engine.deliver_pending_keys().await;
         Ok(())
     }

@@ -49,7 +49,9 @@ use minutist_common::{
     AppError, AudioFormat, DeletionState, MeetingId, MeetingMeta, ProcessingLifecycle, Segment,
 };
 use notes_crdt::{MeetingFolder, NotesStore};
-use sync::{ContentKey, DeviceIdentity, SyncConfig, SyncEngine};
+use sync::{
+    ContentKey, DeviceIdentity, PendingEnrolment as EnginePendingEnrolment, SyncConfig, SyncEngine,
+};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast::{self, error::RecvError};
 use uuid::Uuid;
@@ -260,6 +262,27 @@ pub trait PeerListener: Send + Sync {
     fn on_lagged(&self);
 }
 
+/// A peer the account directory has offered that the user has not yet confirmed
+/// or refused, with the six-digit safety code to compare against that device's
+/// screen. Mirrors [`sync::PendingEnrolment`] across the FFI boundary — plain
+/// strings only, no `iroh` or crypto type crosses.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PendingEnrolment {
+    /// The peer's hex endpoint id.
+    pub peer_id: String,
+    /// The six digits both devices show (zero-padded, so it compares as text).
+    pub safety_code: String,
+}
+
+impl From<EnginePendingEnrolment> for PendingEnrolment {
+    fn from(e: EnginePendingEnrolment) -> Self {
+        Self {
+            peer_id: e.peer_id,
+            safety_code: e.safety_code,
+        }
+    }
+}
+
 /// A running sync endpoint for one device. Wraps [`sync::SyncEngine`] and owns
 /// the tokio runtime it runs on.
 #[derive(uniffi::Object)]
@@ -398,7 +421,7 @@ impl FfiSyncEngine {
     pub async fn note_account_peers(&self, has_other_devices: bool) -> Result<(), SyncFfiError> {
         let engine = self.engine()?;
         // Errors rather than logging: a mint failure leaves this device
-        // permanently unable to sync, and `is_enrolled()` alone cannot tell that
+        // permanently unable to sync, and `is_enrolled_self()` alone cannot tell that
         // apart from the normal "waiting to be enrolled" state. The caller needs
         // to be able to show a fault instead of prompting the user to confirm on
         // another device.
@@ -407,11 +430,92 @@ impl FfiSyncEngine {
         Ok(())
     }
 
-    /// Whether this device holds the account content key, i.e. has been
-    /// enrolled. `false` means it can sync nothing until a device that holds the
-    /// key confirms it.
-    pub fn is_enrolled(&self) -> Result<bool, SyncFfiError> {
+    /// Whether THIS device holds the account content key (has been enrolled).
+    /// `false` covers two distinct states the caller must not conflate: still
+    /// waiting to be enrolled, and — surfaced separately as an error from
+    /// [`Self::note_account_peers`] — a mint failure that leaves a lone device
+    /// permanently unable to sync. For a specific peer awaiting a decision, see
+    /// [`Self::pending_enrolments`]. Wraps [`sync::SyncEngine::is_enrolled_self`].
+    pub fn is_enrolled_self(&self) -> Result<bool, SyncFfiError> {
         Ok(self.engine()?.is_enrolled_self())
+    }
+
+    /// The peers the account directory has offered that this user has not yet
+    /// confirmed or refused, each with the six-digit code to compare against the
+    /// other device's screen. A peer already decided is absent — the verdict
+    /// persists, so the user is asked once, not every poll. This is the list the
+    /// enrolment prompt renders. Wraps [`sync::SyncEngine::pending_enrolments`].
+    pub fn pending_enrolments(&self) -> Result<Vec<PendingEnrolment>, SyncFfiError> {
+        Ok(self
+            .engine()?
+            .pending_enrolments()
+            .into_iter()
+            .map(PendingEnrolment::from)
+            .collect())
+    }
+
+    /// The six-digit code for one specific peer whatever its current verdict —
+    /// for a settings screen re-showing an already-enrolled device's code so the
+    /// user can re-check it against that device. Wraps
+    /// [`sync::SyncEngine::safety_code_for`].
+    pub fn safety_code_for(&self, peer_id: String) -> Result<String, SyncFfiError> {
+        Ok(self.engine()?.safety_code_for(&peer_id)?)
+    }
+
+    /// Record that the user confirmed `peer_id` is a device they own. Records
+    /// only — no dial, returns immediately; hand the peer the key separately with
+    /// [`Self::offer_content_key`], or do both at once with
+    /// [`Self::confirm_and_offer`]. Kept separate from the transfer so the UI can
+    /// distinguish a confirmation that succeeded from a key handover that failed,
+    /// and so confirming a sleeping device does not block on a dial timeout.
+    /// `decided_at` is a caller-supplied RFC 3339 timestamp (this crate keeps no
+    /// clock); it is a display/audit field only — decisions are not ordered or
+    /// compared by it, so a skewed device clock is harmless. Wraps
+    /// [`sync::SyncEngine::confirm_enrolment`].
+    pub fn confirm_enrolment(
+        &self,
+        peer_id: String,
+        decided_at: Option<String>,
+    ) -> Result<(), SyncFfiError> {
+        self.engine()?.confirm_enrolment(&peer_id, decided_at)?;
+        Ok(())
+    }
+
+    /// Record that the user refused `peer_id` and drop the peer. `decided_at` as
+    /// for [`Self::confirm_enrolment`]. Wraps
+    /// [`sync::SyncEngine::refuse_enrolment`].
+    pub fn refuse_enrolment(
+        &self,
+        peer_id: String,
+        decided_at: Option<String>,
+    ) -> Result<(), SyncFfiError> {
+        self.engine()?.refuse_enrolment(&peer_id, decided_at)?;
+        Ok(())
+    }
+
+    /// Hand the account content key to an already-confirmed `peer_id`. This is
+    /// the transfer: it dials and can fail (peer asleep/offline) — retry against
+    /// the standing confirmation, which persists. Wraps
+    /// [`sync::SyncEngine::offer_content_key`].
+    pub async fn offer_content_key(&self, peer_id: String) -> Result<(), SyncFfiError> {
+        let engine = self.engine()?;
+        engine.offer_content_key(&peer_id).await?;
+        Ok(())
+    }
+
+    /// [`Self::confirm_enrolment`] then [`Self::offer_content_key`] in one call.
+    /// The confirmation is recorded even when the transfer fails, so the key
+    /// delivery retries later against the standing verdict. Prefer the two
+    /// separate calls when the UI needs the confirmation and the transfer as
+    /// distinct outcomes. Wraps [`sync::SyncEngine::confirm_and_offer`].
+    pub async fn confirm_and_offer(
+        &self,
+        peer_id: String,
+        decided_at: Option<String>,
+    ) -> Result<(), SyncFfiError> {
+        let engine = self.engine()?;
+        engine.confirm_and_offer(&peer_id, decided_at).await?;
+        Ok(())
     }
 
     /// This device's own publishable direct socket addresses ("ip:port"), for

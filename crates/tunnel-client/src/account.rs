@@ -30,6 +30,16 @@ pub struct DeviceEndpointEntry {
     /// decode to an empty vec.
     #[serde(default)]
     pub direct_addrs: Vec<String>,
+    /// The device's own label from `/pair/start` (e.g. "Andrew's laptop"), so a
+    /// prompt can name a device instead of showing a hex endpoint id. Absent on
+    /// an account service predating the field, and empty for a device that
+    /// supplied none — hence `#[serde(default)]`: a missing field must not fail
+    /// the whole directory decode, which would cost every peer, not this one.
+    ///
+    /// SELF-REPORTED and never verified by the service. A display hint only;
+    /// see `sync::AccountEndpoint::label`.
+    #[serde(default)]
+    pub label: String,
 }
 
 /// A device-directory request failure. `thiserror`-derived so it crosses the
@@ -62,6 +72,13 @@ pub enum AccountDirectoryError {
 /// identified by the credential, so only the endpoint fields are sent.
 #[derive(Debug, Serialize)]
 struct RegisterEndpointRequest<'a> {
+    /// The device's own name, re-sent on every registration so a rename
+    /// propagates without a dedicated endpoint. `None` is omitted from the body
+    /// entirely, and the service reads an absent label as LEAVE UNCHANGED —
+    /// never as clear, so a caller with no trustworthy name keeps whatever the
+    /// device is already called.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<&'a str>,
     endpoint_id: &'a str,
     relay_url: &'a str,
     direct_addrs: &'a [String],
@@ -149,12 +166,14 @@ impl AccountDirectoryClient {
         endpoint_id: &str,
         relay_url: &str,
         direct_addrs: &[String],
+        label: Option<&str>,
     ) -> Result<(), AccountDirectoryError> {
         let resp = self
             .http
             .put(self.url("/v1/account/devices/self/endpoint"))
             .bearer_auth(&self.device_credential)
             .json(&RegisterEndpointRequest {
+                label,
                 endpoint_id,
                 relay_url,
                 direct_addrs,
@@ -259,7 +278,7 @@ mod tests {
             .and(path("/v1/account/devices"))
             .and(header("authorization", "Bearer mdc_test.secret"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {"device_id": "dev-a", "endpoint_id": "ep-a", "relay_url": "https://sync.example/r", "direct_addrs": ["100.82.58.55:41641", "192.168.0.9:41641"]},
+                {"device_id": "dev-a", "endpoint_id": "ep-a", "relay_url": "https://sync.example/r", "direct_addrs": ["100.82.58.55:41641", "192.168.0.9:41641"], "label": "Andrew's laptop"},
                 {"device_id": "dev-b", "endpoint_id": "ep-b", "relay_url": "https://sync.example/r"}
             ])))
             .expect(1)
@@ -278,6 +297,12 @@ mod tests {
         // An entry that omits direct_addrs decodes to an empty vec (older
         // client / relay-only device).
         assert!(devices[1].direct_addrs.is_empty());
+        assert_eq!(devices[0].label, "Andrew's laptop");
+        // An entry with no label at all — an account service predating the
+        // field, or a device that supplied none — must still decode. A missing
+        // field would otherwise fail the WHOLE array, leaving the device with
+        // no peers rather than merely no name.
+        assert!(devices[1].label.is_empty());
     }
 
     #[tokio::test]
@@ -301,6 +326,38 @@ mod tests {
                 "ep-self",
                 "https://sync.example/r",
                 &["100.82.58.55:41641".to_string()],
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    /// `None` omits the key entirely rather than sending `"label": null` — the
+    /// exact-body match in the test above is what pins that. The service reads
+    /// an absent label as "leave the stored name unchanged", which is what lets
+    /// a device with only a generic platform name avoid overwriting a good one.
+    #[tokio::test]
+    async fn register_self_includes_the_label_only_when_supplied() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/account/devices/self/endpoint"))
+            .and(body_json(serde_json::json!({
+                "label": "Andrew's laptop",
+                "endpoint_id": "ep-self",
+                "relay_url": "https://sync.example/r",
+                "direct_addrs": []
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client_for(&server)
+            .register_self_endpoint(
+                "ep-self",
+                "https://sync.example/r",
+                &[],
+                Some("Andrew's laptop"),
             )
             .await
             .unwrap();

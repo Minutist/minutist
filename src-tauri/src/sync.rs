@@ -327,17 +327,17 @@ impl ConnectedSync {
                         Ok(client) => {
                             let source: Arc<dyn AccountEndpointSource> =
                                 Arc::new(account_directory::AccountDirectorySource::new(client));
-                            let self_endpoint = AccountEndpoint {
-                                device_id: cred.device_id,
-                                endpoint_id: engine.endpoint_id().to_string(),
+                            let self_endpoint = AccountEndpoint::self_report(
+                                cred.device_id,
+                                engine.endpoint_id().to_string(),
                                 // The engine homes on SyncConfig::DEFAULT_RELAY_URL —
                                 // the sync engine's own iroh relay, unrelated to
                                 // settings.relay_api_url (the account-service base).
-                                relay_url: SyncConfig::DEFAULT_RELAY_URL.to_string(),
+                                SyncConfig::DEFAULT_RELAY_URL.to_string(),
                                 // Filtered direct addrs (0049) so a same-tailnet/
                                 // LAN peer dials this device directly, no relay/DNS.
-                                direct_addrs: engine.publishable_direct_addrs(),
-                            };
+                                engine.publishable_direct_addrs(),
+                            );
                             // The engine-backed sink: upsert/remove/is_suppressed/
                             // account_peer_ids delegate to the engine, and
                             // on_new_peer first-contact-dials a genuinely-new peer.

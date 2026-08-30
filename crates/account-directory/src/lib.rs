@@ -46,6 +46,9 @@ impl AccountEndpointSource for AccountDirectorySource {
                 endpoint_id: d.endpoint_id,
                 relay_url: d.relay_url,
                 direct_addrs: d.direct_addrs,
+                // The one place an account-published label crosses the network
+                // into the app, so the one place it is normalised.
+                label: sync::sanitise_label(&d.label),
             })
             .collect())
     }
@@ -56,6 +59,7 @@ impl AccountEndpointSource for AccountDirectorySource {
                 &endpoint.endpoint_id,
                 &endpoint.relay_url,
                 &endpoint.direct_addrs,
+                endpoint.label.as_deref(),
             )
             .await
             .map_err(|e| AppError::Internal {

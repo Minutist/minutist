@@ -487,6 +487,7 @@ async fn a_refused_peer_is_dropped_from_the_directory_and_stays_out() {
             endpoint_id: b_id.clone(),
             relay_url: "https://example.invalid".to_string(),
             direct_addrs: Vec::new(),
+            label: None,
         })
     };
     assert!(!was_new, "a refused peer must not read as newly added");

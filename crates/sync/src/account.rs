@@ -41,6 +41,107 @@ pub struct AccountEndpoint {
     /// Empty when the device published none (off-network or an older client);
     /// the peer then reaches it relay-only.
     pub direct_addrs: Vec<String>,
+    /// The device's own name, for showing "Andrew's laptop wants to join"
+    /// instead of a hex endpoint id.
+    ///
+    /// This struct travels in both directions, and `None` means a different
+    /// thing in each:
+    ///
+    /// - **Read** (a directory entry): the device published no name, or the one
+    ///   it published did not survive [`sanitise_label`]. Render it as unnamed.
+    /// - **Write** ([`AccountEndpointSource::register_self`]): "no name to
+    ///   report", NOT "clear the name". The account service reads an absent
+    ///   label as leave-unchanged, so a device with nothing better to say keeps
+    ///   whatever it was called at pairing rather than erasing it.
+    ///
+    /// On the read path every producer must put the value through
+    /// [`sanitise_label`] rather than assigning a raw string — the network
+    /// mapping in `account-directory` is the path that matters today.
+    ///
+    /// UNTRUSTED. The account service stores whatever a device sent and never
+    /// verifies it, and this enrolment flow exists precisely because the
+    /// directory cannot be trusted to say who a device is (see
+    /// `enrolment_proto`'s module doc): a rogue device can call itself
+    /// "Andrew's laptop". A consumer may show this as self-reported context,
+    /// but the safety code stays the thing the user compares — a prompt that
+    /// leans on the name reopens the hole the confirmation closes.
+    pub label: Option<String>,
+}
+
+impl AccountEndpoint {
+    /// Build the value this device publishes about itself, with no name to
+    /// report yet.
+    ///
+    /// `label: None` here is not "clear the name" — see [`Self::label`]'s doc.
+    /// A hand-written struct literal at each call site would have to restate
+    /// that correctly forever; going through this constructor instead makes
+    /// it a fact of the API rather than a comment two callers must each get
+    /// right.
+    pub fn self_report(
+        device_id: String,
+        endpoint_id: String,
+        relay_url: String,
+        direct_addrs: Vec<String>,
+    ) -> Self {
+        Self {
+            device_id,
+            endpoint_id,
+            relay_url,
+            direct_addrs,
+            label: None,
+        }
+    }
+}
+
+/// The maximum label length kept, in characters. Long enough for a real device
+/// name, short enough that a label cannot dominate a prompt or push the safety
+/// code out of view.
+const LABEL_MAX_CHARS: usize = 64;
+
+/// Characters that must not reach a rendered device label.
+///
+/// `is_control` covers Cc but NOT Cf, which is where the bidirectional
+/// overrides and isolates live — those are the ones that matter here, because a
+/// label carrying them can reorder the text rendered around it and so
+/// misrepresent which device is asking. The zero-width characters are included
+/// for the adjacent trick of building lookalike names.
+fn is_unrenderable(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        )
+}
+
+/// Normalise an account-published device label into something safe to render.
+///
+/// Applied once, at the point the untrusted value enters the crate, rather than
+/// left to each consumer: the desktop, the phone and the hub CLI all show this
+/// string, and a rule enforced in one place cannot be forgotten by two of them.
+///
+/// Strips whatever [`is_unrenderable`] rejects, drops leading whitespace, and
+/// truncates to [`LABEL_MAX_CHARS`] characters (characters, not bytes — a byte
+/// cut can split a multi-byte char, and would shorten a non-Latin name far more
+/// than a Latin one) BEFORE collecting into an owned `String`. `raw` is
+/// attacker-controlled and carries no length limit of its own, so bounding the
+/// work before the allocation — rather than allocating the full cleaned string
+/// and truncating after — keeps the cost of a hostile multi-megabyte label the
+/// same as an ordinary one. Trailing whitespace exposed by truncation is
+/// trimmed after. Returns `None` when nothing renderable survives, so an empty
+/// or hostile label reads as "no name" rather than as blank space where a name
+/// should be.
+pub fn sanitise_label(raw: &str) -> Option<String> {
+    let result: String = raw
+        .chars()
+        .filter(|c| !is_unrenderable(*c))
+        .skip_while(|c| c.is_whitespace())
+        .take(LABEL_MAX_CHARS)
+        .collect();
+    let trimmed = result.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// The injected account-service HTTP seam. `crates/sync` depends on this trait
@@ -243,6 +344,65 @@ pub async fn run_account_refresh_loop_v2(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- label sanitising -------------------------------------------------
+
+    #[test]
+    fn an_ordinary_label_survives_intact() {
+        assert_eq!(
+            sanitise_label("Andrew's laptop").as_deref(),
+            Some("Andrew's laptop")
+        );
+    }
+
+    #[test]
+    fn a_label_with_nothing_renderable_becomes_none() {
+        // "no name" is a state a prompt can render honestly; a blank string
+        // where a device name should be is not.
+        assert_eq!(sanitise_label(""), None);
+        assert_eq!(sanitise_label("   \t  "), None);
+        assert_eq!(sanitise_label("\u{202E}\u{200B}"), None);
+    }
+
+    #[test]
+    fn bidi_overrides_and_control_characters_are_stripped() {
+        // The attack this exists for: a label carrying RLO reverses the text
+        // rendered after it, so a device can misrepresent which one is asking
+        // in a list it does not otherwise control. Newlines are the cruder
+        // version — one entry occupying several lines of a prompt.
+        assert_eq!(
+            sanitise_label("Andrew\u{202E}'s laptop").as_deref(),
+            Some("Andrew's laptop")
+        );
+        assert_eq!(
+            sanitise_label("line one\nline two").as_deref(),
+            Some("line oneline two")
+        );
+        assert_eq!(
+            sanitise_label("zero\u{200B}width").as_deref(),
+            Some("zerowidth")
+        );
+        // Bidi isolates (LRI..PDI) are Cf like the overrides, and `is_control`
+        // covers neither — hence the explicit ranges.
+        assert_eq!(
+            sanitise_label("a\u{2066}b\u{2069}c").as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn an_over_long_label_is_truncated_to_the_cap() {
+        let out = sanitise_label(&"n".repeat(LABEL_MAX_CHARS * 3)).expect("non-empty");
+        assert_eq!(out.chars().count(), LABEL_MAX_CHARS);
+    }
+
+    #[test]
+    fn truncation_counts_characters_not_bytes() {
+        // A byte-wise cut could split a multi-byte char, and would shorten a
+        // name in a non-Latin script far more than a Latin one.
+        let out = sanitise_label(&"é".repeat(LABEL_MAX_CHARS * 2)).expect("non-empty");
+        assert_eq!(out.chars().count(), LABEL_MAX_CHARS);
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -255,6 +415,7 @@ mod tests {
             endpoint_id: endpoint.to_string(),
             relay_url: "https://sync.example/relay".to_string(),
             direct_addrs: Vec::new(),
+            label: None,
         }
     }
 

@@ -958,12 +958,12 @@ async fn start_engine(
                 Ok(client) => {
                     let source: Arc<dyn AccountEndpointSource> =
                         Arc::new(account_directory::AccountDirectorySource::new(client));
-                    let self_endpoint = AccountEndpoint {
-                        device_id: cred.device_id,
-                        endpoint_id: engine.endpoint_id().to_string(),
+                    let self_endpoint = AccountEndpoint::self_report(
+                        cred.device_id,
+                        engine.endpoint_id().to_string(),
                         relay_url,
-                        direct_addrs: engine.publishable_direct_addrs(),
-                    };
+                        engine.publishable_direct_addrs(),
+                    );
                     tracing::info!(
                         target: "hub",
                         account_id = %cred.account_id,
